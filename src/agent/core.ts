@@ -61,7 +61,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
 
     const results = await Promise.all(
       calls.map(async (call) => {
-        const decision = await opts.policy.check(call);
+        const decision = await opts.policy.check(call, opts.ctx);
         if (decision.blocked) {
           return {
             id: call.id,
@@ -69,7 +69,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
             isError: true,
           };
         }
-        // TODO(S4): needApproval -> 暂停 loop 等待审批
+        if (decision.needApproval) {
+          // S10 将实现交互审批（暂停 loop / 推 diff / 续跑）；当前先拒绝并提示。
+          return {
+            id: call.id,
+            content: `needs approval: ${decision.reason ?? '该操作需要审批后才能执行'}`,
+            isError: true,
+          };
+        }
         return opts.tools.dispatch(call, opts.ctx);
       }),
     );

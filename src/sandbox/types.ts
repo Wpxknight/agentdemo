@@ -24,6 +24,8 @@ export interface SandboxSpec {
   template?: string;
   /** 沙箱存活超时(ms)，到期被 E2B 回收。 */
   timeoutMs?: number;
+  /** 覆盖 E2B 控制面域名（多集群：每集群一个控制面）。 */
+  domain?: string;
   /** 注入沙箱的环境变量（如 in-cluster 标记）。 */
   envs?: Record<string, string>;
 }

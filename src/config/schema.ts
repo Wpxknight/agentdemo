@@ -28,12 +28,17 @@ export const SandboxConfigSchema = z.object({
 });
 
 export const ClusterSchema = z.object({
-  e2bControl: z.string(),
-  template: z.string(),
-  namespace: z.string(),
-  serviceAccount: z.string(),
-  access: z.enum(['ro', 'rw']),
+  /** 该集群对应的 E2B 控制面端点（集群内动态拉起沙箱）。 */
+  e2bControl: z.string().optional(),
+  /** in-cluster 沙箱模板（含 kubectl + 绑定 ServiceAccount）。 */
+  template: z.string().optional(),
+  namespace: z.string().optional(),
+  serviceAccount: z.string().optional(),
+  /** ro=只读拦截一切变更；rw=允许变更（仍受危险命令/审批约束）。 */
+  access: z.enum(['ro', 'rw']).default('ro'),
   allowNamespaces: z.array(z.string()).optional(),
+  /** 生产集群：变更类操作需审批。 */
+  production: z.boolean().default(false),
 });
 
 export const ConfigSchema = z.object({

@@ -37,6 +37,24 @@
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
     }
     // "remote": { "transport": "http", "url": "https://mcp.example.com/mcp", "headers": { "Authorization": "Bearer ${MCP_TOKEN}" } }
+  },
+  // 多集群运维：kubectl 在各集群 in-cluster 沙箱内执行；access=ro 拦截变更，production 变更需审批
+  "clusters": {
+    "dev": {
+      "e2bControl": "https://e2b.dev-cluster.internal",
+      "template": "kubectl-incluster",
+      "namespace": "aiop",
+      "serviceAccount": "aiop-ops",
+      "access": "rw",
+      "production": false
+    },
+    "prod": {
+      "e2bControl": "https://e2b.prod-cluster.internal",
+      "template": "kubectl-incluster",
+      "namespace": "aiop",
+      "serviceAccount": "aiop-readonly",
+      "access": "ro",
+      "production": true
+    }
   }
-  // clusters 在 S4 阶段启用
 }

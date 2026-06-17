@@ -52,16 +52,16 @@ class E2bHandle implements SandboxHandle {
 export class E2bProvider implements SandboxProvider {
   constructor(private readonly opts: E2bProviderOptions = {}) {}
 
-  private get connectOpts() {
+  private connectOpts(spec: SandboxSpec) {
     return {
       apiKey: this.opts.apiKey ?? process.env.E2B_API_KEY,
-      domain: this.opts.domain,
+      domain: spec.domain ?? this.opts.domain,
     };
   }
 
   async create(spec: SandboxSpec): Promise<SandboxHandle> {
     const sbx = await Sandbox.create({
-      ...this.connectOpts,
+      ...this.connectOpts(spec),
       template: spec.template,
       timeoutMs: spec.timeoutMs,
       envs: spec.envs,
@@ -70,7 +70,7 @@ export class E2bProvider implements SandboxProvider {
   }
 
   async connect(sandboxId: string, spec: SandboxSpec): Promise<SandboxHandle> {
-    const sbx = await Sandbox.connect(sandboxId, this.connectOpts);
+    const sbx = await Sandbox.connect(sandboxId, this.connectOpts(spec));
     if (spec.timeoutMs) await sbx.setTimeout(spec.timeoutMs); // 续命防回收
     return new E2bHandle(sbx);
   }
