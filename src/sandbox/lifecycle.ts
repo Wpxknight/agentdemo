@@ -1,5 +1,6 @@
 import { logger } from '../logger.js';
 import type { SandboxHandle, SandboxProvider, SandboxSpec } from './types.js';
+import type { WarmPool } from './warmpool.js';
 
 const log = logger.child({ mod: 'sandbox' });
 
@@ -16,6 +17,8 @@ export interface SandboxManagerOptions {
   timeoutMs?: number;
   /** 可注入时钟，便于测试。 */
   now?: () => number;
+  /** 可选预热池：新建（非连接远端）时优先从池中取，降低冷启动。 */
+  warmPool?: WarmPool;
 }
 
 /**
@@ -29,6 +32,7 @@ export class SandboxManager {
   private readonly idleMs: number;
   private readonly timeoutMs: number;
   private readonly now: () => number;
+  private readonly warmPool?: WarmPool;
 
   private readonly entries = new Map<string, Entry>();
   private readonly inflight = new Map<string, Promise<SandboxHandle>>();
@@ -38,6 +42,7 @@ export class SandboxManager {
     this.idleMs = opts.idleMs ?? 10 * 60_000;
     this.timeoutMs = opts.timeoutMs ?? 60 * 60_000;
     this.now = opts.now ?? Date.now;
+    this.warmPool = opts.warmPool;
   }
 
   /** 取得（必要时创建 / 连接）一个沙箱句柄，并刷新其活跃时间。 */
@@ -55,7 +60,9 @@ export class SandboxManager {
     const task = (async () => {
       const handle = full.sandboxId
         ? await this.provider.connect(full.sandboxId, full)
-        : await this.provider.create(full);
+        : this.warmPool
+          ? await this.warmPool.acquire()
+          : await this.provider.create(full);
       this.entries.set(spec.key, { handle, lastUsed: this.now() });
       log.info({ key: spec.key, sandboxId: handle.sandboxId, mode: full.sandboxId ? 'connect' : 'create' }, 'sandbox ready');
       return handle;

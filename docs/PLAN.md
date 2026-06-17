@@ -111,4 +111,4 @@ API 通过 HTTP + SSE 暴露（前端后续接入）；本阶段以服务端 + C
 - [x] S7 多租户 + 会话隔离 + 本地认证 — RequestContext 贯穿 Store（各表 tenant_id、强制按租户过滤）、tenants/users 表、scrypt 口令哈希、LocalAuthProvider（jose HS256 JWT login/authenticate）、server/context 认证中间件；跨租户隔离 + 登录签发/校验/伪造拒绝单测；59 通过/1 跳过（注：用 scrypt 替代 argon2 以免原生依赖）
 - [x] S8 RBAC 三角色 + 授权融合 — auth/rbac.ts（权限矩阵 + can/requirePermission/canManageUsersOf）、auth/admin.ts（租户/用户管理带 RBAC）、OpsPolicy 融合（cluster:write 权限、管理员审批权自动放行、集群 ACL 按租户）、schedule preApproved 限管理员；越权/审批/ACL 单测；67 通过/1 跳过
 - [x] S9 SSO 对接 — auth/session.ts（共享会话 JWT，Local/Oidc 复用）、auth/oidc-map.ts（claims→tenant/role 纯映射）、auth/oidc.ts（OidcAuthProvider：openid-client Authorization Code+PKCE、JIT 建号、本系统会话 token）、config.auth 切换 local/oidc；映射/JIT/会话单测（真实 IdP 流程留待联调）；73 通过/1 跳过
-- [ ] S10 增强
+- [x] S10 增强 — 审批门（ApprovalGate：AutoApprove/AutoDeny/Callback，core.ts 接入，CLI 批准/调度拒绝）、WarmPool 预热池（acquire+异步补位，接入 SandboxManager）、远端桌面/浏览器工具（desktop/browser 抽象 + E2bDesktopProvider + browser_navigate/click/type/screenshot/stream_url）；审批/预热/浏览器单测；79 通过/1 跳过

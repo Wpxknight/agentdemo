@@ -47,7 +47,9 @@
     "enabled": false,
     "apiKey": "${E2B_API_KEY}",
     "idleMs": 600000,
-    "timeoutMs": 3600000
+    "timeoutMs": 3600000,
+    "desktop": false,        // 启用远端桌面/浏览器工具（@e2b/desktop）
+    "warmPoolSize": 0        // >0 预热沙箱（仅未配置 clusters 时生效）
   },
   // MCP server：stdio / sse / http 三种 transport，工具以 mcp__<server>__<tool> 暴露
   "mcpServers": {

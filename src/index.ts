@@ -3,6 +3,7 @@ import { loadConfig } from './config/load.js';
 import { runAgent } from './agent/core.js';
 import { buildRuntime } from './runtime.js';
 import { Scheduler } from './scheduler/ticker.js';
+import { AutoApproveGate, AutoDenyGate } from './agent/approval.js';
 import type { ScheduledTask } from './db/store.js';
 
 /**
@@ -28,6 +29,7 @@ async function main() {
     model: rt.model,
     tools: rt.tools,
     policy: rt.policy,
+    approval: new AutoApproveGate(), // CLI 为可信本地操作者，交互即批准
     system: rt.systemExtra,
     ctx: { sessionId: 'cli', tenantId, userId, role },
     task,
@@ -53,6 +55,7 @@ async function runScheduler(config: Awaited<ReturnType<typeof loadConfig>>) {
       model: rt.model,
       tools: rt.tools,
       policy: t.preApproved ? rt.policyPreApproved : rt.policy,
+      approval: new AutoDenyGate(), // 无人值守：未预批准的审批一律拒绝
       system: rt.systemExtra,
       ctx: { sessionId: t.sessionId, ...taskCtx },
       task: t.task,

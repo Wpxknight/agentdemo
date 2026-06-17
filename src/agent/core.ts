@@ -1,6 +1,7 @@
 import type { ChatModel, Msg, StreamEvent, ToolCall } from '../model/types.js';
 import type { PolicyMiddleware } from './policy.js';
 import type { ToolContext, ToolRegistry } from './tools.js';
+import type { ApprovalGate } from './approval.js';
 
 export interface RunAgentOptions {
   model: ChatModel;
@@ -15,6 +16,8 @@ export interface RunAgentOptions {
   onEvent?: (e: StreamEvent) => void;
   /** 安全上限，防止工具循环失控。 */
   maxSteps?: number;
+  /** needApproval 时的审批门；缺省则直接拒绝。 */
+  approval?: ApprovalGate;
 }
 
 export interface RunAgentResult {
@@ -70,12 +73,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
           };
         }
         if (decision.needApproval) {
-          // S10 将实现交互审批（暂停 loop / 推 diff / 续跑）；当前先拒绝并提示。
-          return {
-            id: call.id,
-            content: `needs approval: ${decision.reason ?? '该操作需要审批后才能执行'}`,
-            isError: true,
-          };
+          const approved = opts.approval
+            ? await opts.approval.request({ call, reason: decision.reason, ctx: opts.ctx })
+            : false;
+          if (!approved) {
+            return {
+              id: call.id,
+              content: `needs approval (denied): ${decision.reason ?? '该操作需要审批后才能执行'}`,
+              isError: true,
+            };
+          }
         }
         return opts.tools.dispatch(call, opts.ctx);
       }),

@@ -7,7 +7,11 @@ import { AllowAllPolicy, OpsPolicy } from './agent/policy.js';
 import type { PolicyMiddleware } from './agent/policy.js';
 import { SandboxManager } from './sandbox/lifecycle.js';
 import { E2bProvider } from './sandbox/e2b.js';
+import { WarmPool } from './sandbox/warmpool.js';
+import { E2bDesktopProvider } from './sandbox/e2b-desktop.js';
+import type { DesktopHandle } from './sandbox/desktop.js';
 import { buildSandboxTools } from './tools/builtin.js';
+import { buildBrowserTools } from './tools/browser.js';
 import { McpManager } from './mcp/manager.js';
 import { connectMcp } from './mcp/client.js';
 import { SkillRegistry } from './skill/registry.js';
@@ -67,17 +71,48 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     : new AllowAllPolicy();
 
   let sandboxes: SandboxManager | undefined;
+  let warmPoolRef: WarmPool | undefined;
+  const desktops = new Map<string, Promise<DesktopHandle>>();
   if (config.sandbox?.enabled) {
+    const provider = new E2bProvider({ apiKey: config.sandbox.apiKey, domain: config.sandbox.domain });
+
+    // 预热池：仅在未配置集群时启用（集群需专用模板，避免发错沙箱）
+    let warmPool: WarmPool | undefined;
+    if (config.sandbox.warmPoolSize && !hasClusters) {
+      warmPool = new WarmPool({ provider, spec: {}, size: config.sandbox.warmPoolSize });
+      await warmPool.start();
+      warmPoolRef = warmPool;
+      logger.info({ size: config.sandbox.warmPoolSize }, 'sandbox warm pool ready');
+    } else if (config.sandbox.warmPoolSize && hasClusters) {
+      logger.warn('配置了集群，warmPoolSize 被忽略（集群需专用模板）');
+    }
+
     sandboxes = new SandboxManager({
-      provider: new E2bProvider({ apiKey: config.sandbox.apiKey, domain: config.sandbox.domain }),
+      provider,
       idleMs: config.sandbox.idleMs,
       timeoutMs: config.sandbox.timeoutMs,
+      warmPool,
     });
     for (const t of buildSandboxTools(sandboxes)) tools.register(t);
     logger.info('sandbox tools enabled');
     if (hasClusters) {
       tools.register(buildKubectlTool({ clusters, sandboxes, audit }));
       logger.info({ clusters: clusters.names() }, 'kubectl tool enabled');
+    }
+
+    // 远端桌面 / 浏览器工具
+    if (config.sandbox.desktop) {
+      const dp = new E2bDesktopProvider({ apiKey: config.sandbox.apiKey, domain: config.sandbox.domain });
+      const resolve = (ctx: { sessionId: string }): Promise<DesktopHandle> => {
+        let d = desktops.get(ctx.sessionId);
+        if (!d) {
+          d = dp.create({ key: ctx.sessionId, timeoutMs: config.sandbox!.timeoutMs });
+          desktops.set(ctx.sessionId, d);
+        }
+        return d;
+      };
+      for (const t of buildBrowserTools(resolve)) tools.register(t);
+      logger.info('desktop/browser tools enabled');
     }
   }
 
@@ -134,7 +169,12 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     authProvider,
     defaultContext,
     async dispose() {
+      await Promise.all(
+        [...desktops.values()].map((d) => d.then((h) => h.kill()).catch(() => {})),
+      );
+      desktops.clear();
       await sandboxes?.disposeAll();
+      await warmPoolRef?.drain();
       await mcp?.close();
       await store.close();
     },
