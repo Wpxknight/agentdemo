@@ -1,10 +1,21 @@
 import type { JsonValue, ToolCall, ToolDef, ToolResult } from '../model/types.js';
+import type { RequestContext, Role } from '../auth/types.js';
 
-/** 工具执行时可用的运行上下文（S7 起注入 tenant/user/role）。 */
+/** 工具执行时可用的运行上下文（含租户身份，用于隔离与鉴权）。 */
 export interface ToolContext {
   sessionId: string;
-  // tenant?: string; user?: string; role?: Role;  // S7+
+  tenantId?: string;
+  userId?: string;
+  role?: Role;
   [key: string]: unknown;
+}
+
+/** 从 ToolContext 取出租户身份；缺失则抛错（防止漏过隔离）。 */
+export function reqContext(ctx: ToolContext): RequestContext {
+  if (!ctx.tenantId || !ctx.userId || !ctx.role) {
+    throw new Error('缺少身份上下文（tenantId/userId/role）');
+  }
+  return { tenantId: ctx.tenantId, userId: ctx.userId, role: ctx.role };
 }
 
 export interface ToolHandler {

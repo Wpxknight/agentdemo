@@ -3,6 +3,10 @@ import { readMysqlConfig } from '../src/config/mysql.js';
 import { MemoryStore } from '../src/db/memory.js';
 import { createStore } from '../src/db/index.js';
 import type { Msg } from '../src/model/types.js';
+import type { RequestContext } from '../src/auth/types.js';
+
+const ctxA: RequestContext = { tenantId: 't1', userId: 'u1', role: 'user' };
+const ctxB: RequestContext = { tenantId: 't2', userId: 'u2', role: 'user' };
 
 describe('readMysqlConfig', () => {
   const base = {
@@ -46,24 +50,33 @@ describe('MemoryStore', () => {
 
   it('appends and lists messages scoped by session', async () => {
     const s = new MemoryStore();
-    await s.appendMessage('a', msg('user', 'hi'));
-    await s.appendMessage('a', msg('assistant', 'hello'));
-    await s.appendMessage('b', msg('user', 'other'));
+    await s.appendMessage(ctxA, 'a', msg('user', 'hi'));
+    await s.appendMessage(ctxA, 'a', msg('assistant', 'hello'));
+    await s.appendMessage(ctxA, 'b', msg('user', 'other'));
 
-    const a = await s.listMessages('a');
+    const a = await s.listMessages(ctxA, 'a');
     expect(a.map((m) => m.text)).toEqual(['hi', 'hello']);
-    expect(await s.listMessages('b')).toHaveLength(1);
+    expect(await s.listMessages(ctxA, 'b')).toHaveLength(1);
   });
 
-  it('records and filters audit events', async () => {
+  it('isolates messages across tenants', async () => {
     const s = new MemoryStore();
-    await s.record({ kind: 'kubectl', action: 'exec', sessionId: 'a', cluster: 'dev' });
-    await s.record({ kind: 'policy', action: 'block', sessionId: 'a' });
-    await s.record({ kind: 'kubectl', action: 'exec', sessionId: 'b' });
+    await s.appendMessage(ctxA, 'shared', msg('user', 'a-secret'));
+    await s.appendMessage(ctxB, 'shared', msg('user', 'b-secret'));
 
-    expect(await s.listAudit({ sessionId: 'a' })).toHaveLength(2);
-    expect(await s.listAudit({ kind: 'kubectl' })).toHaveLength(2);
-    expect(await s.listAudit({ kind: 'kubectl', limit: 1 })).toHaveLength(1);
+    expect((await s.listMessages(ctxA, 'shared')).map((m) => m.text)).toEqual(['a-secret']);
+    expect((await s.listMessages(ctxB, 'shared')).map((m) => m.text)).toEqual(['b-secret']);
+  });
+
+  it('records and filters audit events within tenant', async () => {
+    const s = new MemoryStore();
+    await s.record({ kind: 'kubectl', action: 'exec', tenantId: 't1', sessionId: 'a', cluster: 'dev' });
+    await s.record({ kind: 'policy', action: 'block', tenantId: 't1', sessionId: 'a' });
+    await s.record({ kind: 'kubectl', action: 'exec', tenantId: 't2', sessionId: 'b' });
+
+    expect(await s.listAudit(ctxA, { sessionId: 'a' })).toHaveLength(2);
+    expect(await s.listAudit(ctxA, { kind: 'kubectl' })).toHaveLength(1);
+    expect(await s.listAudit(ctxB)).toHaveLength(1);
   });
 });
 
@@ -72,12 +85,13 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlStore (integration)', () =
   it('migrates and roundtrips messages + audit', async () => {
     const store = await createStore(readMysqlConfig());
     const sid = `it-${Date.now()}`;
-    await store.appendMessage(sid, { role: 'user', text: 'ping' });
-    await store.appendMessage(sid, { role: 'assistant', text: 'pong' });
-    await store.record({ kind: 'kubectl', action: 'exec', sessionId: sid, cluster: 'dev' });
+    const ctx: RequestContext = { tenantId: 'it', userId: 'u', role: 'user' };
+    await store.appendMessage(ctx, sid, { role: 'user', text: 'ping' });
+    await store.appendMessage(ctx, sid, { role: 'assistant', text: 'pong' });
+    await store.record({ kind: 'kubectl', action: 'exec', tenantId: 'it', sessionId: sid, cluster: 'dev' });
 
-    expect((await store.listMessages(sid)).map((m) => m.text)).toEqual(['ping', 'pong']);
-    expect(await store.listAudit({ sessionId: sid })).toHaveLength(1);
+    expect((await store.listMessages(ctx, sid)).map((m) => m.text)).toEqual(['ping', 'pong']);
+    expect(await store.listAudit(ctx, { sessionId: sid })).toHaveLength(1);
     await store.close();
   });
 });

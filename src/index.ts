@@ -23,12 +23,13 @@ async function main() {
   const task = argv.join(' ') || '你好，做个自我介绍。';
   logger.info({ model: rt.model.id, task }, 'running agent');
 
+  const { tenantId, userId, role } = rt.defaultContext;
   const result = await runAgent({
     model: rt.model,
     tools: rt.tools,
     policy: rt.policy,
     system: rt.systemExtra,
-    ctx: { sessionId: 'cli' },
+    ctx: { sessionId: 'cli', tenantId, userId, role },
     task,
     onEvent: (e) => {
       if (e.type === 'text_delta') process.stdout.write(e.text);
@@ -37,7 +38,7 @@ async function main() {
 
   process.stdout.write('\n');
   logger.info({ steps: result.steps }, 'done');
-  for (const m of result.messages) await rt.store.appendMessage('cli', m);
+  for (const m of result.messages) await rt.store.appendMessage(rt.defaultContext, 'cli', m);
   await rt.dispose();
 }
 
@@ -46,16 +47,17 @@ async function runScheduler(config: Awaited<ReturnType<typeof loadConfig>>) {
   const rt = await buildRuntime(config);
 
   const runner = async (t: ScheduledTask) => {
-    logger.info({ taskId: t.id, sessionId: t.sessionId }, 'running scheduled task');
+    logger.info({ taskId: t.id, tenantId: t.tenantId, sessionId: t.sessionId }, 'running scheduled task');
+    const taskCtx = { tenantId: t.tenantId, userId: t.userId, role: 'user' as const };
     const result = await runAgent({
       model: rt.model,
       tools: rt.tools,
       policy: t.preApproved ? rt.policyPreApproved : rt.policy,
       system: rt.systemExtra,
-      ctx: { sessionId: t.sessionId },
+      ctx: { sessionId: t.sessionId, ...taskCtx },
       task: t.task,
     });
-    for (const m of result.messages) await rt.store.appendMessage(t.sessionId, m);
+    for (const m of result.messages) await rt.store.appendMessage(taskCtx, t.sessionId, m);
     return { status: 'success' as const, detail: result.text.slice(0, 4000), steps: result.steps };
   };
 

@@ -9,6 +9,8 @@ export interface AuditEvent {
   kind: AuditKind;
   /** 动作，如 allow / block / approve-required / exec。 */
   action: string;
+  /** 归属租户（多租户隔离）。 */
+  tenantId?: string;
   sessionId?: string;
   cluster?: string;
   tool?: string;

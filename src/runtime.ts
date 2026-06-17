@@ -19,6 +19,9 @@ import { readMysqlConfig } from './config/mysql.js';
 import { createStore } from './db/index.js';
 import type { Store } from './db/store.js';
 import { buildScheduleTools } from './tools/schedule.js';
+import { LocalAuthProvider } from './auth/local.js';
+import type { AuthProvider } from './auth/provider.js';
+import type { RequestContext } from './auth/types.js';
 
 export interface Runtime {
   model: ChatModel;
@@ -31,8 +34,14 @@ export interface Runtime {
   policy: PolicyMiddleware;
   /** 无人值守策略（定时任务 preApproved 时使用）。 */
   policyPreApproved: PolicyMiddleware;
+  /** 本地认证提供方（登录 / token 校验）。 */
+  authProvider: AuthProvider;
+  /** 无认证（CLI）场景的默认身份。 */
+  defaultContext: RequestContext;
   dispose(): Promise<void>;
 }
+
+const DEFAULT_TENANT = 'default';
 
 /** 组装一次运行所需的全部组件（模型/工具/策略/持久化）。 */
 export async function buildRuntime(config: Config): Promise<Runtime> {
@@ -91,6 +100,19 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     }
   }
 
+  // 认证：本地 provider（JWT 密钥取自 env，缺省用开发占位）
+  const secret = process.env.AIOP_JWT_SECRET;
+  if (!secret) logger.warn('AIOP_JWT_SECRET 未设置，使用开发占位密钥（勿用于生产）');
+  const authProvider = new LocalAuthProvider({ store, secret: secret ?? 'dev-insecure-secret' });
+
+  // CLI 默认身份：确保默认租户存在
+  await store.createTenant({ id: DEFAULT_TENANT, name: 'Default' }).catch(() => {});
+  const defaultContext: RequestContext = {
+    tenantId: DEFAULT_TENANT,
+    userId: 'cli',
+    role: 'platform_admin',
+  };
+
   return {
     model,
     tools,
@@ -100,6 +122,8 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     systemExtra,
     policy,
     policyPreApproved,
+    authProvider,
+    defaultContext,
     async dispose() {
       await sandboxes?.disposeAll();
       await mcp?.close();

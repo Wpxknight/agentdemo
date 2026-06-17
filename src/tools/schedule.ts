@@ -1,5 +1,6 @@
 import type { JsonValue, ToolResult } from '../model/types.js';
 import type { ToolContext, ToolHandler } from '../agent/tools.js';
+import { reqContext } from '../agent/tools.js';
 import type { Store } from '../db/store.js';
 import { isValidCron } from '../scheduler/cron.js';
 
@@ -35,7 +36,7 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
         if (!cron || !task) return { id: '', content: 'cron 与 task 均必填', isError: true };
         if (!isValidCron(cron)) return { id: '', content: `非法 cron 表达式: ${cron}`, isError: true };
 
-        const created = await store.createScheduledTask({
+        const created = await store.createScheduledTask(reqContext(ctx), {
           sessionId: ctx.sessionId,
           cron,
           task,
@@ -54,7 +55,7 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
         inputSchema: { type: 'object', properties: {} },
       },
       async run(_args, ctx: ToolContext): Promise<ToolResult> {
-        const tasks = await store.listScheduledTasks(ctx.sessionId);
+        const tasks = await store.listScheduledTasks(reqContext(ctx));
         if (!tasks.length) return { id: '', content: '（无定时任务）' };
         const lines = tasks.map(
           (t) =>
@@ -73,11 +74,11 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
           required: ['id'],
         },
       },
-      async run(args): Promise<ToolResult> {
+      async run(args, ctx: ToolContext): Promise<ToolResult> {
         const o = asObject(args);
         const id = typeof o.id === 'number' ? o.id : Number(o.id);
         if (!Number.isInteger(id)) return { id: '', content: 'id 必须是整数', isError: true };
-        await store.setTaskEnabled(id, false);
+        await store.setTaskEnabled(reqContext(ctx), id, false);
         return { id: '', content: `已停用定时任务 #${id}` };
       },
     },

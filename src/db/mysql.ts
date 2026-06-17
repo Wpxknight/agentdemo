@@ -1,18 +1,23 @@
 import type { Kysely } from 'kysely';
-import type { Msg, Role } from '../model/types.js';
+import type { Msg, Role as MsgRole } from '../model/types.js';
 import type { AuditEvent } from '../audit/sink.js';
+import type { RequestContext, Role, Tenant, User } from '../auth/types.js';
 import type { Database } from './schema.js';
 import type {
   AuditFilter,
+  NewUser,
   ScheduledTask,
   ScheduledTaskInput,
   Store,
   TaskRun,
+  UserWithSecret,
 } from './store.js';
 import { nextRunAt } from '../scheduler/cron.js';
 
 interface TaskRow {
   id: number;
+  tenant_id: string;
+  user_id: string;
   session_id: string;
   cron: string;
   task: string;
@@ -25,6 +30,8 @@ interface TaskRow {
 function toTask(r: TaskRow): ScheduledTask {
   return {
     id: r.id,
+    tenantId: r.tenant_id,
+    userId: r.user_id,
     sessionId: r.session_id,
     cron: r.cron,
     task: r.task,
@@ -47,11 +54,11 @@ function parseJson(v: unknown): unknown {
   return v;
 }
 
-/** 基于 Kysely + mysql2 的持久化实现。 */
+/** 基于 Kysely + mysql2 的持久化实现（租户由 ctx 强制过滤）。 */
 export class MysqlStore implements Store {
   constructor(private readonly db: Kysely<Database>) {}
 
-  async appendMessage(sessionId: string, msg: Msg): Promise<void> {
+  async appendMessage(ctx: RequestContext, sessionId: string, msg: Msg): Promise<void> {
     const content = JSON.stringify({
       text: msg.text,
       toolCalls: msg.toolCalls,
@@ -59,14 +66,15 @@ export class MysqlStore implements Store {
     });
     await this.db
       .insertInto('messages')
-      .values({ session_id: sessionId, role: msg.role, content })
+      .values({ tenant_id: ctx.tenantId, session_id: sessionId, role: msg.role, content })
       .execute();
   }
 
-  async listMessages(sessionId: string): Promise<Msg[]> {
+  async listMessages(ctx: RequestContext, sessionId: string): Promise<Msg[]> {
     const rows = await this.db
       .selectFrom('messages')
       .select(['role', 'content'])
+      .where('tenant_id', '=', ctx.tenantId)
       .where('session_id', '=', sessionId)
       .orderBy('id', 'asc')
       .execute();
@@ -74,7 +82,7 @@ export class MysqlStore implements Store {
     return rows.map((r): Msg => {
       const c = (parseJson(r.content) ?? {}) as Partial<Msg>;
       return {
-        role: r.role as Role,
+        role: r.role as MsgRole,
         text: c.text,
         toolCalls: c.toolCalls,
         toolResults: c.toolResults,
@@ -86,6 +94,7 @@ export class MysqlStore implements Store {
     await this.db
       .insertInto('audit_events')
       .values({
+        tenant_id: event.tenantId ?? null,
         kind: event.kind,
         action: event.action,
         session_id: event.sessionId ?? null,
@@ -96,10 +105,11 @@ export class MysqlStore implements Store {
       .execute();
   }
 
-  async listAudit(filter: AuditFilter = {}): Promise<AuditEvent[]> {
+  async listAudit(ctx: RequestContext, filter: AuditFilter = {}): Promise<AuditEvent[]> {
     let q = this.db
       .selectFrom('audit_events')
-      .select(['kind', 'action', 'session_id', 'cluster', 'tool', 'detail', 'created_at'])
+      .select(['tenant_id', 'kind', 'action', 'session_id', 'cluster', 'tool', 'detail', 'created_at'])
+      .where('tenant_id', '=', ctx.tenantId)
       .orderBy('id', 'asc');
     if (filter.sessionId) q = q.where('session_id', '=', filter.sessionId);
     if (filter.kind) q = q.where('kind', '=', filter.kind);
@@ -107,6 +117,7 @@ export class MysqlStore implements Store {
 
     const rows = await q.execute();
     return rows.map((r): AuditEvent => ({
+      tenantId: r.tenant_id ?? undefined,
       kind: r.kind as AuditEvent['kind'],
       action: r.action,
       sessionId: r.session_id ?? undefined,
@@ -117,11 +128,13 @@ export class MysqlStore implements Store {
     }));
   }
 
-  async createScheduledTask(input: ScheduledTaskInput): Promise<ScheduledTask> {
+  async createScheduledTask(ctx: RequestContext, input: ScheduledTaskInput): Promise<ScheduledTask> {
     const next = nextRunAt(input.cron, new Date());
     const res = await this.db
       .insertInto('scheduled_tasks')
       .values({
+        tenant_id: ctx.tenantId,
+        user_id: ctx.userId,
         session_id: input.sessionId,
         cron: input.cron,
         task: input.task,
@@ -132,6 +145,8 @@ export class MysqlStore implements Store {
       .executeTakeFirstOrThrow();
     return {
       id: Number(res.insertId),
+      tenantId: ctx.tenantId,
+      userId: ctx.userId,
       sessionId: input.sessionId,
       cron: input.cron,
       task: input.task,
@@ -141,21 +156,26 @@ export class MysqlStore implements Store {
     };
   }
 
-  async listScheduledTasks(sessionId?: string): Promise<ScheduledTask[]> {
-    let q = this.db.selectFrom('scheduled_tasks').selectAll().orderBy('id', 'asc');
-    if (sessionId) q = q.where('session_id', '=', sessionId);
-    return (await q.execute()).map(toTask);
+  async listScheduledTasks(ctx: RequestContext): Promise<ScheduledTask[]> {
+    const rows = await this.db
+      .selectFrom('scheduled_tasks')
+      .selectAll()
+      .where('tenant_id', '=', ctx.tenantId)
+      .orderBy('id', 'asc')
+      .execute();
+    return rows.map(toTask);
   }
 
-  async setTaskEnabled(id: number, enabled: boolean): Promise<void> {
+  async setTaskEnabled(ctx: RequestContext, id: number, enabled: boolean): Promise<void> {
     await this.db
       .updateTable('scheduled_tasks')
       .set({ enabled: enabled ? 1 : 0 })
       .where('id', '=', id)
+      .where('tenant_id', '=', ctx.tenantId)
       .execute();
   }
 
-  /** 事务内 FOR UPDATE SKIP LOCKED 领取并推进，保证多副本不重复执行。 */
+  /** 系统级：事务内 FOR UPDATE SKIP LOCKED 领取并推进，保证多副本不重复执行。 */
   async claimDueTasks(now: Date, limit: number): Promise<ScheduledTask[]> {
     return this.db.transaction().execute(async (trx) => {
       const rows = await trx
@@ -193,12 +213,14 @@ export class MysqlStore implements Store {
       .execute();
   }
 
-  async listTaskRuns(taskId: number): Promise<TaskRun[]> {
+  async listTaskRuns(ctx: RequestContext, taskId: number): Promise<TaskRun[]> {
     const rows = await this.db
       .selectFrom('task_runs')
-      .select(['task_id', 'status', 'detail', 'steps'])
-      .where('task_id', '=', taskId)
-      .orderBy('id', 'asc')
+      .innerJoin('scheduled_tasks', 'scheduled_tasks.id', 'task_runs.task_id')
+      .select(['task_runs.task_id as task_id', 'task_runs.status as status', 'task_runs.detail as detail', 'task_runs.steps as steps'])
+      .where('scheduled_tasks.tenant_id', '=', ctx.tenantId)
+      .where('task_runs.task_id', '=', taskId)
+      .orderBy('task_runs.id', 'asc')
       .execute();
     return rows.map((r): TaskRun => ({
       taskId: r.task_id,
@@ -206,6 +228,61 @@ export class MysqlStore implements Store {
       detail: r.detail ?? undefined,
       steps: r.steps ?? undefined,
     }));
+  }
+
+  async createTenant(tenant: Tenant): Promise<void> {
+    await this.db
+      .insertInto('tenants')
+      .values({ id: tenant.id, name: tenant.name })
+      .execute();
+  }
+
+  async listTenants(): Promise<Tenant[]> {
+    const rows = await this.db.selectFrom('tenants').select(['id', 'name']).execute();
+    return rows.map((r) => ({ id: r.id, name: r.name }));
+  }
+
+  async createUser(user: NewUser): Promise<User> {
+    const id = `u_${user.tenantId}_${user.username}`;
+    await this.db
+      .insertInto('users')
+      .values({
+        id,
+        tenant_id: user.tenantId,
+        username: user.username,
+        role: user.role,
+        password_hash: user.passwordHash,
+      })
+      .execute();
+    return { id, tenantId: user.tenantId, username: user.username, role: user.role };
+  }
+
+  async getUserByUsername(tenantId: string, username: string): Promise<UserWithSecret | undefined> {
+    const r = await this.db
+      .selectFrom('users')
+      .select(['id', 'tenant_id', 'username', 'role', 'password_hash'])
+      .where('tenant_id', '=', tenantId)
+      .where('username', '=', username)
+      .executeTakeFirst();
+    if (!r) return undefined;
+    return {
+      id: r.id,
+      tenantId: r.tenant_id,
+      username: r.username,
+      role: r.role as Role,
+      passwordHash: r.password_hash,
+    };
+  }
+
+  async getUser(tenantId: string, userId: string): Promise<User | undefined> {
+    const r = await this.db
+      .selectFrom('users')
+      .select(['id', 'tenant_id', 'username', 'role'])
+      .where('tenant_id', '=', tenantId)
+      .where('id', '=', userId)
+      .executeTakeFirst();
+    if (!r) return undefined;
+    return { id: r.id, tenantId: r.tenant_id, username: r.username, role: r.role as Role };
   }
 
   async close(): Promise<void> {

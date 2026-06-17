@@ -69,7 +69,7 @@ export class OpsPolicy implements PolicyMiddleware {
   private async emit(
     action: string,
     decision: PolicyDecision,
-    extra: { sessionId?: string; cluster?: string; tool?: string; detail?: Record<string, unknown> },
+    extra: { tenantId?: string; sessionId?: string; cluster?: string; tool?: string; detail?: Record<string, unknown> },
   ): Promise<PolicyDecision> {
     await this.audit.record({ kind: 'policy', action, ...extra });
     return decision;
@@ -78,21 +78,22 @@ export class OpsPolicy implements PolicyMiddleware {
   private async checkKubectl(call: ToolCall, ctx?: ToolContext): Promise<PolicyDecision> {
     const { cluster, args } = parseKubectlArgs(call.args);
     const sessionId = ctx?.sessionId;
+    const tenantId = ctx?.tenantId;
 
     if (!cluster) {
       return this.emit('block', { blocked: true, reason: '缺少 cluster 参数' }, {
-        sessionId, tool: 'kubectl',
+        tenantId, sessionId, tool: 'kubectl',
       });
     }
     const info = this.clusters.get(cluster);
     if (!info) {
       return this.emit('block', { blocked: true, reason: `未知集群: ${cluster}` }, {
-        sessionId, cluster, tool: 'kubectl',
+        tenantId, sessionId, cluster, tool: 'kubectl',
       });
     }
 
     const cls = classifyKubectl(args);
-    const base = { sessionId, cluster, tool: 'kubectl', detail: { verb: cls.verb, write: cls.write } };
+    const base = { tenantId, sessionId, cluster, tool: 'kubectl', detail: { verb: cls.verb, write: cls.write } };
 
     if (cls.dangerous) {
       return this.emit('block', { blocked: true, reason: `危险命令被拦截：${cls.reason}` }, base);
@@ -116,7 +117,7 @@ export class OpsPolicy implements PolicyMiddleware {
       : '';
     if (DANGEROUS_SHELL.some((re) => re.test(command))) {
       return this.emit('block', { blocked: true, reason: '高危 shell 命令被拦截' }, {
-        sessionId: ctx?.sessionId, tool: 'sbx__run_command', detail: { command },
+        tenantId: ctx?.tenantId, sessionId: ctx?.sessionId, tool: 'sbx__run_command', detail: { command },
       });
     }
     return { blocked: false };

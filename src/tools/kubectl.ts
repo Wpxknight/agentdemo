@@ -79,6 +79,7 @@ export function buildKubectlTool(opts: KubectlToolOptions): ToolHandler {
       await audit.record({
         kind: 'kubectl',
         action: 'exec',
+        tenantId: ctx.tenantId,
         sessionId: ctx.sessionId,
         cluster,
         tool: 'kubectl',

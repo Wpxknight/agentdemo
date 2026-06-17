@@ -1,48 +1,62 @@
 import type { Msg } from '../model/types.js';
 import type { AuditEvent } from '../audit/sink.js';
+import type { RequestContext, Tenant, User } from '../auth/types.js';
 import type {
   AuditFilter,
+  NewUser,
   ScheduledTask,
   ScheduledTaskInput,
   Store,
   TaskRun,
+  UserWithSecret,
 } from './store.js';
 import { nextRunAt } from '../scheduler/cron.js';
 
-/** 内存 Store：未配置 MySQL 时的回落实现，亦用于测试。 */
+interface MsgRow {
+  tenantId: string;
+  sessionId: string;
+  msg: Msg;
+}
+
+/** 内存 Store：未配置 MySQL 时的回落实现，亦用于测试。租户隔离同样强制生效。 */
 export class MemoryStore implements Store {
-  private messages = new Map<string, Msg[]>();
+  private messages: MsgRow[] = [];
   private audit: AuditEvent[] = [];
   private tasks = new Map<number, ScheduledTask>();
   private runs: TaskRun[] = [];
+  private tenants = new Map<string, Tenant>();
+  private users = new Map<string, UserWithSecret>(); // key: tenantId/username
   private taskSeq = 0;
+  private userSeq = 0;
 
-  async appendMessage(sessionId: string, msg: Msg): Promise<void> {
-    const list = this.messages.get(sessionId) ?? [];
-    list.push(msg);
-    this.messages.set(sessionId, list);
+  async appendMessage(ctx: RequestContext, sessionId: string, msg: Msg): Promise<void> {
+    this.messages.push({ tenantId: ctx.tenantId, sessionId, msg });
   }
 
-  async listMessages(sessionId: string): Promise<Msg[]> {
-    return [...(this.messages.get(sessionId) ?? [])];
+  async listMessages(ctx: RequestContext, sessionId: string): Promise<Msg[]> {
+    return this.messages
+      .filter((r) => r.tenantId === ctx.tenantId && r.sessionId === sessionId)
+      .map((r) => r.msg);
   }
 
   async record(event: AuditEvent): Promise<void> {
     this.audit.push({ ...event });
   }
 
-  async listAudit(filter: AuditFilter = {}): Promise<AuditEvent[]> {
-    let rows = this.audit;
+  async listAudit(ctx: RequestContext, filter: AuditFilter = {}): Promise<AuditEvent[]> {
+    let rows = this.audit.filter((e) => e.tenantId === ctx.tenantId);
     if (filter.sessionId) rows = rows.filter((e) => e.sessionId === filter.sessionId);
     if (filter.kind) rows = rows.filter((e) => e.kind === filter.kind);
     const out = [...rows];
     return filter.limit ? out.slice(-filter.limit) : out;
   }
 
-  async createScheduledTask(input: ScheduledTaskInput): Promise<ScheduledTask> {
+  async createScheduledTask(ctx: RequestContext, input: ScheduledTaskInput): Promise<ScheduledTask> {
     const id = ++this.taskSeq;
     const task: ScheduledTask = {
       id,
+      tenantId: ctx.tenantId,
+      userId: ctx.userId,
       sessionId: input.sessionId,
       cron: input.cron,
       task: input.task,
@@ -54,14 +68,15 @@ export class MemoryStore implements Store {
     return { ...task };
   }
 
-  async listScheduledTasks(sessionId?: string): Promise<ScheduledTask[]> {
-    const all = [...this.tasks.values()];
-    return (sessionId ? all.filter((t) => t.sessionId === sessionId) : all).map((t) => ({ ...t }));
+  async listScheduledTasks(ctx: RequestContext): Promise<ScheduledTask[]> {
+    return [...this.tasks.values()]
+      .filter((t) => t.tenantId === ctx.tenantId)
+      .map((t) => ({ ...t }));
   }
 
-  async setTaskEnabled(id: number, enabled: boolean): Promise<void> {
+  async setTaskEnabled(ctx: RequestContext, id: number, enabled: boolean): Promise<void> {
     const t = this.tasks.get(id);
-    if (t) t.enabled = enabled;
+    if (t && t.tenantId === ctx.tenantId) t.enabled = enabled;
   }
 
   // 单进程内 JS 单线程：select→推进之间无 await，天然原子，并发 tick 不会重复领取。
@@ -82,14 +97,55 @@ export class MemoryStore implements Store {
     this.runs.push({ ...run });
   }
 
-  async listTaskRuns(taskId: number): Promise<TaskRun[]> {
+  async listTaskRuns(ctx: RequestContext, taskId: number): Promise<TaskRun[]> {
+    const t = this.tasks.get(taskId);
+    if (!t || t.tenantId !== ctx.tenantId) return [];
     return this.runs.filter((r) => r.taskId === taskId).map((r) => ({ ...r }));
   }
 
+  async createTenant(tenant: Tenant): Promise<void> {
+    this.tenants.set(tenant.id, { ...tenant });
+  }
+
+  async listTenants(): Promise<Tenant[]> {
+    return [...this.tenants.values()];
+  }
+
+  async createUser(user: NewUser): Promise<User> {
+    const id = `u${++this.userSeq}`;
+    const rec: UserWithSecret = {
+      id,
+      tenantId: user.tenantId,
+      username: user.username,
+      role: user.role,
+      passwordHash: user.passwordHash,
+    };
+    this.users.set(`${user.tenantId}/${user.username}`, rec);
+    const { passwordHash: _omit, ...pub } = rec;
+    return pub;
+  }
+
+  async getUserByUsername(tenantId: string, username: string): Promise<UserWithSecret | undefined> {
+    const u = this.users.get(`${tenantId}/${username}`);
+    return u ? { ...u } : undefined;
+  }
+
+  async getUser(tenantId: string, userId: string): Promise<User | undefined> {
+    for (const u of this.users.values()) {
+      if (u.tenantId === tenantId && u.id === userId) {
+        const { passwordHash: _omit, ...pub } = u;
+        return pub;
+      }
+    }
+    return undefined;
+  }
+
   async close(): Promise<void> {
-    this.messages.clear();
+    this.messages = [];
     this.audit = [];
     this.tasks.clear();
     this.runs = [];
+    this.tenants.clear();
+    this.users.clear();
   }
 }

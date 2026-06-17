@@ -10,6 +10,7 @@ type NullableJsonColumn = ColumnType<unknown, string | null, string | null>;
 
 export interface MessagesTable {
   id: Generated<number>;
+  tenant_id: string;
   session_id: string;
   role: string;
   /** JSON：{ text?, toolCalls?, toolResults? } */
@@ -19,6 +20,7 @@ export interface MessagesTable {
 
 export interface AuditEventsTable {
   id: Generated<number>;
+  tenant_id: string | null;
   kind: string;
   action: string;
   session_id: string | null;
@@ -31,6 +33,8 @@ export interface AuditEventsTable {
 
 export interface ScheduledTasksTable {
   id: Generated<number>;
+  tenant_id: string;
+  user_id: string;
   session_id: string;
   cron: string;
   task: string;
@@ -50,9 +54,26 @@ export interface TaskRunsTable {
   created_at: Generated<Date>;
 }
 
+export interface TenantsTable {
+  id: string;
+  name: string;
+  created_at: Generated<Date>;
+}
+
+export interface UsersTable {
+  id: string;
+  tenant_id: string;
+  username: string;
+  role: string;
+  password_hash: string;
+  created_at: Generated<Date>;
+}
+
 export interface Database {
   messages: MessagesTable;
   audit_events: AuditEventsTable;
   scheduled_tasks: ScheduledTasksTable;
   task_runs: TaskRunsTable;
+  tenants: TenantsTable;
+  users: UsersTable;
 }
