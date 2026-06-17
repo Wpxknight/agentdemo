@@ -1,0 +1,26 @@
+{
+  // 自定义模型服务：支持 anthropic / openai 协议，自定义 baseURL / apiKey
+  "models": {
+    "my-claude": {
+      "protocol": "anthropic",
+      "baseURL": "https://api.anthropic.com",
+      "apiKey": "${ANTHROPIC_API_KEY}",
+      "model": "claude-opus-4-8"
+    },
+    "my-gpt": {
+      "protocol": "openai",
+      "baseURL": "https://api.openai.com/v1",
+      "apiKey": "${OPENAI_API_KEY}",
+      "model": "gpt-4o"
+    },
+    "local": {
+      "protocol": "openai",
+      "baseURL": "http://localhost:8000/v1",
+      "apiKey": "x",
+      "model": "qwen"
+    }
+  },
+  "defaultModel": "my-claude",
+  "skills": { "dir": "./skills" }
+  // mcpServers / clusters 在 S3 / S4 阶段启用
+}
