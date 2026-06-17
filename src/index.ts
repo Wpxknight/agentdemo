@@ -7,6 +7,9 @@ import { AllowAllPolicy } from './agent/policy.js';
 import { SandboxManager } from './sandbox/lifecycle.js';
 import { E2bProvider } from './sandbox/e2b.js';
 import { buildSandboxTools } from './tools/builtin.js';
+import { McpManager } from './mcp/manager.js';
+import { connectMcp } from './mcp/client.js';
+import { SkillRegistry } from './skill/registry.js';
 
 /**
  * S1 临时入口：加载配置 + 跑一次 agent。
@@ -32,6 +35,23 @@ async function main() {
     logger.info('sandbox tools enabled');
   }
 
+  let mcp: McpManager | undefined;
+  if (config.mcpServers && Object.keys(config.mcpServers).length) {
+    mcp = new McpManager(config.mcpServers, connectMcp);
+    await mcp.start();
+    for (const t of mcp.tools()) tools.register(t);
+  }
+
+  let systemExtra = '';
+  if (config.skills?.dir) {
+    const skills = new SkillRegistry(config.skills.dir);
+    await skills.scan();
+    if (skills.list().length) {
+      tools.register(skills.tool());
+      systemExtra = skills.summaries();
+    }
+  }
+
   const task = process.argv.slice(2).join(' ') || '你好，做个自我介绍。';
   logger.info({ model: model.id, task }, 'running agent');
 
@@ -39,6 +59,7 @@ async function main() {
     model,
     tools,
     policy,
+    system: systemExtra,
     ctx: { sessionId: 'cli' },
     task,
     onEvent: (e) => {
@@ -50,6 +71,7 @@ async function main() {
   logger.info({ steps: result.steps }, 'done');
 
   await sandboxes?.disposeAll();
+  await mcp?.close();
 }
 
 main().catch((err) => {

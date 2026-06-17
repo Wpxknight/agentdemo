@@ -103,8 +103,8 @@ API 通过 HTTP + SSE 暴露（前端后续接入）；本阶段以服务端 + C
 
 - [x] S0 项目脚手架 — package.json/tsconfig/config 加载(JSONC+env)/pino 日志/vitest
 - [x] S1 模型层 + Agent 循环 — 双协议 adapter、ToolRegistry、runAgent loop；typecheck 通过、5 测试通过
-- [x] S2 工具系统 + E2B 沙箱 — SandboxProvider 抽象、E2bProvider、SandboxManager（缓存/并发去重/idle GC）、sbx:run_code/run_command 工具；config 加 sandbox 段；13 测试通过
-- [ ] S3 MCP + Skill
+- [x] S2 工具系统 + E2B 沙箱 — SandboxProvider 抽象、E2bProvider、SandboxManager（缓存/并发去重/idle GC）、sbx__run_code/run_command 工具；config 加 sandbox 段；13 测试通过
+- [x] S3 MCP + Skill — McpManager（stdio/sse/http、mcp__server__tool 命名、单 server 失败隔离）、SkillRegistry（扫描 SKILL.md、frontmatter、summaries 注入、load_skill 渐进式展开）；示例 skill；21 测试通过
 - [ ] S4 多集群运维 + Policy
 - [ ] S5 持久化（MySQL）
 - [ ] S6 定时任务

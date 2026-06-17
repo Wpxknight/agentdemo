@@ -40,7 +40,7 @@ function resolveSpec(resolve: SpecResolver, ctx: ToolContext): SandboxSpec {
   return { key: ctx.sessionId, ...partial };
 }
 
-/** 构造 E2B 沙箱内置工具：sbx:run_code / sbx:run_command。 */
+/** 构造 E2B 沙箱内置工具：sbx__run_code / sbx__run_command。 */
 export function buildSandboxTools(
   manager: SandboxManager,
   resolve: SpecResolver = defaultResolver,
@@ -48,7 +48,7 @@ export function buildSandboxTools(
   return [
     {
       def: {
-        name: 'sbx:run_code',
+        name: 'sbx__run_code',
         description:
           '在隔离沙箱中执行代码（默认 Python），返回 stdout/stderr。可引用同会话先前定义的变量。',
         inputSchema: {
@@ -73,7 +73,7 @@ export function buildSandboxTools(
     },
     {
       def: {
-        name: 'sbx:run_command',
+        name: 'sbx__run_command',
         description: '在隔离沙箱中执行 shell 命令，返回 stdout/stderr 与退出码。',
         inputSchema: {
           type: 'object',

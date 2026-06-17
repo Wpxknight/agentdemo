@@ -117,11 +117,11 @@ describe('sandbox tools', () => {
     expect(res.isError).toBeFalsy();
   });
 
-  it('sbx:run_command flags non-zero exit as error', async () => {
+  it('sbx__run_command flags non-zero exit as error', async () => {
     const { provider } = mockProvider();
     const mgr = new SandboxManager({ provider });
     const tools = buildSandboxTools(mgr);
-    const runCommand = tools.find((t) => t.def.name === 'sbx:run_command')!;
+    const runCommand = tools.find((t) => t.def.name === 'sbx__run_command')!;
 
     const res = await runCommand.run({ command: 'do-fail' }, ctx);
 

@@ -28,6 +28,15 @@
     "apiKey": "${E2B_API_KEY}",
     "idleMs": 600000,
     "timeoutMs": 3600000
+  },
+  // MCP server：stdio / sse / http 三种 transport，工具以 mcp__<server>__<tool> 暴露
+  "mcpServers": {
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    }
+    // "remote": { "transport": "http", "url": "https://mcp.example.com/mcp", "headers": { "Authorization": "Bearer ${MCP_TOKEN}" } }
   }
-  // mcpServers / clusters 在 S3 / S4 阶段启用
+  // clusters 在 S4 阶段启用
 }
