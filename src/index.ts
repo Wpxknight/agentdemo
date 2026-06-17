@@ -1,92 +1,33 @@
 import { logger } from './logger.js';
 import { loadConfig } from './config/load.js';
-import { createModel } from './model/factory.js';
 import { runAgent } from './agent/core.js';
-import { ToolRegistry } from './agent/tools.js';
-import { AllowAllPolicy, OpsPolicy } from './agent/policy.js';
-import type { PolicyMiddleware } from './agent/policy.js';
-import { SandboxManager } from './sandbox/lifecycle.js';
-import { E2bProvider } from './sandbox/e2b.js';
-import { buildSandboxTools } from './tools/builtin.js';
-import { McpManager } from './mcp/manager.js';
-import { connectMcp } from './mcp/client.js';
-import { SkillRegistry } from './skill/registry.js';
-import { ClusterRegistry } from './config/clusters.js';
-import { buildKubectlTool } from './tools/kubectl.js';
-import { LogAuditSink } from './audit/sink.js';
-import type { AuditSink } from './audit/sink.js';
-import { readMysqlConfig } from './config/mysql.js';
-import { createStore } from './db/index.js';
+import { buildRuntime } from './runtime.js';
+import { Scheduler } from './scheduler/ticker.js';
+import type { ScheduledTask } from './db/store.js';
 
 /**
- * S1 临时入口：加载配置 + 跑一次 agent。
- * 后续阶段替换为 HTTP + SSE 服务（server/http.ts）。
+ * 临时入口（HTTP+SSE 服务后续接入）：
+ *   tsx src/index.ts "任务文本"   → 单次跑一个 agent 任务
+ *   tsx src/index.ts scheduler    → 常驻调度器，到点执行定时任务
  */
 async function main() {
   const config = loadConfig();
-  const modelCfg = config.models[config.defaultModel];
-  if (!modelCfg) throw new Error(`defaultModel not found: ${config.defaultModel}`);
+  const argv = process.argv.slice(2);
 
-  const model = createModel(config.defaultModel, modelCfg);
-  const tools = new ToolRegistry();
-
-  // 持久化：MySQL（配置时）或内存回落；审计同时写日志与 Store
-  const store = await createStore(readMysqlConfig());
-  const logSink = new LogAuditSink();
-  const audit: AuditSink = {
-    async record(e) {
-      await Promise.all([logSink.record(e), store.record(e)]);
-    },
-  };
-  const clusters = new ClusterRegistry(config.clusters);
-
-  // 配置了集群即启用运维策略（读写分离/危险命令/生产审批），否则放行
-  const policy: PolicyMiddleware = clusters.list().length
-    ? new OpsPolicy({ clusters, audit })
-    : new AllowAllPolicy();
-
-  let sandboxes: SandboxManager | undefined;
-  if (config.sandbox?.enabled) {
-    sandboxes = new SandboxManager({
-      provider: new E2bProvider({ apiKey: config.sandbox.apiKey, domain: config.sandbox.domain }),
-      idleMs: config.sandbox.idleMs,
-      timeoutMs: config.sandbox.timeoutMs,
-    });
-    for (const t of buildSandboxTools(sandboxes)) tools.register(t);
-    logger.info('sandbox tools enabled');
-
-    // kubectl 工具依赖 in-cluster 沙箱执行
-    if (clusters.list().length) {
-      tools.register(buildKubectlTool({ clusters, sandboxes, audit }));
-      logger.info({ clusters: clusters.names() }, 'kubectl tool enabled');
-    }
+  if (argv[0] === 'scheduler') {
+    await runScheduler(config);
+    return;
   }
 
-  let mcp: McpManager | undefined;
-  if (config.mcpServers && Object.keys(config.mcpServers).length) {
-    mcp = new McpManager(config.mcpServers, connectMcp);
-    await mcp.start();
-    for (const t of mcp.tools()) tools.register(t);
-  }
-
-  let systemExtra = '';
-  if (config.skills?.dir) {
-    const skills = new SkillRegistry(config.skills.dir);
-    await skills.scan();
-    if (skills.list().length) {
-      tools.register(skills.tool());
-      systemExtra = skills.summaries();
-    }
-  }
-
-  const task = process.argv.slice(2).join(' ') || '你好，做个自我介绍。';
-  logger.info({ model: model.id, task }, 'running agent');
+  const rt = await buildRuntime(config);
+  const task = argv.join(' ') || '你好，做个自我介绍。';
+  logger.info({ model: rt.model.id, task }, 'running agent');
 
   const result = await runAgent({
-    model,
-    tools,
-    policy,
-    system: systemExtra,
+    model: rt.model,
+    tools: rt.tools,
+    policy: rt.policy,
+    system: rt.systemExtra,
     ctx: { sessionId: 'cli' },
     task,
     onEvent: (e) => {
@@ -96,14 +37,39 @@ async function main() {
 
   process.stdout.write('\n');
   logger.info({ steps: result.steps }, 'done');
+  for (const m of result.messages) await rt.store.appendMessage('cli', m);
+  await rt.dispose();
+}
 
-  // 持久化本次会话消息
-  const sessionId = 'cli';
-  for (const m of result.messages) await store.appendMessage(sessionId, m);
+/** 常驻调度器模式：周期 tick 领取并执行到点定时任务。 */
+async function runScheduler(config: Awaited<ReturnType<typeof loadConfig>>) {
+  const rt = await buildRuntime(config);
 
-  await sandboxes?.disposeAll();
-  await mcp?.close();
-  await store.close();
+  const runner = async (t: ScheduledTask) => {
+    logger.info({ taskId: t.id, sessionId: t.sessionId }, 'running scheduled task');
+    const result = await runAgent({
+      model: rt.model,
+      tools: rt.tools,
+      policy: t.preApproved ? rt.policyPreApproved : rt.policy,
+      system: rt.systemExtra,
+      ctx: { sessionId: t.sessionId },
+      task: t.task,
+    });
+    for (const m of result.messages) await rt.store.appendMessage(t.sessionId, m);
+    return { status: 'success' as const, detail: result.text.slice(0, 4000), steps: result.steps };
+  };
+
+  const scheduler = new Scheduler({ store: rt.store, runner });
+  scheduler.start();
+  logger.info('scheduler running; Ctrl-C to stop');
+
+  const shutdown = async () => {
+    scheduler.stop();
+    await rt.dispose();
+    process.exit(0);
+  };
+  process.on('SIGINT', () => void shutdown());
+  process.on('SIGTERM', () => void shutdown());
 }
 
 main().catch((err) => {

@@ -2,7 +2,38 @@ import type { Kysely } from 'kysely';
 import type { Msg, Role } from '../model/types.js';
 import type { AuditEvent } from '../audit/sink.js';
 import type { Database } from './schema.js';
-import type { AuditFilter, Store } from './store.js';
+import type {
+  AuditFilter,
+  ScheduledTask,
+  ScheduledTaskInput,
+  Store,
+  TaskRun,
+} from './store.js';
+import { nextRunAt } from '../scheduler/cron.js';
+
+interface TaskRow {
+  id: number;
+  session_id: string;
+  cron: string;
+  task: string;
+  pre_approved: number;
+  enabled: number;
+  next_run_at: Date;
+  last_run_at: Date | null;
+}
+
+function toTask(r: TaskRow): ScheduledTask {
+  return {
+    id: r.id,
+    sessionId: r.session_id,
+    cron: r.cron,
+    task: r.task,
+    preApproved: Boolean(r.pre_approved),
+    enabled: Boolean(r.enabled),
+    nextRunAt: new Date(r.next_run_at),
+    lastRunAt: r.last_run_at ? new Date(r.last_run_at) : undefined,
+  };
+}
 
 /** mysql2 对 JSON 列读出已是对象；写入是字符串。统一归一化。 */
 function parseJson(v: unknown): unknown {
@@ -83,6 +114,97 @@ export class MysqlStore implements Store {
       tool: r.tool ?? undefined,
       detail: (parseJson(r.detail) as Record<string, unknown> | undefined) ?? undefined,
       at: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+    }));
+  }
+
+  async createScheduledTask(input: ScheduledTaskInput): Promise<ScheduledTask> {
+    const next = nextRunAt(input.cron, new Date());
+    const res = await this.db
+      .insertInto('scheduled_tasks')
+      .values({
+        session_id: input.sessionId,
+        cron: input.cron,
+        task: input.task,
+        pre_approved: input.preApproved ? 1 : 0,
+        enabled: input.enabled === false ? 0 : 1,
+        next_run_at: next,
+      })
+      .executeTakeFirstOrThrow();
+    return {
+      id: Number(res.insertId),
+      sessionId: input.sessionId,
+      cron: input.cron,
+      task: input.task,
+      preApproved: input.preApproved ?? false,
+      enabled: input.enabled ?? true,
+      nextRunAt: next,
+    };
+  }
+
+  async listScheduledTasks(sessionId?: string): Promise<ScheduledTask[]> {
+    let q = this.db.selectFrom('scheduled_tasks').selectAll().orderBy('id', 'asc');
+    if (sessionId) q = q.where('session_id', '=', sessionId);
+    return (await q.execute()).map(toTask);
+  }
+
+  async setTaskEnabled(id: number, enabled: boolean): Promise<void> {
+    await this.db
+      .updateTable('scheduled_tasks')
+      .set({ enabled: enabled ? 1 : 0 })
+      .where('id', '=', id)
+      .execute();
+  }
+
+  /** 事务内 FOR UPDATE SKIP LOCKED 领取并推进，保证多副本不重复执行。 */
+  async claimDueTasks(now: Date, limit: number): Promise<ScheduledTask[]> {
+    return this.db.transaction().execute(async (trx) => {
+      const rows = await trx
+        .selectFrom('scheduled_tasks')
+        .selectAll()
+        .where('enabled', '=', 1)
+        .where('next_run_at', '<=', now)
+        .orderBy('next_run_at', 'asc')
+        .limit(limit)
+        .forUpdate()
+        .skipLocked()
+        .execute();
+
+      const tasks = rows.map(toTask);
+      for (const t of tasks) {
+        await trx
+          .updateTable('scheduled_tasks')
+          .set({ last_run_at: now, next_run_at: nextRunAt(t.cron, now) })
+          .where('id', '=', t.id)
+          .execute();
+      }
+      return tasks;
+    });
+  }
+
+  async recordTaskRun(run: TaskRun): Promise<void> {
+    await this.db
+      .insertInto('task_runs')
+      .values({
+        task_id: run.taskId,
+        status: run.status,
+        detail: run.detail ?? null,
+        steps: run.steps ?? null,
+      })
+      .execute();
+  }
+
+  async listTaskRuns(taskId: number): Promise<TaskRun[]> {
+    const rows = await this.db
+      .selectFrom('task_runs')
+      .select(['task_id', 'status', 'detail', 'steps'])
+      .where('task_id', '=', taskId)
+      .orderBy('id', 'asc')
+      .execute();
+    return rows.map((r): TaskRun => ({
+      taskId: r.task_id,
+      status: r.status as TaskRun['status'],
+      detail: r.detail ?? undefined,
+      steps: r.steps ?? undefined,
     }));
   }
 

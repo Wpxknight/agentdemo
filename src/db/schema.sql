@@ -24,3 +24,28 @@ CREATE TABLE IF NOT EXISTS audit_events (
   KEY idx_audit_session (session_id, id),
   KEY idx_audit_kind (kind, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+  id           BIGINT       NOT NULL AUTO_INCREMENT,
+  session_id   VARCHAR(128) NOT NULL,
+  cron         VARCHAR(128) NOT NULL,
+  task         TEXT         NOT NULL,
+  pre_approved TINYINT(1)   NOT NULL DEFAULT 0,
+  enabled      TINYINT(1)   NOT NULL DEFAULT 1,
+  next_run_at  TIMESTAMP    NOT NULL,
+  last_run_at  TIMESTAMP    NULL,
+  created_at   TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_due (enabled, next_run_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS task_runs (
+  id          BIGINT      NOT NULL AUTO_INCREMENT,
+  task_id     BIGINT      NOT NULL,
+  status      VARCHAR(16) NOT NULL,
+  detail      TEXT        NULL,
+  steps       INT         NULL,
+  created_at  TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_runs_task (task_id, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

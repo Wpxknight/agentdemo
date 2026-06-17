@@ -29,7 +29,30 @@ export interface AuditEventsTable {
   created_at: Generated<Date>;
 }
 
+export interface ScheduledTasksTable {
+  id: Generated<number>;
+  session_id: string;
+  cron: string;
+  task: string;
+  pre_approved: number;
+  enabled: number;
+  next_run_at: Date;
+  last_run_at: Date | null;
+  created_at: Generated<Date>;
+}
+
+export interface TaskRunsTable {
+  id: Generated<number>;
+  task_id: number;
+  status: string;
+  detail: string | null;
+  steps: number | null;
+  created_at: Generated<Date>;
+}
+
 export interface Database {
   messages: MessagesTable;
   audit_events: AuditEventsTable;
+  scheduled_tasks: ScheduledTasksTable;
+  task_runs: TaskRunsTable;
 }

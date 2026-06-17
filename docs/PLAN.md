@@ -107,7 +107,7 @@ API 通过 HTTP + SSE 暴露（前端后续接入）；本阶段以服务端 + C
 - [x] S3 MCP + Skill — McpManager（stdio/sse/http、mcp__server__tool 命名、单 server 失败隔离）、SkillRegistry（扫描 SKILL.md、frontmatter、summaries 注入、load_skill 渐进式展开）；示例 skill；21 测试通过
 - [x] S4 多集群运维 + Policy — ClusterRegistry、classifyKubectl（读写/危险分类，前置 flag 跳过）、kubectl 工具（in-cluster 沙箱执行/dryRun）、OpsPolicy（读写分离/危险拦截/生产审批/preApproved/危险 shell）、AuditSink（Log/Memory）；35 测试通过
 - [x] S5 持久化（MySQL）— config/mysql.ts（env+base64）、Store 抽象、MemoryStore 回落、MysqlStore（Kysely+mysql2）、schema.sql 迁移；audit tee 到日志+Store；config/mysql 与 MemoryStore 单测 + DB 集成测试（MYSQL_HOST 时运行）；42 通过/1 跳过
-- [ ] S6 定时任务
+- [x] S6 定时任务 — scheduled_tasks/task_runs 表、cron 工具（UTC）、schedule_task/list/cancel 工具、Scheduler ticker（claimDueTasks 原子领取，MySQL FOR UPDATE SKIP LOCKED）、runtime.ts 抽取、scheduler 常驻模式；并发不重复/错误记录等单测；50 通过/1 跳过
 - [ ] S7 多租户 + 会话隔离 + 本地认证
 - [ ] S8 RBAC 三角色 + 授权融合
 - [ ] S9 SSO 对接
