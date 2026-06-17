@@ -43,10 +43,42 @@ export const ClusterSchema = z.object({
   tenants: z.array(z.string()).optional(),
 });
 
+const RoleEnum = z.enum(['platform_admin', 'tenant_admin', 'user']);
+
+export const OidcMappingSchema = z.object({
+  /** 提供 tenantId 的 claim 名；缺省用 defaultTenant。 */
+  tenantClaim: z.string().optional(),
+  defaultTenant: z.string().optional(),
+  /** 用户名 claim，默认 preferred_username。 */
+  usernameClaim: z.string().default('preferred_username'),
+  /** 角色/组 claim 名（值可为 string 或 string[]）。 */
+  roleClaim: z.string().optional(),
+  /** IdP 角色/组 → 本系统角色映射。 */
+  roleMap: z.record(z.string(), RoleEnum).optional(),
+  defaultRole: RoleEnum.default('user'),
+});
+
+export const OidcConfigSchema = z.object({
+  issuer: z.string(),
+  clientId: z.string(),
+  clientSecret: z.string().optional(),
+  redirectUri: z.string(),
+  scopes: z.array(z.string()).optional(),
+  mapping: OidcMappingSchema,
+});
+
+export const AuthConfigSchema = z.object({
+  provider: z.enum(['local', 'oidc']).default('local'),
+  /** 会话 token 有效期（jose 时间串），默认 12h。 */
+  jwtTtl: z.string().optional(),
+  oidc: OidcConfigSchema.optional(),
+});
+
 export const ConfigSchema = z.object({
   models: z.record(z.string(), ModelConfigSchema),
   defaultModel: z.string(),
   skills: z.object({ dir: z.string() }).optional(),
+  auth: AuthConfigSchema.optional(),
   sandbox: SandboxConfigSchema.optional(),
   mcpServers: z.record(z.string(), McpServerSchema).optional(),
   clusters: z.record(z.string(), ClusterSchema).optional(),

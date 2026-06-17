@@ -1,9 +1,9 @@
-import { SignJWT, jwtVerify } from 'jose';
 import { logger } from '../logger.js';
 import type { Store } from '../db/store.js';
 import type { AuthProvider } from './provider.js';
 import type { RequestContext, Role, User } from './types.js';
 import { hashPassword, verifyPassword } from './password.js';
+import { signSession, verifySession } from './session.js';
 
 const log = logger.child({ mod: 'auth' });
 
@@ -48,26 +48,10 @@ export class LocalAuthProvider implements AuthProvider {
       log.warn({ tenantId, username }, 'login: 口令错误');
       return undefined;
     }
-    return new SignJWT({ tenant: user.tenantId, role: user.role })
-      .setProtectedHeader({ alg: 'HS256' })
-      .setSubject(user.id)
-      .setIssuedAt()
-      .setExpirationTime(this.ttl)
-      .sign(this.secret);
+    return signSession(this.secret, { tenantId: user.tenantId, userId: user.id, role: user.role }, this.ttl);
   }
 
   async authenticate(token: string): Promise<RequestContext | undefined> {
-    try {
-      const { payload } = await jwtVerify(token, this.secret);
-      const userId = payload.sub;
-      const tenantId = payload.tenant;
-      const role = payload.role;
-      if (typeof userId !== 'string' || typeof tenantId !== 'string' || typeof role !== 'string') {
-        return undefined;
-      }
-      return { userId, tenantId, role: role as Role };
-    } catch {
-      return undefined;
-    }
+    return verifySession(this.secret, token);
   }
 }

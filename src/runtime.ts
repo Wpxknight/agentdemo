@@ -20,6 +20,7 @@ import { createStore } from './db/index.js';
 import type { Store } from './db/store.js';
 import { buildScheduleTools } from './tools/schedule.js';
 import { LocalAuthProvider } from './auth/local.js';
+import { OidcAuthProvider } from './auth/oidc.js';
 import type { AuthProvider } from './auth/provider.js';
 import type { RequestContext } from './auth/types.js';
 
@@ -100,10 +101,18 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     }
   }
 
-  // 认证：本地 provider（JWT 密钥取自 env，缺省用开发占位）
+  // 认证：本地或 OIDC（JWT 密钥取自 env，缺省用开发占位）
   const secret = process.env.AIOP_JWT_SECRET;
   if (!secret) logger.warn('AIOP_JWT_SECRET 未设置，使用开发占位密钥（勿用于生产）');
-  const authProvider = new LocalAuthProvider({ store, secret: secret ?? 'dev-insecure-secret' });
+  const jwtSecret = secret ?? 'dev-insecure-secret';
+  const ttl = config.auth?.jwtTtl;
+  let authProvider: AuthProvider;
+  if (config.auth?.provider === 'oidc' && config.auth.oidc) {
+    authProvider = new OidcAuthProvider({ store, secret: jwtSecret, ttl, config: config.auth.oidc });
+    logger.info({ issuer: config.auth.oidc.issuer }, 'OIDC SSO 已启用');
+  } else {
+    authProvider = new LocalAuthProvider({ store, secret: jwtSecret, ttl });
+  }
 
   // CLI 默认身份：确保默认租户存在
   await store.createTenant({ id: DEFAULT_TENANT, name: 'Default' }).catch(() => {});

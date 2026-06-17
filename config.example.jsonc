@@ -22,6 +22,26 @@
   },
   "defaultModel": "my-claude",
   "skills": { "dir": "./skills" },
+  // 认证：local（默认，用户名口令）或 oidc（SSO）。HTTP 服务接入后生效
+  "auth": {
+    "provider": "local"
+    // "provider": "oidc",
+    // "jwtTtl": "12h",
+    // "oidc": {
+    //   "issuer": "https://keycloak.example.com/realms/aiop",
+    //   "clientId": "aiop",
+    //   "clientSecret": "${OIDC_CLIENT_SECRET}",
+    //   "redirectUri": "https://aiop.example.com/auth/callback",
+    //   "scopes": ["openid", "profile", "email"],
+    //   "mapping": {
+    //     "tenantClaim": "tenant", "defaultTenant": "default",
+    //     "usernameClaim": "preferred_username",
+    //     "roleClaim": "groups",
+    //     "roleMap": { "aiop-platform": "platform_admin", "aiop-admins": "tenant_admin" },
+    //     "defaultRole": "user"
+    //   }
+    // }
+  },
   // E2B 沙箱：enabled=true 时注册 sbx:run_code / sbx:run_command
   "sandbox": {
     "enabled": false,
