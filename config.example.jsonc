@@ -21,6 +21,13 @@
     }
   },
   "defaultModel": "my-claude",
-  "skills": { "dir": "./skills" }
+  "skills": { "dir": "./skills" },
+  // E2B 沙箱：enabled=true 时注册 sbx:run_code / sbx:run_command
+  "sandbox": {
+    "enabled": false,
+    "apiKey": "${E2B_API_KEY}",
+    "idleMs": 600000,
+    "timeoutMs": 3600000
+  }
   // mcpServers / clusters 在 S3 / S4 阶段启用
 }
