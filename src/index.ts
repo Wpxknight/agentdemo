@@ -14,6 +14,9 @@ import { SkillRegistry } from './skill/registry.js';
 import { ClusterRegistry } from './config/clusters.js';
 import { buildKubectlTool } from './tools/kubectl.js';
 import { LogAuditSink } from './audit/sink.js';
+import type { AuditSink } from './audit/sink.js';
+import { readMysqlConfig } from './config/mysql.js';
+import { createStore } from './db/index.js';
 
 /**
  * S1 临时入口：加载配置 + 跑一次 agent。
@@ -26,7 +29,15 @@ async function main() {
 
   const model = createModel(config.defaultModel, modelCfg);
   const tools = new ToolRegistry();
-  const audit = new LogAuditSink();
+
+  // 持久化：MySQL（配置时）或内存回落；审计同时写日志与 Store
+  const store = await createStore(readMysqlConfig());
+  const logSink = new LogAuditSink();
+  const audit: AuditSink = {
+    async record(e) {
+      await Promise.all([logSink.record(e), store.record(e)]);
+    },
+  };
   const clusters = new ClusterRegistry(config.clusters);
 
   // 配置了集群即启用运维策略（读写分离/危险命令/生产审批），否则放行
@@ -86,8 +97,13 @@ async function main() {
   process.stdout.write('\n');
   logger.info({ steps: result.steps }, 'done');
 
+  // 持久化本次会话消息
+  const sessionId = 'cli';
+  for (const m of result.messages) await store.appendMessage(sessionId, m);
+
   await sandboxes?.disposeAll();
   await mcp?.close();
+  await store.close();
 }
 
 main().catch((err) => {

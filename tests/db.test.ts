@@ -1,0 +1,83 @@
+import { describe, expect, it } from 'vitest';
+import { readMysqlConfig } from '../src/config/mysql.js';
+import { MemoryStore } from '../src/db/memory.js';
+import { createStore } from '../src/db/index.js';
+import type { Msg } from '../src/model/types.js';
+
+describe('readMysqlConfig', () => {
+  const base = {
+    MYSQL_HOST: 'db.internal',
+    MYSQL_DATABASE: 'ai_ops',
+    MYSQL_USER: 'ai_ops',
+    MYSQL_PASSWORD_BASE64: Buffer.from('s3cr3t').toString('base64'),
+  };
+
+  it('decodes base64 password and applies defaults', () => {
+    const cfg = readMysqlConfig(base)!;
+    expect(cfg.password).toBe('s3cr3t');
+    expect(cfg.port).toBe(3306);
+    expect(cfg.poolSize).toBe(10);
+    expect(cfg.ssl).toBe(false);
+  });
+
+  it('returns undefined when host absent', () => {
+    expect(readMysqlConfig({})).toBeUndefined();
+  });
+
+  it('throws when database or user missing', () => {
+    expect(() => readMysqlConfig({ MYSQL_HOST: 'h', MYSQL_USER: 'u' })).toThrow(/DATABASE/);
+    expect(() => readMysqlConfig({ MYSQL_HOST: 'h', MYSQL_DATABASE: 'd' })).toThrow(/USER/);
+  });
+
+  it('parses ssl and numeric overrides', () => {
+    const cfg = readMysqlConfig({ ...base, MYSQL_SSL: 'true', MYSQL_PORT: '3307', MYSQL_POOL_SIZE: '5' })!;
+    expect(cfg.ssl).toBe(true);
+    expect(cfg.port).toBe(3307);
+    expect(cfg.poolSize).toBe(5);
+  });
+
+  it('rejects invalid port', () => {
+    expect(() => readMysqlConfig({ ...base, MYSQL_PORT: 'abc' })).toThrow(/PORT/);
+  });
+});
+
+describe('MemoryStore', () => {
+  const msg = (role: Msg['role'], text: string): Msg => ({ role, text });
+
+  it('appends and lists messages scoped by session', async () => {
+    const s = new MemoryStore();
+    await s.appendMessage('a', msg('user', 'hi'));
+    await s.appendMessage('a', msg('assistant', 'hello'));
+    await s.appendMessage('b', msg('user', 'other'));
+
+    const a = await s.listMessages('a');
+    expect(a.map((m) => m.text)).toEqual(['hi', 'hello']);
+    expect(await s.listMessages('b')).toHaveLength(1);
+  });
+
+  it('records and filters audit events', async () => {
+    const s = new MemoryStore();
+    await s.record({ kind: 'kubectl', action: 'exec', sessionId: 'a', cluster: 'dev' });
+    await s.record({ kind: 'policy', action: 'block', sessionId: 'a' });
+    await s.record({ kind: 'kubectl', action: 'exec', sessionId: 'b' });
+
+    expect(await s.listAudit({ sessionId: 'a' })).toHaveLength(2);
+    expect(await s.listAudit({ kind: 'kubectl' })).toHaveLength(2);
+    expect(await s.listAudit({ kind: 'kubectl', limit: 1 })).toHaveLength(1);
+  });
+});
+
+// 集成测试：仅在配置了真实 MySQL 时运行（如 docker）。
+describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlStore (integration)', () => {
+  it('migrates and roundtrips messages + audit', async () => {
+    const store = await createStore(readMysqlConfig());
+    const sid = `it-${Date.now()}`;
+    await store.appendMessage(sid, { role: 'user', text: 'ping' });
+    await store.appendMessage(sid, { role: 'assistant', text: 'pong' });
+    await store.record({ kind: 'kubectl', action: 'exec', sessionId: sid, cluster: 'dev' });
+
+    expect((await store.listMessages(sid)).map((m) => m.text)).toEqual(['ping', 'pong']);
+    expect(await store.listAudit({ sessionId: sid })).toHaveLength(1);
+    await store.close();
+  });
+});
