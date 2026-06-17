@@ -32,6 +32,19 @@ describe('schedule tools', () => {
     expect(await store.listScheduledTasks(rctx)).toHaveLength(1);
   });
 
+  it('only admins may create preApproved tasks', async () => {
+    const store = new MemoryStore();
+    const [schedule] = buildScheduleTools(store);
+
+    const denied = await schedule!.run({ cron: '0 1 * * *', task: 't', preApproved: true }, ctx); // role=user
+    expect(denied.isError).toBe(true);
+
+    const adminCtx = { ...ctx, role: 'tenant_admin' as const };
+    const ok = await schedule!.run({ cron: '0 1 * * *', task: 't', preApproved: true }, adminCtx);
+    expect(ok.isError).toBeFalsy();
+    expect((await store.listScheduledTasks(rctx))[0]!.preApproved).toBe(true);
+  });
+
   it('cancel disables the task', async () => {
     const store = new MemoryStore();
     const tools = buildScheduleTools(store);

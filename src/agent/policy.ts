@@ -4,6 +4,7 @@ import type { ClusterRegistry } from '../config/clusters.js';
 import type { AuditSink } from '../audit/sink.js';
 import { LogAuditSink } from '../audit/sink.js';
 import { classifyKubectl, parseKubectlArgs } from '../ops/classify.js';
+import { can } from './../auth/rbac.js';
 
 /** dispatch 前的策略判定（读写分离 / dry-run / 审批 / 危险命令拦截）。 */
 export interface PolicyDecision {
@@ -93,19 +94,33 @@ export class OpsPolicy implements PolicyMiddleware {
     }
 
     const cls = classifyKubectl(args);
+    const role = ctx?.role;
     const base = { tenantId, sessionId, cluster, tool: 'kubectl', detail: { verb: cls.verb, write: cls.write } };
 
+    // 集群 ACL：限定可访问该集群的租户
+    if (info.tenants?.length && (!tenantId || !info.tenants.includes(tenantId))) {
+      return this.emit('block', { blocked: true, reason: `租户无权访问集群 ${cluster}` }, base);
+    }
     if (cls.dangerous) {
       return this.emit('block', { blocked: true, reason: `危险命令被拦截：${cls.reason}` }, base);
     }
-    if (cls.write && info.access === 'ro') {
-      return this.emit('block', { blocked: true, reason: `集群 ${cluster} 为只读，拒绝变更（${cls.verb}）` }, base);
-    }
-    if (cls.write && info.production) {
-      if (this.preApproved) {
-        return this.emit('allow', { blocked: false }, { ...base, detail: { ...base.detail, preApproved: true } });
+    if (cls.write) {
+      if (!role || !can(role, 'cluster:write')) {
+        return this.emit('block', { blocked: true, reason: `角色 ${role ?? '未知'} 无变更权限` }, base);
       }
-      return this.emit('approve-required', { blocked: false, needApproval: true }, base);
+      if (info.access === 'ro') {
+        return this.emit('block', { blocked: true, reason: `集群 ${cluster} 为只读，拒绝变更（${cls.verb}）` }, base);
+      }
+      if (info.production) {
+        // 有审批权（管理员）→ 自动放行；否则预批准放行，再否则需人工审批
+        if (can(role, 'approve')) {
+          return this.emit('allow', { blocked: false }, { ...base, detail: { ...base.detail, approvedBy: role } });
+        }
+        if (this.preApproved) {
+          return this.emit('allow', { blocked: false }, { ...base, detail: { ...base.detail, preApproved: true } });
+        }
+        return this.emit('approve-required', { blocked: false, needApproval: true }, base);
+      }
     }
     return this.emit('allow', { blocked: false }, base);
   }

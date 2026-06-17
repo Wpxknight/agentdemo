@@ -3,6 +3,7 @@ import type { ToolContext, ToolHandler } from '../agent/tools.js';
 import { reqContext } from '../agent/tools.js';
 import type { Store } from '../db/store.js';
 import { isValidCron } from '../scheduler/cron.js';
+import { can } from '../auth/rbac.js';
 
 function asObject(args: JsonValue): Record<string, JsonValue> {
   return args && typeof args === 'object' && !Array.isArray(args) ? args : {};
@@ -36,11 +37,17 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
         if (!cron || !task) return { id: '', content: 'cron 与 task 均必填', isError: true };
         if (!isValidCron(cron)) return { id: '', content: `非法 cron 表达式: ${cron}`, isError: true };
 
-        const created = await store.createScheduledTask(reqContext(ctx), {
+        const rc = reqContext(ctx);
+        const preApproved = o.preApproved === true;
+        if (preApproved && !can(rc.role, 'approve')) {
+          return { id: '', content: '仅管理员可创建预批准（preApproved）定时任务', isError: true };
+        }
+
+        const created = await store.createScheduledTask(rc, {
           sessionId: ctx.sessionId,
           cron,
           task,
-          preApproved: o.preApproved === true,
+          preApproved,
         });
         return {
           id: '',

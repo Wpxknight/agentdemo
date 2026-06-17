@@ -39,6 +39,8 @@ export const ClusterSchema = z.object({
   allowNamespaces: z.array(z.string()).optional(),
   /** 生产集群：变更类操作需审批。 */
   production: z.boolean().default(false),
+  /** 集群 ACL：允许访问的租户 id 列表；缺省/空表示所有租户可访问。 */
+  tenants: z.array(z.string()).optional(),
 });
 
 export const ConfigSchema = z.object({
