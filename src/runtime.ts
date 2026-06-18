@@ -41,6 +41,8 @@ export interface Runtime {
   policyPreApproved: PolicyMiddleware;
   /** 本地认证提供方（登录 / token 校验）。 */
   authProvider: AuthProvider;
+  /** 会话 JWT 密钥（HTTP 层签发 OIDC 临时 state cookie 等用）。 */
+  jwtSecret: string;
   /** 无认证（CLI）场景的默认身份。 */
   defaultContext: RequestContext;
   dispose(): Promise<void>;
@@ -167,6 +169,7 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     policy,
     policyPreApproved,
     authProvider,
+    jwtSecret,
     defaultContext,
     async dispose() {
       await Promise.all(

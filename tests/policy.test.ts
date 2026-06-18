@@ -71,6 +71,47 @@ describe('OpsPolicy kubectl', () => {
   });
 });
 
+describe('OpsPolicy namespace allowlist', () => {
+  function nsRegistry() {
+    return new ClusterRegistry({
+      dev: { access: 'rw', production: false, allowNamespaces: ['app', 'web'] },
+    });
+  }
+
+  it('allows a whitelisted namespace', async () => {
+    const p = new OpsPolicy({ clusters: nsRegistry() });
+    const d = await p.check(call('kubectl', { cluster: 'dev', args: ['-n', 'app', 'get', 'pods'] }), user);
+    expect(d.blocked).toBe(false);
+  });
+
+  it('allows --namespace=value form', async () => {
+    const p = new OpsPolicy({ clusters: nsRegistry() });
+    const d = await p.check(call('kubectl', { cluster: 'dev', args: ['--namespace=web', 'get', 'pods'] }), user);
+    expect(d.blocked).toBe(false);
+  });
+
+  it('blocks a non-whitelisted namespace', async () => {
+    const p = new OpsPolicy({ clusters: nsRegistry() });
+    const d = await p.check(call('kubectl', { cluster: 'dev', args: ['-n', 'kube-system', 'get', 'pods'] }), user);
+    expect(d.blocked).toBe(true);
+    expect(d.reason).toContain('白名单');
+  });
+
+  it('blocks --all-namespaces when allowlist is set', async () => {
+    const p = new OpsPolicy({ clusters: nsRegistry() });
+    const d = await p.check(call('kubectl', { cluster: 'dev', args: ['get', 'pods', '-A'] }), user);
+    expect(d.blocked).toBe(true);
+    expect(d.reason).toContain('all-namespaces');
+  });
+
+  it('blocks when no namespace is specified', async () => {
+    const p = new OpsPolicy({ clusters: nsRegistry() });
+    const d = await p.check(call('kubectl', { cluster: 'dev', args: ['get', 'pods'] }), user);
+    expect(d.blocked).toBe(true);
+    expect(d.reason).toContain('须用 -n');
+  });
+});
+
 describe('OpsPolicy shell guard', () => {
   it('blocks rm -rf /', async () => {
     const p = new OpsPolicy({ clusters: registry() });

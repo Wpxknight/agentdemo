@@ -43,6 +43,33 @@ function hasFlag(args: string[], ...flags: string[]): boolean {
   return args.some((a) => flags.some((f) => a === f || a.startsWith(`${f}=`)));
 }
 
+/** 取某个带值 flag 的值（支持 `--ns=x` 与 `--ns x` 两种写法）。 */
+function flagValue(args: string[], ...flags: string[]): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    for (const f of flags) {
+      if (a === f) return args[i + 1];
+      if (a.startsWith(`${f}=`)) return a.slice(f.length + 1);
+    }
+  }
+  return undefined;
+}
+
+export interface KubectlScope {
+  /** 显式 `-n/--namespace` 指定的命名空间（未指定为 undefined）。 */
+  namespace?: string;
+  /** 是否使用了 `-A/--all-namespaces`（跨全部命名空间）。 */
+  allNamespaces: boolean;
+}
+
+/** 解析 kubectl 命令的命名空间作用域（供白名单校验）。 */
+export function kubectlScope(args: string[]): KubectlScope {
+  return {
+    namespace: flagValue(args, '-n', '--namespace'),
+    allNamespaces: hasFlag(args, '-A', '--all-namespaces'),
+  };
+}
+
 const CLUSTER_SCOPED = /\b(namespace|namespaces|ns|node|nodes|no|pv|persistentvolume|crd|customresourcedefinition|clusterrole|clusterrolebinding)\b/;
 
 /** 对 kubectl 参数做读写 / 危险性分类。 */

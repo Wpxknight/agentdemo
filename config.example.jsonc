@@ -68,7 +68,9 @@
       "namespace": "aiop",
       "serviceAccount": "aiop-ops",
       "access": "rw",
-      "production": false
+      "production": false,
+      // 命名空间白名单：设置后只允许 -n 指定其中之一，禁止 --all-namespaces
+      "allowNamespaces": ["aiop", "default"]
     },
     "prod": {
       "e2bControl": "https://e2b.prod-cluster.internal",

@@ -3,7 +3,7 @@ import type { ToolContext } from './tools.js';
 import type { ClusterRegistry } from '../config/clusters.js';
 import type { AuditSink } from '../audit/sink.js';
 import { LogAuditSink } from '../audit/sink.js';
-import { classifyKubectl, parseKubectlArgs } from '../ops/classify.js';
+import { classifyKubectl, kubectlScope, parseKubectlArgs } from '../ops/classify.js';
 import { can } from './../auth/rbac.js';
 
 /** dispatch 前的策略判定（读写分离 / dry-run / 审批 / 危险命令拦截）。 */
@@ -100,6 +100,20 @@ export class OpsPolicy implements PolicyMiddleware {
     // 集群 ACL：限定可访问该集群的租户
     if (info.tenants?.length && (!tenantId || !info.tenants.includes(tenantId))) {
       return this.emit('block', { blocked: true, reason: `租户无权访问集群 ${cluster}` }, base);
+    }
+    // 命名空间白名单：配置 allowNamespaces 后，只允许其中的命名空间
+    if (info.allowNamespaces?.length) {
+      const scope = kubectlScope(args);
+      if (scope.allNamespaces) {
+        return this.emit('block', { blocked: true, reason: `集群 ${cluster} 限定命名空间，禁止 --all-namespaces` }, base);
+      }
+      // 必须显式指定命名空间，且须在白名单内（避免落到 SA 默认命名空间绕过限制）
+      if (!scope.namespace) {
+        return this.emit('block', { blocked: true, reason: `集群 ${cluster} 须用 -n 指定命名空间（白名单：${info.allowNamespaces.join(', ')}）` }, base);
+      }
+      if (!info.allowNamespaces.includes(scope.namespace)) {
+        return this.emit('block', { blocked: true, reason: `命名空间 ${scope.namespace} 不在集群 ${cluster} 白名单内` }, base);
+      }
     }
     if (cls.dangerous) {
       return this.emit('block', { blocked: true, reason: `危险命令被拦截：${cls.reason}` }, base);

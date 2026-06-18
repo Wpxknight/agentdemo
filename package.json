@@ -9,6 +9,8 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
+    "serve": "tsx src/index.ts serve",
+    "scheduler": "tsx src/index.ts scheduler",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"

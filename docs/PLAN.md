@@ -112,3 +112,6 @@ API 通过 HTTP + SSE 暴露（前端后续接入）；本阶段以服务端 + C
 - [x] S8 RBAC 三角色 + 授权融合 — auth/rbac.ts（权限矩阵 + can/requirePermission/canManageUsersOf）、auth/admin.ts（租户/用户管理带 RBAC）、OpsPolicy 融合（cluster:write 权限、管理员审批权自动放行、集群 ACL 按租户）、schedule preApproved 限管理员；越权/审批/ACL 单测；67 通过/1 跳过
 - [x] S9 SSO 对接 — auth/session.ts（共享会话 JWT，Local/Oidc 复用）、auth/oidc-map.ts（claims→tenant/role 纯映射）、auth/oidc.ts（OidcAuthProvider：openid-client Authorization Code+PKCE、JIT 建号、本系统会话 token）、config.auth 切换 local/oidc；映射/JIT/会话单测（真实 IdP 流程留待联调）；73 通过/1 跳过
 - [x] S10 增强 — 审批门（ApprovalGate：AutoApprove/AutoDeny/Callback，core.ts 接入，CLI 批准/调度拒绝）、WarmPool 预热池（acquire+异步补位，接入 SandboxManager）、远端桌面/浏览器工具（desktop/browser 抽象 + E2bDesktopProvider + browser_navigate/click/type/screenshot/stream_url）；审批/预热/浏览器单测；79 通过/1 跳过
+- [x] S11 HTTP + SSE 服务 + 收尾 — node:http 无状态服务（健康检查/本地登录/OIDC start+callback 走签名 cookie 保持无状态/agent SSE 流式+会话续接+落库/定时任务/审计/租户用户管理，鉴权融合 RBAC）、CLI 增加 serve / seed-admin（引导首个平台管理员）/ scheduler、CLI 与调度器均接入会话历史续接、命名空间白名单在 OpsPolicy 强制（allowNamespaces：禁 --all-namespaces、须显式 -n 且在白名单内）；HTTP 集成测试 + 命名空间白名单单测；91 通过/1 跳过
+
+> 仍未完成（需真实环境或后续迭代）：交互式审批 diff/暂停-续跑；computer-use 视觉闭环（内部消息格式仍为纯文本，无多模态）；版本化迁移框架（当前仅 CREATE IF NOT EXISTS）；usage/token 计量落库；部署物（Dockerfile/k8s manifest/in-cluster E2B 模板与 SA 绑定）；E2B/MySQL/OIDC 真实环境联调。
