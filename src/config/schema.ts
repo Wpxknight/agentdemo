@@ -17,10 +17,16 @@ export const McpServerSchema = z.object({
 
 export const SandboxConfigSchema = z.object({
   enabled: z.boolean().default(false),
-  /** E2B API key；可用 ${E2B_API_KEY} 注入。 */
+  /** 沙箱后端：e2b（默认）或 opensandbox（阿里开源，k8s 运行时）。 */
+  provider: z.enum(['e2b', 'opensandbox']).default('e2b'),
+  /** API key；E2B 为 ${E2B_API_KEY}，OpenSandbox 为 Lifecycle API key（可空）。 */
   apiKey: z.string().optional(),
-  /** 自托管 E2B 网关域名。 */
+  /** 网关域名：E2B 自托管网关 / OpenSandbox Lifecycle API（host[:port]，无 scheme）。 */
   domain: z.string().optional(),
+  /** OpenSandbox：http / https。 */
+  protocol: z.enum(['http', 'https']).optional(),
+  /** OpenSandbox：未指定 template 时的默认镜像。 */
+  defaultImage: z.string().optional(),
   /** 空闲回收(ms)。 */
   idleMs: z.number().int().positive().optional(),
   /** 沙箱存活超时(ms)。 */

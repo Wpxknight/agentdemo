@@ -117,5 +117,6 @@ API 通过 HTTP + SSE 暴露（前端后续接入）；本阶段以服务端 + C
 - [x] S12 部署物 — Dockerfile（多阶段 / tsx / 非 root）、.dockerignore、deploy/k8s（namespace/configmap/secret 示例/service/server+scheduler Deployment/ops-rbac 示例 SA/README）
 - [x] S13 token 用量计量 — runAgent 累计 usage，openai adapter 补 usage 事件，HTTP/CLI/调度器运行后写审计（kind:usage），SSE done 回传
 - [x] S14 版本化迁移 — schema_migrations 版本表 + migrations/000N_*.sql 顺序应用（baseline=0001_init），对既有库可追加 ALTER 演进
+- [x] S15 OpenSandbox 后端（k8s）— OpenSandboxProvider（@alibaba-group/opensandbox SDK，create/connect/runCommand/runCode(base64 管道)/renew/kill），config.sandbox.provider 选择 e2b|opensandbox，runtime 装配；helm 部署 controller+server 到本地 k8s（含 helm v3.13 sprig/CRD ownership 绕坑记录于 deploy/opensandbox/README.md）；scripts/verify-opensandbox.ts 真集群端到端验证全部通过；provider 单测 8 个；100 通过/1 跳过
 
 > 仍未完成（需真实环境或后续迭代）：交互式审批 diff/暂停-续跑；computer-use 视觉闭环（内部消息格式仍为纯文本，无多模态）；in-cluster E2B 模板与 SA 绑定的实际镜像；E2B/MySQL/OIDC 真实环境联调。

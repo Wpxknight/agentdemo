@@ -7,6 +7,8 @@ import { AllowAllPolicy, OpsPolicy } from './agent/policy.js';
 import type { PolicyMiddleware } from './agent/policy.js';
 import { SandboxManager } from './sandbox/lifecycle.js';
 import { E2bProvider } from './sandbox/e2b.js';
+import { OpenSandboxProvider } from './sandbox/opensandbox.js';
+import type { SandboxProvider } from './sandbox/types.js';
 import { WarmPool } from './sandbox/warmpool.js';
 import { E2bDesktopProvider } from './sandbox/e2b-desktop.js';
 import type { DesktopHandle } from './sandbox/desktop.js';
@@ -76,7 +78,16 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
   let warmPoolRef: WarmPool | undefined;
   const desktops = new Map<string, Promise<DesktopHandle>>();
   if (config.sandbox?.enabled) {
-    const provider = new E2bProvider({ apiKey: config.sandbox.apiKey, domain: config.sandbox.domain });
+    const provider: SandboxProvider =
+      config.sandbox.provider === 'opensandbox'
+        ? new OpenSandboxProvider({
+            domain: config.sandbox.domain,
+            protocol: config.sandbox.protocol,
+            apiKey: config.sandbox.apiKey,
+            defaultImage: config.sandbox.defaultImage,
+          })
+        : new E2bProvider({ apiKey: config.sandbox.apiKey, domain: config.sandbox.domain });
+    logger.info({ provider: config.sandbox.provider }, 'sandbox provider selected');
 
     // 预热池：仅在未配置集群时启用（集群需专用模板，避免发错沙箱）
     let warmPool: WarmPool | undefined;
@@ -102,8 +113,10 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
       logger.info({ clusters: clusters.names() }, 'kubectl tool enabled');
     }
 
-    // 远端桌面 / 浏览器工具
-    if (config.sandbox.desktop) {
+    // 远端桌面 / 浏览器工具（仅 E2B 后端支持）
+    if (config.sandbox.desktop && config.sandbox.provider === 'opensandbox') {
+      logger.warn('opensandbox 后端暂不支持远端桌面/浏览器工具，已跳过 desktop');
+    } else if (config.sandbox.desktop) {
       const dp = new E2bDesktopProvider({ apiKey: config.sandbox.apiKey, domain: config.sandbox.domain });
       const resolve = (ctx: { sessionId: string }): Promise<DesktopHandle> => {
         let d = desktops.get(ctx.sessionId);

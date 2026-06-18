@@ -16,6 +16,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@alibaba-group/opensandbox": "^0.1.9",
     "@anthropic-ai/sdk": "^0.104.2",
     "@e2b/code-interpreter": "^2.6.0",
     "@e2b/desktop": "^2.3.1",
