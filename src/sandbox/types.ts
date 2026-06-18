@@ -22,6 +22,12 @@ export interface SandboxSpec {
   sandboxId?: string;
   /** 模板 / 镜像（动态拉起到集群内部时使用）。 */
   template?: string;
+  /** 动态拉起到目标集群时使用的命名空间。 */
+  namespace?: string;
+  /** 动态拉起到目标集群时绑定的 ServiceAccount。 */
+  serviceAccount?: string;
+  /** 透传给沙箱控制面的元数据，用于审计 / 调度 / 自托管控制面扩展。 */
+  metadata?: Record<string, string>;
   /** 沙箱存活超时(ms)，到期被 E2B 回收。 */
   timeoutMs?: number;
   /** 覆盖 E2B 控制面域名（多集群：每集群一个控制面）。 */

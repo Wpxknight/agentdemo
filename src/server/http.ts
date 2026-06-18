@@ -4,7 +4,7 @@ import { SignJWT, jwtVerify } from 'jose';
 import { logger } from '../logger.js';
 import type { Runtime } from '../runtime.js';
 import { runAgent } from '../agent/core.js';
-import { AutoDenyGate } from '../agent/approval.js';
+import { InMemoryApprovalStore, InteractiveApprovalGate } from '../agent/approval.js';
 import { authenticate } from './context.js';
 import { AuthzError, requirePermission } from '../auth/rbac.js';
 import { LocalAuthProvider } from '../auth/local.js';
@@ -75,9 +75,10 @@ async function requireAuth(rt: Runtime, req: Req): Promise<RequestContext> {
 /** 组装 HTTP + SSE 服务。所有处理无本地状态，可多副本水平扩展。 */
 export function createHttpServer(rt: Runtime): http.Server {
   const secret = new TextEncoder().encode(rt.jwtSecret);
+  const approvals = new InMemoryApprovalStore();
 
   return http.createServer((req, res) => {
-    handle(rt, secret, req, res).catch((err) => {
+    handle(rt, secret, approvals, req, res).catch((err) => {
       if (err instanceof HttpError) return sendJson(res, err.status, { error: err.message });
       if (err instanceof AuthzError) return sendJson(res, 403, { error: err.message });
       log.error({ err }, '请求处理异常');
@@ -87,7 +88,13 @@ export function createHttpServer(rt: Runtime): http.Server {
   });
 }
 
-async function handle(rt: Runtime, secret: Uint8Array, req: Req, res: Res): Promise<void> {
+async function handle(
+  rt: Runtime,
+  secret: Uint8Array,
+  approvals: InMemoryApprovalStore,
+  req: Req,
+  res: Res,
+): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const path = url.pathname;
   const method = req.method ?? 'GET';
@@ -142,7 +149,25 @@ async function handle(rt: Runtime, secret: Uint8Array, req: Req, res: Res): Prom
   }
 
   // —— 以下均需认证 ——
-  if (route === 'POST /v1/agent') return runAgentSse(rt, req, res);
+  if (route === 'POST /v1/agent') return runAgentSse(rt, approvals, req, res);
+
+  // —— 交互式审批 ——
+  if (route === 'GET /v1/approvals') {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'approve');
+    return sendJson(res, 200, { approvals: approvals.list(ctx.tenantId) });
+  }
+  const approvalMatch = /^\/v1\/approvals\/([^/]+)\/(approve|deny)$/.exec(path);
+  if (method === 'POST' && approvalMatch) {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'approve');
+    const id = decodeURIComponent(approvalMatch[1]!);
+    const ok = approvalMatch[2] === 'approve'
+      ? await approvals.approve(id, ctx.tenantId)
+      : await approvals.deny(id, ctx.tenantId);
+    if (!ok) throw new HttpError(404, '审批不存在或已处理');
+    return sendJson(res, 200, { ok: true });
+  }
 
   // GET /v1/sessions/{id}/messages
   const msgMatch = /^\/v1\/sessions\/([^/]+)\/messages$/.exec(path);
@@ -225,7 +250,7 @@ async function handle(rt: Runtime, secret: Uint8Array, req: Req, res: Res): Prom
 }
 
 /** POST /v1/agent：流式（SSE）运行一次 agent，自动续接会话历史并持久化。 */
-async function runAgentSse(rt: Runtime, req: Req, res: Res): Promise<void> {
+async function runAgentSse(rt: Runtime, approvals: InMemoryApprovalStore, req: Req, res: Res): Promise<void> {
   const ctx = await requireAuth(rt, req);
   const body = await readJson(req);
   const task = str(body, 'task');
@@ -244,15 +269,30 @@ async function runAgentSse(rt: Runtime, req: Req, res: Res): Promise<void> {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
   sse('session', { sessionId });
+  const abort = new AbortController();
+  res.on('close', () => abort.abort());
+  const toolCtx = { sessionId, tenantId: ctx.tenantId, userId: ctx.userId, role: ctx.role };
 
   try {
     const result = await runAgent({
       model: rt.model,
       tools: rt.tools,
       policy: rt.policy,
-      approval: new AutoDenyGate(), // HTTP 无交互审批通道：需审批的操作一律拒绝
+      approval: new InteractiveApprovalGate({
+        store: approvals,
+        emit: (pending) => sse('approval_required', pending),
+        signal: abort.signal,
+        diff: async ({ call, ctx: diffCtx }) => {
+          if (call.name !== 'kubectl') return undefined;
+          const args = call.args && typeof call.args === 'object' && !Array.isArray(call.args)
+            ? { ...call.args, dryRun: true }
+            : call.args;
+          const dryRun = await rt.tools.dispatch({ ...call, id: `${call.id}:dry-run`, args }, diffCtx);
+          return dryRun.content;
+        },
+      }),
       system: rt.systemExtra,
-      ctx: { sessionId, tenantId: ctx.tenantId, userId: ctx.userId, role: ctx.role },
+      ctx: toolCtx,
       messages: prior,
       task,
       onEvent: (e) => sse(e.type, e),

@@ -87,12 +87,18 @@ export class OpenSandboxProvider implements SandboxProvider {
   }
 
   async create(spec: SandboxSpec): Promise<SandboxHandle> {
+    const metadata = {
+      ...(spec.key ? { aiop_key: spec.key } : {}),
+      ...spec.metadata,
+      ...(spec.namespace ? { namespace: spec.namespace } : {}),
+      ...(spec.serviceAccount ? { serviceAccount: spec.serviceAccount } : {}),
+    };
     const sbx = await Sandbox.create({
       connectionConfig: this.connConfig(spec),
       image: spec.template ?? this.opts.defaultImage ?? DEFAULT_IMAGE,
       timeoutSeconds: spec.timeoutMs ? Math.ceil(spec.timeoutMs / 1000) : undefined,
       env: spec.envs,
-      metadata: spec.key ? { aiop_key: spec.key } : undefined,
+      metadata: Object.keys(metadata).length ? metadata : undefined,
     });
     return new OpenSandboxHandle(sbx);
   }

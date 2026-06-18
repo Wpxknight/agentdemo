@@ -6,6 +6,7 @@ import type {
   StreamEvent,
   StreamInput,
   ToolDef,
+  ToolResult,
 } from './types.js';
 
 export interface AnthropicModelConfig {
@@ -13,6 +14,23 @@ export interface AnthropicModelConfig {
   baseURL: string;
   apiKey: string;
   model: string;
+}
+
+function toAnthropicToolResultContent(
+  result: ToolResult,
+): string | Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam> {
+  if (!result.contentBlocks?.length) return result.content;
+  return result.contentBlocks.map((b): Anthropic.TextBlockParam | Anthropic.ImageBlockParam => {
+    if (b.type === 'text') return { type: 'text', text: b.text };
+    return {
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: b.mimeType as Anthropic.Base64ImageSource['media_type'],
+        data: b.data,
+      },
+    };
+  });
 }
 
 /** 内部 Msg[] -> Anthropic MessageParam[]（content blocks）。导出以便单测。 */
@@ -25,7 +43,7 @@ export function toAnthropicMessages(messages: Msg[]): Anthropic.MessageParam[] {
         content: (m.toolResults ?? []).map((r) => ({
           type: 'tool_result' as const,
           tool_use_id: r.id,
-          content: r.content,
+          content: toAnthropicToolResultContent(r),
           is_error: r.isError,
         })),
       };

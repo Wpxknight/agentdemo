@@ -83,4 +83,43 @@ describe('kubectl tool', () => {
     expect(res.isError).toBe(true);
     expect(res.content).toContain('未知集群');
   });
+
+  it('passes cluster namespace and serviceAccount into sandbox spec', async () => {
+    const specs: unknown[] = [];
+    const handle: SandboxHandle = {
+      sandboxId: 'sb',
+      runCode: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '' })),
+      runCommand: vi.fn(async (): Promise<ExecResult> => ({ stdout: 'ok', stderr: '', exitCode: 0 })),
+      setTimeout: vi.fn(async () => {}),
+      kill: vi.fn(async () => {}),
+    };
+    const provider: SandboxProvider = {
+      create: vi.fn(async (spec) => {
+        specs.push(spec);
+        return handle;
+      }),
+      connect: vi.fn(async () => handle),
+    };
+    const withSa = new ClusterRegistry({
+      dev: {
+        access: 'rw',
+        production: false,
+        template: 'kubectl:latest',
+        namespace: 'aiop',
+        serviceAccount: 'aiop-ops',
+        e2bControl: 'e2b.aiop.svc:80',
+      },
+    });
+    const tool = buildKubectlTool({ clusters: withSa, sandboxes: new SandboxManager({ provider }) });
+
+    await tool.run({ cluster: 'dev', args: ['get', 'pods', '-n', 'aiop'] }, ctx);
+
+    expect(specs[0]).toMatchObject({
+      template: 'kubectl:latest',
+      namespace: 'aiop',
+      serviceAccount: 'aiop-ops',
+      domain: 'e2b.aiop.svc:80',
+      metadata: { cluster: 'dev', namespace: 'aiop', serviceAccount: 'aiop-ops' },
+    });
+  });
 });

@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aiop-config-oidc
+  namespace: aiop-dev
+data:
+  config.jsonc: |
+    {
+      "models": {
+        "local-placeholder": {
+          "protocol": "openai",
+          "baseURL": "http://127.0.0.1:9/v1",
+          "apiKey": "${OPENAI_API_KEY}",
+          "model": "placeholder"
+        }
+      },
+      "defaultModel": "local-placeholder",
+      "skills": { "dir": "./skills" },
+      "auth": {
+        "provider": "oidc",
+        "jwtTtl": "12h",
+        "oidc": {
+          "issuer": "http://192.168.10.108:30084/dex",
+          "clientId": "aiop",
+          "clientSecret": "${OIDC_CLIENT_SECRET}",
+          "redirectUri": "http://192.168.10.108:30083/auth/callback",
+          "allowInsecureHttp": true,
+          "scopes": ["openid", "profile", "email"],
+          "mapping": {
+            "defaultTenant": "default",
+            "usernameClaim": "email",
+            "defaultRole": "platform_admin"
+          }
+        }
+      },
+      "sandbox": {
+        "enabled": true,
+        "provider": "opensandbox",
+        "domain": "opensandbox-server.opensandbox-system.svc:80",
+        "protocol": "http",
+        "defaultImage": "ubuntu",
+        "idleMs": 600000,
+        "timeoutMs": 3600000,
+        "desktop": false
+      }
+    }

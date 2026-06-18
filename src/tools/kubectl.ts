@@ -15,11 +15,21 @@ export interface KubectlToolOptions {
 
 /** 把集群信息映射为 in-cluster 沙箱规格（按 session×cluster 复用）。 */
 function specFor(sessionId: string, info: ClusterInfo): SandboxSpec {
+  const metadata: Record<string, string> = { cluster: info.name };
+  if (info.namespace) metadata.namespace = info.namespace;
+  if (info.serviceAccount) metadata.serviceAccount = info.serviceAccount;
   return {
     key: `${sessionId}:${info.name}`,
     template: info.template,
+    namespace: info.namespace,
+    serviceAccount: info.serviceAccount,
     domain: info.e2bControl,
-    envs: { AIOP_CLUSTER: info.name },
+    metadata,
+    envs: {
+      AIOP_CLUSTER: info.name,
+      ...(info.namespace ? { AIOP_NAMESPACE: info.namespace } : {}),
+      ...(info.serviceAccount ? { AIOP_SERVICE_ACCOUNT: info.serviceAccount } : {}),
+    },
   };
 }
 

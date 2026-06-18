@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { createHttpServer } from '../src/server/http.js';
@@ -121,5 +121,99 @@ describe('HTTP server', () => {
 
     const nf = await fetch(`${base}/nope`);
     expect(nf.status).toBe(404);
+  });
+
+  it('pauses an SSE agent run for approval and resumes after approve', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'approval-secret' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    await auth.createUser('default', 'user', 'pw', 'user');
+    const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    const userToken = (await auth.login('default', 'user', 'pw'))!;
+
+    const run = vi.fn(async () => ({ id: '', content: 'approved tool result' }));
+    const tools = new ToolRegistry();
+    tools.register({
+      def: { name: 'act', description: 'act', inputSchema: { type: 'object' } },
+      run,
+    });
+
+    let turn = 0;
+    const approvalModel: ChatModel = {
+      id: 'approval-model',
+      async *stream(): AsyncIterable<StreamEvent> {
+        turn++;
+        if (turn === 1) {
+          yield { type: 'tool_call', call: { id: 'c1', name: 'act', args: {} } };
+          yield { type: 'stop', reason: 'tool_use' };
+          return;
+        }
+        yield { type: 'text_delta', text: 'finished after approval' };
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+
+    const rt = {
+      model: approvalModel,
+      tools,
+      store: localStore,
+      policy: { check: async () => ({ blocked: false, needApproval: true, reason: 'prod write' }) },
+      policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth,
+      jwtSecret: 'approval-secret',
+      systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+
+    const approvalServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => approvalServer.listen(0, '127.0.0.1', resolve));
+    const approvalBase = `http://127.0.0.1:${(approvalServer.address() as AddressInfo).port}`;
+
+    try {
+      const r = await fetch(`${approvalBase}/v1/agent`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${adminToken}` },
+        body: JSON.stringify({ task: 'needs approval', sessionId: 'approval-sess' }),
+      });
+      expect(r.status).toBe(200);
+      const reader = r.body!.getReader();
+      const decoder = new TextDecoder();
+      let stream = '';
+      let approvalId = '';
+
+      while (!approvalId) {
+        const next = await reader.read();
+        expect(next.done).toBe(false);
+        stream += decoder.decode(next.value, { stream: true });
+        const m = /event: approval_required\ndata: ([^\n]+)/.exec(stream);
+        if (m) approvalId = (JSON.parse(m[1]!) as { id: string }).id;
+      }
+
+      expect(run).not.toHaveBeenCalled();
+      const deniedByRbac = await fetch(`${approvalBase}/v1/approvals/${approvalId}/approve`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${userToken}` },
+      });
+      expect(deniedByRbac.status).toBe(403);
+
+      const approved = await fetch(`${approvalBase}/v1/approvals/${approvalId}/approve`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${adminToken}` },
+      });
+      expect(approved.status).toBe(200);
+
+      while (!stream.includes('event: done')) {
+        const next = await reader.read();
+        if (next.done) break;
+        stream += decoder.decode(next.value, { stream: true });
+      }
+
+      expect(run).toHaveBeenCalledOnce();
+      expect(stream).toContain('event: done');
+      expect(stream).toContain('finished after approval');
+    } finally {
+      await new Promise<void>((resolve) => approvalServer.close(() => resolve()));
+    }
   });
 });

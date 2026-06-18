@@ -8,6 +8,15 @@ export interface E2bProviderOptions {
   domain?: string;
 }
 
+type E2bCreateOptions = {
+  apiKey?: string;
+  domain?: string;
+  template?: string;
+  timeoutMs?: number;
+  envs?: Record<string, string>;
+  metadata?: Record<string, string>;
+};
+
 /** 把 E2B Sandbox 实例适配为统一的 SandboxHandle。 */
 class E2bHandle implements SandboxHandle {
   constructor(private readonly sbx: Sandbox) {}
@@ -60,12 +69,19 @@ export class E2bProvider implements SandboxProvider {
   }
 
   async create(spec: SandboxSpec): Promise<SandboxHandle> {
-    const sbx = await Sandbox.create({
+    const metadata = {
+      ...spec.metadata,
+      ...(spec.namespace ? { namespace: spec.namespace } : {}),
+      ...(spec.serviceAccount ? { serviceAccount: spec.serviceAccount } : {}),
+    };
+    const opts: E2bCreateOptions = {
       ...this.connectOpts(spec),
       template: spec.template,
       timeoutMs: spec.timeoutMs,
       envs: spec.envs,
-    });
+      ...(Object.keys(metadata).length ? { metadata } : {}),
+    };
+    const sbx = await Sandbox.create(opts);
     return new E2bHandle(sbx);
   }
 

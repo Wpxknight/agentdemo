@@ -2,8 +2,8 @@
 FROM node:24-slim AS deps
 WORKDIR /app
 COPY package.json package-lock.json* ./
-# 无 lockfile 时回退到 npm install
-RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
+# 当前镜像直接用 tsx 运行 TS；tsx 在 devDependencies 中，因此需保留 dev 依赖。
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
 FROM node:24-slim AS runtime
 WORKDIR /app

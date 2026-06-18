@@ -43,13 +43,27 @@ beforeEach(() => {
 describe('OpenSandboxProvider', () => {
   it('create maps spec → SDK options', async () => {
     const p = new OpenSandboxProvider({ defaultImage: 'def:latest' });
-    const handle = await p.create({ key: 'k1', timeoutMs: 60_000, template: 'ubuntu', domain: 'host:8080', envs: { A: '1' } });
+    const handle = await p.create({
+      key: 'k1',
+      timeoutMs: 60_000,
+      template: 'ubuntu',
+      domain: 'host:8080',
+      envs: { A: '1' },
+      namespace: 'aiop',
+      serviceAccount: 'aiop-ops',
+      metadata: { cluster: 'dev' },
+    });
     expect(handle.sandboxId).toBe('sb-123');
     const opts = h.created[0] as Record<string, any>;
     expect(opts.image).toBe('ubuntu');
     expect(opts.timeoutSeconds).toBe(60);
     expect(opts.env).toEqual({ A: '1' });
-    expect(opts.metadata).toEqual({ aiop_key: 'k1' });
+    expect(opts.metadata).toEqual({
+      aiop_key: 'k1',
+      cluster: 'dev',
+      namespace: 'aiop',
+      serviceAccount: 'aiop-ops',
+    });
     expect(opts.connectionConfig.domain).toBe('host:8080');
   });
 

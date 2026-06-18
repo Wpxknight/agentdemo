@@ -6,6 +6,7 @@ import type {
   StreamEvent,
   StreamInput,
   ToolDef,
+  ToolResult,
 } from './types.js';
 
 export interface OpenAIModelConfig {
@@ -17,6 +18,24 @@ export interface OpenAIModelConfig {
 
 type ChatMsg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
+function openAIImageMessages(result: ToolResult): ChatMsg[] {
+  const blocks = result.contentBlocks ?? [];
+  if (!blocks.some((b) => b.type === 'image')) return [];
+
+  const content: OpenAI.Chat.Completions.ChatCompletionContentPart[] = blocks.map((b) => {
+    if (b.type === 'text') return { type: 'text', text: b.text };
+    return {
+      type: 'image_url',
+      image_url: { url: `data:${b.mimeType};base64,${b.data}` },
+    };
+  });
+
+  return [{
+    role: 'user',
+    content,
+  }];
+}
+
 /** 内部 Msg[] -> OpenAI ChatCompletionMessageParam[]（system 进 messages[0]）。导出以便单测。 */
 export function toOpenAIMessages(system: string, messages: Msg[]): ChatMsg[] {
   const out: ChatMsg[] = [];
@@ -26,6 +45,7 @@ export function toOpenAIMessages(system: string, messages: Msg[]): ChatMsg[] {
     if (m.role === 'tool') {
       for (const r of m.toolResults ?? []) {
         out.push({ role: 'tool', tool_call_id: r.id, content: r.content });
+        out.push(...openAIImageMessages(r));
       }
       continue;
     }

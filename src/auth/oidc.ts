@@ -15,6 +15,7 @@ export interface OidcProviderConfig {
   clientSecret?: string;
   redirectUri: string;
   scopes?: string[];
+  allowInsecureHttp?: boolean;
   mapping: OidcMapping;
 }
 
@@ -57,6 +58,7 @@ export class OidcAuthProvider implements AuthProvider {
         this.cfg.clientId,
         undefined,
         this.cfg.clientSecret ? oidc.ClientSecretPost(this.cfg.clientSecret) : undefined,
+        this.cfg.allowInsecureHttp ? { execute: [oidc.allowInsecureRequests] } : undefined,
       );
     }
     return this.discovered;

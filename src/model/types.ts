@@ -28,10 +28,16 @@ export interface ToolCall {
   args: JsonValue;
 }
 
+/** 工具结果的结构化内容块；文本回退始终保留在 ToolResult.content。 */
+export type ToolContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; mimeType: string; data: string };
+
 /** 工具执行结果，回填给模型。 */
 export interface ToolResult {
   id: string;
   content: string;
+  contentBlocks?: ToolContentBlock[];
   isError?: boolean;
 }
 

@@ -102,7 +102,15 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
       async run(_args, ctx): Promise<ToolResult> {
         const d = await resolve(ctx);
         const png = await d.screenshot();
-        return { id: '', content: `截图已捕获（${png.byteLength} 字节）。桌面流：${d.streamUrl()}` };
+        const text = `截图已捕获（${png.byteLength} 字节）。桌面流：${d.streamUrl()}`;
+        return {
+          id: '',
+          content: text,
+          contentBlocks: [
+            { type: 'text', text },
+            { type: 'image', mimeType: 'image/png', data: Buffer.from(png).toString('base64') },
+          ],
+        };
       },
     },
   ];

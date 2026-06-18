@@ -119,4 +119,4 @@ API 通过 HTTP + SSE 暴露（前端后续接入）；本阶段以服务端 + C
 - [x] S14 版本化迁移 — schema_migrations 版本表 + migrations/000N_*.sql 顺序应用（baseline=0001_init），对既有库可追加 ALTER 演进
 - [x] S15 OpenSandbox 后端（k8s）— OpenSandboxProvider（@alibaba-group/opensandbox SDK，create/connect/runCommand/runCode(base64 管道)/renew/kill），config.sandbox.provider 选择 e2b|opensandbox，runtime 装配；helm 部署 controller+server 到本地 k8s（含 helm v3.13 sprig/CRD ownership 绕坑记录于 deploy/opensandbox/README.md）；scripts/verify-opensandbox.ts 真集群端到端验证全部通过；provider 单测 8 个；100 通过/1 跳过
 
-> 仍未完成（需真实环境或后续迭代）：交互式审批 diff/暂停-续跑；computer-use 视觉闭环（内部消息格式仍为纯文本，无多模态）；in-cluster E2B 模板与 SA 绑定的实际镜像；E2B/MySQL/OIDC 真实环境联调。
+> 剩余项收尾（2026-06-18）：交互式审批 diff/暂停-续跑已接入 HTTP SSE（`approval_required` + approve/deny API，单测覆盖）；computer-use 视觉闭环已支持工具结果 image block（Anthropic/OpenAI adapter 映射，截图工具返回 PNG base64，单测覆盖）；in-cluster E2B template/namespace/ServiceAccount metadata 路径已实现并由 mock SDK 单测覆盖；真实 k8s 联调材料已归档到 `deploy/dev-k8s/`，并在集群中完成 MySQL 持久化、Dex OIDC NodePort start、aiop NodePort (`192.168.10.108:30083`) health/login、OpenSandbox in-cluster create/run/kill 验证。外部 E2B 真实联调因当前环境无 `E2B_API_KEY`，保留为文档化凭据门控验证。

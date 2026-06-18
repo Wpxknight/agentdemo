@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiop-server
+  namespace: aiop-dev
+  labels: { app: aiop, component: server }
+spec:
+  # Interactive approvals are process-local and tied to one live SSE connection.
+  replicas: 1
+  selector:
+    matchLabels: { app: aiop, component: server }
+  template:
+    metadata:
+      labels: { app: aiop, component: server }
+    spec:
+      containers:
+        - name: aiop
+          image: aiop:dev
+          imagePullPolicy: IfNotPresent
+          command: ["npm", "run", "serve"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: AIOP_CONFIG
+              value: /config/config.jsonc
+            - name: PORT
+              value: "8080"
+          envFrom:
+            - secretRef: { name: aiop-dev-secrets }
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+      volumes:
+        - name: config
+          configMap: { name: aiop-config }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiop-scheduler
+  namespace: aiop-dev
+  labels: { app: aiop, component: scheduler }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: aiop, component: scheduler }
+  template:
+    metadata:
+      labels: { app: aiop, component: scheduler }
+    spec:
+      containers:
+        - name: aiop
+          image: aiop:dev
+          imagePullPolicy: IfNotPresent
+          command: ["npm", "run", "scheduler"]
+          env:
+            - name: AIOP_CONFIG
+              value: /config/config.jsonc
+          envFrom:
+            - secretRef: { name: aiop-dev-secrets }
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+      volumes:
+        - name: config
+          configMap: { name: aiop-config }

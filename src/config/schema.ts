@@ -74,6 +74,8 @@ export const OidcConfigSchema = z.object({
   clientSecret: z.string().optional(),
   redirectUri: z.string(),
   scopes: z.array(z.string()).optional(),
+  /** 仅用于 dev/test IdP；生产必须使用 HTTPS issuer。 */
+  allowInsecureHttp: z.boolean().default(false),
   mapping: OidcMappingSchema,
 });
 

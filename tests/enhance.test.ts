@@ -1,7 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 import { runAgent } from '../src/agent/core.js';
 import { ToolRegistry } from '../src/agent/tools.js';
-import { AutoApproveGate, AutoDenyGate } from '../src/agent/approval.js';
+import {
+  AutoApproveGate,
+  AutoDenyGate,
+  InMemoryApprovalStore,
+  InteractiveApprovalGate,
+  type ApprovalPending,
+} from '../src/agent/approval.js';
 import { WarmPool } from '../src/sandbox/warmpool.js';
 import { SandboxManager } from '../src/sandbox/lifecycle.js';
 import { buildBrowserTools } from '../src/tools/browser.js';
@@ -65,6 +71,31 @@ describe('approval gate', () => {
     });
     expect(run).not.toHaveBeenCalled();
     expect(r.text).toBe('blocked');
+  });
+
+  it('interactive approval waits until approved', async () => {
+    const store = new InMemoryApprovalStore();
+    const emitted: ApprovalPending[] = [];
+    const gate = new InteractiveApprovalGate({ store, emit: (p) => emitted.push(p) });
+
+    const waiting = gate.request({ call: { id: 'c1', name: 'act', args: {} }, reason: 'prod', ctx });
+
+    expect(emitted).toHaveLength(1);
+    expect(await store.approve(emitted[0]!.id, ctx.tenantId)).toBe(true);
+    await expect(waiting).resolves.toBe(true);
+    expect(store.get(emitted[0]!.id)).toBeUndefined();
+  });
+
+  it('interactive approval resolves false when denied', async () => {
+    const store = new InMemoryApprovalStore();
+    const gate = new InteractiveApprovalGate({ store, emit: () => {} });
+
+    const waiting = gate.request({ call: { id: 'c1', name: 'act', args: {} }, reason: 'prod', ctx });
+    const pending = store.list(ctx.tenantId)[0]!;
+
+    expect(await store.deny(pending.id, ctx.tenantId)).toBe(true);
+    await expect(waiting).resolves.toBe(false);
+    expect(store.get(pending.id)).toBeUndefined();
   });
 });
 
@@ -147,6 +178,10 @@ describe('browser tools', () => {
 
     expect(calls).toEqual(['launch:google-chrome:https://e.com', 'click:10,20', 'type:hi']);
     expect(shot.content).toContain('3 字节');
+    expect(shot.contentBlocks).toEqual([
+      { type: 'text', text: '截图已捕获（3 字节）。桌面流：https://vnc/url' },
+      { type: 'image', mimeType: 'image/png', data: Buffer.from([1, 2, 3]).toString('base64') },
+    ]);
   });
 
   it('browser_navigate validates url', async () => {

@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aiop-config
+  namespace: aiop-dev
+data:
+  config.jsonc: |
+    {
+      "models": {
+        "local-placeholder": {
+          "protocol": "openai",
+          "baseURL": "http://127.0.0.1:9/v1",
+          "apiKey": "${OPENAI_API_KEY}",
+          "model": "placeholder"
+        }
+      },
+      "defaultModel": "local-placeholder",
+      "skills": { "dir": "./skills" },
+      "auth": {
+        "provider": "local",
+        "jwtTtl": "12h"
+      },
+      "sandbox": {
+        "enabled": true,
+        "provider": "opensandbox",
+        "domain": "opensandbox-server.opensandbox-system.svc:80",
+        "protocol": "http",
+        "defaultImage": "ubuntu",
+        "idleMs": 600000,
+        "timeoutMs": 3600000,
+        "desktop": false
+      }
+    }

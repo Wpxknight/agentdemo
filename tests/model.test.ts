@@ -29,6 +29,27 @@ describe('toAnthropicMessages', () => {
     const trBlocks = toolMsg.content as Array<{ type: string; tool_use_id: string }>;
     expect(trBlocks[0]).toMatchObject({ type: 'tool_result', tool_use_id: 'c1' });
   });
+
+  it('maps tool image results to Anthropic image content blocks', () => {
+    const out = toAnthropicMessages([
+      {
+        role: 'tool',
+        toolResults: [
+          {
+            id: 'c1',
+            content: 'screenshot',
+            contentBlocks: [
+              { type: 'text', text: 'screenshot' },
+              { type: 'image', mimeType: 'image/png', data: 'AQID' },
+            ],
+          },
+        ],
+      },
+    ]);
+
+    expect(JSON.stringify(out)).toContain('"media_type":"image/png"');
+    expect(JSON.stringify(out)).toContain('"data":"AQID"');
+  });
 });
 
 describe('toOpenAIMessages', () => {
@@ -47,5 +68,26 @@ describe('toOpenAIMessages', () => {
   it('omits system message when empty', () => {
     const out = toOpenAIMessages('', [{ role: 'user', text: 'hi' }]);
     expect(out[0]).toEqual({ role: 'user', content: 'hi' });
+  });
+
+  it('maps tool image results to text tool result plus image user message', () => {
+    const out = toOpenAIMessages('', [
+      {
+        role: 'tool',
+        toolResults: [
+          {
+            id: 'c1',
+            content: 'screenshot',
+            contentBlocks: [
+              { type: 'text', text: 'screenshot' },
+              { type: 'image', mimeType: 'image/png', data: 'AQID' },
+            ],
+          },
+        ],
+      },
+    ]);
+
+    expect(out[0]).toMatchObject({ role: 'tool', tool_call_id: 'c1', content: 'screenshot' });
+    expect(JSON.stringify(out[1])).toContain('data:image/png;base64,AQID');
   });
 });

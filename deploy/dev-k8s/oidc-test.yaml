@@ -1,0 +1,76 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dex-config
+  namespace: aiop-dev
+data:
+  config.yaml: |
+    issuer: http://192.168.10.108:30084/dex
+    storage:
+      type: memory
+    web:
+      http: 0.0.0.0:5556
+    staticClients:
+      - id: aiop
+        name: aiop
+        secret: aiop-oidc-secret
+        redirectURIs:
+          - http://192.168.10.108:30083/auth/callback
+    enablePasswordDB: true
+    staticPasswords:
+      - email: admin@example.com
+        username: admin
+        userID: oidc-admin
+        # Password: password
+        hash: "$2a$10$33EMT0c9ZqM36Y0KZohMgeOkQKXlV5MG6aF7fbKcwB8MjS6C6jeVi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dex
+  namespace: aiop-dev
+  labels: { app: dex }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: dex }
+  template:
+    metadata:
+      labels: { app: dex }
+    spec:
+      containers:
+        - name: dex
+          image: ghcr.io/dexidp/dex:v2.42.0
+          imagePullPolicy: IfNotPresent
+          args: ["dex", "serve", "/etc/dex/config.yaml"]
+          ports:
+            - containerPort: 5556
+          volumeMounts:
+            - name: config
+              mountPath: /etc/dex
+              readOnly: true
+          readinessProbe:
+            httpGet: { path: /dex/.well-known/openid-configuration, port: 5556 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+      volumes:
+        - name: config
+          configMap: { name: dex-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dex
+  namespace: aiop-dev
+  labels: { app: dex }
+spec:
+  selector: { app: dex }
+  type: NodePort
+  ports:
+    - name: http
+      port: 5556
+      targetPort: 5556
+      nodePort: 30084
