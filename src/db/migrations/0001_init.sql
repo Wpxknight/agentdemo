@@ -1,5 +1,6 @@
--- aiop 持久化迁移（MySQL 8.0+）。幂等：IF NOT EXISTS。
+-- 0001_init：基线 schema（MySQL 8.0+）。幂等：IF NOT EXISTS。
 -- 多租户：业务表均带 tenant_id；tenants/users 见文末（S7）。
+-- 后续变更请新增 000N_xxx.sql（只追加，勿改历史文件）。
 
 CREATE TABLE IF NOT EXISTS messages (
   id          BIGINT       NOT NULL AUTO_INCREMENT,
