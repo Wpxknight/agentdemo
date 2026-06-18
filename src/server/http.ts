@@ -261,7 +261,11 @@ async function runAgentSse(rt: Runtime, req: Req, res: Res): Promise<void> {
     for (const m of result.messages.slice(prior.length)) {
       await rt.store.appendMessage(ctx, sessionId, m);
     }
-    sse('done', { sessionId, steps: result.steps, text: result.text });
+    await rt.audit?.record({
+      kind: 'usage', action: 'agent', tenantId: ctx.tenantId, sessionId,
+      detail: { ...result.usage, steps: result.steps },
+    });
+    sse('done', { sessionId, steps: result.steps, text: result.text, usage: result.usage });
   } catch (err) {
     log.error({ err }, 'agent 运行失败');
     sse('error', { error: err instanceof Error ? err.message : '运行失败' });

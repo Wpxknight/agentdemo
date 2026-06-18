@@ -58,6 +58,25 @@ describe('runAgent', () => {
     ]);
   });
 
+  it('accumulates usage across turns', async () => {
+    const model: ChatModel = {
+      id: 'm',
+      async *stream(): AsyncIterable<StreamEvent> {
+        yield { type: 'text_delta', text: 'ok' };
+        yield { type: 'usage', inputTokens: 10, outputTokens: 5 };
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+    const result = await runAgent({
+      model,
+      tools: new ToolRegistry(),
+      policy: new AllowAllPolicy(),
+      ctx: { sessionId: 't1' },
+      task: 'go',
+    });
+    expect(result.usage).toEqual({ inputTokens: 10, outputTokens: 5 });
+  });
+
   it('blocks tool when policy denies', async () => {
     const tools = new ToolRegistry();
     const run = vi.fn(async () => ({ id: '', content: 'should not run' }));

@@ -68,10 +68,14 @@ async function runOnce(config: Config, task: string) {
   });
 
   process.stdout.write('\n');
-  logger.info({ steps: result.steps }, 'done');
+  logger.info({ steps: result.steps, usage: result.usage }, 'done');
   for (const m of result.messages.slice(prior.length)) {
     await rt.store.appendMessage(rt.defaultContext, sessionId, m);
   }
+  await rt.audit.record({
+    kind: 'usage', action: 'agent', tenantId: rt.defaultContext.tenantId, sessionId,
+    detail: { ...result.usage, steps: result.steps },
+  });
   await rt.dispose();
 }
 
@@ -96,6 +100,10 @@ async function runScheduler(config: Config) {
     for (const m of result.messages.slice(prior.length)) {
       await rt.store.appendMessage(taskCtx, t.sessionId, m);
     }
+    await rt.audit.record({
+      kind: 'usage', action: 'scheduled', tenantId: t.tenantId, sessionId: t.sessionId,
+      detail: { ...result.usage, steps: result.steps, taskId: t.id },
+    });
     return { status: 'success' as const, detail: result.text.slice(0, 4000), steps: result.steps };
   };
 

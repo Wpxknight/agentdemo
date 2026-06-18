@@ -81,6 +81,7 @@ export class OpenAIModel implements ChatModel {
     const stream = await this.client.chat.completions.create({
       model: this.model,
       stream: true,
+      stream_options: { include_usage: true }, // 末尾 chunk 携带 token 用量
       max_tokens: input.maxTokens ?? 8192,
       messages: toOpenAIMessages(input.system, input.messages),
       tools: input.tools.length ? toOpenAITools(input.tools) : undefined,
@@ -90,6 +91,14 @@ export class OpenAIModel implements ChatModel {
     const pending = new Map<number, { id: string; name: string; args: string }>();
 
     for await (const chunk of stream) {
+      // 含 usage 的末尾 chunk 可能没有 choices
+      if (chunk.usage) {
+        yield {
+          type: 'usage',
+          inputTokens: chunk.usage.prompt_tokens ?? 0,
+          outputTokens: chunk.usage.completion_tokens ?? 0,
+        };
+      }
       const choice = chunk.choices[0];
       if (!choice) continue;
       const delta = choice.delta;

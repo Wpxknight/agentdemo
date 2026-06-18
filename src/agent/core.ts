@@ -20,10 +20,18 @@ export interface RunAgentOptions {
   approval?: ApprovalGate;
 }
 
+/** 一次运行累计的 token 用量（跨多轮）。 */
+export interface Usage {
+  inputTokens: number;
+  outputTokens: number;
+}
+
 export interface RunAgentResult {
   messages: Msg[];
   text: string; // 最后一轮 assistant 文本
   steps: number;
+  /** 跨所有轮次累计的 token 用量（adapter 提供 usage 事件时才非零）。 */
+  usage: Usage;
 }
 
 /**
@@ -37,6 +45,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
   const maxSteps = opts.maxSteps ?? 20;
   let lastText = '';
   let steps = 0;
+  const usage: Usage = { inputTokens: 0, outputTokens: 0 };
 
   while (steps < maxSteps) {
     steps++;
@@ -51,6 +60,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
       opts.onEvent?.(ev);
       if (ev.type === 'text_delta') text += ev.text;
       else if (ev.type === 'tool_call') calls.push(ev.call);
+      else if (ev.type === 'usage') {
+        usage.inputTokens += ev.inputTokens;
+        usage.outputTokens += ev.outputTokens;
+      }
     }
 
     lastText = text;
@@ -91,5 +104,5 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     messages.push({ role: 'tool', toolResults: results });
   }
 
-  return { messages, text: lastText, steps };
+  return { messages, text: lastText, steps, usage };
 }
