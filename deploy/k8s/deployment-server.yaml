@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiop-server
+  namespace: aiop
+  labels: { app: aiop, component: server }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: aiop, component: server }
+  template:
+    metadata:
+      labels: { app: aiop, component: server }
+    spec:
+      containers:
+        - name: aiop
+          image: aiop:latest
+          imagePullPolicy: IfNotPresent
+          command: ["npm", "run", "serve"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: AIOP_CONFIG
+              value: /config/config.jsonc
+            - name: PORT
+              value: "8080"
+          envFrom:
+            - secretRef: { name: aiop-secrets }
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+      volumes:
+        - name: config
+          configMap: { name: aiop-config }
