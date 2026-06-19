@@ -42,15 +42,16 @@
     //   }
     // }
   },
-  // 沙箱：enabled=true 时注册 sbx__run_code / sbx__run_command
+  // 沙箱：enabled=true 时注册 sbx__run_code / sbx__run_command。
+  // 本地开发可用 provider=local；生产建议使用 e2b 或 opensandbox。
   "sandbox": {
     "enabled": false,
-    // 后端：e2b（默认）或 opensandbox（阿里开源，k8s 运行时）
-    "provider": "e2b",
+    // 后端：local（本机临时目录 + Chrome）、e2b（默认）或 opensandbox（阿里开源，k8s 运行时）
+    "provider": "local",
     "apiKey": "${E2B_API_KEY}",
     "idleMs": 600000,
     "timeoutMs": 3600000,
-    "desktop": false,        // 启用远端桌面/浏览器工具（@e2b/desktop，仅 e2b）
+    "desktop": true,         // local 使用本机 Chrome；e2b 使用 @e2b/desktop
     "warmPoolSize": 0        // >0 预热沙箱（仅未配置 clusters 时生效）
     // —— OpenSandbox 后端示例（部署见 deploy/opensandbox/README.md）——
     // "provider": "opensandbox",
@@ -61,6 +62,11 @@
   },
   // MCP server：stdio / sse / http 三种 transport，工具以 mcp__<server>__<tool> 暴露
   "mcpServers": {
+    "local": {
+      "transport": "stdio",
+      "command": "node",
+      "args": ["--import", "tsx", "scripts/mcp-echo-server.ts"]
+    },
     "filesystem": {
       "transport": "stdio",
       "command": "npx",

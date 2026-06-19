@@ -3,5 +3,6 @@ dist/
 *.log
 .env
 .env.local
+config.jsonc
 coverage/
 .DS_Store

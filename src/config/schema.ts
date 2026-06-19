@@ -17,8 +17,8 @@ export const McpServerSchema = z.object({
 
 export const SandboxConfigSchema = z.object({
   enabled: z.boolean().default(false),
-  /** 沙箱后端：e2b（默认）或 opensandbox（阿里开源，k8s 运行时）。 */
-  provider: z.enum(['e2b', 'opensandbox']).default('e2b'),
+  /** 沙箱后端：local（本地开发）、e2b 或 opensandbox（阿里开源，k8s 运行时）。 */
+  provider: z.enum(['local', 'e2b', 'opensandbox']).default('e2b'),
   /** API key；E2B 为 ${E2B_API_KEY}，OpenSandbox 为 Lifecycle API key（可空）。 */
   apiKey: z.string().optional(),
   /** 网关域名：E2B 自托管网关 / OpenSandbox Lifecycle API（host[:port]，无 scheme）。 */
@@ -31,7 +31,7 @@ export const SandboxConfigSchema = z.object({
   idleMs: z.number().int().positive().optional(),
   /** 沙箱存活超时(ms)。 */
   timeoutMs: z.number().int().positive().optional(),
-  /** 启用远端桌面 / 浏览器工具（@e2b/desktop）。 */
+  /** 启用桌面 / 浏览器工具；local 使用本机 Chrome，e2b 使用 @e2b/desktop。 */
   desktop: z.boolean().default(false),
   /** 预热池大小（>0 时启用；仅未配置集群时生效，避免与集群专用模板冲突）。 */
   warmPoolSize: z.number().int().positive().optional(),
@@ -54,6 +54,13 @@ export const ClusterSchema = z.object({
 });
 
 const RoleEnum = z.enum(['platform_admin', 'tenant_admin', 'user']);
+
+export const BootstrapAdminSchema = z.object({
+  tenantId: z.string().default('default'),
+  username: z.string(),
+  password: z.string(),
+  role: RoleEnum.default('platform_admin'),
+});
 
 export const OidcMappingSchema = z.object({
   /** 提供 tenantId 的 claim 名；缺省用 defaultTenant。 */
@@ -83,6 +90,8 @@ export const AuthConfigSchema = z.object({
   provider: z.enum(['local', 'oidc']).default('local'),
   /** 会话 token 有效期（jose 时间串），默认 12h。 */
   jwtTtl: z.string().optional(),
+  /** 本地开发/部署引导管理员；仅 local 认证模式生效，已存在则跳过。 */
+  bootstrapAdmin: BootstrapAdminSchema.optional(),
   oidc: OidcConfigSchema.optional(),
 });
 

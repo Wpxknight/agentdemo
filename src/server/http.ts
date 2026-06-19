@@ -1,8 +1,9 @@
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { SignJWT, jwtVerify } from 'jose';
 import { logger } from '../logger.js';
-import type { Runtime } from '../runtime.js';
+import type { Runtime, RuntimeModelConfig } from '../runtime.js';
 import { runAgent } from '../agent/core.js';
 import { InMemoryApprovalStore, InteractiveApprovalGate } from '../agent/approval.js';
 import { authenticate } from './context.js';
@@ -11,6 +12,8 @@ import { LocalAuthProvider } from '../auth/local.js';
 import { OidcAuthProvider } from '../auth/oidc.js';
 import { createTenant, createUser, listTenants } from '../auth/admin.js';
 import type { RequestContext, Role } from '../auth/types.js';
+import { createModel } from '../model/factory.js';
+import type { JsonValue, ToolCall } from '../model/types.js';
 
 const log = logger.child({ mod: 'http' });
 
@@ -19,13 +22,13 @@ type Res = http.ServerResponse;
 
 const OIDC_COOKIE = 'aiop_oidc';
 
-/** 读取并解析 JSON 请求体（限制 1MB）。 */
+/** 读取并解析 JSON 请求体（限制 8MB，支持聊天附件以 base64 形式上传）。 */
 async function readJson(req: Req): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const c of req) {
     size += (c as Buffer).length;
-    if (size > 1_000_000) throw new HttpError(413, '请求体过大');
+    if (size > 8_000_000) throw new HttpError(413, '请求体过大');
     chunks.push(c as Buffer);
   }
   if (!chunks.length) return {};
@@ -40,6 +43,32 @@ function sendJson(res: Res, status: number, body: unknown): void {
   const buf = Buffer.from(JSON.stringify(body));
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': buf.length });
   res.end(buf);
+}
+
+function sendHtml(res: Res, status: number, html: string): void {
+  const buf = Buffer.from(html);
+  res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'content-length': buf.length });
+  res.end(buf);
+}
+
+async function sendWebAsset(res: Res, path: string): Promise<boolean> {
+  if (path === '/favicon.ico') {
+    res.writeHead(204);
+    res.end();
+    return true;
+  }
+  const assets: Record<string, { file: string; type: string }> = {
+    '/': { file: 'index.html', type: 'text/html; charset=utf-8' },
+    '/index.html': { file: 'index.html', type: 'text/html; charset=utf-8' },
+    '/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8' },
+    '/styles.css': { file: 'styles.css', type: 'text/css; charset=utf-8' },
+  };
+  const asset = assets[path];
+  if (!asset) return false;
+  const buf = await readFile(new URL(`../../web/${asset.file}`, import.meta.url));
+  res.writeHead(200, { 'content-type': asset.type, 'content-length': buf.length });
+  res.end(buf);
+  return true;
 }
 
 function parseCookies(header: string | undefined): Record<string, string> {
@@ -63,6 +92,151 @@ class HttpError extends Error {
 function str(o: Record<string, unknown>, key: string): string | undefined {
   const v = o[key];
   return typeof v === 'string' ? v : undefined;
+}
+
+function currentModelConfig(rt: Runtime): RuntimeModelConfig {
+  return rt.modelConfig ?? {
+    id: rt.model.id,
+    protocol: 'anthropic',
+    baseURL: '',
+    apiKey: '',
+    model: rt.model.id,
+  };
+}
+
+function maskApiKey(apiKey: string): string {
+  if (!apiKey) return '';
+  if (apiKey.length <= 6) return `${apiKey.slice(0, 1)}...${apiKey.slice(-1)}`;
+  return `${apiKey.slice(0, 3)}...${apiKey.slice(-3)}`;
+}
+
+function modelSettingsBody(config: RuntimeModelConfig): Record<string, unknown> {
+  return {
+    config: {
+      id: config.id,
+      protocol: config.protocol,
+      base_url: config.baseURL,
+      model: config.model,
+      api_key_set: Boolean(config.apiKey),
+      api_key_preview: maskApiKey(config.apiKey),
+    },
+  };
+}
+
+function parseProtocol(value: string | undefined): 'anthropic' | 'openai' {
+  if (!value || value === 'anthropic') return 'anthropic';
+  if (value === 'openai') return 'openai';
+  throw new HttpError(400, 'protocol 只支持 openai / anthropic');
+}
+
+function modelConfigFromBody(
+  body: Record<string, unknown>,
+  current: RuntimeModelConfig,
+): RuntimeModelConfig {
+  const protocol = parseProtocol(str(body, 'protocol') ?? current.protocol);
+  const baseURL = (str(body, 'base_url') ?? str(body, 'baseURL') ?? current.baseURL).trim();
+  const model = (str(body, 'model') ?? current.model).trim();
+  const id = (str(body, 'id') ?? model).trim();
+  const apiKeyInput = str(body, 'api_key') ?? str(body, 'apiKey');
+  const apiKey = apiKeyInput && apiKeyInput.trim() ? apiKeyInput.trim() : current.apiKey;
+  if (!baseURL) throw new HttpError(400, 'base_url 必填');
+  if (!apiKey) throw new HttpError(400, 'api_key 必填');
+  if (!model) throw new HttpError(400, 'model 必填');
+  return { id: id || model, protocol, baseURL, apiKey, model };
+}
+
+function sessionIdFromBody(body: Record<string, unknown>): string {
+  return str(body, 'sessionId') ?? randomUUID();
+}
+
+function isJsonValue(value: unknown): value is JsonValue {
+  if (value === null) return true;
+  const t = typeof value;
+  if (t === 'string' || t === 'number' || t === 'boolean') return Number.isFinite(value as number) || t !== 'number';
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  if (t === 'object') return Object.values(value as Record<string, unknown>).every(isJsonValue);
+  return false;
+}
+
+function attachmentPrompt(body: Record<string, unknown>): string {
+  const raw = body.attachments;
+  if (!Array.isArray(raw) || raw.length === 0) return '';
+  const lines = raw.slice(0, 10).map((item, idx) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return '';
+    const o = item as Record<string, unknown>;
+    const name = typeof o.name === 'string' && o.name ? o.name : `attachment-${idx + 1}`;
+    const type = typeof o.type === 'string' && o.type ? o.type : 'application/octet-stream';
+    const size = typeof o.size === 'number' && Number.isFinite(o.size) ? `${o.size} bytes` : 'unknown size';
+    const data = typeof o.data === 'string' && o.data ? `\n${o.data}` : '';
+    return `- ${name} (${type}, ${size})${data}`;
+  }).filter(Boolean);
+  return lines.length ? `[上传附件]\n${lines.join('\n')}` : '';
+}
+
+function browserStreamView(sessionId: string): string {
+  const sid = JSON.stringify(sessionId);
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { margin: 0; background: #0f172a; color: #d6e2ff; font: 14px system-ui, sans-serif; }
+    header { display: flex; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #263449; }
+    img { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+    .error { color: #fecaca; padding: 12px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <header><strong>Local browser preview</strong><span id="status">connecting</span></header>
+  <img id="screen" alt="browser preview" />
+  <div id="error" class="error"></div>
+  <script>
+    const sessionId = ${sid};
+    async function refresh() {
+      const token = localStorage.getItem('aiop_token');
+      if (!token) {
+        document.getElementById('status').textContent = 'not logged in';
+        return;
+      }
+      try {
+        const response = await fetch('/v1/browser/screenshot', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token },
+          body: JSON.stringify({ sessionId })
+        });
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.error || response.statusText);
+        const image = body.result && body.result.contentBlocks && body.result.contentBlocks.find((block) => block.type === 'image');
+        if (image) document.getElementById('screen').src = 'data:' + image.mimeType + ';base64,' + image.data;
+        document.getElementById('status').textContent = new Date().toLocaleTimeString();
+        document.getElementById('error').textContent = '';
+      } catch (err) {
+        document.getElementById('status').textContent = 'error';
+        document.getElementById('error').textContent = String(err && err.message ? err.message : err);
+      }
+    }
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>`;
+}
+
+async function dispatchDirectTool(
+  rt: Runtime,
+  ctx: RequestContext,
+  sessionId: string,
+  name: string,
+  args: JsonValue,
+): Promise<Record<string, unknown>> {
+  if (!rt.tools.has(name)) throw new HttpError(409, `工具未启用：${name}`);
+  const call: ToolCall = { id: randomUUID(), name, args };
+  const toolCtx = { sessionId, tenantId: ctx.tenantId, userId: ctx.userId, role: ctx.role };
+  const decision = await rt.policy.check(call, toolCtx);
+  if (decision.blocked) throw new HttpError(403, decision.reason ?? '策略阻止了该操作');
+  if (decision.needApproval) throw new HttpError(409, decision.reason ?? '该操作需要审批，无法直接执行');
+  const result = await rt.tools.dispatch(call, toolCtx);
+  return { ok: !result.isError, sessionId, result };
 }
 
 /** 校验 Bearer token 并返回身份；失败抛 401。 */
@@ -103,6 +277,10 @@ async function handle(
   // —— 健康检查（无需认证）——
   if (route === 'GET /healthz') return sendJson(res, 200, { ok: true });
   if (route === 'GET /readyz') return sendJson(res, 200, { ok: true });
+  if (route === 'GET /v1/browser/stream-view') {
+    return sendHtml(res, 200, browserStreamView(url.searchParams.get('sessionId') || 'default'));
+  }
+  if (method === 'GET' && await sendWebAsset(res, path)) return;
 
   // —— 本地登录 ——
   if (route === 'POST /auth/login') {
@@ -177,6 +355,16 @@ async function handle(
     return sendJson(res, 200, { tools, groups });
   }
 
+  if (route === 'POST /v1/tools/call') {
+    const ctx = await requireAuth(rt, req);
+    const body = await readJson(req);
+    const name = str(body, 'name');
+    if (!name) throw new HttpError(400, 'name 必填');
+    const args = body.args === undefined ? {} : body.args;
+    if (!isJsonValue(args)) throw new HttpError(400, 'args 必须是 JSON 值');
+    return sendJson(res, 200, await dispatchDirectTool(rt, ctx, sessionIdFromBody(body), name, args));
+  }
+
   if (route === 'GET /v1/sandboxes') {
     await requireAuth(rt, req);
     const hasSandboxTools = rt.tools.defs().some((def) => toolCategory(def.name) === 'sandbox');
@@ -190,6 +378,111 @@ async function handle(
         }]
       : [];
     return sendJson(res, 200, { sandboxes });
+  }
+
+  if (route === 'POST /v1/sandbox/run-code') {
+    const ctx = await requireAuth(rt, req);
+    const body = await readJson(req);
+    const code = str(body, 'code');
+    if (!code) throw new HttpError(400, 'code 必填');
+    const args: Record<string, JsonValue> = { code };
+    const language = str(body, 'language');
+    if (language) args.language = language;
+    return sendJson(res, 200, await dispatchDirectTool(rt, ctx, sessionIdFromBody(body), 'sbx__run_code', args));
+  }
+
+  if (route === 'POST /v1/sandbox/run-command') {
+    const ctx = await requireAuth(rt, req);
+    const body = await readJson(req);
+    const command = str(body, 'command');
+    if (!command) throw new HttpError(400, 'command 必填');
+    return sendJson(res, 200, await dispatchDirectTool(rt, ctx, sessionIdFromBody(body), 'sbx__run_command', { command }));
+  }
+
+  if (route === 'POST /v1/browser/stream') {
+    const ctx = await requireAuth(rt, req);
+    const body = await readJson(req);
+    const sessionId = sessionIdFromBody(body);
+    const payload = await dispatchDirectTool(rt, ctx, sessionId, 'desktop_stream_url', {});
+    const result = payload.result;
+    if (result && typeof result === 'object' && !Array.isArray(result)) {
+      const r = result as Record<string, unknown>;
+      if (typeof r.content === 'string' && r.content.includes('data:text/html')) {
+        r.content = `桌面流地址：/v1/browser/stream-view?sessionId=${encodeURIComponent(sessionId)}`;
+      }
+    }
+    return sendJson(res, 200, payload);
+  }
+
+  if (route === 'POST /v1/browser/navigate') {
+    const ctx = await requireAuth(rt, req);
+    const body = await readJson(req);
+    const browserUrl = str(body, 'url');
+    if (!browserUrl) throw new HttpError(400, 'url 必填');
+    return sendJson(res, 200, await dispatchDirectTool(rt, ctx, sessionIdFromBody(body), 'browser_navigate', { url: browserUrl }));
+  }
+
+  if (route === 'POST /v1/browser/click') {
+    const ctx = await requireAuth(rt, req);
+    const body = await readJson(req);
+    const x = Number(body.x);
+    const y = Number(body.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) throw new HttpError(400, 'x/y 必须是数字');
+    return sendJson(res, 200, await dispatchDirectTool(rt, ctx, sessionIdFromBody(body), 'browser_click', { x, y }));
+  }
+
+  if (route === 'POST /v1/browser/type') {
+    const ctx = await requireAuth(rt, req);
+    const body = await readJson(req);
+    const text = str(body, 'text');
+    if (typeof text !== 'string') throw new HttpError(400, 'text 必填');
+    return sendJson(res, 200, await dispatchDirectTool(rt, ctx, sessionIdFromBody(body), 'browser_type', { text }));
+  }
+
+  if (route === 'POST /v1/browser/screenshot') {
+    const ctx = await requireAuth(rt, req);
+    const body = await readJson(req);
+    return sendJson(res, 200, await dispatchDirectTool(rt, ctx, sessionIdFromBody(body), 'browser_screenshot', {}));
+  }
+
+  // —— 设置：运行时 LLM 配置 ——
+  if (route === 'GET /v1/settings/llm') {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'tenant:manage');
+    return sendJson(res, 200, modelSettingsBody(currentModelConfig(rt)));
+  }
+  if (route === 'POST /v1/settings/llm') {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'tenant:manage');
+    const next = modelConfigFromBody(await readJson(req), currentModelConfig(rt));
+    if (rt.updateModel) rt.updateModel(next);
+    else {
+      rt.model = createModel(next.id, next);
+      rt.modelConfig = { ...next };
+    }
+    return sendJson(res, 200, modelSettingsBody(next));
+  }
+  if (route === 'POST /v1/settings/llm/test') {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'tenant:manage');
+    const body = await readJson(req);
+    const hasBody = Object.keys(body).length > 0;
+    const config = hasBody ? modelConfigFromBody(body, currentModelConfig(rt)) : currentModelConfig(rt);
+    const model = hasBody ? createModel(config.id, config) : rt.model;
+    let text = '';
+    try {
+      for await (const e of model.stream({
+        system: '',
+        messages: [{ role: 'user', text: '请只回复 OK，用于测试模型连接。' }],
+        tools: [],
+        maxTokens: 32,
+      })) {
+        if (e.type === 'text_delta') text += e.text;
+      }
+    } catch (err) {
+      throw new HttpError(502, err instanceof Error ? err.message : '模型连接测试失败');
+    }
+    return sendJson(res, 200, { ok: true, text: text.trim(), ...modelSettingsBody(config) });
   }
 
   // —— 交互式审批 ——
@@ -293,7 +586,7 @@ async function handle(
 function toolCategory(name: string): string {
   if (name === 'load_skill' || name.startsWith('skill__')) return 'skill';
   if (name.startsWith('mcp__')) return 'mcp';
-  if (name.startsWith('sbx__') || name.startsWith('browser_')) return 'sandbox';
+  if (name.startsWith('sbx__') || name.startsWith('browser_') || name === 'desktop_stream_url') return 'sandbox';
   if (name.includes('schedule')) return 'schedule';
   if (name === 'kubectl') return 'ops';
   return 'builtin';
@@ -303,8 +596,10 @@ function toolCategory(name: string): string {
 async function runAgentSse(rt: Runtime, approvals: InMemoryApprovalStore, req: Req, res: Res): Promise<void> {
   const ctx = await requireAuth(rt, req);
   const body = await readJson(req);
-  const task = str(body, 'task');
-  if (!task) throw new HttpError(400, 'task 必填');
+  const rawTask = str(body, 'task')?.trim();
+  const uploaded = attachmentPrompt(body);
+  if (!rawTask && !uploaded) throw new HttpError(400, 'task 必填');
+  const task = [rawTask || '请分析上传附件。', uploaded].filter(Boolean).join('\n\n');
   const sessionId = str(body, 'sessionId') ?? randomUUID();
 
   // 续接历史：加载该会话既有消息作为上下文

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { toAnthropicMessages } from '../src/model/anthropic.js';
-import { toOpenAIMessages } from '../src/model/openai.js';
+import { normalizeOpenAIBaseURL, toOpenAIMessages } from '../src/model/openai.js';
 import type { Msg } from '../src/model/types.js';
 
 const convo: Msg[] = [
@@ -89,5 +89,16 @@ describe('toOpenAIMessages', () => {
 
     expect(out[0]).toMatchObject({ role: 'tool', tool_call_id: 'c1', content: 'screenshot' });
     expect(JSON.stringify(out[1])).toContain('data:image/png;base64,AQID');
+  });
+});
+
+describe('normalizeOpenAIBaseURL', () => {
+  it('adds /v1 when the configured endpoint is a bare host', () => {
+    expect(normalizeOpenAIBaseURL('http://192.168.10.108:18317')).toBe('http://192.168.10.108:18317/v1');
+  });
+
+  it('keeps explicit API paths unchanged', () => {
+    expect(normalizeOpenAIBaseURL('http://localhost:8000/v1')).toBe('http://localhost:8000/v1');
+    expect(normalizeOpenAIBaseURL('https://proxy.example.com/openai')).toBe('https://proxy.example.com/openai');
   });
 });

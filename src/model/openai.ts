@@ -18,6 +18,20 @@ export interface OpenAIModelConfig {
 
 type ChatMsg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
+export function normalizeOpenAIBaseURL(baseURL: string): string {
+  const trimmed = baseURL.trim().replace(/\/+$/, '');
+  try {
+    const url = new URL(trimmed);
+    if (!url.pathname || url.pathname === '/') {
+      url.pathname = '/v1';
+      return url.toString().replace(/\/+$/, '');
+    }
+    return trimmed;
+  } catch {
+    return trimmed;
+  }
+}
+
 function openAIImageMessages(result: ToolResult): ChatMsg[] {
   const blocks = result.contentBlocks ?? [];
   if (!blocks.some((b) => b.type === 'image')) return [];
@@ -94,7 +108,7 @@ export class OpenAIModel implements ChatModel {
   constructor(cfg: OpenAIModelConfig) {
     this.id = cfg.id;
     this.model = cfg.model;
-    this.client = new OpenAI({ baseURL: cfg.baseURL, apiKey: cfg.apiKey });
+    this.client = new OpenAI({ baseURL: normalizeOpenAIBaseURL(cfg.baseURL), apiKey: cfg.apiKey });
   }
 
   async *stream(input: StreamInput): AsyncIterable<StreamEvent> {

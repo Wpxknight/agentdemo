@@ -29,8 +29,37 @@ beforeAll(async () => {
   const auth = new LocalAuthProvider({ store, secret: 'test-secret' });
   await auth.createUser('default', 'admin', 'pw', 'platform_admin');
 
+  let activeModel = model;
+  let activeModelConfig: NonNullable<Runtime['modelConfig']> = {
+    id: 'mock',
+    protocol: 'anthropic',
+    baseURL: 'http://localhost:8000/v1',
+    apiKey: 'initial-key',
+    model: 'mock-model',
+  };
   const rt = {
-    model,
+    get model() {
+      return activeModel;
+    },
+    set model(next: ChatModel) {
+      activeModel = next;
+    },
+    get modelConfig() {
+      return activeModelConfig;
+    },
+    set modelConfig(next: NonNullable<Runtime['modelConfig']>) {
+      activeModelConfig = next;
+    },
+    updateModel(next: NonNullable<Runtime['modelConfig']>) {
+      activeModelConfig = next;
+      activeModel = {
+        id: next.id,
+        async *stream(): AsyncIterable<StreamEvent> {
+          yield { type: 'text_delta', text: `model:${next.model}` };
+          yield { type: 'stop', reason: 'end_turn' };
+        },
+      };
+    },
     tools: new ToolRegistry(),
     store,
     policy: new AllowAllPolicy(),
@@ -114,6 +143,31 @@ describe('HTTP server', () => {
     expect(msgs.filter((m) => m.role === 'user').length).toBe(2);
   });
 
+  it('passes uploaded attachment metadata into the agent task', async () => {
+    const r = await fetch(`${base}/v1/agent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        task: '分析上传的日志',
+        sessionId: 'sess-upload',
+        attachments: [{
+          name: 'error.log',
+          type: 'text/plain',
+          size: 12,
+          data: 'data:text/plain;base64,ZXJyb3IgbGluZQ==',
+        }],
+      }),
+    });
+    expect(r.status).toBe(200);
+    expect(await r.text()).toContain('event: done');
+
+    const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+    const msgs = await store.listMessages(ctx, 'sess-upload');
+    expect(msgs.find((m) => m.role === 'user')?.text).toContain('[上传附件]');
+    expect(msgs.find((m) => m.role === 'user')?.text).toContain('error.log');
+    expect(msgs.find((m) => m.role === 'user')?.text).toContain('data:text/plain;base64,ZXJyb3IgbGluZQ==');
+  });
+
   it('admin can list tenants; unknown route 404s', async () => {
     const r = await fetch(`${base}/v1/admin/tenants`, { headers: { authorization: `Bearer ${token}` } });
     expect(r.status).toBe(200);
@@ -121,6 +175,300 @@ describe('HTTP server', () => {
 
     const nf = await fetch(`${base}/nope`);
     expect(nf.status).toBe(404);
+  });
+
+  it('reads, updates, and tests runtime LLM settings', async () => {
+    const initial = await fetch(`${base}/v1/settings/llm`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(initial.status).toBe(200);
+    expect(await initial.json()).toEqual({
+      config: {
+        id: 'mock',
+        protocol: 'anthropic',
+        base_url: 'http://localhost:8000/v1',
+        model: 'mock-model',
+        api_key_set: true,
+        api_key_preview: 'ini...key',
+      },
+    });
+
+    const updated = await fetch(`${base}/v1/settings/llm`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        base_url: 'http://192.168.10.108:18317',
+        api_key: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
+        model: 'glm-5',
+      }),
+    });
+    expect(updated.status).toBe(200);
+    expect(await updated.json()).toEqual({
+      config: {
+        id: 'glm-5',
+        protocol: 'anthropic',
+        base_url: 'http://192.168.10.108:18317',
+        model: 'glm-5',
+        api_key_set: true,
+        api_key_preview: 'tes...aZ3',
+      },
+    });
+
+    const probe = await fetch(`${base}/v1/settings/llm/test`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(probe.status).toBe(200);
+    expect(await probe.json()).toMatchObject({ ok: true, text: 'model:glm-5' });
+
+    const switched = await fetch(`${base}/v1/settings/llm`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        protocol: 'openai',
+        base_url: 'http://192.168.10.108:18317',
+        api_key: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
+        model: 'glm-5',
+      }),
+    });
+    expect(switched.status).toBe(200);
+    expect(await switched.json()).toMatchObject({
+      config: {
+        protocol: 'openai',
+        base_url: 'http://192.168.10.108:18317',
+        model: 'glm-5',
+      },
+    });
+  });
+
+  it('dispatches sandbox code and browser operations over HTTP', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'sandbox-http-secret' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    const calls: string[] = [];
+    const tools = new ToolRegistry();
+    tools.register({
+      def: { name: 'sbx__run_code', description: 'run code', inputSchema: { type: 'object' } },
+      run: async (args) => ({ id: '', content: `code:${(args as { code: string }).code}` }),
+    });
+    tools.register({
+      def: { name: 'browser_navigate', description: 'navigate', inputSchema: { type: 'object' } },
+      run: async (args) => {
+        calls.push(`navigate:${(args as { url: string }).url}`);
+        return { id: '', content: 'navigated' };
+      },
+    });
+    tools.register({
+      def: { name: 'desktop_stream_url', description: 'stream', inputSchema: { type: 'object' } },
+      run: async () => ({ id: '', content: '桌面流地址：http://stream.local/session' }),
+    });
+    tools.register({
+      def: { name: 'browser_click', description: 'click', inputSchema: { type: 'object' } },
+      run: async (args) => {
+        calls.push(`click:${(args as { x: number; y: number }).x},${(args as { x: number; y: number }).y}`);
+        return { id: '', content: 'clicked' };
+      },
+    });
+    tools.register({
+      def: { name: 'browser_type', description: 'type', inputSchema: { type: 'object' } },
+      run: async (args) => {
+        calls.push(`type:${(args as { text: string }).text}`);
+        return { id: '', content: 'typed' };
+      },
+    });
+    tools.register({
+      def: { name: 'browser_screenshot', description: 'screenshot', inputSchema: { type: 'object' } },
+      run: async () => ({
+        id: '',
+        content: 'screenshot',
+        contentBlocks: [{ type: 'image', mimeType: 'image/png', data: 'AQID' }],
+      }),
+    });
+
+    const rt = {
+      model,
+      tools,
+      store: localStore,
+      policy: new AllowAllPolicy(),
+      policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth,
+      jwtSecret: 'sandbox-http-secret',
+      systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+
+    const sandboxServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => sandboxServer.listen(0, '127.0.0.1', resolve));
+    const sandboxBase = `http://127.0.0.1:${(sandboxServer.address() as AddressInfo).port}`;
+    const authed = { authorization: `Bearer ${adminToken}` };
+
+    try {
+      const runCode = await fetch(`${sandboxBase}/v1/sandbox/run-code`, {
+        method: 'POST',
+        headers: { ...authed, 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's1', code: 'print(1)', language: 'python' }),
+      });
+      expect(runCode.status).toBe(200);
+      expect(await runCode.json()).toMatchObject({ ok: true, result: { content: 'code:print(1)' } });
+
+      const nav = await fetch(`${sandboxBase}/v1/browser/navigate`, {
+        method: 'POST',
+        headers: { ...authed, 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's1', url: 'https://example.com' }),
+      });
+      expect(nav.status).toBe(200);
+      expect(await nav.json()).toMatchObject({ ok: true, result: { content: 'navigated' } });
+      expect(calls).toEqual(['navigate:https://example.com']);
+
+      const stream = await fetch(`${sandboxBase}/v1/browser/stream`, {
+        method: 'POST',
+        headers: { ...authed, 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's1' }),
+      });
+      expect(stream.status).toBe(200);
+      expect(await stream.json()).toMatchObject({
+        ok: true,
+        result: { content: '桌面流地址：http://stream.local/session' },
+      });
+
+      const click = await fetch(`${sandboxBase}/v1/browser/click`, {
+        method: 'POST',
+        headers: { ...authed, 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's1', x: 12, y: 34 }),
+      });
+      expect(click.status).toBe(200);
+      expect(await click.json()).toMatchObject({ ok: true, result: { content: 'clicked' } });
+
+      const type = await fetch(`${sandboxBase}/v1/browser/type`, {
+        method: 'POST',
+        headers: { ...authed, 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's1', text: 'hello' }),
+      });
+      expect(type.status).toBe(200);
+      expect(await type.json()).toMatchObject({ ok: true, result: { content: 'typed' } });
+      expect(calls).toEqual(['navigate:https://example.com', 'click:12,34', 'type:hello']);
+
+      const shot = await fetch(`${sandboxBase}/v1/browser/screenshot`, {
+        method: 'POST',
+        headers: { ...authed, 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's1' }),
+      });
+      expect(shot.status).toBe(200);
+      expect(await shot.json()).toMatchObject({
+        ok: true,
+        result: { content: 'screenshot', contentBlocks: [{ type: 'image', mimeType: 'image/png', data: 'AQID' }] },
+      });
+    } finally {
+      await new Promise<void>((resolve) => sandboxServer.close(() => resolve()));
+    }
+  });
+
+  it('wraps local data-url browser streams in a same-origin live preview page', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'stream-view-secret' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    const tools = new ToolRegistry();
+    tools.register({
+      def: { name: 'desktop_stream_url', description: 'stream', inputSchema: { type: 'object' } },
+      run: async () => ({ id: '', content: '桌面流地址：data:text/html;charset=utf-8,%3Chtml%3E%3C%2Fhtml%3E' }),
+    });
+
+    const rt = {
+      model,
+      tools,
+      store: localStore,
+      policy: new AllowAllPolicy(),
+      policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth,
+      jwtSecret: 'stream-view-secret',
+      systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+
+    const streamServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => streamServer.listen(0, '127.0.0.1', resolve));
+    const streamBase = `http://127.0.0.1:${(streamServer.address() as AddressInfo).port}`;
+    const headers = { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' };
+
+    try {
+      const stream = await fetch(`${streamBase}/v1/browser/stream`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ sessionId: 'live-s1' }),
+      });
+      expect(stream.status).toBe(200);
+      expect(await stream.json()).toMatchObject({
+        ok: true,
+        result: { content: '桌面流地址：/v1/browser/stream-view?sessionId=live-s1' },
+      });
+
+      const view = await fetch(`${streamBase}/v1/browser/stream-view?sessionId=live-s1`);
+      expect(view.status).toBe(200);
+      const html = await view.text();
+      expect(html).toContain('/v1/browser/screenshot');
+      expect(html).toContain("localStorage.getItem('aiop_token')");
+      expect(html).toContain('live-s1');
+    } finally {
+      await new Promise<void>((resolve) => streamServer.close(() => resolve()));
+    }
+  });
+
+  it('dispatches any registered tool through the generic tool-call endpoint', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'tool-call-secret' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    const tools = new ToolRegistry();
+    tools.register({
+      def: { name: 'load_skill', description: '加载技能', inputSchema: { type: 'object' } },
+      run: async (args) => ({ id: '', content: `skill:${(args as { name: string }).name}` }),
+    });
+    tools.register({
+      def: { name: 'mcp__fs__read_file', description: '读取文件', inputSchema: { type: 'object' } },
+      run: async (args) => ({ id: '', content: `file:${(args as { path: string }).path}` }),
+    });
+
+    const rt = {
+      model,
+      tools,
+      store: localStore,
+      policy: new AllowAllPolicy(),
+      policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth,
+      jwtSecret: 'tool-call-secret',
+      systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+
+    const toolServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => toolServer.listen(0, '127.0.0.1', resolve));
+    const toolBase = `http://127.0.0.1:${(toolServer.address() as AddressInfo).port}`;
+    const authed = { authorization: `Bearer ${adminToken}` };
+
+    try {
+      const skill = await fetch(`${toolBase}/v1/tools/call`, {
+        method: 'POST',
+        headers: { ...authed, 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's1', name: 'load_skill', args: { name: 'inspect' } }),
+      });
+      expect(skill.status).toBe(200);
+      expect(await skill.json()).toMatchObject({ ok: true, result: { content: 'skill:inspect' } });
+
+      const mcp = await fetch(`${toolBase}/v1/tools/call`, {
+        method: 'POST',
+        headers: { ...authed, 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's1', name: 'mcp__fs__read_file', args: { path: '/tmp/a.txt' } }),
+      });
+      expect(mcp.status).toBe(200);
+      expect(await mcp.json()).toMatchObject({ ok: true, result: { content: 'file:/tmp/a.txt' } });
+    } finally {
+      await new Promise<void>((resolve) => toolServer.close(() => resolve()));
+    }
   });
 
   it('pauses an SSE agent run for approval and resumes after approve', async () => {

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { SandboxManager } from '../src/sandbox/lifecycle.js';
+import { LocalSandboxProvider } from '../src/sandbox/local.js';
 import { buildSandboxTools } from '../src/tools/builtin.js';
 import type {
   ExecResult,
@@ -136,5 +137,32 @@ describe('sandbox tools', () => {
     const [runCode] = buildSandboxTools(mgr);
 
     await expect(runCode!.run({}, ctx)).rejects.toThrow(/code/);
+  });
+});
+
+describe('LocalSandboxProvider', () => {
+  it('executes shell commands in a disposable local sandbox', async () => {
+    const provider = new LocalSandboxProvider();
+    const handle = await provider.create({ key: 'local-test' });
+    try {
+      const res = await handle.runCommand('printf local-ok');
+
+      expect(res).toMatchObject({ stdout: 'local-ok', stderr: '', exitCode: 0 });
+    } finally {
+      await handle.kill();
+    }
+  });
+
+  it('executes JavaScript code and returns stdout', async () => {
+    const provider = new LocalSandboxProvider();
+    const handle = await provider.create({ key: 'local-code-test' });
+    try {
+      const res = await handle.runCode('console.log("js-ok")', { language: 'javascript' });
+
+      expect(res.stdout.trim()).toBe('js-ok');
+      expect(res.exitCode).toBe(0);
+    } finally {
+      await handle.kill();
+    }
   });
 });

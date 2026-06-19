@@ -3,6 +3,9 @@ import { hashPassword, verifyPassword } from '../src/auth/password.js';
 import { LocalAuthProvider } from '../src/auth/local.js';
 import { MemoryStore } from '../src/db/memory.js';
 import { bearerToken, authenticate } from '../src/server/context.js';
+import { parseConfig } from '../src/config/load.js';
+import { buildRuntime } from '../src/runtime.js';
+import type { Config } from '../src/config/schema.js';
 
 describe('password hashing', () => {
   it('verifies correct password and rejects wrong', async () => {
@@ -80,5 +83,58 @@ describe('server/context', () => {
     const ctx = await authenticate(auth, `Bearer ${token}`);
     expect(ctx?.tenantId).toBe('t1');
     expect(await authenticate(auth, undefined)).toBeUndefined();
+  });
+});
+
+describe('local auth bootstrap', () => {
+  it('parses configured bootstrap admin credentials', () => {
+    const cfg = parseConfig(`{
+      "models": { "mock": { "protocol": "openai", "baseURL": "http://localhost/v1", "apiKey": "x", "model": "mock" } },
+      "defaultModel": "mock",
+      "auth": {
+        "provider": "local",
+        "bootstrapAdmin": { "tenantId": "default", "username": "admin", "password": "pw", "role": "platform_admin" }
+      }
+    }`);
+
+    expect(cfg.auth?.bootstrapAdmin?.username).toBe('admin');
+  });
+
+  it('creates the configured bootstrap admin when building local runtime', async () => {
+    const config = {
+      models: { mock: { protocol: 'openai', baseURL: 'http://localhost/v1', apiKey: 'x', model: 'mock' } },
+      defaultModel: 'mock',
+      auth: {
+        provider: 'local',
+        bootstrapAdmin: { tenantId: 'default', username: 'admin', password: 'pw', role: 'platform_admin' },
+      },
+    } as Config;
+
+    const rt = await buildRuntime(config);
+    try {
+      const token = await rt.authProvider.login('default', 'admin', 'pw');
+      expect(token).toBeTypeOf('string');
+    } finally {
+      await rt.dispose();
+    }
+  });
+
+  it('registers local sandbox and browser tools from config', async () => {
+    const cfg = parseConfig(`{
+      "models": { "mock": { "protocol": "openai", "baseURL": "http://localhost/v1", "apiKey": "x", "model": "mock" } },
+      "defaultModel": "mock",
+      "sandbox": { "enabled": true, "provider": "local", "desktop": true }
+    }`);
+
+    const rt = await buildRuntime(cfg);
+    try {
+      expect(rt.tools.has('sbx__run_code')).toBe(true);
+      expect(rt.tools.has('sbx__run_command')).toBe(true);
+      expect(rt.tools.has('desktop_stream_url')).toBe(true);
+      expect(rt.tools.has('browser_navigate')).toBe(true);
+      expect(rt.tools.has('browser_screenshot')).toBe(true);
+    } finally {
+      await rt.dispose();
+    }
   });
 });

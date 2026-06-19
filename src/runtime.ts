@@ -1,6 +1,6 @@
 import { logger } from './logger.js';
 import type { Config } from './config/schema.js';
-import { createModel } from './model/factory.js';
+import { createModel, type ModelConfig as FactoryModelConfig } from './model/factory.js';
 import type { ChatModel } from './model/types.js';
 import { ToolRegistry } from './agent/tools.js';
 import { AllowAllPolicy, OpsPolicy } from './agent/policy.js';
@@ -8,10 +8,12 @@ import type { PolicyMiddleware } from './agent/policy.js';
 import { SandboxManager } from './sandbox/lifecycle.js';
 import { E2bProvider } from './sandbox/e2b.js';
 import { OpenSandboxProvider } from './sandbox/opensandbox.js';
+import { LocalSandboxProvider } from './sandbox/local.js';
 import type { SandboxProvider } from './sandbox/types.js';
 import { WarmPool } from './sandbox/warmpool.js';
 import { E2bDesktopProvider } from './sandbox/e2b-desktop.js';
-import type { DesktopHandle } from './sandbox/desktop.js';
+import { LocalDesktopProvider } from './sandbox/local-desktop.js';
+import type { DesktopHandle, DesktopProvider } from './sandbox/desktop.js';
 import { buildSandboxTools } from './tools/builtin.js';
 import { buildBrowserTools } from './tools/browser.js';
 import { McpManager } from './mcp/manager.js';
@@ -32,6 +34,8 @@ import type { RequestContext } from './auth/types.js';
 
 export interface Runtime {
   model: ChatModel;
+  modelConfig?: RuntimeModelConfig;
+  updateModel?(config: RuntimeModelConfig): void;
   tools: ToolRegistry;
   clusters: ClusterRegistry;
   audit: AuditSink;
@@ -50,6 +54,8 @@ export interface Runtime {
   dispose(): Promise<void>;
 }
 
+export type RuntimeModelConfig = { id: string } & FactoryModelConfig;
+
 const DEFAULT_TENANT = 'default';
 
 /** 组装一次运行所需的全部组件（模型/工具/策略/持久化）。 */
@@ -57,6 +63,7 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
   const modelCfg = config.models[config.defaultModel];
   if (!modelCfg) throw new Error(`defaultModel not found: ${config.defaultModel}`);
   const model = createModel(config.defaultModel, modelCfg);
+  const modelConfig: RuntimeModelConfig = { id: config.defaultModel, ...modelCfg };
   const tools = new ToolRegistry();
 
   const store = await createStore(readMysqlConfig());
@@ -79,7 +86,9 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
   const desktops = new Map<string, Promise<DesktopHandle>>();
   if (config.sandbox?.enabled) {
     const provider: SandboxProvider =
-      config.sandbox.provider === 'opensandbox'
+      config.sandbox.provider === 'local'
+        ? new LocalSandboxProvider()
+        : config.sandbox.provider === 'opensandbox'
         ? new OpenSandboxProvider({
             domain: config.sandbox.domain,
             protocol: config.sandbox.protocol,
@@ -113,11 +122,13 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
       logger.info({ clusters: clusters.names() }, 'kubectl tool enabled');
     }
 
-    // 远端桌面 / 浏览器工具（仅 E2B 后端支持）
+    // 桌面 / 浏览器工具：local 使用本机 Chrome；e2b 使用远端桌面。
     if (config.sandbox.desktop && config.sandbox.provider === 'opensandbox') {
       logger.warn('opensandbox 后端暂不支持远端桌面/浏览器工具，已跳过 desktop');
     } else if (config.sandbox.desktop) {
-      const dp = new E2bDesktopProvider({ apiKey: config.sandbox.apiKey, domain: config.sandbox.domain });
+      const dp: DesktopProvider = config.sandbox.provider === 'local'
+        ? new LocalDesktopProvider()
+        : new E2bDesktopProvider({ apiKey: config.sandbox.apiKey, domain: config.sandbox.domain });
       const resolve = (ctx: { sessionId: string }): Promise<DesktopHandle> => {
         let d = desktops.get(ctx.sessionId);
         if (!d) {
@@ -166,14 +177,34 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
 
   // CLI 默认身份：确保默认租户存在
   await store.createTenant({ id: DEFAULT_TENANT, name: 'Default' }).catch(() => {});
+  if (config.auth?.bootstrapAdmin) {
+    if (authProvider instanceof LocalAuthProvider) {
+      const admin = config.auth.bootstrapAdmin;
+      await store.createTenant({ id: admin.tenantId, name: admin.tenantId }).catch(() => {});
+      const existing = await store.getUserByUsername(admin.tenantId, admin.username);
+      if (existing) {
+        logger.warn({ tenantId: admin.tenantId, username: admin.username }, 'bootstrap admin already exists');
+      } else {
+        await authProvider.createUser(admin.tenantId, admin.username, admin.password, admin.role);
+        logger.info({ tenantId: admin.tenantId, username: admin.username, role: admin.role }, 'bootstrap admin created');
+      }
+    } else {
+      logger.warn('auth.bootstrapAdmin 仅在 local 认证模式生效，当前已忽略');
+    }
+  }
   const defaultContext: RequestContext = {
     tenantId: DEFAULT_TENANT,
     userId: 'cli',
     role: 'platform_admin',
   };
 
-  return {
+  const runtime: Runtime = {
     model,
+    modelConfig,
+    updateModel(next: RuntimeModelConfig) {
+      runtime.model = createModel(next.id, next);
+      runtime.modelConfig = { ...next };
+    },
     tools,
     clusters,
     audit,
@@ -195,4 +226,5 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
       await store.close();
     },
   };
+  return runtime;
 }

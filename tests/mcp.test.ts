@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { McpManager, mcpToolName } from '../src/mcp/manager.js';
+import { connectMcp } from '../src/mcp/client.js';
 import type { McpClientLike, McpServerConfig } from '../src/mcp/types.js';
 
 function fakeClient(tools: { name: string; description?: string }[]): McpClientLike {
@@ -62,5 +63,24 @@ describe('McpManager', () => {
     await mgr.start();
 
     expect(mgr.tools().map((t) => t.def.name)).toEqual(['mcp__good__ping']);
+  });
+});
+
+describe('local MCP smoke server', () => {
+  it('connects over stdio and calls echo', async () => {
+    const client = await connectMcp('local', {
+      transport: 'stdio',
+      command: 'node',
+      args: ['--import', 'tsx', 'scripts/mcp-echo-server.ts'],
+    });
+    try {
+      const listed = await client.listTools();
+      expect(listed.tools.map((tool) => tool.name)).toContain('echo');
+
+      const res = await client.callTool({ name: 'echo', arguments: { text: 'mcp-ok' } });
+      expect(res.content).toEqual([{ type: 'text', text: 'mcp-ok' }]);
+    } finally {
+      await client.close();
+    }
   });
 });
