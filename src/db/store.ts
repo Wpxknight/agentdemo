@@ -40,6 +40,14 @@ export interface TaskRun {
   steps?: number;
 }
 
+export interface SessionSummary {
+  sessionId: string;
+  title: string;
+  lastMessage?: string;
+  messageCount: number;
+  updatedAt?: string;
+}
+
 /** 创建用户（含密码哈希）。 */
 export interface NewUser {
   tenantId: string;
@@ -61,6 +69,7 @@ export interface Store extends AuditSink {
   // —— 会话消息 ——
   appendMessage(ctx: RequestContext, sessionId: string, msg: Msg): Promise<void>;
   listMessages(ctx: RequestContext, sessionId: string): Promise<Msg[]>;
+  listSessions(ctx: RequestContext, limit?: number): Promise<SessionSummary[]>;
 
   // —— 审计 ——（record 来自 AuditSink；event.tenantId 标识归属）
   record(event: AuditEvent): Promise<void>;

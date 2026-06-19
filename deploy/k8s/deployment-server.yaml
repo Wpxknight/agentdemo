@@ -13,17 +13,33 @@ spec:
       labels: { app: aiop, component: server }
     spec:
       containers:
+        - name: aiop-web
+          image: aiop-web:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits: { cpu: "200m", memory: "128Mi" }
         - name: aiop
           image: aiop:latest
           imagePullPolicy: IfNotPresent
           command: ["npm", "run", "serve"]
           ports:
-            - containerPort: 8080
+            - containerPort: 8081
           env:
             - name: AIOP_CONFIG
               value: /config/config.jsonc
             - name: PORT
-              value: "8080"
+              value: "8081"
           envFrom:
             - secretRef: { name: aiop-secrets }
           volumeMounts:
@@ -31,11 +47,11 @@ spec:
               mountPath: /config
               readOnly: true
           readinessProbe:
-            httpGet: { path: /readyz, port: 8080 }
+            httpGet: { path: /readyz, port: 8081 }
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
-            httpGet: { path: /healthz, port: 8080 }
+            httpGet: { path: /healthz, port: 8081 }
             initialDelaySeconds: 10
             periodSeconds: 20
           resources:

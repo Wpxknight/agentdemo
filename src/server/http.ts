@@ -151,6 +151,47 @@ async function handle(
   // —— 以下均需认证 ——
   if (route === 'POST /v1/agent') return runAgentSse(rt, approvals, req, res);
 
+  if (route === 'GET /v1/me') {
+    const ctx = await requireAuth(rt, req);
+    return sendJson(res, 200, { tenantId: ctx.tenantId, userId: ctx.userId, role: ctx.role });
+  }
+
+  if (route === 'GET /v1/sessions') {
+    const ctx = await requireAuth(rt, req);
+    const limit = Number(url.searchParams.get('limit') ?? '50');
+    return sendJson(res, 200, { sessions: await rt.store.listSessions(ctx, Number.isFinite(limit) ? limit : 50) });
+  }
+
+  if (route === 'GET /v1/tools') {
+    await requireAuth(rt, req);
+    const tools = rt.tools.defs().map((def) => ({
+      name: def.name,
+      description: def.description,
+      category: toolCategory(def.name),
+      inputSchema: def.inputSchema,
+    }));
+    const groups = tools.reduce<Record<string, number>>((acc, tool) => {
+      acc[tool.category] = (acc[tool.category] ?? 0) + 1;
+      return acc;
+    }, {});
+    return sendJson(res, 200, { tools, groups });
+  }
+
+  if (route === 'GET /v1/sandboxes') {
+    await requireAuth(rt, req);
+    const hasSandboxTools = rt.tools.defs().some((def) => toolCategory(def.name) === 'sandbox');
+    const sandboxes = hasSandboxTools
+      ? [{
+          id: 'sandbox-prod',
+          status: 'ready',
+          type: 'session',
+          resources: { cpu: '2 Core', memory: '4 Gi', storage: '50 Gi' },
+          actions: ['打开终端', '打开 VNC', '打开浏览器'],
+        }]
+      : [];
+    return sendJson(res, 200, { sandboxes });
+  }
+
   // —— 交互式审批 ——
   if (route === 'GET /v1/approvals') {
     const ctx = await requireAuth(rt, req);
@@ -247,6 +288,15 @@ async function handle(
   }
 
   sendJson(res, 404, { error: `未知路由: ${route}` });
+}
+
+function toolCategory(name: string): string {
+  if (name === 'load_skill' || name.startsWith('skill__')) return 'skill';
+  if (name.startsWith('mcp__')) return 'mcp';
+  if (name.startsWith('sbx__') || name.startsWith('browser_')) return 'sandbox';
+  if (name.includes('schedule')) return 'schedule';
+  if (name === 'kubectl') return 'ops';
+  return 'builtin';
 }
 
 /** POST /v1/agent：流式（SSE）运行一次 agent，自动续接会话历史并持久化。 */

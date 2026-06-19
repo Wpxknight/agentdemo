@@ -6,6 +6,7 @@ import type { Database } from './schema.js';
 import type {
   AuditFilter,
   NewUser,
+  SessionSummary,
   ScheduledTask,
   ScheduledTaskInput,
   Store,
@@ -54,6 +55,12 @@ function parseJson(v: unknown): unknown {
   return v;
 }
 
+function summarize(text: string | undefined, max = 48): string {
+  if (!text) return '';
+  const compact = text.replace(/\s+/g, ' ').trim();
+  return compact.length > max ? `${compact.slice(0, max)}...` : compact;
+}
+
 /** 基于 Kysely + mysql2 的持久化实现（租户由 ctx 强制过滤）。 */
 export class MysqlStore implements Store {
   constructor(private readonly db: Kysely<Database>) {}
@@ -88,6 +95,43 @@ export class MysqlStore implements Store {
         toolResults: c.toolResults,
       };
     });
+  }
+
+  async listSessions(ctx: RequestContext, limit = 50): Promise<SessionSummary[]> {
+    const rows = await this.db
+      .selectFrom('messages')
+      .select(['session_id', 'role', 'content', 'created_at'])
+      .where('tenant_id', '=', ctx.tenantId)
+      .orderBy('id', 'desc')
+      .limit(Math.max(limit * 20, limit))
+      .execute();
+
+    const grouped = new Map<string, Array<{ role: string; text?: string; createdAt: Date }>>();
+    for (const row of rows.reverse()) {
+      const content = (parseJson(row.content) ?? {}) as Partial<Msg>;
+      const items = grouped.get(row.session_id) ?? [];
+      items.push({
+        role: row.role,
+        text: content.text,
+        createdAt: row.created_at instanceof Date ? row.created_at : new Date(String(row.created_at)),
+      });
+      grouped.set(row.session_id, items);
+    }
+
+    return [...grouped.entries()]
+      .map(([sessionId, items]) => {
+        const firstUser = items.find((m) => m.role === 'user' && m.text)?.text;
+        const last = items.at(-1);
+        return {
+          sessionId,
+          title: summarize(firstUser ?? items[0]?.text ?? sessionId),
+          lastMessage: summarize(last?.text),
+          messageCount: items.length,
+          updatedAt: last?.createdAt.toISOString(),
+        };
+      })
+      .sort((a, b) => String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')))
+      .slice(0, limit);
   }
 
   async record(event: AuditEvent): Promise<void> {

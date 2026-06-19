@@ -6,7 +6,8 @@ It deploys:
 
 - MySQL 8.4 for persistent Store verification.
 - Dex as a test OIDC provider exposed on NodePort `30084`.
-- aiop server and scheduler using the local `aiop:dev` image.
+- aiop server Pod using local `aiop-web:dev` + `aiop:dev` images in the same Pod. The web container proxies API/SSE to backend `127.0.0.1:8081`.
+- aiop scheduler using the local `aiop:dev` image.
 - A fixed NodePort service on `30083`.
 - Example operation ServiceAccounts and RBAC.
 
@@ -24,10 +25,11 @@ Do not use port-forward for NodePort checks. Access aiop as `http://192.168.10.1
 
 ## Build image
 
-The manifest uses `imagePullPolicy: IfNotPresent` and image `aiop:dev`.
+The manifest uses `imagePullPolicy: IfNotPresent` and images `aiop:dev` and `aiop-web:dev`.
 
 ```sh
 docker build -t aiop:dev .
+docker build -f web/Dockerfile -t aiop-web:dev .
 ```
 
 This cluster uses Docker as the container runtime on the same node, so the locally built image is available to the kubelet.
@@ -77,7 +79,7 @@ Expected response:
 Default config uses local auth so `seed-admin` is available.
 
 ```sh
-kubectl -n aiop-dev exec deploy/aiop-server -- npm run start seed-admin default admin 'admin-pass'
+kubectl -n aiop-dev exec deploy/aiop-server -c aiop -- npm run start seed-admin default admin 'admin-pass'
 
 TOKEN=$(curl -fsS "${BASE_URL}/auth/login" \
   -H 'content-type: application/json' \

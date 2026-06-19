@@ -4,6 +4,7 @@ import type { RequestContext, Tenant, User } from '../auth/types.js';
 import type {
   AuditFilter,
   NewUser,
+  SessionSummary,
   ScheduledTask,
   ScheduledTaskInput,
   Store,
@@ -16,6 +17,13 @@ interface MsgRow {
   tenantId: string;
   sessionId: string;
   msg: Msg;
+  createdAt: Date;
+}
+
+function summarize(text: string | undefined, max = 48): string {
+  if (!text) return '';
+  const compact = text.replace(/\s+/g, ' ').trim();
+  return compact.length > max ? `${compact.slice(0, max)}...` : compact;
 }
 
 /** 内存 Store：未配置 MySQL 时的回落实现，亦用于测试。租户隔离同样强制生效。 */
@@ -30,13 +38,36 @@ export class MemoryStore implements Store {
   private userSeq = 0;
 
   async appendMessage(ctx: RequestContext, sessionId: string, msg: Msg): Promise<void> {
-    this.messages.push({ tenantId: ctx.tenantId, sessionId, msg });
+    this.messages.push({ tenantId: ctx.tenantId, sessionId, msg, createdAt: new Date() });
   }
 
   async listMessages(ctx: RequestContext, sessionId: string): Promise<Msg[]> {
     return this.messages
       .filter((r) => r.tenantId === ctx.tenantId && r.sessionId === sessionId)
       .map((r) => r.msg);
+  }
+
+  async listSessions(ctx: RequestContext, limit = 50): Promise<SessionSummary[]> {
+    const bySession = new Map<string, MsgRow[]>();
+    for (const row of this.messages.filter((r) => r.tenantId === ctx.tenantId)) {
+      const rows = bySession.get(row.sessionId) ?? [];
+      rows.push(row);
+      bySession.set(row.sessionId, rows);
+    }
+    return [...bySession.entries()]
+      .map(([sessionId, rows]) => {
+        const firstUser = rows.find((r) => r.msg.role === 'user' && r.msg.text)?.msg.text;
+        const last = rows.at(-1);
+        return {
+          sessionId,
+          title: summarize(firstUser ?? rows[0]?.msg.text ?? sessionId),
+          lastMessage: summarize(last?.msg.text),
+          messageCount: rows.length,
+          updatedAt: last?.createdAt.toISOString(),
+        };
+      })
+      .sort((a, b) => String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')))
+      .slice(0, limit);
   }
 
   async record(event: AuditEvent): Promise<void> {
