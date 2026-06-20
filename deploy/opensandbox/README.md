@@ -75,6 +75,12 @@ kubectl get pods -n opensandbox-system   # controller-manager + server 均 1/1 R
 
 如果只需要代码/命令执行，可以把 `desktop` 设为 `false` 并使用普通解释器镜像。
 
+仓库提供了一个基于 Playwright Ubuntu Noble 镜像的浏览器沙箱示例镜像：
+
+```sh
+docker build -f deploy/opensandbox/Dockerfile.browser -t aiop/opensandbox-browser:latest .
+```
+
 集群外联调用 port-forward：
 
 ```sh

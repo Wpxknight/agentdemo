@@ -25,7 +25,7 @@ data:
         "provider": "opensandbox",
         "domain": "opensandbox-server.opensandbox-system.svc:80",
         "protocol": "http",
-        "defaultImage": "aiop/opensandbox-browser:latest",
+        "defaultImage": "aiop/opensandbox-browser:dev",
         "idleMs": 600000,
         "timeoutMs": 3600000,
         "desktop": true

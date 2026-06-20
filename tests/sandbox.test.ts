@@ -192,6 +192,7 @@ describe('OpenSandboxDesktopProvider', () => {
     expect(provider.create).toHaveBeenCalledOnce();
     expect(handle.runCode).toHaveBeenCalledOnce();
     expect(handle.runCommand).toHaveBeenCalled();
+    expect(handle.runCommand).toHaveBeenCalledWith(expect.stringContaining('/ms-playwright'), { timeoutMs: 30_000 });
     expect(desktop.sandboxId).toBe('shared-sandbox');
   });
 

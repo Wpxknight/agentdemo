@@ -1,0 +1,14 @@
+# Browser-capable OpenSandbox runtime image for aiop.
+#
+# Build:
+#   docker build -f deploy/opensandbox/Dockerfile.browser -t aiop/opensandbox-browser:latest .
+#
+# OpenSandbox overrides the container command with its default idle entrypoint,
+# so the image only needs the binaries that execd commands will call.
+FROM mcr.microsoft.com/playwright:v1.57.0-noble
+
+RUN test -x /usr/bin/python3 \
+  && test -x /usr/bin/node \
+  && CHROME_BIN="$(find /ms-playwright -path '*/chrome-linux*/chrome' -type f | head -n 1)" \
+  && test -x "$CHROME_BIN" \
+  && ln -sf "$CHROME_BIN" /usr/bin/chromium

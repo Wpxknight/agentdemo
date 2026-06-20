@@ -172,7 +172,7 @@ fi
 if curl -fsS http://127.0.0.1:9222/json/version >/dev/null 2>&1; then
   exit 0
 fi
-CHROME_BIN="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium-browser || command -v chromium || command -v chrome || true)"
+CHROME_BIN="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium-browser || command -v chromium || command -v chrome || find /ms-playwright -path '*/chrome-linux*/chrome' -type f 2>/dev/null | head -n 1 || true)"
 if [ -z "$CHROME_BIN" ]; then
   echo "chromium/google-chrome is required for OpenSandbox browser tools" >&2
   exit 127
