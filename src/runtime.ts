@@ -13,6 +13,7 @@ import type { SandboxProvider } from './sandbox/types.js';
 import { WarmPool } from './sandbox/warmpool.js';
 import { E2bDesktopProvider } from './sandbox/e2b-desktop.js';
 import { LocalDesktopProvider } from './sandbox/local-desktop.js';
+import { OpenSandboxDesktopProvider } from './sandbox/opensandbox-desktop.js';
 import type { DesktopHandle, DesktopProvider } from './sandbox/desktop.js';
 import { buildSandboxTools } from './tools/builtin.js';
 import { buildBrowserTools } from './tools/browser.js';
@@ -122,13 +123,13 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
       logger.info({ clusters: clusters.names() }, 'kubectl tool enabled');
     }
 
-    // 桌面 / 浏览器工具：local 使用本机 Chrome；e2b 使用远端桌面。
-    if (config.sandbox.desktop && config.sandbox.provider === 'opensandbox') {
-      logger.warn('opensandbox 后端暂不支持远端桌面/浏览器工具，已跳过 desktop');
-    } else if (config.sandbox.desktop) {
+    // 桌面 / 浏览器工具：opensandbox 复用同一会话沙箱；local/e2b 保持各自后端。
+    if (config.sandbox.desktop) {
       const dp: DesktopProvider = config.sandbox.provider === 'local'
         ? new LocalDesktopProvider()
-        : new E2bDesktopProvider({ apiKey: config.sandbox.apiKey, domain: config.sandbox.domain });
+        : config.sandbox.provider === 'opensandbox'
+          ? new OpenSandboxDesktopProvider(sandboxes)
+          : new E2bDesktopProvider({ apiKey: config.sandbox.apiKey, domain: config.sandbox.domain });
       const resolve = (ctx: { sessionId: string }): Promise<DesktopHandle> => {
         let d = desktops.get(ctx.sessionId);
         if (!d) {

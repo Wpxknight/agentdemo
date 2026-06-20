@@ -57,9 +57,23 @@ kubectl get pods -n opensandbox-system   # controller-manager + server 均 1/1 R
   "provider": "opensandbox",
   "domain": "opensandbox-server.opensandbox-system.svc:80",
   "protocol": "http",
-  "defaultImage": "ubuntu"
+  "desktop": true,
+  "defaultImage": "aiop/opensandbox-browser:latest"
 }
 ```
+
+启用 `desktop: true` 后，aiop 的代码执行、shell 命令、浏览器导航/点击/输入/截图都会按
+`sessionId` 复用同一个 OpenSandbox Pod。浏览器工具不会再创建第二个沙箱；它会在该 Pod 内
+启动 headless Chrome，并通过 Pod 内 Node.js CDP 脚本操作浏览器。
+
+用于浏览器沙箱的镜像必须包含：
+
+- `python3`（默认代码执行语言）
+- `node`，且运行时提供全局 `fetch` / `WebSocket`
+- `chromium`、`chromium-browser` 或 `google-chrome`
+- `bash`、`curl`、`base64`、`mkdir` 等基础工具
+
+如果只需要代码/命令执行，可以把 `desktop` 设为 `false` 并使用普通解释器镜像。
 
 集群外联调用 port-forward：
 

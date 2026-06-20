@@ -25,9 +25,9 @@ data:
         "provider": "opensandbox",
         "domain": "opensandbox-server.opensandbox-system.svc:80",
         "protocol": "http",
-        "defaultImage": "ubuntu",
+        "defaultImage": "aiop/opensandbox-browser:latest",
         "idleMs": 600000,
         "timeoutMs": 3600000,
-        "desktop": false
+        "desktop": true
       }
     }

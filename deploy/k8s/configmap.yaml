@@ -17,5 +17,14 @@ data:
       "defaultModel": "my-claude",
       "skills": { "dir": "./skills" },
       "auth": { "provider": "local" },
-      "sandbox": { "enabled": false }
+      "sandbox": {
+        "enabled": true,
+        "provider": "opensandbox",
+        "domain": "opensandbox-server.opensandbox-system.svc:80",
+        "protocol": "http",
+        "defaultImage": "aiop/opensandbox-browser:latest",
+        "idleMs": 600000,
+        "timeoutMs": 3600000,
+        "desktop": true
+      }
     }

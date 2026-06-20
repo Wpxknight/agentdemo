@@ -137,4 +137,30 @@ describe('local auth bootstrap', () => {
       await rt.dispose();
     }
   });
+
+  it('registers OpenSandbox browser tools from config', async () => {
+    const cfg = parseConfig(`{
+      "models": { "mock": { "protocol": "openai", "baseURL": "http://localhost/v1", "apiKey": "x", "model": "mock" } },
+      "defaultModel": "mock",
+      "sandbox": {
+        "enabled": true,
+        "provider": "opensandbox",
+        "domain": "opensandbox-server.opensandbox-system.svc:80",
+        "protocol": "http",
+        "desktop": true,
+        "defaultImage": "aiop/opensandbox-browser:latest"
+      }
+    }`);
+
+    const rt = await buildRuntime(cfg);
+    try {
+      expect(rt.tools.has('sbx__run_code')).toBe(true);
+      expect(rt.tools.has('sbx__run_command')).toBe(true);
+      expect(rt.tools.has('desktop_stream_url')).toBe(true);
+      expect(rt.tools.has('browser_navigate')).toBe(true);
+      expect(rt.tools.has('browser_screenshot')).toBe(true);
+    } finally {
+      await rt.dispose();
+    }
+  });
 });

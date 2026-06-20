@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { SandboxManager } from '../src/sandbox/lifecycle.js';
 import { LocalSandboxProvider } from '../src/sandbox/local.js';
+import { OpenSandboxDesktopProvider } from '../src/sandbox/opensandbox-desktop.js';
 import { buildSandboxTools } from '../src/tools/builtin.js';
 import type {
   ExecResult,
@@ -164,5 +165,61 @@ describe('LocalSandboxProvider', () => {
     } finally {
       await handle.kill();
     }
+  });
+});
+
+describe('OpenSandboxDesktopProvider', () => {
+  it('reuses the same session sandbox as code tools', async () => {
+    const handle: SandboxHandle = {
+      sandboxId: 'shared-sandbox',
+      runCode: vi.fn(async (code: string) => ({ stdout: `code:${code}`, stderr: '', exitCode: 0 })),
+      runCommand: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+      setTimeout: vi.fn(async () => {}),
+      kill: vi.fn(async () => {}),
+    };
+    const provider: SandboxProvider = {
+      create: vi.fn(async () => handle),
+      connect: vi.fn(async () => handle),
+    };
+    const manager = new SandboxManager({ provider });
+    const [runCode] = buildSandboxTools(manager);
+
+    await runCode!.run({ code: 'print("same")' }, { sessionId: 'sess-k8s' });
+    const desktops = new OpenSandboxDesktopProvider(manager);
+    const desktop = await desktops.create({ key: 'sess-k8s', timeoutMs: 60_000 });
+    await desktop.launch('google-chrome', 'https://example.com');
+
+    expect(provider.create).toHaveBeenCalledOnce();
+    expect(handle.runCode).toHaveBeenCalledOnce();
+    expect(handle.runCommand).toHaveBeenCalled();
+    expect(desktop.sandboxId).toBe('shared-sandbox');
+  });
+
+  it('returns screenshot bytes from the sandbox-local CDP helper output', async () => {
+    const png = Buffer.from([1, 2, 3, 4]);
+    const runCommand = vi.fn(async (command: string): Promise<ExecResult> => {
+      if (command.includes('Page.captureScreenshot')) {
+        return { stdout: `__AIOP_SCREENSHOT__${png.toString('base64')}\n`, stderr: '', exitCode: 0 };
+      }
+      return { stdout: '', stderr: '', exitCode: 0 };
+    });
+    const handle: SandboxHandle = {
+      sandboxId: 'shot-sandbox',
+      runCode: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+      runCommand,
+      setTimeout: vi.fn(async () => {}),
+      kill: vi.fn(async () => {}),
+    };
+    const provider: SandboxProvider = {
+      create: vi.fn(async () => handle),
+      connect: vi.fn(async () => handle),
+    };
+    const manager = new SandboxManager({ provider });
+    const desktop = await new OpenSandboxDesktopProvider(manager).create({ key: 'shot-session' });
+
+    const shot = await desktop.screenshot();
+
+    expect([...shot]).toEqual([1, 2, 3, 4]);
+    expect(runCommand).toHaveBeenCalledWith(expect.stringContaining('Page.captureScreenshot'), { timeoutMs: 15_000 });
   });
 });

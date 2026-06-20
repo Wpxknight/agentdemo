@@ -31,7 +31,7 @@ export const SandboxConfigSchema = z.object({
   idleMs: z.number().int().positive().optional(),
   /** 沙箱存活超时(ms)。 */
   timeoutMs: z.number().int().positive().optional(),
-  /** 启用桌面 / 浏览器工具；local 使用本机 Chrome，e2b 使用 @e2b/desktop。 */
+  /** 启用桌面 / 浏览器工具；opensandbox 在同一会话 Pod 内启动 Chrome。 */
   desktop: z.boolean().default(false),
   /** 预热池大小（>0 时启用；仅未配置集群时生效，避免与集群专用模板冲突）。 */
   warmPoolSize: z.number().int().positive().optional(),
