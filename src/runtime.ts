@@ -36,6 +36,7 @@ import type { RequestContext } from './auth/types.js';
 export interface Runtime {
   model: ChatModel;
   modelConfig?: RuntimeModelConfig;
+  modelOptions?: RuntimeModelConfig[];
   updateModel?(config: RuntimeModelConfig): void;
   tools: ToolRegistry;
   clusters: ClusterRegistry;
@@ -65,6 +66,7 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
   if (!modelCfg) throw new Error(`defaultModel not found: ${config.defaultModel}`);
   const model = createModel(config.defaultModel, modelCfg);
   const modelConfig: RuntimeModelConfig = { id: config.defaultModel, ...modelCfg };
+  const modelOptions: RuntimeModelConfig[] = Object.entries(config.models).map(([id, cfg]) => ({ id, ...cfg }));
   const tools = new ToolRegistry();
 
   const store = await createStore(readMysqlConfig());
@@ -202,6 +204,7 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
   const runtime: Runtime = {
     model,
     modelConfig,
+    modelOptions,
     updateModel(next: RuntimeModelConfig) {
       runtime.model = createModel(next.id, next);
       runtime.modelConfig = { ...next };

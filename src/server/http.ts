@@ -57,18 +57,31 @@ async function sendWebAsset(res: Res, path: string): Promise<boolean> {
     res.end();
     return true;
   }
-  const assets: Record<string, { file: string; type: string }> = {
-    '/': { file: 'index.html', type: 'text/html; charset=utf-8' },
-    '/index.html': { file: 'index.html', type: 'text/html; charset=utf-8' },
-    '/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8' },
-    '/styles.css': { file: 'styles.css', type: 'text/css; charset=utf-8' },
-  };
-  const asset = assets[path];
-  if (!asset) return false;
-  const buf = await readFile(new URL(`../../web/${asset.file}`, import.meta.url));
-  res.writeHead(200, { 'content-type': asset.type, 'content-length': buf.length });
+  const cleanPath = decodeURIComponent(path).replace(/^\/+/, '');
+  if (cleanPath.includes('..')) return false;
+  const isSpaRoute = path === '/' || path === '/index.html' || path === '/login';
+  const assetPath = isSpaRoute ? 'index.html' : cleanPath;
+  if (!isSpaRoute && !assetPath.startsWith('assets/')) return false;
+  const buf = await readWebFile(`dist/${assetPath}`).catch(() => undefined);
+  if (!buf) return false;
+  res.writeHead(200, { 'content-type': contentType(assetPath), 'content-length': buf.length });
   res.end(buf);
   return true;
+}
+
+async function readWebFile(file: string): Promise<Buffer> {
+  return readFile(new URL(`../../web/${file}`, import.meta.url));
+}
+
+function contentType(path: string): string {
+  if (path.endsWith('.html')) return 'text/html; charset=utf-8';
+  if (path.endsWith('.js')) return 'text/javascript; charset=utf-8';
+  if (path.endsWith('.css')) return 'text/css; charset=utf-8';
+  if (path.endsWith('.svg')) return 'image/svg+xml';
+  if (path.endsWith('.png')) return 'image/png';
+  if (path.endsWith('.jpg') || path.endsWith('.jpeg')) return 'image/jpeg';
+  if (path.endsWith('.webp')) return 'image/webp';
+  return 'application/octet-stream';
 }
 
 function parseCookies(header: string | undefined): Record<string, string> {
@@ -110,17 +123,21 @@ function maskApiKey(apiKey: string): string {
   return `${apiKey.slice(0, 3)}...${apiKey.slice(-3)}`;
 }
 
-function modelSettingsBody(config: RuntimeModelConfig): Record<string, unknown> {
+function publicModelConfig(config: RuntimeModelConfig): Record<string, unknown> {
   return {
-    config: {
-      id: config.id,
-      protocol: config.protocol,
-      base_url: config.baseURL,
-      model: config.model,
-      api_key_set: Boolean(config.apiKey),
-      api_key_preview: maskApiKey(config.apiKey),
-    },
+    id: config.id,
+    protocol: config.protocol,
+    base_url: config.baseURL,
+    model: config.model,
+    api_key_set: Boolean(config.apiKey),
+    api_key_preview: maskApiKey(config.apiKey),
   };
+}
+
+function modelSettingsBody(config: RuntimeModelConfig, options: RuntimeModelConfig[] = []): Record<string, unknown> {
+  const body: Record<string, unknown> = { config: publicModelConfig(config) };
+  if (options.length) body.options = options.map(publicModelConfig);
+  return body;
 }
 
 function parseProtocol(value: string | undefined): 'anthropic' | 'openai' {
@@ -132,7 +149,15 @@ function parseProtocol(value: string | undefined): 'anthropic' | 'openai' {
 function modelConfigFromBody(
   body: Record<string, unknown>,
   current: RuntimeModelConfig,
+  options: RuntimeModelConfig[] = [],
 ): RuntimeModelConfig {
+  const requestedId = str(body, 'id') ?? str(body, 'model_id');
+  const hasExplicitFields = ['protocol', 'base_url', 'baseURL', 'api_key', 'apiKey', 'model'].some((key) => body[key] !== undefined);
+  if (requestedId && !hasExplicitFields) {
+    const selected = options.find((option) => option.id === requestedId || option.model === requestedId);
+    if (!selected) throw new HttpError(400, `未知模型：${requestedId}`);
+    return { ...selected };
+  }
   const protocol = parseProtocol(str(body, 'protocol') ?? current.protocol);
   const baseURL = (str(body, 'base_url') ?? str(body, 'baseURL') ?? current.baseURL).trim();
   const model = (str(body, 'model') ?? current.model).trim();
@@ -449,25 +474,25 @@ async function handle(
   if (route === 'GET /v1/settings/llm') {
     const ctx = await requireAuth(rt, req);
     requirePermission(ctx, 'tenant:manage');
-    return sendJson(res, 200, modelSettingsBody(currentModelConfig(rt)));
+    return sendJson(res, 200, modelSettingsBody(currentModelConfig(rt), rt.modelOptions));
   }
   if (route === 'POST /v1/settings/llm') {
     const ctx = await requireAuth(rt, req);
     requirePermission(ctx, 'tenant:manage');
-    const next = modelConfigFromBody(await readJson(req), currentModelConfig(rt));
+    const next = modelConfigFromBody(await readJson(req), currentModelConfig(rt), rt.modelOptions);
     if (rt.updateModel) rt.updateModel(next);
     else {
       rt.model = createModel(next.id, next);
       rt.modelConfig = { ...next };
     }
-    return sendJson(res, 200, modelSettingsBody(next));
+    return sendJson(res, 200, modelSettingsBody(next, rt.modelOptions));
   }
   if (route === 'POST /v1/settings/llm/test') {
     const ctx = await requireAuth(rt, req);
     requirePermission(ctx, 'tenant:manage');
     const body = await readJson(req);
     const hasBody = Object.keys(body).length > 0;
-    const config = hasBody ? modelConfigFromBody(body, currentModelConfig(rt)) : currentModelConfig(rt);
+    const config = hasBody ? modelConfigFromBody(body, currentModelConfig(rt), rt.modelOptions) : currentModelConfig(rt);
     const model = hasBody ? createModel(config.id, config) : rt.model;
     let text = '';
     try {
@@ -482,7 +507,7 @@ async function handle(
     } catch (err) {
       throw new HttpError(502, err instanceof Error ? err.message : '模型连接测试失败');
     }
-    return sendJson(res, 200, { ok: true, text: text.trim(), ...modelSettingsBody(config) });
+    return sendJson(res, 200, { ok: true, text: text.trim(), ...modelSettingsBody(config, rt.modelOptions) });
   }
 
   // —— 交互式审批 ——

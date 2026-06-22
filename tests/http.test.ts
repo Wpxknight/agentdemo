@@ -60,6 +60,22 @@ beforeAll(async () => {
         },
       };
     },
+    modelOptions: [
+      {
+        id: 'mock',
+        protocol: 'anthropic',
+        baseURL: 'http://localhost:8000/v1',
+        apiKey: 'initial-key',
+        model: 'mock-model',
+      },
+      {
+        id: 'glm-5',
+        protocol: 'anthropic',
+        baseURL: 'http://192.168.10.108:18317',
+        apiKey: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
+        model: 'glm-5',
+      },
+    ],
     tools: new ToolRegistry(),
     store,
     policy: new AllowAllPolicy(),
@@ -177,6 +193,13 @@ describe('HTTP server', () => {
     expect(nf.status).toBe(404);
   });
 
+  it('serves the frontend shell for the login page route', async () => {
+    const r = await fetch(`${base}/login`);
+    expect(r.status).toBe(200);
+    expect(r.headers.get('content-type')).toContain('text/html');
+    expect(await r.text()).toContain('/app.js');
+  });
+
   it('reads, updates, and tests runtime LLM settings', async () => {
     const initial = await fetch(`${base}/v1/settings/llm`, {
       headers: { authorization: `Bearer ${token}` },
@@ -191,6 +214,24 @@ describe('HTTP server', () => {
         api_key_set: true,
         api_key_preview: 'ini...key',
       },
+      options: [
+        {
+          id: 'mock',
+          protocol: 'anthropic',
+          base_url: 'http://localhost:8000/v1',
+          model: 'mock-model',
+          api_key_set: true,
+          api_key_preview: 'ini...key',
+        },
+        {
+          id: 'glm-5',
+          protocol: 'anthropic',
+          base_url: 'http://192.168.10.108:18317',
+          model: 'glm-5',
+          api_key_set: true,
+          api_key_preview: 'tes...aZ3',
+        },
+      ],
     });
 
     const updated = await fetch(`${base}/v1/settings/llm`, {
@@ -203,7 +244,7 @@ describe('HTTP server', () => {
       }),
     });
     expect(updated.status).toBe(200);
-    expect(await updated.json()).toEqual({
+    expect(await updated.json()).toMatchObject({
       config: {
         id: 'glm-5',
         protocol: 'anthropic',
@@ -237,6 +278,21 @@ describe('HTTP server', () => {
         protocol: 'openai',
         base_url: 'http://192.168.10.108:18317',
         model: 'glm-5',
+      },
+    });
+
+    const optionSwitch = await fetch(`${base}/v1/settings/llm`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ id: 'mock' }),
+    });
+    expect(optionSwitch.status).toBe(200);
+    expect(await optionSwitch.json()).toMatchObject({
+      config: {
+        id: 'mock',
+        protocol: 'anthropic',
+        base_url: 'http://localhost:8000/v1',
+        model: 'mock-model',
       },
     });
   });

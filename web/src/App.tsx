@@ -1,0 +1,1696 @@
+import { type CSSProperties, type FormEvent, type KeyboardEvent, type PointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Activity,
+  Bot,
+  Boxes,
+  CalendarClock,
+  Check,
+  CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
+  Code2,
+  Cuboid,
+  Cpu,
+  Database,
+  Globe,
+  KeyRound,
+  Link2,
+  LogOut,
+  MessageSquare,
+  Monitor,
+  PanelLeftClose,
+  PanelRightClose,
+  Paperclip,
+  Play,
+  Plus,
+  RefreshCcw,
+  Search,
+  Send,
+  Settings,
+  ShieldCheck,
+  Terminal,
+  TerminalSquare,
+  Trash2,
+  User,
+  X,
+} from 'lucide-react';
+import { NAV_ITEMS, defaultLlmConfig, fallbackSandboxes, fallbackSessions, fallbackTasks, fallbackTools } from './app-data';
+import { createApi, randomId, readStorage, writeStorage } from './api';
+import type {
+  Attachment,
+  ChatMessage,
+  ModelSettingsBody,
+  PageId,
+  RuntimeModelConfig,
+  SandboxSummary,
+  SandboxesBody,
+  ScheduleBody,
+  ScheduledTask,
+  SessionSummary,
+  SessionsBody,
+  ToolCallBody,
+  ToolSummary,
+  ToolsBody,
+} from './types';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Separator } from '@/components/ui/separator';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Textarea } from '@/components/ui/textarea';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import { cn } from '@/lib/utils';
+
+const iconMap = {
+  chat: MessageSquare,
+  skills: Boxes,
+  mcp: Link2,
+  schedule: CalendarClock,
+  sandbox: Cuboid,
+  settings: Settings,
+};
+
+const logoUrl = '/assets/logo.jpg';
+const aiAvatarUrl = '/assets/ai-avatar.jpg';
+const userAvatarUrl = '/assets/user-avatar.jpg';
+
+function sessionCategoryFor(session: SessionSummary) {
+  const text = `${session.title} ${session.desc}`.toLowerCase();
+  if (text.includes('pod') || text.includes('异常') || text.includes('oom')) {
+    return { Icon: TerminalSquare, tone: 'danger' };
+  }
+  if (text.includes('巡检') || text.includes('任务')) {
+    return { Icon: CalendarClock, tone: 'info' };
+  }
+  if (text.includes('告警')) {
+    return { Icon: Activity, tone: 'warning' };
+  }
+  if (text.includes('资源') || text.includes('优化')) {
+    return { Icon: Database, tone: 'success' };
+  }
+  return { Icon: MessageSquare, tone: 'neutral' };
+}
+
+const initialMessages: ChatMessage[] = [
+  {
+    role: 'assistant',
+    text: '你好，我是你的 AI 运维助手。\n\n可以帮你查询集群状态、分析告警、执行变更、管理配置和排查问题。',
+    time: '10:15',
+  },
+  {
+    role: 'user',
+    text: '帮我检查 prod 命名空间下 aiop-server 的 Pod 异常，并给出修复建议。',
+    time: '10:16',
+  },
+  {
+    role: 'assistant',
+    text: '已发现 aiop-server-6d9c 最近一次重启原因是 OOMKilled。\n\n建议先查看资源限制，再评估是否调整内存并滚动重启。',
+    time: '10:16',
+    tools: ['kubectl get pods', 'kubectl describe pod', '生成修复建议'],
+  },
+];
+
+function initialPage(): PageId | 'login' {
+  if (typeof window !== 'undefined' && window.location.pathname === '/login') return 'login';
+  return 'chat';
+}
+
+function formatTime(value?: string): string {
+  if (!value) return '';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+}
+
+function formatDateTime(value?: string): string {
+  if (!value) return '-';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return '-';
+  return d.toLocaleString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function clampPreviewWidth(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 440;
+  return Math.min(760, Math.max(360, Math.round(n)));
+}
+
+function formatError(err: unknown): string {
+  return err instanceof Error ? err.message : String(err || '未知错误');
+}
+
+function formatFileSize(size: number): string {
+  if (!Number.isFinite(size) || size <= 0) return '0 B';
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function toolCategory(name: string): string {
+  if (name === 'load_skill' || name.startsWith('skill__')) return 'skill';
+  if (name.startsWith('mcp__')) return 'mcp';
+  if (name.startsWith('sbx__') || name.startsWith('browser_') || name === 'desktop_stream_url') return 'sandbox';
+  return 'builtin';
+}
+
+function toolDisplayName(name = ''): string {
+  return name.replace(/^mcp__/, '').replace(/^skill__/, '').replace(/^sbx__/, '');
+}
+
+function mcpServerName(name = ''): string {
+  const parts = name.split('__');
+  return parts.length >= 3 ? parts[1] || name : name;
+}
+
+function humanizeCron(cron: string): string {
+  const map: Record<string, string> = {
+    '0 2 * * *': '每天 02:00',
+    '0 1 * * *': '每天 01:00',
+    '0 * * * *': '每小时',
+    '0 9 * * 1': '每周一 09:00',
+  };
+  return map[cron] || cron || '-';
+}
+
+function resourceSummary(resources?: Record<string, string>): string {
+  if (!resources) return '-';
+  return [resources.cpu, resources.memory, resources.storage].filter(Boolean).join(' / ') || '-';
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('读取附件失败'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function parseSse(block: string): { event?: string; data?: Record<string, unknown> } | undefined {
+  const eventLine = block.split('\n').find((line) => line.startsWith('event:'));
+  const dataLine = block.split('\n').find((line) => line.startsWith('data:'));
+  if (!eventLine) return undefined;
+  const event = eventLine.slice('event:'.length).trim();
+  const raw = dataLine?.slice('data:'.length).trim();
+  if (!raw) return { event };
+  try {
+    return { event, data: JSON.parse(raw) as Record<string, unknown> };
+  } catch {
+    return { event, data: { text: raw } };
+  }
+}
+
+function formatToolResponse(body: ToolCallBody): string {
+  const content = body.result?.content || body.error || '操作完成。';
+  const image = body.result?.contentBlocks?.find((block) => block.type === 'image');
+  return image?.data ? `${content}\n[image] ${image.mimeType || 'image/png'} ${image.data.length} bytes base64` : content;
+}
+
+function extractUrl(text: string): string {
+  return text.match(/data:text\/html[^ \n)]+/)?.[0]
+    || text.match(/https?:\/\/[^\s)]+/)?.[0]
+    || text.match(/\/[a-zA-Z0-9_./?=&%-]+/)?.[0]
+    || '';
+}
+
+function publicAttachment(file: Attachment): Omit<Attachment, 'id'> {
+  const { id: _id, ...rest } = file;
+  return rest;
+}
+
+function BrandLogo({ className }: { className?: string }) {
+  return (
+    <span className={cn('brand-logo', className)} aria-hidden="true">
+      <img src={logoUrl} alt="" />
+    </span>
+  );
+}
+
+function MessageAvatar({ isUser }: { isUser: boolean }) {
+  return (
+    <div className={cn('avatar', 'message-avatar-image', isUser && 'user-avatar')}>
+      <img src={isUser ? userAvatarUrl : aiAvatarUrl} alt="" />
+      <span>{isUser ? <User /> : <Bot />}</span>
+    </div>
+  );
+}
+
+export default function App() {
+  const [page, setPage] = useState<PageId | 'login'>(initialPage);
+  const [token, setToken] = useState(() => readStorage('aiop_token'));
+  const [sessionId, setSessionId] = useState(() => readStorage('aiop_session_id') || randomId());
+  const [sessions, setSessions] = useState<SessionSummary[]>(fallbackSessions);
+  const [tools, setTools] = useState<ToolSummary[]>([]);
+  const [tasks, setTasks] = useState<ScheduledTask[]>([]);
+  const [sandboxes, setSandboxes] = useState<SandboxSummary[]>([]);
+  const [llm, setLlm] = useState<RuntimeModelConfig>(defaultLlmConfig);
+  const [settingsStatus, setSettingsStatus] = useState('');
+  const [authStatus, setAuthStatus] = useState('');
+  const [historyOpen, setHistoryOpen] = useState(true);
+  const [previewOpen, setPreviewOpen] = useState(true);
+  const [previewWidth, setPreviewWidth] = useState(() => clampPreviewWidth(readStorage('aiop_sandbox_width') || 440));
+  const [sandboxOutput, setSandboxOutput] = useState('沙箱输出会显示在这里。');
+  const [browserStreamUrl, setBrowserStreamUrl] = useState('');
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [toolTestOutput, setToolTestOutput] = useState('');
+  const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    writeStorage('aiop_session_id', sessionId);
+  }, [sessionId]);
+
+  const redirectToLogin = useCallback(() => {
+    setPage('login');
+    setToken('');
+    writeStorage('aiop_token', '');
+    if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
+      window.history.replaceState({}, '', '/login');
+    }
+  }, []);
+
+  const routeAfterLogin = useCallback(() => {
+    setPage('chat');
+    if (typeof window !== 'undefined' && window.location.pathname === '/login') {
+      window.history.replaceState({}, '', '/');
+    }
+  }, []);
+
+  const api = useMemo(() => createApi(token, redirectToLogin), [token, redirectToLogin]);
+
+  const loadLlmSettings = useCallback(async () => {
+    const body = await api.get<ModelSettingsBody>('/v1/settings/llm');
+    setLlm((current) => ({ ...current, ...body.config, options: body.options || current.options || [] }));
+  }, [api]);
+
+  const loadPageData = useCallback(async (target: PageId | 'login' = page) => {
+    if (!token || target === 'login') return;
+    try {
+      if (target === 'chat') {
+        await loadLlmSettings();
+        const body = await api.get<SessionsBody>('/v1/sessions?limit=20');
+        setSessions(body.sessions?.map((session) => ({
+          title: session.title || session.sessionId,
+          time: formatTime(session.updatedAt),
+          desc: session.lastMessage || `${session.messageCount ?? 0} 条消息`,
+          sessionId: session.sessionId,
+        })) || fallbackSessions);
+      }
+      if (target === 'skills' || target === 'mcp') {
+        const body = await api.get<ToolsBody>('/v1/tools');
+        setTools(body.tools || []);
+      }
+      if (target === 'schedule') {
+        const body = await api.get<ScheduleBody>('/v1/schedule');
+        setTasks(body.tasks || []);
+      }
+      if (target === 'sandbox') {
+        const body = await api.get<SandboxesBody>('/v1/sandboxes');
+        setSandboxes(body.sandboxes || []);
+      }
+      if (target === 'settings') await loadLlmSettings();
+    } catch (err) {
+      console.error(err);
+    }
+  }, [api, loadLlmSettings, page, token]);
+
+  useEffect(() => {
+    if (!token && page !== 'login') {
+      redirectToLogin();
+      return;
+    }
+    void loadPageData(page);
+  }, [loadPageData, page, redirectToLogin, token]);
+
+  async function submitLogin(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const tenantId = String(form.get('tenantId') || 'default').trim() || 'default';
+    const username = String(form.get('username') || '').trim();
+    const password = String(form.get('password') || '');
+    if (!username || !password) {
+      setAuthStatus('请输入用户名和密码。');
+      return;
+    }
+    setAuthStatus('正在登录...');
+    const response = await fetch('/auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tenantId, username, password }),
+    });
+    if (!response.ok) {
+      setAuthStatus('登录失败，请检查用户名或密码。');
+      return;
+    }
+    const body = await response.json() as { token: string };
+    setToken(body.token);
+    writeStorage('aiop_token', body.token);
+    setAuthStatus('');
+    routeAfterLogin();
+  }
+
+  function navigate(next: PageId) {
+    if (!token) {
+      redirectToLogin();
+      return;
+    }
+    setPage(next);
+    if (typeof window !== 'undefined') window.history.replaceState({}, '', '/');
+  }
+
+  async function addAttachments(fileList: FileList | null) {
+    const files = [...(fileList || [])].slice(0, 6);
+    if (!files.length) return;
+    const loaded: Attachment[] = [];
+    for (const file of files) {
+      loaded.push({
+        id: randomId(),
+        name: file.name || 'attachment',
+        type: file.type || 'application/octet-stream',
+        size: file.size || 0,
+        data: await readFileAsDataUrl(file),
+      });
+    }
+    setAttachments((current) => [...current, ...loaded]);
+  }
+
+  function insertComposerNewline(textarea: HTMLTextAreaElement) {
+    const start = textarea.selectionStart ?? textarea.value.length;
+    const end = textarea.selectionEnd ?? start;
+    if (typeof textarea.setRangeText === 'function') {
+      textarea.setRangeText('\n', start, end, 'end');
+    } else {
+      textarea.value = `${textarea.value.slice(0, start)}\n${textarea.value.slice(end)}`;
+      textarea.selectionStart = textarea.selectionEnd = start + 1;
+    }
+  }
+
+  async function runAgent(task: string, files: Omit<Attachment, 'id'>[] = []) {
+    const payload = { task, sessionId, attachments: files };
+    const response = await fetch('/v1/agent', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify(payload),
+    });
+    if (response.status === 401) {
+      redirectToLogin();
+      return;
+    }
+    if (!response.ok || !response.body) {
+      setMessages((current) => [...current, { role: 'assistant', text: `请求失败：${response.status}`, time: new Date().toLocaleTimeString() }]);
+      return;
+    }
+    const assistant: ChatMessage = { role: 'assistant', text: '', time: new Date().toLocaleTimeString() };
+    setMessages((current) => [...current, assistant]);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop() || '';
+      for (const part of parts) {
+        const event = parseSse(part);
+        if (event?.event === 'text_delta' && typeof event.data?.text === 'string') {
+          assistant.text += event.data.text;
+          setMessages((current) => current.map((message) => (message === assistant ? { ...assistant } : message)));
+        }
+        if (event?.event === 'done' && typeof event.data?.sessionId === 'string') {
+          setSessionId(event.data.sessionId);
+        }
+      }
+    }
+    await loadPageData(page);
+  }
+
+  async function sendComposer() {
+    const textarea = composerRef.current;
+    const task = textarea?.value.trim() || '';
+    const files = attachments.map(publicAttachment);
+    if (!task && !files.length) return;
+    const sentAttachments = attachments;
+    setMessages((current) => [...current, {
+      role: 'user',
+      text: task || '请分析上传附件。',
+      time: new Date().toLocaleTimeString(),
+      attachments: sentAttachments,
+    }]);
+    if (textarea) textarea.value = '';
+    setAttachments([]);
+    await runAgent(task, files);
+  }
+
+  function handleComposerKeydown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== 'Enter') return;
+    if (event.shiftKey) return;
+    if (event.altKey) {
+      event.preventDefault();
+      insertComposerNewline(event.currentTarget);
+      return;
+    }
+    event.preventDefault();
+    void sendComposer();
+  }
+
+  async function runSandboxCode(code: string, language: string) {
+    if (!code.trim()) return;
+    setSandboxOutput('正在沙箱中运行代码...');
+    try {
+      const body = await api.post<ToolCallBody>('/v1/sandbox/run-code', { sessionId, code, language });
+      setSandboxOutput(formatToolResponse(body));
+    } catch (err) {
+      setSandboxOutput(`运行失败：${formatError(err)}`);
+    }
+  }
+
+  async function openBrowserStream() {
+    setSandboxOutput('正在获取浏览器预览...');
+    try {
+      const body = await api.post<ToolCallBody>('/v1/browser/stream', { sessionId });
+      const text = formatToolResponse(body);
+      const url = extractUrl(text);
+      if (url) setBrowserStreamUrl(url);
+      setSandboxOutput(url ? `${text}\n已加载到右侧预览。` : text);
+    } catch (err) {
+      setSandboxOutput(`预览获取失败：${formatError(err)}`);
+    }
+  }
+
+  async function captureBrowserScreenshot() {
+    setSandboxOutput('正在刷新浏览器截图...');
+    try {
+      const body = await api.post<ToolCallBody>('/v1/browser/screenshot', { sessionId });
+      setSandboxOutput(formatToolResponse(body));
+    } catch (err) {
+      setSandboxOutput(`截图失败：${formatError(err)}`);
+    }
+  }
+
+  async function switchComposerModel(id: string) {
+    if (!id) return;
+    setSettingsStatus('正在切换模型...');
+    try {
+      const body = await api.post<ModelSettingsBody>('/v1/settings/llm', { id });
+      setLlm((current) => ({ ...current, ...body.config, options: body.options || current.options || [] }));
+      setSettingsStatus('模型已切换。');
+    } catch (err) {
+      setSettingsStatus(`模型切换失败：${formatError(err)}`);
+    }
+  }
+
+  function startPreviewResize(event: PointerEvent<HTMLButtonElement>) {
+    if (!previewOpen) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = previewWidth;
+    document.body.classList.add('resizing-preview');
+    const move = (moveEvent: globalThis.PointerEvent) => {
+      setPreviewWidth(clampPreviewWidth(startWidth - (moveEvent.clientX - startX)));
+    };
+    const up = () => {
+      document.body.classList.remove('resizing-preview');
+      writeStorage('aiop_sandbox_width', String(clampPreviewWidth(startWidth)));
+      document.removeEventListener('pointermove', move);
+      document.removeEventListener('pointerup', up);
+    };
+    document.addEventListener('pointermove', move);
+    document.addEventListener('pointerup', up);
+  }
+
+  useEffect(() => {
+    writeStorage('aiop_sandbox_width', String(previewWidth));
+  }, [previewWidth]);
+
+  async function testTool(name: string, rawArgs: string) {
+    if (!name) return;
+    setToolTestOutput('正在调用工具...');
+    try {
+      const args = rawArgs.trim() ? JSON.parse(rawArgs) as unknown : {};
+      const body = await api.post<ToolCallBody>('/v1/tools/call', { sessionId, name, args });
+      setToolTestOutput(formatToolResponse(body));
+    } catch (err) {
+      setToolTestOutput(`调用失败：${formatError(err)}`);
+    }
+  }
+
+  async function testSkillTool(name: string, rawArgs: string) {
+    await testTool(name, rawArgs);
+  }
+
+  async function testMcpTool(name: string, rawArgs: string) {
+    await testTool(name, rawArgs);
+  }
+
+  if (page === 'login') {
+    return <LoginPage authStatus={authStatus} onSubmit={submitLogin} />;
+  }
+
+  const activePage = page as PageId;
+  const skillTools = tools.filter((tool) => (tool.category || toolCategory(tool.name)) === 'skill');
+  const mcpTools = tools.filter((tool) => (tool.category || toolCategory(tool.name)) === 'mcp');
+  const startNewSession = () => {
+    const id = randomId();
+    setSessionId(id);
+    writeStorage('aiop_session_id', id);
+    setMessages(initialMessages.slice(0, 1));
+  };
+
+  if (activePage === 'chat') {
+    return (
+      <TooltipProvider>
+        <PrototypeChatShell
+          token={token}
+          historyOpen={historyOpen}
+          previewOpen={previewOpen}
+          previewWidth={previewWidth}
+          sessions={sessions}
+          messages={messages}
+          attachments={attachments}
+          llm={llm}
+          settingsStatus={settingsStatus}
+          sandboxOutput={sandboxOutput}
+          browserStreamUrl={browserStreamUrl}
+          composerRef={composerRef}
+          fileInputRef={fileInputRef}
+          onNavigate={navigate}
+          onLogout={redirectToLogin}
+          onToggleHistory={() => setHistoryOpen((value) => !value)}
+          onTogglePreview={() => setPreviewOpen((value) => !value)}
+          onNewSession={startNewSession}
+          onChooseAttachment={() => fileInputRef.current?.click()}
+          onAddAttachments={(files) => void addAttachments(files)}
+          onRemoveAttachment={(id) => setAttachments((current) => current.filter((file) => file.id !== id))}
+          onComposerKeydown={handleComposerKeydown}
+          onSubmitComposer={(event) => {
+            event.preventDefault();
+            void sendComposer();
+          }}
+          onModelSwitch={(id) => void switchComposerModel(id)}
+          onRunSandbox={runSandboxCode}
+          onOpenPreview={() => void openBrowserStream()}
+          onRefreshPreview={() => void captureBrowserScreenshot()}
+          onStartResize={startPreviewResize}
+        />
+      </TooltipProvider>
+    );
+  }
+
+  return (
+    <TooltipProvider>
+      <div className="app-shell">
+        <Sidebar page={activePage} onNavigate={navigate} />
+        <main className="main-shell">
+          <Topbar token={token} onLogout={redirectToLogin} />
+          <section className="content-shell content-wide">
+            {activePage === 'skills' && <SkillsPage tools={skillTools.length ? skillTools : fallbackTools.filter((tool) => tool.category === 'skill')} output={toolTestOutput} onTest={testSkillTool} />}
+            {activePage === 'mcp' && <McpPage tools={mcpTools.length ? mcpTools : fallbackTools.filter((tool) => tool.category === 'mcp')} output={toolTestOutput} onTest={testMcpTool} />}
+            {activePage === 'schedule' && <SchedulePage tasks={tasks.length ? tasks : fallbackTasks} />}
+            {activePage === 'sandbox' && <SandboxPage sandboxes={sandboxes.length ? sandboxes : fallbackSandboxes} />}
+            {activePage === 'settings' && <SettingsPage llm={llm} status={settingsStatus} api={api} onLlmChange={setLlm} onStatus={setSettingsStatus} />}
+          </section>
+        </main>
+      </div>
+    </TooltipProvider>
+  );
+}
+
+function Sidebar({ page, onNavigate }: { page: PageId; onNavigate: (page: PageId) => void }) {
+  return (
+    <aside className="sidebar" aria-label="主导航">
+      <BrandLogo className="brand-logo-rail" />
+      <nav className="nav-rail">
+        {NAV_ITEMS.map((item) => {
+          const Icon = iconMap[item.icon];
+          return (
+            <Tooltip key={item.id}>
+              <TooltipTrigger asChild>
+                <button
+                  className={cn('nav-btn', page === item.id && 'active')}
+                  type="button"
+                  aria-label={item.label}
+                  onClick={() => onNavigate(item.id)}
+                >
+                  <Icon />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="right">{item.label}</TooltipContent>
+            </Tooltip>
+          );
+        })}
+      </nav>
+    </aside>
+  );
+}
+
+function Topbar({ token, onLogout }: { token: string; onLogout: () => void }) {
+  return (
+    <header className="topbar">
+      <div className="topbar-title">
+        <BrandLogo className="brand-logo-topbar" />
+        <strong>AIOP</strong>
+        <span>AI 运维工作台</span>
+      </div>
+      <div className="topbar-actions">
+        <Badge variant="outline">租户 default</Badge>
+        <Badge variant="secondary">{token ? 'platform_admin' : '未登录'}</Badge>
+        <Button variant="ghost" size="sm" onClick={onLogout}>
+          <LogOut data-icon="inline-start" />
+          退出
+        </Button>
+      </div>
+    </header>
+  );
+}
+
+function PrototypeChatShell(props: {
+  token: string;
+  historyOpen: boolean;
+  previewOpen: boolean;
+  previewWidth: number;
+  sessions: SessionSummary[];
+  messages: ChatMessage[];
+  attachments: Attachment[];
+  llm: RuntimeModelConfig;
+  settingsStatus: string;
+  sandboxOutput: string;
+  browserStreamUrl: string;
+  composerRef: React.RefObject<HTMLTextAreaElement | null>;
+  fileInputRef: React.RefObject<HTMLInputElement | null>;
+  onNavigate: (page: PageId) => void;
+  onLogout: () => void;
+  onToggleHistory: () => void;
+  onTogglePreview: () => void;
+  onNewSession: () => void;
+  onChooseAttachment: () => void;
+  onAddAttachments: (files: FileList | null) => void;
+  onRemoveAttachment: (id: string) => void;
+  onComposerKeydown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
+  onSubmitComposer: (event: FormEvent<HTMLFormElement>) => void;
+  onModelSwitch: (id: string) => void;
+  onRunSandbox: (code: string, language: string) => void;
+  onOpenPreview: () => void;
+  onRefreshPreview: () => void;
+  onStartResize: (event: PointerEvent<HTMLButtonElement>) => void;
+}) {
+  return (
+    <div className="prototype-chat-page">
+      <header className="prototype-topbar">
+        <div className="prototype-brand">
+          <BrandLogo className="prototype-brand-logo" />
+          <strong>AIOP</strong>
+        </div>
+        <div className="prototype-account">
+          <span>租户 default</span>
+          <div>
+            <img src={userAvatarUrl} alt="" />
+            <strong>{props.token ? 'platform_admin' : '未登录'}</strong>
+          </div>
+          <button type="button" onClick={props.onLogout}>
+            <LogOut />
+            退出
+          </button>
+        </div>
+      </header>
+      <div className="prototype-main-content" id="main-content" style={{ '--sandbox-width': `${props.previewWidth}px` } as CSSProperties}>
+        <PrototypeSidebarNav onNavigate={props.onNavigate} />
+        {props.historyOpen ? (
+          <PrototypeSessionPanel sessions={props.sessions} onToggle={props.onToggleHistory} />
+        ) : (
+          <div className="prototype-collapsed-panel prototype-collapsed-left">
+            <button type="button" onClick={props.onToggleHistory} aria-label="展开最近会话">
+              <ChevronRight />
+            </button>
+          </div>
+        )}
+        <main className="prototype-chat-center">
+          <PrototypeChatHeader onNewSession={props.onNewSession} onToggleHistory={props.onToggleHistory} onTogglePreview={props.onTogglePreview} />
+          <PrototypeMessages messages={props.messages} />
+          <PrototypeComposer
+            llm={props.llm}
+            settingsStatus={props.settingsStatus}
+            attachments={props.attachments}
+            composerRef={props.composerRef}
+            fileInputRef={props.fileInputRef}
+            onChooseAttachment={props.onChooseAttachment}
+            onAddAttachments={props.onAddAttachments}
+            onRemoveAttachment={props.onRemoveAttachment}
+            onComposerKeydown={props.onComposerKeydown}
+            onSubmitComposer={props.onSubmitComposer}
+            onModelSwitch={props.onModelSwitch}
+          />
+        </main>
+        {props.previewOpen ? (
+          <PrototypeSandboxPanel
+            sandboxOutput={props.sandboxOutput}
+            browserStreamUrl={props.browserStreamUrl}
+            onRunSandbox={props.onRunSandbox}
+            onOpenPreview={props.onOpenPreview}
+            onRefreshPreview={props.onRefreshPreview}
+            onStartResize={props.onStartResize}
+            onClose={props.onTogglePreview}
+          />
+        ) : (
+          <div className="prototype-collapsed-panel prototype-collapsed-right">
+            <button type="button" onClick={props.onTogglePreview} aria-label="展开当前沙箱">
+              <ChevronLeft />
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PrototypeSidebarNav({ onNavigate }: { onNavigate: (page: PageId) => void }) {
+  return (
+    <aside className="prototype-sidebar-nav" aria-label="主导航">
+      <BrandLogo className="prototype-sidebar-logo" />
+      {NAV_ITEMS.map((item) => {
+        const Icon = iconMap[item.icon];
+        return (
+          <Tooltip key={item.id}>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className={cn(item.id === 'chat' && 'active')}
+                title={item.label}
+                aria-label={item.label}
+                onClick={() => onNavigate(item.id)}
+              >
+                <Icon />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="right">{item.label}</TooltipContent>
+          </Tooltip>
+        );
+      })}
+    </aside>
+  );
+}
+
+function PrototypeSessionPanel({ sessions, onToggle }: { sessions: SessionSummary[]; onToggle: () => void }) {
+  const [query, setQuery] = useState('');
+  const items = (sessions.length ? sessions : fallbackSessions).filter((session) => {
+    const value = `${session.title} ${session.desc}`.toLowerCase();
+    return value.includes(query.trim().toLowerCase());
+  });
+
+  return (
+    <aside className="prototype-session-panel">
+      <div className="prototype-session-head">
+        <h2>最近会话</h2>
+        <button type="button" onClick={onToggle} aria-label="收起最近会话">
+          <ChevronLeft />
+        </button>
+      </div>
+      <label className="prototype-session-search">
+        <Search />
+        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索会话" />
+      </label>
+      <ScrollArea className="prototype-session-scroll">
+        <div className="prototype-session-group">
+          <span>今天</span>
+          {items.slice(0, 10).map((session, index) => {
+            const category = sessionCategoryFor(session);
+            const SessionIcon = category.Icon;
+            return (
+              <button key={`${session.sessionId || session.title}-${index}`} className={cn('prototype-session-item', index === 0 && 'active')} type="button">
+                <span className={cn('prototype-session-icon', category.tone)}>
+                  <SessionIcon />
+                </span>
+                <strong>{session.title}</strong>
+                <time>{session.time}</time>
+                <p>{session.desc}</p>
+              </button>
+            );
+          })}
+        </div>
+      </ScrollArea>
+    </aside>
+  );
+}
+
+function PrototypeChatHeader(props: { onNewSession: () => void; onToggleHistory: () => void; onTogglePreview: () => void }) {
+  return (
+    <div className="prototype-chat-header">
+      <div>
+        <h1>AI 助手</h1>
+        <span>
+          <i />
+          运行中
+        </span>
+      </div>
+      <div className="prototype-chat-actions">
+        <button type="button" onClick={props.onToggleHistory} aria-label="切换会话列表">
+          <PanelLeftClose />
+        </button>
+        <button type="button" onClick={props.onTogglePreview} aria-label="切换沙箱">
+          <PanelRightClose />
+        </button>
+        <button type="button" className="primary" onClick={props.onNewSession}>
+          <Plus />
+          新建会话
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function PrototypeMessages({ messages }: { messages: ChatMessage[] }) {
+  const messageEndRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    messageEndRef.current?.scrollIntoView({ block: 'end' });
+  }, [messages]);
+
+  return (
+    <ScrollArea className="prototype-message-scroll">
+      <div className="prototype-message-list">
+        {messages.map((message, index) => {
+          const isUser = message.role === 'user';
+          return (
+            <article key={`${message.role}-${index}`} className={cn('prototype-message', isUser && 'user')}>
+              <MessageAvatar isUser={isUser} />
+              <div className="prototype-bubble">
+                {message.text.split('\n').map((line, lineIndex) => (line ? <p key={lineIndex}>{line}</p> : <br key={lineIndex} />))}
+                {message.attachments?.length ? <AttachmentChips attachments={message.attachments} /> : null}
+                {message.tools?.length ? (
+                  <div className="tool-chips">
+                    {message.tools.map((tool) => <Badge key={tool} variant="secondary">{tool}</Badge>)}
+                  </div>
+                ) : null}
+                <time>{message.time}</time>
+              </div>
+            </article>
+          );
+        })}
+        <div ref={messageEndRef} className="prototype-message-end" aria-hidden="true" />
+      </div>
+    </ScrollArea>
+  );
+}
+
+function PrototypeComposer(props: {
+  llm: RuntimeModelConfig;
+  settingsStatus: string;
+  attachments: Attachment[];
+  composerRef: React.RefObject<HTMLTextAreaElement | null>;
+  fileInputRef: React.RefObject<HTMLInputElement | null>;
+  onChooseAttachment: () => void;
+  onAddAttachments: (files: FileList | null) => void;
+  onRemoveAttachment: (id: string) => void;
+  onComposerKeydown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
+  onSubmitComposer: (event: FormEvent<HTMLFormElement>) => void;
+  onModelSwitch: (id: string) => void;
+}) {
+  const options = props.llm.options?.length ? props.llm.options : [props.llm];
+  const current = props.llm.id || props.llm.model;
+
+  return (
+    <form className="prototype-composer" onSubmit={props.onSubmitComposer}>
+      <input
+        ref={props.fileInputRef}
+        id="attachment-input"
+        type="file"
+        multiple
+        hidden
+        onChange={(event) => props.onAddAttachments(event.currentTarget.files)}
+      />
+      {props.attachments.length ? <AttachmentChips attachments={props.attachments} onRemove={props.onRemoveAttachment} /> : null}
+      <div className="prototype-input-box">
+        <button type="button" onClick={props.onChooseAttachment} aria-label="添加附件">
+          <Paperclip />
+        </button>
+        <button type="button" aria-label="代码模式">
+          <Code2 />
+        </button>
+        <textarea
+          ref={props.composerRef}
+          name="task"
+          rows={1}
+          placeholder="输入你的运维问题或指令，Enter 发送，Shift+Enter 换行..."
+          onKeyDown={props.onComposerKeydown}
+        />
+        <button type="submit" className="send" aria-label="发送">
+          <Send />
+        </button>
+      </div>
+      <div className="prototype-composer-meta">
+        <div>
+          <Cpu />
+          <Select name="model_id" value={current} onValueChange={props.onModelSwitch}>
+            <SelectTrigger className="prototype-model-select" aria-label="切换模型">
+              <SelectValue placeholder="选择模型" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                {options.map((option) => {
+                  const value = option.id || option.model;
+                  const label = option.id && option.id !== option.model ? `${option.id} · ${option.model}` : option.model || option.id;
+                  return <SelectItem key={value} value={value}>{label}</SelectItem>;
+                })}
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+          <Badge variant="secondary">{props.llm.protocol}</Badge>
+          <span className="prototype-model-url">{props.llm.base_url || '未配置 Base URL'}</span>
+        </div>
+        <span>{props.settingsStatus || 'Enter 发送 · Shift/Alt+Enter 换行'}</span>
+      </div>
+    </form>
+  );
+}
+
+function PrototypeSandboxPanel(props: {
+  sandboxOutput: string;
+  browserStreamUrl: string;
+  onRunSandbox: (code: string, language: string) => void;
+  onOpenPreview: () => void;
+  onRefreshPreview: () => void;
+  onStartResize: (event: PointerEvent<HTMLButtonElement>) => void;
+  onClose: () => void;
+}) {
+  const [activeTab, setActiveTab] = useState<'terminal' | 'vnc' | 'browser'>('terminal');
+  const [code, setCode] = useState('print("hello from sandbox")');
+  const [language, setLanguage] = useState('python');
+
+  return (
+    <aside className="prototype-sandbox-panel">
+      <button className="prototype-resize-handle" type="button" aria-label="拖动调整沙箱宽度" onPointerDown={props.onStartResize} />
+      <div className="prototype-sandbox-head">
+        <div>
+          <h2>当前沙箱</h2>
+          <span>
+            <i />
+            sandbox-prod · ready
+          </span>
+        </div>
+        <button type="button" onClick={props.onClose} aria-label="收起当前沙箱">
+          <ChevronRight />
+        </button>
+      </div>
+      <div className="prototype-tabs">
+        {[
+          { key: 'terminal' as const, label: '终端', icon: Terminal },
+          { key: 'vnc' as const, label: 'VNC', icon: Monitor },
+          { key: 'browser' as const, label: '浏览器预览', icon: Globe },
+        ].map((tab) => (
+          <button key={tab.key} type="button" className={cn(activeTab === tab.key && 'active')} onClick={() => setActiveTab(tab.key)}>
+            <tab.icon />
+            {tab.label}
+          </button>
+        ))}
+      </div>
+      <div className="prototype-sandbox-body">
+        {activeTab === 'terminal' && (
+          <>
+            <div className="prototype-code-card">
+              <div>
+                <span>
+                  <Code2 />
+                  运行代码
+                </span>
+                <Select value={language} onValueChange={setLanguage}>
+                  <SelectTrigger className="prototype-language-select" aria-label="选择语言">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      <SelectItem value="python">Python</SelectItem>
+                      <SelectItem value="javascript">JavaScript</SelectItem>
+                      <SelectItem value="bash">Bash</SelectItem>
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+              </div>
+              <textarea value={code} onChange={(event) => setCode(event.target.value)} spellCheck={false} />
+              <button type="button" onClick={() => props.onRunSandbox(code, language)}>
+                <Play />
+                运行代码
+              </button>
+            </div>
+            <PrototypeTerminal output={props.sandboxOutput} />
+          </>
+        )}
+        {activeTab === 'vnc' && (
+          <div className="prototype-empty-preview">
+            <Monitor />
+            <strong>VNC 桌面预览</strong>
+            <span>连接到远程桌面。</span>
+          </div>
+        )}
+        {activeTab === 'browser' && (
+          <div className="prototype-browser-card">
+            <div>
+              <span>
+                <Globe />
+                浏览器预览
+              </span>
+              <div>
+                <button type="button" onClick={props.onOpenPreview}>
+                  <Monitor />
+                  加载预览
+                </button>
+                <button type="button" onClick={props.onRefreshPreview}>
+                  <RefreshCcw />
+                  刷新截图
+                </button>
+              </div>
+            </div>
+            {props.browserStreamUrl ? (
+              <iframe src={props.browserStreamUrl} title="浏览器预览" />
+            ) : (
+              <div className="prototype-empty-preview">
+                <Globe />
+                <strong>浏览器预览区域</strong>
+                <span>加载后会在这里显示截图流。</span>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </aside>
+  );
+}
+
+function PrototypeTerminal({ output }: { output: string }) {
+  return (
+    <div className="prototype-terminal">
+      <div>
+        <span>
+          <Check />
+          输出
+        </span>
+      </div>
+      <pre>{output || '沙箱输出会显示在这里。'}</pre>
+    </div>
+  );
+}
+
+function ChatWorkbench(props: {
+  historyOpen: boolean;
+  previewOpen: boolean;
+  previewWidth: number;
+  sessions: SessionSummary[];
+  messages: ChatMessage[];
+  attachments: Attachment[];
+  llm: RuntimeModelConfig;
+  settingsStatus: string;
+  sandboxOutput: string;
+  browserStreamUrl: string;
+  composerRef: React.RefObject<HTMLTextAreaElement | null>;
+  fileInputRef: React.RefObject<HTMLInputElement | null>;
+  onToggleHistory: () => void;
+  onTogglePreview: () => void;
+  onNewSession: () => void;
+  onChooseAttachment: () => void;
+  onAddAttachments: (files: FileList | null) => void;
+  onRemoveAttachment: (id: string) => void;
+  onComposerKeydown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
+  onSubmitComposer: (event: FormEvent<HTMLFormElement>) => void;
+  onModelSwitch: (id: string) => void;
+  onRunSandbox: (code: string, language: string) => void;
+  onOpenPreview: () => void;
+  onRefreshPreview: () => void;
+  onStartResize: (event: PointerEvent<HTMLButtonElement>) => void;
+}) {
+  const layoutClass = cn('chat-layout', !props.historyOpen && 'history-closed', !props.previewOpen && 'preview-closed');
+  return (
+    <div className={layoutClass} style={{ '--sandbox-width': `${props.previewWidth}px` } as CSSProperties}>
+      {props.historyOpen && <SessionHistory sessions={props.sessions} onCollapse={props.onToggleHistory} />}
+      <section className="chat-panel">
+        <div className="panel-header">
+          <div>
+            <h1>AI 运维助手</h1>
+            <p>查询集群、分析告警、执行变更和管理沙箱。</p>
+          </div>
+          <div className="header-actions">
+            <Button variant="outline" size="icon" title="切换会话列表" onClick={props.onToggleHistory}>
+              <PanelLeftClose />
+            </Button>
+            <Button variant="outline" size="icon" title="切换浏览器预览" onClick={props.onTogglePreview}>
+              <PanelRightClose />
+            </Button>
+            <Button onClick={props.onNewSession}>
+              <MessageSquare data-icon="inline-start" />
+              新建会话
+            </Button>
+          </div>
+        </div>
+        <Messages messages={props.messages} />
+        <ComposerModelFooter
+          llm={props.llm}
+          settingsStatus={props.settingsStatus}
+          attachments={props.attachments}
+          composerRef={props.composerRef}
+          fileInputRef={props.fileInputRef}
+          onChooseAttachment={props.onChooseAttachment}
+          onAddAttachments={props.onAddAttachments}
+          onRemoveAttachment={props.onRemoveAttachment}
+          onComposerKeydown={props.onComposerKeydown}
+          onSubmitComposer={props.onSubmitComposer}
+          onModelSwitch={props.onModelSwitch}
+        />
+      </section>
+      {props.previewOpen && (
+        <BrowserPreviewPanel
+          sandboxOutput={props.sandboxOutput}
+          browserStreamUrl={props.browserStreamUrl}
+          onRunSandbox={props.onRunSandbox}
+          onOpenPreview={props.onOpenPreview}
+          onRefreshPreview={props.onRefreshPreview}
+          onStartResize={props.onStartResize}
+          onClose={props.onTogglePreview}
+        />
+      )}
+    </div>
+  );
+}
+
+function SessionHistory({ sessions, onCollapse }: { sessions: SessionSummary[]; onCollapse: () => void }) {
+  return (
+    <aside className="session-drawer">
+      <div className="drawer-head">
+        <div>
+          <h2>最近会话</h2>
+          <span>按更新时间排序</span>
+        </div>
+        <Button variant="ghost" size="icon" onClick={onCollapse}>
+          <X />
+        </Button>
+      </div>
+      <ScrollArea className="session-scroll">
+        <div className="session-list">
+          {(sessions.length ? sessions : fallbackSessions).slice(0, 10).map((session, index) => {
+            const category = sessionCategoryFor(session);
+            const SessionIcon = category.Icon;
+            return (
+              <button key={`${session.sessionId || session.title}-${index}`} className={cn('session-row', index === 0 && 'active')} type="button">
+                <span className={cn('session-row-icon', category.tone)}>
+                  <SessionIcon />
+                </span>
+                <strong>{session.title}</strong>
+                <time>{session.time}</time>
+                <span className="session-desc">{session.desc}</span>
+              </button>
+            );
+          })}
+        </div>
+      </ScrollArea>
+    </aside>
+  );
+}
+
+function Messages({ messages }: { messages: ChatMessage[] }) {
+  return (
+    <ScrollArea className="messages-scroll">
+      <div className="messages-grid">
+        {messages.map((message, index) => {
+          const isUser = message.role === 'user';
+          return (
+            <article key={`${message.role}-${index}`} className={cn('message', isUser && 'message-user')}>
+              <MessageAvatar isUser={isUser} />
+              <div className="bubble">
+                {message.text.split('\n').map((line, lineIndex) => line ? <p key={lineIndex}>{line}</p> : <br key={lineIndex} />)}
+                {message.attachments?.length ? <AttachmentChips attachments={message.attachments} /> : null}
+                {message.tools?.length ? (
+                  <div className="tool-chips">
+                    {message.tools.map((tool) => <Badge key={tool} variant="secondary">{tool}</Badge>)}
+                  </div>
+                ) : null}
+                <time>{message.time}</time>
+              </div>
+            </article>
+          );
+        })}
+      </div>
+    </ScrollArea>
+  );
+}
+
+function AttachmentChips({ attachments, onRemove }: { attachments: Attachment[]; onRemove?: (id: string) => void }) {
+  return (
+    <div className="attachment-list">
+      {attachments.map((file) => (
+        <span className="attachment-chip" key={file.id} title={file.name}>
+          <Paperclip />
+          <span>{file.name}</span>
+          <small>{file.type || 'file'} · {formatFileSize(file.size)}</small>
+          {onRemove ? (
+            <button type="button" onClick={() => onRemove(file.id)} aria-label={`移除 ${file.name}`}>
+              <Trash2 />
+            </button>
+          ) : null}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function ComposerModelFooter(props: {
+  llm: RuntimeModelConfig;
+  settingsStatus: string;
+  attachments: Attachment[];
+  composerRef: React.RefObject<HTMLTextAreaElement | null>;
+  fileInputRef: React.RefObject<HTMLInputElement | null>;
+  onChooseAttachment: () => void;
+  onAddAttachments: (files: FileList | null) => void;
+  onRemoveAttachment: (id: string) => void;
+  onComposerKeydown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
+  onSubmitComposer: (event: FormEvent<HTMLFormElement>) => void;
+  onModelSwitch: (id: string) => void;
+}) {
+  const options = props.llm.options?.length ? props.llm.options : [props.llm];
+  const current = props.llm.id || props.llm.model;
+  const modelSelectName = 'model_id';
+  return (
+    <form className="composer-shell" onSubmit={props.onSubmitComposer}>
+      <input
+        ref={props.fileInputRef}
+        id="attachment-input"
+        type="file"
+        multiple
+        hidden
+        onChange={(event) => props.onAddAttachments(event.currentTarget.files)}
+      />
+      {props.attachments.length ? <AttachmentChips attachments={props.attachments} onRemove={props.onRemoveAttachment} /> : null}
+      <div className="composer-main">
+        <Textarea
+          ref={props.composerRef}
+          name="task"
+          rows={2}
+          placeholder="输入运维问题或指令，Enter 发送"
+          onKeyDown={props.onComposerKeydown}
+        />
+        <div className="composer-action-row">
+          <Button variant="outline" size="icon" type="button" title="添加附件" onClick={props.onChooseAttachment}>
+            <Paperclip />
+          </Button>
+          <Button className="send-button" type="submit">
+            <Send data-icon="inline-start" />
+            发送
+          </Button>
+        </div>
+      </div>
+      <div className="composer-meta">
+        <div className="model-picker">
+          <span>模型信息</span>
+          <Select name={modelSelectName} value={current} onValueChange={props.onModelSwitch}>
+            <SelectTrigger className="model-select" aria-label="切换模型">
+              <SelectValue placeholder="选择模型" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                {options.map((option) => {
+                  const value = option.id || option.model;
+                  const label = option.id && option.id !== option.model ? `${option.id} · ${option.model}` : option.model || option.id;
+                  return <SelectItem key={value} value={value}>{label}</SelectItem>;
+                })}
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+          <Badge variant="secondary">{props.llm.protocol}</Badge>
+          <span className="model-url">{props.llm.base_url || '未配置 Base URL'}</span>
+        </div>
+        <span className="composer-hint">{props.settingsStatus || 'Enter 发送，Shift/Alt+Enter 换行'}</span>
+      </div>
+    </form>
+  );
+}
+
+function BrowserPreviewPanel(props: {
+  sandboxOutput: string;
+  browserStreamUrl: string;
+  onRunSandbox: (code: string, language: string) => void;
+  onOpenPreview: () => void;
+  onRefreshPreview: () => void;
+  onStartResize: (event: PointerEvent<HTMLButtonElement>) => void;
+  onClose: () => void;
+}) {
+  const [code, setCode] = useState('print("hello from sandbox")');
+  const [language, setLanguage] = useState('python');
+  return (
+    <aside className="browser-preview-panel">
+      <button className="resize-handle" type="button" aria-label="拖动调整浏览器预览宽度" onPointerDown={props.onStartResize} />
+      <div className="sandbox-head">
+        <div>
+          <h2>当前沙箱</h2>
+          <p><span className="ready-dot" />sandbox-prod · ready</p>
+        </div>
+        <Button variant="ghost" size="icon" onClick={props.onClose}>
+          <X />
+        </Button>
+      </div>
+      <Card className="sandbox-tool">
+        <CardHeader>
+          <div className="tool-title">
+            <CardTitle>运行代码</CardTitle>
+            <Select value={language} onValueChange={setLanguage}>
+              <SelectTrigger className="language-select" aria-label="选择语言">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="python">Python</SelectItem>
+                  <SelectItem value="javascript">JavaScript</SelectItem>
+                  <SelectItem value="bash">Bash</SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          </div>
+        </CardHeader>
+        <CardContent className="sandbox-code">
+          <Textarea value={code} onChange={(event) => setCode(event.target.value)} spellCheck={false} />
+          <Button type="button" onClick={() => props.onRunSandbox(code, language)}>
+            <Play data-icon="inline-start" />
+            运行代码
+          </Button>
+        </CardContent>
+      </Card>
+      <Card className="preview-tool">
+        <CardHeader>
+          <div className="tool-title">
+            <CardTitle>浏览器预览</CardTitle>
+            <div className="tool-actions">
+              <Button variant="outline" size="sm" type="button" onClick={props.onOpenPreview}>
+                <Monitor data-icon="inline-start" />
+                加载预览
+              </Button>
+              <Button variant="ghost" size="sm" type="button" onClick={props.onRefreshPreview}>
+                <RefreshCcw data-icon="inline-start" />
+                刷新截图
+              </Button>
+            </div>
+          </div>
+          <CardDescription>这里只展示远端浏览器画面，不提供打开 URL、点击、输入等操作控件。</CardDescription>
+        </CardHeader>
+        <CardContent>
+          {props.browserStreamUrl ? (
+            <iframe className="vnc-preview-frame" src={props.browserStreamUrl} title="浏览器预览" />
+          ) : (
+            <div className="preview-empty">
+              <Monitor />
+              <strong>预览当前沙箱浏览器画面</strong>
+              <span>加载后会在这里显示截图流。</span>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+      <div className="terminal">
+        {props.sandboxOutput.split('\n').map((line, index) => <div key={index}>{line || '\u00a0'}</div>)}
+      </div>
+    </aside>
+  );
+}
+
+function SkillsPage({ tools, output, onTest }: { tools: ToolSummary[]; output: string; onTest: (tool: string, args: string) => void }) {
+  const selected = tools[0] || fallbackTools[0];
+  const [args, setArgs] = useState(JSON.stringify(selected?.name === 'load_skill' ? { name: 'inspect' } : {}, null, 2));
+  return (
+    <ManagementPage title="技能" subtitle="管理 AI 助手可调用的技能，提升运维自动化能力" actionLabel="导入技能">
+      <DataTable headers={['技能名称', '描述', '来源', '状态', '最近使用']} rows={tools.map((tool) => [toolDisplayName(tool.name), tool.description || '-', tool.source || '后端', tool.status || '已启用', tool.lastUsed || '-'])} />
+      <DetailPanel title={toolDisplayName(selected?.name)} status={selected?.status || '已启用'} icon={<Search />}>
+        <h3>描述</h3>
+        <p>{selected?.description || '后端已注册的 AI 助手能力。'}</p>
+        <h3>引用文件</h3>
+        <div className="file-list">{(selected?.files || ['SKILL.md', 'schema.json']).map((file) => <span key={file}>{file}</span>)}</div>
+        <h3>测试加载</h3>
+        <Textarea id="tool-test-args" value={args} onChange={(event) => setArgs(event.target.value)} rows={5} spellCheck={false} />
+        <Button type="button" onClick={() => onTest(selected?.name || 'load_skill', args)}>测试加载</Button>
+        {output ? <pre className="tool-output">{output}</pre> : null}
+      </DetailPanel>
+    </ManagementPage>
+  );
+}
+
+function McpPage({ tools, output, onTest }: { tools: ToolSummary[]; output: string; onTest: (tool: string, args: string) => void }) {
+  const servers = buildMcpServers(tools);
+  const selected = servers[0] || { name: '-', transport: '-', status: '未连接', tools: [] as ToolSummary[] };
+  const [tool, setTool] = useState(selected.tools[0]?.name || '');
+  const [args, setArgs] = useState('{}');
+  return (
+    <ManagementPage title="MCP" subtitle="管理 MCP server，扩展 AI 助手的能力边界" actionLabel="新增 MCP">
+      <DataTable headers={['名称', '传输协议', '状态', '工具数', '最近心跳']} rows={servers.map((server) => [server.name, server.transport, server.status, String(server.tools.length), formatTime(new Date().toISOString())])} />
+      <DetailPanel title={selected.name} status={selected.status} icon={<Boxes />}>
+        <h3>连接配置</h3>
+        <div className="kv"><span>传输协议</span><strong>{selected.transport}</strong><span>命令</span><strong>registry</strong></div>
+        <h3>测试调用</h3>
+        <Select value={tool} onValueChange={setTool}>
+          <SelectTrigger><SelectValue placeholder="选择工具" /></SelectTrigger>
+          <SelectContent>
+            <SelectGroup>
+              {selected.tools.map((item) => <SelectItem key={item.name} value={item.name}>{toolDisplayName(item.name)}</SelectItem>)}
+            </SelectGroup>
+          </SelectContent>
+        </Select>
+        <Textarea id="tool-test-args" value={args} onChange={(event) => setArgs(event.target.value)} rows={5} spellCheck={false} />
+        <Button type="button" onClick={() => onTest(tool, args)}>测试工具</Button>
+        {output ? <pre className="tool-output">{output}</pre> : null}
+      </DetailPanel>
+    </ManagementPage>
+  );
+}
+
+function buildMcpServers(tools: ToolSummary[]) {
+  const servers = new Map<string, { name: string; transport: string; status: string; tools: ToolSummary[] }>();
+  for (const tool of tools) {
+    const name = mcpServerName(tool.name);
+    const server = servers.get(name) || { name, transport: tool.transport || 'stdio', status: tool.status || '已连接', tools: [] };
+    server.tools.push(tool);
+    servers.set(name, server);
+  }
+  return [...servers.values()];
+}
+
+function ManagementPage({ title, subtitle, actionLabel, children }: { title: string; subtitle: string; actionLabel: string; children: React.ReactNode }) {
+  const content = Array.isArray(children) ? children : [children];
+  return (
+    <>
+      <PageTitle title={title} subtitle={subtitle} />
+      <div className="toolbar">
+        <label className="search-box"><Search /><Input placeholder={`搜索${title}`} /></label>
+        <Button variant="outline">全部</Button>
+        <Button variant="outline">已启用</Button>
+        <Button>{actionLabel}</Button>
+      </div>
+      <div className="two-pane">
+        <section className="list-card">{content[0]}</section>
+        <aside className="detail-card">{content[1]}</aside>
+      </div>
+    </>
+  );
+}
+
+function DetailPanel({ title, status, icon, children }: { title: string; status: string; icon: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <div className="detail-panel">
+      <div className="detail-title">
+        <div className="large-icon">{icon}</div>
+        <div>
+          <h2>{title}</h2>
+          <Badge variant="secondary">{status}</Badge>
+        </div>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function SchedulePage({ tasks }: { tasks: ScheduledTask[] }) {
+  const selected = tasks[0] || fallbackTasks[0];
+  return (
+    <>
+      <PageTitle title="定时任务" subtitle="配置和管理定时执行的 AI 任务" />
+      <Card className="create-task">
+        <CardContent className="task-create-grid">
+          <Label>创建任务<Textarea placeholder="描述你要定时执行的任务..." /></Label>
+          <Label>执行计划<Input defaultValue="每天 02:00" /></Label>
+          <Button>创建任务</Button>
+        </CardContent>
+      </Card>
+      <div className="task-layout">
+        <DataTable headers={['任务', '计划', '下次执行', '状态', '最近结果']} rows={tasks.map((task) => [task.task, humanizeCron(task.cron), formatDateTime(task.nextRunAt), task.enabled ? '启用' : '暂停', task.lastRunAt ? '成功' : '待执行'])} />
+        <Card className="detail-card compact">
+          <CardHeader>
+            <CardTitle>{selected.task}</CardTitle>
+            <CardDescription>{humanizeCron(selected.cron)} · 下次执行 {formatDateTime(selected.nextRunAt)}</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <DataTable headers={['时间', '状态', '耗时']} rows={[[formatDateTime(selected.lastRunAt), selected.lastRunAt ? '成功' : '待执行', selected.lastRunAt ? '18.42s' : '-']]} />
+          </CardContent>
+        </Card>
+      </div>
+    </>
+  );
+}
+
+function SandboxPage({ sandboxes }: { sandboxes: SandboxSummary[] }) {
+  const selected = sandboxes[0] || fallbackSandboxes[0];
+  return (
+    <>
+      <PageTitle title="沙箱环境" subtitle="管理隔离沙箱，安全执行运维操作" />
+      <div className="toolbar">
+        <Badge variant="secondary"><CheckCircle2 />运行中</Badge>
+        <label className="search-box"><Search /><Input placeholder="搜索沙箱" /></label>
+        <Button>新建沙箱</Button>
+      </div>
+      <div className="two-pane">
+        <section className="list-card">
+          <DataTable headers={['名称', '状态', '类型', '资源', '绑定会话', '创建时间']} rows={sandboxes.map((sandbox) => [sandbox.id, sandbox.status, sandbox.type || 'session', resourceSummary(sandbox.resources), sandbox.sessionId || '未绑定', formatDateTime(sandbox.createdAt)])} />
+        </section>
+        <aside className="detail-card">
+          <DetailPanel title={selected.id} status={selected.status} icon={<Cuboid />}>
+            <h3>基本信息</h3>
+            <div className="kv"><span>模板</span><strong>{selected.type || 'session'}</strong><span>资源</span><strong>{resourceSummary(selected.resources)}</strong></div>
+            <h3>连接信息</h3>
+            <div className="file-list"><span>Terminal /sandbox/{selected.id}/terminal</span><span>Browser /sandbox/{selected.id}/browser</span></div>
+          </DetailPanel>
+        </aside>
+      </div>
+    </>
+  );
+}
+
+function SettingsPage({ llm, status, api, onLlmChange, onStatus }: {
+  llm: RuntimeModelConfig;
+  status: string;
+  api: ReturnType<typeof createApi>;
+  onLlmChange: (next: RuntimeModelConfig) => void;
+  onStatus: (next: string) => void;
+}) {
+  const [form, setForm] = useState(() => ({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: '' }));
+
+  async function save() {
+    onStatus('正在保存配置...');
+    try {
+      const body = await api.post<ModelSettingsBody>('/v1/settings/llm', form);
+      onLlmChange({ ...body.config, options: body.options || llm.options || [] });
+      onStatus('配置已保存，新的聊天请求会使用该模型。');
+    } catch (err) {
+      onStatus(`保存失败：${formatError(err)}`);
+    }
+  }
+
+  async function test() {
+    onStatus('正在测试模型连接...');
+    try {
+      const body = await api.post<ModelSettingsBody & { text?: string }>('/v1/settings/llm/test', form);
+      onLlmChange({ ...body.config, options: body.options || llm.options || [] });
+      onStatus(`测试成功：${body.text || '模型已响应'}`);
+    } catch (err) {
+      onStatus(`测试失败：${formatError(err)}`);
+    }
+  }
+
+  return (
+    <>
+      <PageTitle title="设置" subtitle="配置 AI 助手当前使用的 LLM 服务" />
+      <div className="settings-layout">
+        <Card>
+          <CardHeader>
+            <CardTitle>LLM 配置</CardTitle>
+            <CardDescription>当前模型会用于新的聊天请求。</CardDescription>
+          </CardHeader>
+          <CardContent className="settings-form">
+            <Label>协议<Select value={form.protocol} onValueChange={(protocol) => setForm((current) => ({ ...current, protocol: protocol as RuntimeModelConfig['protocol'] }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="anthropic">Anthropic</SelectItem><SelectItem value="openai">OpenAI Compatible</SelectItem></SelectGroup></SelectContent></Select></Label>
+            <Label>Base URL<Input value={form.base_url} onChange={(event) => setForm((current) => ({ ...current, base_url: event.target.value }))} /></Label>
+            <Label>API Key<Input type="password" placeholder={llm.api_key_set ? `已配置：${llm.api_key_preview}` : '输入 API Key'} value={form.api_key} onChange={(event) => setForm((current) => ({ ...current, api_key: event.target.value }))} /></Label>
+            <Label>Model<Input value={form.model} onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))} /></Label>
+            {status ? <div className="settings-status">{status}</div> : null}
+            <div className="form-actions">
+              <Button variant="outline" type="button" onClick={() => void test()}>测试连接</Button>
+              <Button type="button" onClick={() => void save()}>保存配置</Button>
+            </div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <div className="detail-title">
+              <div className="large-icon"><KeyRound /></div>
+              <div>
+                <CardTitle>{llm.model || '未配置'}</CardTitle>
+                <CardDescription>{llm.api_key_set ? '密钥已配置' : '密钥未配置'}</CardDescription>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="kv">
+            <span>协议</span><strong>{llm.protocol}</strong>
+            <span>Base URL</span><strong>{llm.base_url || '-'}</strong>
+            <span>Model</span><strong>{llm.model || '-'}</strong>
+            <span>API Key</span><strong>{llm.api_key_preview || '-'}</strong>
+          </CardContent>
+        </Card>
+      </div>
+    </>
+  );
+}
+
+function DataTable({ headers, rows }: { headers: string[]; rows: Array<Array<string>> }) {
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>{headers.map((header) => <TableHead key={header}>{header}</TableHead>)}</TableRow>
+      </TableHeader>
+      <TableBody>
+        {rows.map((row, rowIndex) => (
+          <TableRow key={row.join('-')} data-state={rowIndex === 0 ? 'selected' : undefined}>
+            {row.map((cell, cellIndex) => <TableCell key={`${cell}-${cellIndex}`}>{formatCell(cell)}</TableCell>)}
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  );
+}
+
+function formatCell(cell: string) {
+  if (['已启用', '已连接', '启用', '成功', 'ready'].includes(cell)) return <span><span className="green-dot" />{cell}</span>;
+  if (['异常', '待审批', 'starting'].includes(cell)) return <span><span className="orange-dot" />{cell}</span>;
+  if (['已禁用', '暂停', 'idle'].includes(cell)) return <span><span className="muted-dot" />{cell}</span>;
+  return cell;
+}
+
+function PageTitle({ title, subtitle }: { title: string; subtitle: string }) {
+  return (
+    <div className="page-title">
+      <h1>{title}</h1>
+      <p>{subtitle}</p>
+    </div>
+  );
+}
+
+function LoginPage({ authStatus, onSubmit }: { authStatus: string; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
+  return (
+    <main className="login-page">
+      <section className="login-card">
+        <div className="login-brand">
+          <BrandLogo className="brand-logo-login" />
+          <div>
+            <h1>AIOP</h1>
+            <p>登录后进入 AI 运维工作台</p>
+          </div>
+        </div>
+        <form id="login-form" className="login-form" onSubmit={onSubmit}>
+          <Label>租户<Input name="tenantId" defaultValue="default" autoComplete="organization" /></Label>
+          <Label>用户名<Input name="username" defaultValue="admin" autoComplete="username" /></Label>
+          <Label>密码<Input name="password" type="password" autoComplete="current-password" autoFocus /></Label>
+          {authStatus ? <div className="settings-status">{authStatus}</div> : null}
+          <Button className="login-submit" type="submit">登录</Button>
+        </form>
+      </section>
+    </main>
+  );
+}

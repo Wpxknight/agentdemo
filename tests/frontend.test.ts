@@ -1,8 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { readFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
-import { pathToFileURL } from 'node:url';
-import path from 'node:path';
 import type { Server } from 'node:http';
 import { createHttpServer } from '../src/server/http.js';
 import { MemoryStore } from '../src/db/memory.js';
@@ -12,31 +10,45 @@ import { AllowAllPolicy } from '../src/agent/policy.js';
 import type { Runtime } from '../src/runtime.js';
 import type { ChatModel, StreamEvent } from '../src/model/types.js';
 
-async function importWebApp(): Promise<{
-  NAV_ITEMS: Array<{ id: string; label: string }>;
-  PAGES: Record<string, { hasSandboxWorkspace: boolean; hasSessionHistoryDrawer?: boolean }>;
-}> {
-  return import(pathToFileURL(path.resolve('web/app.js')).href);
-}
+describe('React frontend stack', () => {
+  it('uses React, Vite, Tailwind, and shadcn project wiring under web/', async () => {
+    const pkg = JSON.parse(await readFile('web/package.json', 'utf8')) as {
+      scripts: Record<string, string>;
+      dependencies: Record<string, string>;
+      devDependencies: Record<string, string>;
+    };
+    const vite = await readFile('web/vite.config.ts', 'utf8');
+    const components = await readFile('web/components.json', 'utf8');
+    const main = await readFile('web/src/main.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
 
-describe('frontend shell model', () => {
-  it('uses the approved collapsed menu and keeps session history inside chat', async () => {
-    const { NAV_ITEMS, PAGES } = await importWebApp();
-
-    expect(NAV_ITEMS.map((item) => item.label)).toEqual(['聊天', '技能', 'MCP', '定时任务', '沙箱环境', '设置']);
-    expect(NAV_ITEMS.map((item) => item.label)).not.toContain('会话记录');
-    expect(PAGES.chat.hasSessionHistoryDrawer).toBe(true);
+    expect(pkg.scripts).toMatchObject({ dev: 'vite', build: 'tsc -b && vite build', preview: 'vite preview' });
+    expect(pkg.dependencies).toHaveProperty('react');
+    expect(pkg.dependencies).toHaveProperty('react-dom');
+    expect(pkg.dependencies).toHaveProperty('lucide-react');
+    expect(pkg.dependencies).toHaveProperty('class-variance-authority');
+    expect(pkg.devDependencies).toHaveProperty('@vitejs/plugin-react');
+    expect(pkg.devDependencies).toHaveProperty('tailwindcss');
+    expect(vite).toContain('@vitejs/plugin-react');
+    expect(components).toContain('"tsx": true');
+    expect(components).toContain('"ui": "@/components/ui"');
+    expect(main).toContain('createRoot');
+    expect(css).toContain('@tailwind base');
   });
 
-  it('shows the sandbox terminal and VNC only on the chat page', async () => {
-    const { PAGES } = await importWebApp();
+  it('keeps the approved navigation model in React source', async () => {
+    const data = await readFile('web/src/app-data.ts', 'utf8');
 
-    expect(PAGES.chat.hasSandboxWorkspace).toBe(true);
-    expect(PAGES.skills.hasSandboxWorkspace).toBe(false);
-    expect(PAGES.mcp.hasSandboxWorkspace).toBe(false);
-    expect(PAGES.schedule.hasSandboxWorkspace).toBe(false);
-    expect(PAGES.sandbox.hasSandboxWorkspace).toBe(false);
-    expect(PAGES.settings.hasSandboxWorkspace).toBe(false);
+    expect(data).toContain("label: '聊天'");
+    expect(data).toContain("label: '技能'");
+    expect(data).toContain("label: 'MCP'");
+    expect(data).toContain("label: '定时任务'");
+    expect(data).toContain("label: '沙箱环境'");
+    expect(data).toContain("label: '设置'");
+    expect(data).not.toContain('会话记录');
+    expect(data).toContain('hasSessionHistoryDrawer: true');
+    expect(data).toContain('hasSandboxWorkspace: true');
+    expect(data).toContain('hasSandboxWorkspace: false');
   });
 });
 
@@ -51,91 +63,120 @@ describe('frontend container proxy', () => {
     expect(nginx).toMatch(/location\s+=\s+\/readyz/);
     expect(nginx).toContain('proxy_buffering off');
   });
+
+  it('builds React assets in the frontend container before nginx serves them', async () => {
+    const dockerfile = await readFile('web/Dockerfile', 'utf8');
+
+    expect(dockerfile).toContain('FROM node:24-slim AS build');
+    expect(dockerfile).toContain('npm run build');
+    expect(dockerfile).toContain('COPY --from=build /app/dist /usr/share/nginx/html');
+  });
 });
 
 describe('frontend API wiring', () => {
   it('loads every menu page from backend endpoints', async () => {
-    const app = await readFile('web/app.js', 'utf8');
+    const app = await readFile('web/src/App.tsx', 'utf8');
 
-    expect(app).toContain("apiGet('/v1/sessions");
-    expect(app).toContain("apiGet('/v1/tools");
-    expect(app).toContain("apiGet('/v1/schedule");
-    expect(app).toContain("apiGet('/v1/sandboxes");
-    expect(app).toContain("apiGet('/v1/settings/llm");
+    expect(app).toContain("api.get<SessionsBody>('/v1/sessions");
+    expect(app).toContain("api.get<ToolsBody>('/v1/tools");
+    expect(app).toContain("api.get<ScheduleBody>('/v1/schedule");
+    expect(app).toContain("api.get<SandboxesBody>('/v1/sandboxes");
+    expect(app).toContain("api.get<ModelSettingsBody>('/v1/settings/llm");
   });
 
-  it('renders backend-loaded state and refreshes it on page changes', async () => {
-    const app = await readFile('web/app.js', 'utf8');
+  it('keeps the chat browser area as preview-only UI', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
 
-    expect(app).toContain('state.sessions.length ? state.sessions');
-    expect(app).not.toContain('${sessions.slice');
-    expect(app).toContain("toolsForCategory('skill')");
-    expect(app).toContain("toolsForCategory('mcp')");
-    expect(app).toContain('state.tasks.length');
-    expect(app).toContain('state.sandboxes.length');
-    expect(app).toContain('loadPageData(nav)');
-    expect(app).toContain('await loadPageData(state.page)');
+    expect(app).toContain("api.post<ToolCallBody>('/v1/sandbox/run-code");
+    expect(app).toContain("api.post<ToolCallBody>('/v1/browser/stream");
+    expect(app).toContain("api.post<ToolCallBody>('/v1/browser/screenshot");
+    expect(app).toContain('runSandboxCode');
+    expect(app).toContain('openBrowserStream');
+    expect(app).toContain('浏览器预览');
+    expect(app).not.toContain("api.post('/v1/browser/navigate");
+    expect(app).not.toContain("api.post('/v1/browser/click");
+    expect(app).not.toContain("api.post('/v1/browser/type");
+    expect(app).not.toContain('browserNavigate');
+    expect(app).not.toContain('browserClick');
+    expect(app).not.toContain('browserType');
+    expect(app).not.toContain('id="browser-control-form"');
   });
 
-  it('fully removes collapsed chat side panels so the chat column can expand', async () => {
-    const app = await readFile('web/app.js', 'utf8');
-    const css = await readFile('web/styles.css', 'utf8');
+  it('moves model selection into the chat composer footer', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
 
-    expect(app).toContain('history-closed');
-    expect(app).toContain('sandbox-closed');
-    expect(app).not.toContain('history-collapsed');
-    expect(app).not.toContain('sandbox-collapsed');
-    expect(css).toContain('.chat-layout.history-closed.sandbox-closed');
+    expect(app).not.toContain('模型</button>');
+    expect(app).toContain('ComposerModelFooter');
+    expect(app).toContain('model_id');
+    expect(app).toContain('onModelSwitch');
+    expect(app).toContain('模型信息');
   });
 
-  it('keeps the chat page usable on phone-width screens', async () => {
-    const css = await readFile('web/styles.css', 'utf8');
+  it('redirects unauthenticated users to a login page instead of rendering login buttons', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
 
-    expect(css).toContain('@media (max-width: 760px)');
-    expect(css).toContain('.session-drawer { display: none; }');
-    expect(css).toContain('.chat-layout { grid-template-columns: minmax(0, 1fr);');
-    expect(css).toContain('.app-shell { grid-template-columns: 56px minmax(0, 1fr);');
+    expect(app).toContain('LoginPage');
+    expect(app).toContain('redirectToLogin');
+    expect(app).toContain("window.location.pathname !== '/login'");
+    expect(app).toContain('id="login-form"');
+    expect(app).not.toContain('data-action="login"');
   });
 
-  it('only shows nav menu tips while hovering, not because a nav item is active', async () => {
-    const app = await readFile('web/app.js', 'utf8');
-    const css = await readFile('web/styles.css', 'utf8');
+  it('supports dragging the right preview panel wider', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
 
-    expect(css).toContain('.nav-btn:hover .nav-tip');
-    expect(css).toContain('.nav-btn.hide-tip .nav-tip');
-    expect(css).not.toContain('.nav-btn.active .nav-tip');
-    expect(app).toContain('hiddenNavTip');
-    expect(app).toContain("state.hiddenNavTip === item.id ? 'hide-tip' : ''");
-    expect(app).toContain('state.hiddenNavTip = nav');
-    expect(app).toContain("state.hiddenNavTip = ''");
-    expect(app).toContain("document.addEventListener('pointermove'");
+    expect(app).toContain('previewWidth');
+    expect(app).toContain('startPreviewResize');
+    expect(app).toContain("writeStorage('aiop_sandbox_width'");
+    expect(app).toContain('resize-handle');
+    expect(css).toContain('--sandbox-width');
+    expect(css).toContain('.resize-handle');
+    expect(css).toContain('grid-template-columns: 280px minmax(520px, 1fr) var(--sandbox-width)');
   });
 
-  it('wires chat sandbox and browser controls to backend APIs', async () => {
-    const app = await readFile('web/app.js', 'utf8');
+  it('uses a refined visual system for the chat workbench', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
 
-    expect(app).toContain("apiPost('/v1/sandbox/run-code");
-    expect(app).toContain("apiPost('/v1/browser/stream");
-    expect(app).toContain("apiPost('/v1/browser/navigate");
-    expect(app).toContain("apiPost('/v1/browser/click");
-    expect(app).toContain("apiPost('/v1/browser/type");
-    expect(app).toContain("apiPost('/v1/browser/screenshot");
-    expect(app).toContain("data-action=\"run-sandbox-code\"");
-    expect(app).toContain("data-action=\"browser-stream\"");
-    expect(app).toContain("data-action=\"browser-navigate\"");
-    expect(app).toContain("data-action=\"browser-click\"");
-    expect(app).toContain("data-action=\"browser-type\"");
+    expect(app).toContain('BrowserPreviewPanel');
+    expect(app).toContain('PrototypeChatShell');
+    expect(app).toContain('prototype-chat-page');
+    expect(app).toContain('prototype-sidebar-nav');
+    expect(app).toContain('prototype-session-panel');
+    expect(app).toContain('prototype-sandbox-panel');
+    expect(app).toContain('prototype-message-end');
+    expect(app).toContain("scrollIntoView({ block: 'end' })");
+    expect(app).toContain('BrandLogo');
+    expect(app).toContain('MessageAvatar');
+    expect(app).toContain('sessionCategoryFor');
+    expect(app).toContain("activePage === 'chat'");
+    expect(css).toContain('--surface-raised');
+    expect(css).toContain('--surface-muted');
+    expect(css).toContain('--brand-soft');
+    expect(css).toContain('--focus-ring');
+    expect(css).toContain('.prototype-chat-page');
+    expect(css).toContain('.prototype-topbar');
+    expect(css).toContain('.prototype-main-content');
+    expect(css).toContain('.prototype-message-end');
+    expect(css).toContain('.brand-logo');
+    expect(css).toContain('.session-row-icon');
+    expect(css).toContain('.message-avatar-image');
+    expect(css).toContain('.composer-action-row');
+    expect(css).toContain('.messages-grid::before');
+    expect(css).toContain('.composer-shell::before');
+    expect(css).toContain('.browser-preview-panel');
+    expect(css).toContain('linear-gradient(180deg, hsl(var(--background)) 0%, hsl(var(--muted)) 100%)');
   });
 
   it('supports composer attachments and enter-key submission ergonomics', async () => {
-    const app = await readFile('web/app.js', 'utf8');
+    const app = await readFile('web/src/App.tsx', 'utf8');
 
-    expect(app).toContain('attachments: []');
+    expect(app).toContain('useState<Attachment[]>([])');
     expect(app).toContain('type="file"');
     expect(app).toContain('id="attachment-input"');
-    expect(app).toContain('data-action="choose-attachment"');
     expect(app).toContain('readFileAsDataUrl');
-    expect(app).toContain('attachments: state.attachments');
+    expect(app).toContain('attachments');
     expect(app).toContain('handleComposerKeydown');
     expect(app).toContain("event.key !== 'Enter'");
     expect(app).toContain('event.shiftKey');
@@ -145,18 +186,22 @@ describe('frontend API wiring', () => {
   });
 
   it('wires Skills and MCP test calls to the generic tool-call API', async () => {
-    const app = await readFile('web/app.js', 'utf8');
+    const app = await readFile('web/src/App.tsx', 'utf8');
 
-    expect(app).toContain("apiPost('/v1/tools/call");
-    expect(app).toContain("data-action=\"test-skill\"");
-    expect(app).toContain("data-action=\"test-mcp\"");
-    expect(app).toContain('id="tool-test-args"');
-    expect(app).toContain('state.toolTestOutput');
+    expect(app).toContain("api.post<ToolCallBody>('/v1/tools/call");
+    expect(app).toContain('testSkillTool');
+    expect(app).toContain('testMcpTool');
+    expect(app).toContain('tool-test-args');
+    expect(app).toContain('toolTestOutput');
   });
 });
 
 describe('frontend data APIs', () => {
   it('serves frontend assets from the backend server for local use', async () => {
+    await mkdir('web/dist/assets', { recursive: true });
+    await writeFile('web/dist/index.html', '<!doctype html><div id="root"></div><script type="module" src="/assets/app.js"></script>');
+    await writeFile('web/dist/assets/app.js', 'console.log("AIOP React asset placeholder");');
+
     const store = new MemoryStore();
     await store.createTenant({ id: 'default', name: 'Default' });
     const auth = new LocalAuthProvider({ store, secret: 'static-secret' });
@@ -185,12 +230,12 @@ describe('frontend data APIs', () => {
       const html = await fetch(`${base}/`);
       expect(html.status).toBe(200);
       expect(html.headers.get('content-type')).toContain('text/html');
-      expect(await html.text()).toContain('/app.js');
+      expect(await html.text()).toContain('id="root"');
 
-      const js = await fetch(`${base}/app.js`);
+      const js = await fetch(`${base}/assets/app.js`);
       expect(js.status).toBe(200);
       expect(js.headers.get('content-type')).toContain('text/javascript');
-      expect(await js.text()).toContain('NAV_ITEMS');
+      expect(await js.text()).toContain('AIOP React asset placeholder');
 
       const favicon = await fetch(`${base}/favicon.ico`);
       expect(favicon.status).toBe(204);
