@@ -92,7 +92,11 @@ export class SkillRegistry {
     const items = this.list();
     if (!items.length) return '';
     const lines = items.map((s) => `- ${s.name}: ${s.description}`);
-    return `可用技能（用 load_skill 加载完整指令）：\n${lines.join('\n')}`;
+    return [
+      '可用技能（用 load_skill 加载完整指令）：',
+      '用户请求与某个技能描述匹配时，请先调用 load_skill 加载该技能，再按技能指令执行。',
+      lines.join('\n'),
+    ].join('\n');
   }
 
   /** load_skill 工具：按名字展开完整 SKILL.md 正文。 */

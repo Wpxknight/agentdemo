@@ -47,6 +47,7 @@ describe('SkillRegistry', () => {
 
     expect(reg.list().map((s) => s.name)).toEqual(['inspect']);
     expect(reg.summaries()).toContain('inspect: 集群巡检');
+    expect(reg.summaries()).toContain('用户请求与某个技能描述匹配时，请先调用 load_skill');
   });
 
   it('load_skill returns full body and lists bundled files', async () => {

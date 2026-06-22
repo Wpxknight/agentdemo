@@ -50,6 +50,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
   while (steps < maxSteps) {
     steps++;
     let text = '';
+    let thinking = '';
     const calls: ToolCall[] = [];
 
     for await (const ev of opts.model.stream({
@@ -58,7 +59,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
       tools: opts.tools.defs(),
     })) {
       opts.onEvent?.(ev);
-      if (ev.type === 'text_delta') text += ev.text;
+      if (ev.type === 'thinking_delta') thinking += ev.text;
+      else if (ev.type === 'text_delta') text += ev.text;
       else if (ev.type === 'tool_call') calls.push(ev.call);
       else if (ev.type === 'usage') {
         usage.inputTokens += ev.inputTokens;
@@ -70,6 +72,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     messages.push({
       role: 'assistant',
       text,
+      thinking: thinking || undefined,
       toolCalls: calls.length ? calls : undefined,
     });
 

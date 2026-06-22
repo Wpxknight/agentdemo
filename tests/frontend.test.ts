@@ -102,14 +102,19 @@ describe('frontend API wiring', () => {
     expect(app).not.toContain('id="browser-control-form"');
   });
 
-  it('moves model selection into the chat composer footer', async () => {
+  it('keeps chat composer focused on input without model footer details', async () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
 
     expect(app).not.toContain('模型</button>');
-    expect(app).toContain('ComposerModelFooter');
-    expect(app).toContain('model_id');
-    expect(app).toContain('onModelSwitch');
-    expect(app).toContain('模型信息');
+    expect(app).not.toContain('ComposerModelFooter');
+    expect(app).not.toContain('model_id');
+    expect(app).not.toContain('模型信息');
+    expect(app).not.toContain('prototype-composer-meta');
+    expect(app).not.toContain('composer-meta');
+    expect(css).not.toContain('.prototype-composer-meta');
+    expect(css).not.toContain('.composer-meta');
+    expect(css).not.toContain('.model-picker');
   });
 
   it('redirects unauthenticated users to a login page instead of rendering login buttons', async () => {
@@ -183,6 +188,31 @@ describe('frontend API wiring', () => {
     expect(app).toContain('event.altKey');
     expect(app).toContain('insertComposerNewline');
     expect(app).toContain("setRangeText('\\n'");
+  });
+
+  it('keeps message time outside bubbles and renders model thinking as collapsible content', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(app).toContain('function splitThinkingSegments');
+    expect(app).toContain('function MessageContent');
+    expect(app).toContain('function ThinkingBlock');
+    expect(app).toContain('<details className="thinking-block"');
+    expect(app).toContain('const thinkingSegments');
+    expect(app).toContain('const textSegments');
+    expect(app).toContain("event?.event === 'thinking_delta'");
+    expect(app).toContain('assistant.thinking');
+    expect(app).toContain('message.id === assistantId');
+    expect(app).not.toContain('message === assistant');
+    expect(app).toContain('<time className="prototype-message-time">{message.time}</time>');
+    expect(app).toContain('<time className="message-time">{message.time}</time>');
+    expect(app).not.toContain('<time>{message.time}</time>');
+    expect(css).toContain('.prototype-message-stack');
+    expect(css).toContain('.prototype-message-time');
+    expect(css).toContain('.message-time');
+    expect(css).toContain('.thinking-block');
+    expect(css).not.toContain('.prototype-bubble time');
+    expect(css).not.toContain('.bubble time');
   });
 
   it('wires Skills and MCP test calls to the generic tool-call API', async () => {

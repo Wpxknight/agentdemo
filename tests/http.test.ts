@@ -147,6 +147,57 @@ describe('HTTP server', () => {
     expect(msgs.map((m) => m.role)).toContain('assistant');
   });
 
+  it('streams thinking deltas over SSE and persists them separately', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'thinking-secret' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const localToken = (await auth.login('default', 'admin', 'pw'))!;
+    const thinkingModel: ChatModel = {
+      id: 'thinking',
+      async *stream(): AsyncIterable<StreamEvent> {
+        yield { type: 'thinking_delta', text: '先分析上下文。' };
+        yield { type: 'text_delta', text: '最终回答。' };
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+    const rt = {
+      model: thinkingModel,
+      tools: new ToolRegistry(),
+      store: localStore,
+      policy: new AllowAllPolicy(),
+      policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth,
+      jwtSecret: 'thinking-secret',
+      systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+
+    const thinkingServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => thinkingServer.listen(0, '127.0.0.1', resolve));
+    const thinkingBase = `http://127.0.0.1:${(thinkingServer.address() as AddressInfo).port}`;
+
+    try {
+      const r = await fetch(`${thinkingBase}/v1/agent`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${localToken}` },
+        body: JSON.stringify({ task: 'hi', sessionId: 'think-sess' }),
+      });
+      expect(r.status).toBe(200);
+      const body = await r.text();
+      expect(body).toContain('event: thinking_delta');
+      expect(body).toContain('event: text_delta');
+
+      const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+      const msgs = await localStore.listMessages(ctx, 'think-sess');
+      const assistant = msgs.find((m) => m.role === 'assistant');
+      expect(assistant?.thinking).toBe('先分析上下文。');
+      expect(assistant?.text).toBe('最终回答。');
+    } finally {
+      await new Promise<void>((resolve) => thinkingServer.close(() => resolve()));
+    }
+  });
+
   it('continues a session (history is loaded)', async () => {
     await fetch(`${base}/v1/agent`, {
       method: 'POST',

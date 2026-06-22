@@ -68,6 +68,7 @@ export class MysqlStore implements Store {
   async appendMessage(ctx: RequestContext, sessionId: string, msg: Msg): Promise<void> {
     const content = JSON.stringify({
       text: msg.text,
+      thinking: msg.thinking,
       toolCalls: msg.toolCalls,
       toolResults: msg.toolResults,
     });
@@ -91,6 +92,7 @@ export class MysqlStore implements Store {
       return {
         role: r.role as MsgRole,
         text: c.text,
+        thinking: c.thinking,
         toolCalls: c.toolCalls,
         toolResults: c.toolResults,
       };

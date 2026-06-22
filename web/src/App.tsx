@@ -1,4 +1,4 @@
-import { type CSSProperties, type FormEvent, type KeyboardEvent, type PointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, type CSSProperties, type FormEvent, type KeyboardEvent, type PointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   Bot,
@@ -229,6 +229,89 @@ function publicAttachment(file: Attachment): Omit<Attachment, 'id'> {
   return rest;
 }
 
+type ThinkingSegment = {
+  type: 'text' | 'thinking';
+  content: string;
+  streaming?: boolean;
+};
+
+function splitThinkingSegments(text: string): ThinkingSegment[] {
+  const segments: ThinkingSegment[] = [];
+  const lower = text.toLowerCase();
+  let cursor = 0;
+
+  while (cursor < text.length) {
+    const start = lower.indexOf('<think>', cursor);
+    if (start === -1) {
+      segments.push({ type: 'text', content: text.slice(cursor) });
+      break;
+    }
+    if (start > cursor) {
+      segments.push({ type: 'text', content: text.slice(cursor, start) });
+    }
+
+    const contentStart = start + '<think>'.length;
+    const end = lower.indexOf('</think>', contentStart);
+    if (end === -1) {
+      segments.push({ type: 'thinking', content: text.slice(contentStart), streaming: true });
+      break;
+    }
+
+    segments.push({ type: 'thinking', content: text.slice(contentStart, end) });
+    cursor = end + '</think>'.length;
+  }
+
+  return segments.filter((segment) => segment.content.length > 0);
+}
+
+function renderTextLines(text: string, keyPrefix: string) {
+  return text.split('\n').map((line, lineIndex) => (
+    line ? <p key={`${keyPrefix}-${lineIndex}`}>{line}</p> : <br key={`${keyPrefix}-${lineIndex}`} />
+  ));
+}
+
+function ThinkingBlock({ content, streaming }: { content: string; streaming?: boolean }) {
+  const trimmed = content.trim();
+  const [open, setOpen] = useState(Boolean(streaming));
+
+  useEffect(() => {
+    if (streaming) setOpen(true);
+  }, [streaming]);
+
+  if (!trimmed) return null;
+  return (
+    <details className="thinking-block" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
+      <summary>
+        <Cpu />
+        模型 thinking
+      </summary>
+      <div className="thinking-content">{renderTextLines(trimmed, 'thinking')}</div>
+    </details>
+  );
+}
+
+function MessageContent({ message }: { message: ChatMessage }) {
+  const segments = splitThinkingSegments(message.text);
+  const thinkingSegments = [
+    ...(message.thinking ? [{ content: message.thinking, streaming: !message.text.trim() }] : []),
+    ...segments.filter((segment) => segment.type === 'thinking').map((segment) => ({
+      content: segment.content,
+      streaming: segment.streaming,
+    })),
+  ];
+  const textSegments = segments.filter((segment) => segment.type === 'text');
+  return (
+    <>
+      {thinkingSegments.map((segment, index) => (
+        <ThinkingBlock key={`thinking-${index}`} content={segment.content} streaming={segment.streaming} />
+      ))}
+      {textSegments.map((segment, index) => (
+        <Fragment key={`text-${index}`}>{renderTextLines(segment.content, `text-${index}`)}</Fragment>
+      ))}
+    </>
+  );
+}
+
 function BrandLogo({ className }: { className?: string }) {
   return (
     <span className={cn('brand-logo', className)} aria-hidden="true">
@@ -409,10 +492,11 @@ export default function App() {
       return;
     }
     if (!response.ok || !response.body) {
-      setMessages((current) => [...current, { role: 'assistant', text: `请求失败：${response.status}`, time: new Date().toLocaleTimeString() }]);
+      setMessages((current) => [...current, { id: randomId(), role: 'assistant', text: `请求失败：${response.status}`, time: new Date().toLocaleTimeString() }]);
       return;
     }
-    const assistant: ChatMessage = { role: 'assistant', text: '', time: new Date().toLocaleTimeString() };
+    const assistantId = randomId();
+    const assistant: ChatMessage = { id: assistantId, role: 'assistant', text: '', time: new Date().toLocaleTimeString() };
     setMessages((current) => [...current, assistant]);
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -425,9 +509,13 @@ export default function App() {
       buffer = parts.pop() || '';
       for (const part of parts) {
         const event = parseSse(part);
+        if (event?.event === 'thinking_delta' && typeof event.data?.text === 'string') {
+          assistant.thinking = `${assistant.thinking || ''}${event.data.text}`;
+          setMessages((current) => current.map((message) => (message.id === assistantId ? { ...assistant } : message)));
+        }
         if (event?.event === 'text_delta' && typeof event.data?.text === 'string') {
           assistant.text += event.data.text;
-          setMessages((current) => current.map((message) => (message === assistant ? { ...assistant } : message)));
+          setMessages((current) => current.map((message) => (message.id === assistantId ? { ...assistant } : message)));
         }
         if (event?.event === 'done' && typeof event.data?.sessionId === 'string') {
           setSessionId(event.data.sessionId);
@@ -444,6 +532,7 @@ export default function App() {
     if (!task && !files.length) return;
     const sentAttachments = attachments;
     setMessages((current) => [...current, {
+      id: randomId(),
       role: 'user',
       text: task || '请分析上传附件。',
       time: new Date().toLocaleTimeString(),
@@ -740,8 +829,6 @@ function PrototypeChatShell(props: {
           <PrototypeChatHeader onNewSession={props.onNewSession} onToggleHistory={props.onToggleHistory} onTogglePreview={props.onTogglePreview} />
           <PrototypeMessages messages={props.messages} />
           <PrototypeComposer
-            llm={props.llm}
-            settingsStatus={props.settingsStatus}
             attachments={props.attachments}
             composerRef={props.composerRef}
             fileInputRef={props.fileInputRef}
@@ -750,7 +837,6 @@ function PrototypeChatShell(props: {
             onRemoveAttachment={props.onRemoveAttachment}
             onComposerKeydown={props.onComposerKeydown}
             onSubmitComposer={props.onSubmitComposer}
-            onModelSwitch={props.onModelSwitch}
           />
         </main>
         {props.previewOpen ? (
@@ -883,17 +969,19 @@ function PrototypeMessages({ messages }: { messages: ChatMessage[] }) {
         {messages.map((message, index) => {
           const isUser = message.role === 'user';
           return (
-            <article key={`${message.role}-${index}`} className={cn('prototype-message', isUser && 'user')}>
+            <article key={message.id || `${message.role}-${index}`} className={cn('prototype-message', isUser && 'user')}>
               <MessageAvatar isUser={isUser} />
-              <div className="prototype-bubble">
-                {message.text.split('\n').map((line, lineIndex) => (line ? <p key={lineIndex}>{line}</p> : <br key={lineIndex} />))}
-                {message.attachments?.length ? <AttachmentChips attachments={message.attachments} /> : null}
-                {message.tools?.length ? (
-                  <div className="tool-chips">
-                    {message.tools.map((tool) => <Badge key={tool} variant="secondary">{tool}</Badge>)}
-                  </div>
-                ) : null}
-                <time>{message.time}</time>
+              <div className="prototype-message-stack">
+                <div className="prototype-bubble">
+                  <MessageContent message={message} />
+                  {message.attachments?.length ? <AttachmentChips attachments={message.attachments} /> : null}
+                  {message.tools?.length ? (
+                    <div className="tool-chips">
+                      {message.tools.map((tool) => <Badge key={tool} variant="secondary">{tool}</Badge>)}
+                    </div>
+                  ) : null}
+                </div>
+                <time className="prototype-message-time">{message.time}</time>
               </div>
             </article>
           );
@@ -905,8 +993,6 @@ function PrototypeMessages({ messages }: { messages: ChatMessage[] }) {
 }
 
 function PrototypeComposer(props: {
-  llm: RuntimeModelConfig;
-  settingsStatus: string;
   attachments: Attachment[];
   composerRef: React.RefObject<HTMLTextAreaElement | null>;
   fileInputRef: React.RefObject<HTMLInputElement | null>;
@@ -915,11 +1001,7 @@ function PrototypeComposer(props: {
   onRemoveAttachment: (id: string) => void;
   onComposerKeydown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   onSubmitComposer: (event: FormEvent<HTMLFormElement>) => void;
-  onModelSwitch: (id: string) => void;
 }) {
-  const options = props.llm.options?.length ? props.llm.options : [props.llm];
-  const current = props.llm.id || props.llm.model;
-
   return (
     <form className="prototype-composer" onSubmit={props.onSubmitComposer}>
       <input
@@ -948,28 +1030,6 @@ function PrototypeComposer(props: {
         <button type="submit" className="send" aria-label="发送">
           <Send />
         </button>
-      </div>
-      <div className="prototype-composer-meta">
-        <div>
-          <Cpu />
-          <Select name="model_id" value={current} onValueChange={props.onModelSwitch}>
-            <SelectTrigger className="prototype-model-select" aria-label="切换模型">
-              <SelectValue placeholder="选择模型" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectGroup>
-                {options.map((option) => {
-                  const value = option.id || option.model;
-                  const label = option.id && option.id !== option.model ? `${option.id} · ${option.model}` : option.model || option.id;
-                  return <SelectItem key={value} value={value}>{label}</SelectItem>;
-                })}
-              </SelectGroup>
-            </SelectContent>
-          </Select>
-          <Badge variant="secondary">{props.llm.protocol}</Badge>
-          <span className="prototype-model-url">{props.llm.base_url || '未配置 Base URL'}</span>
-        </div>
-        <span>{props.settingsStatus || 'Enter 发送 · Shift/Alt+Enter 换行'}</span>
       </div>
     </form>
   );
@@ -1152,9 +1212,7 @@ function ChatWorkbench(props: {
           </div>
         </div>
         <Messages messages={props.messages} />
-        <ComposerModelFooter
-          llm={props.llm}
-          settingsStatus={props.settingsStatus}
+        <ComposerInput
           attachments={props.attachments}
           composerRef={props.composerRef}
           fileInputRef={props.fileInputRef}
@@ -1163,7 +1221,6 @@ function ChatWorkbench(props: {
           onRemoveAttachment={props.onRemoveAttachment}
           onComposerKeydown={props.onComposerKeydown}
           onSubmitComposer={props.onSubmitComposer}
-          onModelSwitch={props.onModelSwitch}
         />
       </section>
       {props.previewOpen && (
@@ -1222,17 +1279,19 @@ function Messages({ messages }: { messages: ChatMessage[] }) {
         {messages.map((message, index) => {
           const isUser = message.role === 'user';
           return (
-            <article key={`${message.role}-${index}`} className={cn('message', isUser && 'message-user')}>
+            <article key={message.id || `${message.role}-${index}`} className={cn('message', isUser && 'message-user')}>
               <MessageAvatar isUser={isUser} />
-              <div className="bubble">
-                {message.text.split('\n').map((line, lineIndex) => line ? <p key={lineIndex}>{line}</p> : <br key={lineIndex} />)}
-                {message.attachments?.length ? <AttachmentChips attachments={message.attachments} /> : null}
-                {message.tools?.length ? (
-                  <div className="tool-chips">
-                    {message.tools.map((tool) => <Badge key={tool} variant="secondary">{tool}</Badge>)}
-                  </div>
-                ) : null}
-                <time>{message.time}</time>
+              <div className="message-stack">
+                <div className="bubble">
+                  <MessageContent message={message} />
+                  {message.attachments?.length ? <AttachmentChips attachments={message.attachments} /> : null}
+                  {message.tools?.length ? (
+                    <div className="tool-chips">
+                      {message.tools.map((tool) => <Badge key={tool} variant="secondary">{tool}</Badge>)}
+                    </div>
+                  ) : null}
+                </div>
+                <time className="message-time">{message.time}</time>
               </div>
             </article>
           );
@@ -1261,9 +1320,7 @@ function AttachmentChips({ attachments, onRemove }: { attachments: Attachment[];
   );
 }
 
-function ComposerModelFooter(props: {
-  llm: RuntimeModelConfig;
-  settingsStatus: string;
+function ComposerInput(props: {
   attachments: Attachment[];
   composerRef: React.RefObject<HTMLTextAreaElement | null>;
   fileInputRef: React.RefObject<HTMLInputElement | null>;
@@ -1272,11 +1329,7 @@ function ComposerModelFooter(props: {
   onRemoveAttachment: (id: string) => void;
   onComposerKeydown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   onSubmitComposer: (event: FormEvent<HTMLFormElement>) => void;
-  onModelSwitch: (id: string) => void;
 }) {
-  const options = props.llm.options?.length ? props.llm.options : [props.llm];
-  const current = props.llm.id || props.llm.model;
-  const modelSelectName = 'model_id';
   return (
     <form className="composer-shell" onSubmit={props.onSubmitComposer}>
       <input
@@ -1305,28 +1358,6 @@ function ComposerModelFooter(props: {
             发送
           </Button>
         </div>
-      </div>
-      <div className="composer-meta">
-        <div className="model-picker">
-          <span>模型信息</span>
-          <Select name={modelSelectName} value={current} onValueChange={props.onModelSwitch}>
-            <SelectTrigger className="model-select" aria-label="切换模型">
-              <SelectValue placeholder="选择模型" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectGroup>
-                {options.map((option) => {
-                  const value = option.id || option.model;
-                  const label = option.id && option.id !== option.model ? `${option.id} · ${option.model}` : option.model || option.id;
-                  return <SelectItem key={value} value={value}>{label}</SelectItem>;
-                })}
-              </SelectGroup>
-            </SelectContent>
-          </Select>
-          <Badge variant="secondary">{props.llm.protocol}</Badge>
-          <span className="model-url">{props.llm.base_url || '未配置 Base URL'}</span>
-        </div>
-        <span className="composer-hint">{props.settingsStatus || 'Enter 发送，Shift/Alt+Enter 换行'}</span>
       </div>
     </form>
   );

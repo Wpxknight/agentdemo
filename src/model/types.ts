@@ -45,12 +45,14 @@ export interface ToolResult {
 export interface Msg {
   role: Role;
   text?: string;
+  thinking?: string; // role === 'assistant'，模型 reasoning/thinking 内容
   toolCalls?: ToolCall[]; // role === 'assistant'
   toolResults?: ToolResult[]; // role === 'tool'
 }
 
 /** 流式过程中产生的中立事件。 */
 export type StreamEvent =
+  | { type: 'thinking_delta'; text: string }
   | { type: 'text_delta'; text: string }
   | { type: 'tool_call'; call: ToolCall }
   | { type: 'usage'; inputTokens: number; outputTokens: number }

@@ -111,14 +111,23 @@ export class AnthropicModel implements ChatModel {
           }
           break;
 
-        case 'content_block_delta':
-          if (ev.delta.type === 'text_delta') {
-            yield { type: 'text_delta', text: ev.delta.text };
-          } else if (ev.delta.type === 'input_json_delta') {
+        case 'content_block_delta': {
+          const delta = ev.delta as {
+            type: string;
+            text?: string;
+            thinking?: string;
+            partial_json?: string;
+          };
+          if (delta.type === 'text_delta' && typeof delta.text === 'string') {
+            yield { type: 'text_delta', text: delta.text };
+          } else if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+            yield { type: 'thinking_delta', text: delta.thinking };
+          } else if (delta.type === 'input_json_delta') {
             const p = pending.get(ev.index);
-            if (p) p.json += ev.delta.partial_json;
+            if (p) p.json += delta.partial_json ?? '';
           }
           break;
+        }
 
         case 'content_block_stop': {
           const p = pending.get(ev.index);

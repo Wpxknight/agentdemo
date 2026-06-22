@@ -137,6 +137,8 @@ export class OpenAIModel implements ChatModel {
       if (!choice) continue;
       const delta = choice.delta;
 
+      const thinking = readReasoningDelta(delta);
+      if (thinking) yield { type: 'thinking_delta', text: thinking };
       if (delta?.content) yield { type: 'text_delta', text: delta.content };
 
       for (const tc of delta?.tool_calls ?? []) {
@@ -172,4 +174,26 @@ function safeJson(s: string): JsonValue {
   } catch {
     return {};
   }
+}
+
+function readReasoningDelta(delta: unknown): string {
+  if (!delta || typeof delta !== 'object') return '';
+  const record = delta as Record<string, unknown>;
+  for (const key of ['reasoning_content', 'thinking_content', 'reasoning', 'thinking']) {
+    const value = record[key];
+    if (typeof value === 'string') return value;
+  }
+  const details = record.reasoning_details;
+  if (!Array.isArray(details)) return '';
+  return details
+    .map((item) => {
+      if (!item || typeof item !== 'object') return '';
+      const detail = item as Record<string, unknown>;
+      return typeof detail.text === 'string'
+        ? detail.text
+        : typeof detail.delta === 'string'
+          ? detail.delta
+          : '';
+    })
+    .join('');
 }

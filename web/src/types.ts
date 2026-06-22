@@ -73,8 +73,10 @@ export interface Attachment {
 }
 
 export interface ChatMessage {
+  id?: string;
   role: Role;
   text: string;
+  thinking?: string;
   time: string;
   tools?: string[];
   attachments?: Attachment[];
