@@ -71,6 +71,13 @@ describe('frontend container proxy', () => {
     expect(dockerfile).toContain('npm run build');
     expect(dockerfile).toContain('COPY --from=build /app/dist /usr/share/nginx/html');
   });
+
+  it('keeps the bundled skills directory writable for runtime zip imports', async () => {
+    const dockerfile = await readFile('Dockerfile', 'utf8');
+
+    expect(dockerfile).toContain('COPY --chown=node:node skills ./skills');
+    expect(dockerfile).toContain('USER node');
+  });
 });
 
 describe('frontend API wiring', () => {
@@ -148,6 +155,12 @@ describe('frontend API wiring', () => {
     expect(app).toContain('PrototypeChatShell');
     expect(app).toContain('prototype-chat-page');
     expect(app).toContain('prototype-sidebar-nav');
+    expect(app).toContain('<PrototypeSidebarNav page="chat"');
+    expect(app).toContain('<div className="prototype-chat-page management-page">');
+    expect(app).toContain('<div className="prototype-main-content management-main-content">');
+    expect(app).toContain('<PrototypeSidebarNav page={activePage}');
+    expect(app).toContain('SidebarAccountMenu');
+    expect(app).toContain('account-popover');
     expect(app).toContain('prototype-session-panel');
     expect(app).toContain('prototype-sandbox-panel');
     expect(app).toContain('prototype-message-end');
@@ -161,7 +174,12 @@ describe('frontend API wiring', () => {
     expect(css).toContain('--brand-soft');
     expect(css).toContain('--focus-ring');
     expect(css).toContain('.prototype-chat-page');
-    expect(css).toContain('.prototype-topbar');
+    expect(css).toContain('.management-page');
+    expect(css).toContain('.management-main-content');
+    expect(css).not.toContain('.prototype-topbar');
+    expect(css).not.toContain('.topbar');
+    expect(css).toContain('.sidebar-account');
+    expect(css).toContain('.account-popover');
     expect(css).toContain('.prototype-main-content');
     expect(css).toContain('.prototype-message-end');
     expect(css).toContain('.brand-logo');
@@ -263,11 +281,86 @@ describe('frontend API wiring', () => {
     expect(css).toContain('word-break: break-word');
   });
 
-  it('wires Skills and MCP test calls to the generic tool-call API', async () => {
+  it('keeps the skills page focused on browsing and import without test-call controls', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(app).toContain('SkillFileEntry');
+    expect(app).toContain('SkillFileBody');
+    expect(app).toContain('SkillActionBody');
+    expect(app).toContain('showSkillFiles');
+    expect(app).toContain('skill-file-tree-panel');
+    expect(app).toContain('skill-tree-node');
+    expect(app).toContain('skill-tree-up-button');
+    expect(app).toContain('skill-import-button');
+    expect(app).toContain("accept=\".zip,application/zip,application/x-zip-compressed\"");
+    expect(app).toContain("api.post<SkillsImportBody>('/v1/skills/import");
+    expect(app).toContain('api.get<SkillFileBody>(`/v1/skills/${encodeURIComponent(selectedName)}/files');
+    expect(app).toContain('api.post<SkillActionBody>(`/v1/skills/${encodeURIComponent(selectedName)}/disable`');
+    expect(app).toContain('api.post<SkillActionBody>(`/v1/skills/${encodeURIComponent(selectedName)}/enable`');
+    expect(app).toContain('api.delete<SkillActionBody>(`/v1/skills/${encodeURIComponent(selectedName)}`');
+    expect(app).toContain('window.confirm');
+    expect(app).toContain('readFileAsDataUrl(file)');
+    expect(app).toContain('await onImported()');
+    expect(app).toContain("setSelectedFile('SKILL.md')");
+    expect(app).toContain('导入技能');
+    expect(app).toContain('文件大小');
+    expect(app).toContain('更新时间');
+    expect(app).not.toContain('来源 <strong>');
+    expect(app).not.toContain('最近使用');
+    expect(app).not.toContain('管理 AI 助手可调用的技能包和附带文件');
+    expect(app).not.toContain('testSkillTool');
+    expect(app).not.toContain(`<SkillsPage tools={skillTools.length ? skillTools : fallbackTools.filter((tool) => tool.category === 'skill')} output=`);
+    expect(app).not.toContain('测试加载');
+    expect(css).toContain('.skills-workbench');
+    expect(css).toContain('.skill-file-tree-panel');
+    expect(css).toContain('.skill-tree-node');
+    expect(css).toContain('.skill-tree-up-button');
+  });
+
+  it('keeps management page headers compact and title-only', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(app).toContain('function PageTitle({ title }: { title: string })');
+    expect(app).not.toContain('<p>{subtitle}</p>');
+    expect(app).not.toContain('管理 MCP server，扩展 AI 助手的能力边界');
+    expect(app).not.toContain('配置和管理定时执行的 AI 任务');
+    expect(app).not.toContain('管理隔离沙箱，安全执行运维操作');
+    expect(app).not.toContain('配置 AI 助手当前使用的 LLM 服务');
+    expect(css).toContain('min-height: 44px');
+    expect(css).not.toContain('.page-title h1,\n  .skills-page-header h1 {\n    font-size: 14px');
+    expect(css).toContain('.page-title h1,\n  .skills-page-header h1 {\n    font-size: 18px');
+  });
+
+  it('keeps non-chat pages full-screen with a fixed shell and internal scrolling', async () => {
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(css).toContain('.management-page {\n    height: 100vh;');
+    expect(css).toContain('overflow: hidden;');
+    expect(css).toContain('.management-main-content {\n    width: 100%;\n    height: 100%;');
+    expect(css).toContain('.management-main-content .main-shell {\n    flex: 1 1 auto;');
+    expect(css).toContain('.management-main-content .content-shell {\n    width: 100%;\n    height: 100vh;\n    overflow: auto;');
+  });
+
+  it('keeps chat panel toggles only in the header controls', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(app).toContain('PrototypeChatHeader');
+    expect(app).toContain('onToggleHistory={props.onToggleHistory}');
+    expect(app).toContain('onTogglePreview={props.onTogglePreview}');
+    expect(app).not.toContain('prototype-collapsed-left');
+    expect(app).not.toContain('prototype-collapsed-right');
+    expect(app).not.toContain('aria-label="展开最近会话"');
+    expect(app).not.toContain('aria-label="展开当前沙箱"');
+    expect(css).not.toContain('.prototype-collapsed-panel');
+  });
+
+  it('wires MCP test calls to the generic tool-call API', async () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
 
     expect(app).toContain("api.post<ToolCallBody>('/v1/tools/call");
-    expect(app).toContain('testSkillTool');
     expect(app).toContain('testMcpTool');
     expect(app).toContain('tool-test-args');
     expect(app).toContain('toolTestOutput');

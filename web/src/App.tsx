@@ -50,6 +50,10 @@ import type {
   SandboxesBody,
   ScheduleBody,
   ScheduledTask,
+  SkillActionBody,
+  SkillFileBody,
+  SkillFileEntry,
+  SkillsImportBody,
   SessionMessagesBody,
   SessionSummary,
   SessionsBody,
@@ -730,10 +734,6 @@ export default function App() {
     }
   }
 
-  async function testSkillTool(name: string, rawArgs: string) {
-    await testTool(name, rawArgs);
-  }
-
   async function testMcpTool(name: string, rawArgs: string) {
     await testTool(name, rawArgs);
   }
@@ -796,24 +796,36 @@ export default function App() {
 
   return (
     <TooltipProvider>
-      <div className="app-shell">
-        <Sidebar page={activePage} onNavigate={navigate} />
-        <main className="main-shell">
-          <Topbar token={token} onLogout={redirectToLogin} />
+      <div className="prototype-chat-page management-page">
+        <div className="prototype-main-content management-main-content">
+          <PrototypeSidebarNav page={activePage} token={token} onNavigate={navigate} onLogout={redirectToLogin} />
+          <main className="main-shell">
           <section className="content-shell content-wide">
-            {activePage === 'skills' && <SkillsPage tools={skillTools.length ? skillTools : fallbackTools.filter((tool) => tool.category === 'skill')} output={toolTestOutput} onTest={testSkillTool} />}
+            {activePage === 'skills' && (
+              <SkillsPage
+                tools={skillTools.length ? skillTools : fallbackTools.filter((tool) => tool.category === 'skill')}
+                api={api}
+                onImported={() => loadPageData('skills')}
+              />
+            )}
             {activePage === 'mcp' && <McpPage tools={mcpTools} output={toolTestOutput} onTest={testMcpTool} />}
             {activePage === 'schedule' && <SchedulePage tasks={tasks.length ? tasks : fallbackTasks} />}
             {activePage === 'sandbox' && <SandboxPage sandboxes={sandboxes.length ? sandboxes : fallbackSandboxes} />}
             {activePage === 'settings' && <SettingsPage llm={llm} status={settingsStatus} api={api} onLlmChange={setLlm} onStatus={setSettingsStatus} />}
           </section>
-        </main>
+          </main>
+        </div>
       </div>
     </TooltipProvider>
   );
 }
 
-function Sidebar({ page, onNavigate }: { page: PageId; onNavigate: (page: PageId) => void }) {
+function Sidebar({ page, token, onNavigate, onLogout }: {
+  page: PageId;
+  token: string;
+  onNavigate: (page: PageId) => void;
+  onLogout: () => void;
+}) {
   return (
     <aside className="sidebar" aria-label="主导航">
       <BrandLogo className="brand-logo-rail" />
@@ -837,27 +849,41 @@ function Sidebar({ page, onNavigate }: { page: PageId; onNavigate: (page: PageId
           );
         })}
       </nav>
+      <SidebarAccountMenu token={token} onLogout={onLogout} />
     </aside>
   );
 }
 
-function Topbar({ token, onLogout }: { token: string; onLogout: () => void }) {
+function SidebarAccountMenu({ token, onLogout }: { token: string; onLogout: () => void }) {
+  const [open, setOpen] = useState(false);
   return (
-    <header className="topbar">
-      <div className="topbar-title">
-        <BrandLogo className="brand-logo-topbar" />
-        <strong>AIOP</strong>
-        <span>AI 运维工作台</span>
-      </div>
-      <div className="topbar-actions">
-        <Badge variant="outline">租户 default</Badge>
-        <Badge variant="secondary">{token ? 'platform_admin' : '未登录'}</Badge>
-        <Button variant="ghost" size="sm" onClick={onLogout}>
-          <LogOut data-icon="inline-start" />
-          退出
-        </Button>
-      </div>
-    </header>
+    <div className="sidebar-account">
+      <button
+        className={cn('account-avatar-button', open && 'active')}
+        type="button"
+        aria-label="用户菜单"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <img src={userAvatarUrl} alt="" />
+      </button>
+      {open ? (
+        <div className="account-popover" role="menu">
+          <div className="account-popover-user">
+            <img src={userAvatarUrl} alt="" />
+            <div>
+              <strong>{token ? 'platform_admin' : '未登录'}</strong>
+              <span>租户 default</span>
+            </div>
+          </div>
+          <Separator />
+          <Button variant="ghost" size="sm" type="button" role="menuitem" onClick={onLogout}>
+            <LogOut data-icon="inline-start" />
+            退出
+          </Button>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -895,25 +921,8 @@ function PrototypeChatShell(props: {
 }) {
   return (
     <div className="prototype-chat-page">
-      <header className="prototype-topbar">
-        <div className="prototype-brand">
-          <BrandLogo className="prototype-brand-logo" />
-          <strong>AIOP</strong>
-        </div>
-        <div className="prototype-account">
-          <span>租户 default</span>
-          <div>
-            <img src={userAvatarUrl} alt="" />
-            <strong>{props.token ? 'platform_admin' : '未登录'}</strong>
-          </div>
-          <button type="button" onClick={props.onLogout}>
-            <LogOut />
-            退出
-          </button>
-        </div>
-      </header>
       <div className="prototype-main-content" id="main-content" style={{ '--sandbox-width': `${props.previewWidth}px` } as CSSProperties}>
-        <PrototypeSidebarNav onNavigate={props.onNavigate} />
+        <PrototypeSidebarNav page="chat" token={props.token} onNavigate={props.onNavigate} onLogout={props.onLogout} />
         {props.historyOpen ? (
           <PrototypeSessionPanel
             sessions={props.sessions}
@@ -921,13 +930,7 @@ function PrototypeChatShell(props: {
             onToggle={props.onToggleHistory}
             onSelect={props.onSelectSession}
           />
-        ) : (
-          <div className="prototype-collapsed-panel prototype-collapsed-left">
-            <button type="button" onClick={props.onToggleHistory} aria-label="展开最近会话">
-              <ChevronRight />
-            </button>
-          </div>
-        )}
+        ) : null}
         <main className="prototype-chat-center">
           <PrototypeChatHeader onNewSession={props.onNewSession} onToggleHistory={props.onToggleHistory} onTogglePreview={props.onTogglePreview} />
           <PrototypeMessages messages={props.messages} />
@@ -952,19 +955,18 @@ function PrototypeChatShell(props: {
             onStartResize={props.onStartResize}
             onClose={props.onTogglePreview}
           />
-        ) : (
-          <div className="prototype-collapsed-panel prototype-collapsed-right">
-            <button type="button" onClick={props.onTogglePreview} aria-label="展开当前沙箱">
-              <ChevronLeft />
-            </button>
-          </div>
-        )}
+        ) : null}
       </div>
     </div>
   );
 }
 
-function PrototypeSidebarNav({ onNavigate }: { onNavigate: (page: PageId) => void }) {
+function PrototypeSidebarNav({ page, token, onNavigate, onLogout }: {
+  page: PageId;
+  token: string;
+  onNavigate: (page: PageId) => void;
+  onLogout: () => void;
+}) {
   return (
     <aside className="prototype-sidebar-nav" aria-label="主导航">
       <BrandLogo className="prototype-sidebar-logo" />
@@ -975,7 +977,7 @@ function PrototypeSidebarNav({ onNavigate }: { onNavigate: (page: PageId) => voi
             <TooltipTrigger asChild>
               <button
                 type="button"
-                className={cn(item.id === 'chat' && 'active')}
+                className={cn('prototype-nav-btn', item.id === page && 'active')}
                 title={item.label}
                 aria-label={item.label}
                 onClick={() => onNavigate(item.id)}
@@ -987,6 +989,7 @@ function PrototypeSidebarNav({ onNavigate }: { onNavigate: (page: PageId) => voi
           </Tooltip>
         );
       })}
+      <SidebarAccountMenu token={token} onLogout={onLogout} />
     </aside>
   );
 }
@@ -1562,23 +1565,319 @@ function BrowserPreviewPanel(props: {
   );
 }
 
-function SkillsPage({ tools, output, onTest }: { tools: ToolSummary[]; output: string; onTest: (tool: string, args: string) => void }) {
-  const selected = tools[0] || fallbackTools[0];
-  const [args, setArgs] = useState(JSON.stringify(selected?.name === 'load_skill' ? { name: 'inspect' } : {}, null, 2));
+function skillFileEntries(tool?: ToolSummary): SkillFileEntry[] {
+  if (tool?.fileEntries?.length) return tool.fileEntries;
+  const paths = ['SKILL.md', ...(tool?.files || [])];
+  return paths.map((path) => ({
+    path,
+    name: path.split('/').pop() || path,
+    isDirectory: false,
+    size: 0,
+    updatedAt: '',
+  }));
+}
+
+function skillFiles(tool?: ToolSummary): string[] {
+  return skillFileEntries(tool).filter((file) => !file.isDirectory).map((file) => file.path);
+}
+
+function skillPreview(tool?: ToolSummary, selectedFile = 'SKILL.md'): string {
+  const name = toolDisplayName(tool?.name || 'skill');
+  const description = tool?.description || '后端已注册的 AI 助手技能。';
+  const files = skillFiles(tool).map((file) => `- ${file}`).join('\n');
+  if (selectedFile && selectedFile !== 'SKILL.md') {
+    return `# ${selectedFile}\n\n该文件来自技能 ${name} 的目录。\n\n文件内容需要通过后端技能导入或文件浏览能力读取。`;
+  }
+  return `# ${name}\n\n${description}\n\n## Files\n${files}`;
+}
+
+function skillIconFor(tool?: ToolSummary) {
+  const text = `${tool?.name || ''} ${tool?.description || ''}`.toLowerCase();
+  if (text.includes('kubectl') || text.includes('集群')) return TerminalSquare;
+  if (text.includes('web') || text.includes('browser')) return Globe;
+  if (text.includes('pdf') || text.includes('doc')) return Code2;
+  return Boxes;
+}
+
+function isSkillEnabled(tool?: ToolSummary): boolean {
+  if (!tool) return false;
+  return tool.enabled ?? ((tool.status || '已启用') !== '已禁用');
+}
+
+function parentPathOf(path: string): string {
+  const parts = path.split('/').filter(Boolean);
+  if (parts.length <= 1) return '';
+  return parts.slice(0, -1).join('/');
+}
+
+function SkillsPage({ tools, api, onImported }: {
+  tools: ToolSummary[];
+  api: ReturnType<typeof createApi>;
+  onImported: () => Promise<void>;
+}) {
+  const sourceTools = useMemo(
+    () => (tools.length ? tools : fallbackTools.filter((tool) => tool.category === 'skill')),
+    [tools],
+  );
+  const [selectedName, setSelectedName] = useState(sourceTools[0]?.name || '');
+  const [selectedFile, setSelectedFile] = useState('SKILL.md');
+  const [currentDir, setCurrentDir] = useState('');
+  const [directoryEntries, setDirectoryEntries] = useState<SkillFileEntry[]>([]);
+  const [fileBody, setFileBody] = useState<SkillFileBody | null>(null);
+  const [query, setQuery] = useState('');
+  const [showSkillFiles, setShowSkillFiles] = useState(false);
+  const [importStatus, setImportStatus] = useState('');
+  const importInputRef = useRef<HTMLInputElement | null>(null);
+
+  const selected = sourceTools.find((tool) => tool.name === selectedName) || sourceTools[0];
+  const files = useMemo(() => skillFiles(selected), [selected]);
+  const selectedEntry = fileBody?.entry || skillFileEntries(selected).find((file) => file.path === selectedFile);
+  const filteredTools = sourceTools.filter((tool) => {
+    const value = `${toolDisplayName(tool.name)} ${tool.description || ''}`.toLowerCase();
+    return value.includes(query.trim().toLowerCase());
+  });
+  const enabledCount = sourceTools.filter((tool) => (tool.status || '已启用') !== '已禁用').length;
+  const SkillIcon = skillIconFor(selected);
+
+  useEffect(() => {
+    if (!sourceTools.some((tool) => tool.name === selectedName)) {
+      setSelectedName(sourceTools[0]?.name || '');
+    }
+  }, [selectedName, sourceTools]);
+
+  useEffect(() => {
+    if (!selectedName) return;
+    setSelectedFile('SKILL.md');
+    setCurrentDir('');
+    setFileBody(null);
+    void loadSkillDirectory('');
+    void loadSkillFile('SKILL.md');
+  }, [selectedName]);
+
+  async function loadSkillDirectory(path = '') {
+    if (!selectedName) return;
+    try {
+      const suffix = path ? `?path=${encodeURIComponent(path)}` : '';
+      const body = await api.get<SkillFileBody>(`/v1/skills/${encodeURIComponent(selectedName)}/files${suffix}`);
+      setCurrentDir(body.path || path);
+      setDirectoryEntries(body.entries || []);
+    } catch (err) {
+      const entries = skillFileEntries(selected)
+        .filter((entry) => parentPathOf(entry.path) === path)
+        .sort((a, b) => Number(b.isDirectory) - Number(a.isDirectory) || a.name.localeCompare(b.name, 'zh-CN'));
+      setCurrentDir(path);
+      setDirectoryEntries(entries);
+      setImportStatus(`目录加载失败：${formatError(err)}`);
+    }
+  }
+
+  async function loadSkillFile(path = 'SKILL.md') {
+    if (!selectedName) return;
+    setSelectedFile(path);
+    try {
+      const body = await api.get<SkillFileBody>(`/v1/skills/${encodeURIComponent(selectedName)}/files?path=${encodeURIComponent(path)}`);
+      setSelectedFile(body.path || path);
+      setFileBody(body);
+    } catch (err) {
+      const entry = skillFileEntries(selected).find((file) => file.path === path);
+      setFileBody({
+        path,
+        parentPath: parentPathOf(path),
+        entry,
+        content: `${skillPreview(selected, path)}\n\n读取失败：${formatError(err)}`,
+      });
+    }
+  }
+
+  async function toggleSkillEnabled() {
+    if (!selectedName) return;
+    const shouldDisable = isSkillEnabled(selected);
+    setImportStatus(shouldDisable ? '正在禁用技能...' : '正在启用技能...');
+    try {
+      const body = shouldDisable
+        ? await api.post<SkillActionBody>(`/v1/skills/${encodeURIComponent(selectedName)}/disable`)
+        : await api.post<SkillActionBody>(`/v1/skills/${encodeURIComponent(selectedName)}/enable`);
+      await onImported();
+      if (body.skill?.name) setSelectedName(body.skill.name);
+      setImportStatus(shouldDisable ? '技能已禁用。' : '技能已启用。');
+    } catch (err) {
+      setImportStatus(`操作失败：${formatError(err)}`);
+    }
+  }
+
+  async function deleteSelectedSkill() {
+    if (!selectedName) return;
+    if (!window.confirm(`确认删除技能 ${toolDisplayName(selectedName)}？此操作不可恢复。`)) return;
+    setImportStatus('正在删除技能...');
+    try {
+      await api.delete<SkillActionBody>(`/v1/skills/${encodeURIComponent(selectedName)}`, { confirm: true });
+      const next = sourceTools.find((tool) => tool.name !== selectedName)?.name || '';
+      setSelectedName(next);
+      setSelectedFile('SKILL.md');
+      setFileBody(null);
+      await onImported();
+      setImportStatus('技能已删除。');
+    } catch (err) {
+      setImportStatus(`删除失败：${formatError(err)}`);
+    }
+  }
+
+  async function importSkillFile(file: File) {
+    if (!file.name.toLowerCase().endsWith('.zip')) {
+      setImportStatus('请选择 zip 技能包。');
+      return;
+    }
+    setImportStatus('正在导入技能...');
+    try {
+      const body = await api.post<SkillsImportBody>('/v1/skills/import', {
+        filename: file.name,
+        data: await readFileAsDataUrl(file),
+      });
+      await onImported();
+      setSelectedName(body.skill.name);
+      setSelectedFile('SKILL.md');
+      setShowSkillFiles(false);
+      setImportStatus(`已导入 ${toolDisplayName(body.skill.name)}。`);
+    } catch (err) {
+      setImportStatus(`导入失败：${formatError(err)}`);
+    }
+  }
+
   return (
-    <ManagementPage title="技能" subtitle="管理 AI 助手可调用的技能，提升运维自动化能力" actionLabel="导入技能">
-      <DataTable headers={['技能名称', '描述', '来源', '状态', '最近使用']} rows={tools.map((tool) => [toolDisplayName(tool.name), tool.description || '-', tool.source || '后端', tool.status || '已启用', tool.lastUsed || '-'])} />
-      <DetailPanel title={toolDisplayName(selected?.name)} status={selected?.status || '已启用'} icon={<Search />}>
-        <h3>描述</h3>
-        <p>{selected?.description || '后端已注册的 AI 助手能力。'}</p>
-        <h3>引用文件</h3>
-        <div className="file-list">{(selected?.files || ['SKILL.md', 'schema.json']).map((file) => <span key={file}>{file}</span>)}</div>
-        <h3>测试加载</h3>
-        <Textarea id="tool-test-args" value={args} onChange={(event) => setArgs(event.target.value)} rows={5} spellCheck={false} />
-        <Button type="button" onClick={() => onTest(selected?.name || 'load_skill', args)}>测试加载</Button>
-        {output ? <pre className="tool-output">{output}</pre> : null}
-      </DetailPanel>
-    </ManagementPage>
+    <section className="skills-page">
+      <div className="skills-page-header">
+        <div>
+          <h1>技能管理</h1>
+        </div>
+        <input
+          ref={importInputRef}
+          type="file"
+          accept=".zip,application/zip,application/x-zip-compressed"
+          hidden
+          onChange={(event) => {
+            const file = event.currentTarget.files?.[0];
+            event.currentTarget.value = '';
+            if (file) void importSkillFile(file);
+          }}
+        />
+        <Button className="skill-import-button" type="button" onClick={() => importInputRef.current?.click()}>
+          <Plus data-icon="inline-start" />
+          导入技能
+        </Button>
+      </div>
+      {importStatus ? <div className="skill-import-status">{importStatus}</div> : null}
+      <div className={cn('skills-workbench', showSkillFiles && 'with-file-tree')}>
+        <aside className="skill-list-panel">
+          <label className="skill-search-box">
+            <Search />
+            <Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索技能..." />
+          </label>
+          <div className="skill-list-meta">
+            <span>共 {sourceTools.length} 个技能</span>
+            <span>{enabledCount} 个已启用</span>
+          </div>
+          <ScrollArea className="skill-list-scroll">
+            <div className="skill-list">
+              {filteredTools.map((tool) => {
+                const Icon = skillIconFor(tool);
+                const active = tool.name === selected?.name;
+                return (
+                  <button
+                    key={tool.name}
+                    className={cn('skill-list-item', active && 'active')}
+                    type="button"
+                    onClick={() => {
+                      setSelectedName(tool.name);
+                      setSelectedFile(skillFiles(tool)[0] || 'SKILL.md');
+                    }}
+                  >
+                    <span className="skill-list-icon"><Icon /></span>
+                    <span className="skill-list-copy">
+                      <span>
+                        <strong>{toolDisplayName(tool.name)}</strong>
+                        <small>{skillFiles(tool).length} 个文件</small>
+                      </span>
+                      <em>{tool.description || '后端已注册的 AI 助手技能。'}</em>
+                      <span className="skill-list-foot">
+                        <Badge variant="secondary">{tool.status || '已启用'}</Badge>
+                        <small>{isSkillEnabled(tool) ? '可被助手加载' : '不会被助手加载'}</small>
+                      </span>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </ScrollArea>
+        </aside>
+        {showSkillFiles ? (
+          <aside className="skill-file-tree-panel">
+            <div className="skill-panel-title">
+              <strong>文件目录</strong>
+              <span>{currentDir || '根目录'}</span>
+            </div>
+            <div className="skill-file-tree">
+              {currentDir ? (
+                <button
+                  className="skill-tree-up-button"
+                  type="button"
+                  onClick={() => void loadSkillDirectory(parentPathOf(currentDir))}
+                >
+                  <ChevronLeft />
+                  <span>上级目录</span>
+                </button>
+              ) : null}
+              {directoryEntries.map((entry) => (
+                <button
+                  key={entry.path}
+                  className={cn('skill-file-row', 'skill-tree-node', entry.isDirectory && 'directory', selectedFile === entry.path && 'active')}
+                  style={{ '--depth': String(Math.max(0, entry.path.split('/').length - 1)) } as CSSProperties}
+                  type="button"
+                  onClick={() => {
+                    if (entry.isDirectory) void loadSkillDirectory(entry.path);
+                    else void loadSkillFile(entry.path);
+                  }}
+                >
+                  {entry.isDirectory ? <Boxes /> : <Code2 />}
+                  <span>{entry.name}</span>
+                </button>
+              ))}
+            </div>
+          </aside>
+        ) : null}
+        <main className="skill-detail-panel">
+          <div className="skill-detail-head">
+            <div className="skill-title-block">
+              <span className="skill-detail-icon"><SkillIcon /></span>
+              <div>
+                <h2>{toolDisplayName(selected?.name)}</h2>
+                <p>{selected?.description || '后端已注册的 AI 助手技能。'}</p>
+              </div>
+            </div>
+            <div className="skill-detail-actions">
+              <Button variant="outline" size="sm" type="button" onClick={() => setShowSkillFiles((value) => !value)}>
+                <Boxes data-icon="inline-start" />
+                {showSkillFiles ? '隐藏目录' : '目录'}
+              </Button>
+              <Button variant="outline" size="sm" type="button" onClick={() => void toggleSkillEnabled()}>
+                {isSkillEnabled(selected) ? <X data-icon="inline-start" /> : <Check data-icon="inline-start" />}
+                {isSkillEnabled(selected) ? '禁用' : '启用'}
+              </Button>
+              <Button variant="outline" size="sm" type="button" onClick={() => void deleteSelectedSkill()}>
+                <Trash2 data-icon="inline-start" />
+                删除
+              </Button>
+              <Badge variant="secondary">{selected?.status || '已启用'}</Badge>
+            </div>
+          </div>
+          <div className="skill-meta-row">
+            <span>文件大小 <strong>{formatFileSize(selectedEntry?.size || 0)}</strong></span>
+            <span>更新时间 <strong>{formatDateTime(selectedEntry?.updatedAt)}</strong></span>
+            <span>当前文件 <strong>{selectedFile}</strong></span>
+          </div>
+          <pre className="skill-preview">{fileBody?.content || skillPreview(selected, selectedFile)}</pre>
+        </main>
+      </div>
+    </section>
   );
 }
 
@@ -1599,7 +1898,7 @@ function McpPage({ tools, output, onTest }: { tools: ToolSummary[]; output: stri
   }, [selected.tools, tool]);
 
   return (
-    <ManagementPage title="MCP" subtitle="管理 MCP server，扩展 AI 助手的能力边界" actionLabel="新增 MCP">
+    <ManagementPage title="MCP" actionLabel="新增 MCP">
       <DataTable headers={['名称', '传输协议', '状态', '工具数', '最近心跳']} rows={serverRows} />
       <DetailPanel title={selected.name} status={selected.status} icon={<Boxes />}>
         <h3>连接配置</h3>
@@ -1633,11 +1932,11 @@ function buildMcpServers(tools: ToolSummary[]) {
   return [...servers.values()];
 }
 
-function ManagementPage({ title, subtitle, actionLabel, children }: { title: string; subtitle: string; actionLabel: string; children: React.ReactNode }) {
+function ManagementPage({ title, actionLabel, children }: { title: string; actionLabel: string; children: React.ReactNode }) {
   const content = Array.isArray(children) ? children : [children];
   return (
     <>
-      <PageTitle title={title} subtitle={subtitle} />
+      <PageTitle title={title} />
       <div className="toolbar">
         <label className="search-box"><Search /><Input placeholder={`搜索${title}`} /></label>
         <Button variant="outline">全部</Button>
@@ -1671,7 +1970,7 @@ function SchedulePage({ tasks }: { tasks: ScheduledTask[] }) {
   const selected = tasks[0] || fallbackTasks[0];
   return (
     <>
-      <PageTitle title="定时任务" subtitle="配置和管理定时执行的 AI 任务" />
+      <PageTitle title="定时任务" />
       <Card className="create-task">
         <CardContent className="task-create-grid">
           <Label>创建任务<Textarea placeholder="描述你要定时执行的任务..." /></Label>
@@ -1699,7 +1998,7 @@ function SandboxPage({ sandboxes }: { sandboxes: SandboxSummary[] }) {
   const selected = sandboxes[0] || fallbackSandboxes[0];
   return (
     <>
-      <PageTitle title="沙箱环境" subtitle="管理隔离沙箱，安全执行运维操作" />
+      <PageTitle title="沙箱环境" />
       <div className="toolbar">
         <Badge variant="secondary"><CheckCircle2 />运行中</Badge>
         <label className="search-box"><Search /><Input placeholder="搜索沙箱" /></label>
@@ -1759,7 +2058,7 @@ function SettingsPage({ llm, status, api, onLlmChange, onStatus }: {
 
   return (
     <>
-      <PageTitle title="设置" subtitle="配置 AI 助手当前使用的 LLM 服务" />
+      <PageTitle title="设置" />
       <div className="settings-layout">
         <Card>
           <CardHeader>
@@ -1824,11 +2123,10 @@ function formatCell(cell: string) {
   return cell;
 }
 
-function PageTitle({ title, subtitle }: { title: string; subtitle: string }) {
+function PageTitle({ title }: { title: string }) {
   return (
     <div className="page-title">
       <h1>{title}</h1>
-      <p>{subtitle}</p>
     </div>
   );
 }

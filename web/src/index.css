@@ -164,11 +164,6 @@
     display: block;
   }
 
-  .brand-logo-topbar {
-    width: 32px;
-    height: 32px;
-  }
-
   .brand-logo-login {
     width: 46px;
     height: 46px;
@@ -216,38 +211,96 @@
     transform: translateY(-1px);
   }
 
+  .sidebar-account {
+    position: relative;
+    margin-top: auto;
+  }
+
+  .account-avatar-button {
+    width: 42px;
+    height: 42px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    display: grid;
+    place-items: center;
+    padding: 3px;
+    transition: background .14s ease, box-shadow .14s ease, transform .14s ease;
+  }
+
+  .account-avatar-button img {
+    width: 100%;
+    height: 100%;
+    border-radius: inherit;
+    object-fit: cover;
+    display: block;
+    box-shadow: 0 0 0 1px hsl(var(--border));
+  }
+
+  .account-avatar-button:hover,
+  .account-avatar-button.active {
+    background: hsl(var(--primary) / .08);
+    box-shadow: 0 0 0 3px hsl(var(--primary) / .08);
+    transform: translateY(-1px);
+  }
+
+  .account-popover {
+    position: absolute;
+    left: calc(100% + 12px);
+    bottom: 0;
+    width: 214px;
+    border: 1px solid hsl(var(--border));
+    border-radius: 8px;
+    background: var(--surface-raised);
+    box-shadow: 0 18px 48px rgba(15, 40, 80, .15);
+    padding: 10px;
+    display: grid;
+    gap: 10px;
+    z-index: 40;
+  }
+
+  .account-popover-user {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr);
+    gap: 10px;
+    align-items: center;
+  }
+
+  .account-popover-user img {
+    width: 34px;
+    height: 34px;
+    border-radius: 999px;
+    object-fit: cover;
+  }
+
+  .account-popover-user div {
+    min-width: 0;
+    display: grid;
+    gap: 2px;
+  }
+
+  .account-popover-user strong,
+  .account-popover-user span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .account-popover-user span {
+    color: hsl(var(--muted-foreground));
+    font-size: 12px;
+  }
+
+  .account-popover button {
+    justify-content: flex-start;
+  }
+
   .main-shell {
     min-width: 0;
     display: grid;
-    grid-template-rows: 64px minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
   }
 
-  .topbar {
-    background: rgba(255, 255, 255, .9);
-    border-bottom: 1px solid hsl(var(--border) / .76);
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 0 20px;
-    backdrop-filter: blur(14px);
-  }
-
-  .topbar-title,
-  .topbar-actions {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    min-width: 0;
-  }
-
-  .topbar-title strong {
-    font-size: 21px;
-    line-height: 1;
-    letter-spacing: 0;
-    color: hsl(var(--primary));
-  }
-
-  .topbar-title span,
   .drawer-head span {
     color: hsl(var(--muted-foreground));
     font-size: 13px;
@@ -838,11 +891,20 @@
   }
 
   .page-title {
-    margin-bottom: 20px;
+    min-height: 44px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid hsl(214 70% 91%);
   }
 
-  .page-title p {
-    margin-top: 8px;
+  .page-title h1,
+  .skills-page-header h1 {
+    font-size: 18px;
+    line-height: 1.25;
+    color: hsl(var(--primary));
   }
 
   .toolbar {
@@ -957,6 +1019,337 @@
     max-height: 260px;
   }
 
+  .skills-page {
+    height: calc(100vh - 48px);
+    min-height: 620px;
+    display: grid;
+    grid-template-rows: auto auto minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .skills-page-header {
+    grid-row: 1;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid hsl(214 70% 91%);
+  }
+
+  .skill-import-status {
+    grid-row: 2;
+    min-height: 34px;
+    border: 1px solid hsl(var(--border));
+    border-radius: 8px;
+    background: var(--surface-raised);
+    color: hsl(var(--muted-foreground));
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    font-size: 12px;
+  }
+
+  .skills-workbench {
+    grid-row: 3;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 312px minmax(0, 1fr);
+    border: 1px solid hsl(var(--border));
+    border-radius: 8px;
+    background: hsl(var(--card));
+    overflow: hidden;
+    box-shadow: 0 12px 30px rgba(15, 40, 80, .055);
+  }
+
+  .skills-workbench.with-file-tree {
+    grid-template-columns: 312px 240px minmax(0, 1fr);
+  }
+
+  .skill-list-panel,
+  .skill-file-tree-panel,
+  .skill-detail-panel {
+    min-height: 0;
+  }
+
+  .skill-list-panel {
+    border-right: 1px solid hsl(var(--border));
+    background: hsl(var(--surface-muted) / .68);
+    display: grid;
+    grid-template-rows: auto auto minmax(0, 1fr);
+    gap: 10px;
+    padding: 12px;
+  }
+
+  .skill-search-box {
+    height: 38px;
+    border: 1px solid hsl(var(--border));
+    border-radius: 8px;
+    background: hsl(var(--card));
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 10px;
+    color: hsl(var(--muted-foreground));
+  }
+
+  .skill-search-box svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .skill-search-box input {
+    border: 0;
+    box-shadow: none;
+    padding: 0;
+  }
+
+  .skill-list-meta {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: hsl(var(--muted-foreground));
+    font-size: 12px;
+  }
+
+  .skill-list-scroll {
+    min-height: 0;
+  }
+
+  .skill-list {
+    display: grid;
+    gap: 8px;
+    padding-right: 4px;
+  }
+
+  .skill-list-item {
+    width: 100%;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    background: hsl(var(--card));
+    text-align: left;
+    padding: 12px;
+    display: grid;
+    grid-template-columns: 40px minmax(0, 1fr);
+    gap: 11px;
+    transition: border-color .14s ease, box-shadow .14s ease, background .14s ease;
+  }
+
+  .skill-list-item:hover,
+  .skill-list-item.active {
+    border-color: hsl(var(--primary) / .25);
+    box-shadow: 0 8px 22px rgba(15, 91, 216, .08);
+  }
+
+  .skill-list-item.active {
+    background: linear-gradient(90deg, hsl(214 100% 98%) 0%, #fff 100%);
+  }
+
+  .skill-list-icon,
+  .skill-detail-icon {
+    border-radius: 8px;
+    display: grid;
+    place-items: center;
+    background: hsl(var(--primary) / .09);
+    color: hsl(var(--primary));
+    box-shadow: inset 0 0 0 1px hsl(var(--primary) / .12);
+  }
+
+  .skill-list-icon {
+    width: 40px;
+    height: 40px;
+  }
+
+  .skill-list-icon svg,
+  .skill-detail-icon svg,
+  .skill-file-row svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  .skill-list-copy {
+    min-width: 0;
+    display: grid;
+    gap: 6px;
+  }
+
+  .skill-list-copy > span:first-child,
+  .skill-list-foot,
+  .skill-panel-title,
+  .skill-detail-head,
+  .skill-title-block,
+  .skill-detail-actions,
+  .skill-meta-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .skill-list-copy > span:first-child {
+    justify-content: space-between;
+  }
+
+  .skill-list-copy strong,
+  .skill-list-copy em {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .skill-list-copy small,
+  .skill-list-copy em,
+  .skill-panel-title span,
+  .skill-meta-row {
+    color: hsl(var(--muted-foreground));
+    font-size: 12px;
+  }
+
+  .skill-list-copy em {
+    font-style: normal;
+  }
+
+  .skill-list-foot {
+    justify-content: space-between;
+  }
+
+  .skill-file-tree-panel {
+    border-right: 1px solid hsl(var(--border));
+    background: #fff;
+    padding: 12px;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .skill-panel-title {
+    justify-content: space-between;
+    min-height: 32px;
+  }
+
+  .skill-file-tree {
+    overflow: auto;
+    display: grid;
+    align-content: start;
+    gap: 4px;
+  }
+
+  .skill-file-row {
+    min-height: 34px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: hsl(var(--muted-foreground));
+    display: grid;
+    grid-template-columns: 20px minmax(0, 1fr);
+    align-items: center;
+    gap: 8px;
+    padding: 0 8px 0 calc(8px + var(--depth, 0) * 12px);
+    text-align: left;
+  }
+
+  .skill-tree-up-button {
+    min-height: 32px;
+    border: 1px solid hsl(var(--border));
+    border-radius: 8px;
+    background: hsl(var(--surface-muted));
+    color: hsl(var(--muted-foreground));
+    display: grid;
+    grid-template-columns: 18px minmax(0, 1fr);
+    align-items: center;
+    gap: 8px;
+    padding: 0 8px;
+    text-align: left;
+  }
+
+  .skill-tree-up-button:hover,
+  .skill-tree-node.directory:hover {
+    color: hsl(var(--primary));
+    border-color: hsl(var(--primary) / .25);
+  }
+
+  .skill-tree-up-button svg,
+  .skill-tree-node svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .skill-file-row span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .skill-file-row:hover,
+  .skill-file-row.active {
+    background: hsl(var(--primary) / .08);
+    color: hsl(var(--primary));
+  }
+
+  .skill-detail-panel {
+    background: #fff;
+    display: grid;
+    grid-template-rows: auto auto minmax(0, 1fr);
+    overflow: hidden;
+  }
+
+  .skill-detail-head {
+    justify-content: space-between;
+    gap: 16px;
+    padding: 18px 18px 14px;
+    border-bottom: 1px solid hsl(var(--border));
+  }
+
+  .skill-title-block {
+    min-width: 0;
+    align-items: flex-start;
+  }
+
+  .skill-detail-icon {
+    width: 44px;
+    height: 44px;
+    flex: 0 0 auto;
+  }
+
+  .skill-title-block h2 {
+    font-size: 18px;
+    margin-bottom: 4px;
+  }
+
+  .skill-title-block p {
+    max-width: 720px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .skill-detail-actions {
+    flex: 0 0 auto;
+    justify-content: flex-end;
+  }
+
+  .skill-meta-row {
+    min-height: 42px;
+    padding: 0 18px;
+    border-bottom: 1px solid hsl(var(--border));
+    flex-wrap: wrap;
+  }
+
+  .skill-meta-row strong {
+    color: hsl(var(--foreground));
+  }
+
+  .skill-preview {
+    margin: 0;
+    min-height: 0;
+    overflow: auto;
+    background: #fff;
+    color: #26364d;
+    padding: 18px;
+    font: 13px/1.75 "SFMono-Regular", Consolas, monospace;
+    white-space: pre-wrap;
+  }
+
   .empty-hint {
     margin: 0;
     border: 1px dashed hsl(var(--border));
@@ -1054,92 +1447,35 @@
   .prototype-chat-page {
     height: 100vh;
     overflow: hidden;
-    display: flex;
-    flex-direction: column;
     background: linear-gradient(135deg, hsl(214 100% 98% / .82), #fff);
   }
 
-  .prototype-topbar {
-    height: 56px;
-    min-height: 56px;
-    border-bottom: 1px solid hsl(214 70% 91%);
-    background: rgba(255, 255, 255, .94);
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0 16px;
-    box-shadow: 0 1px 3px rgba(15, 23, 42, .04);
-    z-index: 30;
+  .management-page {
+    height: 100vh;
+    overflow: hidden;
   }
 
-  .prototype-brand,
-  .prototype-account,
-  .prototype-account > div,
-  .prototype-account button {
-    display: flex;
-    align-items: center;
+  .management-main-content {
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
   }
 
-  .prototype-brand {
-    gap: 12px;
+  .management-main-content .main-shell {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 0;
+    height: 100%;
   }
 
-  .prototype-brand-logo {
-    width: 32px;
-    height: 32px;
-    border-radius: 8px;
-  }
-
-  .prototype-brand strong {
-    font-size: 20px;
-    font-weight: 800;
-    color: hsl(var(--primary));
-  }
-
-  .prototype-account {
-    gap: 12px;
+  .management-main-content .content-shell {
+    width: 100%;
+    height: 100vh;
+    overflow: auto;
     min-width: 0;
   }
 
-  .prototype-account > span,
-  .prototype-account > div {
-    min-height: 28px;
-    border-radius: 8px;
-    background: hsl(214 32% 96%);
-    color: hsl(216 20% 34%);
-    font-size: 12px;
-    font-weight: 650;
-    padding: 5px 10px;
-    border: 1px solid hsl(214 32% 90%);
-  }
-
-  .prototype-account > div {
-    gap: 7px;
-    padding-left: 7px;
-  }
-
-  .prototype-account img {
-    width: 24px;
-    height: 24px;
-    border-radius: 999px;
-    object-fit: cover;
-  }
-
-  .prototype-account button {
-    border: 0;
-    background: transparent;
-    color: hsl(var(--foreground));
-    gap: 6px;
-    min-height: 34px;
-    padding: 0 8px;
-    border-radius: 8px;
-  }
-
-  .prototype-account button:hover {
-    background: hsl(var(--muted));
-  }
-
-  .prototype-account svg,
   .prototype-sidebar-nav svg,
   .prototype-chat-actions svg,
   .prototype-session-head svg,
@@ -1147,14 +1483,13 @@
   .prototype-sandbox-head svg,
   .prototype-tabs svg,
   .prototype-code-card svg,
-  .prototype-browser-card svg,
-  .prototype-collapsed-panel svg {
+  .prototype-browser-card svg {
     width: 18px;
     height: 18px;
   }
 
   .prototype-main-content {
-    flex: 1;
+    height: 100%;
     min-height: 0;
     display: flex;
     overflow: hidden;
@@ -1180,10 +1515,9 @@
     margin-bottom: 14px;
   }
 
-  .prototype-sidebar-nav button,
+  .prototype-nav-btn,
   .prototype-session-head button,
   .prototype-chat-actions button,
-  .prototype-collapsed-panel button,
   .prototype-sandbox-head button {
     border: 0;
     background: transparent;
@@ -1194,22 +1528,21 @@
     transition: background .16s ease, color .16s ease, transform .16s ease;
   }
 
-  .prototype-sidebar-nav button {
+  .prototype-nav-btn {
     width: 40px;
     height: 40px;
     border-radius: 10px;
   }
 
-  .prototype-sidebar-nav button.active {
+  .prototype-nav-btn.active {
     color: hsl(var(--primary));
     background: hsl(var(--primary) / .09);
     box-shadow: inset 0 0 0 1px hsl(var(--primary) / .14);
   }
 
-  .prototype-sidebar-nav button:hover,
+  .prototype-nav-btn:hover,
   .prototype-session-head button:hover,
   .prototype-chat-actions button:hover,
-  .prototype-collapsed-panel button:hover,
   .prototype-sandbox-head button:hover {
     color: hsl(var(--primary));
     background: hsl(var(--muted));
@@ -1981,29 +2314,6 @@
     font: 12px/1.75 "SFMono-Regular", Consolas, monospace;
   }
 
-  .prototype-collapsed-panel {
-    width: 40px;
-    min-width: 40px;
-    display: grid;
-    place-items: center;
-    background: hsl(214 32% 96% / .82);
-  }
-
-  .prototype-collapsed-left {
-    border-right: 1px solid hsl(214 70% 91%);
-  }
-
-  .prototype-collapsed-right {
-    border-left: 1px solid hsl(214 70% 91%);
-  }
-
-  .prototype-collapsed-panel button {
-    width: 28px;
-    height: 28px;
-    background: #fff;
-    border: 1px solid hsl(214 70% 88%);
-    color: hsl(var(--primary));
-  }
 }
 
 @media (max-width: 1200px) {
@@ -2018,8 +2328,7 @@
     display: none;
   }
 
-  .prototype-sandbox-panel,
-  .prototype-collapsed-right {
+  .prototype-sandbox-panel {
     display: none;
   }
 
@@ -2027,6 +2336,26 @@
   .settings-layout,
   .task-create-grid {
     grid-template-columns: 1fr;
+  }
+
+  .skills-page {
+    height: auto;
+    min-height: calc(100vh - 48px);
+  }
+
+  .skills-workbench,
+  .skills-workbench.with-file-tree {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .skill-list-panel,
+  .skill-file-tree-panel {
+    border-right: 0;
+    border-bottom: 1px solid hsl(var(--border));
+  }
+
+  .skill-list-scroll {
+    max-height: 300px;
   }
 
   .detail-card {
@@ -2065,30 +2394,33 @@
     height: 44px;
   }
 
-  .topbar {
-    padding: 0 12px;
-  }
-
-  .topbar-actions {
-    display: none;
-  }
-
-  .topbar-title span {
-    display: none;
-  }
-
   .content-shell {
     padding: 10px;
-    overflow: hidden;
+    overflow: auto;
   }
 
-  .prototype-topbar {
-    padding: 0 12px;
+  .content-wide {
+    padding: 16px;
   }
 
-  .prototype-account > span,
-  .prototype-account > div {
-    display: none;
+  .skills-page-header,
+  .skill-detail-head,
+  .skill-meta-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .skills-workbench {
+    min-height: 0;
+  }
+
+  .skill-title-block p {
+    white-space: normal;
+  }
+
+  .account-popover {
+    width: 204px;
+    left: calc(100% + 8px);
   }
 
   .prototype-sidebar-nav {
@@ -2096,8 +2428,12 @@
     min-width: 52px;
   }
 
-  .prototype-session-panel,
-  .prototype-collapsed-left {
+  .prototype-sidebar-logo {
+    width: 32px;
+    height: 32px;
+  }
+
+  .prototype-session-panel {
     display: none;
   }
 

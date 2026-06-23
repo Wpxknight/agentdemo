@@ -33,6 +33,11 @@ export function createApi(token: string, onUnauthorized: () => void) {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
     }),
+    delete: <T>(path: string, body: unknown = {}) => request<T>(path, {
+      method: 'DELETE',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
   };
 }
 

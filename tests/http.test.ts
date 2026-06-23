@@ -1,5 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, mkdir } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { Server } from 'node:http';
 import { createHttpServer } from '../src/server/http.js';
 import { MemoryStore } from '../src/db/memory.js';
@@ -8,6 +11,7 @@ import { ToolRegistry } from '../src/agent/tools.js';
 import { AllowAllPolicy } from '../src/agent/policy.js';
 import type { Runtime } from '../src/runtime.js';
 import type { ChatModel, StreamEvent } from '../src/model/types.js';
+import { SkillRegistry } from '../src/skill/registry.js';
 
 /** 纯文本回答的 mock 模型（不发起工具调用）。 */
 const model: ChatModel = {
@@ -17,6 +21,68 @@ const model: ChatModel = {
     yield { type: 'stop', reason: 'end_turn' };
   },
 };
+
+function crc32(buf: Buffer): number {
+  let crc = 0xffffffff;
+  for (const b of buf) {
+    crc ^= b;
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function storedZip(files: Record<string, string>): Buffer {
+  const localParts: Buffer[] = [];
+  const centralParts: Buffer[] = [];
+  let offset = 0;
+  for (const [name, text] of Object.entries(files)) {
+    const nameBuf = Buffer.from(name);
+    const data = Buffer.from(text);
+    const crc = crc32(data);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0, 6);
+    local.writeUInt16LE(0, 8);
+    local.writeUInt32LE(0, 10);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(nameBuf.length, 26);
+    local.writeUInt16LE(0, 28);
+    localParts.push(local, nameBuf, data);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0, 8);
+    central.writeUInt16LE(0, 10);
+    central.writeUInt32LE(0, 12);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(nameBuf.length, 28);
+    central.writeUInt16LE(0, 30);
+    central.writeUInt16LE(0, 32);
+    central.writeUInt32LE(0, 34);
+    central.writeUInt32LE(0, 38);
+    central.writeUInt32LE(offset, 42);
+    centralParts.push(central, nameBuf);
+    offset += local.length + nameBuf.length + data.length;
+  }
+  const centralSize = centralParts.reduce((n, part) => n + part.length, 0);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(Object.keys(files).length, 8);
+  end.writeUInt16LE(Object.keys(files).length, 10);
+  end.writeUInt32LE(centralSize, 12);
+  end.writeUInt32LE(offset, 16);
+  end.writeUInt16LE(0, 20);
+  return Buffer.concat([...localParts, ...centralParts, end]);
+}
 
 let server: Server;
 let base: string;
@@ -607,6 +673,158 @@ describe('HTTP server', () => {
       expect(await mcp.json()).toMatchObject({ ok: true, result: { content: 'file:/tmp/a.txt' } });
     } finally {
       await new Promise<void>((resolve) => toolServer.close(() => resolve()));
+    }
+  });
+
+  it('imports a zipped skill and exposes it in the tools list', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'skill-import-secret' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    const skillRoot = await mkdtemp(join(tmpdir(), 'aiop-http-skill-import-'));
+    await mkdir(skillRoot, { recursive: true });
+    const skills = new SkillRegistry(skillRoot);
+    await skills.scan();
+    const tools = new ToolRegistry();
+    tools.register(skills.tool());
+    const rt = {
+      model,
+      tools,
+      skillRegistry: skills,
+      store: localStore,
+      policy: new AllowAllPolicy(),
+      policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth,
+      jwtSecret: 'skill-import-secret',
+      systemExtra: skills.summaries(),
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+
+    const importServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => importServer.listen(0, '127.0.0.1', resolve));
+    const importBase = `http://127.0.0.1:${(importServer.address() as AddressInfo).port}`;
+    const data = storedZip({
+      'SKILL.md': '---\nname: imported\ndescription: Imported skill\n---\n# Imported',
+      'scripts/run.sh': 'echo imported',
+    }).toString('base64');
+
+    try {
+      const imported = await fetch(`${importBase}/v1/skills/import`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ filename: 'imported.zip', data: `data:application/zip;base64,${data}` }),
+      });
+      expect(imported.status).toBe(201);
+      expect(await imported.json()).toMatchObject({
+        skill: {
+          name: 'imported',
+          description: 'Imported skill',
+          enabled: true,
+          status: '已启用',
+          fileEntries: expect.arrayContaining([
+            expect.objectContaining({ path: 'SKILL.md', isDirectory: false, size: expect.any(Number), updatedAt: expect.any(String) }),
+            expect.objectContaining({ path: 'scripts', isDirectory: true }),
+            expect.objectContaining({ path: 'scripts/run.sh', isDirectory: false, size: expect.any(Number), updatedAt: expect.any(String) }),
+          ]),
+        },
+      });
+
+      const listed = await fetch(`${importBase}/v1/tools`, {
+        headers: { authorization: `Bearer ${adminToken}` },
+      });
+      expect(listed.status).toBe(200);
+      const body = await listed.json() as {
+        tools: Array<{
+          name: string;
+          description: string;
+          category: string;
+          enabled?: boolean;
+          status?: string;
+          fileEntries?: Array<{ path: string; isDirectory: boolean; size: number; updatedAt: string }>;
+        }>;
+      };
+      expect(body.tools).toContainEqual(expect.objectContaining({
+        name: 'imported',
+        description: 'Imported skill',
+        category: 'skill',
+        enabled: true,
+        status: '已启用',
+        fileEntries: expect.arrayContaining([
+          expect.objectContaining({ path: 'SKILL.md', isDirectory: false }),
+          expect.objectContaining({ path: 'scripts', isDirectory: true }),
+          expect.objectContaining({ path: 'scripts/run.sh', isDirectory: false }),
+        ]),
+      }));
+
+      const rootFiles = await fetch(`${importBase}/v1/skills/imported/files`, {
+        headers: { authorization: `Bearer ${adminToken}` },
+      });
+      expect(rootFiles.status).toBe(200);
+      expect(await rootFiles.json()).toMatchObject({
+        path: '',
+        parentPath: null,
+        entries: [
+          expect.objectContaining({ path: 'scripts', isDirectory: true }),
+          expect.objectContaining({ path: 'SKILL.md', isDirectory: false }),
+        ],
+      });
+
+      const skillMd = await fetch(`${importBase}/v1/skills/imported/files?path=SKILL.md`, {
+        headers: { authorization: `Bearer ${adminToken}` },
+      });
+      expect(skillMd.status).toBe(200);
+      expect(await skillMd.json()).toMatchObject({
+        path: 'SKILL.md',
+        entry: expect.objectContaining({ path: 'SKILL.md', isDirectory: false }),
+        content: expect.stringContaining('# Imported'),
+      });
+
+      const disabled = await fetch(`${importBase}/v1/skills/imported/disable`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${adminToken}` },
+      });
+      expect(disabled.status).toBe(200);
+      expect(await disabled.json()).toMatchObject({ skill: { name: 'imported', enabled: false, status: '已禁用' } });
+
+      const disabledLoad = await fetch(`${importBase}/v1/tools/call`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's1', name: 'load_skill', args: { name: 'imported' } }),
+      });
+      expect(disabledLoad.status).toBe(200);
+      expect(await disabledLoad.json()).toMatchObject({ ok: false, result: { isError: true } });
+
+      const enabled = await fetch(`${importBase}/v1/skills/imported/enable`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${adminToken}` },
+      });
+      expect(enabled.status).toBe(200);
+      expect(await enabled.json()).toMatchObject({ skill: { name: 'imported', enabled: true, status: '已启用' } });
+
+      const rejectedDelete = await fetch(`${importBase}/v1/skills/imported`, {
+        method: 'DELETE',
+        headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ confirm: false }),
+      });
+      expect(rejectedDelete.status).toBe(400);
+
+      const deleted = await fetch(`${importBase}/v1/skills/imported`, {
+        method: 'DELETE',
+        headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ confirm: true }),
+      });
+      expect(deleted.status).toBe(200);
+      expect(await deleted.json()).toEqual({ ok: true });
+
+      const afterDelete = await fetch(`${importBase}/v1/tools`, {
+        headers: { authorization: `Bearer ${adminToken}` },
+      });
+      expect(afterDelete.status).toBe(200);
+      const afterDeleteBody = await afterDelete.json() as { tools: Array<{ name: string }> };
+      expect(afterDeleteBody.tools.map((tool) => tool.name)).not.toContain('imported');
+    } finally {
+      await new Promise<void>((resolve) => importServer.close(() => resolve()));
     }
   });
 

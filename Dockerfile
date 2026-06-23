@@ -12,8 +12,8 @@ ENV NODE_ENV=production
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json tsconfig.json ./
 COPY src ./src
-# skills 目录可选；存在则带上
-COPY skills ./skills
+# skills 目录需要运行时写入，用于 zip 技能导入。
+COPY --chown=node:node skills ./skills
 
 # 以非 root 运行
 USER node

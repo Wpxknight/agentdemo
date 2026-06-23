@@ -6,3 +6,5 @@ dist/
 config.jsonc
 coverage/
 .DS_Store
+.codegraph/
+.aios-team.txt

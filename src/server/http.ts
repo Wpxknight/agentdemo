@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { SignJWT, jwtVerify } from 'jose';
 import { logger } from '../logger.js';
 import type { Runtime, RuntimeModelConfig } from '../runtime.js';
@@ -14,6 +15,8 @@ import { createTenant, createUser, listTenants } from '../auth/admin.js';
 import type { RequestContext, Role } from '../auth/types.js';
 import { createModel } from '../model/factory.js';
 import type { JsonValue, ToolCall } from '../model/types.js';
+import { importSkillZip } from '../skill/import.js';
+import type { Skill } from '../skill/registry.js';
 
 const log = logger.child({ mod: 'http' });
 
@@ -368,17 +371,103 @@ async function handle(
 
   if (route === 'GET /v1/tools') {
     await requireAuth(rt, req);
-    const tools = rt.tools.defs().map((def) => ({
-      name: def.name,
-      description: def.description,
-      category: toolCategory(def.name),
-      inputSchema: def.inputSchema,
-    }));
+    const tools = [
+      ...rt.tools.defs()
+        .filter((def) => !(rt.skillRegistry && def.name === 'load_skill'))
+        .map((def) => ({
+          name: def.name,
+          description: def.description,
+          category: toolCategory(def.name),
+          inputSchema: def.inputSchema,
+        })),
+      ...(rt.skillRegistry?.list().map(publicSkill) ?? []),
+    ];
     const groups = tools.reduce<Record<string, number>>((acc, tool) => {
-      acc[tool.category] = (acc[tool.category] ?? 0) + 1;
+      const category = typeof tool.category === 'string' ? tool.category : 'builtin';
+      acc[category] = (acc[category] ?? 0) + 1;
       return acc;
     }, {});
     return sendJson(res, 200, { tools, groups });
+  }
+
+  if (route === 'POST /v1/skills/import') {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'tenant:manage');
+    if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
+    const body = await readJson(req);
+    const filename = str(body, 'filename');
+    const data = str(body, 'data');
+    if (!filename || !data) throw new HttpError(400, 'filename/data 必填');
+    if (!/\.zip$/i.test(filename)) throw new HttpError(400, '仅支持导入 zip 技能包');
+
+    const imported = await importSkillZip({
+      rootDir: rt.skillRegistry.rootDir(),
+      filename,
+      data: decodeSkillImportData(data),
+    });
+    await rt.skillRegistry.scan();
+    rt.systemExtra = rt.skillRegistry.summaries();
+    const skill = rt.skillRegistry.list().find((item) => resolve(item.dir) === resolve(imported.skillDir));
+    if (!skill) throw new HttpError(422, '导入后未发现有效技能');
+    return sendJson(res, 201, { skill: publicSkill(skill) });
+  }
+
+  const skillFilesMatch = /^\/v1\/skills\/([^/]+)\/files$/.exec(path);
+  if (method === 'GET' && skillFilesMatch) {
+    await requireAuth(rt, req);
+    if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
+    const name = decodeURIComponent(skillFilesMatch[1]!);
+    const requestedPath = url.searchParams.get('path') ?? '';
+    try {
+      const entries = await rt.skillRegistry.listDir(name, requestedPath);
+      return sendJson(res, 200, {
+        path: requestedPath,
+        parentPath: requestedPath ? parentSkillPath(requestedPath) : null,
+        entries,
+      });
+    } catch (err) {
+      if (String(err).includes('不是目录')) {
+        try {
+          return sendJson(res, 200, await rt.skillRegistry.readFile(name, requestedPath));
+        } catch (readErr) {
+          throw skillHttpError(readErr);
+        }
+      }
+      throw skillHttpError(err);
+    }
+  }
+
+  const skillActionMatch = /^\/v1\/skills\/([^/]+)\/(enable|disable)$/.exec(path);
+  if (method === 'POST' && skillActionMatch) {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'tenant:manage');
+    if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
+    const name = decodeURIComponent(skillActionMatch[1]!);
+    const enabled = skillActionMatch[2] === 'enable';
+    try {
+      const skill = await rt.skillRegistry.setEnabled(name, enabled);
+      rt.systemExtra = rt.skillRegistry.summaries();
+      return sendJson(res, 200, { skill: publicSkill(skill) });
+    } catch (err) {
+      throw skillHttpError(err);
+    }
+  }
+
+  const skillDeleteMatch = /^\/v1\/skills\/([^/]+)$/.exec(path);
+  if (method === 'DELETE' && skillDeleteMatch) {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'tenant:manage');
+    if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
+    const body = await readJson(req);
+    if (body.confirm !== true) throw new HttpError(400, '删除技能需要 confirm=true');
+    const name = decodeURIComponent(skillDeleteMatch[1]!);
+    try {
+      await rt.skillRegistry.delete(name);
+      rt.systemExtra = rt.skillRegistry.summaries();
+      return sendJson(res, 200, { ok: true });
+    } catch (err) {
+      throw skillHttpError(err);
+    }
   }
 
   if (route === 'POST /v1/tools/call') {
@@ -620,6 +709,51 @@ function toolCategory(name: string): string {
   if (name.includes('schedule')) return 'schedule';
   if (name === 'kubectl') return 'ops';
   return 'builtin';
+}
+
+function decodeSkillImportData(data: string): Buffer {
+  if (data.startsWith('data:')) {
+    const match = /^data:[^,]*;base64,(.*)$/s.exec(data);
+    if (!match) throw new HttpError(400, '技能包 data URL 必须是 base64');
+    return decodeBase64(match[1]!);
+  }
+  return decodeBase64(data);
+}
+
+function decodeBase64(raw: string): Buffer {
+  const compact = raw.replace(/\s+/g, '');
+  if (!compact) throw new HttpError(400, '技能包数据为空');
+  const data = Buffer.from(compact, 'base64');
+  if (!data.length) throw new HttpError(400, '技能包数据为空');
+  return data;
+}
+
+function publicSkill(skill: Skill): Record<string, unknown> {
+  return {
+    name: skill.name,
+    description: skill.description,
+    category: 'skill',
+    source: '本地',
+    enabled: skill.enabled,
+    status: skill.enabled ? '已启用' : '已禁用',
+    files: skill.files.filter((file) => !file.isDirectory && file.path !== 'SKILL.md').map((file) => file.path),
+    fileEntries: skill.files,
+  };
+}
+
+function parentSkillPath(path: string): string | null {
+  const parts = path.split('/').filter(Boolean);
+  if (parts.length <= 1) return '';
+  return parts.slice(0, -1).join('/');
+}
+
+function skillHttpError(err: unknown): HttpError {
+  const message = err instanceof Error ? err.message : String(err || '技能操作失败');
+  if (message.includes('未找到技能')) return new HttpError(404, message);
+  if (message.includes('非法技能文件路径') || message.includes('不是目录') || message.includes('不是文件')) {
+    return new HttpError(400, message);
+  }
+  return new HttpError(500, message);
 }
 
 /** POST /v1/agent：流式（SSE）运行一次 agent，自动续接会话历史并持久化。 */

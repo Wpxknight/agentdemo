@@ -39,6 +39,7 @@ export interface Runtime {
   modelOptions?: RuntimeModelConfig[];
   updateModel?(config: RuntimeModelConfig): void;
   tools: ToolRegistry;
+  skillRegistry?: SkillRegistry;
   clusters: ClusterRegistry;
   audit: AuditSink;
   store: Store;
@@ -173,13 +174,13 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
   for (const t of buildScheduleTools(store)) tools.register(t);
 
   let systemExtra = '';
+  let skillRegistry: SkillRegistry | undefined;
   if (config.skills?.dir) {
     const skills = new SkillRegistry(config.skills.dir);
     await skills.scan();
-    if (skills.list().length) {
-      tools.register(skills.tool());
-      systemExtra = skills.summaries();
-    }
+    tools.register(skills.tool());
+    skillRegistry = skills;
+    systemExtra = skills.summaries();
   }
 
   // 认证：本地或 OIDC（JWT 密钥取自 env，缺省用开发占位）
@@ -229,6 +230,7 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
       runtime.modelConfig = { ...next };
     },
     tools,
+    skillRegistry,
     clusters,
     audit,
     store,

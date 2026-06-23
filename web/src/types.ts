@@ -27,10 +27,20 @@ export interface ToolSummary {
   category?: string;
   source?: string;
   status?: string;
+  enabled?: boolean;
   lastUsed?: string;
   transport?: string;
   files?: string[];
+  fileEntries?: SkillFileEntry[];
   inputSchema?: unknown;
+}
+
+export interface SkillFileEntry {
+  path: string;
+  name: string;
+  isDirectory: boolean;
+  size: number;
+  updatedAt: string;
 }
 
 export interface ScheduledTask {
@@ -104,6 +114,23 @@ export interface SessionMessagesBody {
 export interface ToolsBody {
   tools: ToolSummary[];
   groups?: Record<string, number>;
+}
+
+export interface SkillsImportBody {
+  skill: ToolSummary;
+}
+
+export interface SkillFileBody {
+  path: string;
+  parentPath: string | null;
+  entry?: SkillFileEntry;
+  entries?: SkillFileEntry[];
+  content?: string;
+}
+
+export interface SkillActionBody {
+  skill?: ToolSummary;
+  ok?: boolean;
 }
 
 export interface ScheduleBody {
