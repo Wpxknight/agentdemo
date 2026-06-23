@@ -88,6 +88,7 @@ export interface ChatMessage {
   role: Role;
   text: string;
   thinking?: string;
+  running?: boolean;
   time: string;
   tools?: string[];
   attachments?: Attachment[];
@@ -101,6 +102,10 @@ export interface SessionsBody {
     lastMessage?: string;
     messageCount?: number;
   }>;
+  total?: number;
+  limit?: number;
+  offset?: number;
+  hasMore?: boolean;
 }
 
 export interface SessionMessagesBody {

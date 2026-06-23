@@ -85,8 +85,9 @@ const iconMap = {
 };
 
 const logoUrl = '/assets/logo.jpg';
-const aiAvatarUrl = '/assets/ai-avatar.jpg';
+const aiAvatarUrl = logoUrl;
 const userAvatarUrl = '/assets/user-avatar.jpg';
+const SESSION_PAGE_SIZE = 20;
 
 function sessionCategoryFor(session: SessionSummary) {
   const text = `${session.title} ${session.desc}`.toLowerCase();
@@ -251,6 +252,45 @@ function sessionMessagesToChatMessages(body: SessionMessagesBody): ChatMessage[]
   return messages.length ? messages : initialMessages.slice(0, 1);
 }
 
+function mapSessionSummary(session: SessionsBody['sessions'][number]): SessionSummary {
+  return {
+    title: session.title || session.sessionId,
+    time: formatTime(session.updatedAt),
+    desc: session.lastMessage || `${session.messageCount ?? 0} 条消息`,
+    sessionId: session.sessionId,
+  };
+}
+
+function skillAliases(skill: ToolSummary): string[] {
+  return [skill.name, toolDisplayName(skill.name)].filter(Boolean);
+}
+
+function parseSkillShortcut(text: string, skills: ToolSummary[]) {
+  const match = /^\/([^\s]*)\s*(.*)$/s.exec(text.trimStart());
+  if (!match) return undefined;
+  const query = match[1] || '';
+  const normalized = query.toLowerCase();
+  const skill = skills.find((item) => skillAliases(item).some((name) => name.toLowerCase() === normalized));
+  return { query, rest: match[2] || '', skill };
+}
+
+function skillSuggestionsFor(text: string, skills: ToolSummary[]): ToolSummary[] {
+  const shortcut = parseSkillShortcut(text, skills);
+  if (!shortcut) return [];
+  const query = shortcut.query.toLowerCase();
+  return skills
+    .filter((skill) => skill.enabled !== false)
+    .filter((skill) => !query || skillAliases(skill).some((name) => name.toLowerCase().includes(query)))
+    .slice(0, 6);
+}
+
+function applySkillShortcut(task: string, skills: ToolSummary[]): string {
+  const shortcut = parseSkillShortcut(task, skills);
+  if (!shortcut?.skill) return task;
+  const rest = shortcut.rest.trim() || '请按技能说明继续处理当前问题。';
+  return `请先使用技能 ${shortcut.skill.name}（可调用 load_skill 读取技能说明），然后处理：${rest}`;
+}
+
 type ThinkingSegment = {
   type: 'text' | 'thinking';
   content: string;
@@ -294,7 +334,7 @@ function renderTextLines(text: string, keyPrefix: string) {
 
 function ThinkingBlock({ content, streaming }: { content: string; streaming?: boolean }) {
   const trimmed = content.trim();
-  const [open, setOpen] = useState(Boolean(streaming));
+  const [open, setOpen] = useState(true);
 
   useEffect(() => {
     if (streaming) setOpen(true);
@@ -418,6 +458,12 @@ export default function App() {
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [toolTestOutput, setToolTestOutput] = useState('');
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
+  const [composerValue, setComposerValue] = useState('');
+  const [sessionOffset, setSessionOffset] = useState(0);
+  const [sessionTotal, setSessionTotal] = useState(0);
+  const [sessionHasMore, setSessionHasMore] = useState(false);
+  const [runningAgentCount, setRunningAgentCount] = useState(0);
+  const [skillShortcutDraft, setSkillShortcutDraft] = useState('');
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -448,18 +494,27 @@ export default function App() {
     setLlm((current) => ({ ...current, ...body.config, options: body.options || current.options || [] }));
   }, [api]);
 
+  const fetchSessionsPage = useCallback(async (sessionOffset = 0, append = false) => {
+    const body = await api.get<SessionsBody>(`/v1/sessions?limit=${SESSION_PAGE_SIZE}&offset=${sessionOffset}`);
+    const next = body.sessions?.map(mapSessionSummary) || [];
+    setSessions((current) => {
+      if (!append) return next.length ? next : [];
+      const seen = new Set(current.map((session) => session.sessionId).filter(Boolean));
+      return [...current, ...next.filter((session) => !session.sessionId || !seen.has(session.sessionId))];
+    });
+    setSessionOffset(sessionOffset);
+    setSessionTotal(body.total ?? next.length);
+    setSessionHasMore(Boolean(body.hasMore));
+  }, [api]);
+
   const loadPageData = useCallback(async (target: PageId | 'login' = page) => {
     if (!token || target === 'login') return;
     try {
       if (target === 'chat') {
         await loadLlmSettings();
-        const body = await api.get<SessionsBody>('/v1/sessions?limit=20');
-        setSessions(body.sessions?.map((session) => ({
-          title: session.title || session.sessionId,
-          time: formatTime(session.updatedAt),
-          desc: session.lastMessage || `${session.messageCount ?? 0} 条消息`,
-          sessionId: session.sessionId,
-        })) || fallbackSessions);
+        await fetchSessionsPage(0, false);
+        const toolsBody = await api.get<ToolsBody>('/v1/tools');
+        setTools(toolsBody.tools || []);
       }
       if (target === 'skills' || target === 'mcp') {
         const body = await api.get<ToolsBody>('/v1/tools');
@@ -477,7 +532,7 @@ export default function App() {
     } catch (err) {
       console.error(err);
     }
-  }, [api, loadLlmSettings, page, token]);
+  }, [api, fetchSessionsPage, loadLlmSettings, page, token]);
 
   useEffect(() => {
     if (!token && page !== 'login') {
@@ -541,6 +596,37 @@ export default function App() {
     }
   }
 
+  function startNewSession() {
+    const id = randomId();
+    setSessionId(id);
+    writeStorage('aiop_session_id', id);
+    setMessages(initialMessages.slice(0, 1));
+    setAttachments([]);
+  }
+
+  async function loadNextSessionsPage() {
+    if (!sessionHasMore) return;
+    await fetchSessionsPage(sessionOffset + SESSION_PAGE_SIZE, true);
+  }
+
+  async function deleteSession(session: SessionSummary) {
+    if (!session.sessionId) return;
+    if (!window.confirm(`确定删除会话“${session.title}”？`)) return;
+    try {
+      await api.delete<{ ok: boolean }>(`/v1/sessions/${encodeURIComponent(session.sessionId)}`);
+      setSessions((current) => current.filter((item) => item.sessionId !== session.sessionId));
+      setSessionTotal((current) => Math.max(0, current - 1));
+      if (session.sessionId === sessionId) startNewSession();
+    } catch (err) {
+      setMessages((current) => [...current, {
+        id: randomId(),
+        role: 'assistant',
+        text: `删除会话失败：${formatError(err)}`,
+        time: new Date().toLocaleTimeString(),
+      }]);
+    }
+  }
+
   async function addAttachments(fileList: FileList | null) {
     const files = [...(fileList || [])].slice(0, 6);
     if (!files.length) return;
@@ -566,10 +652,11 @@ export default function App() {
       textarea.value = `${textarea.value.slice(0, start)}\n${textarea.value.slice(end)}`;
       textarea.selectionStart = textarea.selectionEnd = start + 1;
     }
+    setComposerValue(textarea.value);
   }
 
-  async function runAgent(task: string, files: Omit<Attachment, 'id'>[] = []) {
-    const payload = { task, sessionId, attachments: files };
+  async function runAgent(task: string, files: Omit<Attachment, 'id'>[] = [], requestSessionId = sessionId) {
+    const payload = { task, sessionId: requestSessionId, attachments: files };
     const response = await fetch('/v1/agent', {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
@@ -584,50 +671,61 @@ export default function App() {
       return;
     }
     const assistantId = randomId();
-    const assistant: ChatMessage = { id: assistantId, role: 'assistant', text: '', time: new Date().toLocaleTimeString() };
+    const assistant: ChatMessage = { id: assistantId, role: 'assistant', text: '', time: new Date().toLocaleTimeString(), running: true };
     const publishAssistant = () => {
       setMessages((current) => current.map((message) => (message.id === assistantId ? { ...assistant } : message)));
     };
     setMessages((current) => [...current, assistant]);
+    setRunningAgentCount((current) => current + 1);
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const parts = buffer.split('\n\n');
-      buffer = parts.pop() || '';
-      for (const part of parts) {
-        const event = parseSse(part);
-        if (event?.event === 'thinking_delta' && typeof event.data?.text === 'string') {
-          assistant.thinking = `${assistant.thinking || ''}${event.data.text}`;
-          publishAssistant();
-        }
-        if (event?.event === 'text_delta' && typeof event.data?.text === 'string') {
-          assistant.text += event.data.text;
-          publishAssistant();
-        }
-        if (event?.event === 'error') {
-          const message = typeof event.data?.error === 'string' ? event.data.error : '运行失败';
-          assistant.text = assistant.text.trim()
-            ? `${assistant.text}\n\n运行失败：${message}`
-            : `运行失败：${message}`;
-          publishAssistant();
-        }
-        if (event?.event === 'done' && typeof event.data?.sessionId === 'string') {
-          setSessionId(event.data.sessionId);
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() || '';
+        for (const part of parts) {
+          const event = parseSse(part);
+          if (event?.event === 'thinking_delta' && typeof event.data?.text === 'string') {
+            assistant.thinking = `${assistant.thinking || ''}${event.data.text}`;
+            publishAssistant();
+          }
+          if (event?.event === 'text_delta' && typeof event.data?.text === 'string') {
+            assistant.text += event.data.text;
+            publishAssistant();
+          }
+          if (event?.event === 'error') {
+            const message = typeof event.data?.error === 'string' ? event.data.error : '运行失败';
+            assistant.text = assistant.text.trim()
+              ? `${assistant.text}\n\n运行失败：${message}`
+              : `运行失败：${message}`;
+            publishAssistant();
+          }
+          if (event?.event === 'done' && typeof event.data?.sessionId === 'string') {
+            setSessionId(event.data.sessionId);
+          }
         }
       }
+    } catch (err) {
+      assistant.text = assistant.text.trim()
+        ? `${assistant.text}\n\n连接中断：${formatError(err)}`
+        : `连接中断：${formatError(err)}`;
+    } finally {
+      Object.assign(assistant, { running: false });
+      publishAssistant();
+      setRunningAgentCount((current) => Math.max(0, current - 1));
+      await fetchSessionsPage(0, false);
     }
-    await loadPageData(page);
   }
 
-  async function sendComposer() {
-    const textarea = composerRef.current;
-    const task = textarea?.value.trim() || '';
+  function sendComposer() {
+    const task = composerValue.trim();
     const files = attachments.map(publicAttachment);
     if (!task && !files.length) return;
+    const taskForAgent = applySkillShortcut(task, skillTools);
     const sentAttachments = attachments;
     setMessages((current) => [...current, {
       id: randomId(),
@@ -636,9 +734,10 @@ export default function App() {
       time: new Date().toLocaleTimeString(),
       attachments: sentAttachments,
     }]);
-    if (textarea) textarea.value = '';
+    setComposerValue('');
+    setSkillShortcutDraft('');
     setAttachments([]);
-    await runAgent(task, files);
+    void runAgent(taskForAgent || '请分析上传附件。', files, sessionId);
   }
 
   function handleComposerKeydown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -745,12 +844,7 @@ export default function App() {
   const activePage = page as PageId;
   const skillTools = tools.filter((tool) => (tool.category || toolCategory(tool.name)) === 'skill');
   const mcpTools = tools.filter((tool) => (tool.category || toolCategory(tool.name)) === 'mcp');
-  const startNewSession = () => {
-    const id = randomId();
-    setSessionId(id);
-    writeStorage('aiop_session_id', id);
-    setMessages(initialMessages.slice(0, 1));
-  };
+  const skillSuggestions = skillSuggestionsFor(composerValue, skillTools);
 
   if (activePage === 'chat') {
     return (
@@ -761,11 +855,17 @@ export default function App() {
           previewOpen={previewOpen}
           previewWidth={previewWidth}
           sessions={sessions}
+          sessionTotal={sessionTotal}
+          sessionHasMore={sessionHasMore}
           selectedSessionId={sessionId}
           messages={messages}
           attachments={attachments}
+          composerValue={composerValue}
+          skillSuggestions={skillSuggestions}
+          skillShortcutDraft={skillShortcutDraft}
           llm={llm}
           settingsStatus={settingsStatus}
+          runningAgentCount={runningAgentCount}
           sandboxOutput={sandboxOutput}
           browserStreamUrl={browserStreamUrl}
           composerRef={composerRef}
@@ -776,13 +876,25 @@ export default function App() {
           onTogglePreview={() => setPreviewOpen((value) => !value)}
           onNewSession={startNewSession}
           onSelectSession={selectSession}
+          onDeleteSession={(session) => void deleteSession(session)}
+          onLoadMoreSessions={() => void loadNextSessionsPage()}
           onChooseAttachment={() => fileInputRef.current?.click()}
           onAddAttachments={(files) => void addAttachments(files)}
           onRemoveAttachment={(id) => setAttachments((current) => current.filter((file) => file.id !== id))}
+          onComposerChange={(value) => {
+            setComposerValue(value);
+            setSkillShortcutDraft(value.startsWith('/') ? value : '');
+          }}
+          onChooseSkillSuggestion={(skill) => {
+            const next = `/${skill.name} `;
+            setComposerValue(next);
+            setSkillShortcutDraft(next);
+            requestAnimationFrame(() => composerRef.current?.focus());
+          }}
           onComposerKeydown={handleComposerKeydown}
           onSubmitComposer={(event) => {
             event.preventDefault();
-            void sendComposer();
+            sendComposer();
           }}
           onModelSwitch={(id) => void switchComposerModel(id)}
           onRunSandbox={runSandboxCode}
@@ -893,11 +1005,17 @@ function PrototypeChatShell(props: {
   previewOpen: boolean;
   previewWidth: number;
   sessions: SessionSummary[];
+  sessionTotal: number;
+  sessionHasMore: boolean;
   selectedSessionId: string;
   messages: ChatMessage[];
   attachments: Attachment[];
+  composerValue: string;
+  skillSuggestions: ToolSummary[];
+  skillShortcutDraft: string;
   llm: RuntimeModelConfig;
   settingsStatus: string;
+  runningAgentCount: number;
   sandboxOutput: string;
   browserStreamUrl: string;
   composerRef: React.RefObject<HTMLTextAreaElement | null>;
@@ -908,9 +1026,13 @@ function PrototypeChatShell(props: {
   onTogglePreview: () => void;
   onNewSession: () => void;
   onSelectSession: (session: SessionSummary) => void;
+  onDeleteSession: (session: SessionSummary) => void;
+  onLoadMoreSessions: () => void;
   onChooseAttachment: () => void;
   onAddAttachments: (files: FileList | null) => void;
   onRemoveAttachment: (id: string) => void;
+  onComposerChange: (value: string) => void;
+  onChooseSkillSuggestion: (skill: ToolSummary) => void;
   onComposerKeydown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   onSubmitComposer: (event: FormEvent<HTMLFormElement>) => void;
   onModelSwitch: (id: string) => void;
@@ -926,21 +1048,35 @@ function PrototypeChatShell(props: {
         {props.historyOpen ? (
           <PrototypeSessionPanel
             sessions={props.sessions}
+            total={props.sessionTotal}
+            hasMore={props.sessionHasMore}
             selectedSessionId={props.selectedSessionId}
             onToggle={props.onToggleHistory}
             onSelect={props.onSelectSession}
+            onDelete={props.onDeleteSession}
+            onLoadMore={props.onLoadMoreSessions}
           />
         ) : null}
         <main className="prototype-chat-center">
-          <PrototypeChatHeader onNewSession={props.onNewSession} onToggleHistory={props.onToggleHistory} onTogglePreview={props.onTogglePreview} />
+          <PrototypeChatHeader
+            runningAgentCount={props.runningAgentCount}
+            onNewSession={props.onNewSession}
+            onToggleHistory={props.onToggleHistory}
+            onTogglePreview={props.onTogglePreview}
+          />
           <PrototypeMessages messages={props.messages} />
           <PrototypeComposer
             attachments={props.attachments}
+            value={props.composerValue}
+            skillSuggestions={props.skillSuggestions}
+            skillShortcutDraft={props.skillShortcutDraft}
             composerRef={props.composerRef}
             fileInputRef={props.fileInputRef}
             onChooseAttachment={props.onChooseAttachment}
             onAddAttachments={props.onAddAttachments}
             onRemoveAttachment={props.onRemoveAttachment}
+            onComposerChange={props.onComposerChange}
+            onChooseSkillSuggestion={props.onChooseSkillSuggestion}
             onComposerKeydown={props.onComposerKeydown}
             onSubmitComposer={props.onSubmitComposer}
           />
@@ -994,11 +1130,15 @@ function PrototypeSidebarNav({ page, token, onNavigate, onLogout }: {
   );
 }
 
-function PrototypeSessionPanel({ sessions, selectedSessionId, onToggle, onSelect }: {
+function PrototypeSessionPanel({ sessions, total, hasMore, selectedSessionId, onToggle, onSelect, onDelete, onLoadMore }: {
   sessions: SessionSummary[];
+  total: number;
+  hasMore: boolean;
   selectedSessionId: string;
   onToggle: () => void;
   onSelect: (session: SessionSummary) => void;
+  onDelete: (session: SessionSummary) => void;
+  onLoadMore: () => void;
 }) {
   const [query, setQuery] = useState('');
   const items = (sessions.length ? sessions : fallbackSessions).filter((session) => {
@@ -1021,40 +1161,64 @@ function PrototypeSessionPanel({ sessions, selectedSessionId, onToggle, onSelect
       <ScrollArea className="prototype-session-scroll">
         <div className="prototype-session-group">
           <span>今天</span>
-          {items.slice(0, 10).map((session, index) => {
+          {items.map((session, index) => {
             const category = sessionCategoryFor(session);
             const SessionIcon = category.Icon;
             const isActive = Boolean(session.sessionId && session.sessionId === selectedSessionId);
             return (
-              <button
+              <div
                 key={`${session.sessionId || session.title}-${index}`}
                 className={cn('prototype-session-item', isActive && 'active')}
-                type="button"
+                role="button"
+                tabIndex={0}
                 onClick={() => onSelect(session)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    onSelect(session);
+                  }
+                }}
               >
                 <span className={cn('prototype-session-icon', category.tone)}>
                   <SessionIcon />
                 </span>
                 <strong>{session.title}</strong>
                 <time>{session.time}</time>
+                {session.sessionId ? (
+                  <button
+                    className="prototype-session-delete"
+                    type="button"
+                    aria-label={`删除会话 ${session.title}`}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onDelete(session);
+                    }}
+                  >
+                    <Trash2 />
+                  </button>
+                ) : null}
                 <p>{session.desc}</p>
-              </button>
+              </div>
             );
           })}
         </div>
       </ScrollArea>
+      <div className="prototype-session-pagination">
+        <span>{items.length} / {total || items.length}</span>
+        <button type="button" disabled={!hasMore} onClick={onLoadMore}>加载更多</button>
+      </div>
     </aside>
   );
 }
 
-function PrototypeChatHeader(props: { onNewSession: () => void; onToggleHistory: () => void; onTogglePreview: () => void }) {
+function PrototypeChatHeader(props: { runningAgentCount: number; onNewSession: () => void; onToggleHistory: () => void; onTogglePreview: () => void }) {
   return (
     <div className="prototype-chat-header">
       <div>
         <h1>AI 助手</h1>
         <span>
           <i />
-          运行中
+          {props.runningAgentCount ? `${props.runningAgentCount} 个任务运行中` : '就绪'}
         </span>
       </div>
       <div className="prototype-chat-actions">
@@ -1097,6 +1261,7 @@ function PrototypeMessages({ messages }: { messages: ChatMessage[] }) {
                       {message.tools.map((tool) => <Badge key={tool} variant="secondary">{tool}</Badge>)}
                     </div>
                   ) : null}
+                  {message.running ? <RunningIndicator /> : null}
                 </div>
                 <time className="prototype-message-time">{message.time}</time>
               </div>
@@ -1109,13 +1274,29 @@ function PrototypeMessages({ messages }: { messages: ChatMessage[] }) {
   );
 }
 
+function RunningIndicator() {
+  return (
+    <div className="prototype-running-indicator" aria-label="执行中">
+      <span />
+      <span />
+      <span />
+      <em>执行中</em>
+    </div>
+  );
+}
+
 function PrototypeComposer(props: {
   attachments: Attachment[];
+  value: string;
+  skillSuggestions: ToolSummary[];
+  skillShortcutDraft: string;
   composerRef: React.RefObject<HTMLTextAreaElement | null>;
   fileInputRef: React.RefObject<HTMLInputElement | null>;
   onChooseAttachment: () => void;
   onAddAttachments: (files: FileList | null) => void;
   onRemoveAttachment: (id: string) => void;
+  onComposerChange: (value: string) => void;
+  onChooseSkillSuggestion: (skill: ToolSummary) => void;
   onComposerKeydown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   onSubmitComposer: (event: FormEvent<HTMLFormElement>) => void;
 }) {
@@ -1130,6 +1311,28 @@ function PrototypeComposer(props: {
         onChange={(event) => props.onAddAttachments(event.currentTarget.files)}
       />
       {props.attachments.length ? <AttachmentChips attachments={props.attachments} onRemove={props.onRemoveAttachment} /> : null}
+      {props.skillShortcutDraft && props.skillSuggestions.length ? (
+        <div className="slash-skill-menu" role="listbox" aria-label="技能快捷选择">
+          {props.skillSuggestions.map((skill) => (
+            <button
+              key={skill.name}
+              className="slash-skill-option"
+              type="button"
+              onMouseDown={(event) => {
+                event.preventDefault();
+                props.onChooseSkillSuggestion(skill);
+              }}
+            >
+              <Boxes />
+              <span>
+                <strong>/{skill.name}</strong>
+                <small>{skill.description || '使用技能'}</small>
+              </span>
+              <em>使用技能</em>
+            </button>
+          ))}
+        </div>
+      ) : null}
       <div className="prototype-input-box">
         <button type="button" onClick={props.onChooseAttachment} aria-label="添加附件">
           <Paperclip />
@@ -1140,8 +1343,10 @@ function PrototypeComposer(props: {
         <textarea
           ref={props.composerRef}
           name="task"
+          value={props.value}
           rows={1}
-          placeholder="输入你的运维问题或指令，Enter 发送，Shift+Enter 换行..."
+          placeholder="输入你的运维问题，或输入 /技能名 快速使用技能..."
+          onChange={(event) => props.onComposerChange(event.target.value)}
           onKeyDown={props.onComposerKeydown}
         />
         <button type="submit" className="send" aria-label="发送">

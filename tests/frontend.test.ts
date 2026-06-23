@@ -84,7 +84,7 @@ describe('frontend API wiring', () => {
   it('loads every menu page from backend endpoints', async () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
 
-    expect(app).toContain("api.get<SessionsBody>('/v1/sessions");
+    expect(app).toContain('api.get<SessionsBody>(`/v1/sessions?limit=${SESSION_PAGE_SIZE}&offset=${sessionOffset}`');
     expect(app).toContain("api.get<ToolsBody>('/v1/tools");
     expect(app).toContain("api.get<ScheduleBody>('/v1/schedule");
     expect(app).toContain("api.get<SandboxesBody>('/v1/sandboxes");
@@ -219,6 +219,53 @@ describe('frontend API wiring', () => {
     expect(app).toContain('onClick={() => onSelect(session)}');
   });
 
+  it('supports paginated and deletable session history without blocking chat input during runs', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+    const types = await readFile('web/src/types.ts', 'utf8');
+
+    expect(app).toContain('SESSION_PAGE_SIZE');
+    expect(app).toContain('sessionOffset');
+    expect(app).toContain('sessionTotal');
+    expect(app).toContain("`/v1/sessions?limit=${SESSION_PAGE_SIZE}&offset=${sessionOffset}`");
+    expect(app).toContain('hasMore');
+    expect(app).toContain('loadNextSessionsPage');
+    expect(app).toContain('deleteSession');
+    expect(app).toContain('api.delete<{ ok: boolean }>(`/v1/sessions/${encodeURIComponent(session.sessionId)}`');
+    expect(app).toContain('onDeleteSession');
+    expect(app).toContain('event.stopPropagation()');
+    expect(app).toContain('aria-label={`删除会话 ${session.title}`}');
+    expect(app).toContain('runningAgentCount');
+    expect(app).toContain('running: true');
+    expect(app).toContain('running: false');
+    expect(app).toContain('message.running');
+    expect(app).toContain('prototype-running-indicator');
+    expect(css).toContain('.prototype-running-indicator');
+    expect(css).toContain('@keyframes aiop-thinking-pulse');
+    expect(types).toContain('running?: boolean');
+    expect(types).toContain('total?: number;');
+    expect(types).toContain('offset?: number;');
+    expect(types).toContain('hasMore?: boolean;');
+    expect(app).not.toContain('disabled={runningAgentCount');
+  });
+
+  it('supports slash skill shortcuts in the chat composer', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(app).toContain('parseSkillShortcut');
+    expect(app).toContain('applySkillShortcut');
+    expect(app).toContain('skillShortcutDraft');
+    expect(app).toContain('slash-skill-menu');
+    expect(app).toContain('slash-skill-option');
+    expect(app).toContain('使用技能');
+    expect(app).toContain("api.get<ToolsBody>('/v1/tools')");
+    expect(app).toContain("请先使用技能 ${shortcut.skill.name}");
+    expect(app).toContain('skillSuggestions');
+    expect(css).toContain('.slash-skill-menu');
+    expect(css).toContain('.slash-skill-option');
+  });
+
   it('keeps message time outside bubbles and renders model thinking as collapsible content', async () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
     const css = await readFile('web/src/index.css', 'utf8');
@@ -227,6 +274,7 @@ describe('frontend API wiring', () => {
     expect(app).toContain('function MessageContent');
     expect(app).toContain('function ThinkingBlock');
     expect(app).toContain('<details className="thinking-block"');
+    expect(app).toContain('const [open, setOpen] = useState(true)');
     expect(app).toContain('const thinkingSegments');
     expect(app).toContain('const textSegments');
     expect(app).toContain("event?.event === 'thinking_delta'");
@@ -242,6 +290,17 @@ describe('frontend API wiring', () => {
     expect(css).toContain('.thinking-block');
     expect(css).not.toContain('.prototype-bubble time');
     expect(css).not.toContain('.bubble time');
+  });
+
+  it('uses the refreshed AIOP logo for assistant identity and concise running copy', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(app).toContain("const logoUrl = '/assets/logo.jpg'");
+    expect(app).toContain('const aiAvatarUrl = logoUrl');
+    expect(app).toContain('<em>执行中</em>');
+    expect(app).toContain('aria-label="执行中"');
+    expect(app).not.toContain("const aiAvatarUrl = '/assets/ai-avatar.jpg'");
+    expect(app).not.toContain('AI 正在执行');
   });
 
   it('renders assistant replies with Markdown, GFM, and syntax highlighting only for assistant messages', async () => {

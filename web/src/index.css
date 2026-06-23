@@ -1633,9 +1633,10 @@
     padding: 10px;
     margin-bottom: 4px;
     display: grid;
-    grid-template-columns: 32px minmax(0, 1fr) auto;
+    grid-template-columns: 32px minmax(0, 1fr) auto auto;
     gap: 2px 10px;
     align-items: center;
+    cursor: pointer;
     transition: background .16s ease, border-color .16s ease, transform .16s ease;
   }
 
@@ -1706,6 +1707,55 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .prototype-session-delete {
+    width: 28px;
+    height: 28px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: hsl(215 16% 48%);
+    display: grid;
+    place-items: center;
+  }
+
+  .prototype-session-delete:hover {
+    background: hsl(0 84% 96%);
+    color: hsl(0 76% 52%);
+  }
+
+  .prototype-session-delete svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  .prototype-session-pagination {
+    border-top: 1px solid hsl(214 70% 91%);
+    padding: 10px 12px 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    color: hsl(215 16% 48%);
+    font-size: 12px;
+  }
+
+  .prototype-session-pagination button {
+    min-height: 30px;
+    border: 1px solid hsl(214 70% 88%);
+    border-radius: 8px;
+    background: #fff;
+    color: hsl(var(--primary));
+    padding: 0 10px;
+    font-size: 12px;
+    font-weight: 650;
+  }
+
+  .prototype-session-pagination button:disabled {
+    color: hsl(var(--muted-foreground));
+    background: hsl(var(--muted));
+    cursor: not-allowed;
   }
 
   .prototype-chat-center {
@@ -1841,6 +1891,50 @@
     border-top-right-radius: 4px;
     background: linear-gradient(135deg, hsl(214 89% 55%), hsl(214 89% 44%));
     box-shadow: 0 8px 20px hsl(var(--primary) / .18);
+  }
+
+  .prototype-running-indicator {
+    margin-top: 10px;
+    min-height: 28px;
+    border-top: 1px solid hsl(214 70% 91%);
+    padding-top: 10px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: hsl(215 16% 42%);
+    font-size: 12px;
+  }
+
+  .prototype-running-indicator span {
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: hsl(var(--primary));
+    animation: aiop-thinking-pulse 1s infinite ease-in-out;
+  }
+
+  .prototype-running-indicator span:nth-child(2) {
+    animation-delay: .14s;
+  }
+
+  .prototype-running-indicator span:nth-child(3) {
+    animation-delay: .28s;
+  }
+
+  .prototype-running-indicator em {
+    font-style: normal;
+    margin-left: 2px;
+  }
+
+  @keyframes aiop-thinking-pulse {
+    0%, 80%, 100% {
+      opacity: .35;
+      transform: translateY(0);
+    }
+    40% {
+      opacity: 1;
+      transform: translateY(-3px);
+    }
   }
 
   .prototype-bubble p {
@@ -2018,6 +2112,70 @@
     border-top: 1px solid hsl(214 70% 91%);
     background: #fff;
     padding: 14px 20px 12px;
+    position: relative;
+  }
+
+  .slash-skill-menu {
+    position: absolute;
+    left: 20px;
+    right: 20px;
+    bottom: calc(100% - 6px);
+    border: 1px solid hsl(214 70% 88%);
+    border-radius: 8px;
+    background: #fff;
+    box-shadow: 0 18px 42px rgba(15, 40, 80, .14);
+    padding: 6px;
+    display: grid;
+    gap: 4px;
+    z-index: 12;
+  }
+
+  .slash-skill-option {
+    width: 100%;
+    min-height: 42px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    display: grid;
+    grid-template-columns: 24px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 8px;
+    text-align: left;
+    color: hsl(var(--foreground));
+  }
+
+  .slash-skill-option:hover {
+    background: hsl(var(--primary) / .08);
+  }
+
+  .slash-skill-option svg {
+    width: 17px;
+    height: 17px;
+    color: hsl(var(--primary));
+  }
+
+  .slash-skill-option span {
+    min-width: 0;
+    display: grid;
+    gap: 2px;
+  }
+
+  .slash-skill-option strong,
+  .slash-skill-option small {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .slash-skill-option small,
+  .slash-skill-option em {
+    color: hsl(var(--muted-foreground));
+    font-size: 12px;
+  }
+
+  .slash-skill-option em {
+    font-style: normal;
   }
 
   .prototype-input-box {

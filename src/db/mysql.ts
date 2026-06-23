@@ -30,6 +30,7 @@ interface TaskRow {
 }
 
 interface SessionRow {
+  id: number;
   session_id: string;
   role: string;
   content: unknown;
@@ -129,18 +130,33 @@ export class MysqlStore implements Store {
     });
   }
 
-  async listSessions(ctx: RequestContext, limit = 50): Promise<SessionSummary[]> {
-    const historyLimit = Math.max(limit * 20, limit);
-    const { rows } = await sql<SessionRow>`
-      SELECT session_id, role, content, created_at
+  async listSessions(ctx: RequestContext, limit = 50, offset = 0): Promise<SessionSummary[]> {
+    const safeLimit = Math.max(0, limit);
+    const safeOffset = Math.max(0, offset);
+    if (safeLimit <= 0) return [];
+
+    const { rows: sessionRows } = await sql<{ session_id: string; last_id: number }>`
+      SELECT session_id, MAX(id) AS last_id
       FROM messages FORCE INDEX (idx_messages_tenant_id)
       WHERE tenant_id = ${ctx.tenantId}
-      ORDER BY id DESC
-      LIMIT ${historyLimit}
+      GROUP BY session_id
+      ORDER BY last_id DESC
+      LIMIT ${safeLimit}
+      OFFSET ${safeOffset}
     `.execute(this.db);
+    const sessionIds = sessionRows.map((row) => row.session_id);
+    if (!sessionIds.length) return [];
+
+    const rows = await this.db
+      .selectFrom('messages')
+      .select(['id', 'session_id', 'role', 'content', 'created_at'])
+      .where('tenant_id', '=', ctx.tenantId)
+      .where('session_id', 'in', sessionIds)
+      .orderBy('id', 'asc')
+      .execute() as SessionRow[];
 
     const grouped = new Map<string, Array<{ role: string; text?: string; createdAt: Date }>>();
-    for (const row of rows.reverse()) {
+    for (const row of rows) {
       const content = (parseJson(row.content) ?? {}) as Partial<Msg>;
       const items = grouped.get(row.session_id) ?? [];
       items.push({
@@ -164,7 +180,25 @@ export class MysqlStore implements Store {
         };
       })
       .sort((a, b) => String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')))
-      .slice(0, limit);
+      .sort((a, b) => sessionIds.indexOf(a.sessionId) - sessionIds.indexOf(b.sessionId));
+  }
+
+  async countSessions(ctx: RequestContext): Promise<number> {
+    const { rows } = await sql<{ total: number | string | bigint }>`
+      SELECT COUNT(DISTINCT session_id) AS total
+      FROM messages
+      WHERE tenant_id = ${ctx.tenantId}
+    `.execute(this.db);
+    return Number(rows[0]?.total ?? 0);
+  }
+
+  async deleteSession(ctx: RequestContext, sessionId: string): Promise<boolean> {
+    const result = await this.db
+      .deleteFrom('messages')
+      .where('tenant_id', '=', ctx.tenantId)
+      .where('session_id', '=', sessionId)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows ?? 0) > 0;
   }
 
   async record(event: AuditEvent): Promise<void> {

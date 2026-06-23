@@ -276,6 +276,52 @@ describe('HTTP server', () => {
     expect(msgs.filter((m) => m.role === 'user').length).toBe(2);
   });
 
+  it('paginates and deletes chat sessions', async () => {
+    const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+    for (let i = 0; i < 3; i++) {
+      await store.appendMessage(ctx, `paged-${i}`, { role: 'user', text: `分页会话 ${i}` });
+      await store.appendMessage(ctx, `paged-${i}`, { role: 'assistant', text: `回答 ${i}` });
+    }
+
+    const first = await fetch(`${base}/v1/sessions?limit=2&offset=0`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(first.status).toBe(200);
+    const firstBody = await first.json() as {
+      sessions: Array<{ sessionId: string }>;
+      total: number;
+      limit: number;
+      offset: number;
+      hasMore: boolean;
+    };
+    expect(firstBody.sessions).toHaveLength(2);
+    expect(firstBody.limit).toBe(2);
+    expect(firstBody.offset).toBe(0);
+    expect(firstBody.total).toBeGreaterThanOrEqual(3);
+    expect(firstBody.hasMore).toBe(true);
+
+    const second = await fetch(`${base}/v1/sessions?limit=2&offset=2`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    const secondBody = await second.json() as { sessions: Array<{ sessionId: string }>; offset: number };
+    expect(secondBody.offset).toBe(2);
+    expect(secondBody.sessions.map((session) => session.sessionId)).not.toContain(firstBody.sessions[0]!.sessionId);
+
+    const deleted = await fetch(`${base}/v1/sessions/paged-1`, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(deleted.status).toBe(200);
+    expect(await deleted.json()).toEqual({ ok: true });
+    await expect(store.listMessages(ctx, 'paged-1')).resolves.toEqual([]);
+
+    const missing = await fetch(`${base}/v1/sessions/paged-1`, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(missing.status).toBe(404);
+  });
+
   it('passes uploaded attachment metadata into the agent task', async () => {
     const r = await fetch(`${base}/v1/agent`, {
       method: 'POST',

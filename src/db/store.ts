@@ -77,7 +77,9 @@ export interface Store extends AuditSink {
   // —— 会话消息 ——
   appendMessage(ctx: RequestContext, sessionId: string, msg: Msg): Promise<void>;
   listMessages(ctx: RequestContext, sessionId: string): Promise<Msg[]>;
-  listSessions(ctx: RequestContext, limit?: number): Promise<SessionSummary[]>;
+  listSessions(ctx: RequestContext, limit?: number, offset?: number): Promise<SessionSummary[]>;
+  countSessions(ctx: RequestContext): Promise<number>;
+  deleteSession(ctx: RequestContext, sessionId: string): Promise<boolean>;
 
   // —— 审计 ——（record 来自 AuditSink；event.tenantId 标识归属）
   record(event: AuditEvent): Promise<void>;

@@ -49,7 +49,7 @@ export class MemoryStore implements Store {
       .map((r) => r.msg);
   }
 
-  async listSessions(ctx: RequestContext, limit = 50): Promise<SessionSummary[]> {
+  async listSessions(ctx: RequestContext, limit = 50, offset = 0): Promise<SessionSummary[]> {
     const bySession = new Map<string, MsgRow[]>();
     for (const row of this.messages.filter((r) => r.tenantId === ctx.tenantId)) {
       const rows = bySession.get(row.sessionId) ?? [];
@@ -69,7 +69,17 @@ export class MemoryStore implements Store {
         };
       })
       .sort((a, b) => String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')))
-      .slice(0, limit);
+      .slice(Math.max(0, offset), Math.max(0, offset) + limit);
+  }
+
+  async countSessions(ctx: RequestContext): Promise<number> {
+    return new Set(this.messages.filter((r) => r.tenantId === ctx.tenantId).map((r) => r.sessionId)).size;
+  }
+
+  async deleteSession(ctx: RequestContext, sessionId: string): Promise<boolean> {
+    const before = this.messages.length;
+    this.messages = this.messages.filter((r) => !(r.tenantId === ctx.tenantId && r.sessionId === sessionId));
+    return this.messages.length < before;
   }
 
   async record(event: AuditEvent): Promise<void> {

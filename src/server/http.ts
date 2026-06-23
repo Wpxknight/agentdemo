@@ -178,6 +178,12 @@ function sessionIdFromBody(body: Record<string, unknown>): string {
   return str(body, 'sessionId') ?? randomUUID();
 }
 
+function intParam(value: string | null, fallback: number, min: number, max: number): number {
+  const n = Number(value ?? '');
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(n)));
+}
+
 function isJsonValue(value: unknown): value is JsonValue {
   if (value === null) return true;
   const t = typeof value;
@@ -365,8 +371,22 @@ async function handle(
 
   if (route === 'GET /v1/sessions') {
     const ctx = await requireAuth(rt, req);
-    const limit = Number(url.searchParams.get('limit') ?? '50');
-    return sendJson(res, 200, { sessions: await rt.store.listSessions(ctx, Number.isFinite(limit) ? limit : 50) });
+    const limit = intParam(url.searchParams.get('limit') ?? url.searchParams.get('pageSize'), 50, 1, 100);
+    const page = intParam(url.searchParams.get('page'), 0, 0, 100000);
+    const offset = page > 0
+      ? (page - 1) * limit
+      : intParam(url.searchParams.get('offset'), 0, 0, 1000000);
+    const [sessions, total] = await Promise.all([
+      rt.store.listSessions(ctx, limit, offset),
+      rt.store.countSessions(ctx),
+    ]);
+    return sendJson(res, 200, {
+      sessions,
+      total,
+      limit,
+      offset,
+      hasMore: offset + sessions.length < total,
+    });
   }
 
   if (route === 'GET /v1/tools') {
@@ -628,6 +648,14 @@ async function handle(
     const ctx = await requireAuth(rt, req);
     const messages = await rt.store.listMessages(ctx, decodeURIComponent(msgMatch[1]!));
     return sendJson(res, 200, { messages });
+  }
+
+  const sessionDeleteMatch = /^\/v1\/sessions\/([^/]+)$/.exec(path);
+  if (method === 'DELETE' && sessionDeleteMatch) {
+    const ctx = await requireAuth(rt, req);
+    const ok = await rt.store.deleteSession(ctx, decodeURIComponent(sessionDeleteMatch[1]!));
+    if (!ok) throw new HttpError(404, '会话不存在');
+    return sendJson(res, 200, { ok: true });
   }
 
   // —— 定时任务 ——
