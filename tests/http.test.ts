@@ -262,6 +262,7 @@ describe('HTTP server', () => {
         protocol: 'anthropic',
         base_url: 'http://localhost:8000/v1',
         model: 'mock-model',
+        api_key: 'initial-key',
         api_key_set: true,
         api_key_preview: 'ini...key',
       },
@@ -271,6 +272,7 @@ describe('HTTP server', () => {
           protocol: 'anthropic',
           base_url: 'http://localhost:8000/v1',
           model: 'mock-model',
+          api_key: 'initial-key',
           api_key_set: true,
           api_key_preview: 'ini...key',
         },
@@ -279,6 +281,7 @@ describe('HTTP server', () => {
           protocol: 'anthropic',
           base_url: 'http://192.168.10.108:18317',
           model: 'glm-5',
+          api_key: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
           api_key_set: true,
           api_key_preview: 'tes...aZ3',
         },
@@ -301,9 +304,17 @@ describe('HTTP server', () => {
         protocol: 'anthropic',
         base_url: 'http://192.168.10.108:18317',
         model: 'glm-5',
+        api_key: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
         api_key_set: true,
         api_key_preview: 'tes...aZ3',
       },
+    });
+    expect(await store.getLlmSettings({ tenantId: 'default' })).toMatchObject({
+      id: 'glm-5',
+      protocol: 'anthropic',
+      baseURL: 'http://192.168.10.108:18317',
+      apiKey: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
+      model: 'glm-5',
     });
 
     const probe = await fetch(`${base}/v1/settings/llm/test`, {
@@ -329,6 +340,7 @@ describe('HTTP server', () => {
         protocol: 'openai',
         base_url: 'http://192.168.10.108:18317',
         model: 'glm-5',
+        api_key: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
       },
     });
 
@@ -344,6 +356,26 @@ describe('HTTP server', () => {
         protocol: 'anthropic',
         base_url: 'http://localhost:8000/v1',
         model: 'mock-model',
+        api_key: 'initial-key',
+      },
+    });
+
+    const keepKey = await fetch(`${base}/v1/settings/llm`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        protocol: 'openai',
+        base_url: 'http://example.test/v1',
+        model: 'new-model-without-key',
+      }),
+    });
+    expect(keepKey.status).toBe(200);
+    expect(await keepKey.json()).toMatchObject({
+      config: {
+        protocol: 'openai',
+        base_url: 'http://example.test/v1',
+        model: 'new-model-without-key',
+        api_key: 'initial-key',
       },
     });
   });

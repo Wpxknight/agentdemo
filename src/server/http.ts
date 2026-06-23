@@ -129,6 +129,7 @@ function publicModelConfig(config: RuntimeModelConfig): Record<string, unknown> 
     protocol: config.protocol,
     base_url: config.baseURL,
     model: config.model,
+    api_key: config.apiKey,
     api_key_set: Boolean(config.apiKey),
     api_key_preview: maskApiKey(config.apiKey),
   };
@@ -474,12 +475,15 @@ async function handle(
   if (route === 'GET /v1/settings/llm') {
     const ctx = await requireAuth(rt, req);
     requirePermission(ctx, 'tenant:manage');
-    return sendJson(res, 200, modelSettingsBody(currentModelConfig(rt), rt.modelOptions));
+    const config = await rt.store.getLlmSettings(ctx) ?? currentModelConfig(rt);
+    return sendJson(res, 200, modelSettingsBody(config, rt.modelOptions));
   }
   if (route === 'POST /v1/settings/llm') {
     const ctx = await requireAuth(rt, req);
     requirePermission(ctx, 'tenant:manage');
-    const next = modelConfigFromBody(await readJson(req), currentModelConfig(rt), rt.modelOptions);
+    const current = await rt.store.getLlmSettings(ctx) ?? currentModelConfig(rt);
+    const next = modelConfigFromBody(await readJson(req), current, rt.modelOptions);
+    await rt.store.setLlmSettings(ctx, next);
     if (rt.updateModel) rt.updateModel(next);
     else {
       rt.model = createModel(next.id, next);
@@ -492,7 +496,8 @@ async function handle(
     requirePermission(ctx, 'tenant:manage');
     const body = await readJson(req);
     const hasBody = Object.keys(body).length > 0;
-    const config = hasBody ? modelConfigFromBody(body, currentModelConfig(rt), rt.modelOptions) : currentModelConfig(rt);
+    const current = await rt.store.getLlmSettings(ctx) ?? currentModelConfig(rt);
+    const config = hasBody ? modelConfigFromBody(body, current, rt.modelOptions) : current;
     const model = hasBody ? createModel(config.id, config) : rt.model;
     let text = '';
     try {

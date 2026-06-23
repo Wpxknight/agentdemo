@@ -26,7 +26,7 @@ import { LogAuditSink } from './audit/sink.js';
 import type { AuditSink } from './audit/sink.js';
 import { readMysqlConfig } from './config/mysql.js';
 import { createStore } from './db/index.js';
-import type { Store } from './db/store.js';
+import type { LlmSettings, Store } from './db/store.js';
 import { buildScheduleTools } from './tools/schedule.js';
 import { LocalAuthProvider } from './auth/local.js';
 import { OidcAuthProvider } from './auth/oidc.js';
@@ -60,12 +60,29 @@ export type RuntimeModelConfig = { id: string } & FactoryModelConfig;
 
 const DEFAULT_TENANT = 'default';
 
-/** 组装一次运行所需的全部组件（模型/工具/策略/持久化）。 */
-export async function buildRuntime(config: Config): Promise<Runtime> {
+function defaultRuntimeModelConfig(config: Config): RuntimeModelConfig {
   const modelCfg = config.models[config.defaultModel];
   if (!modelCfg) throw new Error(`defaultModel not found: ${config.defaultModel}`);
-  const model = createModel(config.defaultModel, modelCfg);
-  const modelConfig: RuntimeModelConfig = { id: config.defaultModel, ...modelCfg };
+  return { id: config.defaultModel, ...modelCfg };
+}
+
+function toRuntimeModelConfig(settings: LlmSettings): RuntimeModelConfig {
+  return { ...settings };
+}
+
+export async function resolveRuntimeModelConfig(
+  config: Config,
+  store?: Store,
+  tenantId = DEFAULT_TENANT,
+): Promise<RuntimeModelConfig> {
+  const fallback = defaultRuntimeModelConfig(config);
+  const persisted = await store?.getLlmSettings({ tenantId });
+  return persisted ? toRuntimeModelConfig(persisted) : fallback;
+}
+
+/** 组装一次运行所需的全部组件（模型/工具/策略/持久化）。 */
+export async function buildRuntime(config: Config): Promise<Runtime> {
+  let modelConfig = defaultRuntimeModelConfig(config);
   const modelOptions: RuntimeModelConfig[] = Object.entries(config.models).map(([id, cfg]) => ({ id, ...cfg }));
   const tools = new ToolRegistry();
 
@@ -200,6 +217,8 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     userId: 'cli',
     role: 'platform_admin',
   };
+  modelConfig = await resolveRuntimeModelConfig(config, store, DEFAULT_TENANT);
+  const model = createModel(modelConfig.id, modelConfig);
 
   const runtime: Runtime = {
     model,

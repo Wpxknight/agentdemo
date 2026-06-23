@@ -59,6 +59,7 @@ export interface RuntimeModelConfig {
   protocol: 'anthropic' | 'openai';
   base_url: string;
   model: string;
+  api_key: string;
   api_key_set: boolean;
   api_key_preview: string;
   options?: RuntimeModelConfig[];
@@ -89,6 +90,14 @@ export interface SessionsBody {
     updatedAt?: string;
     lastMessage?: string;
     messageCount?: number;
+  }>;
+}
+
+export interface SessionMessagesBody {
+  messages: Array<{
+    role: Role | 'tool';
+    text?: string;
+    thinking?: string;
   }>;
 }
 

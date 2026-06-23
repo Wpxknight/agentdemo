@@ -1,10 +1,11 @@
-import type { Kysely } from 'kysely';
+import { sql, type Kysely } from 'kysely';
 import type { Msg, Role as MsgRole } from '../model/types.js';
 import type { AuditEvent } from '../audit/sink.js';
 import type { RequestContext, Role, Tenant, User } from '../auth/types.js';
 import type { Database } from './schema.js';
 import type {
   AuditFilter,
+  LlmSettings,
   NewUser,
   SessionSummary,
   ScheduledTask,
@@ -26,6 +27,13 @@ interface TaskRow {
   enabled: number;
   next_run_at: Date;
   last_run_at: Date | null;
+}
+
+interface SessionRow {
+  session_id: string;
+  role: string;
+  content: unknown;
+  created_at: Date | string;
 }
 
 function toTask(r: TaskRow): ScheduledTask {
@@ -59,6 +67,28 @@ function summarize(text: string | undefined, max = 48): string {
   if (!text) return '';
   const compact = text.replace(/\s+/g, ' ').trim();
   return compact.length > max ? `${compact.slice(0, max)}...` : compact;
+}
+
+function parseLlmSettings(value: unknown): LlmSettings | undefined {
+  const v = parseJson(value);
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const o = v as Record<string, unknown>;
+  if (
+    typeof o.id !== 'string'
+    || (o.protocol !== 'anthropic' && o.protocol !== 'openai')
+    || typeof o.baseURL !== 'string'
+    || typeof o.apiKey !== 'string'
+    || typeof o.model !== 'string'
+  ) {
+    return undefined;
+  }
+  return {
+    id: o.id,
+    protocol: o.protocol,
+    baseURL: o.baseURL,
+    apiKey: o.apiKey,
+    model: o.model,
+  };
 }
 
 /** 基于 Kysely + mysql2 的持久化实现（租户由 ctx 强制过滤）。 */
@@ -100,13 +130,14 @@ export class MysqlStore implements Store {
   }
 
   async listSessions(ctx: RequestContext, limit = 50): Promise<SessionSummary[]> {
-    const rows = await this.db
-      .selectFrom('messages')
-      .select(['session_id', 'role', 'content', 'created_at'])
-      .where('tenant_id', '=', ctx.tenantId)
-      .orderBy('id', 'desc')
-      .limit(Math.max(limit * 20, limit))
-      .execute();
+    const historyLimit = Math.max(limit * 20, limit);
+    const { rows } = await sql<SessionRow>`
+      SELECT session_id, role, content, created_at
+      FROM messages FORCE INDEX (idx_messages_tenant_id)
+      WHERE tenant_id = ${ctx.tenantId}
+      ORDER BY id DESC
+      LIMIT ${historyLimit}
+    `.execute(this.db);
 
     const grouped = new Map<string, Array<{ role: string; text?: string; createdAt: Date }>>();
     for (const row of rows.reverse()) {
@@ -329,6 +360,31 @@ export class MysqlStore implements Store {
       .executeTakeFirst();
     if (!r) return undefined;
     return { id: r.id, tenantId: r.tenant_id, username: r.username, role: r.role as Role };
+  }
+
+  async getLlmSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<LlmSettings | undefined> {
+    const row = await this.db
+      .selectFrom('tenant_settings')
+      .select(['config'])
+      .where('tenant_id', '=', ctx.tenantId)
+      .where('setting_key', '=', 'llm.default')
+      .executeTakeFirst();
+    return row ? parseLlmSettings(row.config) : undefined;
+  }
+
+  async setLlmSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: LlmSettings): Promise<void> {
+    const config = JSON.stringify(settings);
+    const updated = await this.db
+      .updateTable('tenant_settings')
+      .set({ config })
+      .where('tenant_id', '=', ctx.tenantId)
+      .where('setting_key', '=', 'llm.default')
+      .executeTakeFirst();
+    if (Number(updated.numUpdatedRows) > 0) return;
+    await this.db
+      .insertInto('tenant_settings')
+      .values({ tenant_id: ctx.tenantId, setting_key: 'llm.default', config })
+      .execute();
   }
 
   async close(): Promise<void> {

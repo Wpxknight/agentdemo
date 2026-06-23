@@ -4,6 +4,7 @@ import { MemoryStore } from '../src/db/memory.js';
 import { createStore } from '../src/db/index.js';
 import type { Msg } from '../src/model/types.js';
 import type { RequestContext } from '../src/auth/types.js';
+import { readFile } from 'node:fs/promises';
 
 const ctxA: RequestContext = { tenantId: 't1', userId: 'u1', role: 'user' };
 const ctxB: RequestContext = { tenantId: 't2', userId: 'u2', role: 'user' };
@@ -77,6 +78,58 @@ describe('MemoryStore', () => {
     expect(await s.listAudit(ctxA, { sessionId: 'a' })).toHaveLength(2);
     expect(await s.listAudit(ctxA, { kind: 'kubectl' })).toHaveLength(1);
     expect(await s.listAudit(ctxB)).toHaveLength(1);
+  });
+
+  it('persists LLM settings per tenant', async () => {
+    const s = new MemoryStore();
+    await s.setLlmSettings(ctxA, {
+      id: 'tenant-a',
+      protocol: 'openai',
+      baseURL: 'http://llm-a/v1',
+      apiKey: 'plain-a-key',
+      model: 'model-a',
+    });
+    await s.setLlmSettings(ctxB, {
+      id: 'tenant-b',
+      protocol: 'anthropic',
+      baseURL: 'http://llm-b',
+      apiKey: 'plain-b-key',
+      model: 'model-b',
+    });
+
+    expect(await s.getLlmSettings(ctxA)).toEqual({
+      id: 'tenant-a',
+      protocol: 'openai',
+      baseURL: 'http://llm-a/v1',
+      apiKey: 'plain-a-key',
+      model: 'model-a',
+    });
+    expect(await s.getLlmSettings(ctxB)).toEqual({
+      id: 'tenant-b',
+      protocol: 'anthropic',
+      baseURL: 'http://llm-b',
+      apiKey: 'plain-b-key',
+      model: 'model-b',
+    });
+  });
+
+  it('has a MySQL migration for tenant settings', async () => {
+    const migration = await readFile('src/db/migrations/0002_tenant_settings.sql', 'utf8');
+    expect(migration).toContain('CREATE TABLE IF NOT EXISTS tenant_settings');
+    expect(migration).toContain('tenant_id');
+    expect(migration).toContain('setting_key');
+  });
+
+  it('has a MySQL index for tenant history ordering', async () => {
+    const migration = await readFile('src/db/migrations/0003_messages_tenant_history_index.sql', 'utf8');
+    expect(migration).toContain('idx_messages_tenant_id');
+    expect(migration).toContain('tenant_id');
+    expect(migration).toContain('id');
+  });
+
+  it('forces the tenant history index when listing sessions', async () => {
+    const source = await readFile('src/db/mysql.ts', 'utf8');
+    expect(source).toContain('FORCE INDEX (idx_messages_tenant_id)');
   });
 });
 

@@ -190,6 +190,17 @@ describe('frontend API wiring', () => {
     expect(app).toContain("setRangeText('\\n'");
   });
 
+  it('loads persisted messages when a history session is selected', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(app).toContain('SessionMessagesBody');
+    expect(app).toContain('sessionMessagesToChatMessages');
+    expect(app).toContain('selectSession');
+    expect(app).toContain("api.get<SessionMessagesBody>(`/v1/sessions/${encodeURIComponent(session.sessionId)}/messages`)");
+    expect(app).toContain('onSelectSession={selectSession}');
+    expect(app).toContain('onClick={() => onSelect(session)}');
+  });
+
   it('keeps message time outside bubbles and renders model thinking as collapsible content', async () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
     const css = await readFile('web/src/index.css', 'utf8');
@@ -215,6 +226,43 @@ describe('frontend API wiring', () => {
     expect(css).not.toContain('.bubble time');
   });
 
+  it('renders assistant replies with Markdown, GFM, and syntax highlighting only for assistant messages', async () => {
+    const pkg = JSON.parse(await readFile('web/package.json', 'utf8')) as { dependencies: Record<string, string> };
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(pkg.dependencies).toHaveProperty('react-markdown');
+    expect(pkg.dependencies).toHaveProperty('remark-gfm');
+    expect(pkg.dependencies).toHaveProperty('rehype-highlight');
+    expect(pkg.dependencies).toHaveProperty('highlight.js');
+    expect(app).toContain("import ReactMarkdown, { type Components } from 'react-markdown'");
+    expect(app).toContain("import remarkGfm from 'remark-gfm'");
+    expect(app).toContain("import rehypeHighlight from 'rehype-highlight'");
+    expect(app).toContain('function MarkdownMessage');
+    expect(app).toContain('remarkPlugins={[remarkGfm]}');
+    expect(app).toContain('rehypePlugins={[rehypeHighlight]}');
+    expect(app).toContain("skipHtml");
+    expect(app).toContain("message.role === 'assistant'");
+    expect(app).toContain('<MarkdownMessage content={segment.content} />');
+    expect(app).toContain("renderTextLines(segment.content, `text-${index}`)");
+  });
+
+  it('styles Markdown output and code blocks without breaking message bubbles', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(app).toContain('className="markdown-code-block"');
+    expect(app).toContain('className="markdown-inline-code"');
+    expect(app).toContain('className="markdown-link"');
+    expect(css).toContain('.markdown-body');
+    expect(css).toContain('.markdown-code-block');
+    expect(css).toContain('.markdown-inline-code');
+    expect(css).toContain('.markdown-body table');
+    expect(css).toContain('.markdown-body blockquote');
+    expect(css).toContain('.markdown-body pre');
+    expect(css).toContain('overflow-x: auto');
+    expect(css).toContain('word-break: break-word');
+  });
+
   it('wires Skills and MCP test calls to the generic tool-call API', async () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
 
@@ -223,6 +271,17 @@ describe('frontend API wiring', () => {
     expect(app).toContain('testMcpTool');
     expect(app).toContain('tool-test-args');
     expect(app).toContain('toolTestOutput');
+  });
+
+  it('does not show fallback MCP tools when the backend has none registered', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(app).toContain("activePage === 'mcp' && <McpPage tools={mcpTools}");
+    expect(app).not.toContain("fallbackTools.filter((tool) => tool.category === 'mcp')");
+    expect(app).toContain('const hasTools = selected.tools.length > 0');
+    expect(app).toContain('selected.tools.some((item) => item.name === tool)');
+    expect(app).toContain('暂无已连接的 MCP 工具');
+    expect(app).toContain('disabled={!hasTools}');
   });
 });
 
@@ -369,6 +428,7 @@ describe('frontend data APIs', () => {
         protocol: 'anthropic',
         base_url: 'http://localhost:8000/v1',
         model: 'ui-model',
+        api_key: 'ui-key',
         api_key_set: true,
       });
     } finally {

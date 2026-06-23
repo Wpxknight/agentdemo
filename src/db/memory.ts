@@ -4,6 +4,7 @@ import type { RequestContext, Tenant, User } from '../auth/types.js';
 import type {
   AuditFilter,
   NewUser,
+  LlmSettings,
   SessionSummary,
   ScheduledTask,
   ScheduledTaskInput,
@@ -34,6 +35,7 @@ export class MemoryStore implements Store {
   private runs: TaskRun[] = [];
   private tenants = new Map<string, Tenant>();
   private users = new Map<string, UserWithSecret>(); // key: tenantId/username
+  private llmSettings = new Map<string, LlmSettings>();
   private taskSeq = 0;
   private userSeq = 0;
 
@@ -171,6 +173,15 @@ export class MemoryStore implements Store {
     return undefined;
   }
 
+  async getLlmSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<LlmSettings | undefined> {
+    const settings = this.llmSettings.get(ctx.tenantId);
+    return settings ? { ...settings } : undefined;
+  }
+
+  async setLlmSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: LlmSettings): Promise<void> {
+    this.llmSettings.set(ctx.tenantId, { ...settings });
+  }
+
   async close(): Promise<void> {
     this.messages = [];
     this.audit = [];
@@ -178,5 +189,6 @@ export class MemoryStore implements Store {
     this.runs = [];
     this.tenants.clear();
     this.users.clear();
+    this.llmSettings.clear();
   }
 }

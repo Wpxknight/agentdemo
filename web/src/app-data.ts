@@ -48,6 +48,7 @@ export const defaultLlmConfig: RuntimeModelConfig = {
   protocol: 'anthropic',
   base_url: 'http://192.168.10.108:18317',
   model: 'glm-5',
+  api_key: '',
   api_key_set: false,
   api_key_preview: '',
   options: [],

@@ -2,6 +2,14 @@ import type { Msg } from '../model/types.js';
 import type { AuditEvent, AuditSink } from '../audit/sink.js';
 import type { Role, RequestContext, Tenant, User } from '../auth/types.js';
 
+export interface LlmSettings {
+  id: string;
+  protocol: 'anthropic' | 'openai';
+  baseURL: string;
+  apiKey: string;
+  model: string;
+}
+
 /** 审计查询过滤（租户由 ctx 强制限定）。 */
 export interface AuditFilter {
   sessionId?: string;
@@ -90,6 +98,10 @@ export interface Store extends AuditSink {
   createUser(user: NewUser): Promise<User>;
   getUserByUsername(tenantId: string, username: string): Promise<UserWithSecret | undefined>;
   getUser(tenantId: string, userId: string): Promise<User | undefined>;
+
+  // —— 租户设置 ——
+  getLlmSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<LlmSettings | undefined>;
+  setLlmSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: LlmSettings): Promise<void>;
 
   close(): Promise<void>;
 }

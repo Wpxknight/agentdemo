@@ -1,4 +1,7 @@
 import { Fragment, type CSSProperties, type FormEvent, type KeyboardEvent, type PointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import ReactMarkdown, { type Components } from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import rehypeHighlight from 'rehype-highlight';
 import {
   Activity,
   Bot,
@@ -41,11 +44,13 @@ import type {
   ChatMessage,
   ModelSettingsBody,
   PageId,
+  Role,
   RuntimeModelConfig,
   SandboxSummary,
   SandboxesBody,
   ScheduleBody,
   ScheduledTask,
+  SessionMessagesBody,
   SessionSummary,
   SessionsBody,
   ToolCallBody,
@@ -229,6 +234,19 @@ function publicAttachment(file: Attachment): Omit<Attachment, 'id'> {
   return rest;
 }
 
+function sessionMessagesToChatMessages(body: SessionMessagesBody): ChatMessage[] {
+  const messages = body.messages
+    .filter((message) => message.role === 'user' || message.role === 'assistant')
+    .map((message, index) => ({
+      id: `history-${index}`,
+      role: message.role as Role,
+      text: message.text || '',
+      thinking: message.thinking,
+      time: '',
+    }));
+  return messages.length ? messages : initialMessages.slice(0, 1);
+}
+
 type ThinkingSegment = {
   type: 'text' | 'thinking';
   content: string;
@@ -290,6 +308,50 @@ function ThinkingBlock({ content, streaming }: { content: string; streaming?: bo
   );
 }
 
+const markdownComponents: Components = {
+  pre({ children }) {
+    return <>{children}</>;
+  },
+  code({ className, children, ...props }) {
+    const language = /language-([\w-]+)/.exec(className || '')?.[1];
+    const codeText = String(children ?? '').replace(/\n$/, '');
+    const isBlock = Boolean(language) || codeText.includes('\n');
+    if (isBlock) {
+      return (
+        <div className="markdown-code-frame">
+          {language ? <div className="markdown-code-language">{language}</div> : null}
+          <pre className="markdown-code-block">
+            <code className={cn(className, 'markdown-code')} {...props}>{children}</code>
+          </pre>
+        </div>
+      );
+    }
+    return <code className="markdown-inline-code" {...props}>{children}</code>;
+  },
+  a({ href, children }) {
+    return (
+      <a className="markdown-link" href={href} target="_blank" rel="noreferrer">
+        {children}
+      </a>
+    );
+  },
+};
+
+function MarkdownMessage({ content }: { content: string }) {
+  return (
+    <div className="markdown-body">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[rehypeHighlight]}
+        skipHtml
+        components={markdownComponents}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 function MessageContent({ message }: { message: ChatMessage }) {
   const segments = splitThinkingSegments(message.text);
   const thinkingSegments = [
@@ -306,7 +368,11 @@ function MessageContent({ message }: { message: ChatMessage }) {
         <ThinkingBlock key={`thinking-${index}`} content={segment.content} streaming={segment.streaming} />
       ))}
       {textSegments.map((segment, index) => (
-        <Fragment key={`text-${index}`}>{renderTextLines(segment.content, `text-${index}`)}</Fragment>
+        <Fragment key={`text-${index}`}>
+          {message.role === 'assistant'
+            ? <MarkdownMessage content={segment.content} />
+            : renderTextLines(segment.content, `text-${index}`)}
+        </Fragment>
       ))}
     </>
   );
@@ -453,6 +519,24 @@ export default function App() {
     if (typeof window !== 'undefined') window.history.replaceState({}, '', '/');
   }
 
+  async function selectSession(session: SessionSummary) {
+    if (!session.sessionId) return;
+    try {
+      const body = await api.get<SessionMessagesBody>(`/v1/sessions/${encodeURIComponent(session.sessionId)}/messages`);
+      setSessionId(session.sessionId);
+      writeStorage('aiop_session_id', session.sessionId);
+      setMessages(sessionMessagesToChatMessages(body));
+      setAttachments([]);
+    } catch (err) {
+      setMessages([{
+        id: randomId(),
+        role: 'assistant',
+        text: `加载会话失败：${formatError(err)}`,
+        time: new Date().toLocaleTimeString(),
+      }]);
+    }
+  }
+
   async function addAttachments(fileList: FileList | null) {
     const files = [...(fileList || [])].slice(0, 6);
     if (!files.length) return;
@@ -497,6 +581,9 @@ export default function App() {
     }
     const assistantId = randomId();
     const assistant: ChatMessage = { id: assistantId, role: 'assistant', text: '', time: new Date().toLocaleTimeString() };
+    const publishAssistant = () => {
+      setMessages((current) => current.map((message) => (message.id === assistantId ? { ...assistant } : message)));
+    };
     setMessages((current) => [...current, assistant]);
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -511,11 +598,18 @@ export default function App() {
         const event = parseSse(part);
         if (event?.event === 'thinking_delta' && typeof event.data?.text === 'string') {
           assistant.thinking = `${assistant.thinking || ''}${event.data.text}`;
-          setMessages((current) => current.map((message) => (message.id === assistantId ? { ...assistant } : message)));
+          publishAssistant();
         }
         if (event?.event === 'text_delta' && typeof event.data?.text === 'string') {
           assistant.text += event.data.text;
-          setMessages((current) => current.map((message) => (message.id === assistantId ? { ...assistant } : message)));
+          publishAssistant();
+        }
+        if (event?.event === 'error') {
+          const message = typeof event.data?.error === 'string' ? event.data.error : '运行失败';
+          assistant.text = assistant.text.trim()
+            ? `${assistant.text}\n\n运行失败：${message}`
+            : `运行失败：${message}`;
+          publishAssistant();
         }
         if (event?.event === 'done' && typeof event.data?.sessionId === 'string') {
           setSessionId(event.data.sessionId);
@@ -667,6 +761,7 @@ export default function App() {
           previewOpen={previewOpen}
           previewWidth={previewWidth}
           sessions={sessions}
+          selectedSessionId={sessionId}
           messages={messages}
           attachments={attachments}
           llm={llm}
@@ -680,6 +775,7 @@ export default function App() {
           onToggleHistory={() => setHistoryOpen((value) => !value)}
           onTogglePreview={() => setPreviewOpen((value) => !value)}
           onNewSession={startNewSession}
+          onSelectSession={selectSession}
           onChooseAttachment={() => fileInputRef.current?.click()}
           onAddAttachments={(files) => void addAttachments(files)}
           onRemoveAttachment={(id) => setAttachments((current) => current.filter((file) => file.id !== id))}
@@ -706,7 +802,7 @@ export default function App() {
           <Topbar token={token} onLogout={redirectToLogin} />
           <section className="content-shell content-wide">
             {activePage === 'skills' && <SkillsPage tools={skillTools.length ? skillTools : fallbackTools.filter((tool) => tool.category === 'skill')} output={toolTestOutput} onTest={testSkillTool} />}
-            {activePage === 'mcp' && <McpPage tools={mcpTools.length ? mcpTools : fallbackTools.filter((tool) => tool.category === 'mcp')} output={toolTestOutput} onTest={testMcpTool} />}
+            {activePage === 'mcp' && <McpPage tools={mcpTools} output={toolTestOutput} onTest={testMcpTool} />}
             {activePage === 'schedule' && <SchedulePage tasks={tasks.length ? tasks : fallbackTasks} />}
             {activePage === 'sandbox' && <SandboxPage sandboxes={sandboxes.length ? sandboxes : fallbackSandboxes} />}
             {activePage === 'settings' && <SettingsPage llm={llm} status={settingsStatus} api={api} onLlmChange={setLlm} onStatus={setSettingsStatus} />}
@@ -771,6 +867,7 @@ function PrototypeChatShell(props: {
   previewOpen: boolean;
   previewWidth: number;
   sessions: SessionSummary[];
+  selectedSessionId: string;
   messages: ChatMessage[];
   attachments: Attachment[];
   llm: RuntimeModelConfig;
@@ -784,6 +881,7 @@ function PrototypeChatShell(props: {
   onToggleHistory: () => void;
   onTogglePreview: () => void;
   onNewSession: () => void;
+  onSelectSession: (session: SessionSummary) => void;
   onChooseAttachment: () => void;
   onAddAttachments: (files: FileList | null) => void;
   onRemoveAttachment: (id: string) => void;
@@ -817,7 +915,12 @@ function PrototypeChatShell(props: {
       <div className="prototype-main-content" id="main-content" style={{ '--sandbox-width': `${props.previewWidth}px` } as CSSProperties}>
         <PrototypeSidebarNav onNavigate={props.onNavigate} />
         {props.historyOpen ? (
-          <PrototypeSessionPanel sessions={props.sessions} onToggle={props.onToggleHistory} />
+          <PrototypeSessionPanel
+            sessions={props.sessions}
+            selectedSessionId={props.selectedSessionId}
+            onToggle={props.onToggleHistory}
+            onSelect={props.onSelectSession}
+          />
         ) : (
           <div className="prototype-collapsed-panel prototype-collapsed-left">
             <button type="button" onClick={props.onToggleHistory} aria-label="展开最近会话">
@@ -888,7 +991,12 @@ function PrototypeSidebarNav({ onNavigate }: { onNavigate: (page: PageId) => voi
   );
 }
 
-function PrototypeSessionPanel({ sessions, onToggle }: { sessions: SessionSummary[]; onToggle: () => void }) {
+function PrototypeSessionPanel({ sessions, selectedSessionId, onToggle, onSelect }: {
+  sessions: SessionSummary[];
+  selectedSessionId: string;
+  onToggle: () => void;
+  onSelect: (session: SessionSummary) => void;
+}) {
   const [query, setQuery] = useState('');
   const items = (sessions.length ? sessions : fallbackSessions).filter((session) => {
     const value = `${session.title} ${session.desc}`.toLowerCase();
@@ -913,8 +1021,14 @@ function PrototypeSessionPanel({ sessions, onToggle }: { sessions: SessionSummar
           {items.slice(0, 10).map((session, index) => {
             const category = sessionCategoryFor(session);
             const SessionIcon = category.Icon;
+            const isActive = Boolean(session.sessionId && session.sessionId === selectedSessionId);
             return (
-              <button key={`${session.sessionId || session.title}-${index}`} className={cn('prototype-session-item', index === 0 && 'active')} type="button">
+              <button
+                key={`${session.sessionId || session.title}-${index}`}
+                className={cn('prototype-session-item', isActive && 'active')}
+                type="button"
+                onClick={() => onSelect(session)}
+              >
                 <span className={cn('prototype-session-icon', category.tone)}>
                   <SessionIcon />
                 </span>
@@ -1473,14 +1587,26 @@ function McpPage({ tools, output, onTest }: { tools: ToolSummary[]; output: stri
   const selected = servers[0] || { name: '-', transport: '-', status: '未连接', tools: [] as ToolSummary[] };
   const [tool, setTool] = useState(selected.tools[0]?.name || '');
   const [args, setArgs] = useState('{}');
+  const hasTools = selected.tools.length > 0;
+  const serverRows = servers.length
+    ? servers.map((server) => [server.name, server.transport, server.status, String(server.tools.length), formatTime(new Date().toISOString())])
+    : [['-', '-', '未连接', '0', '-']];
+
+  useEffect(() => {
+    if (!selected.tools.some((item) => item.name === tool)) {
+      setTool(selected.tools[0]?.name || '');
+    }
+  }, [selected.tools, tool]);
+
   return (
     <ManagementPage title="MCP" subtitle="管理 MCP server，扩展 AI 助手的能力边界" actionLabel="新增 MCP">
-      <DataTable headers={['名称', '传输协议', '状态', '工具数', '最近心跳']} rows={servers.map((server) => [server.name, server.transport, server.status, String(server.tools.length), formatTime(new Date().toISOString())])} />
+      <DataTable headers={['名称', '传输协议', '状态', '工具数', '最近心跳']} rows={serverRows} />
       <DetailPanel title={selected.name} status={selected.status} icon={<Boxes />}>
         <h3>连接配置</h3>
         <div className="kv"><span>传输协议</span><strong>{selected.transport}</strong><span>命令</span><strong>registry</strong></div>
         <h3>测试调用</h3>
-        <Select value={tool} onValueChange={setTool}>
+        {!hasTools ? <p className="empty-hint">暂无已连接的 MCP 工具</p> : null}
+        <Select value={tool} onValueChange={setTool} disabled={!hasTools}>
           <SelectTrigger><SelectValue placeholder="选择工具" /></SelectTrigger>
           <SelectContent>
             <SelectGroup>
@@ -1488,8 +1614,8 @@ function McpPage({ tools, output, onTest }: { tools: ToolSummary[]; output: stri
             </SelectGroup>
           </SelectContent>
         </Select>
-        <Textarea id="tool-test-args" value={args} onChange={(event) => setArgs(event.target.value)} rows={5} spellCheck={false} />
-        <Button type="button" onClick={() => onTest(tool, args)}>测试工具</Button>
+        <Textarea id="tool-test-args" value={args} onChange={(event) => setArgs(event.target.value)} rows={5} spellCheck={false} disabled={!hasTools} />
+        <Button type="button" disabled={!hasTools} onClick={() => onTest(tool, args)}>测试工具</Button>
         {output ? <pre className="tool-output">{output}</pre> : null}
       </DetailPanel>
     </ManagementPage>
@@ -1603,7 +1729,11 @@ function SettingsPage({ llm, status, api, onLlmChange, onStatus }: {
   onLlmChange: (next: RuntimeModelConfig) => void;
   onStatus: (next: string) => void;
 }) {
-  const [form, setForm] = useState(() => ({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: '' }));
+  const [form, setForm] = useState(() => ({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '' }));
+
+  useEffect(() => {
+    setForm({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '' });
+  }, [llm.api_key, llm.base_url, llm.model, llm.protocol]);
 
   async function save() {
     onStatus('正在保存配置...');
@@ -1639,7 +1769,7 @@ function SettingsPage({ llm, status, api, onLlmChange, onStatus }: {
           <CardContent className="settings-form">
             <Label>协议<Select value={form.protocol} onValueChange={(protocol) => setForm((current) => ({ ...current, protocol: protocol as RuntimeModelConfig['protocol'] }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="anthropic">Anthropic</SelectItem><SelectItem value="openai">OpenAI Compatible</SelectItem></SelectGroup></SelectContent></Select></Label>
             <Label>Base URL<Input value={form.base_url} onChange={(event) => setForm((current) => ({ ...current, base_url: event.target.value }))} /></Label>
-            <Label>API Key<Input type="password" placeholder={llm.api_key_set ? `已配置：${llm.api_key_preview}` : '输入 API Key'} value={form.api_key} onChange={(event) => setForm((current) => ({ ...current, api_key: event.target.value }))} /></Label>
+            <Label>API Key<Input placeholder="输入 API Key" value={form.api_key} onChange={(event) => setForm((current) => ({ ...current, api_key: event.target.value }))} /></Label>
             <Label>Model<Input value={form.model} onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))} /></Label>
             {status ? <div className="settings-status">{status}</div> : null}
             <div className="form-actions">
@@ -1662,7 +1792,7 @@ function SettingsPage({ llm, status, api, onLlmChange, onStatus }: {
             <span>协议</span><strong>{llm.protocol}</strong>
             <span>Base URL</span><strong>{llm.base_url || '-'}</strong>
             <span>Model</span><strong>{llm.model || '-'}</strong>
-            <span>API Key</span><strong>{llm.api_key_preview || '-'}</strong>
+            <span>API Key</span><strong>{llm.api_key || '-'}</strong>
           </CardContent>
         </Card>
       </div>

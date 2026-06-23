@@ -69,6 +69,14 @@ export interface UsersTable {
   created_at: Generated<Date>;
 }
 
+export interface TenantSettingsTable {
+  tenant_id: string;
+  setting_key: string;
+  config: JsonColumn;
+  created_at: Generated<Date>;
+  updated_at: Generated<Date>;
+}
+
 export interface Database {
   messages: MessagesTable;
   audit_events: AuditEventsTable;
@@ -76,4 +84,5 @@ export interface Database {
   task_runs: TaskRunsTable;
   tenants: TenantsTable;
   users: UsersTable;
+  tenant_settings: TenantSettingsTable;
 }
