@@ -1,0 +1,80 @@
+# 沙箱专属 ServiceAccount + RBAC + batchsandbox 模板覆盖
+#
+# 目的：让 OpenSandbox 拉起的沙箱 Pod 以专属 SA(aiop-sandbox)运行，
+# 从而在 Pod 内用 in-cluster config 直接跑 kubectl 查询 pod 等资源。
+#
+# 背景（重要）：aiop 的 clusters[].serviceAccount 只会作为 OpenSandbox 的
+# metadata / AIOP_SERVICE_ACCOUNT 环境变量透传，batchsandbox provider 并不会
+# 据此设置 Pod 的 serviceAccountName —— 它只认服务端的 batchsandbox 模板文件。
+# 所以专属 SA 必须在这里(部署阶段)创建，并通过模板把 serviceAccountName 注入 Pod。
+#
+# 应用：
+#   kubectl apply -f deploy/opensandbox/sandbox-sa.yaml
+# 然后让 server 使用下面的模板(见 deploy/opensandbox/README.md 的 patch 步骤)。
+---
+# 1) 沙箱 Pod 所在命名空间(= server config.toml 的 kubernetes.namespace)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aiop-sandbox
+  namespace: opensandbox
+---
+# 2) 只读集群视图：查询 pod / service / 事件 / 工作负载等。
+#    若只需某些命名空间，把下面的 ClusterRoleBinding 换成对应 ns 的 RoleBinding。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aiop-sandbox-readonly
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - services
+      - endpoints
+      - events
+      - nodes
+      - namespaces
+      - configmaps
+      - persistentvolumeclaims
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aiop-sandbox-readonly
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aiop-sandbox-readonly
+subjects:
+  - kind: ServiceAccount
+    name: aiop-sandbox
+    namespace: opensandbox
+---
+# 3) batchsandbox PodTemplate 覆盖：把 serviceAccountName 注入每个沙箱 Pod。
+#    内容会被 OpenSandbox server 的 BatchSandboxTemplateManager 深度 merge 进
+#    每个 BatchSandbox CR。务必保留 example 模板里的 restartPolicy / tolerations。
+#    注意：此 ConfigMap 在 server 所在的 opensandbox-system 命名空间。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opensandbox-batchsandbox-template
+  namespace: opensandbox-system
+data:
+  template.yaml: |
+    metadata:
+    spec:
+      replicas: 1
+      template:
+        spec:
+          serviceAccountName: aiop-sandbox
+          restartPolicy: Never
+          tolerations:
+            - operator: "Exists"

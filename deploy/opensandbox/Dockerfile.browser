@@ -7,6 +7,13 @@
 # so the image only needs the binaries that execd commands will call.
 FROM mcr.microsoft.com/playwright:v1.57.0-noble
 
+# kubectl：沙箱 Pod 内用 in-cluster config 查询集群（in-cluster 用 SA token 挂载的 CA，
+# 无需系统 ca 证书，静态二进制直接 COPY）。构建前把二进制放进构建上下文：
+#   cp "$(which kubectl)" deploy/opensandbox/kubectl   # 版本对齐集群（如 v1.32.x）
+# 该文件已被 .gitignore 忽略，不入库。离线集群无外网时此法不依赖 apt / dl.k8s.io。
+COPY deploy/opensandbox/kubectl /usr/local/bin/kubectl
+RUN chmod +x /usr/local/bin/kubectl && kubectl version --client
+
 RUN test -x /usr/bin/python3 \
   && test -x /usr/bin/node \
   && CHROME_BIN="$(find /ms-playwright -path '*/chrome-linux*/chrome' -type f | head -n 1)" \
