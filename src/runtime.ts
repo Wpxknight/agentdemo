@@ -40,6 +40,8 @@ export interface Runtime {
   updateModel?(config: RuntimeModelConfig): void;
   tools: ToolRegistry;
   skillRegistry?: SkillRegistry;
+  /** 会话沙箱管理器（按会话/集群复用、空闲 GC、会话关闭销毁）。 */
+  sandboxes?: SandboxManager;
   clusters: ClusterRegistry;
   audit: AuditSink;
   store: Store;
@@ -104,6 +106,7 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
 
   let sandboxes: SandboxManager | undefined;
   let warmPoolRef: WarmPool | undefined;
+  let sandboxSweepTimer: ReturnType<typeof setInterval> | undefined;
   const desktops = new Map<string, Promise<DesktopHandle>>();
   if (config.sandbox?.enabled) {
     const provider: SandboxProvider =
@@ -136,8 +139,15 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
       timeoutMs: config.sandbox.timeoutMs,
       warmPool,
     });
+    // 空闲 GC：周期性 sweep() 回收空闲超 idleMs 的沙箱（最长每分钟检一次）。
+    const sweepMs = Math.max(30_000, Math.min(config.sandbox.idleMs ?? 10 * 60_000, 60_000));
+    const sweeper = sandboxes;
+    sandboxSweepTimer = setInterval(() => {
+      void sweeper.sweep().catch((err) => logger.warn({ err: String(err) }, 'sandbox sweep failed'));
+    }, sweepMs);
+    sandboxSweepTimer.unref?.();
     for (const t of buildSandboxTools(sandboxes)) tools.register(t);
-    logger.info('sandbox tools enabled');
+    logger.info({ sweepMs }, 'sandbox tools enabled');
     if (hasClusters) {
       tools.register(buildKubectlTool({ clusters, sandboxes, audit }));
       logger.info({ clusters: clusters.names() }, 'kubectl tool enabled');
@@ -231,6 +241,7 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     },
     tools,
     skillRegistry,
+    sandboxes,
     clusters,
     audit,
     store,
@@ -241,6 +252,7 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     jwtSecret,
     defaultContext,
     async dispose() {
+      if (sandboxSweepTimer) clearInterval(sandboxSweepTimer);
       await Promise.all(
         [...desktops.values()].map((d) => d.then((h) => h.kill()).catch(() => {})),
       );

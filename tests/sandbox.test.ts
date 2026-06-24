@@ -92,6 +92,37 @@ describe('SandboxManager', () => {
     expect(mgr.has('fresh')).toBe(true);
   });
 
+  it('renews backend timeout on reuse', async () => {
+    const { provider } = mockProvider();
+    const mgr = new SandboxManager({ provider, timeoutMs: 5_000 });
+
+    const h = await mgr.get({ key: 's1' }); // 新建：不续期
+    expect(h.setTimeout).not.toHaveBeenCalled();
+
+    await mgr.get({ key: 's1' }); // 复用：按 timeoutMs 续期
+    await mgr.get({ key: 's1' });
+    expect(h.setTimeout).toHaveBeenCalledTimes(2);
+    expect(h.setTimeout).toHaveBeenLastCalledWith(5_000);
+  });
+
+  it('disposeSession kills the default key and all cluster keys', async () => {
+    const { provider, killed } = mockProvider();
+    const mgr = new SandboxManager({ provider });
+
+    await mgr.get({ key: 'sess' }); // 默认会话沙箱
+    await mgr.get({ key: 'sess:prod' }); // 集群键
+    await mgr.get({ key: 'sess:dev' });
+    await mgr.get({ key: 'other' }); // 别的会话，不应被清
+
+    const keys = await mgr.disposeSession('sess');
+
+    expect(keys.sort()).toEqual(['sess', 'sess:dev', 'sess:prod']);
+    expect(killed.length).toBe(3);
+    expect(mgr.has('sess')).toBe(false);
+    expect(mgr.has('sess:prod')).toBe(false);
+    expect(mgr.has('other')).toBe(true);
+  });
+
   it('disposeAll kills everything', async () => {
     const { provider, killed } = mockProvider();
     const mgr = new SandboxManager({ provider });

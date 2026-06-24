@@ -662,8 +662,11 @@ async function handle(
   const sessionDeleteMatch = /^\/v1\/sessions\/([^/]+)$/.exec(path);
   if (method === 'DELETE' && sessionDeleteMatch) {
     const ctx = await requireAuth(rt, req);
-    const ok = await rt.store.deleteSession(ctx, decodeURIComponent(sessionDeleteMatch[1]!));
+    const sessionId = decodeURIComponent(sessionDeleteMatch[1]!);
+    const ok = await rt.store.deleteSession(ctx, sessionId);
     if (!ok) throw new HttpError(404, '会话不存在');
+    // 会话关闭即销毁其名下沙箱（含集群 sessionId:cluster 键）；best-effort，不阻塞响应。
+    void rt.sandboxes?.disposeSession(sessionId);
     return sendJson(res, 200, { ok: true });
   }
 

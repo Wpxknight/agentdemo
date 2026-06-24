@@ -7,6 +7,8 @@ const log = logger.child({ mod: 'sandbox' });
 interface Entry {
   handle: SandboxHandle;
   lastUsed: number;
+  /** 该沙箱的存活超时(ms)，复用时据此续期。 */
+  timeoutMs: number;
 }
 
 export interface SandboxManagerOptions {
@@ -50,20 +52,26 @@ export class SandboxManager {
     const cached = this.entries.get(spec.key);
     if (cached) {
       cached.lastUsed = this.now();
+      // 按使用续期：刷新后端存活超时，使"空闲超时"真正按空闲计算（而非创建后固定 TTL）。
+      // 不阻塞热路径，失败仅告警——本地 lastUsed 仍驱动 sweep 回收。
+      void cached.handle.setTimeout(cached.timeoutMs).catch((err) =>
+        log.warn({ key: spec.key, err: String(err) }, 'sandbox renew on reuse failed'),
+      );
       return cached.handle;
     }
 
     const existing = this.inflight.get(spec.key);
     if (existing) return existing;
 
-    const full: SandboxSpec = { timeoutMs: this.timeoutMs, ...spec };
+    const effectiveTimeout = spec.timeoutMs ?? this.timeoutMs;
+    const full: SandboxSpec = { ...spec, timeoutMs: effectiveTimeout };
     const task = (async () => {
       const handle = full.sandboxId
         ? await this.provider.connect(full.sandboxId, full)
         : this.warmPool
           ? await this.warmPool.acquire()
           : await this.provider.create(full);
-      this.entries.set(spec.key, { handle, lastUsed: this.now() });
+      this.entries.set(spec.key, { handle, lastUsed: this.now(), timeoutMs: effectiveTimeout });
       log.info({ key: spec.key, sandboxId: handle.sandboxId, mode: full.sandboxId ? 'connect' : 'create' }, 'sandbox ready');
       return handle;
     })();
@@ -108,6 +116,24 @@ export class SandboxManager {
     if (!e) return;
     this.entries.delete(key);
     await e.handle.kill();
+  }
+
+  /**
+   * 销毁某会话名下的全部沙箱（会话关闭时调用）：
+   * 默认键 = sessionId，集群键 = `${sessionId}:${cluster}`。单个 kill 失败仅告警，不影响其余。
+   */
+  async disposeSession(sessionId: string): Promise<string[]> {
+    const prefix = `${sessionId}:`;
+    const keys = [...this.entries.keys()].filter((k) => k === sessionId || k.startsWith(prefix));
+    await Promise.all(
+      keys.map((k) =>
+        this.dispose(k).catch((err) =>
+          log.warn({ key: k, err: String(err) }, 'sandbox dispose (session) failed'),
+        ),
+      ),
+    );
+    if (keys.length) log.info({ sessionId, count: keys.length }, 'sandboxes disposed (session closed)');
+    return keys;
   }
 
   /** 销毁全部（进程退出时调用）。 */

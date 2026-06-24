@@ -1,0 +1,63 @@
+# 运维网络排查（netdiag）OpenSandbox 运行时镜像。
+#
+# 配合 skills/netdiag 使用：在特权 + 主机网络（hostNetwork）的沙箱 Pod 内做
+# 容器/节点网络排查。OpenSandbox 会用自带的 idle entrypoint 覆盖镜像命令，
+# 所以镜像只需备齐 execd 会调用的二进制（python3/node + 网络工具 + kubectl）。
+#
+# Build:
+#   cp "$(which kubectl)" deploy/opensandbox/kubectl   # 版本对齐集群（如 v1.32.x）
+#   docker build -f deploy/opensandbox/Dockerfile.netdiag -t aiop/opensandbox-netdiag:latest .
+#
+# 注意：fabric-admin（/opt/cni/bin/fabric-admin）是**节点宿主机**上的二进制，
+# 不打进镜像 —— 由 batchsandbox 模板用 hostPath 把宿主 /opt/cni/bin 挂进沙箱
+# （见 deploy/opensandbox/netdiag-sandbox.yaml）。ovs-ofctl/ovs-vsctl 也同理，
+# 优先 `kubectl exec` 进 fabric-node/ovs 容器执行。
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 排查工具集：
+# - tcpdump / iproute2(ip,ss) / net-tools(netstat) / iputils-ping / dnsutils(dig,nslookup)
+# - conntrack(conntrack-tools) / iptables / nftables / ethtool / traceroute / mtr / socat / netcat
+# - curl / jq / bind9-host / less / procps(ps) / util-linux(nsenter) / iproute2
+# - python3 / nodejs（aiop 代码执行与 CDP 脚本所需；命令执行默认 python3）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      jq \
+      tcpdump \
+      iproute2 \
+      net-tools \
+      iputils-ping \
+      iputils-tracepath \
+      traceroute \
+      mtr-tiny \
+      dnsutils \
+      bind9-host \
+      conntrack \
+      iptables \
+      nftables \
+      ipset \
+      ethtool \
+      socat \
+      netcat-openbsd \
+      tcptraceroute \
+      openvswitch-switch \
+      util-linux \
+      procps \
+      less \
+      vim-tiny \
+      python3 \
+      nodejs \
+  && rm -rf /var/lib/apt/lists/*
+
+# kubectl：沙箱 Pod 内用 in-cluster config 查询集群 / exec 进 fabric-ovs 容器看流表。
+# 构建前把与集群版本对齐的二进制放进构建上下文（deploy/opensandbox/kubectl，已被 .gitignore 忽略）。
+COPY deploy/opensandbox/kubectl /usr/local/bin/kubectl
+RUN chmod +x /usr/local/bin/kubectl && kubectl version --client
+
+# 自检：确认排查必备命令都在。
+RUN for b in python3 tcpdump conntrack dig nslookup ping netstat ss ip iptables nft \
+             curl jq nsenter ovs-ofctl ovs-vsctl kubectl; do \
+      command -v "$b" >/dev/null || { echo "missing: $b" >&2; exit 1; }; \
+    done && echo "netdiag image OK"

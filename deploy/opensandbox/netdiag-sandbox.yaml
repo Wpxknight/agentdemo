@@ -1,0 +1,129 @@
+# 运维网络排查（netdiag）沙箱：专属 SA + RBAC + batchsandbox 模板覆盖
+# （特权 privileged + 主机网络 hostNetwork + hostPID + 宿主路径挂载）。
+#
+# 目的：让 OpenSandbox 拉起的沙箱 Pod 以「节点调试 Pod」形态运行，配合 skills/netdiag
+# 做容器/节点网络排查：在节点主机网络命名空间里跑 fabric-admin / curl localhost:9013 /
+# tcpdump / conntrack / iptables，并能 kubectl exec 进 fabric-ovs 容器看流表。
+#
+# ⚠️ 重大约束（务必先读 deploy/opensandbox/README.netdiag.md）：
+#   OpenSandbox 的 batchsandbox provider 只有**一个全局模板**（ConfigMap
+#   opensandbox-batchsandbox-template）。套用本模板后，**该 server 拉起的所有沙箱**都会变成
+#   特权 + hostNetwork。因此**强烈建议为 netdiag 单独跑一套 OpenSandbox server**（或独立集群入口
+#   domain），不要和普通代码/浏览器沙箱共用同一个 server。
+#
+# 应用：
+#   kubectl apply -f deploy/opensandbox/netdiag-sandbox.yaml
+# 然后把模板挂到 server（见 README.netdiag.md 的 patch 步骤）。
+---
+# 1) netdiag 沙箱 Pod 所在命名空间(= server config.toml 的 kubernetes.namespace)的专属 SA。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aiop-netdiag
+  namespace: opensandbox
+---
+# 2) 排查所需的只读集群视图 + pods/exec（用于进 fabric-ovs 容器跑 ovs 命令）。
+#    pods/exec 是写动作类的能力，按需收紧到具体 ns（换成 RoleBinding）。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aiop-netdiag
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - services
+      - endpoints
+      - events
+      - nodes
+      - namespaces
+      - configmaps
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aiop-netdiag
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aiop-netdiag
+subjects:
+  - kind: ServiceAccount
+    name: aiop-netdiag
+    namespace: opensandbox
+---
+# 3) batchsandbox PodTemplate 覆盖：注入 SA、主机网络、特权、宿主路径挂载。
+#    会被 OpenSandbox server 的 BatchSandboxTemplateManager 深度 merge 进每个 BatchSandbox CR。
+#    保留 example 模板里的 restartPolicy / tolerations。此 ConfigMap 在 server 所在的
+#    opensandbox-system 命名空间。
+#
+#    Pod 级字段（serviceAccountName/hostNetwork/hostPID/dnsPolicy/volumes/tolerations）会稳妥合并。
+#    容器级字段（securityContext.privileged + volumeMounts）必须落在 **OpenSandbox 注入的沙箱
+#    容器** 上 —— 下面 containers[].name 用占位名 `sandbox`，**部署后务必核对**真实容器名并对齐：
+#      kubectl get pod -n opensandbox <某个沙箱pod> -o jsonpath='{.spec.containers[*].name}'
+#    如不一致，把下方 name 改成真实名，或 README.netdiag.md 里改用「独立特权 server」方案。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opensandbox-batchsandbox-template
+  namespace: opensandbox-system
+data:
+  template.yaml: |
+    metadata:
+    spec:
+      replicas: 1
+      template:
+        spec:
+          serviceAccountName: aiop-netdiag
+          hostNetwork: true
+          hostPID: true
+          dnsPolicy: ClusterFirstWithHostNet
+          restartPolicy: Never
+          tolerations:
+            - operator: "Exists"
+          volumes:
+            - name: cni-bin
+              hostPath:
+                path: /opt/cni/bin          # 宿主 fabric-admin 所在目录
+                type: Directory
+            - name: ovs-run
+              hostPath:
+                path: /var/run/openvswitch   # 本机直跑 ovs-ofctl/ovs-vsctl 用的 sock
+                type: DirectoryOrCreate
+            - name: host-netns
+              hostPath:
+                path: /run/netns             # nsenter 进 pod netns 抓包用
+                type: DirectoryOrCreate
+            - name: lib-modules
+              hostPath:
+                path: /lib/modules           # conntrack/iptables 内核模块
+                type: Directory
+          containers:
+            - name: sandbox                  # ← 占位名！部署后核对真实容器名再对齐（见上注释）
+              securityContext:
+                privileged: true
+                capabilities:
+                  add: ["NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_PTRACE"]
+              volumeMounts:
+                - name: cni-bin
+                  mountPath: /opt/cni/bin
+                  readOnly: true
+                - name: ovs-run
+                  mountPath: /var/run/openvswitch
+                - name: host-netns
+                  mountPath: /run/netns
+                  mountPropagation: HostToContainer
+                - name: lib-modules
+                  mountPath: /lib/modules
+                  readOnly: true
