@@ -377,18 +377,25 @@ describe('frontend API wiring', () => {
     expect(css).toContain('.skill-tree-up-button');
   });
 
-  it('keeps management page headers compact and title-only', async () => {
+  it('shows a one-line description beside each page title', async () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
     const css = await readFile('web/src/index.css', 'utf8');
 
-    expect(app).toContain('function PageTitle({ title }: { title: string })');
-    expect(app).not.toContain('<p>{subtitle}</p>');
-    expect(app).not.toContain('管理 MCP server，扩展 AI 助手的能力边界');
-    expect(app).not.toContain('配置和管理定时执行的 AI 任务');
-    expect(app).not.toContain('管理隔离沙箱，安全执行运维操作');
-    expect(app).not.toContain('配置 AI 助手当前使用的 LLM 服务');
+    // PageTitle 支持标题同行展示简要描述
+    expect(app).toContain('function PageTitle({ title, desc }');
+    expect(app).toContain('className="page-subtitle"');
+    expect(app).toContain('className="page-heading"');
+    // 各页描述文案
+    expect(app).toContain('接入 MCP Server，扩展 AI 可用的工具');
+    expect(app).toContain('按 cron 周期自动执行的运维任务');
+    expect(app).toContain('隔离的代码 / 命令执行环境');
+    expect(app).toContain('模型与运行时配置');
+    expect(app).toContain('管理本地与导入的 Skill，供 AI 调用');
+    // 标题与描述同一行（横向基线对齐）
+    expect(css).toContain('.page-subtitle');
+    expect(css).toContain('.page-heading');
+    expect(css).toContain('flex-direction: row');
     expect(css).toContain('min-height: 44px');
-    expect(css).not.toContain('.page-title h1,\n  .skills-page-header h1 {\n    font-size: 14px');
     expect(css).toContain('.page-title h1,\n  .skills-page-header h1 {\n    font-size: 18px');
   });
 

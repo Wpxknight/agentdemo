@@ -2,12 +2,20 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import type { ExecResult, SandboxHandle, SandboxProvider, SandboxSpec } from './types.js';
+import type {
+  ExecResult,
+  OutputSink,
+  RunCodeOpts,
+  RunCommandOpts,
+  SandboxHandle,
+  SandboxProvider,
+  SandboxSpec,
+} from './types.js';
 
 function runProcess(
   command: string,
   args: string[],
-  opts: { cwd: string; timeoutMs?: number },
+  opts: { cwd: string; timeoutMs?: number; onOutput?: OutputSink },
 ): Promise<ExecResult> {
   return new Promise((resolve) => {
     const child = spawn(command, args, {
@@ -25,8 +33,8 @@ function runProcess(
 
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
-    child.stdout.on('data', (chunk) => { stdout += chunk; });
-    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.stdout.on('data', (chunk) => { stdout += chunk; opts.onOutput?.({ stream: 'stdout', text: String(chunk) }); });
+    child.stderr.on('data', (chunk) => { stderr += chunk; opts.onOutput?.({ stream: 'stderr', text: String(chunk) }); });
     child.on('error', (err) => {
       clearTimeout(timer);
       resolve({ stdout, stderr, exitCode: 127, error: String(err) });
@@ -65,18 +73,18 @@ class LocalSandboxHandle implements SandboxHandle {
     this.sandboxId = `local-${key.replace(/[^a-zA-Z0-9_.-]/g, '-')}-${Date.now().toString(36)}`;
   }
 
-  async runCode(code: string, opts?: { language?: string }): Promise<ExecResult> {
+  async runCode(code: string, opts?: RunCodeOpts): Promise<ExecResult> {
     if (this.killed) return { stdout: '', stderr: '', exitCode: 1, error: 'sandbox already killed' };
     const fileName = codeFile(opts?.language);
     const file = path.join(this.dir, fileName);
     await writeFile(file, code);
     const cmd = codeCommand(opts?.language, file);
-    return runProcess(cmd.command, cmd.args, { cwd: this.dir });
+    return runProcess(cmd.command, cmd.args, { cwd: this.dir, onOutput: opts?.onOutput });
   }
 
-  async runCommand(command: string, opts?: { timeoutMs?: number }): Promise<ExecResult> {
+  async runCommand(command: string, opts?: RunCommandOpts): Promise<ExecResult> {
     if (this.killed) return { stdout: '', stderr: '', exitCode: 1, error: 'sandbox already killed' };
-    return runProcess('bash', ['-lc', command], { cwd: this.dir, timeoutMs: opts?.timeoutMs });
+    return runProcess('bash', ['-lc', command], { cwd: this.dir, timeoutMs: opts?.timeoutMs, onOutput: opts?.onOutput });
   }
 
   async setTimeout(_ms: number): Promise<void> {

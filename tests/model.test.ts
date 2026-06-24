@@ -30,6 +30,30 @@ describe('toAnthropicMessages', () => {
     expect(trBlocks[0]).toMatchObject({ type: 'tool_result', tool_use_id: 'c1' });
   });
 
+  it('replays thinking blocks first with signature so tool-use turns do not 400', () => {
+    const out = toAnthropicMessages([
+      {
+        role: 'assistant',
+        text: 'checking',
+        thinkingBlocks: [{ thinking: 'reasoning…', signature: 'sig-abc' }],
+        toolCalls: [{ id: 'c1', name: 'echo', args: {} }],
+      },
+    ]);
+    const blocks = out[0].content as Array<{ type: string; signature?: string }>;
+    // 思考块必须在最前，且带回签名
+    expect(blocks[0]).toEqual({ type: 'thinking', thinking: 'reasoning…', signature: 'sig-abc' });
+    expect(blocks[1]).toMatchObject({ type: 'text' });
+    expect(blocks[2]).toMatchObject({ type: 'tool_use' });
+  });
+
+  it('drops thinking blocks lacking a signature (cannot be replayed)', () => {
+    const out = toAnthropicMessages([
+      { role: 'assistant', text: 'hi', thinkingBlocks: [{ thinking: 'x', signature: '' }] },
+    ]);
+    const blocks = out[0].content as Array<{ type: string }>;
+    expect(blocks.every((b) => b.type !== 'thinking')).toBe(true);
+  });
+
   it('maps tool image results to Anthropic image content blocks', () => {
     const out = toAnthropicMessages([
       {

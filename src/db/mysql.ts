@@ -83,12 +83,16 @@ function parseLlmSettings(value: unknown): LlmSettings | undefined {
   ) {
     return undefined;
   }
+  const efforts = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
   return {
     id: o.id,
     protocol: o.protocol,
     baseURL: o.baseURL,
     apiKey: o.apiKey,
     model: o.model,
+    ...(typeof o.effort === 'string' && efforts.includes(o.effort)
+      ? { effort: o.effort as LlmSettings['effort'] }
+      : {}),
   };
 }
 

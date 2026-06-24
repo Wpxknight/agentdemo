@@ -5,6 +5,8 @@ export const ModelConfigSchema = z.object({
   baseURL: z.string(),
   apiKey: z.string(),
   model: z.string(),
+  /** 推理深度：none 关闭思考；low..max 对应 Anthropic effort；缺省=思考开启走模型默认深度。 */
+  effort: z.enum(['none', 'low', 'medium', 'high', 'xhigh', 'max']).optional(),
 });
 
 export const McpServerSchema = z.object({

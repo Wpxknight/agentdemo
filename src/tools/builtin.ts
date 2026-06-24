@@ -68,7 +68,7 @@ export function buildSandboxTools(
         const code = reqString(o, 'code');
         const language = typeof o.language === 'string' ? o.language : undefined;
         const sbx = await manager.get(resolveSpec(resolve, ctx));
-        return formatExec(await sbx.runCode(code, { language }));
+        return formatExec(await sbx.runCode(code, { language, onOutput: ctx.onOutput }));
       },
     },
     {
@@ -87,7 +87,7 @@ export function buildSandboxTools(
         const o = asObject(args);
         const command = reqString(o, 'command');
         const sbx = await manager.get(resolveSpec(resolve, ctx));
-        return formatExec(await sbx.runCommand(command));
+        return formatExec(await sbx.runCommand(command, { onOutput: ctx.onOutput }));
       },
     },
   ];

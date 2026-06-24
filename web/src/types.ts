@@ -64,6 +64,8 @@ export interface SandboxSummary {
   actions?: string[];
 }
 
+export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
 export interface RuntimeModelConfig {
   id: string;
   protocol: 'anthropic' | 'openai';
@@ -72,6 +74,8 @@ export interface RuntimeModelConfig {
   api_key: string;
   api_key_set: boolean;
   api_key_preview: string;
+  /** 推理深度（none 关闭思考；仅 Anthropic 协议生效）。 */
+  effort?: ReasoningEffort;
   options?: RuntimeModelConfig[];
 }
 
@@ -83,11 +87,19 @@ export interface Attachment {
   data: string;
 }
 
+export interface TaskStep {
+  id: string;
+  label: string;
+  status: 'running' | 'done' | 'error';
+}
+
 export interface ChatMessage {
   id?: string;
   role: Role;
   text: string;
   thinking?: string;
+  /** 任务执行进度：每个工具调用一步，实时标记完成/失败。 */
+  steps?: TaskStep[];
   running?: boolean;
   time: string;
   tools?: string[];

@@ -8,6 +8,8 @@ export interface LlmSettings {
   baseURL: string;
   apiKey: string;
   model: string;
+  /** 推理深度：none 关闭思考；low..max 对应 Anthropic effort；缺省=思考开启走模型默认深度。 */
+  effort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 }
 
 /** 审计查询过滤（租户由 ctx 强制限定）。 */

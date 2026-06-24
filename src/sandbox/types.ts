@@ -36,13 +36,34 @@ export interface SandboxSpec {
   envs?: Record<string, string>;
 }
 
+/** 沙箱执行过程中的实时输出分片（用于前端终端预览）。 */
+export interface OutputChunk {
+  stream: 'stdout' | 'stderr';
+  text: string;
+}
+
+/** 实时输出回调：执行期逐段回传 stdout/stderr。 */
+export type OutputSink = (chunk: OutputChunk) => void;
+
+export interface RunCodeOpts {
+  language?: string;
+  /** 提供时逐段回传 stdout/stderr（流式预览）；不影响最终 ExecResult。 */
+  onOutput?: OutputSink;
+}
+
+export interface RunCommandOpts {
+  timeoutMs?: number;
+  /** 提供时逐段回传 stdout/stderr（流式预览）；不影响最终 ExecResult。 */
+  onOutput?: OutputSink;
+}
+
 /** 一个已就绪沙箱的统一句柄。 */
 export interface SandboxHandle {
   readonly sandboxId: string;
   /** 在沙箱里执行代码（默认 python）。 */
-  runCode(code: string, opts?: { language?: string }): Promise<ExecResult>;
+  runCode(code: string, opts?: RunCodeOpts): Promise<ExecResult>;
   /** 在沙箱里执行 shell 命令。 */
-  runCommand(command: string, opts?: { timeoutMs?: number }): Promise<ExecResult>;
+  runCommand(command: string, opts?: RunCommandOpts): Promise<ExecResult>;
   /** 续命，防止被回收。 */
   setTimeout(ms: number): Promise<void>;
   /** 销毁沙箱。 */

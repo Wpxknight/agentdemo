@@ -59,6 +59,26 @@ describe('runAgent', () => {
     ]);
   });
 
+  it('emits tool_result per tool call for live progress', async () => {
+    const tools = new ToolRegistry();
+    tools.register({
+      def: { name: 'echo', description: 'echo', inputSchema: { type: 'object' } },
+      run: async () => ({ id: '', content: 'ok' }),
+    });
+    const seen: StreamEvent[] = [];
+
+    await runAgent({
+      model: mockModel(),
+      tools,
+      policy: new AllowAllPolicy(),
+      ctx: { sessionId: 't1' },
+      task: 'go',
+      onEvent: (event) => seen.push(event),
+    });
+
+    expect(seen).toContainEqual({ type: 'tool_result', toolId: 'c1', name: 'echo', isError: false });
+  });
+
   it('accumulates usage across turns', async () => {
     const model: ChatModel = {
       id: 'm',

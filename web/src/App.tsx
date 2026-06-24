@@ -44,6 +44,7 @@ import type {
   ChatMessage,
   ModelSettingsBody,
   PageId,
+  ReasoningEffort,
   Role,
   RuntimeModelConfig,
   SandboxSummary,
@@ -57,6 +58,7 @@ import type {
   SessionMessagesBody,
   SessionSummary,
   SessionsBody,
+  TaskStep,
   ToolCallBody,
   ToolSummary,
   ToolsBody,
@@ -221,6 +223,49 @@ function parseSse(block: string): { event?: string; data?: Record<string, unknow
   }
 }
 
+/** 把沙箱 / kubectl 工具调用还原成可读的命令行；非这类工具返回 null。 */
+function sandboxCommandLine(call: unknown): string | null {
+  if (!call || typeof call !== 'object') return null;
+  const { name, args } = call as { name?: string; args?: Record<string, unknown> };
+  const a = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>;
+  if (name === 'sbx__run_command') return typeof a.command === 'string' ? a.command : null;
+  if (name === 'sbx__run_code') {
+    const lang = typeof a.language === 'string' ? a.language : 'python';
+    return typeof a.code === 'string' ? `[${lang}]\n${a.code}` : null;
+  }
+  if (name === 'kubectl') {
+    const argv = Array.isArray(a.args) ? a.args.join(' ') : '';
+    const cluster = typeof a.cluster === 'string' ? `   # cluster=${a.cluster}` : '';
+    return `kubectl ${argv}${cluster}`;
+  }
+  return null;
+}
+
+/** 工具调用 → 任务进度条目的可读标签。 */
+function stepLabel(call: unknown): string {
+  if (!call || typeof call !== 'object') return '执行工具';
+  const { name, args } = call as { name?: string; args?: Record<string, unknown> };
+  const a = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>;
+  if (name === 'sbx__run_command') {
+    const cmd = typeof a.command === 'string' ? a.command : '';
+    return `执行命令：${truncate(cmd, 60)}`;
+  }
+  if (name === 'sbx__run_code') {
+    const lang = typeof a.language === 'string' ? a.language : 'python';
+    return `运行代码（${lang}）`;
+  }
+  if (name === 'kubectl') {
+    const argv = Array.isArray(a.args) ? a.args.join(' ') : '';
+    return `kubectl ${truncate(argv, 60)}`;
+  }
+  return `调用工具：${toolDisplayName(name)}`;
+}
+
+function truncate(text: string, max: number): string {
+  const oneLine = text.replace(/\s+/g, ' ').trim();
+  return oneLine.length > max ? `${oneLine.slice(0, max)}…` : oneLine;
+}
+
 function formatToolResponse(body: ToolCallBody): string {
   const content = body.result?.content || body.error || '操作完成。';
   const image = body.result?.contentBlocks?.find((block) => block.type === 'image');
@@ -352,6 +397,27 @@ function ThinkingBlock({ content, streaming }: { content: string; streaming?: bo
   );
 }
 
+function TaskProgress({ steps }: { steps: TaskStep[] }) {
+  const done = steps.filter((s) => s.status !== 'running').length;
+  return (
+    <div className="task-progress">
+      <div className="task-progress-head">
+        任务进度 <span className="task-progress-count">{done}/{steps.length}</span>
+      </div>
+      <ul className="task-progress-list">
+        {steps.map((step) => (
+          <li key={step.id} className={`task-step task-${step.status}`}>
+            <span className="task-step-icon">
+              {step.status === 'done' ? <Check /> : step.status === 'error' ? <X /> : <span className="task-spinner" />}
+            </span>
+            <span className="task-step-label">{step.label}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 const markdownComponents: Components = {
   pre({ children }) {
     return <>{children}</>;
@@ -411,6 +477,7 @@ function MessageContent({ message }: { message: ChatMessage }) {
       {thinkingSegments.map((segment, index) => (
         <ThinkingBlock key={`thinking-${index}`} content={segment.content} streaming={segment.streaming} />
       ))}
+      {message.steps?.length ? <TaskProgress steps={message.steps} /> : null}
       {textSegments.map((segment, index) => (
         <Fragment key={`text-${index}`}>
           {message.role === 'assistant'
@@ -680,6 +747,18 @@ export default function App() {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    // 沙箱执行过程汇入右侧面板终端：首个沙箱事件出现时才清空旧内容，
+    // 避免无沙箱调用的对话误清手动运行的输出。
+    let terminalBuffer = '';
+    let terminalStarted = false;
+    const pushTerminal = (chunk: string) => {
+      if (!terminalStarted) {
+        terminalStarted = true;
+        terminalBuffer = '';
+      }
+      terminalBuffer += chunk;
+      setSandboxOutput(terminalBuffer);
+    };
     try {
       while (true) {
         const { done, value } = await reader.read();
@@ -695,6 +774,26 @@ export default function App() {
           }
           if (event?.event === 'text_delta' && typeof event.data?.text === 'string') {
             assistant.text += event.data.text;
+            publishAssistant();
+          }
+          if (event?.event === 'tool_call' && event.data?.call) {
+            const call = event.data.call as { id?: string };
+            if (typeof call.id === 'string') {
+              const step: TaskStep = { id: call.id, label: stepLabel(event.data.call), status: 'running' };
+              assistant.steps = [...(assistant.steps || []), step];
+              publishAssistant();
+            }
+            // 仅沙箱/kubectl 工具的命令进右侧终端面板
+            const line = sandboxCommandLine(event.data.call);
+            if (line) pushTerminal(`${terminalStarted ? '\n' : ''}$ ${line}\n`);
+          }
+          if (event?.event === 'tool_output' && typeof event.data?.text === 'string') {
+            pushTerminal(event.data.text);
+          }
+          if (event?.event === 'tool_result' && typeof event.data?.toolId === 'string') {
+            const toolId = event.data.toolId;
+            const status: TaskStep['status'] = event.data.isError === true ? 'error' : 'done';
+            assistant.steps = (assistant.steps || []).map((s) => (s.id === toolId ? { ...s, status } : s));
             publishAssistant();
           }
           if (event?.event === 'error') {
@@ -714,6 +813,10 @@ export default function App() {
         ? `${assistant.text}\n\n连接中断：${formatError(err)}`
         : `连接中断：${formatError(err)}`;
     } finally {
+      // 运行结束：未收到结果的步骤（连接中断等）标记为失败，避免一直转圈。
+      if (assistant.steps?.some((s) => s.status === 'running')) {
+        assistant.steps = assistant.steps.map((s) => (s.status === 'running' ? { ...s, status: 'error' } : s));
+      }
       Object.assign(assistant, { running: false });
       publishAssistant();
       setRunningAgentCount((current) => Math.max(0, current - 1));
@@ -1470,6 +1573,12 @@ function PrototypeSandboxPanel(props: {
 }
 
 function PrototypeTerminal({ output }: { output: string }) {
+  const preRef = useRef<HTMLPreElement>(null);
+  // 实时输出时自动滚到底部，像终端一样跟随最新内容。
+  useEffect(() => {
+    const el = preRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [output]);
   return (
     <div className="prototype-terminal">
       <div>
@@ -1478,7 +1587,7 @@ function PrototypeTerminal({ output }: { output: string }) {
           输出
         </span>
       </div>
-      <pre>{output || '沙箱输出会显示在这里。'}</pre>
+      <pre ref={preRef}>{output || '沙箱输出会显示在这里。'}</pre>
     </div>
   );
 }
@@ -1516,9 +1625,9 @@ function ChatWorkbench(props: {
       {props.historyOpen && <SessionHistory sessions={props.sessions} onCollapse={props.onToggleHistory} />}
       <section className="chat-panel">
         <div className="panel-header">
-          <div>
+          <div className="page-heading">
             <h1>AI 运维助手</h1>
-            <p>查询集群、分析告警、执行变更和管理沙箱。</p>
+            <p className="page-subtitle">查询集群、分析告警、执行变更和管理沙箱。</p>
           </div>
           <div className="header-actions">
             <Button variant="outline" size="icon" title="切换会话列表" onClick={props.onToggleHistory}>
@@ -1951,8 +2060,9 @@ function SkillsPage({ tools, api, onImported }: {
   return (
     <section className="skills-page">
       <div className="skills-page-header">
-        <div>
+        <div className="page-heading">
           <h1>技能管理</h1>
+          <p className="page-subtitle">管理本地与导入的 Skill，供 AI 调用</p>
         </div>
         <input
           ref={importInputRef}
@@ -2103,7 +2213,7 @@ function McpPage({ tools, output, onTest }: { tools: ToolSummary[]; output: stri
   }, [selected.tools, tool]);
 
   return (
-    <ManagementPage title="MCP" actionLabel="新增 MCP">
+    <ManagementPage title="MCP" desc="接入 MCP Server，扩展 AI 可用的工具" actionLabel="新增 MCP">
       <DataTable headers={['名称', '传输协议', '状态', '工具数', '最近心跳']} rows={serverRows} />
       <DetailPanel title={selected.name} status={selected.status} icon={<Boxes />}>
         <h3>连接配置</h3>
@@ -2137,11 +2247,11 @@ function buildMcpServers(tools: ToolSummary[]) {
   return [...servers.values()];
 }
 
-function ManagementPage({ title, actionLabel, children }: { title: string; actionLabel: string; children: React.ReactNode }) {
+function ManagementPage({ title, desc, actionLabel, children }: { title: string; desc?: string; actionLabel: string; children: React.ReactNode }) {
   const content = Array.isArray(children) ? children : [children];
   return (
     <>
-      <PageTitle title={title} />
+      <PageTitle title={title} desc={desc} />
       <div className="toolbar">
         <label className="search-box"><Search /><Input placeholder={`搜索${title}`} /></label>
         <Button variant="outline">全部</Button>
@@ -2175,7 +2285,7 @@ function SchedulePage({ tasks }: { tasks: ScheduledTask[] }) {
   const selected = tasks[0] || fallbackTasks[0];
   return (
     <>
-      <PageTitle title="定时任务" />
+      <PageTitle title="定时任务" desc="按 cron 周期自动执行的运维任务" />
       <Card className="create-task">
         <CardContent className="task-create-grid">
           <Label>创建任务<Textarea placeholder="描述你要定时执行的任务..." /></Label>
@@ -2203,7 +2313,7 @@ function SandboxPage({ sandboxes }: { sandboxes: SandboxSummary[] }) {
   const selected = sandboxes[0] || fallbackSandboxes[0];
   return (
     <>
-      <PageTitle title="沙箱环境" />
+      <PageTitle title="沙箱环境" desc="隔离的代码 / 命令执行环境" />
       <div className="toolbar">
         <Badge variant="secondary"><CheckCircle2 />运行中</Badge>
         <label className="search-box"><Search /><Input placeholder="搜索沙箱" /></label>
@@ -2233,11 +2343,11 @@ function SettingsPage({ llm, status, api, onLlmChange, onStatus }: {
   onLlmChange: (next: RuntimeModelConfig) => void;
   onStatus: (next: string) => void;
 }) {
-  const [form, setForm] = useState(() => ({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '' }));
+  const [form, setForm] = useState(() => ({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', effort: llm.effort || 'medium' }));
 
   useEffect(() => {
-    setForm({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '' });
-  }, [llm.api_key, llm.base_url, llm.model, llm.protocol]);
+    setForm({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', effort: llm.effort || 'medium' });
+  }, [llm.api_key, llm.base_url, llm.model, llm.protocol, llm.effort]);
 
   async function save() {
     onStatus('正在保存配置...');
@@ -2263,7 +2373,7 @@ function SettingsPage({ llm, status, api, onLlmChange, onStatus }: {
 
   return (
     <>
-      <PageTitle title="设置" />
+      <PageTitle title="设置" desc="模型与运行时配置" />
       <div className="settings-layout">
         <Card>
           <CardHeader>
@@ -2275,6 +2385,8 @@ function SettingsPage({ llm, status, api, onLlmChange, onStatus }: {
             <Label>Base URL<Input value={form.base_url} onChange={(event) => setForm((current) => ({ ...current, base_url: event.target.value }))} /></Label>
             <Label>API Key<Input placeholder="输入 API Key" value={form.api_key} onChange={(event) => setForm((current) => ({ ...current, api_key: event.target.value }))} /></Label>
             <Label>Model<Input value={form.model} onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))} /></Label>
+            <Label>推理深度<Select value={form.effort} onValueChange={(effort) => setForm((current) => ({ ...current, effort: effort as ReasoningEffort }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="none">none（关闭思考）</SelectItem><SelectItem value="low">low</SelectItem><SelectItem value="medium">medium</SelectItem><SelectItem value="high">high</SelectItem><SelectItem value="xhigh">xhigh</SelectItem><SelectItem value="max">max</SelectItem></SelectGroup></SelectContent></Select></Label>
+            {form.protocol === 'openai' ? <div className="settings-hint">推理深度仅对 Anthropic 协议生效</div> : null}
             {status ? <div className="settings-status">{status}</div> : null}
             <div className="form-actions">
               <Button variant="outline" type="button" onClick={() => void test()}>测试连接</Button>
@@ -2328,10 +2440,11 @@ function formatCell(cell: string) {
   return cell;
 }
 
-function PageTitle({ title }: { title: string }) {
+function PageTitle({ title, desc }: { title: string; desc?: string }) {
   return (
     <div className="page-title">
       <h1>{title}</h1>
+      {desc ? <p className="page-subtitle">{desc}</p> : null}
     </div>
   );
 }

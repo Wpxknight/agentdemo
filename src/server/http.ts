@@ -135,6 +135,7 @@ function publicModelConfig(config: RuntimeModelConfig): Record<string, unknown> 
     api_key: config.apiKey,
     api_key_set: Boolean(config.apiKey),
     api_key_preview: maskApiKey(config.apiKey),
+    effort: config.effort,
   };
 }
 
@@ -171,7 +172,15 @@ function modelConfigFromBody(
   if (!baseURL) throw new HttpError(400, 'base_url 必填');
   if (!apiKey) throw new HttpError(400, 'api_key 必填');
   if (!model) throw new HttpError(400, 'model 必填');
-  return { id: id || model, protocol, baseURL, apiKey, model };
+  return { id: id || model, protocol, baseURL, apiKey, model, effort: parseEffort(str(body, 'effort'), current.effort) };
+}
+
+const EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+
+/** 解析推理深度；缺省/非法保留当前值。 */
+function parseEffort(value: string | undefined, current: RuntimeModelConfig['effort']): RuntimeModelConfig['effort'] {
+  if (value === undefined) return current;
+  return (EFFORTS as readonly string[]).includes(value) ? (value as RuntimeModelConfig['effort']) : current;
 }
 
 function sessionIdFromBody(body: Record<string, unknown>): string {

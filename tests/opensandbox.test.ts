@@ -80,7 +80,7 @@ describe('OpenSandboxProvider', () => {
     const r = await handle.runCommand('echo hello', { timeoutMs: 5_000 });
     expect(r.stdout).toBe('hello');
     expect(r.exitCode).toBe(0);
-    expect(h.run).toHaveBeenCalledWith('echo hello', { timeoutSeconds: 5 });
+    expect(h.run).toHaveBeenCalledWith('echo hello', { timeoutSeconds: 5 }, undefined);
   });
 
   it('runCommand surfaces execution error', async () => {
@@ -98,7 +98,23 @@ describe('OpenSandboxProvider', () => {
     const handle = await p.create({ key: 'k' });
     await handle.runCode('print(1+1)', { language: 'python' });
     const b64 = Buffer.from('print(1+1)', 'utf8').toString('base64');
-    expect(h.run).toHaveBeenCalledWith(`echo ${b64} | base64 -d | python3`);
+    expect(h.run).toHaveBeenCalledWith(`echo ${b64} | base64 -d | python3`, undefined, undefined);
+  });
+
+  it('runCommand forwards stdout/stderr to onOutput via SDK handlers', async () => {
+    h.run.mockImplementation(async (_cmd: string, _opts: unknown, handlers: any) => {
+      handlers?.onStdout?.({ text: 'out-line', timestamp: 0 });
+      handlers?.onStderr?.({ text: 'err-line', timestamp: 0 });
+      return exec('out-line');
+    });
+    const p = new OpenSandboxProvider();
+    const handle = await p.create({ key: 'k' });
+    const chunks: Array<{ stream: string; text: string }> = [];
+    await handle.runCommand('echo hi', { onOutput: (c) => chunks.push(c) });
+    expect(chunks).toEqual([
+      { stream: 'stdout', text: 'out-line' },
+      { stream: 'stderr', text: 'err-line' },
+    ]);
   });
 
   it('runCode picks node for javascript', async () => {

@@ -5,7 +5,10 @@
       "protocol": "anthropic",
       "baseURL": "https://api.anthropic.com",
       "apiKey": "${ANTHROPIC_API_KEY}",
-      "model": "claude-opus-4-8"
+      "model": "claude-opus-4-8",
+      // 推理深度：none 关闭思考；low|medium|high|xhigh|max 对应 Anthropic effort。
+      // 缺省=思考开启走模型默认深度。也可在设置页调整。仅 anthropic 协议生效。
+      "effort": "medium"
     },
     "my-gpt": {
       "protocol": "openai",

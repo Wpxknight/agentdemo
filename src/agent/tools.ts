@@ -1,5 +1,6 @@
 import type { JsonValue, ToolCall, ToolDef, ToolResult } from '../model/types.js';
 import type { RequestContext, Role } from '../auth/types.js';
+import type { OutputSink } from '../sandbox/types.js';
 
 /** 工具执行时可用的运行上下文（含租户身份，用于隔离与鉴权）。 */
 export interface ToolContext {
@@ -7,6 +8,8 @@ export interface ToolContext {
   tenantId?: string;
   userId?: string;
   role?: Role;
+  /** 实时输出回调：工具执行期把 stdout/stderr 分片回传（由 agent loop 注入，按工具调用归集）。 */
+  onOutput?: OutputSink;
   [key: string]: unknown;
 }
 

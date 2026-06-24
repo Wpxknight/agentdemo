@@ -1,6 +1,14 @@
 import { Sandbox } from '@alibaba-group/opensandbox';
-import type { ConnectionConfigOptions, Execution } from '@alibaba-group/opensandbox';
-import type { ExecResult, SandboxHandle, SandboxProvider, SandboxSpec } from './types.js';
+import type { ConnectionConfigOptions, Execution, ExecutionHandlers } from '@alibaba-group/opensandbox';
+import type {
+  ExecResult,
+  OutputSink,
+  RunCodeOpts,
+  RunCommandOpts,
+  SandboxHandle,
+  SandboxProvider,
+  SandboxSpec,
+} from './types.js';
 
 /**
  * OpenSandbox（阿里开源沙箱）后端：通过 @alibaba-group/opensandbox SDK
@@ -29,6 +37,15 @@ const INTERPRETERS: Record<string, string> = {
   bash: 'bash', sh: 'sh', shell: 'bash',
 };
 
+/** 把统一的 OutputSink 适配为 SDK 的 ExecutionHandlers（onStdout/onStderr 流式回调）。 */
+function streamHandlers(onOutput?: OutputSink): ExecutionHandlers | undefined {
+  if (!onOutput) return undefined;
+  return {
+    onStdout: (m) => onOutput({ stream: 'stdout', text: m.text }),
+    onStderr: (m) => onOutput({ stream: 'stderr', text: m.text }),
+  };
+}
+
 function toExecResult(exec: Execution): ExecResult {
   return {
     stdout: exec.logs.stdout.map((m) => m.text).join(''),
@@ -46,18 +63,24 @@ class OpenSandboxHandle implements SandboxHandle {
     return this.sbx.id;
   }
 
-  async runCode(code: string, opts?: { language?: string }): Promise<ExecResult> {
+  async runCode(code: string, opts?: RunCodeOpts): Promise<ExecResult> {
     const interp = INTERPRETERS[(opts?.language ?? 'python').toLowerCase()] ?? 'python3';
     // 源码 base64 后经管道喂给解释器 stdin，规避引号 / 换行转义问题
     const b64 = Buffer.from(code, 'utf8').toString('base64');
-    const exec = await this.sbx.commands.run(`echo ${b64} | base64 -d | ${interp}`);
+    const exec = await this.sbx.commands.run(
+      `echo ${b64} | base64 -d | ${interp}`,
+      undefined,
+      streamHandlers(opts?.onOutput),
+    );
     return toExecResult(exec);
   }
 
-  async runCommand(command: string, opts?: { timeoutMs?: number }): Promise<ExecResult> {
-    const exec = await this.sbx.commands.run(command, {
-      timeoutSeconds: opts?.timeoutMs ? Math.ceil(opts.timeoutMs / 1000) : undefined,
-    });
+  async runCommand(command: string, opts?: RunCommandOpts): Promise<ExecResult> {
+    const exec = await this.sbx.commands.run(
+      command,
+      { timeoutSeconds: opts?.timeoutMs ? Math.ceil(opts.timeoutMs / 1000) : undefined },
+      streamHandlers(opts?.onOutput),
+    );
     return toExecResult(exec);
   }
 

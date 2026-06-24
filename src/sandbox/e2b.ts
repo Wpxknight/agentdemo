@@ -1,5 +1,12 @@
 import { Sandbox } from '@e2b/code-interpreter';
-import type { ExecResult, SandboxHandle, SandboxProvider, SandboxSpec } from './types.js';
+import type {
+  ExecResult,
+  RunCodeOpts,
+  RunCommandOpts,
+  SandboxHandle,
+  SandboxProvider,
+  SandboxSpec,
+} from './types.js';
 
 export interface E2bProviderOptions {
   /** E2B API key；缺省读 E2B_API_KEY 环境变量。 */
@@ -25,9 +32,12 @@ class E2bHandle implements SandboxHandle {
     return this.sbx.sandboxId;
   }
 
-  async runCode(code: string, opts?: { language?: string }): Promise<ExecResult> {
+  async runCode(code: string, opts?: RunCodeOpts): Promise<ExecResult> {
+    const onOutput = opts?.onOutput;
     const exec = await this.sbx.runCode(code, {
       language: opts?.language as never,
+      onStdout: onOutput ? (m) => onOutput({ stream: 'stdout', text: m.line }) : undefined,
+      onStderr: onOutput ? (m) => onOutput({ stream: 'stderr', text: m.line }) : undefined,
     });
     return {
       stdout: exec.logs.stdout.join(''),
@@ -36,9 +46,12 @@ class E2bHandle implements SandboxHandle {
     };
   }
 
-  async runCommand(command: string, opts?: { timeoutMs?: number }): Promise<ExecResult> {
+  async runCommand(command: string, opts?: RunCommandOpts): Promise<ExecResult> {
+    const onOutput = opts?.onOutput;
     const res = await this.sbx.commands.run(command, {
       timeoutMs: opts?.timeoutMs,
+      onStdout: onOutput ? (data: string) => onOutput({ stream: 'stdout', text: data }) : undefined,
+      onStderr: onOutput ? (data: string) => onOutput({ stream: 'stderr', text: data }) : undefined,
     });
     return {
       stdout: res.stdout,

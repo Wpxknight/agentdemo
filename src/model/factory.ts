@@ -1,4 +1,4 @@
-import type { ChatModel } from './types.js';
+import type { ChatModel, ReasoningEffort } from './types.js';
 import { AnthropicModel } from './anthropic.js';
 import { OpenAIModel } from './openai.js';
 
@@ -7,6 +7,8 @@ export interface ModelConfig {
   baseURL: string;
   apiKey: string;
   model: string;
+  /** 推理深度：none 关闭思考；low..max 对应 Anthropic effort。缺省=思考开启走模型默认深度。 */
+  effort?: ReasoningEffort;
 }
 
 /** 按配置创建模型实例（自定义 baseURL/apiKey + 协议）。 */

@@ -84,7 +84,7 @@ export function buildKubectlTool(opts: KubectlToolOptions): ToolHandler {
       const command = `kubectl ${finalArgs.map(shellQuote).join(' ')}`;
 
       const sbx = await opts.sandboxes.get(specFor(ctx.sessionId, info));
-      const res = await sbx.runCommand(command);
+      const res = await sbx.runCommand(command, { onOutput: ctx.onOutput });
 
       await audit.record({
         kind: 'kubectl',

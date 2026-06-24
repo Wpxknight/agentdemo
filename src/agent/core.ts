@@ -1,4 +1,4 @@
-import type { ChatModel, Msg, StreamEvent, ToolCall } from '../model/types.js';
+import type { ChatModel, Msg, StreamEvent, ToolCall, ToolResult } from '../model/types.js';
 import type { PolicyMiddleware } from './policy.js';
 import type { ToolContext, ToolRegistry } from './tools.js';
 import type { ApprovalGate } from './approval.js';
@@ -52,6 +52,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     let text = '';
     let thinking = '';
     const calls: ToolCall[] = [];
+    const thinkingBlocks: { thinking: string; signature: string }[] = [];
 
     for await (const ev of opts.model.stream({
       system,
@@ -60,6 +61,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     })) {
       opts.onEvent?.(ev);
       if (ev.type === 'thinking_delta') thinking += ev.text;
+      else if (ev.type === 'thinking_block') thinkingBlocks.push({ thinking: ev.thinking, signature: ev.signature });
       else if (ev.type === 'text_delta') text += ev.text;
       else if (ev.type === 'tool_call') calls.push(ev.call);
       else if (ev.type === 'usage') {
@@ -73,6 +75,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
       role: 'assistant',
       text,
       thinking: thinking || undefined,
+      thinkingBlocks: thinkingBlocks.length ? thinkingBlocks : undefined,
       toolCalls: calls.length ? calls : undefined,
     });
 
@@ -80,27 +83,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
 
     const results = await Promise.all(
       calls.map(async (call) => {
-        const decision = await opts.policy.check(call, opts.ctx);
-        if (decision.blocked) {
-          return {
-            id: call.id,
-            content: `blocked by policy: ${decision.reason ?? 'denied'}`,
-            isError: true,
-          };
-        }
-        if (decision.needApproval) {
-          const approved = opts.approval
-            ? await opts.approval.request({ call, reason: decision.reason, ctx: opts.ctx })
-            : false;
-          if (!approved) {
-            return {
-              id: call.id,
-              content: `needs approval (denied): ${decision.reason ?? '该操作需要审批后才能执行'}`,
-              isError: true,
-            };
-          }
-        }
-        return opts.tools.dispatch(call, opts.ctx);
+        const result = await runOneCall(call, opts);
+        // 工具完成即发事件，供前端实时标记该步完成/失败（并行调用各自完成各自上报）。
+        opts.onEvent?.({ type: 'tool_result', toolId: call.id, name: call.name, isError: Boolean(result.isError) });
+        return result;
       }),
     );
 
@@ -108,4 +94,34 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
   }
 
   return { messages, text: lastText, steps, usage };
+}
+
+/** 执行单个工具调用：Policy 校验 → 审批 → dispatch；返回回填给模型的 ToolResult。 */
+async function runOneCall(call: ToolCall, opts: RunAgentOptions): Promise<ToolResult> {
+  const decision = await opts.policy.check(call, opts.ctx);
+  if (decision.blocked) {
+    return { id: call.id, content: `blocked by policy: ${decision.reason ?? 'denied'}`, isError: true };
+  }
+  if (decision.needApproval) {
+    const approved = opts.approval
+      ? await opts.approval.request({ call, reason: decision.reason, ctx: opts.ctx })
+      : false;
+    if (!approved) {
+      return {
+        id: call.id,
+        content: `needs approval (denied): ${decision.reason ?? '该操作需要审批后才能执行'}`,
+        isError: true,
+      };
+    }
+  }
+  // 为每个工具调用派生独立 ctx，注入按 call.id 归集的实时输出回调，
+  // 供沙箱 stdout/stderr 流式回传到前端（不污染共享 opts.ctx，避免并发串台）。
+  const callCtx: ToolContext = opts.onEvent
+    ? {
+        ...opts.ctx,
+        onOutput: ({ stream, text }) =>
+          opts.onEvent?.({ type: 'tool_output', toolId: call.id, stream, text }),
+      }
+    : opts.ctx;
+  return opts.tools.dispatch(call, callCtx);
 }
