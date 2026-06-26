@@ -230,6 +230,30 @@ describe('frontend API wiring', () => {
     expect(app).toContain('`/v1/sessions/${encodeURIComponent(sessionId)}/terminate`');
   });
 
+  it('shows sandbox output as structured terminal entries and keeps the code runner collapsed', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(app).toContain('<details className="prototype-code-card"');
+    expect(app).toContain('<summary>');
+    expect(app).toContain('function parseSandboxOutput');
+    expect(app).toContain("kind: 'command'");
+    expect(app).toContain("kind = 'stderr'");
+    expect(app).toContain("kind = 'error'");
+    expect(app).toContain('sandbox-output-line command');
+    expect(app).toContain('sandboxOutputCommand');
+    expect(app).toContain('terminalStats');
+    expect(app).toContain('prototype-terminal-empty');
+    expect(css).toContain('.sandbox-output-line.command');
+    expect(css).toContain('.sandbox-output-line.stderr');
+    expect(css).toContain('.sandbox-output-line.error');
+    expect(css).toContain('.prototype-terminal-head');
+    expect(css).toContain('display: block;');
+    expect(css).toContain('white-space: pre');
+    expect(css).toContain('overflow-x: auto');
+    expect(css).toContain('.prototype-code-card summary');
+  });
+
   it('supports paginated and deletable session history without blocking chat input during runs', async () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
     const css = await readFile('web/src/index.css', 'utf8');

@@ -91,6 +91,27 @@ const logoUrl = '/assets/logo.jpg';
 const aiAvatarUrl = logoUrl;
 const userAvatarUrl = '/assets/user-avatar.jpg';
 const SESSION_PAGE_SIZE = 20;
+type SandboxOutputKind = 'command' | 'stdout' | 'stderr' | 'error';
+
+interface SandboxOutputEntry {
+  id: string;
+  kind: SandboxOutputKind;
+  text: string;
+}
+
+const sandboxOutputClassNames: Record<SandboxOutputKind, string> = {
+  command: 'sandbox-output-line command',
+  stdout: 'sandbox-output-line stdout',
+  stderr: 'sandbox-output-line stderr',
+  error: 'sandbox-output-line error',
+};
+
+const sandboxOutputLabels: Record<SandboxOutputKind, string> = {
+  command: 'cmd',
+  stdout: 'out',
+  stderr: 'err',
+  error: 'fail',
+};
 
 function sessionCategoryFor(session: SessionSummary) {
   const text = `${session.title} ${session.desc}`.toLowerCase();
@@ -232,7 +253,7 @@ function sandboxCommandLine(call: unknown): string | null {
   if (name === 'sbx__run_command') return typeof a.command === 'string' ? a.command : null;
   if (name === 'sbx__run_code') {
     const lang = typeof a.language === 'string' ? a.language : 'python';
-    return typeof a.code === 'string' ? `[${lang}]\n${a.code}` : null;
+    return typeof a.code === 'string' ? sandboxOutputCommand(lang, a.code) : null;
   }
   if (name === 'kubectl') {
     const argv = Array.isArray(a.args) ? a.args.join(' ') : '';
@@ -240,6 +261,10 @@ function sandboxCommandLine(call: unknown): string | null {
     return `kubectl ${argv}${cluster}`;
   }
   return null;
+}
+
+function sandboxOutputCommand(language: string, code: string): string {
+  return `run-code --language ${language} ${truncate(code, 120)}`;
 }
 
 /** 工具调用 → 任务进度条目的可读标签。 */
@@ -271,6 +296,59 @@ function formatToolResponse(body: ToolCallBody): string {
   const content = body.result?.content || body.error || '操作完成。';
   const image = body.result?.contentBlocks?.find((block) => block.type === 'image');
   return image?.data ? `${content}\n[image] ${image.mimeType || 'image/png'} ${image.data.length} bytes base64` : content;
+}
+
+function parseSandboxOutput(output: string): SandboxOutputEntry[] {
+  const lines = output.replace(/\r\n/g, '\n').split('\n');
+  const entries: SandboxOutputEntry[] = [];
+  let kind: SandboxOutputKind = 'stdout';
+  let buffer: string[] = [];
+
+  const flush = () => {
+    if (!buffer.length) return;
+    const text = buffer.join('\n').replace(/\n+$/g, '');
+    if (text) entries.push({ id: `${entries.length}-${kind}`, kind, text });
+    buffer = [];
+  };
+
+  for (const line of lines) {
+    if (line.startsWith('$ ')) {
+      flush();
+      entries.push({ id: `${entries.length}-command`, kind: 'command', text: line.slice(2) });
+      kind = 'stdout';
+      continue;
+    }
+    if (line === '[stderr]' || line.startsWith('[stderr]')) {
+      flush();
+      kind = 'stderr';
+      const rest = line.slice('[stderr]'.length).trim();
+      if (rest) buffer.push(rest);
+      continue;
+    }
+    if (line === '[error]' || line.startsWith('[error]')) {
+      flush();
+      kind = 'error';
+      const rest = line.slice('[error]'.length).trim();
+      if (rest) buffer.push(rest);
+      continue;
+    }
+    if (/^(运行失败|预览获取失败|截图失败|连接中断)/.test(line)) {
+      flush();
+      kind = 'error';
+      buffer.push(line);
+      continue;
+    }
+    buffer.push(line);
+  }
+  flush();
+  return entries;
+}
+
+function terminalStats(output: string): string {
+  if (!output.trim()) return '空';
+  const lineCount = output.replace(/\n$/, '').split('\n').length;
+  const byteCount = new TextEncoder().encode(output).length;
+  return `${lineCount} 行 · ${formatFileSize(byteCount)}`;
 }
 
 function extractUrl(text: string): string {
@@ -521,7 +599,7 @@ export default function App() {
   const [historyOpen, setHistoryOpen] = useState(true);
   const [previewOpen, setPreviewOpen] = useState(true);
   const [previewWidth, setPreviewWidth] = useState(() => clampPreviewWidth(readStorage('aiop_sandbox_width') || 440));
-  const [sandboxOutput, setSandboxOutput] = useState('沙箱输出会显示在这里。');
+  const [sandboxOutput, setSandboxOutput] = useState('');
   const [browserStreamUrl, setBrowserStreamUrl] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [toolTestOutput, setToolTestOutput] = useState('');
@@ -887,35 +965,36 @@ export default function App() {
 
   async function runSandboxCode(code: string, language: string) {
     if (!code.trim()) return;
-    setSandboxOutput('正在沙箱中运行代码...');
+    const command = sandboxOutputCommand(language, code);
+    setSandboxOutput(`$ ${command}\n正在沙箱中运行代码...`);
     try {
       const body = await api.post<ToolCallBody>('/v1/sandbox/run-code', { sessionId, code, language });
-      setSandboxOutput(formatToolResponse(body));
+      setSandboxOutput(`$ ${command}\n${formatToolResponse(body)}`);
     } catch (err) {
-      setSandboxOutput(`运行失败：${formatError(err)}`);
+      setSandboxOutput(`$ ${command}\n[error]\n运行失败：${formatError(err)}`);
     }
   }
 
   async function openBrowserStream() {
-    setSandboxOutput('正在获取浏览器预览...');
+    setSandboxOutput('$ browser stream\n正在获取浏览器预览...');
     try {
       const body = await api.post<ToolCallBody>('/v1/browser/stream', { sessionId });
       const text = formatToolResponse(body);
       const url = extractUrl(text);
       if (url) setBrowserStreamUrl(url);
-      setSandboxOutput(url ? `${text}\n已加载到右侧预览。` : text);
+      setSandboxOutput(url ? `$ browser stream\n${text}\n已加载到右侧预览。` : `$ browser stream\n${text}`);
     } catch (err) {
-      setSandboxOutput(`预览获取失败：${formatError(err)}`);
+      setSandboxOutput(`$ browser stream\n[error]\n预览获取失败：${formatError(err)}`);
     }
   }
 
   async function captureBrowserScreenshot() {
-    setSandboxOutput('正在刷新浏览器截图...');
+    setSandboxOutput('$ browser screenshot\n正在刷新浏览器截图...');
     try {
       const body = await api.post<ToolCallBody>('/v1/browser/screenshot', { sessionId });
-      setSandboxOutput(formatToolResponse(body));
+      setSandboxOutput(`$ browser screenshot\n${formatToolResponse(body)}`);
     } catch (err) {
-      setSandboxOutput(`截图失败：${formatError(err)}`);
+      setSandboxOutput(`$ browser screenshot\n[error]\n截图失败：${formatError(err)}`);
     }
   }
 
@@ -1527,6 +1606,7 @@ function PrototypeSandboxPanel(props: {
   const [activeTab, setActiveTab] = useState<'terminal' | 'vnc' | 'browser'>('terminal');
   const [code, setCode] = useState('print("hello from sandbox")');
   const [language, setLanguage] = useState('python');
+  const [codeOpen, setCodeOpen] = useState(false);
 
   return (
     <aside className="prototype-sandbox-panel">
@@ -1558,31 +1638,43 @@ function PrototypeSandboxPanel(props: {
       <div className="prototype-sandbox-body">
         {activeTab === 'terminal' && (
           <>
-            <div className="prototype-code-card">
-              <div>
+            <details className="prototype-code-card" open={codeOpen} onToggle={(event) => setCodeOpen(event.currentTarget.open)}>
+              <summary>
                 <span>
                   <Code2 />
                   运行代码
                 </span>
-                <Select value={language} onValueChange={setLanguage}>
-                  <SelectTrigger className="prototype-language-select" aria-label="选择语言">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectGroup>
-                      <SelectItem value="python">Python</SelectItem>
-                      <SelectItem value="javascript">JavaScript</SelectItem>
-                      <SelectItem value="bash">Bash</SelectItem>
-                    </SelectGroup>
-                  </SelectContent>
-                </Select>
+                <em>{codeOpen ? '收起' : '展开'}</em>
+              </summary>
+              <div className="prototype-code-card-body">
+                <div className="prototype-code-options">
+                  <span>执行语言</span>
+                  <Select value={language} onValueChange={setLanguage}>
+                    <SelectTrigger className="prototype-language-select" aria-label="选择语言">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        <SelectItem value="python">Python</SelectItem>
+                        <SelectItem value="javascript">JavaScript</SelectItem>
+                        <SelectItem value="bash">Bash</SelectItem>
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <textarea value={code} onChange={(event) => setCode(event.target.value)} spellCheck={false} />
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCodeOpen(false);
+                    props.onRunSandbox(code, language);
+                  }}
+                >
+                  <Play />
+                  运行代码
+                </button>
               </div>
-              <textarea value={code} onChange={(event) => setCode(event.target.value)} spellCheck={false} />
-              <button type="button" onClick={() => props.onRunSandbox(code, language)}>
-                <Play />
-                运行代码
-              </button>
-            </div>
+            </details>
             <PrototypeTerminal output={props.sandboxOutput} />
           </>
         )}
@@ -1628,21 +1720,32 @@ function PrototypeSandboxPanel(props: {
 }
 
 function PrototypeTerminal({ output }: { output: string }) {
-  const preRef = useRef<HTMLPreElement>(null);
+  const outputRef = useRef<HTMLDivElement>(null);
+  const entries = parseSandboxOutput(output);
   // 实时输出时自动滚到底部，像终端一样跟随最新内容。
   useEffect(() => {
-    const el = preRef.current;
+    const el = outputRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [output]);
   return (
     <div className="prototype-terminal">
-      <div>
+      <div className="prototype-terminal-head">
         <span>
           <Check />
           输出
         </span>
+        <small>{terminalStats(output)}</small>
       </div>
-      <pre ref={preRef}>{output || '沙箱输出会显示在这里。'}</pre>
+      <div ref={outputRef} className="prototype-terminal-output">
+        {entries.length ? entries.map((entry) => (
+          <div key={entry.id} className={sandboxOutputClassNames[entry.kind]}>
+            <span>{sandboxOutputLabels[entry.kind]}</span>
+            <code>{entry.kind === 'command' ? `$ ${entry.text}` : entry.text}</code>
+          </div>
+        )) : (
+          <div className="prototype-terminal-empty">暂无沙箱输出。</div>
+        )}
+      </div>
     </div>
   );
 }
@@ -1776,6 +1879,7 @@ function Messages({ messages }: { messages: ChatMessage[] }) {
                       {message.tools.map((tool) => <Badge key={tool} variant="secondary">{tool}</Badge>)}
                     </div>
                   ) : null}
+                  {message.running ? <RunningIndicator /> : null}
                 </div>
                 <time className="message-time">{message.time}</time>
               </div>
@@ -1928,7 +2032,12 @@ function BrowserPreviewPanel(props: {
         </CardContent>
       </Card>
       <div className="terminal">
-        {props.sandboxOutput.split('\n').map((line, index) => <div key={index}>{line || '\u00a0'}</div>)}
+        {parseSandboxOutput(props.sandboxOutput).map((entry) => (
+          <div key={entry.id} className={sandboxOutputClassNames[entry.kind]}>
+            <span>{sandboxOutputLabels[entry.kind]}</span>
+            <code>{entry.kind === 'command' ? `$ ${entry.text}` : entry.text}</code>
+          </div>
+        ))}
       </div>
     </aside>
   );
