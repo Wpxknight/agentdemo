@@ -42,6 +42,7 @@ kubectl apply -f deploy/dev-k8s/aiop-secret.example.yaml
 kubectl apply -f deploy/dev-k8s/mysql.yaml
 kubectl apply -f deploy/dev-k8s/oidc-test.yaml
 kubectl apply -f deploy/dev-k8s/aiop-configmap.yaml
+kubectl apply -f deploy/dev-k8s/aiop-configmap-netdiag.yaml   # optional: ops/netdiag sandbox config
 kubectl apply -f deploy/dev-k8s/aiop-configmap-oidc.yaml
 kubectl apply -f deploy/dev-k8s/aiop-deployment.yaml
 kubectl apply -f deploy/dev-k8s/aiop-service-nodeport.yaml
@@ -152,6 +153,62 @@ kubectl -n opensandbox-system get svc opensandbox-server
 ```
 
 Because the default aiop config uses a placeholder model endpoint, agent-driven sandbox tool calls require a real model endpoint before they can be exercised through `/v1/agent`. The OpenSandbox provider itself is verified by the repository tests and by the existing `deploy/opensandbox/README.md` procedure.
+
+### Switch this dev stack to the ops/netdiag sandbox
+
+For fabric / OVS operations, do not use the browser sandbox image or the readonly `aiop-sandbox`
+template. Build the netdiag image, apply the privileged netdiag template, then switch aiop to the
+netdiag ConfigMap:
+
+```sh
+cp "$(which kubectl)" deploy/opensandbox/kubectl
+docker build -f deploy/opensandbox/Dockerfile.netdiag -t aiop/opensandbox-netdiag:dev .
+
+kubectl apply -f deploy/opensandbox/netdiag-sandbox.yaml
+kubectl apply -f deploy/dev-k8s/aiop-configmap-netdiag.yaml
+
+kubectl rollout restart deployment/opensandbox-server -n opensandbox-system
+kubectl rollout status deployment/opensandbox-server -n opensandbox-system
+kubectl delete pod -n opensandbox --all
+
+kubectl -n aiop-dev patch deploy aiop-server --type=json \
+  -p='[{"op":"replace","path":"/spec/template/spec/volumes/0/configMap/name","value":"aiop-config-netdiag"}]'
+kubectl -n aiop-dev rollout status deploy/aiop-server --timeout=180s
+```
+
+`netdiag-sandbox.yaml` sets the sandbox container `imagePullPolicy` to `IfNotPresent`; with this
+single-node Docker runtime, the locally built `aiop/opensandbox-netdiag:dev` image is used without
+pulling from Docker Hub. Avoid `:latest` for local-only images because Kubernetes defaults it to
+`imagePullPolicy: Always`.
+
+Expected RBAC checks:
+
+```sh
+kubectl auth can-i create pods --subresource=exec -n kube-system \
+  --as=system:serviceaccount:opensandbox:aiop-netdiag
+kubectl auth can-i create pods -n opensandbox \
+  --as=system:serviceaccount:opensandbox:aiop-netdiag
+kubectl auth can-i create daemonsets.apps -n fabric-e2e \
+  --as=system:serviceaccount:opensandbox:aiop-netdiag
+kubectl auth can-i create deployments.apps -n fabric-e2e \
+  --as=system:serviceaccount:opensandbox:aiop-netdiag
+kubectl auth can-i create services -n fabric-e2e \
+  --as=system:serviceaccount:opensandbox:aiop-netdiag
+kubectl auth can-i get clusterroles \
+  --as=system:serviceaccount:opensandbox:aiop-netdiag
+kubectl auth can-i create daemonsets.apps -n fabric-e2e \
+  --as=system:serviceaccount:kube-system:fabric-node-serviceaccount
+```
+
+Expected sandbox tools:
+
+```sh
+command -v ip
+ip r
+/opt/cni/bin/fabric-admin version
+ls -la /etc/cni/net.d
+kubectl auth can-i --list
+```
 
 ## E2B
 

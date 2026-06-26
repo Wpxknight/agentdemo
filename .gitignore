@@ -8,6 +8,8 @@ coverage/
 .DS_Store
 .codegraph/
 .aios-team.txt
+__pycache__/
+*.py[cod]
 
 # vendored kubectl binary for offline browser-sandbox image build (see Dockerfile.browser)
 deploy/opensandbox/kubectl

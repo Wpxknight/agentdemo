@@ -9,9 +9,14 @@ description: 容器网络与节点网络排查——pod/svc/nodeport 不通、�
 时，按下面的流程排查。本 skill 假设你运行在一个**特权 + 主机网络（hostNetwork）的运维沙箱**里
 （部署见 `deploy/opensandbox/README.netdiag.md`），因此：
 
-- shell 命令（`sbx__run_command`）直接跑在某个**节点的主机网络命名空间**里：`curl localhost:9013/...`、
-  `fabric-admin`、`tcpdump`、`conntrack`、`netstat`、`ping`、`dig`、`nslookup` 都可用。
+- shell 命令（`sbx__run_command`）直接跑在某个**节点的主机网络命名空间**里：
+  `/opt/cni/bin/fabric-admin`、`curl localhost:9013/...`、`tcpdump`、`conntrack`、`netstat`、
+  `ping`、`dig`、`nslookup` 都可用。
 - `kubectl` 走 in-cluster ServiceAccount，可查资源、`exec` 进 fabric/ovs 容器看流表。
+
+**执行原则：优先使用 `/opt/cni/bin/fabric-admin` 命令行**完成 fabric 网络运维诊断；只有
+`fabric-admin` 没有对应子命令、需要读取原始 fabric-ctl HTTP 数据，或 `fabric-admin` 不可用时，
+才退回 `curl localhost:9013/...`。只读优先，变更类子命令仍按本文末尾安全约束先请求确认。
 
 > 该沙箱只落在**一个**节点上。要在 pod/svc 的**对端节点**排查（如目标 pod 在另一节点），
 > 用 `kubectl -n kube-system exec <对端节点的 fabric-node pod>` 进对端容器执行，或说明需要在对端节点起沙箱。
@@ -28,6 +33,30 @@ description: 容器网络与节点网络排查——pod/svc/nodeport 不通、�
 | fabric DaemonSet | `fabric-node`（含 fabric-ctl/fabric-admin/ovs 命令）、`fabric-ovs`（容器名 `ovs`） |
 
 > fabric 组件所在命名空间默认 `kube-system`，先确认：`kubectl get pod -A | grep -E 'fabric|ovs'`。
+
+---
+
+## 前置检查：确认当前就是运维沙箱
+
+网络排查开始前先跑：
+
+```
+cat /var/run/secrets/kubernetes.io/serviceaccount/namespace
+command -v ip && ip r
+test -x /opt/cni/bin/fabric-admin && /opt/cni/bin/fabric-admin version
+ls -la /etc/cni/net.d
+kubectl auth can-i create pods --subresource=exec -n kube-system
+kubectl auth can-i create pods -n opensandbox
+kubectl auth can-i get clusterroles
+```
+
+期望：ServiceAccount 命名空间为 `opensandbox`，`ip` 可用，`fabric-admin` 存在，宿主
+`/etc/cni/net.d` 已挂载，
+三条 `kubectl auth can-i` 均为 `yes`。如果不是，说明当前仍在普通沙箱或旧沙箱里：
+
+1. 应用 `deploy/opensandbox/netdiag-sandbox.yaml`；
+2. 重启 `opensandbox-server`；
+3. 删除旧的 `opensandbox` 沙箱 Pod 后重新拉起。
 
 ---
 

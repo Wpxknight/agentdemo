@@ -6,12 +6,12 @@
 #
 # Build:
 #   cp "$(which kubectl)" deploy/opensandbox/kubectl   # 版本对齐集群（如 v1.32.x）
-#   docker build -f deploy/opensandbox/Dockerfile.netdiag -t aiop/opensandbox-netdiag:latest .
+#   docker build -f deploy/opensandbox/Dockerfile.netdiag -t aiop/opensandbox-netdiag:dev .
 #
 # 注意：fabric-admin（/opt/cni/bin/fabric-admin）是**节点宿主机**上的二进制，
-# 不打进镜像 —— 由 batchsandbox 模板用 hostPath 把宿主 /opt/cni/bin 挂进沙箱
-# （见 deploy/opensandbox/netdiag-sandbox.yaml）。ovs-ofctl/ovs-vsctl 也同理，
-# 优先 `kubectl exec` 进 fabric-node/ovs 容器执行。
+# 不打进镜像 —— 由 batchsandbox 模板用 hostPath 把宿主 /opt/cni/bin 挂进沙箱。
+# 宿主 CNI 配置目录 /etc/cni/net.d 也由模板只读挂载（见 deploy/opensandbox/netdiag-sandbox.yaml）。
+# ovs-ofctl/ovs-vsctl 也同理，优先 `kubectl exec` 进 fabric-node/ovs 容器执行。
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive

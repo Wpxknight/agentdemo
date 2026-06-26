@@ -1,0 +1,11 @@
+# OpenSandbox server patch for netdiag operations sandboxes.
+#
+# Upstream v0.1.9 merges template volumes and volumeMounts into runtime
+# BatchSandbox manifests, but it drops container-level securityContext because
+# runtime containers replace template containers. Netdiag needs the actual
+# sandbox container to be privileged, so this image preserves selected
+# container-level fields from the batchsandbox template.
+FROM sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/server:v0.1.9
+
+COPY deploy/opensandbox/patches/merge-netdiag-security-context.py /tmp/merge-netdiag-security-context.py
+RUN python /tmp/merge-netdiag-security-context.py && rm /tmp/merge-netdiag-security-context.py

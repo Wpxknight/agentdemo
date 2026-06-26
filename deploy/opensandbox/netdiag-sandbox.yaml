@@ -2,7 +2,7 @@
 # （特权 privileged + 主机网络 hostNetwork + hostPID + 宿主路径挂载）。
 #
 # 目的：让 OpenSandbox 拉起的沙箱 Pod 以「节点调试 Pod」形态运行，配合 skills/netdiag
-# 做容器/节点网络排查：在节点主机网络命名空间里跑 fabric-admin / curl localhost:9013 /
+# 做容器/节点网络排查：在节点主机网络命名空间里优先跑 fabric-admin / curl localhost:9013 /
 # tcpdump / conntrack / iptables，并能 kubectl exec 进 fabric-ovs 容器看流表。
 #
 # ⚠️ 重大约束（务必先读 deploy/opensandbox/README.netdiag.md）：
@@ -15,15 +15,31 @@
 #   kubectl apply -f deploy/opensandbox/netdiag-sandbox.yaml
 # 然后把模板挂到 server（见 README.netdiag.md 的 patch 步骤）。
 ---
-# 1) netdiag 沙箱 Pod 所在命名空间(= server config.toml 的 kubernetes.namespace)的专属 SA。
+# 1) netdiag 沙箱 Pod 所在命名空间(= server config.toml 的 kubernetes.namespace)。
+#    显式允许 privileged Pod，避免集群启用 Pod Security Admission 后拒绝运维沙箱。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: opensandbox
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+---
+# 2) netdiag 沙箱专属 SA。
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: aiop-netdiag
   namespace: opensandbox
 ---
-# 2) 排查所需的只读集群视图 + pods/exec（用于进 fabric-ovs 容器跑 ovs 命令）。
-#    pods/exec 是写动作类的能力，按需收紧到具体 ns（换成 RoleBinding）。
+# 3) 运维排查所需的集群视图 + 受控写权限：
+#    - pods/deployments/daemonsets/services：允许运维沙箱动态创建探测与 e2e 资源；
+#    - pods/exec：进 kube-system fabric-node/fabric-ovs 或 default/x-tools 容器做诊断；
+#    - authorization.k8s.io：允许 `kubectl auth can-i --list` 自检；
+#    - rbac.authorization.k8s.io：允许查看和 apply/patch RBAC 修复；
+#    - namespaces：允许创建 fabric-e2e 等诊断命名空间。
+#    这是高权限运维 SA；不要给普通代码/浏览器沙箱复用。
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -37,15 +53,32 @@ rules:
       - endpoints
       - events
       - nodes
-      - namespaces
       - configmaps
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
-    resources: ["pods/exec"]
+    resources: ["pods", "services", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/exec", "pods/attach", "pods/portforward"]
     verbs: ["create"]
   - apiGroups: ["apps"]
     resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["selfsubjectaccessreviews", "selfsubjectrulesreviews"]
+    verbs: ["create"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
@@ -63,7 +96,68 @@ subjects:
     name: aiop-netdiag
     namespace: opensandbox
 ---
-# 3) batchsandbox PodTemplate 覆盖：注入 SA、主机网络、特权、宿主路径挂载。
+# 4) opensandbox 命名空间内的临时探测 Pod 权限。
+#    ClusterRole 已允许运维沙箱在目标命名空间动态创建 Pod/Service/Workload；
+#    这里保留 namespace-local Role，便于审计 opensandbox 内 dns-test 这类临时探测 Pod。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aiop-netdiag-probe-pods
+  namespace: opensandbox
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/attach"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aiop-netdiag-probe-pods
+  namespace: opensandbox
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: aiop-netdiag-probe-pods
+subjects:
+  - kind: ServiceAccount
+    name: aiop-netdiag
+    namespace: opensandbox
+---
+# 5) fabric-admin e2e network 会让 fabric-node 在 fabric-e2e 里创建测试 DaemonSet。
+#    该动作使用 kube-system/fabric-node-serviceaccount，而不是 aiop-netdiag。
+#    注意：e2e 流程会清理并重建 fabric-e2e namespace，所以不能把权限放在
+#    fabric-e2e namespace 内的 RoleBinding；否则清理 namespace 后权限会一起消失。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fabric-e2e
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fabric-node-e2e
+rules:
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fabric-node-e2e
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fabric-node-e2e
+subjects:
+  - kind: ServiceAccount
+    name: fabric-node-serviceaccount
+    namespace: kube-system
+---
+# 6) batchsandbox PodTemplate 覆盖：注入 SA、主机网络、特权、宿主路径挂载。
 #    会被 OpenSandbox server 的 BatchSandboxTemplateManager 深度 merge 进每个 BatchSandbox CR。
 #    保留 example 模板里的 restartPolicy / tolerations。此 ConfigMap 在 server 所在的
 #    opensandbox-system 命名空间。
@@ -97,6 +191,10 @@ data:
               hostPath:
                 path: /opt/cni/bin          # 宿主 fabric-admin 所在目录
                 type: Directory
+            - name: cni-netd
+              hostPath:
+                path: /etc/cni/net.d        # 宿主 CNI 网络配置
+                type: Directory
             - name: ovs-run
               hostPath:
                 path: /var/run/openvswitch   # 本机直跑 ovs-ofctl/ovs-vsctl 用的 sock
@@ -111,6 +209,7 @@ data:
                 type: Directory
           containers:
             - name: sandbox                  # ← 占位名！部署后核对真实容器名再对齐（见上注释）
+              imagePullPolicy: IfNotPresent
               securityContext:
                 privileged: true
                 capabilities:
@@ -118,6 +217,9 @@ data:
               volumeMounts:
                 - name: cni-bin
                   mountPath: /opt/cni/bin
+                  readOnly: true
+                - name: cni-netd
+                  mountPath: /etc/cni/net.d
                   readOnly: true
                 - name: ovs-run
                   mountPath: /var/run/openvswitch

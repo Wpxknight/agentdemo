@@ -7,7 +7,7 @@
 
 - `skills/netdiag/SKILL.md` —— 内置 skill（排查流程；aiop 启动时自动从 `skills/` 扫描装载）。
 - `deploy/opensandbox/Dockerfile.netdiag` —— 沙箱镜像（tcpdump/conntrack/dig/iptables/ovs/kubectl…）。
-- `deploy/opensandbox/netdiag-sandbox.yaml` —— 专属 SA + RBAC + 特权/hostNetwork 的 batchsandbox 模板。
+- `deploy/opensandbox/netdiag-sandbox.yaml` —— 专属 SA + 运维 RBAC + fabric e2e RBAC + 特权/hostNetwork 的 batchsandbox 模板。
 
 ## ⚠️ 必读：单一全局模板约束
 
@@ -33,9 +33,12 @@ OpenSandbox server 同时拉「普通沙箱」和「特权 netdiag 沙箱」。�
 
 ```sh
 cp "$(which kubectl)" deploy/opensandbox/kubectl          # 版本对齐集群
-docker build -f deploy/opensandbox/Dockerfile.netdiag -t aiop/opensandbox-netdiag:latest .
+docker build -f deploy/opensandbox/Dockerfile.netdiag -t aiop/opensandbox-netdiag:dev .
 # 推到集群可拉取的 registry
 ```
+
+单节点本地 Docker runtime 场景可直接使用 `:dev` 本地镜像；不要用 `:latest` 做本地-only
+镜像 tag，因为 Kubernetes 默认会按 `imagePullPolicy: Always` 尝试从远端拉取。
 
 ### 2) 创建 SA / RBAC / 特权模板 ConfigMap
 
@@ -43,10 +46,24 @@ docker build -f deploy/opensandbox/Dockerfile.netdiag -t aiop/opensandbox-netdia
 kubectl apply -f deploy/opensandbox/netdiag-sandbox.yaml
 ```
 
-- `aiop-netdiag`（ns `opensandbox`）+ 只读 ClusterRole（含 `pods/exec`，用于进 fabric-ovs 容器）；
+- `opensandbox` namespace 会被标记为 `pod-security.kubernetes.io/enforce/audit/warn=privileged`，
+  确保 privileged 运维沙箱 Pod 不被 Pod Security Admission 拦截；
+- `aiop-netdiag`（ns `opensandbox`）+ 运维 ClusterRole：
+  - `pods` / `services` / `configmaps`：用于动态创建探测 Pod、Service 和配套配置；
+  - `deployments` / `daemonsets` / `statefulsets` / `replicasets`：用于 fabric e2e 或现场复现资源；
+  - `jobs` / `cronjobs`：用于批处理式诊断任务；
+  - `pods/exec`：用于进 `kube-system` 的 `fabric-node` / `fabric-ovs` 或 `default` 的 `x-tools` 容器；
+  - `authorization.k8s.io`：用于 `kubectl auth can-i --list` 自检；
+  - `rbac.authorization.k8s.io`：用于查看和 `apply` / `patch` RBAC 修复；
+  - `namespaces`：用于创建 `fabric-e2e` 等诊断命名空间；
+- `aiop-netdiag-probe-pods` Role（ns `opensandbox`）：允许创建/删除 `dns-test` 这类临时探测 Pod；
+- `fabric-node-e2e` ClusterRoleBinding：允许
+  `system:serviceaccount:kube-system:fabric-node-serviceaccount` 创建/清理 e2e DaemonSet。
+  `fabric-admin e2e network` 会清理并重建 `fabric-e2e` namespace，所以该权限不能放在
+  `fabric-e2e` namespace 内的 RoleBinding；
 - ConfigMap `opensandbox-batchsandbox-template`（ns `opensandbox-system`），含
-  `serviceAccountName/hostNetwork/hostPID/privileged` + 宿主 `/opt/cni/bin`、`/var/run/openvswitch`、
-  `/run/netns`、`/lib/modules` 挂载。
+  `serviceAccountName/hostNetwork/hostPID/privileged/imagePullPolicy: IfNotPresent` + 宿主
+  `/opt/cni/bin`、`/etc/cni/net.d`、`/var/run/openvswitch`、`/run/netns`、`/lib/modules` 挂载。
 
 ### 3) 让 server 使用该模板（subPath 覆盖镜像内置默认模板）
 
@@ -59,6 +76,24 @@ kubectl patch deployment opensandbox-server -n opensandbox-system --type=json -p
 
 > `helm upgrade` 会覆盖该 patch；持久化请折进 `opensandbox-server` chart（见 `README.md`）。
 
+如果这个挂载已经存在，`kubectl apply -f deploy/opensandbox/netdiag-sandbox.yaml` 只会更新
+ConfigMap。由于 Deployment 使用 `subPath` 挂载模板文件，已运行的 server Pod 不会自动看到
+ConfigMap 更新，必须重启 server 并重建旧沙箱：
+
+```sh
+kubectl rollout restart deployment/opensandbox-server -n opensandbox-system
+kubectl rollout status deployment/opensandbox-server -n opensandbox-system
+kubectl delete pod -n opensandbox --all
+```
+
+确认 server 读到的是 netdiag 模板：
+
+```sh
+kubectl -n opensandbox-system exec deploy/opensandbox-server -- \
+  grep -E 'serviceAccountName|hostNetwork|hostPID|/opt/cni/bin|/etc/cni/net.d' \
+  /etc/opensandbox/example.batchsandbox-template.yaml
+```
+
 ### 4) aiop 配置：把 netdiag 设为默认会话沙箱
 
 ```jsonc
@@ -67,7 +102,7 @@ kubectl patch deployment opensandbox-server -n opensandbox-system --type=json -p
   "provider": "opensandbox",
   "domain": "opensandbox-server.opensandbox-system.svc:80",  // 这套 ops server 的地址
   "protocol": "http",
-  "defaultImage": "aiop/opensandbox-netdiag:latest"
+  "defaultImage": "aiop/opensandbox-netdiag:dev"
 }
 ```
 
@@ -91,14 +126,38 @@ kubectl get -n opensandbox $POD -o jsonpath='{.spec.hostNetwork} {.spec.containe
 进沙箱（或在 aiop 里走 netdiag skill）执行：
 
 ```sh
+cat /var/run/secrets/kubernetes.io/serviceaccount/namespace
+command -v ip && ip r
 /opt/cni/bin/fabric-admin version
 /opt/cni/bin/fabric-admin health show
+ls -la /etc/cni/net.d
 curl -s "localhost:9013/health/"
 tcpdump -ni any -c 3
 kubectl get pod -A | grep -E 'fabric|ovs'
 ```
 
 均有输出即就绪。之后对话里说「排查 xxx pod 网络不通 / svc 不通」会自动走 `netdiag` skill。
+
+RBAC 快速自检（从任意有管理权限的终端执行）：
+
+```sh
+kubectl auth can-i create pods --subresource=exec -n kube-system \
+  --as=system:serviceaccount:opensandbox:aiop-netdiag
+kubectl auth can-i create pods -n opensandbox \
+  --as=system:serviceaccount:opensandbox:aiop-netdiag
+kubectl auth can-i create daemonsets.apps -n fabric-e2e \
+  --as=system:serviceaccount:opensandbox:aiop-netdiag
+kubectl auth can-i create deployments.apps -n fabric-e2e \
+  --as=system:serviceaccount:opensandbox:aiop-netdiag
+kubectl auth can-i create services -n fabric-e2e \
+  --as=system:serviceaccount:opensandbox:aiop-netdiag
+kubectl auth can-i get clusterroles \
+  --as=system:serviceaccount:opensandbox:aiop-netdiag
+kubectl auth can-i create daemonsets.apps -n fabric-e2e \
+  --as=system:serviceaccount:kube-system:fabric-node-serviceaccount
+```
+
+期望全部输出 `yes`。
 
 ## 安全提示
 
