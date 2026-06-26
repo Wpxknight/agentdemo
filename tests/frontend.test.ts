@@ -233,14 +233,17 @@ describe('frontend API wiring', () => {
   it('shows sandbox output as structured terminal entries and keeps the code runner collapsed', async () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
     const css = await readFile('web/src/index.css', 'utf8');
+    const sandboxOutput = await readFile('web/src/sandbox-output.ts', 'utf8');
 
     expect(app).toContain('<details className="prototype-code-card"');
     expect(app).toContain('<summary>');
-    expect(app).toContain('function parseSandboxOutput');
-    expect(app).toContain("kind: 'command'");
-    expect(app).toContain("kind = 'stderr'");
-    expect(app).toContain("kind = 'error'");
-    expect(app).toContain('sandbox-output-line command');
+    expect(app).toContain('parseSandboxOutput');
+    expect(app).toContain('formatSandboxOutputChunk');
+    expect(sandboxOutput).toContain("'command' | 'stdout' | 'stderr' | 'error'");
+    expect(sandboxOutput).toContain("push('command'");
+    expect(sandboxOutput).toContain('sandbox-output-line command');
+    expect(sandboxOutput).toContain('[stdout]');
+    expect(sandboxOutput).toContain('[stderr]');
     expect(app).toContain('sandboxOutputCommand');
     expect(app).toContain('terminalStats');
     expect(app).toContain('prototype-terminal-empty');

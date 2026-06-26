@@ -31,6 +31,15 @@ const exec = (stdout: string, extra: Record<string, unknown> = {}) => ({
   ...extra,
 });
 
+const execLogs = (stdout: string[], stderr: string[] = [], extra: Record<string, unknown> = {}) => ({
+  logs: {
+    stdout: stdout.map((text) => ({ text })),
+    stderr: stderr.map((text) => ({ text })),
+  },
+  exitCode: 0,
+  ...extra,
+});
+
 beforeEach(() => {
   h.run.mockReset();
   h.kill.mockReset();
@@ -81,6 +90,15 @@ describe('OpenSandboxProvider', () => {
     expect(r.stdout).toBe('hello');
     expect(r.exitCode).toBe(0);
     expect(h.run).toHaveBeenCalledWith('echo hello', { timeoutSeconds: 5 }, undefined);
+  });
+
+  it('preserves line breaks between separate stdout and stderr log messages', async () => {
+    h.run.mockResolvedValue(execLogs(['alpha', 'beta'], ['warn', 'again']));
+    const p = new OpenSandboxProvider();
+    const handle = await p.create({ key: 'k' });
+    const r = await handle.runCommand('network-check');
+    expect(r.stdout).toBe('alpha\nbeta');
+    expect(r.stderr).toBe('warn\nagain');
   });
 
   it('runCommand surfaces execution error', async () => {

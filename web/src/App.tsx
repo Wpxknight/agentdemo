@@ -40,6 +40,7 @@ import {
 } from 'lucide-react';
 import { NAV_ITEMS, defaultLlmConfig, fallbackSandboxes, fallbackSessions, fallbackTasks, fallbackTools } from './app-data';
 import { createApi, randomId, readStorage, writeStorage } from './api';
+import { formatSandboxOutputChunk, parseSandboxOutput, sandboxOutputClassNames, sandboxOutputCommand, sandboxOutputLabels } from './sandbox-output';
 import type {
   Attachment,
   ChatMessage,
@@ -91,27 +92,6 @@ const logoUrl = '/assets/logo.jpg';
 const aiAvatarUrl = logoUrl;
 const userAvatarUrl = '/assets/user-avatar.jpg';
 const SESSION_PAGE_SIZE = 20;
-type SandboxOutputKind = 'command' | 'stdout' | 'stderr' | 'error';
-
-interface SandboxOutputEntry {
-  id: string;
-  kind: SandboxOutputKind;
-  text: string;
-}
-
-const sandboxOutputClassNames: Record<SandboxOutputKind, string> = {
-  command: 'sandbox-output-line command',
-  stdout: 'sandbox-output-line stdout',
-  stderr: 'sandbox-output-line stderr',
-  error: 'sandbox-output-line error',
-};
-
-const sandboxOutputLabels: Record<SandboxOutputKind, string> = {
-  command: 'cmd',
-  stdout: 'out',
-  stderr: 'err',
-  error: 'fail',
-};
 
 function sessionCategoryFor(session: SessionSummary) {
   const text = `${session.title} ${session.desc}`.toLowerCase();
@@ -263,10 +243,6 @@ function sandboxCommandLine(call: unknown): string | null {
   return null;
 }
 
-function sandboxOutputCommand(language: string, code: string): string {
-  return `run-code --language ${language} ${truncate(code, 120)}`;
-}
-
 /** 工具调用 → 任务进度条目的可读标签。 */
 function stepLabel(call: unknown): string {
   if (!call || typeof call !== 'object') return '执行工具';
@@ -296,52 +272,6 @@ function formatToolResponse(body: ToolCallBody): string {
   const content = body.result?.content || body.error || '操作完成。';
   const image = body.result?.contentBlocks?.find((block) => block.type === 'image');
   return image?.data ? `${content}\n[image] ${image.mimeType || 'image/png'} ${image.data.length} bytes base64` : content;
-}
-
-function parseSandboxOutput(output: string): SandboxOutputEntry[] {
-  const lines = output.replace(/\r\n/g, '\n').split('\n');
-  const entries: SandboxOutputEntry[] = [];
-  let kind: SandboxOutputKind = 'stdout';
-  let buffer: string[] = [];
-
-  const flush = () => {
-    if (!buffer.length) return;
-    const text = buffer.join('\n').replace(/\n+$/g, '');
-    if (text) entries.push({ id: `${entries.length}-${kind}`, kind, text });
-    buffer = [];
-  };
-
-  for (const line of lines) {
-    if (line.startsWith('$ ')) {
-      flush();
-      entries.push({ id: `${entries.length}-command`, kind: 'command', text: line.slice(2) });
-      kind = 'stdout';
-      continue;
-    }
-    if (line === '[stderr]' || line.startsWith('[stderr]')) {
-      flush();
-      kind = 'stderr';
-      const rest = line.slice('[stderr]'.length).trim();
-      if (rest) buffer.push(rest);
-      continue;
-    }
-    if (line === '[error]' || line.startsWith('[error]')) {
-      flush();
-      kind = 'error';
-      const rest = line.slice('[error]'.length).trim();
-      if (rest) buffer.push(rest);
-      continue;
-    }
-    if (/^(运行失败|预览获取失败|截图失败|连接中断)/.test(line)) {
-      flush();
-      kind = 'error';
-      buffer.push(line);
-      continue;
-    }
-    buffer.push(line);
-  }
-  flush();
-  return entries;
 }
 
 function terminalStats(output: string): string {
@@ -889,8 +819,12 @@ export default function App() {
             const line = sandboxCommandLine(event.data.call);
             if (line) pushTerminal(`${terminalStarted ? '\n' : ''}$ ${line}\n`);
           }
-          if (event?.event === 'tool_output' && typeof event.data?.text === 'string') {
-            pushTerminal(event.data.text);
+          if (
+            event?.event === 'tool_output'
+            && typeof event.data?.text === 'string'
+            && (event.data?.stream === 'stdout' || event.data?.stream === 'stderr')
+          ) {
+            pushTerminal(formatSandboxOutputChunk(event.data.stream, event.data.text));
           }
           if (event?.event === 'tool_result' && typeof event.data?.toolId === 'string') {
             const toolId = event.data.toolId;

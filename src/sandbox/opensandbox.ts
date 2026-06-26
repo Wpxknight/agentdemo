@@ -9,6 +9,7 @@ import type {
   SandboxProvider,
   SandboxSpec,
 } from './types.js';
+import { joinLogText } from './output.js';
 
 /**
  * OpenSandbox（阿里开源沙箱）后端：通过 @alibaba-group/opensandbox SDK
@@ -48,8 +49,8 @@ function streamHandlers(onOutput?: OutputSink): ExecutionHandlers | undefined {
 
 function toExecResult(exec: Execution): ExecResult {
   return {
-    stdout: exec.logs.stdout.map((m) => m.text).join(''),
-    stderr: exec.logs.stderr.map((m) => m.text).join(''),
+    stdout: joinLogText(exec.logs.stdout.map((m) => m.text)),
+    stderr: joinLogText(exec.logs.stderr.map((m) => m.text)),
     exitCode: exec.exitCode ?? undefined,
     error: exec.error ? `${exec.error.name}: ${exec.error.value}` : undefined,
   };

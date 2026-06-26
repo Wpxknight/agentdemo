@@ -14,8 +14,7 @@ vi.mock('@e2b/code-interpreter', () => {
     readonly sandboxId = 'sb-e2b';
     readonly commands = { run: h.runCommand };
     async runCode(code: string) {
-      h.runCode(code);
-      return { logs: { stdout: [], stderr: [] } };
+      return h.runCode(code);
     }
     async setTimeout(ms: number) { h.setTimeout(ms); }
     async kill() { h.kill(); }
@@ -38,6 +37,7 @@ beforeEach(() => {
   h.connected.length = 0;
   h.runCode.mockReset();
   h.runCommand.mockReset();
+  h.runCode.mockResolvedValue({ logs: { stdout: [], stderr: [] } });
   h.setTimeout.mockReset();
   h.kill.mockReset();
 });
@@ -62,5 +62,19 @@ describe('E2bProvider', () => {
         serviceAccount: 'aiop-ops',
       },
     });
+  });
+
+  it('preserves line breaks between separate runCode log messages', async () => {
+    h.runCode.mockResolvedValue({
+      logs: {
+        stdout: ['alpha', 'beta'],
+        stderr: ['warn', 'again'],
+      },
+    });
+    const p = new E2bProvider({ apiKey: 'key' });
+    const handle = await p.create({ key: 'session:dev' });
+    const result = await handle.runCode('print("x")', { language: 'python' });
+    expect(result.stdout).toBe('alpha\nbeta');
+    expect(result.stderr).toBe('warn\nagain');
   });
 });

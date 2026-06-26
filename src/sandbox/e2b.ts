@@ -7,6 +7,7 @@ import type {
   SandboxProvider,
   SandboxSpec,
 } from './types.js';
+import { joinLogText } from './output.js';
 
 export interface E2bProviderOptions {
   /** E2B API key；缺省读 E2B_API_KEY 环境变量。 */
@@ -40,8 +41,8 @@ class E2bHandle implements SandboxHandle {
       onStderr: onOutput ? (m) => onOutput({ stream: 'stderr', text: m.line }) : undefined,
     });
     return {
-      stdout: exec.logs.stdout.join(''),
-      stderr: exec.logs.stderr.join(''),
+      stdout: joinLogText(exec.logs.stdout),
+      stderr: joinLogText(exec.logs.stderr),
       error: exec.error ? `${exec.error.name}: ${exec.error.value}` : undefined,
     };
   }
