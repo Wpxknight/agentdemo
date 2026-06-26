@@ -22,8 +22,11 @@ const log = logger.child({ mod: 'http' });
 
 type Req = http.IncomingMessage;
 type Res = http.ServerResponse;
+type ActiveAgentRun = { abort: AbortController };
+type ActiveAgentRuns = Map<string, Set<ActiveAgentRun>>;
 
 const OIDC_COOKIE = 'aiop_oidc';
+const RUN_TERMINATED_MESSAGE = '会话运行已终止';
 
 /** 读取并解析 JSON 请求体（限制 8MB，支持聊天附件以 base64 形式上传）。 */
 async function readJson(req: Req): Promise<Record<string, unknown>> {
@@ -294,9 +297,10 @@ async function requireAuth(rt: Runtime, req: Req): Promise<RequestContext> {
 export function createHttpServer(rt: Runtime): http.Server {
   const secret = new TextEncoder().encode(rt.jwtSecret);
   const approvals = new InMemoryApprovalStore();
+  const activeRuns: ActiveAgentRuns = new Map();
 
   return http.createServer((req, res) => {
-    handle(rt, secret, approvals, req, res).catch((err) => {
+    handle(rt, secret, approvals, activeRuns, req, res).catch((err) => {
       if (err instanceof HttpError) return sendJson(res, err.status, { error: err.message });
       if (err instanceof AuthzError) return sendJson(res, 403, { error: err.message });
       log.error({ err }, '请求处理异常');
@@ -310,6 +314,7 @@ async function handle(
   rt: Runtime,
   secret: Uint8Array,
   approvals: InMemoryApprovalStore,
+  activeRuns: ActiveAgentRuns,
   req: Req,
   res: Res,
 ): Promise<void> {
@@ -371,7 +376,7 @@ async function handle(
   }
 
   // —— 以下均需认证 ——
-  if (route === 'POST /v1/agent') return runAgentSse(rt, approvals, req, res);
+  if (route === 'POST /v1/agent') return runAgentSse(rt, approvals, activeRuns, req, res);
 
   if (route === 'GET /v1/me') {
     const ctx = await requireAuth(rt, req);
@@ -659,6 +664,14 @@ async function handle(
     return sendJson(res, 200, { messages });
   }
 
+  const sessionTerminateMatch = /^\/v1\/sessions\/([^/]+)\/terminate$/.exec(path);
+  if (method === 'POST' && sessionTerminateMatch) {
+    const ctx = await requireAuth(rt, req);
+    const sessionId = decodeURIComponent(sessionTerminateMatch[1]!);
+    const aborted = abortActiveRuns(activeRuns, activeRunKey(ctx, sessionId));
+    return sendJson(res, 200, { ok: true, sessionId, aborted });
+  }
+
   const sessionDeleteMatch = /^\/v1\/sessions\/([^/]+)$/.exec(path);
   if (method === 'DELETE' && sessionDeleteMatch) {
     const ctx = await requireAuth(rt, req);
@@ -796,8 +809,49 @@ function skillHttpError(err: unknown): HttpError {
   return new HttpError(500, message);
 }
 
+function activeRunKey(ctx: RequestContext, sessionId: string): string {
+  return JSON.stringify([ctx.tenantId, sessionId]);
+}
+
+function addActiveRun(activeRuns: ActiveAgentRuns, key: string, run: ActiveAgentRun): void {
+  const set = activeRuns.get(key) ?? new Set<ActiveAgentRun>();
+  set.add(run);
+  activeRuns.set(key, set);
+}
+
+function removeActiveRun(activeRuns: ActiveAgentRuns, key: string, run: ActiveAgentRun): void {
+  const set = activeRuns.get(key);
+  if (!set) return;
+  set.delete(run);
+  if (!set.size) activeRuns.delete(key);
+}
+
+function abortActiveRuns(activeRuns: ActiveAgentRuns, key: string): number {
+  const set = activeRuns.get(key);
+  if (!set?.size) return 0;
+  let aborted = 0;
+  for (const run of set) {
+    if (run.abort.signal.aborted) continue;
+    run.abort.abort(new Error(RUN_TERMINATED_MESSAGE));
+    aborted++;
+  }
+  return aborted;
+}
+
+function abortReasonMessage(reason: unknown): string {
+  if (reason instanceof Error) return reason.message;
+  if (typeof reason === 'string' && reason) return reason;
+  return RUN_TERMINATED_MESSAGE;
+}
+
 /** POST /v1/agent：流式（SSE）运行一次 agent，自动续接会话历史并持久化。 */
-async function runAgentSse(rt: Runtime, approvals: InMemoryApprovalStore, req: Req, res: Res): Promise<void> {
+async function runAgentSse(
+  rt: Runtime,
+  approvals: InMemoryApprovalStore,
+  activeRuns: ActiveAgentRuns,
+  req: Req,
+  res: Res,
+): Promise<void> {
   const ctx = await requireAuth(rt, req);
   const body = await readJson(req);
   const rawTask = str(body, 'task')?.trim();
@@ -814,12 +868,21 @@ async function runAgentSse(rt: Runtime, approvals: InMemoryApprovalStore, req: R
     'cache-control': 'no-cache, no-transform',
     connection: 'keep-alive',
   });
+  let closed = false;
   const sse = (event: string, data: unknown): void => {
+    if (closed || res.destroyed || res.writableEnded) return;
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
   sse('session', { sessionId });
   const abort = new AbortController();
-  res.on('close', () => abort.abort());
+  const activeKey = activeRunKey(ctx, sessionId);
+  const activeRun: ActiveAgentRun = { abort };
+  const onClose = () => {
+    closed = true;
+    if (!abort.signal.aborted) abort.abort(new Error('客户端连接已关闭'));
+  };
+  addActiveRun(activeRuns, activeKey, activeRun);
+  res.on('close', onClose);
   const toolCtx = { sessionId, tenantId: ctx.tenantId, userId: ctx.userId, role: ctx.role };
 
   try {
@@ -844,6 +907,7 @@ async function runAgentSse(rt: Runtime, approvals: InMemoryApprovalStore, req: R
       ctx: toolCtx,
       messages: prior,
       task,
+      signal: abort.signal,
       onEvent: (e) => sse(e.type, e),
     });
     // 仅持久化本轮新增消息（task + 后续），避免重复落库历史
@@ -856,9 +920,15 @@ async function runAgentSse(rt: Runtime, approvals: InMemoryApprovalStore, req: R
     });
     sse('done', { sessionId, steps: result.steps, text: result.text, usage: result.usage });
   } catch (err) {
-    log.error({ err }, 'agent 运行失败');
-    sse('error', { error: err instanceof Error ? err.message : '运行失败' });
+    if (abort.signal.aborted) {
+      sse('terminated', { sessionId, reason: abortReasonMessage(abort.signal.reason) });
+    } else {
+      log.error({ err }, 'agent 运行失败');
+      sse('error', { error: err instanceof Error ? err.message : '运行失败' });
+    }
   } finally {
-    res.end();
+    removeActiveRun(activeRuns, activeKey, activeRun);
+    res.off('close', onClose);
+    if (!res.destroyed && !res.writableEnded) res.end();
   }
 }

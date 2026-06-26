@@ -112,7 +112,7 @@ export class AnthropicModel implements ChatModel {
       ...(thinkingOn ? { thinking: { type: 'adaptive', display: 'summarized' } as const } : {}),
       // effort 控制思考/输出努力程度（low|medium|high|xhigh|max），需配合 adaptive。
       ...(effortLevel ? { output_config: { effort: effortLevel } } : {}),
-    });
+    }, input.signal ? { signal: input.signal } : undefined);
 
     // 累积进行中的 tool_use 块（index -> 部分状态）
     const pending = new Map<number, { id: string; name: string; json: string }>();

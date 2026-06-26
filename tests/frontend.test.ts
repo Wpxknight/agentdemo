@@ -219,6 +219,17 @@ describe('frontend API wiring', () => {
     expect(app).toContain('onClick={() => onSelect(session)}');
   });
 
+  it('wires a terminate-session button to the active chat run', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(app).toContain('CircleStop');
+    expect(app).toContain('terminateCurrentSession');
+    expect(app).toContain('onTerminateSession={terminateCurrentSession}');
+    expect(app).toContain('onTerminateSession: () => void');
+    expect(app).toContain('终止会话');
+    expect(app).toContain('`/v1/sessions/${encodeURIComponent(sessionId)}/terminate`');
+  });
+
   it('supports paginated and deletable session history without blocking chat input during runs', async () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
     const css = await readFile('web/src/index.css', 'utf8');

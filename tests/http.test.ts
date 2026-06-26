@@ -10,7 +10,7 @@ import { LocalAuthProvider } from '../src/auth/local.js';
 import { ToolRegistry } from '../src/agent/tools.js';
 import { AllowAllPolicy } from '../src/agent/policy.js';
 import type { Runtime } from '../src/runtime.js';
-import type { ChatModel, StreamEvent } from '../src/model/types.js';
+import type { ChatModel, Msg, StreamEvent } from '../src/model/types.js';
 import { SkillRegistry } from '../src/skill/registry.js';
 
 /** 纯文本回答的 mock 模型（不发起工具调用）。 */
@@ -274,6 +274,142 @@ describe('HTTP server', () => {
     const msgs = await store.listMessages(ctx, 'sess-1');
     // 两轮：user/assistant ×2
     expect(msgs.filter((m) => m.role === 'user').length).toBe(2);
+  });
+
+  it('passes prior session messages into the model context', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'context-secret' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+    await localStore.appendMessage(ctx, 'ctx-sess', { role: 'user', text: '上一轮问题' });
+    await localStore.appendMessage(ctx, 'ctx-sess', { role: 'assistant', text: '上一轮回答' });
+
+    const seenMessages: Msg[][] = [];
+    const contextModel: ChatModel = {
+      id: 'context',
+      async *stream(input): AsyncIterable<StreamEvent> {
+        seenMessages.push(input.messages.map((message) => ({ ...message })));
+        yield { type: 'text_delta', text: `seen:${input.messages.length}` };
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+    const rt = {
+      model: contextModel,
+      tools: new ToolRegistry(),
+      store: localStore,
+      policy: new AllowAllPolicy(),
+      policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth,
+      jwtSecret: 'context-secret',
+      systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+
+    const contextServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => contextServer.listen(0, '127.0.0.1', resolve));
+    const contextBase = `http://127.0.0.1:${(contextServer.address() as AddressInfo).port}`;
+
+    try {
+      const r = await fetch(`${contextBase}/v1/agent`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${adminToken}` },
+        body: JSON.stringify({ task: '本轮问题', sessionId: 'ctx-sess' }),
+      });
+      expect(r.status).toBe(200);
+      expect(await r.text()).toContain('event: done');
+      expect(seenMessages).toHaveLength(1);
+      expect(seenMessages[0]!.map((m) => [m.role, m.text])).toEqual([
+        ['user', '上一轮问题'],
+        ['assistant', '上一轮回答'],
+        ['user', '本轮问题'],
+      ]);
+    } finally {
+      await new Promise<void>((resolve) => contextServer.close(() => resolve()));
+    }
+  });
+
+  it('terminates an active agent run without deleting the session history', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'terminate-secret' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+    await localStore.appendMessage(ctx, 'term-sess', { role: 'user', text: '保留的问题' });
+    await localStore.appendMessage(ctx, 'term-sess', { role: 'assistant', text: '保留的回答' });
+
+    let streamStarted!: () => void;
+    const started = new Promise<void>((resolve) => { streamStarted = resolve; });
+    let aborted = false;
+    const slowModel: ChatModel = {
+      id: 'slow',
+      async *stream(input): AsyncIterable<StreamEvent> {
+        streamStarted();
+        yield { type: 'text_delta', text: '开始执行' };
+        const signal = (input as { signal?: AbortSignal }).signal;
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) {
+            aborted = true;
+            resolve();
+            return;
+          }
+          signal?.addEventListener('abort', () => {
+            aborted = true;
+            resolve();
+          }, { once: true });
+          setTimeout(resolve, 300);
+        });
+        if (!aborted) yield { type: 'text_delta', text: '未终止' };
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+    const rt = {
+      model: slowModel,
+      tools: new ToolRegistry(),
+      store: localStore,
+      policy: new AllowAllPolicy(),
+      policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth,
+      jwtSecret: 'terminate-secret',
+      systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+
+    const terminateServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => terminateServer.listen(0, '127.0.0.1', resolve));
+    const terminateBase = `http://127.0.0.1:${(terminateServer.address() as AddressInfo).port}`;
+    const headers = { 'content-type': 'application/json', authorization: `Bearer ${adminToken}` };
+
+    try {
+      const run = fetch(`${terminateBase}/v1/agent`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ task: '长任务', sessionId: 'term-sess' }),
+      });
+      await started;
+      const stopped = await fetch(`${terminateBase}/v1/sessions/term-sess/terminate`, {
+        method: 'POST',
+        headers,
+      });
+
+      expect(stopped.status).toBe(200);
+      expect(await stopped.json()).toMatchObject({ ok: true, sessionId: 'term-sess', aborted: 1 });
+
+      const runResponse = await run;
+      expect(runResponse.status).toBe(200);
+      const body = await runResponse.text();
+      expect(body).toContain('event: terminated');
+      expect(body).not.toContain('未终止');
+      expect(aborted).toBe(true);
+      await expect(localStore.listMessages(ctx, 'term-sess')).resolves.toEqual([
+        { role: 'user', text: '保留的问题' },
+        { role: 'assistant', text: '保留的回答' },
+      ] as Msg[]);
+    } finally {
+      await new Promise<void>((resolve) => terminateServer.close(() => resolve()));
+    }
   });
 
   it('paginates and deletes chat sessions', async () => {

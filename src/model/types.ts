@@ -80,6 +80,8 @@ export interface StreamInput {
   messages: Msg[];
   tools: ToolDef[];
   maxTokens?: number;
+  /** 当前请求的取消信号；HTTP 终止会话或客户端断开时用于中止上游模型流。 */
+  signal?: AbortSignal;
 }
 
 /** 所有模型 adapter 实现的统一接口。 */

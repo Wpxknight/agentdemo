@@ -11,6 +11,7 @@ import {
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
+  CircleStop,
   Code2,
   Cuboid,
   Cpu,
@@ -530,6 +531,7 @@ export default function App() {
   const [sessionTotal, setSessionTotal] = useState(0);
   const [sessionHasMore, setSessionHasMore] = useState(false);
   const [runningAgentCount, setRunningAgentCount] = useState(0);
+  const [terminatingSession, setTerminatingSession] = useState(false);
   const [skillShortcutDraft, setSkillShortcutDraft] = useState('');
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -694,6 +696,25 @@ export default function App() {
     }
   }
 
+  async function terminateCurrentSession() {
+    if (!sessionId || runningAgentCount <= 0 || terminatingSession) return;
+    setTerminatingSession(true);
+    try {
+      await api.post<{ ok: boolean; sessionId: string; aborted: number }>(
+        `/v1/sessions/${encodeURIComponent(sessionId)}/terminate`,
+      );
+    } catch (err) {
+      setMessages((current) => [...current, {
+        id: randomId(),
+        role: 'assistant',
+        text: `终止会话失败：${formatError(err)}`,
+        time: new Date().toLocaleTimeString(),
+      }]);
+    } finally {
+      setTerminatingSession(false);
+    }
+  }
+
   async function addAttachments(fileList: FileList | null) {
     const files = [...(fileList || [])].slice(0, 6);
     if (!files.length) return;
@@ -768,6 +789,9 @@ export default function App() {
         buffer = parts.pop() || '';
         for (const part of parts) {
           const event = parseSse(part);
+          if (event?.event === 'session' && typeof event.data?.sessionId === 'string') {
+            setSessionId(event.data.sessionId);
+          }
           if (event?.event === 'thinking_delta' && typeof event.data?.text === 'string') {
             assistant.thinking = `${assistant.thinking || ''}${event.data.text}`;
             publishAssistant();
@@ -794,6 +818,12 @@ export default function App() {
             const toolId = event.data.toolId;
             const status: TaskStep['status'] = event.data.isError === true ? 'error' : 'done';
             assistant.steps = (assistant.steps || []).map((s) => (s.id === toolId ? { ...s, status } : s));
+            publishAssistant();
+          }
+          if (event?.event === 'terminated') {
+            assistant.text = assistant.text.trim()
+              ? `${assistant.text}\n\n已终止当前运行。`
+              : '已终止当前运行。';
             publishAssistant();
           }
           if (event?.event === 'error') {
@@ -969,6 +999,7 @@ export default function App() {
           llm={llm}
           settingsStatus={settingsStatus}
           runningAgentCount={runningAgentCount}
+          terminatingSession={terminatingSession}
           sandboxOutput={sandboxOutput}
           browserStreamUrl={browserStreamUrl}
           composerRef={composerRef}
@@ -978,6 +1009,7 @@ export default function App() {
           onToggleHistory={() => setHistoryOpen((value) => !value)}
           onTogglePreview={() => setPreviewOpen((value) => !value)}
           onNewSession={startNewSession}
+          onTerminateSession={terminateCurrentSession}
           onSelectSession={selectSession}
           onDeleteSession={(session) => void deleteSession(session)}
           onLoadMoreSessions={() => void loadNextSessionsPage()}
@@ -1119,6 +1151,7 @@ function PrototypeChatShell(props: {
   llm: RuntimeModelConfig;
   settingsStatus: string;
   runningAgentCount: number;
+  terminatingSession: boolean;
   sandboxOutput: string;
   browserStreamUrl: string;
   composerRef: React.RefObject<HTMLTextAreaElement | null>;
@@ -1128,6 +1161,7 @@ function PrototypeChatShell(props: {
   onToggleHistory: () => void;
   onTogglePreview: () => void;
   onNewSession: () => void;
+  onTerminateSession: () => void;
   onSelectSession: (session: SessionSummary) => void;
   onDeleteSession: (session: SessionSummary) => void;
   onLoadMoreSessions: () => void;
@@ -1163,7 +1197,9 @@ function PrototypeChatShell(props: {
         <main className="prototype-chat-center">
           <PrototypeChatHeader
             runningAgentCount={props.runningAgentCount}
+            terminatingSession={props.terminatingSession}
             onNewSession={props.onNewSession}
+            onTerminateSession={props.onTerminateSession}
             onToggleHistory={props.onToggleHistory}
             onTogglePreview={props.onTogglePreview}
           />
@@ -1314,7 +1350,15 @@ function PrototypeSessionPanel({ sessions, total, hasMore, selectedSessionId, on
   );
 }
 
-function PrototypeChatHeader(props: { runningAgentCount: number; onNewSession: () => void; onToggleHistory: () => void; onTogglePreview: () => void }) {
+function PrototypeChatHeader(props: {
+  runningAgentCount: number;
+  terminatingSession: boolean;
+  onNewSession: () => void;
+  onTerminateSession: () => void;
+  onToggleHistory: () => void;
+  onTogglePreview: () => void;
+}) {
+  const canTerminate = props.runningAgentCount > 0 && !props.terminatingSession;
   return (
     <div className="prototype-chat-header">
       <div>
@@ -1330,6 +1374,17 @@ function PrototypeChatHeader(props: { runningAgentCount: number; onNewSession: (
         </button>
         <button type="button" onClick={props.onTogglePreview} aria-label="切换沙箱">
           <PanelRightClose />
+        </button>
+        <button
+          type="button"
+          className="danger"
+          disabled={!canTerminate}
+          onClick={props.onTerminateSession}
+          title="终止当前运行"
+          aria-label="终止会话"
+        >
+          <CircleStop />
+          {props.terminatingSession ? '终止中' : '终止会话'}
         </button>
         <button type="button" className="primary" onClick={props.onNewSession}>
           <Plus />

@@ -18,6 +18,8 @@ export interface RunAgentOptions {
   maxSteps?: number;
   /** needApproval 时的审批门；缺省则直接拒绝。 */
   approval?: ApprovalGate;
+  /** 当前运行的取消信号；由 HTTP 终止会话或客户端断开触发。 */
+  signal?: AbortSignal;
 }
 
 /** 一次运行累计的 token 用量（跨多轮）。 */
@@ -48,6 +50,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
   const usage: Usage = { inputTokens: 0, outputTokens: 0 };
 
   while (steps < maxSteps) {
+    throwIfAborted(opts.signal);
     steps++;
     let text = '';
     let thinking = '';
@@ -58,7 +61,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
       system,
       messages,
       tools: opts.tools.defs(),
+      signal: opts.signal,
     })) {
+      throwIfAborted(opts.signal);
       opts.onEvent?.(ev);
       if (ev.type === 'thinking_delta') thinking += ev.text;
       else if (ev.type === 'thinking_block') thinkingBlocks.push({ thinking: ev.thinking, signature: ev.signature });
@@ -69,6 +74,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
         usage.outputTokens += ev.outputTokens;
       }
     }
+    throwIfAborted(opts.signal);
 
     lastText = text;
     messages.push({
@@ -80,6 +86,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     });
 
     if (calls.length === 0) break;
+    throwIfAborted(opts.signal);
 
     const results = await Promise.all(
       calls.map(async (call) => {
@@ -89,6 +96,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
         return result;
       }),
     );
+    throwIfAborted(opts.signal);
 
     messages.push({ role: 'tool', toolResults: results });
   }
@@ -98,7 +106,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
 
 /** 执行单个工具调用：Policy 校验 → 审批 → dispatch；返回回填给模型的 ToolResult。 */
 async function runOneCall(call: ToolCall, opts: RunAgentOptions): Promise<ToolResult> {
+  throwIfAborted(opts.signal);
   const decision = await opts.policy.check(call, opts.ctx);
+  throwIfAborted(opts.signal);
   if (decision.blocked) {
     return { id: call.id, content: `blocked by policy: ${decision.reason ?? 'denied'}`, isError: true };
   }
@@ -114,6 +124,7 @@ async function runOneCall(call: ToolCall, opts: RunAgentOptions): Promise<ToolRe
       };
     }
   }
+  throwIfAborted(opts.signal);
   // 为每个工具调用派生独立 ctx，注入按 call.id 归集的实时输出回调，
   // 供沙箱 stdout/stderr 流式回传到前端（不污染共享 opts.ctx，避免并发串台）。
   const callCtx: ToolContext = opts.onEvent
@@ -123,5 +134,14 @@ async function runOneCall(call: ToolCall, opts: RunAgentOptions): Promise<ToolRe
           opts.onEvent?.({ type: 'tool_output', toolId: call.id, stream, text }),
       }
     : opts.ctx;
-  return opts.tools.dispatch(call, callCtx);
+  const result = await opts.tools.dispatch(call, callCtx);
+  throwIfAborted(opts.signal);
+  return result;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const reason = signal.reason;
+  if (reason instanceof Error) throw reason;
+  throw new Error(typeof reason === 'string' && reason ? reason : '运行已终止');
 }

@@ -1936,6 +1936,27 @@
     gap: 7px;
   }
 
+  .prototype-chat-actions button:disabled {
+    opacity: .48;
+    cursor: not-allowed;
+    transform: none;
+  }
+
+  .prototype-chat-actions button:disabled:hover {
+    color: hsl(215 16% 47%);
+    background: transparent;
+  }
+
+  .prototype-chat-actions button.danger {
+    color: hsl(0 72% 44%);
+    background: hsl(0 82% 97%);
+  }
+
+  .prototype-chat-actions button.danger:hover:not(:disabled) {
+    color: hsl(0 78% 38%);
+    background: hsl(0 86% 94%);
+  }
+
   .prototype-chat-actions button.primary {
     background: linear-gradient(90deg, hsl(214 89% 52%), hsl(214 89% 44%));
     color: white;

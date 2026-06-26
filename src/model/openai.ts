@@ -119,7 +119,7 @@ export class OpenAIModel implements ChatModel {
       max_tokens: input.maxTokens ?? 8192,
       messages: toOpenAIMessages(input.system, input.messages),
       tools: input.tools.length ? toOpenAITools(input.tools) : undefined,
-    });
+    }, input.signal ? { signal: input.signal } : undefined);
 
     // 按 index 累积流式 tool_calls
     const pending = new Map<number, { id: string; name: string; args: string }>();
