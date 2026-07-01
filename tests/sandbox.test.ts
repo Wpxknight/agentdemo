@@ -105,6 +105,40 @@ describe('SandboxManager', () => {
     expect(h.setTimeout).toHaveBeenLastCalledWith(5_000);
   });
 
+  it('lists active sandboxes with session bindings and timestamps', async () => {
+    const { provider } = mockProvider();
+    let clock = 1_000;
+    const mgr = new SandboxManager({ provider, now: () => clock });
+
+    await mgr.get({ key: 'sess-a' });
+    clock = 2_000;
+    await mgr.get({ key: 'sess-b:prod', template: 'fabric-node', metadata: { cluster: 'prod' } });
+
+    expect(mgr.list()).toEqual([
+      expect.objectContaining({
+        id: 'new-1',
+        sandboxId: 'new-1',
+        key: 'sess-a',
+        sessionId: 'sess-a',
+        status: 'ready',
+        type: 'session',
+        createdAt: new Date(1_000).toISOString(),
+        lastUsedAt: new Date(1_000).toISOString(),
+      }),
+      expect.objectContaining({
+        id: 'new-2',
+        sandboxId: 'new-2',
+        key: 'sess-b:prod',
+        sessionId: 'sess-b',
+        status: 'ready',
+        type: 'fabric-node',
+        metadata: { cluster: 'prod' },
+        createdAt: new Date(2_000).toISOString(),
+        lastUsedAt: new Date(2_000).toISOString(),
+      }),
+    ]);
+  });
+
   it('disposeSession kills the default key and all cluster keys', async () => {
     const { provider, killed } = mockProvider();
     const mgr = new SandboxManager({ provider });
@@ -169,6 +203,21 @@ describe('sandbox tools', () => {
     const [runCode] = buildSandboxTools(mgr);
 
     await expect(runCode!.run({}, ctx)).rejects.toThrow(/code/);
+  });
+
+  it('isolates sandbox tools by session and exposes both bindings', async () => {
+    const { provider } = mockProvider();
+    const mgr = new SandboxManager({ provider });
+    const [runCode] = buildSandboxTools(mgr);
+
+    await runCode!.run({ code: 'print("a")' }, { sessionId: 'session-a' });
+    await runCode!.run({ code: 'print("b")' }, { sessionId: 'session-b' });
+
+    expect(provider.create).toHaveBeenCalledTimes(2);
+    expect(mgr.list().map((item) => [item.key, item.sessionId, item.id])).toEqual([
+      ['session-a', 'session-a', 'new-1'],
+      ['session-b', 'session-b', 'new-2'],
+    ]);
   });
 });
 

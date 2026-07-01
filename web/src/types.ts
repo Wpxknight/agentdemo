@@ -54,13 +54,26 @@ export interface ScheduledTask {
   sessionId?: string;
 }
 
+export interface TaskRun {
+  id?: number;
+  taskId: number;
+  status: 'success' | 'error';
+  detail?: string;
+  steps?: number;
+  createdAt?: string;
+}
+
 export interface SandboxSummary {
   id: string;
   status: string;
+  sandboxId?: string;
+  key?: string;
   type?: string;
   resources?: Record<string, string>;
   sessionId?: string;
   createdAt?: string;
+  lastUsedAt?: string;
+  metadata?: Record<string, string>;
   actions?: string[];
 }
 
@@ -152,6 +165,10 @@ export interface SkillActionBody {
 
 export interface ScheduleBody {
   tasks: ScheduledTask[];
+}
+
+export interface ScheduleRunsBody {
+  runs: TaskRun[];
 }
 
 export interface SandboxesBody {

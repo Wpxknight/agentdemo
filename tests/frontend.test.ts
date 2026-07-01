@@ -11,6 +11,12 @@ import type { Runtime } from '../src/runtime.js';
 import type { ChatModel, StreamEvent } from '../src/model/types.js';
 
 describe('React frontend stack', () => {
+  it('uses the AIOP logo as the browser tab icon', async () => {
+    const html = await readFile('web/index.html', 'utf8');
+
+    expect(html).toContain('<link rel="icon" type="image/jpeg" href="/assets/logo.jpg" />');
+  });
+
   it('uses React, Vite, Tailwind, and shadcn project wiring under web/', async () => {
     const pkg = JSON.parse(await readFile('web/package.json', 'utf8')) as {
       scripts: Record<string, string>;
@@ -87,8 +93,31 @@ describe('frontend API wiring', () => {
     expect(app).toContain('api.get<SessionsBody>(`/v1/sessions?limit=${SESSION_PAGE_SIZE}&offset=${sessionOffset}`');
     expect(app).toContain("api.get<ToolsBody>('/v1/tools");
     expect(app).toContain("api.get<ScheduleBody>('/v1/schedule");
+    expect(app).toContain('api.get<ScheduleRunsBody>(`/v1/schedule/${selectedTask.id}/runs`)');
     expect(app).toContain("api.get<SandboxesBody>('/v1/sandboxes");
     expect(app).toContain("api.get<ModelSettingsBody>('/v1/settings/llm");
+  });
+
+  it('lets operators select scheduled tasks and inspect retained run results', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+    const types = await readFile('web/src/types.ts', 'utf8');
+
+    expect(types).toContain('export interface TaskRun');
+    expect(types).toContain('export interface ScheduleRunsBody');
+    expect(app).toContain('useState<TaskRun[]>([])');
+    expect(app).toContain('<SchedulePage tasks={tasks.length ? tasks : fallbackTasks} api={api} />');
+    expect(app).toContain('selectedTaskId');
+    expect(app).toContain('selectedRunId');
+    expect(app).toContain('setSelectedTaskId(task.id)');
+    expect(app).toContain('setSelectedRunId(run.id)');
+    expect(app).toContain('className="schedule-task-button"');
+    expect(app).toContain('className="schedule-run-button"');
+    expect(app).toContain('className="schedule-run-detail"');
+    expect(app).toContain('执行结果');
+    expect(css).toContain('.schedule-task-button');
+    expect(css).toContain('.schedule-run-button');
+    expect(css).toContain('.schedule-run-detail');
   });
 
   it('keeps the chat browser area as preview-only UI', async () => {
@@ -219,15 +248,30 @@ describe('frontend API wiring', () => {
     expect(app).toContain('onClick={() => onSelect(session)}');
   });
 
-  it('wires a terminate-session button to the active chat run', async () => {
+  it('confirms before stopping the active chat run', async () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
 
     expect(app).toContain('CircleStop');
+    expect(app).toContain('StopSessionConfirmDialog');
+    expect(app).toContain('showStopConfirm');
+    expect(app).toContain('setShowStopConfirm(true)');
+    expect(app).toContain('confirmStopCurrentSession');
     expect(app).toContain('terminateCurrentSession');
-    expect(app).toContain('onTerminateSession={terminateCurrentSession}');
-    expect(app).toContain('onTerminateSession: () => void');
-    expect(app).toContain('终止会话');
+    expect(app).toContain('onRequestStopSession={() => setShowStopConfirm(true)}');
+    expect(app).toContain('onConfirm={confirmStopCurrentSession}');
+    expect(app).toContain('onCancel={() => setShowStopConfirm(false)}');
+    expect(app).toContain('onRequestStopSession: () => void');
+    expect(app).toContain('aria-label="停止"');
+    expect(app).toContain("'停止中'");
+    expect(app).toContain("'停止'");
+    expect(app).toContain('确认停止当前任务？');
+    expect(app).toContain('停止后，当前会话正在执行的模型响应和工具调用会被中断。');
+    expect(app).not.toContain('终止会话');
     expect(app).toContain('`/v1/sessions/${encodeURIComponent(sessionId)}/terminate`');
+    expect(css).toContain('.confirm-dialog-backdrop');
+    expect(css).toContain('.confirm-dialog-panel');
+    expect(css).toContain('.confirm-dialog-actions');
   });
 
   it('shows sandbox output as structured terminal entries and keeps the code runner collapsed', async () => {
@@ -545,6 +589,12 @@ describe('frontend data APIs', () => {
       task: '每日巡检 aiop 命名空间',
       enabled: true,
     });
+    await store.recordTaskRun({
+      taskId: 1,
+      status: 'success',
+      detail: '巡检完成：所有 Pod 正常',
+      steps: 3,
+    });
 
     const tools = new ToolRegistry();
     tools.register({
@@ -606,16 +656,29 @@ describe('frontend data APIs', () => {
       expect(toolsBody.groups).toMatchObject({ skill: 1, mcp: 1, sandbox: 1 });
       expect(toolsBody.tools.map((t) => t.name)).toContain('mcp__filesystem__read_file');
 
-      const schedule = await getJson<{ tasks: unknown[] }>(`${base}/v1/schedule`, authed);
+      const schedule = await getJson<{ tasks: Array<{ id: number }> }>(`${base}/v1/schedule`, authed);
       expect(schedule.tasks).toHaveLength(1);
+
+      const runs = await getJson<{ runs: Array<{ id: number; taskId: number; status: string; detail: string; steps: number; createdAt: string }> }>(
+        `${base}/v1/schedule/${schedule.tasks[0]!.id}/runs`,
+        authed,
+      );
+      expect(runs.runs).toEqual([
+        expect.objectContaining({
+          id: 1,
+          taskId: schedule.tasks[0]!.id,
+          status: 'success',
+          detail: '巡检完成：所有 Pod 正常',
+          steps: 3,
+        }),
+      ]);
+      expect(new Date(runs.runs[0]!.createdAt).getTime()).not.toBeNaN();
 
       const sandboxes = await getJson<{ sandboxes: Array<{ id: string; status: string; actions: string[] }> }>(
         `${base}/v1/sandboxes`,
         authed,
       );
-      expect(sandboxes.sandboxes).toEqual([
-        expect.objectContaining({ id: 'sandbox-prod', status: 'ready', actions: ['打开终端', '打开 VNC', '打开浏览器'] }),
-      ]);
+      expect(sandboxes.sandboxes).toEqual([]);
 
       const settings = await getJson<{ config: { protocol: string; base_url: string; model: string; api_key_set: boolean } }>(
         `${base}/v1/settings/llm`,

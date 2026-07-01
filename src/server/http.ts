@@ -516,17 +516,7 @@ async function handle(
 
   if (route === 'GET /v1/sandboxes') {
     await requireAuth(rt, req);
-    const hasSandboxTools = rt.tools.defs().some((def) => toolCategory(def.name) === 'sandbox');
-    const sandboxes = hasSandboxTools
-      ? [{
-          id: 'sandbox-prod',
-          status: 'ready',
-          type: 'session',
-          resources: { cpu: '2 Core', memory: '4 Gi', storage: '50 Gi' },
-          actions: ['打开终端', '打开 VNC', '打开浏览器'],
-        }]
-      : [];
-    return sendJson(res, 200, { sandboxes });
+    return sendJson(res, 200, { sandboxes: rt.sandboxes?.list() ?? [] });
   }
 
   if (route === 'POST /v1/sandbox/run-code') {
@@ -702,6 +692,12 @@ async function handle(
       sessionId, cron, task, preApproved, enabled: body.enabled !== false,
     });
     return sendJson(res, 201, { task: created });
+  }
+  const schedRunsMatch = /^\/v1\/schedule\/(\d+)\/runs$/.exec(path);
+  if (method === 'GET' && schedRunsMatch) {
+    const ctx = await requireAuth(rt, req);
+    const runs = await rt.store.listTaskRuns(ctx, Number(schedRunsMatch[1]));
+    return sendJson(res, 200, { runs });
   }
   const schedMatch = /^\/v1\/schedule\/(\d+)\/(enable|disable)$/.exec(path);
   if (method === 'POST' && schedMatch) {

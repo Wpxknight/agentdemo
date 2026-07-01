@@ -7,6 +7,8 @@ const manifest = readFileSync(manifestPath, 'utf8');
 const devConfigPath = resolve('deploy/dev-k8s/aiop-configmap-netdiag.yaml');
 const skillPath = resolve('skills/netdiag/SKILL.md');
 const skill = readFileSync(skillPath, 'utf8');
+const readmePath = resolve('deploy/opensandbox/README.netdiag.md');
+const readme = readFileSync(readmePath, 'utf8');
 const serverDockerfilePath = resolve('deploy/opensandbox/Dockerfile.server-netdiag');
 const serverPatchPath = resolve('deploy/opensandbox/patches/merge-netdiag-security-context.py');
 
@@ -68,6 +70,25 @@ describe('netdiag sandbox manifest', () => {
     expect(skill).toContain('优先使用 `/opt/cni/bin/fabric-admin` 命令行');
     expect(skill).toContain('/opt/cni/bin/fabric-admin health show');
     expect(skill).toContain('/opt/cni/bin/fabric-admin e2e network');
+  });
+
+  it('documents node-wide fabric health preflight and automatic repair before netdiag flows', () => {
+    expect(skill).toContain('逐节点 fabric 健康预检');
+    expect(skill).toContain('kubectl -n kube-system exec "$pod" -c fabric -- /opt/cni/bin/fabric-admin health show');
+    expect(skill).toContain('kubectl -n kube-system exec "$pod" -c fabric -- /opt/cni/bin/fabric-admin health fix --all --force');
+    expect(skill).toContain('health show 不符合预期时直接执行 `health fix --all --force`');
+  });
+
+  it('documents fabric-node fabric container as the per-node execution target', () => {
+    expect(skill).toContain('fabric-node 的 `fabric` 容器内置 `/opt/cni/bin/fabric-admin`、`ovs`、`tcpdump`、`conntrack`');
+    expect(skill).toContain('逐节点命令优先 `kubectl -n kube-system exec <fabric-node-pod> -c fabric -- ...`');
+  });
+
+  it('keeps operations sandbox creation in the chat agent instead of main-sandbox kubectl apply', () => {
+    expect(skill).toContain('由聊天智能体重新拉起 netdiag 运维沙箱');
+    expect(skill).toContain('不要在当前主沙箱里执行 `kubectl apply -f deploy/opensandbox/netdiag-sandbox.yaml`');
+    expect(skill).toContain('每个沙箱都是平级实例');
+    expect(readme).toContain('聊天智能体拉起的 netdiag 运维沙箱与普通主沙箱是平级沙箱');
   });
 
   it('patches OpenSandbox server to preserve privileged securityContext from the template', () => {

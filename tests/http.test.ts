@@ -12,6 +12,9 @@ import { AllowAllPolicy } from '../src/agent/policy.js';
 import type { Runtime } from '../src/runtime.js';
 import type { ChatModel, Msg, StreamEvent } from '../src/model/types.js';
 import { SkillRegistry } from '../src/skill/registry.js';
+import { SandboxManager } from '../src/sandbox/lifecycle.js';
+import { buildSandboxTools } from '../src/tools/builtin.js';
+import type { ExecResult, SandboxHandle, SandboxProvider, SandboxSpec } from '../src/sandbox/types.js';
 
 /** 纯文本回答的 mock 模型（不发起工具调用）。 */
 const model: ChatModel = {
@@ -21,6 +24,22 @@ const model: ChatModel = {
     yield { type: 'stop', reason: 'end_turn' };
   },
 };
+
+function mockSandboxProvider() {
+  let seq = 0;
+  const makeHandle = (id: string): SandboxHandle => ({
+    sandboxId: id,
+    runCode: vi.fn(async (code: string): Promise<ExecResult> => ({ stdout: `code:${code}`, stderr: '', exitCode: 0 })),
+    runCommand: vi.fn(async (command: string): Promise<ExecResult> => ({ stdout: `cmd:${command}`, stderr: '', exitCode: 0 })),
+    setTimeout: vi.fn(async () => {}),
+    kill: vi.fn(async () => {}),
+  });
+  const provider: SandboxProvider = {
+    create: vi.fn(async (_spec: SandboxSpec) => makeHandle(`sandbox-${++seq}`)),
+    connect: vi.fn(async (sandboxId: string) => makeHandle(sandboxId)),
+  };
+  return { provider };
+}
 
 function crc32(buf: Buffer): number {
   let crc = 0xffffffff;
@@ -747,6 +766,63 @@ describe('HTTP server', () => {
         ok: true,
         result: { content: 'screenshot', contentBlocks: [{ type: 'image', mimeType: 'image/png', data: 'AQID' }] },
       });
+    } finally {
+      await new Promise<void>((resolve) => sandboxServer.close(() => resolve()));
+    }
+  });
+
+  it('lists real active sandboxes with their bound chat sessions', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'sandbox-list-secret' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    const { provider } = mockSandboxProvider();
+    const manager = new SandboxManager({ provider });
+    const tools = new ToolRegistry();
+    for (const tool of buildSandboxTools(manager)) tools.register(tool);
+    const rt = {
+      model,
+      tools,
+      sandboxes: manager,
+      store: localStore,
+      policy: new AllowAllPolicy(),
+      policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth,
+      jwtSecret: 'sandbox-list-secret',
+      systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+
+    const sandboxServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => sandboxServer.listen(0, '127.0.0.1', resolve));
+    const sandboxBase = `http://127.0.0.1:${(sandboxServer.address() as AddressInfo).port}`;
+    const headers = { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' };
+
+    try {
+      await fetch(`${sandboxBase}/v1/sandbox/run-command`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ sessionId: 'session-a', command: 'echo a' }),
+      });
+      await fetch(`${sandboxBase}/v1/sandbox/run-command`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ sessionId: 'session-b', command: 'echo b' }),
+      });
+
+      const listed = await fetch(`${sandboxBase}/v1/sandboxes`, {
+        headers: { authorization: `Bearer ${adminToken}` },
+      });
+
+      expect(listed.status).toBe(200);
+      const body = await listed.json() as {
+        sandboxes: Array<{ id: string; sandboxId: string; key: string; sessionId: string; status: string; type: string }>;
+      };
+      expect(body.sandboxes).toEqual([
+        expect.objectContaining({ id: 'sandbox-1', sandboxId: 'sandbox-1', key: 'session-a', sessionId: 'session-a', status: 'ready', type: 'session' }),
+        expect.objectContaining({ id: 'sandbox-2', sandboxId: 'sandbox-2', key: 'session-b', sessionId: 'session-b', status: 'ready', type: 'session' }),
+      ]);
     } finally {
       await new Promise<void>((resolve) => sandboxServer.close(() => resolve()));
     }

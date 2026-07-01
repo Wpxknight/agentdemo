@@ -36,6 +36,37 @@ export interface RunAgentResult {
   usage: Usage;
 }
 
+export const CHAT_SYSTEM_GUARDRAILS = [
+  '聊天执行规则：',
+  '1. 默认中文回复，结论清晰，过程可追溯，不编造结果。',
+  '2. 只读检查可直接执行；涉及创建、修改、删除、重启、部署、修复、扩缩容、写配置或其他有副作用操作时，必须先向用户确认。',
+  '3. 变更确认格式：',
+  '',
+  '### 待确认变更',
+  '- 操作内容：',
+  '- 操作目的：',
+  '- 影响范围：',
+  '- 风险点：',
+  '- 验证方式：',
+  '',
+  '请确认是否执行。',
+  '',
+  '4. 用户明确同意后才可执行变更；执行后必须验证结果。',
+  '5. 任务结束必须按以下格式汇报：',
+  '',
+  '### 执行汇报',
+  '- 问题根因：',
+  '- 已解决：',
+  '- 关键操作：',
+  '- 未完成：',
+  '- 风险与影响：',
+  '- 后续建议：',
+].join('\n');
+
+function buildSystemPrompt(system?: string): string {
+  return [CHAT_SYSTEM_GUARDRAILS, system?.trim()].filter(Boolean).join('\n\n');
+}
+
 /**
  * Agentic loop：模型 → 收集 text/tool_call → Policy 校验 → dispatch → 回填 → 直到无工具调用。
  */
@@ -43,7 +74,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
   const messages: Msg[] = opts.messages ? [...opts.messages] : [];
   if (opts.task) messages.push({ role: 'user', text: opts.task });
 
-  const system = opts.system ?? '';
+  const system = buildSystemPrompt(opts.system);
   const maxSteps = opts.maxSteps ?? 20;
   let lastText = '';
   let steps = 0;

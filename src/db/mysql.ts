@@ -332,16 +332,25 @@ export class MysqlStore implements Store {
     const rows = await this.db
       .selectFrom('task_runs')
       .innerJoin('scheduled_tasks', 'scheduled_tasks.id', 'task_runs.task_id')
-      .select(['task_runs.task_id as task_id', 'task_runs.status as status', 'task_runs.detail as detail', 'task_runs.steps as steps'])
+      .select([
+        'task_runs.id as id',
+        'task_runs.task_id as task_id',
+        'task_runs.status as status',
+        'task_runs.detail as detail',
+        'task_runs.steps as steps',
+        'task_runs.created_at as created_at',
+      ])
       .where('scheduled_tasks.tenant_id', '=', ctx.tenantId)
       .where('task_runs.task_id', '=', taskId)
-      .orderBy('task_runs.id', 'asc')
+      .orderBy('task_runs.id', 'desc')
       .execute();
     return rows.map((r): TaskRun => ({
+      id: r.id,
       taskId: r.task_id,
       status: r.status as TaskRun['status'],
       detail: r.detail ?? undefined,
       steps: r.steps ?? undefined,
+      createdAt: r.created_at instanceof Date ? r.created_at : new Date(String(r.created_at)),
     }));
   }
 

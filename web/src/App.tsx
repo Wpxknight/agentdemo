@@ -52,6 +52,7 @@ import type {
   SandboxSummary,
   SandboxesBody,
   ScheduleBody,
+  ScheduleRunsBody,
   ScheduledTask,
   SkillActionBody,
   SkillFileBody,
@@ -60,6 +61,7 @@ import type {
   SessionMessagesBody,
   SessionSummary,
   SessionsBody,
+  TaskRun,
   TaskStep,
   ToolCallBody,
   ToolSummary,
@@ -540,6 +542,7 @@ export default function App() {
   const [sessionHasMore, setSessionHasMore] = useState(false);
   const [runningAgentCount, setRunningAgentCount] = useState(0);
   const [terminatingSession, setTerminatingSession] = useState(false);
+  const [showStopConfirm, setShowStopConfirm] = useState(false);
   const [skillShortcutDraft, setSkillShortcutDraft] = useState('');
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -715,12 +718,17 @@ export default function App() {
       setMessages((current) => [...current, {
         id: randomId(),
         role: 'assistant',
-        text: `终止会话失败：${formatError(err)}`,
+        text: `停止任务失败：${formatError(err)}`,
         time: new Date().toLocaleTimeString(),
       }]);
     } finally {
       setTerminatingSession(false);
     }
+  }
+
+  async function confirmStopCurrentSession() {
+    setShowStopConfirm(false);
+    await terminateCurrentSession();
   }
 
   async function addAttachments(fileList: FileList | null) {
@@ -1022,7 +1030,7 @@ export default function App() {
           onToggleHistory={() => setHistoryOpen((value) => !value)}
           onTogglePreview={() => setPreviewOpen((value) => !value)}
           onNewSession={startNewSession}
-          onTerminateSession={terminateCurrentSession}
+          onRequestStopSession={() => setShowStopConfirm(true)}
           onSelectSession={selectSession}
           onDeleteSession={(session) => void deleteSession(session)}
           onLoadMoreSessions={() => void loadNextSessionsPage()}
@@ -1050,6 +1058,13 @@ export default function App() {
           onRefreshPreview={() => void captureBrowserScreenshot()}
           onStartResize={startPreviewResize}
         />
+        <StopSessionConfirmDialog
+          open={showStopConfirm}
+          runningCount={runningAgentCount}
+          stopping={terminatingSession}
+          onConfirm={confirmStopCurrentSession}
+          onCancel={() => setShowStopConfirm(false)}
+        />
       </TooltipProvider>
     );
   }
@@ -1069,7 +1084,7 @@ export default function App() {
               />
             )}
             {activePage === 'mcp' && <McpPage tools={mcpTools} output={toolTestOutput} onTest={testMcpTool} />}
-            {activePage === 'schedule' && <SchedulePage tasks={tasks.length ? tasks : fallbackTasks} />}
+            {activePage === 'schedule' && <SchedulePage tasks={tasks.length ? tasks : fallbackTasks} api={api} />}
             {activePage === 'sandbox' && <SandboxPage sandboxes={sandboxes.length ? sandboxes : fallbackSandboxes} />}
             {activePage === 'settings' && <SettingsPage llm={llm} status={settingsStatus} api={api} onLlmChange={setLlm} onStatus={setSettingsStatus} />}
           </section>
@@ -1174,7 +1189,7 @@ function PrototypeChatShell(props: {
   onToggleHistory: () => void;
   onTogglePreview: () => void;
   onNewSession: () => void;
-  onTerminateSession: () => void;
+  onRequestStopSession: () => void;
   onSelectSession: (session: SessionSummary) => void;
   onDeleteSession: (session: SessionSummary) => void;
   onLoadMoreSessions: () => void;
@@ -1212,7 +1227,7 @@ function PrototypeChatShell(props: {
             runningAgentCount={props.runningAgentCount}
             terminatingSession={props.terminatingSession}
             onNewSession={props.onNewSession}
-            onTerminateSession={props.onTerminateSession}
+            onRequestStopSession={props.onRequestStopSession}
             onToggleHistory={props.onToggleHistory}
             onTogglePreview={props.onTogglePreview}
           />
@@ -1367,7 +1382,7 @@ function PrototypeChatHeader(props: {
   runningAgentCount: number;
   terminatingSession: boolean;
   onNewSession: () => void;
-  onTerminateSession: () => void;
+  onRequestStopSession: () => void;
   onToggleHistory: () => void;
   onTogglePreview: () => void;
 }) {
@@ -1392,18 +1407,74 @@ function PrototypeChatHeader(props: {
           type="button"
           className="danger"
           disabled={!canTerminate}
-          onClick={props.onTerminateSession}
-          title="终止当前运行"
-          aria-label="终止会话"
+          onClick={props.onRequestStopSession}
+          title="停止当前运行"
+          aria-label="停止"
         >
           <CircleStop />
-          {props.terminatingSession ? '终止中' : '终止会话'}
+          {props.terminatingSession ? '停止中' : '停止'}
         </button>
         <button type="button" className="primary" onClick={props.onNewSession}>
           <Plus />
           新建会话
         </button>
       </div>
+    </div>
+  );
+}
+
+function StopSessionConfirmDialog(props: {
+  open: boolean;
+  runningCount: number;
+  stopping: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  useEffect(() => {
+    if (!props.open) return;
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape' && !props.stopping) props.onCancel();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [props]);
+
+  if (!props.open) return null;
+  return (
+    <div className="confirm-dialog-backdrop" role="presentation" onMouseDown={props.stopping ? undefined : props.onCancel}>
+      <section
+        className="confirm-dialog-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="stop-session-title"
+        aria-describedby="stop-session-desc"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="confirm-dialog-icon danger">
+          <CircleStop />
+        </div>
+        <div className="confirm-dialog-copy">
+          <h2 id="stop-session-title">确认停止当前任务？</h2>
+          <p id="stop-session-desc">停止后，当前会话正在执行的模型响应和工具调用会被中断。</p>
+          <dl>
+            <div>
+              <dt>影响范围</dt>
+              <dd>{props.runningCount} 个运行中的任务</dd>
+            </div>
+            <div>
+              <dt>会话状态</dt>
+              <dd>已产生的消息和工具输出会保留</dd>
+            </div>
+          </dl>
+        </div>
+        <div className="confirm-dialog-actions">
+          <button type="button" className="ghost" disabled={props.stopping} onClick={props.onCancel}>取消</button>
+          <button type="button" className="danger" disabled={props.stopping} onClick={props.onConfirm}>
+            <CircleStop />
+            {props.stopping ? '停止中' : '确认停止'}
+          </button>
+        </div>
+      </section>
     </div>
   );
 }
@@ -2379,8 +2450,53 @@ function DetailPanel({ title, status, icon, children }: { title: string; status:
   );
 }
 
-function SchedulePage({ tasks }: { tasks: ScheduledTask[] }) {
-  const selected = tasks[0] || fallbackTasks[0];
+function SchedulePage({ tasks, api }: { tasks: ScheduledTask[]; api: ReturnType<typeof createApi> }) {
+  const [selectedTaskId, setSelectedTaskId] = useState<number | undefined>(() => tasks.find((task) => task.id !== undefined)?.id);
+  const [runs, setRuns] = useState<TaskRun[]>([]);
+  const [selectedRunId, setSelectedRunId] = useState<number | undefined>();
+  const [runsStatus, setRunsStatus] = useState('');
+  const selectedTask = tasks.find((task) => task.id === selectedTaskId) || tasks[0] || fallbackTasks[0];
+  const selectedRun = runs.find((run) => run.id === selectedRunId) || runs[0];
+
+  useEffect(() => {
+    if (!tasks.length) {
+      setSelectedTaskId(undefined);
+      return;
+    }
+    if (selectedTaskId !== undefined && tasks.some((task) => task.id === selectedTaskId)) return;
+    setSelectedTaskId(tasks.find((task) => task.id !== undefined)?.id);
+  }, [selectedTaskId, tasks]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadRuns() {
+      if (selectedTask.id === undefined) {
+        setRuns([]);
+        setSelectedRunId(undefined);
+        setRunsStatus('暂无执行结果');
+        return;
+      }
+      setRunsStatus('正在加载执行结果...');
+      try {
+        const body = await api.get<ScheduleRunsBody>(`/v1/schedule/${selectedTask.id}/runs`);
+        if (cancelled) return;
+        const next = body.runs || [];
+        setRuns(next);
+        setSelectedRunId((current) => (current !== undefined && next.some((run) => run.id === current) ? current : next[0]?.id));
+        setRunsStatus(next.length ? '' : '暂无执行结果');
+      } catch (err) {
+        if (cancelled) return;
+        setRuns([]);
+        setSelectedRunId(undefined);
+        setRunsStatus(`加载执行结果失败：${formatError(err)}`);
+      }
+    }
+    void loadRuns();
+    return () => {
+      cancelled = true;
+    };
+  }, [api, selectedTask.id]);
+
   return (
     <>
       <PageTitle title="定时任务" desc="按 cron 周期自动执行的运维任务" />
@@ -2392,14 +2508,73 @@ function SchedulePage({ tasks }: { tasks: ScheduledTask[] }) {
         </CardContent>
       </Card>
       <div className="task-layout">
-        <DataTable headers={['任务', '计划', '下次执行', '状态', '最近结果']} rows={tasks.map((task) => [task.task, humanizeCron(task.cron), formatDateTime(task.nextRunAt), task.enabled ? '启用' : '暂停', task.lastRunAt ? '成功' : '待执行'])} />
+        <div className="schedule-table-scroll">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                {['任务', '计划', '下次执行', '状态', '最近结果'].map((header) => <TableHead key={header}>{header}</TableHead>)}
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {tasks.map((task, index) => (
+                <TableRow key={task.id ?? `${task.task}-${index}`} data-state={task === selectedTask ? 'selected' : undefined}>
+                  <TableCell>
+                    <button
+                      className="schedule-task-button"
+                      type="button"
+                      onClick={() => {
+                        if (task.id === undefined) return;
+                        setSelectedTaskId(task.id);
+                      }}
+                    >
+                      <strong>{task.task}</strong>
+                      <span>{task.sessionId || '未绑定会话'}</span>
+                    </button>
+                  </TableCell>
+                  <TableCell>{humanizeCron(task.cron)}</TableCell>
+                  <TableCell>{formatDateTime(task.nextRunAt)}</TableCell>
+                  <TableCell>{formatCell(task.enabled ? '启用' : '暂停')}</TableCell>
+                  <TableCell>{formatCell(task.lastRunAt ? '成功' : '待执行')}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
         <Card className="detail-card compact">
           <CardHeader>
-            <CardTitle>{selected.task}</CardTitle>
-            <CardDescription>{humanizeCron(selected.cron)} · 下次执行 {formatDateTime(selected.nextRunAt)}</CardDescription>
+            <CardTitle>{selectedTask.task}</CardTitle>
+            <CardDescription>{humanizeCron(selectedTask.cron)} · 下次执行 {formatDateTime(selectedTask.nextRunAt)}</CardDescription>
           </CardHeader>
           <CardContent>
-            <DataTable headers={['时间', '状态', '耗时']} rows={[[formatDateTime(selected.lastRunAt), selected.lastRunAt ? '成功' : '待执行', selected.lastRunAt ? '18.42s' : '-']]} />
+            <Table>
+              <TableHeader>
+                <TableRow>{['时间', '状态', '步骤'].map((header) => <TableHead key={header}>{header}</TableHead>)}</TableRow>
+              </TableHeader>
+              <TableBody>
+                {runs.map((run, index) => (
+                  <TableRow key={run.id ?? `${run.taskId}-${index}`} data-state={run === selectedRun ? 'selected' : undefined}>
+                    <TableCell>
+                      <button
+                        className="schedule-run-button"
+                        type="button"
+                        onClick={() => {
+                          if (run.id === undefined) return;
+                          setSelectedRunId(run.id);
+                        }}
+                      >
+                        {formatDateTime(run.createdAt)}
+                      </button>
+                    </TableCell>
+                    <TableCell>{formatCell(run.status === 'success' ? '成功' : '异常')}</TableCell>
+                    <TableCell>{run.steps === undefined ? '-' : String(run.steps)}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+            <div className="schedule-run-detail">
+              <h3>执行结果</h3>
+              <pre>{selectedRun?.detail || runsStatus || '暂无执行结果'}</pre>
+            </div>
           </CardContent>
         </Card>
       </div>

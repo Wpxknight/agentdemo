@@ -28,6 +28,45 @@ function mockModel(): ChatModel {
 }
 
 describe('runAgent', () => {
+  it('adds chat safety and final-report requirements to the system prompt', async () => {
+    const model: ChatModel = {
+      id: 'system-contract-model',
+      async *stream(input: StreamInput): AsyncIterable<StreamEvent> {
+        expect(input.system).toContain('默认中文回复，结论清晰，过程可追溯，不编造结果');
+        expect(input.system).toContain('只读检查可直接执行');
+        expect(input.system).toContain('涉及创建、修改、删除、重启、部署、修复、扩缩容、写配置或其他有副作用操作时，必须先向用户确认');
+        expect(input.system).toContain('### 待确认变更');
+        expect(input.system).toContain('- 操作内容：');
+        expect(input.system).toContain('- 操作目的：');
+        expect(input.system).toContain('- 影响范围：');
+        expect(input.system).toContain('- 风险点：');
+        expect(input.system).toContain('- 验证方式：');
+        expect(input.system).toContain('用户明确同意后才可执行变更；执行后必须验证结果');
+        expect(input.system).toContain('### 执行汇报');
+        expect(input.system).toContain('问题根因');
+        expect(input.system).toContain('已解决');
+        expect(input.system).toContain('关键操作');
+        expect(input.system).toContain('未完成');
+        expect(input.system).toContain('风险与影响');
+        expect(input.system).toContain('后续建议');
+        expect(input.system).toContain('existing system instructions');
+        yield { type: 'text_delta', text: 'ok' };
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+
+    const result = await runAgent({
+      model,
+      tools: new ToolRegistry(),
+      policy: new AllowAllPolicy(),
+      system: 'existing system instructions',
+      ctx: { sessionId: 't1' },
+      task: 'go',
+    });
+
+    expect(result.text).toBe('ok');
+  });
+
   it('dispatches tool calls and loops until no tool call', async () => {
     const tools = new ToolRegistry();
     const run = vi.fn(async (args: unknown) => ({

@@ -71,8 +71,12 @@ describe('Scheduler', () => {
 
     expect(handled).toBe(1);
     expect(runner).toHaveBeenCalledOnce();
+    expect(runner).toHaveBeenCalledWith(expect.objectContaining({ task: 'do it', sessionId: 's1' }));
     const runs = await store.listTaskRuns(rctx, 1);
-    expect(runs).toEqual([{ taskId: 1, status: 'success', detail: 'ok', steps: 2 }]);
+    expect(runs).toEqual([
+      expect.objectContaining({ id: 1, taskId: 1, status: 'success', detail: 'ok', steps: 2 }),
+    ]);
+    expect(runs[0]!.createdAt).toBeInstanceOf(Date);
   });
 
   it('does not run tasks that are not yet due', async () => {

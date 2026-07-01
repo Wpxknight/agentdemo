@@ -1485,11 +1485,93 @@
   .task-layout {
     display: grid;
     gap: 16px;
+    min-width: 0;
+  }
+
+  .schedule-table-scroll {
+    min-width: 0;
+    overflow-x: auto;
+  }
+
+  .schedule-table-scroll table {
+    min-width: 760px;
+    width: 100%;
+  }
+
+  .task-layout .detail-card.compact table {
+    min-width: 520px;
+    width: 100%;
+  }
+
+  .schedule-task-button,
+  .schedule-run-button {
+    width: 100%;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    padding: 0;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .schedule-task-button {
+    display: grid;
+    gap: 4px;
+    min-width: 220px;
+  }
+
+  .schedule-task-button strong {
+    color: hsl(var(--foreground));
+    font-weight: 650;
+  }
+
+  .schedule-task-button span {
+    color: hsl(var(--muted-foreground));
+    font-size: 12px;
+  }
+
+  .schedule-run-button {
+    font: inherit;
+    white-space: nowrap;
+  }
+
+  .schedule-task-button:hover strong,
+  .schedule-run-button:hover {
+    color: hsl(var(--primary));
+  }
+
+  .schedule-run-detail {
+    display: grid;
+    gap: 8px;
+    margin-top: 14px;
+  }
+
+  .schedule-run-detail h3 {
+    margin: 0;
+    color: hsl(var(--foreground));
+    font-size: 13px;
+    font-weight: 650;
+  }
+
+  .schedule-run-detail pre {
+    margin: 0;
+    max-height: 240px;
+    overflow: auto;
+    border: 1px solid hsl(var(--border));
+    border-radius: 8px;
+    background: hsl(var(--surface-muted));
+    color: hsl(var(--foreground));
+    padding: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font: 12px/1.7 "SFMono-Regular", Consolas, monospace;
   }
 
   .detail-card.compact {
     border-radius: 8px;
     border: 1px solid hsl(var(--border));
+    min-width: 0;
+    overflow-x: auto;
   }
 
   .settings-layout {
@@ -1961,6 +2043,144 @@
     background: linear-gradient(90deg, hsl(214 89% 52%), hsl(214 89% 44%));
     color: white;
     box-shadow: 0 5px 16px hsl(var(--primary) / .22);
+  }
+
+  .confirm-dialog-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 80;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background: rgba(15, 23, 42, .36);
+    backdrop-filter: blur(8px);
+  }
+
+  .confirm-dialog-panel {
+    width: min(460px, 100%);
+    border: 1px solid hsl(214 70% 88%);
+    border-radius: 12px;
+    background: rgba(255, 255, 255, .96);
+    box-shadow: 0 24px 70px rgba(15, 40, 80, .24);
+    padding: 20px;
+    display: grid;
+    grid-template-columns: 44px minmax(0, 1fr);
+    gap: 14px;
+  }
+
+  .confirm-dialog-icon {
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+    display: grid;
+    place-items: center;
+    background: hsl(var(--primary) / .1);
+    color: hsl(var(--primary));
+  }
+
+  .confirm-dialog-icon.danger {
+    background: hsl(0 82% 96%);
+    color: hsl(0 72% 44%);
+  }
+
+  .confirm-dialog-icon svg {
+    width: 22px;
+    height: 22px;
+  }
+
+  .confirm-dialog-copy {
+    min-width: 0;
+    display: grid;
+    gap: 10px;
+  }
+
+  .confirm-dialog-copy h2 {
+    font-size: 16px;
+    line-height: 1.35;
+    color: hsl(217 33% 18%);
+  }
+
+  .confirm-dialog-copy p {
+    color: hsl(var(--muted-foreground));
+    font-size: 13px;
+    line-height: 1.65;
+  }
+
+  .confirm-dialog-copy dl {
+    margin: 2px 0 0;
+    display: grid;
+    gap: 8px;
+  }
+
+  .confirm-dialog-copy dl div {
+    min-height: 34px;
+    border: 1px solid hsl(214 70% 91%);
+    border-radius: 8px;
+    background: hsl(214 45% 98%);
+    padding: 8px 10px;
+    display: grid;
+    grid-template-columns: 70px minmax(0, 1fr);
+    gap: 10px;
+    align-items: center;
+  }
+
+  .confirm-dialog-copy dt {
+    color: hsl(215 16% 48%);
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .confirm-dialog-copy dd {
+    margin: 0;
+    color: hsl(217 33% 22%);
+    font-size: 13px;
+    font-weight: 650;
+  }
+
+  .confirm-dialog-actions {
+    grid-column: 1 / -1;
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    padding-top: 4px;
+  }
+
+  .confirm-dialog-actions button {
+    min-height: 36px;
+    border-radius: 8px;
+    padding: 0 14px;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 13px;
+    font-weight: 750;
+  }
+
+  .confirm-dialog-actions button.ghost {
+    border: 1px solid hsl(214 70% 88%);
+    background: #fff;
+    color: hsl(217 33% 22%);
+  }
+
+  .confirm-dialog-actions button.ghost:hover:not(:disabled) {
+    background: hsl(214 45% 97%);
+  }
+
+  .confirm-dialog-actions button.danger {
+    border: 1px solid hsl(0 72% 45%);
+    background: hsl(0 72% 45%);
+    color: #fff;
+    box-shadow: 0 8px 20px hsl(0 72% 45% / .2);
+  }
+
+  .confirm-dialog-actions button.danger:hover:not(:disabled) {
+    background: hsl(0 78% 38%);
+    border-color: hsl(0 78% 38%);
+  }
+
+  .confirm-dialog-actions button:disabled {
+    opacity: .55;
+    cursor: not-allowed;
   }
 
   .prototype-message-scroll {

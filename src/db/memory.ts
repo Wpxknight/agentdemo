@@ -37,6 +37,7 @@ export class MemoryStore implements Store {
   private users = new Map<string, UserWithSecret>(); // key: tenantId/username
   private llmSettings = new Map<string, LlmSettings>();
   private taskSeq = 0;
+  private runSeq = 0;
   private userSeq = 0;
 
   async appendMessage(ctx: RequestContext, sessionId: string, msg: Msg): Promise<void> {
@@ -137,13 +138,20 @@ export class MemoryStore implements Store {
   }
 
   async recordTaskRun(run: TaskRun): Promise<void> {
-    this.runs.push({ ...run });
+    this.runs.push({
+      ...run,
+      id: run.id ?? ++this.runSeq,
+      createdAt: run.createdAt ?? new Date(),
+    });
   }
 
   async listTaskRuns(ctx: RequestContext, taskId: number): Promise<TaskRun[]> {
     const t = this.tasks.get(taskId);
     if (!t || t.tenantId !== ctx.tenantId) return [];
-    return this.runs.filter((r) => r.taskId === taskId).map((r) => ({ ...r }));
+    return this.runs
+      .filter((r) => r.taskId === taskId)
+      .sort((a, b) => (b.id ?? 0) - (a.id ?? 0))
+      .map((r) => ({ ...r }));
   }
 
   async createTenant(tenant: Tenant): Promise<void> {
@@ -197,6 +205,7 @@ export class MemoryStore implements Store {
     this.audit = [];
     this.tasks.clear();
     this.runs = [];
+    this.runSeq = 0;
     this.tenants.clear();
     this.users.clear();
     this.llmSettings.clear();

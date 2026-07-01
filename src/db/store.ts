@@ -44,10 +44,12 @@ export interface ScheduledTask {
 }
 
 export interface TaskRun {
+  id?: number;
   taskId: number;
   status: 'success' | 'error';
   detail?: string;
   steps?: number;
+  createdAt?: Date;
 }
 
 export interface SessionSummary {

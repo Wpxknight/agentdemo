@@ -7,8 +7,22 @@ const log = logger.child({ mod: 'sandbox' });
 interface Entry {
   handle: SandboxHandle;
   lastUsed: number;
+  createdAt: number;
   /** 该沙箱的存活超时(ms)，复用时据此续期。 */
   timeoutMs: number;
+  spec: SandboxSpec;
+}
+
+export interface SandboxSummary {
+  id: string;
+  sandboxId: string;
+  key: string;
+  status: 'ready';
+  type: string;
+  sessionId: string;
+  createdAt: string;
+  lastUsedAt: string;
+  metadata?: Record<string, string>;
 }
 
 export interface SandboxManagerOptions {
@@ -71,7 +85,14 @@ export class SandboxManager {
         : this.warmPool
           ? await this.warmPool.acquire()
           : await this.provider.create(full);
-      this.entries.set(spec.key, { handle, lastUsed: this.now(), timeoutMs: effectiveTimeout });
+      const readyAt = this.now();
+      this.entries.set(spec.key, {
+        handle,
+        lastUsed: readyAt,
+        createdAt: readyAt,
+        timeoutMs: effectiveTimeout,
+        spec: full,
+      });
       log.info({ key: spec.key, sandboxId: handle.sandboxId, mode: full.sandboxId ? 'connect' : 'create' }, 'sandbox ready');
       return handle;
     })();
@@ -90,6 +111,24 @@ export class SandboxManager {
 
   size(): number {
     return this.entries.size;
+  }
+
+  /** 列出当前活跃沙箱，供运维页面展示会话绑定关系。 */
+  list(): SandboxSummary[] {
+    return [...this.entries.entries()].map(([key, entry]) => {
+      const sessionId = entry.spec.metadata?.sessionId ?? key.split(':')[0] ?? key;
+      return {
+        id: entry.handle.sandboxId,
+        sandboxId: entry.handle.sandboxId,
+        key,
+        status: 'ready',
+        type: entry.spec.template ?? (key.includes(':') ? 'cluster' : 'session'),
+        sessionId,
+        createdAt: new Date(entry.createdAt).toISOString(),
+        lastUsedAt: new Date(entry.lastUsed).toISOString(),
+        ...(entry.spec.metadata ? { metadata: { ...entry.spec.metadata } } : {}),
+      };
+    });
   }
 
   /** 回收空闲超时的沙箱；返回被回收的键。 */
