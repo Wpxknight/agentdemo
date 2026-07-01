@@ -6,10 +6,10 @@
 # tcpdump / conntrack / iptables，并能 kubectl exec 进 fabric-ovs 容器看流表。
 #
 # ⚠️ 重大约束（务必先读 deploy/opensandbox/README.netdiag.md）：
-#   OpenSandbox 的 batchsandbox provider 只有**一个全局模板**（ConfigMap
-#   opensandbox-batchsandbox-template）。套用本模板后，**该 server 拉起的所有沙箱**都会变成
-#   特权 + hostNetwork。因此**强烈建议为 netdiag 单独跑一套 OpenSandbox server**（或独立集群入口
-#   domain），不要和普通代码/浏览器沙箱共用同一个 server。
+#   OpenSandbox 的 batchsandbox provider 只有一个全局模板。必须配合
+#   deploy/opensandbox/Dockerfile.server-netdiag 中的 server patch 使用：只有 metadata
+#   profile=netdiag 或 privileged=true 的沙箱才会合并本特权模板。未打 patch 时不要把该模板
+#   挂到普通代码/浏览器沙箱共用的 OpenSandbox server。
 #
 # 应用：
 #   kubectl apply -f deploy/opensandbox/netdiag-sandbox.yaml
@@ -162,11 +162,12 @@ subjects:
 #    保留 example 模板里的 restartPolicy / tolerations。此 ConfigMap 在 server 所在的
 #    opensandbox-system 命名空间。
 #
-#    Pod 级字段（serviceAccountName/hostNetwork/hostPID/dnsPolicy/volumes/tolerations）会稳妥合并。
-#    容器级字段（securityContext.privileged + volumeMounts）必须落在 **OpenSandbox 注入的沙箱
+#    Pod 级字段（serviceAccountName/hostNetwork/hostPID/dnsPolicy/volumes/tolerations）只会在
+#    profile=netdiag 或 privileged=true 时合并。容器级字段（securityContext.privileged + volumeMounts）
+#    必须落在 **OpenSandbox 注入的沙箱
 #    容器** 上 —— 下面 containers[].name 用占位名 `sandbox`，**部署后务必核对**真实容器名并对齐：
 #      kubectl get pod -n opensandbox <某个沙箱pod> -o jsonpath='{.spec.containers[*].name}'
-#    如不一致，把下方 name 改成真实名，或 README.netdiag.md 里改用「独立特权 server」方案。
+#    如不一致，把下方 name 改成真实名。
 apiVersion: v1
 kind: ConfigMap
 metadata:

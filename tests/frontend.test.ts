@@ -409,14 +409,17 @@ describe('frontend API wiring', () => {
     expect(app).toContain('const [selectedSandboxId, setSelectedSandboxId] = useState<string | null>(null)');
     expect(app).toContain('selectedRowIndex={selectedIndex >= 0 ? selectedIndex : null}');
     expect(app).toContain('onRowClick={(rowIndex) => setSelectedSandboxId(sandboxes[rowIndex]?.id ?? null)}');
-    expect(app).toContain('选择沙箱查看详情');
+    expect(app).toContain('{selected ? <aside className="detail-card sandbox-detail-card">');
     expect(app).toContain('当前没有运行中的沙箱。');
-    expect(app).toContain('暂无运行中沙箱');
+    expect(app).not.toContain('选择沙箱查看详情');
+    expect(app).not.toContain('暂无运行中沙箱');
     expect(app).toContain('onKeyDown={onRowClick ? (event) =>');
     expect(css).toContain('.sandbox-profile-grid');
     expect(css).toContain('.sandbox-profile-item');
     expect(css).toContain('.clickable-row');
-    expect(css).toContain('.detail-empty');
+    expect(css).toContain('.sandbox-detail-card');
+    expect(css).toContain('.two-pane > .list-card');
+    expect(css).toContain('overflow-x: auto');
     expect(css).toContain('.prototype-session-id');
   });
 

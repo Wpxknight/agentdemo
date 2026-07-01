@@ -1085,6 +1085,10 @@
     overflow: hidden;
   }
 
+  .two-pane.single-pane {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .list-card,
   .detail-card {
     border: 0;
@@ -1093,8 +1097,20 @@
     padding: 26px;
   }
 
+  .two-pane > .list-card {
+    min-width: 0;
+    overflow-x: auto;
+  }
+
   .detail-card {
     border-left: 1px solid hsl(var(--border));
+    background: hsl(var(--card));
+    position: relative;
+    z-index: 1;
+  }
+
+  .sandbox-detail-card {
+    min-width: 0;
   }
 
   .detail-panel {

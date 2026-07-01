@@ -9,23 +9,19 @@
 - `deploy/opensandbox/Dockerfile.netdiag` —— 沙箱镜像（tcpdump/conntrack/dig/iptables/ovs/kubectl…）。
 - `deploy/opensandbox/netdiag-sandbox.yaml` —— 专属 SA + 运维 RBAC + fabric e2e RBAC + 特权/hostNetwork 的 batchsandbox 模板。
 
-## ⚠️ 必读：单一全局模板约束
+## ⚠️ 必读：全局模板与条件启用
 
 OpenSandbox 的 batchsandbox provider **只有一个全局 PodTemplate**（ConfigMap
-`opensandbox-batchsandbox-template`，见 `sandbox-sa.yaml` 注释）。aiop 侧
-`SandboxSpec` 也没有 per-request 的 privileged/hostNetwork 字段。所以**无法**让同一个
-OpenSandbox server 同时拉「普通沙箱」和「特权 netdiag 沙箱」。两个落地方式：
+`opensandbox-batchsandbox-template`）。如果直接把特权模板挂到未修改的 OpenSandbox server，
+该 server 拉起的所有沙箱都会变成 privileged + hostNetwork，多个沙箱还会抢 execd 固定端口。
 
-1. **（推荐）为 netdiag 单独跑一套 OpenSandbox server**：它的全局模板就是特权/hostNetwork。
-   普通代码/浏览器沙箱用原来那套 server，互不影响。aiop 用一个独立 `clusters[]` 入口（各自
-   `domain`）指向这套 ops server —— 与 aiop「每集群一个控制面 domain」的设计一致。
-2. **整套部署就是为运维而生**：直接把全局模板换成本目录的特权模板，`sandbox.defaultImage`
-   设为 netdiag 镜像。此时**该 server 的所有沙箱都是特权 + hostNetwork**，仅适合纯运维部署。
+本目录通过 `deploy/opensandbox/Dockerfile.server-netdiag` 给 server 打补丁：只有请求 metadata
+包含 `profile=netdiag` 或 `privileged=true` 时才合并特权模板；普通 `code/browser` 沙箱跳过模板，
+继续使用隔离网络和普通 ServiceAccount。
 
 > 还要注意：shell 命令（`sbx__run_command`）跑在**默认会话沙箱**里（`sandbox.*` 配置），
 > 而 `kubectl` 工具跑在**集群沙箱**里（`clusters[].template/domain`）。netdiag 的 fabric-admin /
-> curl localhost:9013 / tcpdump 是 shell 命令，所以 netdiag 必须成为**默认会话沙箱**。
-> 方式 1 下即「让该 ops 部署的 `sandbox.defaultImage` = netdiag 镜像 + 特权全局模板」。
+> curl localhost:9013 / tcpdump 应通过 `sandbox_ensure profile=netdiag` 拉起 netdiag 运维沙箱后执行。
 
 运行期不要试图在普通主沙箱里 `kubectl apply` 本目录的模板来“升级”当前沙箱。聊天智能体通过
 `sandbox_list_profiles` + `sandbox_ensure profile=netdiag` 拉起的 netdiag 运维沙箱与普通主沙箱是平级沙箱：
@@ -69,7 +65,7 @@ kubectl apply -f deploy/opensandbox/netdiag-sandbox.yaml
   `serviceAccountName/hostNetwork/hostPID/privileged/imagePullPolicy: IfNotPresent` + 宿主
   `/opt/cni/bin`、`/etc/cni/net.d`、`/var/run/openvswitch`、`/run/netns`、`/lib/modules` 挂载。
 
-### 3) 让 server 使用该模板（subPath 覆盖镜像内置默认模板）
+### 3) 让 patched server 使用该模板（subPath 覆盖镜像内置默认模板）
 
 ```sh
 kubectl patch deployment opensandbox-server -n opensandbox-system --type=json -p='[
@@ -170,7 +166,7 @@ kubectl auth can-i create daemonsets.apps -n fabric-e2e \
 
 特权 + hostNetwork + hostPID + 宿主路径挂载 = 几乎等同于节点 root。务必：
 
-- 只在受控运维场景启用；用独立 server / 独立 `clusters[]` 入口与普通沙箱隔离；
+- 只在受控运维场景启用；确保 OpenSandbox server 使用 `Dockerfile.server-netdiag` 构建的 patched 镜像；
 - `netdiag` skill 已约定先做逐节点 `health show`，不符合预期时执行
   `health fix --all --force`；其他变更类操作（改流表/iptables/`dp-reload`）先确认；
 - 真正的硬边界是 K8s RBAC 与本模板的挂载范围，应用层（`src/agent/policy.ts`）只是补充拦截。

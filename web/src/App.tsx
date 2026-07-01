@@ -2726,7 +2726,7 @@ function SandboxPage({ sandboxes, profiles }: { sandboxes: SandboxSummary[]; pro
           <div className="empty-inline">暂无可用沙箱模板。</div>
         )}
       </section>
-      <div className="two-pane">
+      <div className={cn('two-pane', !selected && 'single-pane')}>
         <section className="list-card">
           <DataTable
             headers={['沙箱 ID', '状态', 'Profile', '镜像/模板', '绑定会话', 'Key', '活跃时间']}
@@ -2744,8 +2744,7 @@ function SandboxPage({ sandboxes, profiles }: { sandboxes: SandboxSummary[]; pro
           />
           {!sandboxes.length ? <div className="empty-inline">当前没有运行中的沙箱。</div> : null}
         </section>
-        <aside className="detail-card">
-          {selected ? (
+        {selected ? <aside className="detail-card sandbox-detail-card">
             <DetailPanel title={selected.id} status={selected.status} icon={<Cuboid />}>
               <h3>基本信息</h3>
               <div className="kv">
@@ -2761,14 +2760,7 @@ function SandboxPage({ sandboxes, profiles }: { sandboxes: SandboxSummary[]; pro
               <h3>连接信息</h3>
               <div className="file-list"><span>Terminal /sandbox/{selected.id}/terminal</span><span>Browser /sandbox/{selected.id}/browser</span></div>
             </DetailPanel>
-          ) : (
-            <div className="detail-empty">
-              <Cuboid />
-              <strong>{sandboxes.length ? '选择沙箱查看详情' : '暂无运行中沙箱'}</strong>
-              <p>{sandboxes.length ? '点击左侧沙箱行后，这里会展示 ID、类型、绑定会话和运行信息。' : '对话调用沙箱工具后，这里会显示沙箱与会话绑定关系。'}</p>
-            </div>
-          )}
-        </aside>
+          </aside> : null}
       </div>
     </>
   );

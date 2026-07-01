@@ -139,7 +139,9 @@ kubectl get pods -n opensandbox -o jsonpath='{.items[0].spec.serviceAccountName}
 ### 按集群差异化 SA（设计落差）
 
 aiop 的 `config.example.jsonc` 想做 dev=`aiop-ops`(rw) / prod=`aiop-readonly`(ro) 不同 SA。
-但单个 OpenSandbox batchsandbox server 只有一个全局模板 SA，无法按请求 metadata 切 SA。要做到：
+未修改的 OpenSandbox batchsandbox server 只有一个全局模板 SA，无法按请求 metadata 切 SA。
+本仓库 `Dockerfile.server-netdiag` 只为 `profile=netdiag` / `privileged=true` 增加了条件模板合并；
+通用 per-cluster SA 仍建议按下面方式落地：
 
 - 每个目标集群跑一套独立 OpenSandbox server（各自模板各自 SA）—— 与 aiop「每集群一个控制面
   `domain`」的设计吻合；或

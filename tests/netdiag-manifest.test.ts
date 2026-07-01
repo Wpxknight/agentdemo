@@ -105,4 +105,16 @@ describe('netdiag sandbox manifest', () => {
     expect(patch).toContain('imagePullPolicy');
     expect(patch).toContain('_merge_pod_spec_extras');
   });
+
+  it('limits netdiag host-network template merging to privileged/netdiag sandboxes', () => {
+    const patch = readFileSync(serverPatchPath, 'utf8');
+
+    expect(patch).toContain('def _template_extras_enabled');
+    expect(patch).toContain('labels.get("privileged") == "true"');
+    expect(patch).toContain('labels.get("profile") == "netdiag"');
+    expect(patch).toContain('extra_volumes, extra_mounts, extra_container_patch = ([], [], {})');
+    expect(patch).toContain('template_extras_enabled = self._template_extras_enabled(labels)');
+    expect(patch).toContain('if template_extras_enabled:');
+    expect(patch).toContain('else runtime_manifest');
+  });
 });

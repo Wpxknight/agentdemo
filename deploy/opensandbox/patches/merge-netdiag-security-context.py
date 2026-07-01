@@ -7,11 +7,22 @@ source = TARGET.read_text()
 
 source = source.replace(
     "        extra_volumes, extra_mounts = self._extract_template_pod_extras()\n",
-    "        extra_volumes, extra_mounts, extra_container_patch = self._extract_template_pod_extras()\n",
+    "        extra_volumes, extra_mounts, extra_container_patch = ([], [], {})\n"
+    "        template_extras_enabled = self._template_extras_enabled(labels)\n"
+    "        if template_extras_enabled:\n"
+    "            extra_volumes, extra_mounts, extra_container_patch = self._extract_template_pod_extras()\n",
 )
 source = source.replace(
     "        self._merge_pod_spec_extras(batchsandbox, extra_volumes, extra_mounts)\n",
     "        self._merge_pod_spec_extras(batchsandbox, extra_volumes, extra_mounts, extra_container_patch)\n",
+)
+source = source.replace(
+    "        batchsandbox = self.template_manager.merge_with_runtime_values(runtime_manifest)\n",
+    "        batchsandbox = (\n"
+    "            self.template_manager.merge_with_runtime_values(runtime_manifest)\n"
+    "            if template_extras_enabled\n"
+    "            else runtime_manifest\n"
+    "        )\n",
 )
 
 start = source.find("    def _extract_template_pod_extras")
@@ -19,7 +30,17 @@ end = source.find("    # TODO: support empty cmd or env", start)
 if start == -1 or end == -1:
     raise SystemExit("could not find template extras functions to patch")
 
-replacement = '''    def _extract_template_pod_extras(self) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]], Dict[str, Any]]:
+replacement = '''    def _template_extras_enabled(self, labels: Dict[str, str]) -> bool:
+        """
+        Only netdiag sandboxes may inherit the global host-network template.
+
+        The OpenSandbox batchsandbox template is server-wide. Applying it to
+        browser/code sandboxes makes every pod hostNetwork=true, which collides
+        on execd's fixed port and can route commands to the wrong sandbox.
+        """
+        return labels.get("privileged") == "true" or labels.get("profile") == "netdiag"
+
+    def _extract_template_pod_extras(self) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]], Dict[str, Any]]:
         """
         Extract extra template pod fields that runtime containers otherwise overwrite.
 
