@@ -376,6 +376,36 @@
     padding-right: 6px;
   }
 
+  .session-empty {
+    min-height: 160px;
+    border: 1px dashed hsl(var(--border));
+    border-radius: 8px;
+    background: hsl(var(--surface-muted) / .7);
+    display: grid;
+    place-items: center;
+    align-content: center;
+    gap: 8px;
+    padding: 18px;
+    text-align: center;
+    color: hsl(var(--muted-foreground));
+  }
+
+  .session-empty svg {
+    width: 22px;
+    height: 22px;
+    color: hsl(var(--primary));
+  }
+
+  .session-empty strong {
+    color: hsl(var(--foreground));
+    font-size: 13px;
+  }
+
+  .session-empty span {
+    font-size: 12px;
+    line-height: 1.5;
+  }
+
   .session-row {
     width: 100%;
     min-height: 62px;
@@ -1923,6 +1953,39 @@
     height: 15px;
   }
 
+  .prototype-session-empty {
+    min-height: 170px;
+    margin: 4px 0;
+    border: 1px dashed hsl(214 50% 84%);
+    border-radius: 12px;
+    background: linear-gradient(180deg, #fff 0%, hsl(214 45% 98%) 100%);
+    display: grid;
+    align-content: center;
+    justify-items: center;
+    gap: 8px;
+    padding: 18px;
+    text-align: center;
+    color: hsl(215 16% 48%);
+  }
+
+  .prototype-session-empty svg {
+    width: 24px;
+    height: 24px;
+    color: hsl(var(--primary));
+  }
+
+  .prototype-session-empty strong {
+    color: hsl(217 33% 20%);
+    font-size: 13px;
+  }
+
+  .prototype-session-empty p {
+    max-width: 180px;
+    color: hsl(215 16% 48%);
+    font-size: 12px;
+    line-height: 1.55;
+  }
+
   .prototype-session-pagination {
     border-top: 1px solid hsl(214 70% 91%);
     padding: 10px 12px 0;
@@ -2052,26 +2115,26 @@
     display: grid;
     place-items: center;
     padding: 24px;
-    background: rgba(15, 23, 42, .36);
-    backdrop-filter: blur(8px);
+    background: rgba(15, 23, 42, .42);
+    backdrop-filter: blur(10px);
   }
 
   .confirm-dialog-panel {
-    width: min(460px, 100%);
-    border: 1px solid hsl(214 70% 88%);
-    border-radius: 12px;
-    background: rgba(255, 255, 255, .96);
-    box-shadow: 0 24px 70px rgba(15, 40, 80, .24);
-    padding: 20px;
+    width: min(520px, 100%);
+    border: 1px solid hsl(214 38% 82%);
+    border-radius: 8px;
+    background: linear-gradient(180deg, #fff 0%, hsl(214 48% 98%) 100%);
+    box-shadow: 0 28px 80px rgba(15, 40, 80, .28);
+    padding: 18px;
     display: grid;
-    grid-template-columns: 44px minmax(0, 1fr);
-    gap: 14px;
+    grid-template-columns: 46px minmax(0, 1fr);
+    gap: 16px;
   }
 
   .confirm-dialog-icon {
-    width: 44px;
-    height: 44px;
-    border-radius: 12px;
+    width: 46px;
+    height: 46px;
+    border-radius: 8px;
     display: grid;
     place-items: center;
     background: hsl(var(--primary) / .1);
@@ -2079,23 +2142,36 @@
   }
 
   .confirm-dialog-icon.danger {
-    background: hsl(0 82% 96%);
-    color: hsl(0 72% 44%);
+    background: hsl(0 82% 97%);
+    color: hsl(0 72% 42%);
+    box-shadow: inset 0 0 0 1px hsl(0 72% 88%);
   }
 
   .confirm-dialog-icon svg {
-    width: 22px;
-    height: 22px;
+    width: 21px;
+    height: 21px;
   }
 
   .confirm-dialog-copy {
     min-width: 0;
     display: grid;
-    gap: 10px;
+    gap: 9px;
+  }
+
+  .confirm-dialog-kicker {
+    width: fit-content;
+    border: 1px solid hsl(214 38% 84%);
+    border-radius: 999px;
+    background: hsl(214 45% 98%);
+    color: hsl(215 16% 42%);
+    padding: 3px 8px;
+    font-size: 11px;
+    font-weight: 750;
+    line-height: 1.2;
   }
 
   .confirm-dialog-copy h2 {
-    font-size: 16px;
+    font-size: 18px;
     line-height: 1.35;
     color: hsl(217 33% 18%);
   }
@@ -2106,17 +2182,37 @@
     line-height: 1.65;
   }
 
-  .confirm-dialog-copy dl {
+  .confirm-dialog-alert {
+    border: 1px solid hsl(38 92% 82%);
+    border-radius: 8px;
+    background: hsl(43 92% 96%);
+    color: hsl(32 84% 28%);
+    display: grid;
+    grid-template-columns: 18px minmax(0, 1fr);
+    gap: 8px;
+    align-items: start;
+    padding: 9px 10px;
+    font-size: 12px;
+    line-height: 1.55;
+  }
+
+  .confirm-dialog-alert svg {
+    width: 16px;
+    height: 16px;
+    margin-top: 2px;
+  }
+
+  .confirm-dialog-meta {
     margin: 2px 0 0;
     display: grid;
     gap: 8px;
   }
 
-  .confirm-dialog-copy dl div {
-    min-height: 34px;
-    border: 1px solid hsl(214 70% 91%);
+  .confirm-dialog-meta div {
+    min-height: 38px;
+    border: 1px solid hsl(214 38% 88%);
     border-radius: 8px;
-    background: hsl(214 45% 98%);
+    background: rgba(255, 255, 255, .78);
     padding: 8px 10px;
     display: grid;
     grid-template-columns: 70px minmax(0, 1fr);
@@ -2142,7 +2238,9 @@
     display: flex;
     justify-content: flex-end;
     gap: 10px;
-    padding-top: 4px;
+    border-top: 1px solid hsl(214 38% 88%);
+    padding-top: 12px;
+    margin-top: 2px;
   }
 
   .confirm-dialog-actions button {
@@ -3053,6 +3151,20 @@
   .prototype-chat-actions button {
     min-width: 36px;
     padding: 0 10px;
+  }
+
+  .prototype-chat-actions button.danger {
+    width: 38px;
+    min-width: 38px;
+    padding: 0;
+    gap: 0;
+    justify-content: center;
+    font-size: 0;
+  }
+
+  .prototype-chat-actions button.danger svg {
+    width: 18px;
+    height: 18px;
   }
 
   .prototype-message-list {

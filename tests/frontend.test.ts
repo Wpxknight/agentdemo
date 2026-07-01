@@ -267,10 +267,19 @@ describe('frontend API wiring', () => {
     expect(app).toContain("'停止'");
     expect(app).toContain('确认停止当前任务？');
     expect(app).toContain('停止后，当前会话正在执行的模型响应和工具调用会被中断。');
+    expect(app).toContain('className="confirm-dialog-kicker"');
+    expect(app).toContain('className="confirm-dialog-alert"');
+    expect(app).toContain('className="confirm-dialog-meta"');
+    expect(app).toContain('中断执行');
     expect(app).not.toContain('终止会话');
     expect(app).toContain('`/v1/sessions/${encodeURIComponent(sessionId)}/terminate`');
     expect(css).toContain('.confirm-dialog-backdrop');
     expect(css).toContain('.confirm-dialog-panel');
+    expect(css).toContain('.confirm-dialog-kicker');
+    expect(css).toContain('.confirm-dialog-alert');
+    expect(css).toContain('.confirm-dialog-meta');
+    expect(css).toContain('.prototype-chat-actions button.danger');
+    expect(css).toContain('font-size: 0;');
     expect(css).toContain('.confirm-dialog-actions');
   });
 
@@ -329,6 +338,19 @@ describe('frontend API wiring', () => {
     expect(types).toContain('offset?: number;');
     expect(types).toContain('hasMore?: boolean;');
     expect(app).not.toContain('disabled={runningAgentCount');
+  });
+
+  it('does not show sample sessions when the backend returns an empty history list', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(app).toContain('useState<SessionSummary[]>([])');
+    expect(app).not.toContain('useState<SessionSummary[]>(fallbackSessions)');
+    expect(app).not.toContain('(sessions.length ? sessions : fallbackSessions)');
+    expect(app).toContain('prototype-session-empty');
+    expect(app).toContain('暂无会话记录');
+    expect(css).toContain('.prototype-session-empty');
+    expect(css).toContain('.session-empty');
   });
 
   it('supports slash skill shortcuts in the chat composer', async () => {

@@ -38,7 +38,7 @@ import {
   User,
   X,
 } from 'lucide-react';
-import { NAV_ITEMS, defaultLlmConfig, fallbackSandboxes, fallbackSessions, fallbackTasks, fallbackTools } from './app-data';
+import { NAV_ITEMS, defaultLlmConfig, fallbackSandboxes, fallbackTasks, fallbackTools } from './app-data';
 import { createApi, randomId, readStorage, writeStorage } from './api';
 import { formatSandboxOutputChunk, parseSandboxOutput, sandboxOutputClassNames, sandboxOutputCommand, sandboxOutputLabels } from './sandbox-output';
 import type {
@@ -521,7 +521,7 @@ export default function App() {
   const [page, setPage] = useState<PageId | 'login'>(initialPage);
   const [token, setToken] = useState(() => readStorage('aiop_token'));
   const [sessionId, setSessionId] = useState(() => readStorage('aiop_session_id') || randomId());
-  const [sessions, setSessions] = useState<SessionSummary[]>(fallbackSessions);
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [tools, setTools] = useState<ToolSummary[]>([]);
   const [tasks, setTasks] = useState<ScheduledTask[]>([]);
   const [sandboxes, setSandboxes] = useState<SandboxSummary[]>([]);
@@ -1308,10 +1308,12 @@ function PrototypeSessionPanel({ sessions, total, hasMore, selectedSessionId, on
   onLoadMore: () => void;
 }) {
   const [query, setQuery] = useState('');
-  const items = (sessions.length ? sessions : fallbackSessions).filter((session) => {
+  const trimmedQuery = query.trim().toLowerCase();
+  const items = sessions.filter((session) => {
     const value = `${session.title} ${session.desc}`.toLowerCase();
-    return value.includes(query.trim().toLowerCase());
+    return value.includes(trimmedQuery);
   });
+  const emptyCopy = trimmedQuery ? '没有匹配会话' : '暂无会话记录';
 
   return (
     <aside className="prototype-session-panel">
@@ -1328,7 +1330,7 @@ function PrototypeSessionPanel({ sessions, total, hasMore, selectedSessionId, on
       <ScrollArea className="prototype-session-scroll">
         <div className="prototype-session-group">
           <span>今天</span>
-          {items.map((session, index) => {
+          {items.length ? items.map((session, index) => {
             const category = sessionCategoryFor(session);
             const SessionIcon = category.Icon;
             const isActive = Boolean(session.sessionId && session.sessionId === selectedSessionId);
@@ -1367,7 +1369,13 @@ function PrototypeSessionPanel({ sessions, total, hasMore, selectedSessionId, on
                 <p>{session.desc}</p>
               </div>
             );
-          })}
+          }) : (
+            <div className="prototype-session-empty">
+              <MessageSquare />
+              <strong>{emptyCopy}</strong>
+              <p>{trimmedQuery ? '换个关键词再试。' : '新建或发送消息后，会话会出现在这里。'}</p>
+            </div>
+          )}
         </div>
       </ScrollArea>
       <div className="prototype-session-pagination">
@@ -1450,13 +1458,16 @@ function StopSessionConfirmDialog(props: {
         aria-describedby="stop-session-desc"
         onMouseDown={(event) => event.stopPropagation()}
       >
-        <div className="confirm-dialog-icon danger">
-          <CircleStop />
-        </div>
+        <div className="confirm-dialog-icon danger"><CircleStop /></div>
         <div className="confirm-dialog-copy">
+          <span className="confirm-dialog-kicker">全局操作确认</span>
           <h2 id="stop-session-title">确认停止当前任务？</h2>
           <p id="stop-session-desc">停止后，当前会话正在执行的模型响应和工具调用会被中断。</p>
-          <dl>
+          <div className="confirm-dialog-alert">
+            <ShieldCheck />
+            <span>中断执行前请确认影响范围，已产生的消息和工具输出会保留。</span>
+          </div>
+          <dl className="confirm-dialog-meta">
             <div>
               <dt>影响范围</dt>
               <dd>{props.runningCount} 个运行中的任务</dd>
@@ -1833,6 +1844,7 @@ function ChatWorkbench(props: {
 }
 
 function SessionHistory({ sessions, onCollapse }: { sessions: SessionSummary[]; onCollapse: () => void }) {
+  const recentSessions = sessions.slice(0, 10);
   return (
     <aside className="session-drawer">
       <div className="drawer-head">
@@ -1846,7 +1858,7 @@ function SessionHistory({ sessions, onCollapse }: { sessions: SessionSummary[]; 
       </div>
       <ScrollArea className="session-scroll">
         <div className="session-list">
-          {(sessions.length ? sessions : fallbackSessions).slice(0, 10).map((session, index) => {
+          {recentSessions.length ? recentSessions.map((session, index) => {
             const category = sessionCategoryFor(session);
             const SessionIcon = category.Icon;
             return (
@@ -1859,7 +1871,13 @@ function SessionHistory({ sessions, onCollapse }: { sessions: SessionSummary[]; 
                 <span className="session-desc">{session.desc}</span>
               </button>
             );
-          })}
+          }) : (
+            <div className="session-empty">
+              <MessageSquare />
+              <strong>暂无会话记录</strong>
+              <span>开始一次对话后，这里会显示最近会话。</span>
+            </div>
+          )}
         </div>
       </ScrollArea>
     </aside>
