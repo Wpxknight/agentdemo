@@ -3,6 +3,7 @@ import { SandboxManager } from '../src/sandbox/lifecycle.js';
 import { LocalSandboxProvider } from '../src/sandbox/local.js';
 import { OpenSandboxDesktopProvider } from '../src/sandbox/opensandbox-desktop.js';
 import { buildSandboxTools } from '../src/tools/builtin.js';
+import { buildSandboxProfileTools } from '../src/tools/sandbox-profiles.js';
 import type {
   ExecResult,
   SandboxHandle,
@@ -139,6 +140,32 @@ describe('SandboxManager', () => {
     ]);
   });
 
+  it('lists profile metadata for active sandboxes', async () => {
+    const { provider } = mockProvider();
+    const mgr = new SandboxManager({ provider });
+
+    await mgr.get({
+      key: 'sess-a:profile:netdiag',
+      profile: 'netdiag',
+      template: 'aiop/opensandbox-netdiag:dev',
+      domain: 'opensandbox-netdiag.opensandbox-system.svc:80',
+      metadata: { sessionId: 'sess-a', profile: 'netdiag', privileged: 'true', capabilities: 'kubectl,tcpdump' },
+    });
+
+    expect(mgr.list()).toEqual([
+      expect.objectContaining({
+        key: 'sess-a:profile:netdiag',
+        sessionId: 'sess-a',
+        type: 'netdiag',
+        profile: 'netdiag',
+        image: 'aiop/opensandbox-netdiag:dev',
+        domain: 'opensandbox-netdiag.opensandbox-system.svc:80',
+        privileged: true,
+        capabilities: ['kubectl', 'tcpdump'],
+      }),
+    ]);
+  });
+
   it('disposeSession kills the default key and all cluster keys', async () => {
     const { provider, killed } = mockProvider();
     const mgr = new SandboxManager({ provider });
@@ -218,6 +245,46 @@ describe('sandbox tools', () => {
       ['session-a', 'session-a', 'new-1'],
       ['session-b', 'session-b', 'new-2'],
     ]);
+  });
+
+  it('lets the agent list profiles and run commands in the selected sandbox profile', async () => {
+    const { provider } = mockProvider();
+    const mgr = new SandboxManager({ provider });
+    const tools = buildSandboxProfileTools(mgr, [
+      {
+        name: 'code',
+        description: '普通代码沙箱',
+        image: 'aiop/opensandbox-code:dev',
+        desktop: false,
+        privileged: false,
+        capabilities: ['python', 'shell'],
+      },
+      {
+        name: 'netdiag',
+        description: '网络排查沙箱',
+        image: 'aiop/opensandbox-netdiag:dev',
+        desktop: false,
+        privileged: true,
+        capabilities: ['kubectl', 'tcpdump'],
+      },
+    ]);
+    const listProfiles = tools.find((tool) => tool.def.name === 'sandbox_list_profiles')!;
+    const runCommand = tools.find((tool) => tool.def.name === 'sandbox_run_command')!;
+
+    const listed = await listProfiles.run({}, ctx);
+    expect(listed.content).toContain('netdiag');
+    expect(listed.content).toContain('tcpdump');
+
+    const res = await runCommand.run({ profile: 'netdiag', command: 'kubectl get pods' }, ctx);
+
+    expect(res.content).toContain('out:kubectl get pods');
+    expect(provider.create).toHaveBeenCalledWith(expect.objectContaining({
+      key: 'sess-1:profile:netdiag',
+      profile: 'netdiag',
+      template: 'aiop/opensandbox-netdiag:dev',
+      metadata: expect.objectContaining({ sessionId: 'sess-1', profile: 'netdiag', privileged: 'true' }),
+    }));
+    expect(mgr.list()[0]).toMatchObject({ profile: 'netdiag', sessionId: 'sess-1' });
   });
 });
 

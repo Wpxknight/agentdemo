@@ -69,12 +69,32 @@ export interface SandboxSummary {
   sandboxId?: string;
   key?: string;
   type?: string;
+  profile?: string;
+  image?: string;
+  domain?: string;
+  namespace?: string;
+  serviceAccount?: string;
+  capabilities?: string[];
+  privileged?: boolean;
   resources?: Record<string, string>;
   sessionId?: string;
   createdAt?: string;
   lastUsedAt?: string;
   metadata?: Record<string, string>;
   actions?: string[];
+}
+
+export interface SandboxProfileSummary {
+  name: string;
+  description: string;
+  image?: string;
+  domain?: string;
+  namespace?: string;
+  serviceAccount?: string;
+  desktop: boolean;
+  privileged: boolean;
+  capabilities: string[];
+  timeoutMs?: number;
 }
 
 export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
@@ -173,6 +193,7 @@ export interface ScheduleRunsBody {
 
 export interface SandboxesBody {
   sandboxes: SandboxSummary[];
+  profiles?: SandboxProfileSummary[];
 }
 
 export interface ModelSettingsBody {

@@ -95,6 +95,7 @@ describe('frontend API wiring', () => {
     expect(app).toContain("api.get<ScheduleBody>('/v1/schedule");
     expect(app).toContain('api.get<ScheduleRunsBody>(`/v1/schedule/${selectedTask.id}/runs`)');
     expect(app).toContain("api.get<SandboxesBody>('/v1/sandboxes");
+    expect(app).toContain('setSandboxProfiles(body.profiles || [])');
     expect(app).toContain("api.get<ModelSettingsBody>('/v1/settings/llm");
   });
 
@@ -124,6 +125,7 @@ describe('frontend API wiring', () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
 
     expect(app).toContain("api.post<ToolCallBody>('/v1/sandbox/run-code");
+    expect(app).toContain("name.startsWith('sandbox_')");
     expect(app).toContain("api.post<ToolCallBody>('/v1/browser/stream");
     expect(app).toContain("api.post<ToolCallBody>('/v1/browser/screenshot");
     expect(app).toContain('runSandboxCode');
@@ -191,6 +193,7 @@ describe('frontend API wiring', () => {
     expect(app).toContain('SidebarAccountMenu');
     expect(app).toContain('account-popover');
     expect(app).toContain('prototype-session-panel');
+    expect(app).toContain('prototype-session-id');
     expect(app).toContain('prototype-sandbox-panel');
     expect(app).toContain('prototype-message-end');
     expect(app).toContain("scrollIntoView({ block: 'end' })");
@@ -380,6 +383,30 @@ describe('frontend API wiring', () => {
     expect(app).toContain('暂无会话记录');
     expect(css).toContain('.prototype-session-empty');
     expect(css).toContain('.session-empty');
+  });
+
+  it('shows sandbox profiles and live sandbox-session bindings without fallback rows', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+    const types = await readFile('web/src/types.ts', 'utf8');
+
+    expect(types).toContain('export interface SandboxProfileSummary');
+    expect(types).toContain('profiles?: SandboxProfileSummary[]');
+    expect(types).toContain('profile?: string;');
+    expect(types).toContain('capabilities?: string[];');
+    expect(app).toContain('const [sandboxProfiles, setSandboxProfiles] = useState<SandboxProfileSummary[]>([])');
+    expect(app).toContain('<SandboxPage sandboxes={sandboxes} profiles={sandboxProfiles} />');
+    expect(app).not.toContain('sandboxes.length ? sandboxes : fallbackSandboxes');
+    expect(app).toContain('支持的沙箱模板');
+    expect(app).toContain('AI 会按任务能力选择 profile');
+    expect(app).toContain("headers={['沙箱 ID', '状态', 'Profile', '镜像/模板', '绑定会话', 'Key', '活跃时间']}");
+    expect(app).toContain('sandbox.sessionId ||');
+    expect(app).toContain('当前没有运行中的沙箱。');
+    expect(app).toContain('暂无运行中沙箱');
+    expect(css).toContain('.sandbox-profile-grid');
+    expect(css).toContain('.sandbox-profile-item');
+    expect(css).toContain('.detail-empty');
+    expect(css).toContain('.prototype-session-id');
   });
 
   it('supports slash skill shortcuts in the chat composer', async () => {
@@ -726,11 +753,12 @@ describe('frontend data APIs', () => {
       ]);
       expect(new Date(runs.runs[0]!.createdAt).getTime()).not.toBeNaN();
 
-      const sandboxes = await getJson<{ sandboxes: Array<{ id: string; status: string; actions: string[] }> }>(
+      const sandboxes = await getJson<{ sandboxes: Array<{ id: string; status: string; actions: string[] }>; profiles: unknown[] }>(
         `${base}/v1/sandboxes`,
         authed,
       );
       expect(sandboxes.sandboxes).toEqual([]);
+      expect(sandboxes.profiles).toEqual([]);
 
       const settings = await getJson<{ config: { protocol: string; base_url: string; model: string; api_key_set: boolean } }>(
         `${base}/v1/settings/llm`,

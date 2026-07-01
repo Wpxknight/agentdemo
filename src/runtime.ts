@@ -16,6 +16,7 @@ import { LocalDesktopProvider } from './sandbox/local-desktop.js';
 import { OpenSandboxDesktopProvider } from './sandbox/opensandbox-desktop.js';
 import type { DesktopHandle, DesktopProvider } from './sandbox/desktop.js';
 import { buildSandboxTools } from './tools/builtin.js';
+import { buildSandboxProfileTools } from './tools/sandbox-profiles.js';
 import { buildBrowserTools } from './tools/browser.js';
 import { McpManager } from './mcp/manager.js';
 import { connectMcp } from './mcp/client.js';
@@ -28,6 +29,15 @@ import { readMysqlConfig } from './config/mysql.js';
 import { createStore } from './db/index.js';
 import type { LlmSettings, Store } from './db/store.js';
 import { buildScheduleTools } from './tools/schedule.js';
+import {
+  findSandboxProfile,
+  publicSandboxProfiles,
+  resolveSandboxProfiles,
+  sandboxSpecForProfile,
+  selectBrowserProfile,
+  selectDefaultProfile,
+} from './sandbox/profiles.js';
+import type { PublicSandboxProfile, SandboxProfile } from './sandbox/profiles.js';
 import { LocalAuthProvider } from './auth/local.js';
 import { OidcAuthProvider } from './auth/oidc.js';
 import type { AuthProvider } from './auth/provider.js';
@@ -42,6 +52,8 @@ export interface Runtime {
   skillRegistry?: SkillRegistry;
   /** 会话沙箱管理器（按会话/集群复用、空闲 GC、会话关闭销毁）。 */
   sandboxes?: SandboxManager;
+  /** 可供模型选择的沙箱模板/profile 列表。 */
+  sandboxProfiles?: PublicSandboxProfile[];
   clusters: ClusterRegistry;
   audit: AuditSink;
   store: Store;
@@ -105,10 +117,12 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     : new AllowAllPolicy();
 
   let sandboxes: SandboxManager | undefined;
+  let sandboxProfiles: SandboxProfile[] = [];
   let warmPoolRef: WarmPool | undefined;
   let sandboxSweepTimer: ReturnType<typeof setInterval> | undefined;
   const desktops = new Map<string, Promise<DesktopHandle>>();
   if (config.sandbox?.enabled) {
+    sandboxProfiles = resolveSandboxProfiles(config.sandbox);
     const provider: SandboxProvider =
       config.sandbox.provider === 'local'
         ? new LocalSandboxProvider()
@@ -120,7 +134,7 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
             defaultImage: config.sandbox.defaultImage,
           })
         : new E2bProvider({ apiKey: config.sandbox.apiKey, domain: config.sandbox.domain });
-    logger.info({ provider: config.sandbox.provider }, 'sandbox provider selected');
+    logger.info({ provider: config.sandbox.provider, profiles: sandboxProfiles.map((profile) => profile.name) }, 'sandbox provider selected');
 
     // 预热池：仅在未配置集群时启用（集群需专用模板，避免发错沙箱）
     let warmPool: WarmPool | undefined;
@@ -146,7 +160,11 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
       void sweeper.sweep().catch((err) => logger.warn({ err: String(err) }, 'sandbox sweep failed'));
     }, sweepMs);
     sandboxSweepTimer.unref?.();
-    for (const t of buildSandboxTools(sandboxes)) tools.register(t);
+    const defaultProfile = selectDefaultProfile(sandboxProfiles);
+    const defaultResolver = (ctx: { sessionId: string }) =>
+      defaultProfile ? sandboxSpecForProfile(defaultProfile, ctx) : { key: ctx.sessionId };
+    for (const t of buildSandboxTools(sandboxes, defaultResolver)) tools.register(t);
+    for (const t of buildSandboxProfileTools(sandboxes, sandboxProfiles)) tools.register(t);
     logger.info({ sweepMs }, 'sandbox tools enabled');
     if (hasClusters) {
       tools.register(buildKubectlTool({ clusters, sandboxes, audit }));
@@ -155,16 +173,19 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
 
     // 桌面 / 浏览器工具：opensandbox 复用同一会话沙箱；local/e2b 保持各自后端。
     if (config.sandbox.desktop) {
+      const browserProfile = selectBrowserProfile(sandboxProfiles);
       const dp: DesktopProvider = config.sandbox.provider === 'local'
         ? new LocalDesktopProvider()
         : config.sandbox.provider === 'opensandbox'
           ? new OpenSandboxDesktopProvider(sandboxes)
           : new E2bDesktopProvider({ apiKey: config.sandbox.apiKey, domain: config.sandbox.domain });
       const resolve = (ctx: { sessionId: string }): Promise<DesktopHandle> => {
-        let d = desktops.get(ctx.sessionId);
+        const profile = browserProfile ?? findSandboxProfile(sandboxProfiles);
+        const spec = sandboxSpecForProfile(profile, ctx);
+        let d = desktops.get(spec.key);
         if (!d) {
-          d = dp.create({ key: ctx.sessionId, timeoutMs: config.sandbox!.timeoutMs });
-          desktops.set(ctx.sessionId, d);
+          d = dp.create(spec);
+          desktops.set(spec.key, d);
         }
         return d;
       };
@@ -242,6 +263,7 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     tools,
     skillRegistry,
     sandboxes,
+    sandboxProfiles: publicSandboxProfiles(sandboxProfiles),
     clusters,
     audit,
     store,

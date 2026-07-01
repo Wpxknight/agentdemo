@@ -27,7 +27,9 @@ OpenSandbox server 同时拉「普通沙箱」和「特权 netdiag 沙箱」。�
 > curl localhost:9013 / tcpdump 是 shell 命令，所以 netdiag 必须成为**默认会话沙箱**。
 > 方式 1 下即「让该 ops 部署的 `sandbox.defaultImage` = netdiag 镜像 + 特权全局模板」。
 
-运行期不要试图在普通主沙箱里 `kubectl apply` 本目录的模板来“升级”当前沙箱。聊天智能体拉起的 netdiag 运维沙箱与普通主沙箱是平级沙箱：普通沙箱不满足 netdiag 前置检查时，应由聊天智能体创建新的 netdiag 运维沙箱，再在新沙箱内重新执行检查和诊断。
+运行期不要试图在普通主沙箱里 `kubectl apply` 本目录的模板来“升级”当前沙箱。聊天智能体通过
+`sandbox_list_profiles` + `sandbox_ensure profile=netdiag` 拉起的 netdiag 运维沙箱与普通主沙箱是平级沙箱：
+普通沙箱不满足 netdiag 前置检查时，应由聊天智能体创建新的 netdiag 运维沙箱，再在新沙箱内重新执行检查和诊断。
 
 ## 部署步骤
 

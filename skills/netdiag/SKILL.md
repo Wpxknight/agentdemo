@@ -58,7 +58,8 @@ kubectl auth can-i get clusterroles
 `/etc/cni/net.d` 已挂载，
 三条 `kubectl auth can-i` 均为 `yes`。如果不是，说明当前仍在普通沙箱或旧沙箱里：
 
-1. 停止在当前沙箱继续诊断，由聊天智能体重新拉起 netdiag 运维沙箱；
+1. 停止在当前沙箱继续诊断；先调用 `sandbox_list_profiles` 确认存在 `netdiag`，再调用
+   `sandbox_ensure` 且 `profile=netdiag` 拉起/复用 netdiag 运维沙箱；
 2. 不要在当前主沙箱里执行 `kubectl apply -f deploy/opensandbox/netdiag-sandbox.yaml`、patch
    OpenSandbox server 或删除旧沙箱；
 3. 每个沙箱都是平级实例，主沙箱不能“升级”为运维沙箱；新 netdiag 运维沙箱就绪后，重新执行本节检查。

@@ -19,6 +19,13 @@ export interface SandboxSummary {
   key: string;
   status: 'ready';
   type: string;
+  profile?: string;
+  image?: string;
+  domain?: string;
+  namespace?: string;
+  serviceAccount?: string;
+  capabilities?: string[];
+  privileged?: boolean;
   sessionId: string;
   createdAt: string;
   lastUsedAt: string;
@@ -117,12 +124,24 @@ export class SandboxManager {
   list(): SandboxSummary[] {
     return [...this.entries.entries()].map(([key, entry]) => {
       const sessionId = entry.spec.metadata?.sessionId ?? key.split(':')[0] ?? key;
+      const profile = entry.spec.profile ?? entry.spec.metadata?.profile;
+      const capabilities = entry.spec.metadata?.capabilities
+        ?.split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
       return {
         id: entry.handle.sandboxId,
         sandboxId: entry.handle.sandboxId,
         key,
         status: 'ready',
-        type: entry.spec.template ?? (key.includes(':') ? 'cluster' : 'session'),
+        type: profile ?? entry.spec.template ?? (key.includes(':') ? 'cluster' : 'session'),
+        ...(profile ? { profile } : {}),
+        ...(entry.spec.template ? { image: entry.spec.template } : {}),
+        ...(entry.spec.domain ? { domain: entry.spec.domain } : {}),
+        ...(entry.spec.namespace ? { namespace: entry.spec.namespace } : {}),
+        ...(entry.spec.serviceAccount ? { serviceAccount: entry.spec.serviceAccount } : {}),
+        ...(capabilities?.length ? { capabilities } : {}),
+        ...(entry.spec.metadata?.privileged === 'true' ? { privileged: true } : {}),
         sessionId,
         createdAt: new Date(entry.createdAt).toISOString(),
         lastUsedAt: new Date(entry.lastUsed).toISOString(),

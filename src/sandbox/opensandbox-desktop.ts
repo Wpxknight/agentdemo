@@ -271,12 +271,12 @@ export class OpenSandboxDesktopProvider implements DesktopProvider {
   constructor(private readonly manager: SandboxManager) {}
 
   async create(spec: DesktopSpec): Promise<DesktopHandle> {
-    const handle = await this.manager.get({ key: spec.key, timeoutMs: spec.timeoutMs });
+    const handle = await this.manager.get({ ...spec });
     return new OpenSandboxDesktopHandle(handle);
   }
 
   async connect(sandboxId: string, spec: DesktopSpec): Promise<DesktopHandle> {
-    const handle = await this.manager.get({ key: spec.key, sandboxId, timeoutMs: spec.timeoutMs });
+    const handle = await this.manager.get({ ...spec, sandboxId });
     return new OpenSandboxDesktopHandle(handle);
   }
 }

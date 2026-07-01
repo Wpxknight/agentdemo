@@ -85,10 +85,14 @@ describe('netdiag sandbox manifest', () => {
   });
 
   it('keeps operations sandbox creation in the chat agent instead of main-sandbox kubectl apply', () => {
-    expect(skill).toContain('由聊天智能体重新拉起 netdiag 运维沙箱');
+    expect(skill).toContain('sandbox_list_profiles');
+    expect(skill).toContain('sandbox_ensure');
+    expect(skill).toContain('profile=netdiag');
     expect(skill).toContain('不要在当前主沙箱里执行 `kubectl apply -f deploy/opensandbox/netdiag-sandbox.yaml`');
     expect(skill).toContain('每个沙箱都是平级实例');
-    expect(readme).toContain('聊天智能体拉起的 netdiag 运维沙箱与普通主沙箱是平级沙箱');
+    expect(readme).toContain('sandbox_list_profiles');
+    expect(readme).toContain('sandbox_ensure profile=netdiag');
+    expect(readme).toContain('拉起的 netdiag 运维沙箱与普通主沙箱是平级沙箱');
   });
 
   it('patches OpenSandbox server to preserve privileged securityContext from the template', () => {

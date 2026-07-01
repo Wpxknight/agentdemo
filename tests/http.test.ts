@@ -14,6 +14,7 @@ import type { ChatModel, Msg, StreamEvent } from '../src/model/types.js';
 import { SkillRegistry } from '../src/skill/registry.js';
 import { SandboxManager } from '../src/sandbox/lifecycle.js';
 import { buildSandboxTools } from '../src/tools/builtin.js';
+import { buildSandboxProfileTools } from '../src/tools/sandbox-profiles.js';
 import type { ExecResult, SandboxHandle, SandboxProvider, SandboxSpec } from '../src/sandbox/types.js';
 
 /** 纯文本回答的 mock 模型（不发起工具调用）。 */
@@ -781,10 +782,30 @@ describe('HTTP server', () => {
     const manager = new SandboxManager({ provider });
     const tools = new ToolRegistry();
     for (const tool of buildSandboxTools(manager)) tools.register(tool);
+    const profiles = [
+      {
+        name: 'code',
+        description: '普通代码沙箱',
+        image: 'aiop/opensandbox-code:dev',
+        desktop: false,
+        privileged: false,
+        capabilities: ['python', 'shell'],
+      },
+      {
+        name: 'netdiag',
+        description: '网络排查沙箱',
+        image: 'aiop/opensandbox-netdiag:dev',
+        desktop: false,
+        privileged: true,
+        capabilities: ['kubectl', 'tcpdump'],
+      },
+    ];
+    for (const tool of buildSandboxProfileTools(manager, profiles)) tools.register(tool);
     const rt = {
       model,
       tools,
       sandboxes: manager,
+      sandboxProfiles: profiles,
       store: localStore,
       policy: new AllowAllPolicy(),
       policyPreApproved: new AllowAllPolicy(),
@@ -808,7 +829,7 @@ describe('HTTP server', () => {
       await fetch(`${sandboxBase}/v1/sandbox/run-command`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ sessionId: 'session-b', command: 'echo b' }),
+        body: JSON.stringify({ sessionId: 'session-b', profile: 'netdiag', command: 'echo b' }),
       });
 
       const listed = await fetch(`${sandboxBase}/v1/sandboxes`, {
@@ -817,11 +838,26 @@ describe('HTTP server', () => {
 
       expect(listed.status).toBe(200);
       const body = await listed.json() as {
-        sandboxes: Array<{ id: string; sandboxId: string; key: string; sessionId: string; status: string; type: string }>;
+        sandboxes: Array<{ id: string; sandboxId: string; key: string; sessionId: string; status: string; type: string; profile?: string; image?: string; privileged?: boolean }>;
+        profiles: Array<{ name: string; image?: string; capabilities: string[] }>;
       };
+      expect(body.profiles).toEqual([
+        expect.objectContaining({ name: 'code', image: 'aiop/opensandbox-code:dev', capabilities: ['python', 'shell'] }),
+        expect.objectContaining({ name: 'netdiag', image: 'aiop/opensandbox-netdiag:dev', capabilities: ['kubectl', 'tcpdump'] }),
+      ]);
       expect(body.sandboxes).toEqual([
         expect.objectContaining({ id: 'sandbox-1', sandboxId: 'sandbox-1', key: 'session-a', sessionId: 'session-a', status: 'ready', type: 'session' }),
-        expect.objectContaining({ id: 'sandbox-2', sandboxId: 'sandbox-2', key: 'session-b', sessionId: 'session-b', status: 'ready', type: 'session' }),
+        expect.objectContaining({
+          id: 'sandbox-2',
+          sandboxId: 'sandbox-2',
+          key: 'session-b:profile:netdiag',
+          sessionId: 'session-b',
+          status: 'ready',
+          type: 'netdiag',
+          profile: 'netdiag',
+          image: 'aiop/opensandbox-netdiag:dev',
+          privileged: true,
+        }),
       ]);
     } finally {
       await new Promise<void>((resolve) => sandboxServer.close(() => resolve()));

@@ -5,7 +5,14 @@
 
 export interface DesktopSpec {
   key: string;
+  profile?: string;
   sandboxId?: string;
+  template?: string;
+  domain?: string;
+  namespace?: string;
+  serviceAccount?: string;
+  metadata?: Record<string, string>;
+  envs?: Record<string, string>;
   timeoutMs?: number;
 }
 

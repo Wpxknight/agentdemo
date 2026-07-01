@@ -130,9 +130,12 @@ describe('local auth bootstrap', () => {
     try {
       expect(rt.tools.has('sbx__run_code')).toBe(true);
       expect(rt.tools.has('sbx__run_command')).toBe(true);
+      expect(rt.tools.has('sandbox_list_profiles')).toBe(true);
+      expect(rt.tools.has('sandbox_run_command')).toBe(true);
       expect(rt.tools.has('desktop_stream_url')).toBe(true);
       expect(rt.tools.has('browser_navigate')).toBe(true);
       expect(rt.tools.has('browser_screenshot')).toBe(true);
+      expect(rt.sandboxProfiles?.map((profile) => profile.name)).toEqual(['default']);
     } finally {
       await rt.dispose();
     }
@@ -148,7 +151,12 @@ describe('local auth bootstrap', () => {
         "domain": "opensandbox-server.opensandbox-system.svc:80",
         "protocol": "http",
         "desktop": true,
-        "defaultImage": "aiop/opensandbox-browser:latest"
+        "defaultImage": "aiop/opensandbox-browser:latest",
+        "profiles": {
+          "code": { "description": "代码沙箱", "image": "aiop/opensandbox-code:latest", "capabilities": ["python", "shell"] },
+          "browser": { "description": "浏览器沙箱", "image": "aiop/opensandbox-browser:latest", "desktop": true, "capabilities": ["browser", "screenshot"] },
+          "netdiag": { "description": "运维沙箱", "image": "aiop/opensandbox-netdiag:dev", "privileged": true, "capabilities": ["kubectl", "tcpdump"] }
+        }
       }
     }`);
 
@@ -156,9 +164,18 @@ describe('local auth bootstrap', () => {
     try {
       expect(rt.tools.has('sbx__run_code')).toBe(true);
       expect(rt.tools.has('sbx__run_command')).toBe(true);
+      expect(rt.tools.has('sandbox_list_profiles')).toBe(true);
+      expect(rt.tools.has('sandbox_ensure')).toBe(true);
+      expect(rt.tools.has('sandbox_run_code')).toBe(true);
+      expect(rt.tools.has('sandbox_run_command')).toBe(true);
       expect(rt.tools.has('desktop_stream_url')).toBe(true);
       expect(rt.tools.has('browser_navigate')).toBe(true);
       expect(rt.tools.has('browser_screenshot')).toBe(true);
+      expect(rt.sandboxProfiles).toEqual([
+        expect.objectContaining({ name: 'code', image: 'aiop/opensandbox-code:latest', capabilities: ['python', 'shell'] }),
+        expect.objectContaining({ name: 'browser', desktop: true, image: 'aiop/opensandbox-browser:latest' }),
+        expect.objectContaining({ name: 'netdiag', privileged: true, capabilities: ['kubectl', 'tcpdump'] }),
+      ]);
     } finally {
       await rt.dispose();
     }

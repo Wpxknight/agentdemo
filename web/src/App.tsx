@@ -37,7 +37,7 @@ import {
   User,
   X,
 } from 'lucide-react';
-import { NAV_ITEMS, defaultLlmConfig, fallbackSandboxes, fallbackTasks, fallbackTools } from './app-data';
+import { NAV_ITEMS, defaultLlmConfig, fallbackTasks, fallbackTools } from './app-data';
 import { createApi, randomId, readStorage, writeStorage } from './api';
 import { formatSandboxOutputChunk, parseSandboxOutput, sandboxOutputClassNames, sandboxOutputCommand, sandboxOutputLabels } from './sandbox-output';
 import type {
@@ -49,6 +49,7 @@ import type {
   Role,
   RuntimeModelConfig,
   SandboxSummary,
+  SandboxProfileSummary,
   SandboxesBody,
   ScheduleBody,
   ScheduleRunsBody,
@@ -188,7 +189,7 @@ function formatFileSize(size: number): string {
 function toolCategory(name: string): string {
   if (name === 'load_skill' || name.startsWith('skill__')) return 'skill';
   if (name.startsWith('mcp__')) return 'mcp';
-  if (name.startsWith('sbx__') || name.startsWith('browser_') || name === 'desktop_stream_url') return 'sandbox';
+  if (name.startsWith('sbx__') || name.startsWith('sandbox_') || name.startsWith('browser_') || name === 'desktop_stream_url') return 'sandbox';
   return 'builtin';
 }
 
@@ -214,6 +215,10 @@ function humanizeCron(cron: string): string {
 function resourceSummary(resources?: Record<string, string>): string {
   if (!resources) return '-';
   return [resources.cpu, resources.memory, resources.storage].filter(Boolean).join(' / ') || '-';
+}
+
+function listSummary(items?: string[]): string {
+  return items?.length ? items.join(' / ') : '-';
 }
 
 function readFileAsDataUrl(file: File): Promise<string> {
@@ -537,6 +542,7 @@ export default function App() {
   const [tools, setTools] = useState<ToolSummary[]>([]);
   const [tasks, setTasks] = useState<ScheduledTask[]>([]);
   const [sandboxes, setSandboxes] = useState<SandboxSummary[]>([]);
+  const [sandboxProfiles, setSandboxProfiles] = useState<SandboxProfileSummary[]>([]);
   const [llm, setLlm] = useState<RuntimeModelConfig>(defaultLlmConfig);
   const [settingsStatus, setSettingsStatus] = useState('');
   const [authStatus, setAuthStatus] = useState('');
@@ -620,6 +626,7 @@ export default function App() {
       if (target === 'sandbox') {
         const body = await api.get<SandboxesBody>('/v1/sandboxes');
         setSandboxes(body.sandboxes || []);
+        setSandboxProfiles(body.profiles || []);
       }
       if (target === 'settings') await loadLlmSettings();
     } catch (err) {
@@ -1142,7 +1149,7 @@ export default function App() {
             )}
             {activePage === 'mcp' && <McpPage tools={mcpTools} output={toolTestOutput} onTest={testMcpTool} />}
             {activePage === 'schedule' && <SchedulePage tasks={tasks.length ? tasks : fallbackTasks} api={api} />}
-            {activePage === 'sandbox' && <SandboxPage sandboxes={sandboxes.length ? sandboxes : fallbackSandboxes} />}
+            {activePage === 'sandbox' && <SandboxPage sandboxes={sandboxes} profiles={sandboxProfiles} />}
             {activePage === 'settings' && <SettingsPage llm={llm} status={settingsStatus} api={api} onLlmChange={setLlm} onStatus={setSettingsStatus} />}
           </section>
           </main>
@@ -1429,6 +1436,7 @@ function PrototypeSessionPanel({ sessions, total, hasMore, selectedSessionId, on
                     <Trash2 />
                   </button>
                 ) : null}
+                {session.sessionId ? <code className="prototype-session-id">{session.sessionId}</code> : null}
                 <p>{session.desc}</p>
               </div>
             );
@@ -2675,27 +2683,80 @@ function SchedulePage({ tasks, api }: { tasks: ScheduledTask[]; api: ReturnType<
   );
 }
 
-function SandboxPage({ sandboxes }: { sandboxes: SandboxSummary[] }) {
-  const selected = sandboxes[0] || fallbackSandboxes[0];
+function SandboxPage({ sandboxes, profiles }: { sandboxes: SandboxSummary[]; profiles: SandboxProfileSummary[] }) {
+  const selected = sandboxes[0];
   return (
     <>
       <PageTitle title="沙箱环境" desc="隔离的代码 / 命令执行环境" />
       <div className="toolbar">
-        <Badge variant="secondary"><CheckCircle2 />运行中</Badge>
+        <Badge variant="secondary"><CheckCircle2 />{sandboxes.length} 个运行中</Badge>
         <label className="search-box"><Search /><Input placeholder="搜索沙箱" /></label>
-        <Button>新建沙箱</Button>
+        <Button variant="outline">模板 {profiles.length}</Button>
       </div>
+      <section className="list-card sandbox-profile-card">
+        <div className="section-head compact">
+          <h2>支持的沙箱模板</h2>
+          <span>AI 会按任务能力选择 profile</span>
+        </div>
+        {profiles.length ? (
+          <div className="sandbox-profile-grid">
+            {profiles.map((profile) => (
+              <div key={profile.name} className="sandbox-profile-item">
+                <div>
+                  <strong>{profile.name}</strong>
+                  {profile.privileged ? <Badge variant="destructive">特权</Badge> : null}
+                  {profile.desktop ? <Badge variant="secondary">浏览器</Badge> : null}
+                </div>
+                <p>{profile.description}</p>
+                <code>{profile.image || profile.domain || '-'}</code>
+                <span>{listSummary(profile.capabilities)}</span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="empty-inline">暂无可用沙箱模板。</div>
+        )}
+      </section>
       <div className="two-pane">
         <section className="list-card">
-          <DataTable headers={['名称', '状态', '类型', '资源', '绑定会话', '创建时间']} rows={sandboxes.map((sandbox) => [sandbox.id, sandbox.status, sandbox.type || 'session', resourceSummary(sandbox.resources), sandbox.sessionId || '未绑定', formatDateTime(sandbox.createdAt)])} />
+          <DataTable
+            headers={['沙箱 ID', '状态', 'Profile', '镜像/模板', '绑定会话', 'Key', '活跃时间']}
+            rows={sandboxes.map((sandbox) => [
+              sandbox.id,
+              sandbox.status,
+              sandbox.profile || sandbox.type || 'session',
+              sandbox.image || sandbox.type || '-',
+              sandbox.sessionId || '未绑定',
+              sandbox.key || '-',
+              formatDateTime(sandbox.lastUsedAt || sandbox.createdAt),
+            ])}
+          />
+          {!sandboxes.length ? <div className="empty-inline">当前没有运行中的沙箱。</div> : null}
         </section>
         <aside className="detail-card">
-          <DetailPanel title={selected.id} status={selected.status} icon={<Cuboid />}>
-            <h3>基本信息</h3>
-            <div className="kv"><span>模板</span><strong>{selected.type || 'session'}</strong><span>资源</span><strong>{resourceSummary(selected.resources)}</strong></div>
-            <h3>连接信息</h3>
-            <div className="file-list"><span>Terminal /sandbox/{selected.id}/terminal</span><span>Browser /sandbox/{selected.id}/browser</span></div>
-          </DetailPanel>
+          {selected ? (
+            <DetailPanel title={selected.id} status={selected.status} icon={<Cuboid />}>
+              <h3>基本信息</h3>
+              <div className="kv">
+                <span>Profile</span><strong>{selected.profile || selected.type || 'session'}</strong>
+                <span>镜像/模板</span><strong>{selected.image || '-'}</strong>
+                <span>绑定会话</span><strong>{selected.sessionId || '未绑定'}</strong>
+                <span>Key</span><strong>{selected.key || '-'}</strong>
+                <span>Domain</span><strong>{selected.domain || '-'}</strong>
+                <span>权限</span><strong>{selected.privileged ? '特权' : '普通'}</strong>
+                <span>能力</span><strong>{listSummary(selected.capabilities)}</strong>
+                <span>资源</span><strong>{resourceSummary(selected.resources)}</strong>
+              </div>
+              <h3>连接信息</h3>
+              <div className="file-list"><span>Terminal /sandbox/{selected.id}/terminal</span><span>Browser /sandbox/{selected.id}/browser</span></div>
+            </DetailPanel>
+          ) : (
+            <div className="detail-empty">
+              <Cuboid />
+              <strong>暂无运行中沙箱</strong>
+              <p>对话调用沙箱工具后，这里会显示沙箱与会话绑定关系。</p>
+            </div>
+          )}
         </aside>
       </div>
     </>

@@ -17,6 +17,28 @@ export const McpServerSchema = z.object({
   headers: z.record(z.string(), z.string()).optional(),
 });
 
+export const SandboxProfileSchema = z.object({
+  /** 展示给模型和 UI 的用途说明。 */
+  description: z.string().optional(),
+  /** OpenSandbox image / E2B template。 */
+  image: z.string().optional(),
+  /** 兼容既有 SandboxSpec.template 命名。 */
+  template: z.string().optional(),
+  /** 指向独立 OpenSandbox/E2B 控制面，用于隔离普通/运维沙箱。 */
+  domain: z.string().optional(),
+  namespace: z.string().optional(),
+  serviceAccount: z.string().optional(),
+  /** 该 profile 是否适合作为浏览器/桌面沙箱。 */
+  desktop: z.boolean().optional(),
+  /** 仅用于展示和提示；真正权限边界由 OpenSandbox server PodTemplate/RBAC 决定。 */
+  privileged: z.boolean().default(false),
+  /** 供模型选择 profile 时参考的能力标签。 */
+  capabilities: z.array(z.string()).default([]),
+  /** 注入沙箱的环境变量。不要放敏感值；UI/API 不回显 env。 */
+  envs: z.record(z.string(), z.string()).optional(),
+  timeoutMs: z.number().int().positive().optional(),
+});
+
 export const SandboxConfigSchema = z.object({
   enabled: z.boolean().default(false),
   /** 沙箱后端：local（本地开发）、e2b 或 opensandbox（阿里开源，k8s 运行时）。 */
@@ -37,6 +59,8 @@ export const SandboxConfigSchema = z.object({
   desktop: z.boolean().default(false),
   /** 预热池大小（>0 时启用；仅未配置集群时生效，避免与集群专用模板冲突）。 */
   warmPoolSize: z.number().int().positive().optional(),
+  /** 可供模型选择的沙箱模板列表。缺省时自动生成 default profile。 */
+  profiles: z.record(z.string(), SandboxProfileSchema).optional(),
 });
 
 export const ClusterSchema = z.object({
@@ -109,3 +133,4 @@ export const ConfigSchema = z.object({
 
 export type Config = z.infer<typeof ConfigSchema>;
 export type ModelConfig = z.infer<typeof ModelConfigSchema>;
+export type SandboxConfig = z.infer<typeof SandboxConfigSchema>;

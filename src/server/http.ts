@@ -190,6 +190,10 @@ function sessionIdFromBody(body: Record<string, unknown>): string {
   return str(body, 'sessionId') ?? randomUUID();
 }
 
+function profileFromBody(body: Record<string, unknown>): string | undefined {
+  return str(body, 'profile') ?? str(body, 'sandboxProfile');
+}
+
 function intParam(value: string | null, fallback: number, min: number, max: number): number {
   const n = Number(value ?? '');
   if (!Number.isFinite(n)) return fallback;
@@ -516,7 +520,7 @@ async function handle(
 
   if (route === 'GET /v1/sandboxes') {
     await requireAuth(rt, req);
-    return sendJson(res, 200, { sandboxes: rt.sandboxes?.list() ?? [] });
+    return sendJson(res, 200, { sandboxes: rt.sandboxes?.list() ?? [], profiles: rt.sandboxProfiles ?? [] });
   }
 
   if (route === 'POST /v1/sandbox/run-code') {
@@ -527,7 +531,15 @@ async function handle(
     const args: Record<string, JsonValue> = { code };
     const language = str(body, 'language');
     if (language) args.language = language;
-    return sendJson(res, 200, await dispatchDirectTool(rt, ctx, sessionIdFromBody(body), 'sbx__run_code', args));
+    const profile = profileFromBody(body);
+    if (profile) args.profile = profile;
+    return sendJson(res, 200, await dispatchDirectTool(
+      rt,
+      ctx,
+      sessionIdFromBody(body),
+      profile ? 'sandbox_run_code' : 'sbx__run_code',
+      args,
+    ));
   }
 
   if (route === 'POST /v1/sandbox/run-command') {
@@ -535,7 +547,16 @@ async function handle(
     const body = await readJson(req);
     const command = str(body, 'command');
     if (!command) throw new HttpError(400, 'command 必填');
-    return sendJson(res, 200, await dispatchDirectTool(rt, ctx, sessionIdFromBody(body), 'sbx__run_command', { command }));
+    const args: Record<string, JsonValue> = { command };
+    const profile = profileFromBody(body);
+    if (profile) args.profile = profile;
+    return sendJson(res, 200, await dispatchDirectTool(
+      rt,
+      ctx,
+      sessionIdFromBody(body),
+      profile ? 'sandbox_run_command' : 'sbx__run_command',
+      args,
+    ));
   }
 
   if (route === 'POST /v1/browser/stream') {
@@ -754,7 +775,7 @@ async function handle(
 function toolCategory(name: string): string {
   if (name === 'load_skill' || name.startsWith('skill__')) return 'skill';
   if (name.startsWith('mcp__')) return 'mcp';
-  if (name.startsWith('sbx__') || name.startsWith('browser_') || name === 'desktop_stream_url') return 'sandbox';
+  if (name.startsWith('sbx__') || name.startsWith('sandbox_') || name.startsWith('browser_') || name === 'desktop_stream_url') return 'sandbox';
   if (name.includes('schedule')) return 'schedule';
   if (name === 'kubectl') return 'ops';
   return 'builtin';

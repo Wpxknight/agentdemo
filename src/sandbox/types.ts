@@ -18,6 +18,8 @@ export interface ExecResult {
 export interface SandboxSpec {
   /** 逻辑缓存键：同一 (session × cluster) 复用同一个沙箱。 */
   key: string;
+  /** 沙箱模板/profile 名称，用于 UI 展示和会话内多沙箱隔离。 */
+  profile?: string;
   /** 连接远端既有沙箱时提供其 id；不提供则新建。 */
   sandboxId?: string;
   /** 模板 / 镜像（动态拉起到集群内部时使用）。 */
