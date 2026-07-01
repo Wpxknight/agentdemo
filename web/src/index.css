@@ -2115,147 +2115,70 @@
     display: grid;
     place-items: center;
     padding: 24px;
-    background: rgba(15, 23, 42, .42);
-    backdrop-filter: blur(10px);
+    background: rgba(15, 23, 42, .18);
   }
 
   .confirm-dialog-panel {
-    width: min(520px, 100%);
-    border: 1px solid hsl(214 38% 82%);
+    width: min(460px, 100%);
+    border: 1px solid hsl(214 32% 86%);
     border-radius: 8px;
-    background: linear-gradient(180deg, #fff 0%, hsl(214 48% 98%) 100%);
-    box-shadow: 0 28px 80px rgba(15, 40, 80, .28);
-    padding: 18px;
+    background: #fff;
+    box-shadow: 0 18px 42px rgba(15, 23, 42, .16);
+    padding: 22px;
     display: grid;
-    grid-template-columns: 46px minmax(0, 1fr);
     gap: 16px;
-  }
-
-  .confirm-dialog-icon {
-    width: 46px;
-    height: 46px;
-    border-radius: 8px;
-    display: grid;
-    place-items: center;
-    background: hsl(var(--primary) / .1);
-    color: hsl(var(--primary));
-  }
-
-  .confirm-dialog-icon.danger {
-    background: hsl(0 82% 97%);
-    color: hsl(0 72% 42%);
-    box-shadow: inset 0 0 0 1px hsl(0 72% 88%);
-  }
-
-  .confirm-dialog-icon svg {
-    width: 21px;
-    height: 21px;
   }
 
   .confirm-dialog-copy {
     min-width: 0;
     display: grid;
-    gap: 9px;
-  }
-
-  .confirm-dialog-kicker {
-    width: fit-content;
-    border: 1px solid hsl(214 38% 84%);
-    border-radius: 999px;
-    background: hsl(214 45% 98%);
-    color: hsl(215 16% 42%);
-    padding: 3px 8px;
-    font-size: 11px;
-    font-weight: 750;
-    line-height: 1.2;
+    gap: 8px;
   }
 
   .confirm-dialog-copy h2 {
-    font-size: 18px;
-    line-height: 1.35;
-    color: hsl(217 33% 18%);
+    font-size: 17px;
+    line-height: 1.4;
+    font-weight: 760;
+    color: hsl(217 33% 16%);
   }
 
   .confirm-dialog-copy p {
     color: hsl(var(--muted-foreground));
     font-size: 13px;
-    line-height: 1.65;
+    line-height: 1.58;
   }
 
   .confirm-dialog-alert {
-    border: 1px solid hsl(38 92% 82%);
+    border: 1px solid hsl(38 88% 82%);
     border-radius: 8px;
-    background: hsl(43 92% 96%);
-    color: hsl(32 84% 28%);
-    display: grid;
-    grid-template-columns: 18px minmax(0, 1fr);
-    gap: 8px;
-    align-items: start;
-    padding: 9px 10px;
+    background: hsl(43 92% 97%);
+    color: hsl(32 84% 26%);
+    padding: 10px 12px;
     font-size: 12px;
     line-height: 1.55;
   }
 
-  .confirm-dialog-alert svg {
-    width: 16px;
-    height: 16px;
-    margin-top: 2px;
-  }
-
-  .confirm-dialog-meta {
-    margin: 2px 0 0;
-    display: grid;
-    gap: 8px;
-  }
-
-  .confirm-dialog-meta div {
-    min-height: 38px;
-    border: 1px solid hsl(214 38% 88%);
-    border-radius: 8px;
-    background: rgba(255, 255, 255, .78);
-    padding: 8px 10px;
-    display: grid;
-    grid-template-columns: 70px minmax(0, 1fr);
-    gap: 10px;
-    align-items: center;
-  }
-
-  .confirm-dialog-copy dt {
-    color: hsl(215 16% 48%);
-    font-size: 12px;
-    font-weight: 700;
-  }
-
-  .confirm-dialog-copy dd {
-    margin: 0;
-    color: hsl(217 33% 22%);
-    font-size: 13px;
-    font-weight: 650;
-  }
-
   .confirm-dialog-actions {
-    grid-column: 1 / -1;
     display: flex;
     justify-content: flex-end;
     gap: 10px;
-    border-top: 1px solid hsl(214 38% 88%);
+    border-top: 1px solid hsl(214 36% 89%);
     padding-top: 12px;
-    margin-top: 2px;
+    margin-top: 4px;
   }
 
   .confirm-dialog-actions button {
-    min-height: 36px;
+    min-height: 38px;
     border-radius: 8px;
-    padding: 0 14px;
+    padding: 0 15px;
     display: inline-flex;
     align-items: center;
-    gap: 7px;
     font-size: 13px;
     font-weight: 750;
   }
 
   .confirm-dialog-actions button.ghost {
-    border: 1px solid hsl(214 70% 88%);
+    border: 1px solid hsl(214 36% 86%);
     background: #fff;
     color: hsl(217 33% 22%);
   }
@@ -2268,12 +2191,24 @@
     border: 1px solid hsl(0 72% 45%);
     background: hsl(0 72% 45%);
     color: #fff;
-    box-shadow: 0 8px 20px hsl(0 72% 45% / .2);
+    box-shadow: 0 8px 18px hsl(0 72% 45% / .18);
   }
 
   .confirm-dialog-actions button.danger:hover:not(:disabled) {
     background: hsl(0 78% 38%);
     border-color: hsl(0 78% 38%);
+  }
+
+  .confirm-dialog-actions button.primary {
+    border: 1px solid hsl(var(--primary));
+    background: hsl(var(--primary));
+    color: hsl(var(--primary-foreground));
+    box-shadow: 0 8px 20px hsl(var(--primary) / .18);
+  }
+
+  .confirm-dialog-actions button.primary:hover:not(:disabled) {
+    background: hsl(214 89% 44%);
+    border-color: hsl(214 89% 44%);
   }
 
   .confirm-dialog-actions button:disabled {
@@ -2972,7 +2907,7 @@
     padding: 1px 0;
   }
 
-  .sandbox-output-line span {
+  .sandbox-output-line .sandbox-output-label {
     justify-content: flex-end;
     color: #60708f;
     font-size: 10px;
@@ -2998,6 +2933,64 @@
   .sandbox-output-line.error code {
     color: #fca5a5;
   }
+
+  .sandbox-output-line code .ansi-segment {
+    justify-content: initial;
+    color: inherit;
+    font: inherit;
+    font-size: inherit;
+    letter-spacing: 0;
+    text-transform: none;
+  }
+
+  .sandbox-output-line code .ansi-bold {
+    font-weight: 800;
+  }
+
+  .sandbox-output-line code .ansi-dim {
+    opacity: .72;
+  }
+
+  .sandbox-output-line code .ansi-italic {
+    font-style: italic;
+  }
+
+  .sandbox-output-line code .ansi-underline {
+    text-decoration: underline;
+  }
+
+  .sandbox-output-line code .ansi-fg-black { color: #111827; }
+  .sandbox-output-line code .ansi-fg-red { color: #f87171; }
+  .sandbox-output-line code .ansi-fg-green { color: #34d399; }
+  .sandbox-output-line code .ansi-fg-yellow { color: #facc15; }
+  .sandbox-output-line code .ansi-fg-blue { color: #60a5fa; }
+  .sandbox-output-line code .ansi-fg-magenta { color: #e879f9; }
+  .sandbox-output-line code .ansi-fg-cyan { color: #22d3ee; }
+  .sandbox-output-line code .ansi-fg-white { color: #f8fafc; }
+  .sandbox-output-line code .ansi-fg-bright-black { color: #94a3b8; }
+  .sandbox-output-line code .ansi-fg-bright-red { color: #fca5a5; }
+  .sandbox-output-line code .ansi-fg-bright-green { color: #86efac; }
+  .sandbox-output-line code .ansi-fg-bright-yellow { color: #fde047; }
+  .sandbox-output-line code .ansi-fg-bright-blue { color: #93c5fd; }
+  .sandbox-output-line code .ansi-fg-bright-magenta { color: #f0abfc; }
+  .sandbox-output-line code .ansi-fg-bright-cyan { color: #67e8f9; }
+  .sandbox-output-line code .ansi-fg-bright-white { color: #ffffff; }
+  .sandbox-output-line code .ansi-bg-black { background-color: #111827; }
+  .sandbox-output-line code .ansi-bg-red { background-color: rgba(248, 113, 113, .24); }
+  .sandbox-output-line code .ansi-bg-green { background-color: rgba(52, 211, 153, .22); }
+  .sandbox-output-line code .ansi-bg-yellow { background-color: rgba(250, 204, 21, .2); }
+  .sandbox-output-line code .ansi-bg-blue { background-color: rgba(96, 165, 250, .22); }
+  .sandbox-output-line code .ansi-bg-magenta { background-color: rgba(232, 121, 249, .22); }
+  .sandbox-output-line code .ansi-bg-cyan { background-color: rgba(34, 211, 238, .22); }
+  .sandbox-output-line code .ansi-bg-white { background-color: rgba(248, 250, 252, .22); }
+  .sandbox-output-line code .ansi-bg-bright-black { background-color: rgba(148, 163, 184, .2); }
+  .sandbox-output-line code .ansi-bg-bright-red { background-color: rgba(252, 165, 165, .24); }
+  .sandbox-output-line code .ansi-bg-bright-green { background-color: rgba(134, 239, 172, .22); }
+  .sandbox-output-line code .ansi-bg-bright-yellow { background-color: rgba(253, 224, 71, .22); }
+  .sandbox-output-line code .ansi-bg-bright-blue { background-color: rgba(147, 197, 253, .22); }
+  .sandbox-output-line code .ansi-bg-bright-magenta { background-color: rgba(240, 171, 252, .22); }
+  .sandbox-output-line code .ansi-bg-bright-cyan { background-color: rgba(103, 232, 249, .22); }
+  .sandbox-output-line code .ansi-bg-bright-white { background-color: rgba(255, 255, 255, .24); }
 
   .prototype-terminal-empty {
     color: #91a4c7;

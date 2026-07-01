@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatSandboxOutputChunk, parseSandboxOutput } from '../web/src/sandbox-output';
+import { formatSandboxOutputChunk, parseAnsiSegments, parseSandboxOutput } from '../web/src/sandbox-output';
 
 describe('sandbox terminal output formatting', () => {
   it('keeps each physical stdout line as a separate terminal row', () => {
@@ -64,6 +64,28 @@ describe('sandbox terminal output formatting', () => {
       ['stdout', '---192.110.0.20'],
       ['stderr', 'Nameserver limits were exceeded'],
       ['stdout', '=== OVS local summary ==='],
+    ]);
+  });
+
+  it('recognizes ANSI foreground colors without leaking escape characters', () => {
+    const entries = parseSandboxOutput(formatSandboxOutputChunk(
+      'stdout',
+      'plain \u001b[31mred\u001b[0m \u001b[1;32mok\u001b[22;39m done',
+    ));
+
+    expect(entries[0].text).toBe('plain red ok done');
+    expect(entries[0].segments).toEqual([
+      { text: 'plain ' },
+      { text: 'red', className: 'ansi-segment ansi-fg-red' },
+      { text: ' ' },
+      { text: 'ok', className: 'ansi-segment ansi-fg-green ansi-bold' },
+      { text: ' done' },
+    ]);
+  });
+
+  it('maps extended ANSI colors to safe inline styles', () => {
+    expect(parseAnsiSegments('\u001b[38;5;196mhot\u001b[0m')).toEqual([
+      { text: 'hot', className: 'ansi-segment', style: { color: 'rgb(255, 0, 0)' } },
     ]);
   });
 });

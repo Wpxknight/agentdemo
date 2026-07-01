@@ -31,7 +31,6 @@ import {
   Search,
   Send,
   Settings,
-  ShieldCheck,
   Terminal,
   TerminalSquare,
   Trash2,
@@ -94,6 +93,19 @@ const logoUrl = '/assets/logo.jpg';
 const aiAvatarUrl = logoUrl;
 const userAvatarUrl = '/assets/user-avatar.jpg';
 const SESSION_PAGE_SIZE = 20;
+
+type ConfirmDialogTone = 'danger' | 'warning' | 'info';
+
+interface ConfirmDialogRequest {
+  title: string;
+  description: string;
+  alert?: string;
+  confirmLabel: string;
+  busyLabel?: string;
+  cancelLabel?: string;
+  tone?: ConfirmDialogTone;
+  onConfirm: () => void | Promise<void>;
+}
 
 function sessionCategoryFor(session: SessionSummary) {
   const text = `${session.title} ${session.desc}`.toLowerCase();
@@ -542,7 +554,8 @@ export default function App() {
   const [sessionHasMore, setSessionHasMore] = useState(false);
   const [runningAgentCount, setRunningAgentCount] = useState(0);
   const [terminatingSession, setTerminatingSession] = useState(false);
-  const [showStopConfirm, setShowStopConfirm] = useState(false);
+  const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogRequest | null>(null);
+  const [confirmDialogBusy, setConfirmDialogBusy] = useState(false);
   const [skillShortcutDraft, setSkillShortcutDraft] = useState('');
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -689,9 +702,45 @@ export default function App() {
     await fetchSessionsPage(sessionOffset + SESSION_PAGE_SIZE, true);
   }
 
+  function requestConfirmDialog(request: ConfirmDialogRequest) {
+    if (confirmDialogBusy) return;
+    setConfirmDialog(request);
+  }
+
+  function cancelConfirmDialog() {
+    if (confirmDialogBusy) return;
+    setConfirmDialog(null);
+  }
+
+  async function runConfirmDialogAction() {
+    if (!confirmDialog || confirmDialogBusy) return;
+    setConfirmDialogBusy(true);
+    try {
+      await confirmDialog.onConfirm();
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setConfirmDialogBusy(false);
+      setConfirmDialog(null);
+    }
+  }
+
+  function requestDeleteSession(session: SessionSummary) {
+    if (!session.sessionId) return;
+    const sessionLabel = session.title || session.sessionId;
+    requestConfirmDialog({
+      title: `删除会话“${sessionLabel}”？`,
+      description: '删除后，这条会话记录和历史消息将从列表中移除。',
+      alert: '此操作不可恢复，请确认不再需要这条会话记录。',
+      confirmLabel: '确认删除',
+      busyLabel: '删除中',
+      tone: 'danger',
+      onConfirm: () => deleteSession(session),
+    });
+  }
+
   async function deleteSession(session: SessionSummary) {
     if (!session.sessionId) return;
-    if (!window.confirm(`确定删除会话“${session.title}”？`)) return;
     try {
       await api.delete<{ ok: boolean }>(`/v1/sessions/${encodeURIComponent(session.sessionId)}`);
       setSessions((current) => current.filter((item) => item.sessionId !== session.sessionId));
@@ -726,9 +775,17 @@ export default function App() {
     }
   }
 
-  async function confirmStopCurrentSession() {
-    setShowStopConfirm(false);
-    await terminateCurrentSession();
+  function requestStopCurrentSession() {
+    if (!sessionId || runningAgentCount <= 0 || terminatingSession) return;
+    requestConfirmDialog({
+      title: '确认停止当前任务？',
+      description: '停止后，当前会话正在执行的模型响应和工具调用会被中断。',
+      alert: '中断执行前请确认影响范围，已产生的消息和工具输出会保留。',
+      confirmLabel: '确认停止',
+      busyLabel: '停止中',
+      tone: 'danger',
+      onConfirm: terminateCurrentSession,
+    });
   }
 
   async function addAttachments(fileList: FileList | null) {
@@ -1030,9 +1087,9 @@ export default function App() {
           onToggleHistory={() => setHistoryOpen((value) => !value)}
           onTogglePreview={() => setPreviewOpen((value) => !value)}
           onNewSession={startNewSession}
-          onRequestStopSession={() => setShowStopConfirm(true)}
+          onRequestStopSession={requestStopCurrentSession}
           onSelectSession={selectSession}
-          onDeleteSession={(session) => void deleteSession(session)}
+          onDeleteSession={requestDeleteSession}
           onLoadMoreSessions={() => void loadNextSessionsPage()}
           onChooseAttachment={() => fileInputRef.current?.click()}
           onAddAttachments={(files) => void addAttachments(files)}
@@ -1058,12 +1115,11 @@ export default function App() {
           onRefreshPreview={() => void captureBrowserScreenshot()}
           onStartResize={startPreviewResize}
         />
-        <StopSessionConfirmDialog
-          open={showStopConfirm}
-          runningCount={runningAgentCount}
-          stopping={terminatingSession}
-          onConfirm={confirmStopCurrentSession}
-          onCancel={() => setShowStopConfirm(false)}
+        <ConfirmDialog
+          request={confirmDialog}
+          busy={confirmDialogBusy}
+          onConfirm={() => void runConfirmDialogAction()}
+          onCancel={cancelConfirmDialog}
         />
       </TooltipProvider>
     );
@@ -1081,6 +1137,7 @@ export default function App() {
                 tools={skillTools.length ? skillTools : fallbackTools.filter((tool) => tool.category === 'skill')}
                 api={api}
                 onImported={() => loadPageData('skills')}
+                onRequestConfirm={requestConfirmDialog}
               />
             )}
             {activePage === 'mcp' && <McpPage tools={mcpTools} output={toolTestOutput} onTest={testMcpTool} />}
@@ -1091,6 +1148,12 @@ export default function App() {
           </main>
         </div>
       </div>
+      <ConfirmDialog
+        request={confirmDialog}
+        busy={confirmDialogBusy}
+        onConfirm={() => void runConfirmDialogAction()}
+        onCancel={cancelConfirmDialog}
+      />
     </TooltipProvider>
   );
 }
@@ -1431,58 +1494,48 @@ function PrototypeChatHeader(props: {
   );
 }
 
-function StopSessionConfirmDialog(props: {
-  open: boolean;
-  runningCount: number;
-  stopping: boolean;
+function ConfirmDialog(props: {
+  request: ConfirmDialogRequest | null;
+  busy: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
   useEffect(() => {
-    if (!props.open) return;
+    if (!props.request) return;
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
-      if (event.key === 'Escape' && !props.stopping) props.onCancel();
+      if (event.key === 'Escape' && !props.busy) props.onCancel();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [props]);
 
-  if (!props.open) return null;
+  if (!props.request) return null;
+  const tone = props.request.tone || 'info';
   return (
-    <div className="confirm-dialog-backdrop" role="presentation" onMouseDown={props.stopping ? undefined : props.onCancel}>
+    <div className="confirm-dialog-backdrop" role="presentation" onMouseDown={props.busy ? undefined : props.onCancel}>
       <section
-        className="confirm-dialog-panel"
+        className={cn('confirm-dialog-panel', tone)}
         role="dialog"
         aria-modal="true"
-        aria-labelledby="stop-session-title"
-        aria-describedby="stop-session-desc"
+        aria-labelledby="confirm-dialog-title"
+        aria-describedby="confirm-dialog-desc"
         onMouseDown={(event) => event.stopPropagation()}
       >
-        <div className="confirm-dialog-icon danger"><CircleStop /></div>
         <div className="confirm-dialog-copy">
-          <span className="confirm-dialog-kicker">全局操作确认</span>
-          <h2 id="stop-session-title">确认停止当前任务？</h2>
-          <p id="stop-session-desc">停止后，当前会话正在执行的模型响应和工具调用会被中断。</p>
-          <div className="confirm-dialog-alert">
-            <ShieldCheck />
-            <span>中断执行前请确认影响范围，已产生的消息和工具输出会保留。</span>
-          </div>
-          <dl className="confirm-dialog-meta">
-            <div>
-              <dt>影响范围</dt>
-              <dd>{props.runningCount} 个运行中的任务</dd>
+          <h2 id="confirm-dialog-title">{props.request.title}</h2>
+          <p id="confirm-dialog-desc">{props.request.description}</p>
+          {props.request.alert ? (
+            <div className="confirm-dialog-alert">
+              <span>{props.request.alert}</span>
             </div>
-            <div>
-              <dt>会话状态</dt>
-              <dd>已产生的消息和工具输出会保留</dd>
-            </div>
-          </dl>
+          ) : null}
         </div>
         <div className="confirm-dialog-actions">
-          <button type="button" className="ghost" disabled={props.stopping} onClick={props.onCancel}>取消</button>
-          <button type="button" className="danger" disabled={props.stopping} onClick={props.onConfirm}>
-            <CircleStop />
-            {props.stopping ? '停止中' : '确认停止'}
+          <button type="button" className="ghost" disabled={props.busy} onClick={props.onCancel}>
+            {props.request.cancelLabel || '取消'}
+          </button>
+          <button type="button" className={tone === 'danger' ? 'danger' : 'primary'} disabled={props.busy} onClick={props.onConfirm}>
+            {props.busy ? props.request.busyLabel || '处理中' : props.request.confirmLabel}
           </button>
         </div>
       </section>
@@ -1755,8 +1808,8 @@ function PrototypeTerminal({ output }: { output: string }) {
       <div ref={outputRef} className="prototype-terminal-output">
         {entries.length ? entries.map((entry) => (
           <div key={entry.id} className={sandboxOutputClassNames[entry.kind]}>
-            <span>{sandboxOutputLabels[entry.kind]}</span>
-            <code>{entry.kind === 'command' ? `$ ${entry.text}` : entry.text}</code>
+            <span className="sandbox-output-label">{sandboxOutputLabels[entry.kind]}</span>
+            <code>{renderSandboxOutputSegments(entry)}</code>
           </div>
         )) : (
           <div className="prototype-terminal-empty">暂无沙箱输出。</div>
@@ -1764,6 +1817,15 @@ function PrototypeTerminal({ output }: { output: string }) {
       </div>
     </div>
   );
+}
+
+function renderSandboxOutputSegments(entry: ReturnType<typeof parseSandboxOutput>[number]) {
+  const segments = entry.kind === 'command' ? [{ text: `$ ${entry.text}` }] : entry.segments;
+  return segments.map((segment, index) => (
+    segment.className || segment.style
+      ? <span key={index} className={segment.className} style={segment.style}>{segment.text}</span>
+      : <Fragment key={index}>{segment.text}</Fragment>
+  ));
 }
 
 function ChatWorkbench(props: {
@@ -2057,8 +2119,8 @@ function BrowserPreviewPanel(props: {
       <div className="terminal">
         {parseSandboxOutput(props.sandboxOutput).map((entry) => (
           <div key={entry.id} className={sandboxOutputClassNames[entry.kind]}>
-            <span>{sandboxOutputLabels[entry.kind]}</span>
-            <code>{entry.kind === 'command' ? `$ ${entry.text}` : entry.text}</code>
+            <span className="sandbox-output-label">{sandboxOutputLabels[entry.kind]}</span>
+            <code>{renderSandboxOutputSegments(entry)}</code>
           </div>
         ))}
       </div>
@@ -2111,10 +2173,11 @@ function parentPathOf(path: string): string {
   return parts.slice(0, -1).join('/');
 }
 
-function SkillsPage({ tools, api, onImported }: {
+function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
   tools: ToolSummary[];
   api: ReturnType<typeof createApi>;
   onImported: () => Promise<void>;
+  onRequestConfirm: (request: ConfirmDialogRequest) => void;
 }) {
   const sourceTools = useMemo(
     () => (tools.length ? tools : fallbackTools.filter((tool) => tool.category === 'skill')),
@@ -2206,9 +2269,21 @@ function SkillsPage({ tools, api, onImported }: {
     }
   }
 
+  function requestDeleteSelectedSkill() {
+    if (!selectedName) return;
+    onRequestConfirm({
+      title: `删除技能 ${toolDisplayName(selectedName)}？`,
+      description: '删除后，该 Skill 目录会从服务端移除，AI 将无法继续加载它。',
+      alert: '此操作不可恢复，请确认已有备份或不再需要该技能。',
+      confirmLabel: '确认删除',
+      busyLabel: '删除中',
+      tone: 'danger',
+      onConfirm: deleteSelectedSkill,
+    });
+  }
+
   async function deleteSelectedSkill() {
     if (!selectedName) return;
-    if (!window.confirm(`确认删除技能 ${toolDisplayName(selectedName)}？此操作不可恢复。`)) return;
     setImportStatus('正在删除技能...');
     try {
       await api.delete<SkillActionBody>(`/v1/skills/${encodeURIComponent(selectedName)}`, { confirm: true });
@@ -2364,7 +2439,7 @@ function SkillsPage({ tools, api, onImported }: {
                 {isSkillEnabled(selected) ? <X data-icon="inline-start" /> : <Check data-icon="inline-start" />}
                 {isSkillEnabled(selected) ? '禁用' : '启用'}
               </Button>
-              <Button variant="outline" size="sm" type="button" onClick={() => void deleteSelectedSkill()}>
+              <Button variant="outline" size="sm" type="button" onClick={requestDeleteSelectedSkill}>
                 <Trash2 data-icon="inline-start" />
                 删除
               </Button>

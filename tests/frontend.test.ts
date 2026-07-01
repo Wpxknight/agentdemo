@@ -253,34 +253,56 @@ describe('frontend API wiring', () => {
     const css = await readFile('web/src/index.css', 'utf8');
 
     expect(app).toContain('CircleStop');
-    expect(app).toContain('StopSessionConfirmDialog');
-    expect(app).toContain('showStopConfirm');
-    expect(app).toContain('setShowStopConfirm(true)');
-    expect(app).toContain('confirmStopCurrentSession');
+    expect(app).toContain('ConfirmDialog');
+    expect(app).toContain('confirmDialog');
+    expect(app).toContain('requestStopCurrentSession');
     expect(app).toContain('terminateCurrentSession');
-    expect(app).toContain('onRequestStopSession={() => setShowStopConfirm(true)}');
-    expect(app).toContain('onConfirm={confirmStopCurrentSession}');
-    expect(app).toContain('onCancel={() => setShowStopConfirm(false)}');
+    expect(app).toContain('onRequestStopSession={requestStopCurrentSession}');
+    expect(app).toContain('onConfirm={() => void runConfirmDialogAction()}');
+    expect(app).toContain('onCancel={cancelConfirmDialog}');
     expect(app).toContain('onRequestStopSession: () => void');
     expect(app).toContain('aria-label="停止"');
     expect(app).toContain("'停止中'");
     expect(app).toContain("'停止'");
     expect(app).toContain('确认停止当前任务？');
     expect(app).toContain('停止后，当前会话正在执行的模型响应和工具调用会被中断。');
-    expect(app).toContain('className="confirm-dialog-kicker"');
     expect(app).toContain('className="confirm-dialog-alert"');
-    expect(app).toContain('className="confirm-dialog-meta"');
+    expect(app).not.toContain('className="confirm-dialog-icon"');
+    expect(app).not.toContain('className="confirm-dialog-kicker"');
+    expect(app).not.toContain('className="confirm-dialog-meta"');
     expect(app).toContain('中断执行');
     expect(app).not.toContain('终止会话');
     expect(app).toContain('`/v1/sessions/${encodeURIComponent(sessionId)}/terminate`');
+    const confirmBackdropRule = css.match(/\.confirm-dialog-backdrop\s*\{[\s\S]*?\n  \}/)?.[0] || '';
     expect(css).toContain('.confirm-dialog-backdrop');
     expect(css).toContain('.confirm-dialog-panel');
-    expect(css).toContain('.confirm-dialog-kicker');
+    expect(css).toContain('background: rgba(15, 23, 42, .18);');
+    expect(confirmBackdropRule).not.toContain('backdrop-filter');
     expect(css).toContain('.confirm-dialog-alert');
-    expect(css).toContain('.confirm-dialog-meta');
+    expect(css).not.toContain('.confirm-dialog-panel::before');
+    expect(css).not.toContain('.confirm-dialog-kicker');
+    expect(css).not.toContain('.confirm-dialog-meta');
+    expect(css).not.toContain('.confirm-dialog-icon');
+    expect(css).toContain('.confirm-dialog-actions button.primary');
     expect(css).toContain('.prototype-chat-actions button.danger');
     expect(css).toContain('font-size: 0;');
     expect(css).toContain('.confirm-dialog-actions');
+  });
+
+  it('uses page-styled confirmation dialogs instead of browser-native prompts', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(app).not.toMatch(/window\.(confirm|alert|prompt)/);
+    expect(app).toContain('requestDeleteSession');
+    expect(app).toContain('requestDeleteSelectedSkill');
+    expect(app).toContain("confirmLabel: '确认删除'");
+    expect(app).toContain('onRequestConfirm={requestConfirmDialog}');
+    expect(app).toContain('title: `删除会话“${sessionLabel}”？`');
+    expect(app).toContain('删除后，这条会话记录和历史消息将从列表中移除。');
+    expect(app).toContain('此操作不可恢复，请确认不再需要这条会话记录。');
+    expect(app).toContain('删除技能');
+    expect(app).not.toContain("kicker: '删除确认'");
+    expect(app).not.toContain("icon: 'delete'");
   });
 
   it('shows sandbox output as structured terminal entries and keeps the code runner collapsed', async () => {
@@ -299,10 +321,17 @@ describe('frontend API wiring', () => {
     expect(sandboxOutput).toContain('[stderr]');
     expect(app).toContain('sandboxOutputCommand');
     expect(app).toContain('terminalStats');
+    expect(app).toContain('renderSandboxOutputSegments');
+    expect(app).toContain('entry.segments');
+    expect(app).toContain('sandbox-output-label');
     expect(app).toContain('prototype-terminal-empty');
     expect(css).toContain('.sandbox-output-line.command');
     expect(css).toContain('.sandbox-output-line.stderr');
     expect(css).toContain('.sandbox-output-line.error');
+    expect(css).toContain('.sandbox-output-line .sandbox-output-label');
+    expect(css).toContain('.sandbox-output-line code .ansi-segment');
+    expect(css).toContain('.sandbox-output-line code .ansi-fg-red');
+    expect(css).toContain('.sandbox-output-line code .ansi-bg-blue');
     expect(css).toContain('.prototype-terminal-head');
     expect(css).toContain('display: block;');
     expect(css).toContain('white-space: pre');
@@ -462,7 +491,8 @@ describe('frontend API wiring', () => {
     expect(app).toContain('api.post<SkillActionBody>(`/v1/skills/${encodeURIComponent(selectedName)}/disable`');
     expect(app).toContain('api.post<SkillActionBody>(`/v1/skills/${encodeURIComponent(selectedName)}/enable`');
     expect(app).toContain('api.delete<SkillActionBody>(`/v1/skills/${encodeURIComponent(selectedName)}`');
-    expect(app).toContain('window.confirm');
+    expect(app).toContain('requestDeleteSelectedSkill');
+    expect(app).not.toContain('window.confirm');
     expect(app).toContain('readFileAsDataUrl(file)');
     expect(app).toContain('await onImported()');
     expect(app).toContain("setSelectedFile('SKILL.md')");
