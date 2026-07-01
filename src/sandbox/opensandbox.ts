@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { Sandbox } from '@alibaba-group/opensandbox';
 import type { ConnectionConfigOptions, Execution, ExecutionHandlers } from '@alibaba-group/opensandbox';
 import type {
@@ -30,6 +31,7 @@ export interface OpenSandboxProviderOptions {
 }
 
 const DEFAULT_IMAGE = 'opensandbox/code-interpreter:latest';
+const K8S_LABEL_VALUE = /^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$/;
 
 /** 语言 → 解释器二进制（runCode 经命令执行）。 */
 const INTERPRETERS: Record<string, string> = {
@@ -54,6 +56,27 @@ function toExecResult(exec: Execution): ExecResult {
     exitCode: exec.exitCode ?? undefined,
     error: exec.error ? `${exec.error.name}: ${exec.error.value}` : undefined,
   };
+}
+
+function safeK8sLabelValue(value: string): string {
+  if (K8S_LABEL_VALUE.test(value)) return value;
+  const hash = createHash('sha256').update(value).digest('hex').slice(0, 12);
+  const suffix = `-${hash}`;
+  const budget = 63 - suffix.length;
+  const normalized = value
+    .replace(/[^A-Za-z0-9_.-]+/g, '-')
+    .replace(/^[^A-Za-z0-9]+/, '')
+    .replace(/[^A-Za-z0-9]+$/, '');
+  const prefix = (normalized || 'value')
+    .slice(0, budget)
+    .replace(/[^A-Za-z0-9]+$/, '') || 'value';
+  return `${prefix}${suffix}`;
+}
+
+function safeMetadataValues(metadata: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(metadata).map(([key, value]) => [key, safeK8sLabelValue(value)]),
+  );
 }
 
 /** 把 OpenSandbox Sandbox 实例适配为统一的 SandboxHandle。 */
@@ -111,12 +134,12 @@ export class OpenSandboxProvider implements SandboxProvider {
   }
 
   async create(spec: SandboxSpec): Promise<SandboxHandle> {
-    const metadata = {
+    const metadata = safeMetadataValues({
       ...(spec.key ? { aiop_key: spec.key } : {}),
       ...spec.metadata,
       ...(spec.namespace ? { namespace: spec.namespace } : {}),
       ...(spec.serviceAccount ? { serviceAccount: spec.serviceAccount } : {}),
-    };
+    });
     const sbx = await Sandbox.create({
       connectionConfig: this.connConfig(spec),
       image: spec.template ?? this.opts.defaultImage ?? DEFAULT_IMAGE,

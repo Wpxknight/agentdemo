@@ -76,6 +76,32 @@ describe('OpenSandboxProvider', () => {
     expect(opts.connectionConfig.domain).toBe('host:8080');
   });
 
+  it('sanitizes metadata values before passing them to Kubernetes-backed OpenSandbox', async () => {
+    const p = new OpenSandboxProvider({ defaultImage: 'def:latest' });
+
+    await p.create({
+      key: '部署验证-netdiag:profile:netdiag',
+      metadata: {
+        sessionId: '部署验证-netdiag',
+        profile: 'netdiag',
+        privileged: 'true',
+        capabilities: 'kubectl,tcpdump',
+      },
+    });
+
+    const opts = h.created[0] as Record<string, any>;
+    const labelValue = /^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$/;
+    expect(opts.metadata.aiop_key).toMatch(labelValue);
+    expect(opts.metadata.aiop_key.length).toBeLessThanOrEqual(63);
+    expect(opts.metadata.aiop_key).not.toContain('部署验证');
+    expect(opts.metadata.sessionId).toMatch(labelValue);
+    expect(opts.metadata.sessionId).not.toBe('部署验证-netdiag');
+    expect(opts.metadata.capabilities).toMatch(labelValue);
+    expect(opts.metadata.capabilities).not.toContain(',');
+    expect(opts.metadata.profile).toBe('netdiag');
+    expect(opts.metadata.privileged).toBe('true');
+  });
+
   it('create falls back to defaultImage', async () => {
     const p = new OpenSandboxProvider({ defaultImage: 'def:latest' });
     await p.create({ key: 'k' });
