@@ -113,6 +113,16 @@ function str(o: Record<string, unknown>, key: string): string | undefined {
   return typeof v === 'string' ? v : undefined;
 }
 
+function newSessionId(): string {
+  return String(Date.now() * 1000 + Math.floor(Math.random() * 1000));
+}
+
+function sessionIdValue(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.trim()) return value.trim();
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return String(value);
+  return undefined;
+}
+
 function currentModelConfig(rt: Runtime): RuntimeModelConfig {
   return rt.modelConfig ?? {
     id: rt.model.id,
@@ -187,7 +197,7 @@ function parseEffort(value: string | undefined, current: RuntimeModelConfig['eff
 }
 
 function sessionIdFromBody(body: Record<string, unknown>): string {
-  return str(body, 'sessionId') ?? randomUUID();
+  return sessionIdValue(body.sessionId) ?? newSessionId();
 }
 
 function profileFromBody(body: Record<string, unknown>): string | undefined {
@@ -703,7 +713,7 @@ async function handle(
     const ctx = await requireAuth(rt, req);
     requirePermission(ctx, 'task:create');
     const body = await readJson(req);
-    const sessionId = str(body, 'sessionId') ?? randomUUID();
+    const sessionId = sessionIdFromBody(body);
     const cron = str(body, 'cron');
     const task = str(body, 'task');
     if (!cron || !task) throw new HttpError(400, 'cron/task 必填');
@@ -875,7 +885,7 @@ async function runAgentSse(
   const uploaded = attachmentPrompt(body);
   if (!rawTask && !uploaded) throw new HttpError(400, 'task 必填');
   const task = [rawTask || '请分析上传附件。', uploaded].filter(Boolean).join('\n\n');
-  const sessionId = str(body, 'sessionId') ?? randomUUID();
+  const sessionId = sessionIdFromBody(body);
 
   // 续接历史：加载该会话既有消息作为上下文
   const prior = await rt.store.listMessages(ctx, sessionId);

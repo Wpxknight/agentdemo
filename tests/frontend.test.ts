@@ -375,10 +375,15 @@ describe('frontend API wiring', () => {
   it('does not show sample sessions when the backend returns an empty history list', async () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
     const css = await readFile('web/src/index.css', 'utf8');
+    const api = await readFile('web/src/api.ts', 'utf8');
 
     expect(app).toContain('useState<SessionSummary[]>([])');
     expect(app).not.toContain('useState<SessionSummary[]>(fallbackSessions)');
     expect(app).not.toContain('(sessions.length ? sessions : fallbackSessions)');
+    expect(api).toContain('export function numericSessionId()');
+    expect(api).toContain('Date.now() * 1000');
+    expect(app).toContain("readStorage('aiop_session_id') || numericSessionId()");
+    expect(app).toContain('const id = numericSessionId();');
     expect(app).toContain('prototype-session-empty');
     expect(app).toContain('暂无会话记录');
     expect(css).toContain('.prototype-session-empty');
@@ -401,10 +406,16 @@ describe('frontend API wiring', () => {
     expect(app).toContain('AI 会按任务能力选择 profile');
     expect(app).toContain("headers={['沙箱 ID', '状态', 'Profile', '镜像/模板', '绑定会话', 'Key', '活跃时间']}");
     expect(app).toContain('sandbox.sessionId ||');
+    expect(app).toContain('const [selectedSandboxId, setSelectedSandboxId] = useState<string | null>(null)');
+    expect(app).toContain('selectedRowIndex={selectedIndex >= 0 ? selectedIndex : null}');
+    expect(app).toContain('onRowClick={(rowIndex) => setSelectedSandboxId(sandboxes[rowIndex]?.id ?? null)}');
+    expect(app).toContain('选择沙箱查看详情');
     expect(app).toContain('当前没有运行中的沙箱。');
     expect(app).toContain('暂无运行中沙箱');
+    expect(app).toContain('onKeyDown={onRowClick ? (event) =>');
     expect(css).toContain('.sandbox-profile-grid');
     expect(css).toContain('.sandbox-profile-item');
+    expect(css).toContain('.clickable-row');
     expect(css).toContain('.detail-empty');
     expect(css).toContain('.prototype-session-id');
   });

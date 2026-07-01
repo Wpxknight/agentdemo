@@ -1148,6 +1148,15 @@
     overflow-wrap: anywhere;
   }
 
+  .clickable-row {
+    cursor: pointer;
+  }
+
+  .clickable-row:focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: -2px;
+  }
+
   .section-head.compact {
     display: flex;
     align-items: center;

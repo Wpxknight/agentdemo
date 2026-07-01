@@ -45,3 +45,8 @@ export function randomId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
   return `session-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
+
+export function numericSessionId(): string {
+  const randomPart = Math.floor(Math.random() * 1000);
+  return String(Date.now() * 1000 + randomPart);
+}

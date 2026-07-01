@@ -38,7 +38,7 @@ import {
   X,
 } from 'lucide-react';
 import { NAV_ITEMS, defaultLlmConfig, fallbackTasks, fallbackTools } from './app-data';
-import { createApi, randomId, readStorage, writeStorage } from './api';
+import { createApi, numericSessionId, randomId, readStorage, writeStorage } from './api';
 import { formatSandboxOutputChunk, parseSandboxOutput, sandboxOutputClassNames, sandboxOutputCommand, sandboxOutputLabels } from './sandbox-output';
 import type {
   Attachment,
@@ -537,7 +537,7 @@ function MessageAvatar({ isUser }: { isUser: boolean }) {
 export default function App() {
   const [page, setPage] = useState<PageId | 'login'>(initialPage);
   const [token, setToken] = useState(() => readStorage('aiop_token'));
-  const [sessionId, setSessionId] = useState(() => readStorage('aiop_session_id') || randomId());
+  const [sessionId, setSessionId] = useState(() => readStorage('aiop_session_id') || numericSessionId());
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [tools, setTools] = useState<ToolSummary[]>([]);
   const [tasks, setTasks] = useState<ScheduledTask[]>([]);
@@ -697,7 +697,7 @@ export default function App() {
   }
 
   function startNewSession() {
-    const id = randomId();
+    const id = numericSessionId();
     setSessionId(id);
     writeStorage('aiop_session_id', id);
     setMessages(initialMessages.slice(0, 1));
@@ -2684,7 +2684,16 @@ function SchedulePage({ tasks, api }: { tasks: ScheduledTask[]; api: ReturnType<
 }
 
 function SandboxPage({ sandboxes, profiles }: { sandboxes: SandboxSummary[]; profiles: SandboxProfileSummary[] }) {
-  const selected = sandboxes[0];
+  const [selectedSandboxId, setSelectedSandboxId] = useState<string | null>(null);
+  const selectedIndex = sandboxes.findIndex((sandbox) => sandbox.id === selectedSandboxId);
+  const selected = selectedIndex >= 0 ? sandboxes[selectedIndex] : undefined;
+
+  useEffect(() => {
+    if (selectedSandboxId && !sandboxes.some((sandbox) => sandbox.id === selectedSandboxId)) {
+      setSelectedSandboxId(null);
+    }
+  }, [sandboxes, selectedSandboxId]);
+
   return (
     <>
       <PageTitle title="沙箱环境" desc="隔离的代码 / 命令执行环境" />
@@ -2730,6 +2739,8 @@ function SandboxPage({ sandboxes, profiles }: { sandboxes: SandboxSummary[]; pro
               sandbox.key || '-',
               formatDateTime(sandbox.lastUsedAt || sandbox.createdAt),
             ])}
+            selectedRowIndex={selectedIndex >= 0 ? selectedIndex : null}
+            onRowClick={(rowIndex) => setSelectedSandboxId(sandboxes[rowIndex]?.id ?? null)}
           />
           {!sandboxes.length ? <div className="empty-inline">当前没有运行中的沙箱。</div> : null}
         </section>
@@ -2753,8 +2764,8 @@ function SandboxPage({ sandboxes, profiles }: { sandboxes: SandboxSummary[]; pro
           ) : (
             <div className="detail-empty">
               <Cuboid />
-              <strong>暂无运行中沙箱</strong>
-              <p>对话调用沙箱工具后，这里会显示沙箱与会话绑定关系。</p>
+              <strong>{sandboxes.length ? '选择沙箱查看详情' : '暂无运行中沙箱'}</strong>
+              <p>{sandboxes.length ? '点击左侧沙箱行后，这里会展示 ID、类型、绑定会话和运行信息。' : '对话调用沙箱工具后，这里会显示沙箱与会话绑定关系。'}</p>
             </div>
           )}
         </aside>
@@ -2843,7 +2854,13 @@ function SettingsPage({ llm, status, api, onLlmChange, onStatus }: {
   );
 }
 
-function DataTable({ headers, rows }: { headers: string[]; rows: Array<Array<string>> }) {
+function DataTable({ headers, rows, selectedRowIndex, onRowClick }: {
+  headers: string[];
+  rows: Array<Array<string>>;
+  selectedRowIndex?: number | null;
+  onRowClick?: (rowIndex: number) => void;
+}) {
+  const effectiveSelectedRowIndex = selectedRowIndex === undefined ? 0 : selectedRowIndex;
   return (
     <Table>
       <TableHeader>
@@ -2851,7 +2868,20 @@ function DataTable({ headers, rows }: { headers: string[]; rows: Array<Array<str
       </TableHeader>
       <TableBody>
         {rows.map((row, rowIndex) => (
-          <TableRow key={row.join('-')} data-state={rowIndex === 0 ? 'selected' : undefined}>
+          <TableRow
+            key={row.join('-')}
+            className={onRowClick ? 'clickable-row' : undefined}
+            data-state={rowIndex === effectiveSelectedRowIndex ? 'selected' : undefined}
+            role={onRowClick ? 'button' : undefined}
+            tabIndex={onRowClick ? 0 : undefined}
+            onClick={onRowClick ? () => onRowClick(rowIndex) : undefined}
+            onKeyDown={onRowClick ? (event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                onRowClick(rowIndex);
+              }
+            } : undefined}
+          >
             {row.map((cell, cellIndex) => <TableCell key={`${cell}-${cellIndex}`}>{formatCell(cell)}</TableCell>)}
           </TableRow>
         ))}

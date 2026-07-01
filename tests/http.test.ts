@@ -233,6 +233,29 @@ describe('HTTP server', () => {
     expect(msgs.map((m) => m.role)).toContain('assistant');
   });
 
+  it('uses numeric session ids when the client omits or sends a numeric sessionId', async () => {
+    const generated = await fetch(`${base}/v1/agent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ task: 'numeric session please' }),
+    });
+    expect(generated.status).toBe(200);
+    const generatedBody = await generated.text();
+    const generatedSessionId = /event: session\ndata: (.+)\n/.exec(generatedBody)?.[1];
+    expect(generatedSessionId).toBeTruthy();
+    expect(JSON.parse(generatedSessionId!).sessionId).toMatch(/^\d+$/);
+
+    const numericInput = await fetch(`${base}/v1/agent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ task: 'numeric input', sessionId: 123456 }),
+    });
+    expect(numericInput.status).toBe(200);
+    const numericBody = await numericInput.text();
+    const numericSessionId = /event: session\ndata: (.+)\n/.exec(numericBody)?.[1];
+    expect(JSON.parse(numericSessionId!).sessionId).toBe('123456');
+  });
+
   it('streams thinking deltas over SSE and persists them separately', async () => {
     const localStore = new MemoryStore();
     await localStore.createTenant({ id: 'default', name: 'Default' });
