@@ -692,7 +692,7 @@ describe('HTTP server', () => {
     });
     tools.register({
       def: { name: 'desktop_stream_url', description: 'stream', inputSchema: { type: 'object' } },
-      run: async () => ({ id: '', content: '桌面流地址：http://stream.local/session' }),
+      run: async () => ({ id: '', content: '浏览器预览地址：http://stream.local/session' }),
     });
     tools.register({
       def: { name: 'browser_click', description: 'click', inputSchema: { type: 'object' } },
@@ -760,7 +760,7 @@ describe('HTTP server', () => {
       expect(stream.status).toBe(200);
       expect(await stream.json()).toMatchObject({
         ok: true,
-        result: { content: '桌面流地址：http://stream.local/session' },
+        result: { content: '浏览器预览地址：http://stream.local/session' },
       });
 
       const click = await fetch(`${sandboxBase}/v1/browser/click`, {
@@ -896,7 +896,7 @@ describe('HTTP server', () => {
     const tools = new ToolRegistry();
     tools.register({
       def: { name: 'desktop_stream_url', description: 'stream', inputSchema: { type: 'object' } },
-      run: async () => ({ id: '', content: '桌面流地址：data:text/html;charset=utf-8,%3Chtml%3E%3C%2Fhtml%3E' }),
+      run: async () => ({ id: '', content: '浏览器预览地址：data:text/html;charset=utf-8,%3Chtml%3E%3C%2Fhtml%3E' }),
     });
 
     const rt = {
@@ -925,7 +925,7 @@ describe('HTTP server', () => {
       expect(stream.status).toBe(200);
       expect(await stream.json()).toMatchObject({
         ok: true,
-        result: { content: '桌面流地址：/v1/browser/stream-view?sessionId=live-s1' },
+        result: { content: '浏览器预览地址：/v1/browser/stream-view?sessionId=live-s1' },
       });
 
       const view = await fetch(`${streamBase}/v1/browser/stream-view?sessionId=live-s1`);

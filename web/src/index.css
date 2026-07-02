@@ -987,7 +987,7 @@
     color: hsl(var(--foreground));
   }
 
-  .vnc-preview-frame {
+  .browser-preview-frame {
     display: block;
     width: 100%;
     height: 260px;

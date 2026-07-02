@@ -1680,7 +1680,7 @@ function PrototypeSandboxPanel(props: {
   onStartResize: (event: PointerEvent<HTMLButtonElement>) => void;
   onClose: () => void;
 }) {
-  const [activeTab, setActiveTab] = useState<'terminal' | 'vnc' | 'browser'>('terminal');
+  const [activeTab, setActiveTab] = useState<'terminal' | 'browser'>('terminal');
   const [code, setCode] = useState('print("hello from sandbox")');
   const [language, setLanguage] = useState('python');
   const [codeOpen, setCodeOpen] = useState(false);
@@ -1703,7 +1703,6 @@ function PrototypeSandboxPanel(props: {
       <div className="prototype-tabs">
         {[
           { key: 'terminal' as const, label: '终端', icon: Terminal },
-          { key: 'vnc' as const, label: 'VNC', icon: Monitor },
           { key: 'browser' as const, label: '浏览器预览', icon: Globe },
         ].map((tab) => (
           <button key={tab.key} type="button" className={cn(activeTab === tab.key && 'active')} onClick={() => setActiveTab(tab.key)}>
@@ -1754,13 +1753,6 @@ function PrototypeSandboxPanel(props: {
             </details>
             <PrototypeTerminal output={props.sandboxOutput} />
           </>
-        )}
-        {activeTab === 'vnc' && (
-          <div className="prototype-empty-preview">
-            <Monitor />
-            <strong>VNC 桌面预览</strong>
-            <span>连接到远程桌面。</span>
-          </div>
         )}
         {activeTab === 'browser' && (
           <div className="prototype-browser-card">
@@ -2114,7 +2106,7 @@ function BrowserPreviewPanel(props: {
         </CardHeader>
         <CardContent>
           {props.browserStreamUrl ? (
-            <iframe className="vnc-preview-frame" src={props.browserStreamUrl} title="浏览器预览" />
+            <iframe className="browser-preview-frame" src={props.browserStreamUrl} title="浏览器预览" />
           ) : (
             <div className="preview-empty">
               <Monitor />

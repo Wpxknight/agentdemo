@@ -131,6 +131,10 @@ describe('frontend API wiring', () => {
     expect(app).toContain('runSandboxCode');
     expect(app).toContain('openBrowserStream');
     expect(app).toContain('浏览器预览');
+    expect(app).toContain("useState<'terminal' | 'browser'>('terminal')");
+    expect(app).not.toContain("{ key: 'vnc'");
+    expect(app).not.toContain('VNC 桌面预览');
+    expect(app).not.toContain('vnc-preview-frame');
     expect(app).not.toContain("api.post('/v1/browser/navigate");
     expect(app).not.toContain("api.post('/v1/browser/click");
     expect(app).not.toContain("api.post('/v1/browser/type");

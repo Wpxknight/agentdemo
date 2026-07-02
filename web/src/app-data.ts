@@ -39,7 +39,7 @@ export const fallbackTasks: ScheduledTask[] = [
 ];
 
 export const fallbackSandboxes: SandboxSummary[] = [
-  { id: 'sandbox-prod', status: 'ready', type: 'session', resources: { cpu: '2 Core', memory: '4 Gi', storage: '50 Gi' }, sessionId: '#8124', createdAt: '2026-06-22T10:15:00+08:00', actions: ['打开终端', '打开 VNC', '打开浏览器'] },
+  { id: 'sandbox-prod', status: 'ready', type: 'session', resources: { cpu: '2 Core', memory: '4 Gi', storage: '50 Gi' }, sessionId: '#8124', createdAt: '2026-06-22T10:15:00+08:00', actions: ['打开终端', '打开浏览器预览'] },
   { id: 'sandbox-browser', status: 'starting', type: 'browser', resources: { cpu: '1 Core', memory: '2 Gi', storage: '20 Gi' }, sessionId: '未绑定', createdAt: '2026-06-22T09:02:00+08:00', actions: ['打开浏览器'] },
 ];
 

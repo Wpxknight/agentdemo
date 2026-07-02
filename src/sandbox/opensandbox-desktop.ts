@@ -177,8 +177,32 @@ if [ -z "$CHROME_BIN" ]; then
   echo "chromium/google-chrome is required for OpenSandbox browser tools" >&2
   exit 127
 fi
+if ! command -v Xvfb >/dev/null 2>&1; then
+  echo "Xvfb is required for headed OpenSandbox browser tools" >&2
+  exit 127
+fi
+if [ -z "$DISPLAY" ]; then
+  DISPLAY=":99"
+fi
+export DISPLAY
+DISPLAY_NUM="$(printf '%s' "$DISPLAY" | sed 's/^://')"
+if ! pgrep -f "Xvfb $DISPLAY" >/dev/null 2>&1; then
+  rm -f "/tmp/.X$DISPLAY_NUM-lock" "/tmp/.X11-unix/X$DISPLAY_NUM"
+  nohup Xvfb "$DISPLAY" -screen 0 1280x900x24 -nolisten tcp >/tmp/aiop-browser/xvfb.log 2>&1 &
+  echo $! >/tmp/aiop-browser/xvfb.pid
+fi
+for i in $(seq 1 50); do
+  if [ -S "/tmp/.X11-unix/X$DISPLAY_NUM" ]; then
+    break
+  fi
+  sleep 0.1
+done
+if [ ! -S "/tmp/.X11-unix/X$DISPLAY_NUM" ]; then
+  cat /tmp/aiop-browser/xvfb.log >&2 || true
+  echo "Xvfb display $DISPLAY did not become ready" >&2
+  exit 1
+fi
 nohup "$CHROME_BIN" \
-  --headless=new \
   --disable-gpu \
   --no-sandbox \
   --disable-dev-shm-usage \
@@ -241,7 +265,8 @@ class OpenSandboxDesktopHandle implements DesktopHandle {
 
   async kill(): Promise<void> {
     await this.handle.runCommand(
-      `if [ -f ${WORK_DIR}/chrome.pid ]; then kill "$(cat ${WORK_DIR}/chrome.pid)" >/dev/null 2>&1 || true; fi`,
+      `if [ -f ${WORK_DIR}/chrome.pid ]; then kill "$(cat ${WORK_DIR}/chrome.pid)" >/dev/null 2>&1 || true; fi
+if [ -f ${WORK_DIR}/xvfb.pid ]; then kill "$(cat ${WORK_DIR}/xvfb.pid)" >/dev/null 2>&1 || true; fi`,
       { timeoutMs: 5_000 },
     ).catch(() => {});
     this.chromeReady = false;

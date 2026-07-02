@@ -148,8 +148,8 @@ describe('browser tools', () => {
     const calls: string[] = [];
     const handle: DesktopHandle = {
       sandboxId: 'd1',
-      startStream: vi.fn(async () => 'https://vnc/url'),
-      streamUrl: () => 'https://vnc/url',
+      startStream: vi.fn(async () => 'https://browser-preview/url'),
+      streamUrl: () => 'https://browser-preview/url',
       launch: vi.fn(async (app: string, uri?: string) => {
         calls.push(`launch:${app}:${uri ?? ''}`);
       }),
@@ -170,7 +170,7 @@ describe('browser tools', () => {
     const tools = buildBrowserTools(async () => handle);
     const by = (n: string) => tools.find((t) => t.def.name === n)!;
 
-    expect((await by('desktop_stream_url').run({}, ctx)).content).toContain('https://vnc/url');
+    expect((await by('desktop_stream_url').run({}, ctx)).content).toContain('https://browser-preview/url');
     await by('browser_navigate').run({ url: 'https://e.com' }, ctx);
     await by('browser_click').run({ x: 10, y: 20 }, ctx);
     await by('browser_type').run({ text: 'hi' }, ctx);
@@ -179,7 +179,7 @@ describe('browser tools', () => {
     expect(calls).toEqual(['launch:google-chrome:https://e.com', 'click:10,20', 'type:hi']);
     expect(shot.content).toContain('3 字节');
     expect(shot.contentBlocks).toEqual([
-      { type: 'text', text: '截图已捕获（3 字节）。桌面流：https://vnc/url' },
+      { type: 'text', text: '截图已捕获（3 字节）。浏览器预览：https://browser-preview/url' },
       { type: 'image', mimeType: 'image/png', data: Buffer.from([1, 2, 3]).toString('base64') },
     ]);
   });

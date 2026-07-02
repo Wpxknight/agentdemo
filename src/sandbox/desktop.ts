@@ -1,5 +1,5 @@
 /**
- * 远端桌面（noVNC 流 + computer-use 操作）抽象。
+ * 远端浏览器预览 + computer-use 操作抽象。
  * 工具只依赖这些接口，由 E2bDesktopProvider（@e2b/desktop）或测试 mock 实现。
  */
 
@@ -18,7 +18,7 @@ export interface DesktopSpec {
 
 export interface DesktopHandle {
   readonly sandboxId: string;
-  /** 启动桌面流，返回 noVNC 页面 URL（前端 iframe 渲染）。 */
+  /** 启动浏览器预览，返回前端 iframe 渲染的页面 URL。 */
   startStream(): Promise<string>;
   streamUrl(): string;
   /** 启动应用（如 google-chrome）并可选打开 URL。 */

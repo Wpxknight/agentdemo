@@ -578,7 +578,7 @@ async function handle(
     if (result && typeof result === 'object' && !Array.isArray(result)) {
       const r = result as Record<string, unknown>;
       if (typeof r.content === 'string' && r.content.includes('data:text/html')) {
-        r.content = `桌面流地址：/v1/browser/stream-view?sessionId=${encodeURIComponent(sessionId)}`;
+        r.content = `浏览器预览地址：/v1/browser/stream-view?sessionId=${encodeURIComponent(sessionId)}`;
       }
     }
     return sendJson(res, 200, payload);

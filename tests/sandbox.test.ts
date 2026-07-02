@@ -340,6 +340,10 @@ describe('OpenSandboxDesktopProvider', () => {
     expect(handle.runCode).toHaveBeenCalledOnce();
     expect(handle.runCommand).toHaveBeenCalled();
     expect(handle.runCommand).toHaveBeenCalledWith(expect.stringContaining('/ms-playwright'), { timeoutMs: 30_000 });
+    const startCommand = vi.mocked(handle.runCommand).mock.calls[0]?.[0] as string;
+    expect(startCommand).toContain('Xvfb');
+    expect(startCommand).toContain('DISPLAY');
+    expect(startCommand).not.toContain('--headless');
     expect(desktop.sandboxId).toBe('shared-sandbox');
   });
 
