@@ -14,8 +14,12 @@ export interface RunAgentOptions {
   ctx: ToolContext;
   /** 流式事件回调（供 SSE 推前端 / 日志）。 */
   onEvent?: (e: StreamEvent) => void;
+  /** 当前运行中插入的新消息；在模型轮次边界被合并到上下文。 */
+  drainPendingMessages?: () => Msg[] | Promise<Msg[]>;
   /** 安全上限，防止工具循环失控。 */
   maxSteps?: number;
+  /** 模型连接失败重试间隔；默认 100ms，测试可设 0。 */
+  modelRetryDelayMs?: number;
   /** needApproval 时的审批门；缺省则直接拒绝。 */
   approval?: ApprovalGate;
   /** 当前运行的取消信号；由 HTTP 终止会话或客户端断开触发。 */
@@ -82,33 +86,55 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
 
   const system = buildSystemPrompt(opts.system);
   const maxSteps = opts.maxSteps ?? 20;
+  const maxModelAttempts = 10;
   let lastText = '';
   let steps = 0;
   const usage: Usage = { inputTokens: 0, outputTokens: 0 };
 
   while (steps < maxSteps) {
     throwIfAborted(opts.signal);
+    if (steps > 0) {
+      await drainPendingMessages(messages, opts);
+      throwIfAborted(opts.signal);
+    }
     steps++;
     let text = '';
     let thinking = '';
     const calls: ToolCall[] = [];
     const thinkingBlocks: { thinking: string; signature: string }[] = [];
 
-    for await (const ev of opts.model.stream({
-      system,
-      messages,
-      tools: opts.tools.defs(),
-      signal: opts.signal,
-    })) {
-      throwIfAborted(opts.signal);
-      opts.onEvent?.(ev);
-      if (ev.type === 'thinking_delta') thinking += ev.text;
-      else if (ev.type === 'thinking_block') thinkingBlocks.push({ thinking: ev.thinking, signature: ev.signature });
-      else if (ev.type === 'text_delta') text += ev.text;
-      else if (ev.type === 'tool_call') calls.push(ev.call);
-      else if (ev.type === 'usage') {
-        usage.inputTokens += ev.inputTokens;
-        usage.outputTokens += ev.outputTokens;
+    for (let attempt = 1; attempt <= maxModelAttempts; attempt++) {
+      let sawEvent = false;
+      try {
+        for await (const ev of opts.model.stream({
+          system,
+          messages,
+          tools: opts.tools.defs(),
+          signal: opts.signal,
+        })) {
+          sawEvent = true;
+          throwIfAborted(opts.signal);
+          opts.onEvent?.(ev);
+          if (ev.type === 'thinking_delta') thinking += ev.text;
+          else if (ev.type === 'thinking_block') thinkingBlocks.push({ thinking: ev.thinking, signature: ev.signature });
+          else if (ev.type === 'text_delta') text += ev.text;
+          else if (ev.type === 'tool_call') calls.push(ev.call);
+          else if (ev.type === 'usage') {
+            usage.inputTokens += ev.inputTokens;
+            usage.outputTokens += ev.outputTokens;
+          }
+        }
+        break;
+      } catch (err) {
+        throwIfAborted(opts.signal);
+        if (sawEvent || attempt >= maxModelAttempts) throw err;
+        opts.onEvent?.({
+          type: 'model_retry',
+          attempt: attempt + 1,
+          maxAttempts: maxModelAttempts,
+          error: errorMessage(err),
+        });
+        await sleep(opts.modelRetryDelayMs ?? 100, opts.signal);
       }
     }
     throwIfAborted(opts.signal);
@@ -122,7 +148,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
       toolCalls: calls.length ? calls : undefined,
     });
 
-    if (calls.length === 0) break;
+    if (calls.length === 0) {
+      const hadPending = await drainPendingMessages(messages, opts);
+      if (hadPending) continue;
+      break;
+    }
     throwIfAborted(opts.signal);
 
     const results = await Promise.all(
@@ -139,6 +169,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
   }
 
   return { messages, text: lastText, steps, usage };
+}
+
+async function drainPendingMessages(messages: Msg[], opts: RunAgentOptions): Promise<boolean> {
+  const pending = await opts.drainPendingMessages?.();
+  if (!pending?.length) return false;
+  messages.push(...pending);
+  return true;
 }
 
 /** 执行单个工具调用：Policy 校验 → 审批 → dispatch；返回回填给模型的 ToolResult。 */
@@ -181,4 +218,19 @@ function throwIfAborted(signal?: AbortSignal): void {
   const reason = signal.reason;
   if (reason instanceof Error) throw reason;
   throw new Error(typeof reason === 'string' && reason ? reason : '运行已终止');
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return;
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(signal.reason instanceof Error ? signal.reason : new Error('运行已终止'));
+    }, { once: true });
+  });
 }

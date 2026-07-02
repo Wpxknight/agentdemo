@@ -140,6 +140,101 @@ describe('runAgent', () => {
     expect(result.usage).toEqual({ inputTokens: 10, outputTokens: 5 });
   });
 
+  it('retries model connection failures before any stream event up to success', async () => {
+    let attempts = 0;
+    const seen: StreamEvent[] = [];
+    const model: ChatModel = {
+      id: 'flaky',
+      async *stream(): AsyncIterable<StreamEvent> {
+        attempts++;
+        if (attempts < 3) throw new Error(`connect ${attempts}`);
+        yield { type: 'text_delta', text: 'ok' };
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+
+    const result = await runAgent({
+      model,
+      tools: new ToolRegistry(),
+      policy: new AllowAllPolicy(),
+      ctx: { sessionId: 't1' },
+      task: 'go',
+      modelRetryDelayMs: 0,
+      onEvent: (event) => seen.push(event),
+    });
+
+    expect(attempts).toBe(3);
+    expect(seen.filter((event) => event.type === 'model_retry')).toEqual([
+      { type: 'model_retry', attempt: 2, maxAttempts: 10, error: 'connect 1' },
+      { type: 'model_retry', attempt: 3, maxAttempts: 10, error: 'connect 2' },
+    ]);
+    expect(result.text).toBe('ok');
+  });
+
+  it('does not retry a model failure after partial output', async () => {
+    let attempts = 0;
+    const model: ChatModel = {
+      id: 'partial-fail',
+      async *stream(): AsyncIterable<StreamEvent> {
+        attempts++;
+        yield { type: 'text_delta', text: 'partial' };
+        throw new Error('stream lost');
+      },
+    };
+
+    await expect(runAgent({
+      model,
+      tools: new ToolRegistry(),
+      policy: new AllowAllPolicy(),
+      ctx: { sessionId: 't1' },
+      task: 'go',
+      modelRetryDelayMs: 0,
+    })).rejects.toThrow('stream lost');
+    expect(attempts).toBe(1);
+  });
+
+  it('drains pending user messages before finishing the current run', async () => {
+    let turn = 0;
+    const seenTurns: Array<Array<[string, string | undefined]>> = [];
+    const model: ChatModel = {
+      id: 'pending-aware',
+      async *stream(input): AsyncIterable<StreamEvent> {
+        turn++;
+        seenTurns.push(input.messages.map((message) => [message.role, message.text]));
+        if (turn === 1) {
+          yield { type: 'text_delta', text: 'first' };
+        } else {
+          yield { type: 'text_delta', text: 'second' };
+        }
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+    let drained = false;
+
+    const result = await runAgent({
+      model,
+      tools: new ToolRegistry(),
+      policy: new AllowAllPolicy(),
+      ctx: { sessionId: 't1' },
+      task: 'original',
+      drainPendingMessages: () => {
+        if (drained) return [];
+        drained = true;
+        return [{ role: 'user', text: 'correction' }];
+      },
+    });
+
+    expect(turn).toBe(2);
+    expect(result.text).toBe('second');
+    expect(result.messages.map((message) => [message.role, message.text])).toEqual([
+      ['user', 'original'],
+      ['assistant', 'first'],
+      ['user', 'correction'],
+      ['assistant', 'second'],
+    ]);
+    expect(seenTurns[1]).toContainEqual(['user', 'correction']);
+  });
+
   it('keeps model thinking separate from assistant answer text', async () => {
     const seen: StreamEvent[] = [];
     const model: ChatModel = {

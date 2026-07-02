@@ -72,6 +72,8 @@ export type StreamEvent =
   | { type: 'tool_output'; toolId: string; stream: 'stdout' | 'stderr'; text: string }
   /** 单个工具调用执行完成（成功/失败），供前端实时标记任务进度。 */
   | { type: 'tool_result'; toolId: string; name: string; isError: boolean }
+  /** 模型连接在未产生任何输出前失败，agent 正在重试下一次连接。 */
+  | { type: 'model_retry'; attempt: number; maxAttempts: number; error: string }
   | { type: 'usage'; inputTokens: number; outputTokens: number }
   | { type: 'stop'; reason: string };
 
