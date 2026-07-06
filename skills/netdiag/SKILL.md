@@ -97,20 +97,34 @@ done
    tcpdump -ni any host <podIP> -c 50
    ```
 
-   **抓包必须配数据路径有向图**（ASCII 代码块）：每跳写清**哪个节点/Pod 的哪块网卡**
-   （Pod eth0 → veth/OVS 端口 → boc0 → 节点物理网卡 → … → 目标Pod eth0）；**请求链路与
-   应答链路分开各画一条**（应答是反向路径，可能走不同网卡，不能省略）；抓完把结果标回图上
-   （✓有包 / ✗缺包 / 未抓）并**标记第一个缺包点**——丢包环节就在「最后见包点 → 第一个缺包点」
-   之间。NodePort/ClusterIP 场景把 DNAT 前后地址变化标在箭头上。示例：
+   **抓包必须配数据路径图**（mermaid 代码块，上下两条泳道：上=请求链路、下=应答链路。
+   应答是反向路径、可能走不同网卡，不能省略）：每跳一个节点，写清**哪个节点/Pod 的哪块网卡**
+   （Pod eth0 → veth/OVS 端口 → boc0 → 节点物理网卡 → … → 目标Pod eth0）；抓完把结果标回
+   图上（✓有包 / ✗缺包 / 未抓，✗ 挂 `miss` 类、未抓挂 `skip` 类）并在**第一个缺包点**节点里
+   注明——丢包环节就在「最后见包点 → 第一个缺包点」之间。NodePort/ClusterIP 场景把 DNAT
+   前后地址变化标在箭头上（`-->|DNAT: nodeIP:30080→10.244.2.8:80|`）。示例：
 
-   ```
-   请求链路 srcPod(10.244.1.5) ⇒ dstPod(10.244.2.8)：
-   [源Pod eth0]✓ ──> [节点A veth:fab000aabbcc]✓ ──> [节点A boc0]✓ ──> [节点A ens192]✓
-       ──> [节点B ens192]✓ ──> [节点B boc0]✓ ──> [节点B veth:fab000ddeeff]✓ ──> [目标Pod eth0]✓
-
-   应答链路 dstPod(10.244.2.8) ⇒ srcPod(10.244.1.5)：
-   [目标Pod eth0]✓ ──> [节点B veth:fab000ddeeff]✓ ──> [节点B boc0]✓ ──> [节点B ens192]✗ ←第一个缺包点
-       ──> [节点A ens192]✗ ──> [节点A boc0]未抓 ──> [节点A veth:fab000aabbcc]未抓 ──> [源Pod eth0]✗
+   ```mermaid
+   flowchart TB
+     subgraph REQ["请求链路 srcPod(10.244.1.5) ⇒ dstPod(10.244.2.8)"]
+       direction LR
+       q1["源Pod eth0 ✓"] --> q2["节点A veth:fab000aabbcc ✓"]
+       q2 --> q3["节点A boc0 ✓"] --> q4["节点A ens192 ✓"]
+       q4 --> q5["节点B ens192 ✓"] --> q6["节点B boc0 ✓"]
+       q6 --> q7["节点B veth:fab000ddeeff ✓"] --> q8["目标Pod eth0 ✓"]
+     end
+     subgraph REP["应答链路 dstPod(10.244.2.8) ⇒ srcPod(10.244.1.5)"]
+       direction LR
+       r1["目标Pod eth0 ✓"] --> r2["节点B veth:fab000ddeeff ✓"]
+       r2 --> r3["节点B boc0 ✓"] --> r4["节点B ens192 ✗<br/>第一个缺包点"]
+       r4 --> r5["节点A ens192 ✗"] --> r6["节点A boc0 未抓"]
+       r6 --> r7["节点A veth:fab000aabbcc 未抓"] --> r8["源Pod eth0 ✗"]
+     end
+     REQ ~~~ REP
+     classDef miss fill:#fee2e2,stroke:#dc2626,color:#991b1b
+     classDef skip fill:#f1f5f9,stroke:#94a3b8,color:#64748b,stroke-dasharray:4 3
+     class r4,r5,r8 miss
+     class r6,r7 skip
    ```
 
 6. **conntrack**：`conntrack -L | grep <podIP>`；实时 `conntrack -E | grep <podIP>`。
@@ -153,7 +167,7 @@ done
 ## 汇总与安全约束
 
 - 汇报格式：**现象 → 定位环节（路由/流表/iptables/DNS/系统日志/组件）→ 证据（命令输出关键行）→ 结论与建议**。
-- 做过抓包必附**数据路径有向图**：网卡级路径、请求/应答链路各一条、标注 ✓/✗/未抓 和第一个缺包点。
+- 做过抓包必附**数据路径图**：mermaid 上下双泳道（上请求/下应答）、网卡级路径、标注 ✓/✗/未抓 和第一个缺包点。
 - 具体网络问题**必查相关节点 iptables**（legacy + nft 两套、filter + nat），并常规检查路由与系统日志。
 - 默认只读。抓包等产生流量的操作先说明再执行；`e2e network` 仅限用户明确要求集群巡检时执行。
 - 第 0 步的 `health fix --all --force` 是前置修复，发现异常直接执行并展示修复前后输出；

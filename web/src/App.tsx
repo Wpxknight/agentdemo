@@ -38,6 +38,7 @@ import {
   X,
 } from 'lucide-react';
 import { NAV_ITEMS, defaultLlmConfig, fallbackTasks, fallbackTools } from './app-data';
+import { MermaidDiagram } from './components/mermaid-diagram';
 import { createApi, numericSessionId, randomId, readStorage, writeStorage } from './api';
 import { formatSandboxOutputChunk, parseSandboxOutput, sandboxOutputClassNames, sandboxOutputCommand, sandboxOutputLabels } from './sandbox-output';
 import type {
@@ -539,6 +540,9 @@ const markdownComponents: Components = {
     const language = /language-([\w-]+)/.exec(className || '')?.[1];
     const codeText = String(children ?? '').replace(/\n$/, '');
     const isBlock = Boolean(language) || codeText.includes('\n');
+    if (language === 'mermaid') {
+      return <MermaidDiagram code={codeText} />;
+    }
     if (isBlock) {
       return (
         <div className="markdown-code-frame">

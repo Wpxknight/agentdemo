@@ -2678,6 +2678,68 @@
     background: #0f172a;
   }
 
+  .markdown-mermaid {
+    overflow-x: auto;
+    border: 1px solid hsl(var(--border));
+    border-radius: 10px;
+    background: #fff;
+    cursor: zoom-in;
+    margin: 0 0 10px;
+    padding: 14px;
+  }
+
+  .markdown-mermaid:hover {
+    border-color: hsl(var(--primary));
+  }
+
+  .markdown-mermaid svg {
+    display: block;
+    height: auto;
+    margin: 0 auto;
+    max-width: 100%;
+  }
+
+  .mermaid-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 90;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(15, 23, 42, .78);
+    cursor: zoom-out;
+    padding: 4vh 3vw;
+  }
+
+  .mermaid-overlay-canvas {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: auto;
+    max-width: 100%;
+    max-height: 100%;
+    border-radius: 14px;
+    background: #fff;
+    padding: 28px;
+  }
+
+  .mermaid-overlay-canvas svg {
+    width: min(88vw, 1400px);
+    height: auto;
+    max-width: none !important;
+    max-height: 84vh;
+  }
+
+  .mermaid-overlay-hint {
+    position: fixed;
+    bottom: 18px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: rgba(226, 232, 240, .85);
+    font-size: 12px;
+    pointer-events: none;
+  }
+
   .markdown-code-language {
     border-bottom: 1px solid rgba(148, 163, 184, .22);
     color: #cbd5e1;
