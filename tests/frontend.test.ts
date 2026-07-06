@@ -236,10 +236,16 @@ describe('frontend API wiring', () => {
     expect(css).toContain('.session-row-icon');
     expect(css).toContain('.message-avatar-image');
     expect(css).toContain('.composer-action-row');
-    expect(css).toContain('.messages-grid::before');
-    expect(css).toContain('.composer-shell::before');
     expect(css).toContain('.browser-preview-panel');
-    expect(css).toContain('linear-gradient(180deg, hsl(var(--background)) 0%, hsl(var(--muted)) 100%)');
+    // AIOS 设计系统（ui-design/）：主色 #5882FC、扁平工作台、50px 模块栏、Element 风格表格，无渐变/玻璃模糊装饰
+    expect(css).toContain('--primary: 225 96% 67%');
+    expect(css).toContain('--background: 218 40% 96%');
+    expect(css).toContain('grid-template-columns: 50px minmax(0, 1fr)');
+    expect(css).toContain('.aios-table');
+    expect(css).toContain('background: #f1f5fe');
+    expect(css).toContain('SimSun');
+    expect(css).not.toContain('linear-gradient');
+    expect(css).not.toContain('backdrop-filter');
   });
 
   it('supports composer attachments and enter-key submission ergonomics', async () => {

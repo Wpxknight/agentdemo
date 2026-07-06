@@ -3,36 +3,38 @@
 @tailwind utilities;
 
 @layer base {
+  /* AIOS Design System tokens（见 ui-design/aios-design-system.md）：
+     浅色工作台，主色 #5882FC 仅用于可点击/选中/链接/关键值，页面底色 #F1F4F9，边框 #DCDFE6。 */
   :root {
-    --background: 214 48% 97%;
-    --foreground: 220 37% 13%;
+    --background: 218 40% 96%; /* #F1F4F9 workbench page */
+    --foreground: 220 3% 39%; /* #606266 body text */
     --card: 0 0% 100%;
-    --card-foreground: 220 37% 13%;
+    --card-foreground: 220 3% 39%;
     --popover: 0 0% 100%;
-    --popover-foreground: 220 37% 13%;
-    --primary: 214 89% 47%;
+    --popover-foreground: 220 3% 39%;
+    --primary: 225 96% 67%; /* #5882FC */
     --primary-foreground: 0 0% 100%;
-    --secondary: 210 36% 94%;
-    --secondary-foreground: 220 37% 20%;
-    --muted: 211 39% 92%;
-    --muted-foreground: 216 16% 45%;
-    --accent: 190 68% 42%;
-    --accent-foreground: 0 0% 100%;
-    --destructive: 0 72% 55%;
+    --secondary: 200 12% 95%; /* #F2F4F5 active bg */
+    --secondary-foreground: 220 3% 39%;
+    --muted: 216 33% 97%; /* #F5F7FA */
+    --muted-foreground: 220 4% 58%; /* #909399 secondary info */
+    --accent: 0 0% 96%; /* #F5F5F5 hover surface */
+    --accent-foreground: 225 96% 67%;
+    --destructive: 0 87% 69%; /* #F56C6C */
     --destructive-foreground: 0 0% 100%;
-    --border: 214 32% 88%;
-    --input: 214 32% 88%;
-    --ring: 214 89% 47%;
-    --radius: 8px;
-    --surface-raised: rgba(255, 255, 255, .96);
-    --surface-muted: hsl(212 44% 97%);
-    --brand-soft: hsl(214 100% 97%);
-    --brand-border: hsl(214 92% 88%);
-    --brand-shadow: rgba(37, 99, 235, .13);
-    --focus-ring: rgba(15, 91, 216, .16);
+    --border: 222 17% 88%; /* #DCDFE6 */
+    --input: 222 17% 88%;
+    --ring: 225 96% 67%;
+    --radius: 6px; /* rounded-md = 4px 控件圆角；面板类显式用 10px */
+    --surface-raised: #ffffff;
+    --surface-muted: #f5f7fa;
+    --brand-soft: #eff3ff; /* info card bg */
+    --brand-border: rgba(88, 130, 252, .25);
+    --brand-shadow: rgba(88, 130, 252, .12);
+    --focus-ring: rgba(88, 130, 252, .16);
     --sandbox-width: 440px;
     color-scheme: light;
-    font-family: Inter, "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif;
+    font-family: Tahoma, Helvetica, Arial, Verdana, "Microsoft YaHei", SimSun, 宋体;
   }
 
   * {
@@ -43,8 +45,8 @@
   body {
     @apply m-0 text-foreground;
     min-width: 320px;
-    background: linear-gradient(180deg, hsl(var(--background)) 0%, hsl(var(--muted)) 100%);
-    font-size: 14px;
+    background: hsl(var(--background));
+    font-size: 13px;
   }
 
   body.resizing-preview {
@@ -67,14 +69,14 @@
   }
 
   h1 {
-    font-size: 23px;
-    line-height: 1.25;
-    font-weight: 750;
+    font-size: 16px;
+    line-height: 24px;
+    font-weight: 700;
     letter-spacing: 0;
   }
 
   h2 {
-    font-size: 18px;
+    font-size: 16px;
     line-height: 1.35;
     font-weight: 700;
   }
@@ -94,7 +96,7 @@
 
   * {
     scrollbar-width: thin;
-    scrollbar-color: hsl(214 28% 74%) transparent;
+    scrollbar-color: hsl(220 11% 78%) transparent;
   }
 
   *::-webkit-scrollbar {
@@ -107,7 +109,7 @@
   }
 
   *::-webkit-scrollbar-thumb {
-    background: hsl(214 28% 74%);
+    background: hsl(220 11% 78%);
     border: 2px solid transparent;
     border-radius: 999px;
     background-clip: padding-box;
@@ -118,42 +120,42 @@
   .app-shell {
     min-height: 100vh;
     display: grid;
-    grid-template-columns: 64px minmax(0, 1fr);
+    grid-template-columns: 50px minmax(0, 1fr);
   }
 
+  /* 主模块栏：50px 宽、白底、右侧 1px 分隔（AIOS primary module rail） */
   .sidebar {
     position: sticky;
     top: 0;
     height: 100vh;
-    background: rgba(255, 255, 255, .92);
-    border-right: 1px solid hsl(var(--border) / .78);
+    background: hsl(var(--card));
+    border-right: 1px solid hsl(var(--border));
     display: flex;
     flex-direction: column;
     align-items: center;
-    padding: 14px 0;
-    backdrop-filter: blur(14px);
+    padding: 8px 0;
   }
 
   .brand-mark {
-    width: 42px;
-    height: 42px;
-    border-radius: 8px;
+    width: 36px;
+    height: 36px;
+    border-radius: 4px;
     display: grid;
     place-items: center;
     color: hsl(var(--primary));
-    background: hsl(var(--primary) / .08);
-    box-shadow: inset 0 0 0 1px hsl(var(--primary) / .12);
+    background: var(--brand-soft);
+    box-shadow: inset 0 0 0 1px var(--brand-border);
   }
 
   .brand-logo {
-    width: 42px;
-    height: 42px;
-    border-radius: 8px;
+    width: 36px;
+    height: 36px;
+    border-radius: 4px;
     display: grid;
     place-items: center;
     overflow: hidden;
     background: var(--brand-soft);
-    box-shadow: inset 0 0 0 1px var(--brand-border), 0 4px 12px var(--brand-shadow);
+    box-shadow: inset 0 0 0 1px var(--brand-border);
     flex: 0 0 auto;
   }
 
@@ -178,37 +180,40 @@
   .nav-rail {
     display: flex;
     flex-direction: column;
-    gap: 10px;
-    align-items: center;
-    margin-top: 26px;
+    gap: 2px;
+    align-items: stretch;
+    align-self: stretch;
+    margin-top: 18px;
   }
 
+  /* 模块项：全宽命中区，活跃态用左侧 2px 主色边 + 浅底，不用圆角色块 */
   .nav-btn {
-    width: 42px;
-    height: 42px;
+    width: 100%;
+    height: 40px;
     border: 0;
-    border-radius: 8px;
+    border-left: 2px solid transparent;
+    border-radius: 0;
     background: transparent;
-    color: hsl(var(--muted-foreground));
+    color: hsl(var(--foreground));
     display: grid;
     place-items: center;
-    transition: background .14s ease, color .14s ease, transform .14s ease;
+    transition: background .15s ease, color .15s ease;
   }
 
   .nav-btn svg {
-    width: 20px;
-    height: 20px;
+    width: 18px;
+    height: 18px;
   }
 
   .nav-btn.active {
     color: hsl(var(--primary));
-    background: hsl(var(--primary) / .09);
-    box-shadow: inset 0 0 0 1px hsl(var(--primary) / .14);
+    background: hsl(var(--secondary));
+    border-left-color: hsl(var(--primary));
   }
 
   .nav-btn:hover {
-    background: hsl(var(--muted));
-    transform: translateY(-1px);
+    background: hsl(var(--accent));
+    color: hsl(var(--primary));
   }
 
   .sidebar-account {
@@ -217,8 +222,8 @@
   }
 
   .account-avatar-button {
-    width: 42px;
-    height: 42px;
+    width: 36px;
+    height: 36px;
     border: 0;
     border-radius: 999px;
     background: transparent;
@@ -239,9 +244,8 @@
 
   .account-avatar-button:hover,
   .account-avatar-button.active {
-    background: hsl(var(--primary) / .08);
-    box-shadow: 0 0 0 3px hsl(var(--primary) / .08);
-    transform: translateY(-1px);
+    background: hsl(var(--accent));
+    box-shadow: 0 0 0 2px var(--brand-border);
   }
 
   .account-popover {
@@ -250,9 +254,9 @@
     bottom: 0;
     width: 214px;
     border: 1px solid hsl(var(--border));
-    border-radius: 8px;
+    border-radius: 4px;
     background: var(--surface-raised);
-    box-shadow: 0 18px 48px rgba(15, 40, 80, .15);
+    box-shadow: 0 2px 12px 0 rgba(0, 0, 0, .1);
     padding: 10px;
     display: grid;
     gap: 10px;
@@ -311,8 +315,9 @@
     padding: 14px 16px;
   }
 
+  /* 管理列表页内容区：24px 水平、22px 垂直（AIOS list anatomy） */
   .content-wide {
-    padding: 24px 28px;
+    padding: 22px 24px;
   }
 
   .chat-layout {
@@ -334,15 +339,16 @@
     grid-template-columns: minmax(0, 1fr);
   }
 
+  /* 业务面板：白底、10px 圆角、#DCDFE6 边框（AIOS panel） */
   .session-drawer,
   .chat-panel,
   .browser-preview-panel,
   .list-card,
   .detail-card {
     background: var(--surface-raised);
-    border: 1px solid hsl(var(--border) / .9);
-    border-radius: 8px;
-    box-shadow: 0 12px 30px rgba(15, 40, 80, .055);
+    border: 1px solid hsl(var(--border));
+    border-radius: 10px;
+    box-shadow: 0 0 12px 0 rgba(0, 0, 0, .06);
   }
 
   .session-drawer {
@@ -427,8 +433,8 @@
   }
 
   .session-row.active {
-    border-color: hsl(var(--primary) / .26);
-    background: linear-gradient(90deg, hsl(214 100% 98%) 0%, hsl(214 100% 96%) 100%);
+    border-color: var(--brand-border);
+    background: var(--brand-soft);
     box-shadow: inset 3px 0 0 hsl(var(--primary));
   }
 
@@ -461,7 +467,7 @@
   }
 
   .session-row-icon.info {
-    background: hsl(214 100% 96%);
+    background: var(--brand-soft);
     color: hsl(var(--primary));
   }
 
@@ -494,13 +500,13 @@
     overflow: hidden;
     display: grid;
     grid-template-rows: auto minmax(0, 1fr) auto;
-    background: linear-gradient(180deg, #ffffff 0%, #fbfdff 100%);
+    background: #ffffff;
   }
 
   .panel-header {
-    padding: 18px 20px 14px;
-    border-bottom: 1px solid hsl(var(--border) / .7);
-    background: rgba(255, 255, 255, .9);
+    padding: 14px 20px 12px;
+    border-bottom: 1px solid hsl(var(--border));
+    background: #ffffff;
   }
 
   .header-actions,
@@ -516,18 +522,8 @@
   .messages-grid {
     position: relative;
     min-height: 100%;
-    padding: 18px 20px 18px;
-    background: linear-gradient(180deg, #fbfdff 0%, #f8fbff 100%);
-  }
-
-  .messages-grid::before {
-    content: "";
-    position: absolute;
-    inset: 0;
-    pointer-events: none;
-    background-image: linear-gradient(rgba(15, 91, 216, .028) 1px, transparent 1px), linear-gradient(90deg, rgba(15, 91, 216, .023) 1px, transparent 1px);
-    background-size: 30px 30px;
-    mask-image: linear-gradient(180deg, rgba(0,0,0,.48), transparent 70%);
+    padding: 16px 20px;
+    background: #ffffff;
   }
 
   .message {
@@ -598,16 +594,15 @@
 
   .bubble {
     width: 100%;
-    border: 1px solid hsl(var(--border) / .95);
+    border: 1px solid hsl(var(--border));
     border-radius: 8px;
-    background: rgba(255,255,255,.96);
-    padding: 14px 16px;
-    box-shadow: 0 8px 20px rgba(16, 24, 40, .045);
+    background: #ffffff;
+    padding: 12px 14px;
   }
 
   .message-user .bubble {
-    background: linear-gradient(180deg, #f7fbff 0%, #eef6ff 100%);
-    border-color: hsl(var(--primary) / .24);
+    background: var(--brand-soft);
+    border-color: var(--brand-border);
   }
 
   .bubble p + p {
@@ -681,6 +676,45 @@
 
   .retry-notice::before {
     content: '🔁';
+  }
+
+  /* Element 风格表格原语（AIOS）：表头底色、斑马纹、悬浮、单元格内边距统一由此持有，
+     组件不得再用工具类声明 th/td 的 padding、字重或行背景。 */
+  .aios-table {
+    font-size: 13px;
+  }
+
+  .aios-table th {
+    background: #f1f5fe;
+    padding: 12px 14px;
+    font-size: 12px;
+    font-weight: 700;
+    color: hsl(var(--foreground));
+  }
+
+  .aios-table td {
+    padding: 12px 14px;
+  }
+
+  .aios-table tbody tr {
+    border-color: #ebeef5;
+  }
+
+  .aios-table tbody tr:nth-child(odd) {
+    background: #fafafa;
+  }
+
+  .aios-table tbody tr:nth-child(even) {
+    background: #f1f5fe;
+  }
+
+  .aios-table tbody tr:hover {
+    background: #f5f5f5;
+  }
+
+  .aios-table tbody tr[data-state="selected"] {
+    background: rgba(88, 130, 252, .1);
+    box-shadow: inset 2px 0 0 hsl(var(--primary));
   }
 
   /* 任务进度：每个工具调用一步，实时标记完成/失败 */
@@ -828,30 +862,19 @@
 
   .composer-shell {
     position: relative;
-    margin: 12px 20px 18px;
-    border: 1px solid hsl(var(--primary) / .28);
-    border-radius: 8px;
-    padding: 11px;
+    margin: 12px 20px 16px;
+    border: 1px solid hsl(var(--border));
+    border-radius: 4px;
+    padding: 10px;
     display: grid;
-    gap: 9px;
-    background: rgba(255,255,255,.98);
-    box-shadow: 0 12px 26px rgba(15, 91, 216, .08);
+    gap: 8px;
+    background: #ffffff;
     overflow: hidden;
-  }
-
-  .composer-shell::before {
-    content: "";
-    position: absolute;
-    left: 0;
-    right: 0;
-    top: 0;
-    height: 2px;
-    background: linear-gradient(90deg, hsl(var(--primary)) 0%, hsl(var(--accent)) 100%);
   }
 
   .composer-shell:focus-within {
     border-color: hsl(var(--primary));
-    box-shadow: 0 0 0 3px var(--focus-ring), 0 14px 30px rgba(15, 91, 216, .10);
+    box-shadow: 0 0 0 2px var(--focus-ring);
   }
 
   .composer-main {
@@ -963,7 +986,7 @@
   .preview-tool {
     padding-top: 0;
     gap: 10px;
-    background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+    background: #ffffff;
   }
 
   .sandbox-tool [data-slot="card-header"],
@@ -997,7 +1020,7 @@
     color: hsl(var(--muted-foreground));
     border: 1px dashed hsl(var(--border));
     border-radius: 8px;
-    background: linear-gradient(180deg, #fbfdff 0%, #f5f9ff 100%);
+    background: #fafafa;
   }
 
   .preview-empty svg {
@@ -1020,7 +1043,7 @@
   }
 
   .terminal {
-    background: linear-gradient(180deg, #0b1220 0%, #101827 100%);
+    background: #101827;
     color: #d6e2ff;
     border-radius: 8px;
     padding: 14px;
@@ -1039,7 +1062,7 @@
     gap: 10px;
     margin-bottom: 12px;
     padding-bottom: 8px;
-    border-bottom: 1px solid hsl(214 70% 91%);
+    border-bottom: 1px solid hsl(var(--border));
   }
 
   .page-title h1,
@@ -1232,9 +1255,9 @@
 
   .sandbox-profile-item {
     min-width: 0;
-    border: 1px solid hsl(214 36% 88%);
+    border: 1px solid hsl(var(--border));
     border-radius: 8px;
-    background: hsl(214 45% 98%);
+    background: var(--surface-muted);
     padding: 12px;
     display: grid;
     gap: 7px;
@@ -1324,7 +1347,7 @@
     justify-content: space-between;
     gap: 16px;
     padding-bottom: 8px;
-    border-bottom: 1px solid hsl(214 70% 91%);
+    border-bottom: 1px solid hsl(var(--border));
   }
 
   .skill-import-status {
@@ -1349,7 +1372,7 @@
     border-radius: 8px;
     background: hsl(var(--card));
     overflow: hidden;
-    box-shadow: 0 12px 30px rgba(15, 40, 80, .055);
+    box-shadow: 0 0 12px 0 rgba(0, 0, 0, .06);
   }
 
   .skills-workbench.with-file-tree {
@@ -1428,11 +1451,11 @@
   .skill-list-item:hover,
   .skill-list-item.active {
     border-color: hsl(var(--primary) / .25);
-    box-shadow: 0 8px 22px rgba(15, 91, 216, .08);
+    box-shadow: 0 0 12px 0 rgba(0, 0, 0, .06);
   }
 
   .skill-list-item.active {
-    background: linear-gradient(90deg, hsl(214 100% 98%) 0%, #fff 100%);
+    background: var(--brand-soft);
   }
 
   .skill-list-icon,
@@ -1788,7 +1811,7 @@
     display: grid;
     place-items: center;
     padding: 28px;
-    background: linear-gradient(180deg, hsl(var(--background)) 0%, hsl(var(--muted)) 100%);
+    background: hsl(var(--background));
   }
 
   .login-card {
@@ -1796,7 +1819,7 @@
     border: 1px solid hsl(var(--border));
     border-radius: 8px;
     background: var(--surface-raised);
-    box-shadow: 0 26px 64px rgba(15, 45, 95, .14);
+    box-shadow: 0 0 12px 0 rgba(0, 0, 0, .12);
     padding: 30px;
   }
 
@@ -1824,7 +1847,7 @@
   .prototype-chat-page {
     height: 100vh;
     overflow: hidden;
-    background: linear-gradient(135deg, hsl(214 100% 98% / .82), #fff);
+    background: hsl(var(--background));
   }
 
   .management-page {
@@ -1876,7 +1899,7 @@
     width: 52px;
     min-width: 52px;
     background: #fff;
-    border-right: 1px solid hsl(214 70% 91%);
+    border-right: 1px solid hsl(var(--border));
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -1928,8 +1951,8 @@
   .prototype-session-panel {
     width: 260px;
     min-width: 260px;
-    background: hsl(214 32% 96% / .82);
-    border-right: 1px solid hsl(214 70% 91%);
+    background: var(--surface-muted);
+    border-right: 1px solid hsl(var(--border));
     display: flex;
     flex-direction: column;
     min-height: 0;
@@ -1971,7 +1994,7 @@
   .prototype-session-search input {
     width: 100%;
     height: 36px;
-    border: 1px solid hsl(214 90% 89%);
+    border: 1px solid var(--brand-border);
     border-radius: 10px;
     background: #fff;
     padding: 0 12px 0 32px;
@@ -2019,11 +2042,11 @@
 
   .prototype-session-item:hover {
     background: #fff;
-    border-color: hsl(214 90% 90%);
+    border-color: var(--brand-border);
   }
 
   .prototype-session-item.active {
-    background: linear-gradient(90deg, hsl(214 100% 97%), hsl(214 100% 95%));
+    background: var(--brand-soft);
     border-left: 3px solid hsl(var(--primary));
   }
 
@@ -2049,7 +2072,7 @@
   }
 
   .prototype-session-icon.info {
-    background: hsl(214 100% 96%);
+    background: var(--brand-soft);
     color: hsl(var(--primary));
   }
 
@@ -2120,9 +2143,9 @@
   .prototype-session-empty {
     min-height: 170px;
     margin: 4px 0;
-    border: 1px dashed hsl(214 50% 84%);
+    border: 1px dashed hsl(var(--border));
     border-radius: 12px;
-    background: linear-gradient(180deg, #fff 0%, hsl(214 45% 98%) 100%);
+    background: #fafafa;
     display: grid;
     align-content: center;
     justify-items: center;
@@ -2151,7 +2174,7 @@
   }
 
   .prototype-session-pagination {
-    border-top: 1px solid hsl(214 70% 91%);
+    border-top: 1px solid hsl(var(--border));
     padding: 10px 12px 0;
     display: flex;
     align-items: center;
@@ -2163,7 +2186,7 @@
 
   .prototype-session-pagination button {
     min-height: 30px;
-    border: 1px solid hsl(214 70% 88%);
+    border: 1px solid hsl(var(--border));
     border-radius: 8px;
     background: #fff;
     color: hsl(var(--primary));
@@ -2193,9 +2216,8 @@
     justify-content: space-between;
     gap: 14px;
     padding: 13px 20px;
-    border-bottom: 1px solid hsl(214 70% 91%);
-    background: rgba(255, 255, 255, .82);
-    backdrop-filter: blur(10px);
+    border-bottom: 1px solid hsl(var(--border));
+    background: #ffffff;
   }
 
   .prototype-chat-header > div:first-child {
@@ -2276,9 +2298,8 @@
   }
 
   .prototype-chat-actions button.primary {
-    background: linear-gradient(90deg, hsl(214 89% 52%), hsl(214 89% 44%));
+    background: hsl(var(--primary));
     color: white;
-    box-shadow: 0 5px 16px hsl(var(--primary) / .22);
   }
 
   .confirm-dialog-backdrop {
@@ -2293,7 +2314,7 @@
 
   .confirm-dialog-panel {
     width: min(460px, 100%);
-    border: 1px solid hsl(214 32% 86%);
+    border: 1px solid hsl(var(--border));
     border-radius: 8px;
     background: #fff;
     box-shadow: 0 18px 42px rgba(15, 23, 42, .16);
@@ -2335,7 +2356,7 @@
     display: flex;
     justify-content: flex-end;
     gap: 10px;
-    border-top: 1px solid hsl(214 36% 89%);
+    border-top: 1px solid hsl(var(--border));
     padding-top: 12px;
     margin-top: 4px;
   }
@@ -2351,13 +2372,13 @@
   }
 
   .confirm-dialog-actions button.ghost {
-    border: 1px solid hsl(214 36% 86%);
+    border: 1px solid hsl(var(--border));
     background: #fff;
     color: hsl(217 33% 22%);
   }
 
   .confirm-dialog-actions button.ghost:hover:not(:disabled) {
-    background: hsl(214 45% 97%);
+    background: var(--surface-muted);
   }
 
   .confirm-dialog-actions button.danger {
@@ -2380,8 +2401,8 @@
   }
 
   .confirm-dialog-actions button.primary:hover:not(:disabled) {
-    background: hsl(214 89% 44%);
-    border-color: hsl(214 89% 44%);
+    background: hsl(var(--primary));
+    border-color: hsl(var(--primary));
   }
 
   .confirm-dialog-actions button:disabled {
@@ -2432,7 +2453,7 @@
 
   .prototype-bubble {
     width: 100%;
-    border: 1px solid hsl(214 70% 91%);
+    border: 1px solid hsl(var(--border));
     background: #fff;
     color: hsl(217 33% 28%);
     border-radius: 16px;
@@ -2447,14 +2468,13 @@
     border-color: transparent;
     border-top-left-radius: 16px;
     border-top-right-radius: 4px;
-    background: linear-gradient(135deg, hsl(214 89% 55%), hsl(214 89% 44%));
-    box-shadow: 0 8px 20px hsl(var(--primary) / .18);
+    background: hsl(var(--primary));
   }
 
   .prototype-running-indicator {
     margin-top: 10px;
     min-height: 28px;
-    border-top: 1px solid hsl(214 70% 91%);
+    border-top: 1px solid hsl(var(--border));
     padding-top: 10px;
     display: flex;
     align-items: center;
@@ -2558,22 +2578,22 @@
   }
 
   .markdown-body blockquote {
-    border-left: 3px solid hsl(214 89% 55%);
+    border-left: 3px solid hsl(var(--primary));
     color: hsl(215 16% 38%);
     padding: 2px 0 2px 12px;
   }
 
   .markdown-link {
-    color: hsl(214 89% 44%);
+    color: hsl(var(--primary));
     font-weight: 650;
     text-decoration: underline;
     text-underline-offset: 3px;
   }
 
   .markdown-inline-code {
-    border: 1px solid hsl(214 70% 88%);
+    border: 1px solid hsl(var(--border));
     border-radius: 5px;
-    background: hsl(214 70% 96%);
+    background: var(--brand-soft);
     color: hsl(217 82% 28%);
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
     font-size: .9em;
@@ -2626,13 +2646,13 @@
 
   .markdown-body th,
   .markdown-body td {
-    border: 1px solid hsl(214 45% 86%);
+    border: 1px solid hsl(var(--border));
     padding: 7px 9px;
     text-align: left;
   }
 
   .markdown-body th {
-    background: hsl(214 70% 96%);
+    background: var(--brand-soft);
     color: hsl(217 33% 22%);
   }
 
@@ -2667,7 +2687,7 @@
   }
 
   .prototype-composer {
-    border-top: 1px solid hsl(214 70% 91%);
+    border-top: 1px solid hsl(var(--border));
     background: #fff;
     padding: 14px 20px 12px;
     position: relative;
@@ -2678,10 +2698,10 @@
     left: 20px;
     right: 20px;
     bottom: calc(100% - 6px);
-    border: 1px solid hsl(214 70% 88%);
+    border: 1px solid hsl(var(--border));
     border-radius: 8px;
     background: #fff;
-    box-shadow: 0 18px 42px rgba(15, 40, 80, .14);
+    box-shadow: 0 2px 12px 0 rgba(0, 0, 0, .1);
     padding: 6px;
     display: grid;
     gap: 4px;
@@ -2740,8 +2760,8 @@
     display: flex;
     align-items: flex-end;
     gap: 8px;
-    border: 1px solid hsl(214 70% 91%);
-    background: hsl(214 32% 96%);
+    border: 1px solid hsl(var(--border));
+    background: var(--surface-muted);
     border-radius: 16px;
     padding: 8px;
     transition: border-color .16s ease, box-shadow .16s ease;
@@ -2770,9 +2790,8 @@
   }
 
   .prototype-input-box button.send {
-    background: linear-gradient(135deg, hsl(214 89% 52%), hsl(214 89% 44%));
+    background: hsl(var(--primary));
     color: white;
-    box-shadow: 0 6px 16px hsl(var(--primary) / .2);
   }
 
   .prototype-input-box textarea {
@@ -2791,8 +2810,8 @@
     width: var(--sandbox-width);
     min-width: 280px;
     max-width: 760px;
-    background: hsl(214 32% 96% / .82);
-    border-left: 1px solid hsl(214 70% 91%);
+    background: var(--surface-muted);
+    border-left: 1px solid hsl(var(--border));
     position: relative;
     display: flex;
     flex-direction: column;
@@ -2846,7 +2865,7 @@
     display: flex;
     gap: 0;
     padding: 0 16px;
-    border-bottom: 1px solid hsl(214 70% 91%);
+    border-bottom: 1px solid hsl(var(--border));
   }
 
   .prototype-tabs button {
@@ -2891,7 +2910,7 @@
   .prototype-code-card,
   .prototype-browser-card {
     background: #fff;
-    border: 1px solid hsl(214 70% 91%);
+    border: 1px solid hsl(var(--border));
     border-radius: 12px;
     box-shadow: 0 1px 3px rgba(15, 23, 42, .04);
     overflow: hidden;
@@ -2902,7 +2921,7 @@
   .prototype-browser-card > div:first-child,
   .prototype-terminal-head {
     min-height: 42px;
-    border-bottom: 1px solid hsl(214 70% 95%);
+    border-bottom: 1px solid hsl(var(--border));
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -2953,7 +2972,7 @@
   .prototype-language-select {
     height: 28px;
     min-width: 112px;
-    background: hsl(214 32% 96%);
+    background: var(--surface-muted);
   }
 
   .prototype-code-card textarea {
@@ -2978,7 +2997,7 @@
     border: 0;
     border-radius: 10px;
     color: #fff;
-    background: linear-gradient(90deg, hsl(214 89% 52%), hsl(214 89% 44%));
+    background: hsl(var(--primary));
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -2993,9 +3012,9 @@
 
   .prototype-browser-card button {
     min-height: 32px;
-    border: 1px solid hsl(214 70% 91%);
+    border: 1px solid hsl(var(--border));
     border-radius: 8px;
-    background: hsl(214 32% 96%);
+    background: var(--surface-muted);
     color: hsl(var(--foreground));
     display: inline-flex;
     align-items: center;
@@ -3008,7 +3027,7 @@
     width: calc(100% - 24px);
     height: clamp(420px, calc(100vh - 260px), 760px);
     margin: 12px;
-    border: 1px solid hsl(214 70% 91%);
+    border: 1px solid hsl(var(--border));
     border-radius: 10px;
     background: #fff;
   }
@@ -3017,14 +3036,14 @@
     min-height: clamp(360px, calc(100vh - 360px), 620px);
     margin: 12px;
     border-radius: 10px;
-    border: 1px dashed hsl(214 70% 88%);
+    border: 1px dashed hsl(var(--border));
     color: hsl(var(--muted-foreground));
     display: grid;
     place-items: center;
     align-content: center;
     gap: 7px;
     text-align: center;
-    background: hsl(214 100% 98%);
+    background: var(--brand-soft);
   }
 
   .prototype-empty-preview svg {
