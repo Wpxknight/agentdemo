@@ -6,6 +6,7 @@ import type {
   ReasoningEffort,
   StreamEvent,
   StreamInput,
+  ToolContentBlock,
   ToolDef,
   ToolResult,
 } from './types.js';
@@ -19,21 +20,23 @@ export interface AnthropicModelConfig {
   effort?: ReasoningEffort;
 }
 
+function toAnthropicContentBlock(b: ToolContentBlock): Anthropic.TextBlockParam | Anthropic.ImageBlockParam {
+  if (b.type === 'text') return { type: 'text', text: b.text };
+  return {
+    type: 'image',
+    source: {
+      type: 'base64',
+      media_type: b.mimeType as Anthropic.Base64ImageSource['media_type'],
+      data: b.data,
+    },
+  };
+}
+
 function toAnthropicToolResultContent(
   result: ToolResult,
 ): string | Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam> {
   if (!result.contentBlocks?.length) return result.content;
-  return result.contentBlocks.map((b): Anthropic.TextBlockParam | Anthropic.ImageBlockParam => {
-    if (b.type === 'text') return { type: 'text', text: b.text };
-    return {
-      type: 'image',
-      source: {
-        type: 'base64',
-        media_type: b.mimeType as Anthropic.Base64ImageSource['media_type'],
-        data: b.data,
-      },
-    };
-  });
+  return result.contentBlocks.map(toAnthropicContentBlock);
 }
 
 /** 内部 Msg[] -> Anthropic MessageParam[]（content blocks）。导出以便单测。 */
@@ -70,6 +73,13 @@ export function toAnthropicMessages(messages: Msg[]): Anthropic.MessageParam[] {
       return { role: 'assistant', content: blocks };
     }
 
+    // user 消息可携带多模态内容块（如上传的图片附件）
+    if (m.contentBlocks?.length) {
+      const blocks: Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam> = [];
+      if (m.text) blocks.push({ type: 'text', text: m.text });
+      blocks.push(...m.contentBlocks.map(toAnthropicContentBlock));
+      return { role: 'user', content: blocks };
+    }
     return { role: 'user', content: m.text ?? '' };
   });
 }
@@ -121,6 +131,15 @@ export class AnthropicModel implements ChatModel {
 
     for await (const ev of stream) {
       switch (ev.type) {
+        case 'message_start': {
+          // 输入用量只在 message_start 报（含缓存读写）；输出用量走 message_delta，避免重复累计。
+          const u = ev.message.usage;
+          const inputTokens =
+            (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
+          if (inputTokens > 0) yield { type: 'usage', inputTokens, outputTokens: 0 };
+          break;
+        }
+
         case 'content_block_start':
           if (ev.content_block.type === 'tool_use') {
             pending.set(ev.index, {

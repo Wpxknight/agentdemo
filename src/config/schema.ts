@@ -5,6 +5,9 @@ export const ModelConfigSchema = z.object({
   baseURL: z.string(),
   apiKey: z.string(),
   model: z.string(),
+  contextWindowTokens: z.number().int().positive().optional(),
+  /** 历史里保留图片的最近带图消息条数（更早的替换占位符），默认 1；0 表示一张不留。 */
+  contextKeepImages: z.number().int().min(0).optional(),
   /** 推理深度：none 关闭思考；low..max 对应 Anthropic effort；缺省=思考开启走模型默认深度。 */
   effort: z.enum(['none', 'low', 'medium', 'high', 'xhigh', 'max']).optional(),
 });

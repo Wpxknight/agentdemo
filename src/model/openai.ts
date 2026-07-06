@@ -5,6 +5,7 @@ import type {
   Msg,
   StreamEvent,
   StreamInput,
+  ToolContentBlock,
   ToolDef,
   ToolResult,
 } from './types.js';
@@ -32,21 +33,22 @@ export function normalizeOpenAIBaseURL(baseURL: string): string {
   }
 }
 
+function toOpenAIContentPart(
+  b: ToolContentBlock,
+): OpenAI.Chat.Completions.ChatCompletionContentPart {
+  if (b.type === 'text') return { type: 'text', text: b.text };
+  return {
+    type: 'image_url',
+    image_url: { url: `data:${b.mimeType};base64,${b.data}` },
+  };
+}
+
 function openAIImageMessages(result: ToolResult): ChatMsg[] {
   const blocks = result.contentBlocks ?? [];
   if (!blocks.some((b) => b.type === 'image')) return [];
-
-  const content: OpenAI.Chat.Completions.ChatCompletionContentPart[] = blocks.map((b) => {
-    if (b.type === 'text') return { type: 'text', text: b.text };
-    return {
-      type: 'image_url',
-      image_url: { url: `data:${b.mimeType};base64,${b.data}` },
-    };
-  });
-
   return [{
     role: 'user',
-    content,
+    content: blocks.map(toOpenAIContentPart),
   }];
 }
 
@@ -80,6 +82,14 @@ export function toOpenAIMessages(system: string, messages: Msg[]): ChatMsg[] {
       continue;
     }
 
+    // user 消息可携带多模态内容块（如上传的图片附件）
+    if (m.contentBlocks?.length) {
+      const parts: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [];
+      if (m.text) parts.push({ type: 'text', text: m.text });
+      parts.push(...m.contentBlocks.map(toOpenAIContentPart));
+      out.push({ role: 'user', content: parts });
+      continue;
+    }
     out.push({ role: 'user', content: m.text ?? '' });
   }
 

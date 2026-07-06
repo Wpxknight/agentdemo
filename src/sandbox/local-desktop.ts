@@ -134,15 +134,17 @@ class LocalDesktopHandle implements DesktopHandle {
   }
 
   private async capturePng(): Promise<Uint8Array> {
+    // 用 JPEG + quality 截图：截图对模型是 token 大头（尤其按字节计费的模型），
+    // JPEG 比无损 PNG 小一个数量级，直接降低上下文占用。
     const result = await this.withPage(async (page) => {
       await page.send('Page.enable');
-      return page.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
+      return page.send('Page.captureScreenshot', { format: 'jpeg', quality: 60, captureBeyondViewport: false });
     }) as { data?: string };
     return Buffer.from(result.data || '', 'base64');
   }
 
   private updateStream(png: Uint8Array): void {
-    const html = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="2"><style>body{margin:0;background:#0f172a;color:#d6e2ff;font:14px sans-serif}header{padding:10px 12px;border-bottom:1px solid #263449}img{display:block;max-width:100%;height:auto;margin:auto}</style></head><body><header>Local browser preview · ${new Date().toLocaleTimeString()}</header><img src="data:image/png;base64,${Buffer.from(png).toString('base64')}" /></body></html>`;
+    const html = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="2"><style>body{margin:0;background:#0f172a;color:#d6e2ff;font:14px sans-serif}header{padding:10px 12px;border-bottom:1px solid #263449}img{display:block;max-width:100%;height:auto;margin:auto}</style></head><body><header>Local browser preview · ${new Date().toLocaleTimeString()}</header><img src="data:image/jpeg;base64,${Buffer.from(png).toString('base64')}" /></body></html>`;
     this.stream = `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
   }
 

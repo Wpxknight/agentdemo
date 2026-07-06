@@ -1,17 +1,23 @@
 import type { Msg } from '../model/types.js';
+import { estimateTokens } from '../agent/context.js';
 import type { AuditEvent } from '../audit/sink.js';
 import type { RequestContext, Tenant, User } from '../auth/types.js';
 import type {
   AuditFilter,
   NewUser,
   LlmSettings,
+  SchedulerSettings,
+  SessionContextUsage,
+  SessionInput,
   SessionSummary,
+  SessionTouchInput,
   ScheduledTask,
   ScheduledTaskInput,
   Store,
   TaskRun,
   UserWithSecret,
 } from './store.js';
+import { DEFAULT_SESSION_TITLE } from './store.js';
 import { nextRunAt } from '../scheduler/cron.js';
 
 interface MsgRow {
@@ -19,6 +25,15 @@ interface MsgRow {
   sessionId: string;
   msg: Msg;
   createdAt: Date;
+}
+
+interface SessionRow {
+  tenantId: string;
+  sessionId: string;
+  title: string;
+  explicitTitle: boolean;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 function summarize(text: string | undefined, max = 48): string {
@@ -30,57 +45,151 @@ function summarize(text: string | undefined, max = 48): string {
 /** 内存 Store：未配置 MySQL 时的回落实现，亦用于测试。租户隔离同样强制生效。 */
 export class MemoryStore implements Store {
   private messages: MsgRow[] = [];
+  private sessions = new Map<string, SessionRow>();
   private audit: AuditEvent[] = [];
   private tasks = new Map<number, ScheduledTask>();
   private runs: TaskRun[] = [];
   private tenants = new Map<string, Tenant>();
   private users = new Map<string, UserWithSecret>(); // key: tenantId/username
   private llmSettings = new Map<string, LlmSettings>();
+  private schedulerSettings = new Map<string, SchedulerSettings>();
   private taskSeq = 0;
   private runSeq = 0;
   private userSeq = 0;
 
+  private sessionKey(ctx: Pick<RequestContext, 'tenantId'>, sessionId: string): string {
+    return `${ctx.tenantId}/${sessionId}`;
+  }
+
+  private sessionMessages(ctx: RequestContext, sessionId: string): MsgRow[] {
+    return this.messages.filter((r) => r.tenantId === ctx.tenantId && r.sessionId === sessionId);
+  }
+
+  private sessionSummary(ctx: RequestContext, session: SessionRow): SessionSummary {
+    const rows = this.sessionMessages(ctx, session.sessionId);
+    const last = rows.at(-1);
+    return {
+      sessionId: session.sessionId,
+      title: session.title,
+      lastMessage: summarize(last?.msg.text),
+      messageCount: rows.length,
+      updatedAt: (last?.createdAt ?? session.updatedAt).toISOString(),
+    };
+  }
+
+  async createSession(ctx: RequestContext, input: SessionInput): Promise<SessionSummary> {
+    const now = new Date();
+    const key = this.sessionKey(ctx, input.sessionId);
+    // 占位标题（如前端默认的“新会话”）不算显式命名，之后首条用户消息可覆盖。
+    const explicitTitle = Boolean(input.title) && input.title !== DEFAULT_SESSION_TITLE;
+    const existing = this.sessions.get(key);
+    if (existing) {
+      if (input.title) {
+        existing.title = summarize(input.title);
+        existing.explicitTitle = explicitTitle || existing.explicitTitle;
+      }
+      existing.updatedAt = now;
+      return this.sessionSummary(ctx, existing);
+    }
+
+    const session: SessionRow = {
+      tenantId: ctx.tenantId,
+      sessionId: input.sessionId,
+      title: summarize(input.title ?? input.sessionId),
+      explicitTitle,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.sessions.set(key, session);
+    return this.sessionSummary(ctx, session);
+  }
+
+  async touchSession(ctx: RequestContext, sessionId: string, input: SessionTouchInput = {}): Promise<void> {
+    const key = this.sessionKey(ctx, sessionId);
+    const updatedAt = input.updatedAt ? new Date(input.updatedAt) : new Date();
+    const existing = this.sessions.get(key);
+    if (existing) {
+      // 占位标题被首条用户消息覆盖一次后即锁定，后续消息不再改名。
+      if (input.title && !existing.explicitTitle) {
+        existing.title = summarize(input.title);
+        existing.explicitTitle = true;
+      }
+      existing.updatedAt = updatedAt;
+      return;
+    }
+
+    this.sessions.set(key, {
+      tenantId: ctx.tenantId,
+      sessionId,
+      title: summarize(input.title ?? sessionId),
+      explicitTitle: Boolean(input.title) && input.title !== DEFAULT_SESSION_TITLE,
+      createdAt: updatedAt,
+      updatedAt,
+    });
+  }
+
   async appendMessage(ctx: RequestContext, sessionId: string, msg: Msg): Promise<void> {
-    this.messages.push({ tenantId: ctx.tenantId, sessionId, msg, createdAt: new Date() });
+    const createdAt = new Date();
+    this.messages.push({ tenantId: ctx.tenantId, sessionId, msg, createdAt });
+    await this.touchSession(ctx, sessionId, {
+      title: msg.role === 'user' ? msg.text : undefined,
+      updatedAt: createdAt,
+    });
+  }
+
+  async appendMessages(ctx: RequestContext, sessionId: string, msgs: Msg[]): Promise<void> {
+    if (!msgs.length) return;
+    const createdAt = new Date();
+    for (const msg of msgs) this.messages.push({ tenantId: ctx.tenantId, sessionId, msg, createdAt });
+    await this.touchSession(ctx, sessionId, {
+      title: msgs.find((m) => m.role === 'user' && m.text)?.text,
+      updatedAt: createdAt,
+    });
   }
 
   async listMessages(ctx: RequestContext, sessionId: string): Promise<Msg[]> {
-    return this.messages
-      .filter((r) => r.tenantId === ctx.tenantId && r.sessionId === sessionId)
-      .map((r) => r.msg);
+    return this.sessionMessages(ctx, sessionId).map((r) => r.msg);
+  }
+
+  async replaceMessages(ctx: RequestContext, sessionId: string, messages: Msg[]): Promise<void> {
+    const createdAt = new Date();
+    this.messages = this.messages.filter((r) => !(r.tenantId === ctx.tenantId && r.sessionId === sessionId));
+    for (const msg of messages) this.messages.push({ tenantId: ctx.tenantId, sessionId, msg, createdAt });
   }
 
   async listSessions(ctx: RequestContext, limit = 50, offset = 0): Promise<SessionSummary[]> {
-    const bySession = new Map<string, MsgRow[]>();
-    for (const row of this.messages.filter((r) => r.tenantId === ctx.tenantId)) {
-      const rows = bySession.get(row.sessionId) ?? [];
-      rows.push(row);
-      bySession.set(row.sessionId, rows);
-    }
-    return [...bySession.entries()]
-      .map(([sessionId, rows]) => {
-        const firstUser = rows.find((r) => r.msg.role === 'user' && r.msg.text)?.msg.text;
-        const last = rows.at(-1);
-        return {
-          sessionId,
-          title: summarize(firstUser ?? rows[0]?.msg.text ?? sessionId),
-          lastMessage: summarize(last?.msg.text),
-          messageCount: rows.length,
-          updatedAt: last?.createdAt.toISOString(),
-        };
-      })
+    const safeLimit = Math.max(0, limit);
+    const safeOffset = Math.max(0, offset);
+    if (safeLimit <= 0) return [];
+
+    return [...this.sessions.values()]
+      .filter((r) => r.tenantId === ctx.tenantId)
+      .map((session) => this.sessionSummary(ctx, session))
       .sort((a, b) => String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')))
-      .slice(Math.max(0, offset), Math.max(0, offset) + limit);
+      .slice(safeOffset, safeOffset + safeLimit);
   }
 
   async countSessions(ctx: RequestContext): Promise<number> {
-    return new Set(this.messages.filter((r) => r.tenantId === ctx.tenantId).map((r) => r.sessionId)).size;
+    return [...this.sessions.values()].filter((r) => r.tenantId === ctx.tenantId).length;
   }
 
   async deleteSession(ctx: RequestContext, sessionId: string): Promise<boolean> {
     const before = this.messages.length;
     this.messages = this.messages.filter((r) => !(r.tenantId === ctx.tenantId && r.sessionId === sessionId));
-    return this.messages.length < before;
+    const deletedSession = this.sessions.delete(this.sessionKey(ctx, sessionId));
+    return this.messages.length < before || deletedSession;
+  }
+
+  async getSessionContextUsage(
+    ctx: RequestContext,
+    sessionId: string,
+    maxTokens: number,
+  ): Promise<SessionContextUsage> {
+    return {
+      usedTokens: estimateTokens(await this.listMessages(ctx, sessionId)),
+      maxTokens,
+      estimated: true,
+    };
   }
 
   async record(event: AuditEvent): Promise<void> {
@@ -200,8 +309,18 @@ export class MemoryStore implements Store {
     this.llmSettings.set(ctx.tenantId, { ...settings });
   }
 
+  async getSchedulerSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<SchedulerSettings | undefined> {
+    const settings = this.schedulerSettings.get(ctx.tenantId);
+    return settings ? { ...settings } : undefined;
+  }
+
+  async setSchedulerSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SchedulerSettings): Promise<void> {
+    this.schedulerSettings.set(ctx.tenantId, { ...settings });
+  }
+
   async close(): Promise<void> {
     this.messages = [];
+    this.sessions.clear();
     this.audit = [];
     this.tasks.clear();
     this.runs = [];
@@ -209,5 +328,6 @@ export class MemoryStore implements Store {
     this.tenants.clear();
     this.users.clear();
     this.llmSettings.clear();
+    this.schedulerSettings.clear();
   }
 }

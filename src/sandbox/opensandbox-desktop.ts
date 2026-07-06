@@ -39,7 +39,7 @@ function assertOk(res: ExecResult, action: string): void {
 
 function previewHtml(png?: Uint8Array): string {
   const body = png && png.byteLength
-    ? `<img src="data:image/png;base64,${Buffer.from(png).toString('base64')}" />`
+    ? `<img src="data:image/jpeg;base64,${Buffer.from(png).toString('base64')}" />`
     : '<main>OpenSandbox browser preview is ready.</main>';
   return `<!doctype html><html><head><meta charset="utf-8"><style>body{margin:0;background:#0f172a;color:#d6e2ff;font:14px system-ui,sans-serif}header{padding:10px 12px;border-bottom:1px solid #263449}main{padding:16px}img{display:block;max-width:100%;height:auto;margin:auto}</style></head><body><header>OpenSandbox browser preview</header>${body}</body></html>`;
 }
@@ -146,7 +146,8 @@ async function main() {
       return;
     }
     if (action === 'screenshot') {
-      const result = await page.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
+      // JPEG + quality：截图是上下文 token 大头，JPEG 比无损 PNG 小一个数量级。
+      const result = await page.send('Page.captureScreenshot', { format: 'jpeg', quality: 60, captureBeyondViewport: false });
       console.log('__AIOP_SCREENSHOT__' + result.data);
       return;
     }

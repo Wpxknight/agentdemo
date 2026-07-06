@@ -51,5 +51,6 @@ export const defaultLlmConfig: RuntimeModelConfig = {
   api_key: '',
   api_key_set: false,
   api_key_preview: '',
+  context_window_tokens: 200000,
   options: [],
 };

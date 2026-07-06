@@ -7,6 +7,9 @@ export interface ModelConfig {
   baseURL: string;
   apiKey: string;
   model: string;
+  contextWindowTokens?: number;
+  /** 历史里保留图片的最近带图消息条数（更早的替换占位符），默认 1；0 表示一张不留。 */
+  contextKeepImages?: number;
   /** 推理深度：none 关闭思考；low..max 对应 Anthropic effort。缺省=思考开启走模型默认深度。 */
   effort?: ReasoningEffort;
 }

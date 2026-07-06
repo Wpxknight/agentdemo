@@ -5,7 +5,13 @@ import { resolve } from 'node:path';
 import { SignJWT, jwtVerify } from 'jose';
 import { logger } from '../logger.js';
 import type { Runtime, RuntimeModelConfig } from '../runtime.js';
-import { runAgent } from '../agent/core.js';
+import { COMPACTION_RETRY_GROWTH_TOKENS, runAgent } from '../agent/core.js';
+import {
+  DEFAULT_CONTEXT_WINDOW_TOKENS,
+  contextBudgetTokens as budgetForWindow,
+  renderForSummary,
+} from '../agent/context.js';
+import type { ChatModel, ToolContentBlock } from '../model/types.js';
 import { InMemoryApprovalStore, InteractiveApprovalGate } from '../agent/approval.js';
 import { authenticate } from './context.js';
 import { AuthzError, requirePermission } from '../auth/rbac.js';
@@ -13,8 +19,9 @@ import { LocalAuthProvider } from '../auth/local.js';
 import { OidcAuthProvider } from '../auth/oidc.js';
 import { createTenant, createUser, listTenants } from '../auth/admin.js';
 import type { RequestContext, Role } from '../auth/types.js';
+import { DEFAULT_TASK_MAX_RUN_MS } from '../db/store.js';
 import { createModel } from '../model/factory.js';
-import type { JsonValue, ToolCall } from '../model/types.js';
+import type { JsonValue, Msg, ToolCall } from '../model/types.js';
 import { importSkillZip } from '../skill/import.js';
 import type { Skill } from '../skill/registry.js';
 
@@ -22,11 +29,19 @@ const log = logger.child({ mod: 'http' });
 
 type Req = http.IncomingMessage;
 type Res = http.ServerResponse;
-type ActiveAgentRun = { abort: AbortController };
+type ActiveAgentRun = { abort: AbortController; append: (message: Msg) => void; drain: () => Msg[] };
 type ActiveAgentRuns = Map<string, Set<ActiveAgentRun>>;
+/** 无效压缩水位（tenant+session → token 数）：摘要后仍超触发线时记录，历史没涨够前跳过重试。 */
+type CompactionWatermarks = Map<string, number>;
 
 const OIDC_COOKIE = 'aiop_oidc';
 const RUN_TERMINATED_MESSAGE = '会话运行已终止';
+const GOAL_MODE_SYSTEM = [
+  '目标模式：用户通过 /goal 授权你自主推进目标任务，直到目标完成、遇到阻塞或需要用户决策。',
+  '在目标模式下，低风险、可逆、只读或纯新增的辅助步骤可直接执行，不要为普通中间步骤反复请求确认。',
+  '涉及不可逆、高风险、破坏性、删除、修改现有系统状态、生产变更、凭据暴露或费用明显增加的操作，仍必须先询问用户并等待明确确认。',
+  '持续记录关键行动和验证结果；完成后用简洁 Markdown 汇报目标是否达成、执行过的关键步骤和遗留风险。',
+].join('\n');
 
 /** 读取并解析 JSON 请求体（限制 8MB，支持聊天附件以 base64 形式上传）。 */
 async function readJson(req: Req): Promise<Record<string, unknown>> {
@@ -148,6 +163,8 @@ function publicModelConfig(config: RuntimeModelConfig): Record<string, unknown> 
     api_key: config.apiKey,
     api_key_set: Boolean(config.apiKey),
     api_key_preview: maskApiKey(config.apiKey),
+    context_window_tokens: contextWindowTokens(config),
+    context_keep_images: keepImagesOf(config),
     effort: config.effort,
   };
 }
@@ -170,22 +187,51 @@ function modelConfigFromBody(
   options: RuntimeModelConfig[] = [],
 ): RuntimeModelConfig {
   const requestedId = str(body, 'id') ?? str(body, 'model_id');
-  const hasExplicitFields = ['protocol', 'base_url', 'baseURL', 'api_key', 'apiKey', 'model'].some((key) => body[key] !== undefined);
+  const hasExplicitFields = [
+    'protocol',
+    'base_url',
+    'baseURL',
+    'api_key',
+    'apiKey',
+    'model',
+    'context_window_tokens',
+    'contextWindowTokens',
+    'context_keep_images',
+    'contextKeepImages',
+  ].some((key) => body[key] !== undefined);
+  const selected = requestedId ? options.find((option) => option.id === requestedId || option.model === requestedId) : undefined;
   if (requestedId && !hasExplicitFields) {
-    const selected = options.find((option) => option.id === requestedId || option.model === requestedId);
     if (!selected) throw new HttpError(400, `未知模型：${requestedId}`);
     return { ...selected };
   }
-  const protocol = parseProtocol(str(body, 'protocol') ?? current.protocol);
-  const baseURL = (str(body, 'base_url') ?? str(body, 'baseURL') ?? current.baseURL).trim();
-  const model = (str(body, 'model') ?? current.model).trim();
-  const id = (str(body, 'id') ?? model).trim();
+  const base = selected ?? current;
+  const protocol = parseProtocol(str(body, 'protocol') ?? base.protocol);
+  const baseURL = (str(body, 'base_url') ?? str(body, 'baseURL') ?? base.baseURL).trim();
+  const model = (str(body, 'model') ?? base.model).trim();
+  const id = (str(body, 'id') ?? (selected ? base.id : model)).trim();
   const apiKeyInput = str(body, 'api_key') ?? str(body, 'apiKey');
-  const apiKey = apiKeyInput && apiKeyInput.trim() ? apiKeyInput.trim() : current.apiKey;
+  const apiKey = apiKeyInput && apiKeyInput.trim() ? apiKeyInput.trim() : base.apiKey;
   if (!baseURL) throw new HttpError(400, 'base_url 必填');
   if (!apiKey) throw new HttpError(400, 'api_key 必填');
   if (!model) throw new HttpError(400, 'model 必填');
-  return { id: id || model, protocol, baseURL, apiKey, model, effort: parseEffort(str(body, 'effort'), current.effort) };
+  return {
+    id: id || model,
+    protocol,
+    baseURL,
+    apiKey,
+    model,
+    contextWindowTokens: parseContextWindowTokens(body, base.contextWindowTokens),
+    contextKeepImages: parseContextKeepImages(body, base.contextKeepImages),
+    effort: parseEffort(str(body, 'effort'), base.effort),
+  };
+}
+
+function parseContextKeepImages(body: Record<string, unknown>, current: number | undefined): number | undefined {
+  const value = body.context_keep_images ?? body.contextKeepImages;
+  if (value === undefined) return current;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) throw new HttpError(400, 'context_keep_images 必须是 >= 0 的整数');
+  return Math.floor(n);
 }
 
 const EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
@@ -194,6 +240,59 @@ const EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 function parseEffort(value: string | undefined, current: RuntimeModelConfig['effort']): RuntimeModelConfig['effort'] {
   if (value === undefined) return current;
   return (EFFORTS as readonly string[]).includes(value) ? (value as RuntimeModelConfig['effort']) : current;
+}
+
+function parseContextWindowTokens(body: Record<string, unknown>, current: number | undefined): number | undefined {
+  const value = body.context_window_tokens ?? body.contextWindowTokens;
+  if (value === undefined) return current;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) throw new HttpError(400, 'context_window_tokens 必须是正整数');
+  return Math.floor(n);
+}
+
+function contextWindowTokens(config?: Pick<RuntimeModelConfig, 'contextWindowTokens'>): number {
+  return config?.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
+}
+
+/** 发送给模型前压缩历史的 token 预算 = 上下文窗口 − 输出预留 − 安全余量。 */
+function contextBudgetTokens(config?: Pick<RuntimeModelConfig, 'contextWindowTokens'>): number {
+  return budgetForWindow(contextWindowTokens(config));
+}
+
+/** 触发摘要压缩的阈值：历史 token 超过预算的这个比例时，把最旧的消息摘要成一段。 */
+const COMPACTION_TRIGGER_RATIO = 0.85;
+/** 摘要压缩时保留原样的最近消息条数（更早的进摘要）。 */
+const COMPACTION_KEEP_RECENT = 8;
+
+/** 触发摘要压缩的 token 阈值（runAgent 在轮次边界按此检查，含首轮）。 */
+function compactionTriggerTokens(config?: Pick<RuntimeModelConfig, 'contextWindowTokens'>): number {
+  return Math.floor(contextBudgetTokens(config) * COMPACTION_TRIGGER_RATIO);
+}
+
+/** 历史里保留图片的最近带图消息条数（配置可调，默认 1）。 */
+function keepImagesOf(config?: Pick<RuntimeModelConfig, 'contextKeepImages'>): number {
+  return config?.contextKeepImages ?? 1;
+}
+
+const SUMMARY_SYSTEM = [
+  '你是对话历史压缩器。把给定的较早对话浓缩成一段简洁摘要，供后续对话继续参考。',
+  '必须保留：用户目标与关键决策、已执行的操作与结论、涉及的资源/文件/命令、尚未完成的事项与已知报错。',
+  '不要编造；不要复述寒暄；用中文，尽量紧凑。',
+].join('\n');
+
+/** 用模型把一段较早的消息摘要成纯文本（图片/超长结果已在渲染时裁剪，避免摘要请求本身超窗）。 */
+async function summarizeMessages(model: ChatModel, stale: Msg[], signal?: AbortSignal): Promise<string> {
+  let text = '';
+  for await (const ev of model.stream({
+    system: SUMMARY_SYSTEM,
+    messages: [{ role: 'user', text: `请压缩以下对话历史：\n\n${renderForSummary(stale)}` }],
+    tools: [],
+    maxTokens: 2000,
+    signal,
+  })) {
+    if (ev.type === 'text_delta') text += ev.text;
+  }
+  return text.trim();
 }
 
 function sessionIdFromBody(body: Record<string, unknown>): string {
@@ -219,19 +318,68 @@ function isJsonValue(value: unknown): value is JsonValue {
   return false;
 }
 
-function attachmentPrompt(body: Record<string, unknown>): string {
+const IMAGE_DATA_URL_RE = /^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$/i;
+
+function attachmentItems(body: Record<string, unknown>): Record<string, unknown>[] {
   const raw = body.attachments;
-  if (!Array.isArray(raw) || raw.length === 0) return '';
-  const lines = raw.slice(0, 10).map((item, idx) => {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) return '';
-    const o = item as Record<string, unknown>;
+  if (!Array.isArray(raw) || raw.length === 0) return [];
+  return raw.slice(0, 10).filter(
+    (item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item),
+  );
+}
+
+function imageAttachmentData(o: Record<string, unknown>): { mimeType: string; data: string } | undefined {
+  if (typeof o.data !== 'string') return undefined;
+  const match = IMAGE_DATA_URL_RE.exec(o.data.trim());
+  return match ? { mimeType: match[1]!.toLowerCase(), data: match[2]! } : undefined;
+}
+
+/**
+ * 附件文本清单。图片附件只列元信息（图像本体走 contentBlocks，避免 base64 内联进 text
+ * 后绕过 keep-last-K 剥离 / 硬裁剪，一张大图就能把请求顶爆）。
+ */
+function attachmentPrompt(body: Record<string, unknown>): string {
+  const lines = attachmentItems(body).map((o, idx) => {
     const name = typeof o.name === 'string' && o.name ? o.name : `attachment-${idx + 1}`;
     const type = typeof o.type === 'string' && o.type ? o.type : 'application/octet-stream';
     const size = typeof o.size === 'number' && Number.isFinite(o.size) ? `${o.size} bytes` : 'unknown size';
-    const data = typeof o.data === 'string' && o.data ? `\n${o.data}` : '';
-    return `- ${name} (${type}, ${size})${data}`;
+    const image = imageAttachmentData(o);
+    const data = !image && typeof o.data === 'string' && o.data ? `\n${o.data}` : '';
+    const note = image ? '（图片见消息内容块）' : '';
+    return `- ${name} (${type}, ${size})${note}${data}`;
   }).filter(Boolean);
   return lines.length ? `[上传附件]\n${lines.join('\n')}` : '';
+}
+
+/** 图片附件 → user 消息的 image 内容块（受上下文治理的 keep-last-K / 占位符剥离约束）。 */
+function attachmentImageBlocks(body: Record<string, unknown>): ToolContentBlock[] {
+  return attachmentItems(body)
+    .map(imageAttachmentData)
+    .filter((img): img is { mimeType: string; data: string } => Boolean(img))
+    .map((img) => ({ type: 'image' as const, mimeType: img.mimeType, data: img.data }));
+}
+
+function textFromBody(body: Record<string, unknown>): string | undefined {
+  return str(body, 'task') ?? str(body, 'text') ?? str(body, 'message');
+}
+
+function userTextFromBody(body: Record<string, unknown>, fallback = '请分析上传附件。'): string {
+  const rawTask = textFromBody(body)?.trim();
+  const uploaded = attachmentPrompt(body);
+  if (!rawTask && !uploaded) throw new HttpError(400, 'task 必填');
+  return [rawTask || fallback, uploaded].filter(Boolean).join('\n\n');
+}
+
+function userMessageFromBody(body: Record<string, unknown>): Msg {
+  const blocks = attachmentImageBlocks(body);
+  return { role: 'user', text: userTextFromBody(body), contentBlocks: blocks.length ? blocks : undefined };
+}
+
+function parseGoalTask(text: string): { goalMode: boolean; task: string } {
+  const match = /^\/goal(?:\s+|$)([\s\S]*)$/i.exec(text.trim());
+  if (!match) return { goalMode: false, task: text };
+  const task = match[1]?.trim() || '请自主完成这个目标任务。';
+  return { goalMode: true, task };
 }
 
 function browserStreamView(sessionId: string): string {
@@ -312,9 +460,10 @@ export function createHttpServer(rt: Runtime): http.Server {
   const secret = new TextEncoder().encode(rt.jwtSecret);
   const approvals = new InMemoryApprovalStore();
   const activeRuns: ActiveAgentRuns = new Map();
+  const compactionWatermarks: CompactionWatermarks = new Map();
 
   return http.createServer((req, res) => {
-    handle(rt, secret, approvals, activeRuns, req, res).catch((err) => {
+    handle(rt, secret, approvals, activeRuns, compactionWatermarks, req, res).catch((err) => {
       if (err instanceof HttpError) return sendJson(res, err.status, { error: err.message });
       if (err instanceof AuthzError) return sendJson(res, 403, { error: err.message });
       log.error({ err }, '请求处理异常');
@@ -329,6 +478,7 @@ async function handle(
   secret: Uint8Array,
   approvals: InMemoryApprovalStore,
   activeRuns: ActiveAgentRuns,
+  compactionWatermarks: CompactionWatermarks,
   req: Req,
   res: Res,
 ): Promise<void> {
@@ -390,7 +540,7 @@ async function handle(
   }
 
   // —— 以下均需认证 ——
-  if (route === 'POST /v1/agent') return runAgentSse(rt, approvals, activeRuns, req, res);
+  if (route === 'POST /v1/agent') return runAgentSse(rt, approvals, activeRuns, compactionWatermarks, req, res);
 
   if (route === 'GET /v1/me') {
     const ctx = await requireAuth(rt, req);
@@ -415,6 +565,16 @@ async function handle(
       offset,
       hasMore: offset + sessions.length < total,
     });
+  }
+
+  if (route === 'POST /v1/sessions') {
+    const ctx = await requireAuth(rt, req);
+    const body = await readJson(req);
+    const session = await rt.store.createSession(ctx, {
+      sessionId: sessionIdFromBody(body),
+      title: str(body, 'title') ?? '新会话',
+    });
+    return sendJson(res, 201, { session });
   }
 
   if (route === 'GET /v1/tools') {
@@ -659,6 +819,26 @@ async function handle(
     return sendJson(res, 200, { ok: true, text: text.trim(), ...modelSettingsBody(config, rt.modelOptions) });
   }
 
+  // —— 设置：定时任务运行时长 ——
+  if (route === 'GET /v1/settings/scheduler') {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'tenant:manage');
+    const settings = await rt.store.getSchedulerSettings(ctx);
+    return sendJson(res, 200, {
+      settings: { max_run_minutes: Math.round((settings?.maxRunMs ?? DEFAULT_TASK_MAX_RUN_MS) / 60_000) },
+    });
+  }
+  if (route === 'POST /v1/settings/scheduler') {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'tenant:manage');
+    const body = await readJson(req);
+    const n = Number(body.max_run_minutes ?? body.maxRunMinutes);
+    if (!Number.isFinite(n) || n < 1) throw new HttpError(400, 'max_run_minutes 必须是 >= 1 的整数');
+    const minutes = Math.floor(n);
+    await rt.store.setSchedulerSettings(ctx, { maxRunMs: minutes * 60_000 });
+    return sendJson(res, 200, { settings: { max_run_minutes: minutes } });
+  }
+
   // —— 交互式审批 ——
   if (route === 'GET /v1/approvals') {
     const ctx = await requireAuth(rt, req);
@@ -685,6 +865,28 @@ async function handle(
     return sendJson(res, 200, { messages });
   }
 
+  const sessionAppendMatch = /^\/v1\/sessions\/([^/]+)\/append$/.exec(path);
+  if (method === 'POST' && sessionAppendMatch) {
+    const ctx = await requireAuth(rt, req);
+    const sessionId = decodeURIComponent(sessionAppendMatch[1]!);
+    const message = userMessageFromBody(await readJson(req));
+    const activeRun = findActiveRun(activeRuns, activeRunKey(ctx, sessionId));
+    if (activeRun) {
+      activeRun.append(message);
+      return sendJson(res, 200, { ok: true, sessionId, queued: true });
+    }
+    await rt.store.appendMessage(ctx, sessionId, message);
+    return sendJson(res, 200, { ok: true, sessionId, queued: false });
+  }
+
+  const sessionContextMatch = /^\/v1\/sessions\/([^/]+)\/context$/.exec(path);
+  if (method === 'GET' && sessionContextMatch) {
+    const ctx = await requireAuth(rt, req);
+    const sessionId = decodeURIComponent(sessionContextMatch[1]!);
+    const usage = await rt.store.getSessionContextUsage(ctx, sessionId, contextWindowTokens(currentModelConfig(rt)));
+    return sendJson(res, 200, { sessionId, ...usage });
+  }
+
   const sessionTerminateMatch = /^\/v1\/sessions\/([^/]+)\/terminate$/.exec(path);
   if (method === 'POST' && sessionTerminateMatch) {
     const ctx = await requireAuth(rt, req);
@@ -699,6 +901,7 @@ async function handle(
     const sessionId = decodeURIComponent(sessionDeleteMatch[1]!);
     const ok = await rt.store.deleteSession(ctx, sessionId);
     if (!ok) throw new HttpError(404, '会话不存在');
+    compactionWatermarks.delete(activeRunKey(ctx, sessionId));
     // 会话关闭即销毁其名下沙箱（含集群 sessionId:cluster 键）；best-effort，不阻塞响应。
     void rt.sandboxes?.disposeSession(sessionId);
     return sendJson(res, 200, { ok: true });
@@ -853,6 +1056,12 @@ function removeActiveRun(activeRuns: ActiveAgentRuns, key: string, run: ActiveAg
   if (!set.size) activeRuns.delete(key);
 }
 
+function findActiveRun(activeRuns: ActiveAgentRuns, key: string): ActiveAgentRun | undefined {
+  const set = activeRuns.get(key);
+  if (!set?.size) return undefined;
+  return [...set].find((run) => !run.abort.signal.aborted);
+}
+
 function abortActiveRuns(activeRuns: ActiveAgentRuns, key: string): number {
   const set = activeRuns.get(key);
   if (!set?.size) return 0;
@@ -876,19 +1085,22 @@ async function runAgentSse(
   rt: Runtime,
   approvals: InMemoryApprovalStore,
   activeRuns: ActiveAgentRuns,
+  compactionWatermarks: CompactionWatermarks,
   req: Req,
   res: Res,
 ): Promise<void> {
   const ctx = await requireAuth(rt, req);
   const body = await readJson(req);
-  const rawTask = str(body, 'task')?.trim();
-  const uploaded = attachmentPrompt(body);
-  if (!rawTask && !uploaded) throw new HttpError(400, 'task 必填');
-  const task = [rawTask || '请分析上传附件。', uploaded].filter(Boolean).join('\n\n');
+  const userText = userTextFromBody(body);
+  const taskBlocks = attachmentImageBlocks(body);
+  const parsedTask = parseGoalTask(userText);
   const sessionId = sessionIdFromBody(body);
 
-  // 续接历史：加载该会话既有消息作为上下文
-  const prior = await rt.store.listMessages(ctx, sessionId);
+  // 同一会话互斥：并发运行会各自加载相同历史再各自落库，导致历史交错重复，
+  // 且压缩落库（replaceMessages）会覆盖对方新写的消息。运行中追加消息请走 /append。
+  if (findActiveRun(activeRuns, activeRunKey(ctx, sessionId))) {
+    throw new HttpError(409, '该会话已有正在运行的任务；可通过 append 追加消息，或先终止当前运行');
+  }
 
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
@@ -902,8 +1114,13 @@ async function runAgentSse(
   };
   sse('session', { sessionId });
   const abort = new AbortController();
+  const pendingMessages: Msg[] = [];
   const activeKey = activeRunKey(ctx, sessionId);
-  const activeRun: ActiveAgentRun = { abort };
+  const activeRun: ActiveAgentRun = {
+    abort,
+    append: (message) => pendingMessages.push(message),
+    drain: () => pendingMessages.splice(0),
+  };
   const onClose = () => {
     closed = true;
     if (!abort.signal.aborted) abort.abort(new Error('客户端连接已关闭'));
@@ -913,6 +1130,12 @@ async function runAgentSse(
   const toolCtx = { sessionId, tenantId: ctx.tenantId, userId: ctx.userId, role: ctx.role };
 
   try {
+    // 续接历史：加载该会话既有消息作为上下文。
+    // 必须在 addActiveRun 之后加载：此后并发 append 都进内存队列走 drain，
+    // 不会在 listMessages 与 replaceMessages 之间直写库被压缩覆盖。
+    const prior = await rt.store.listMessages(ctx, sessionId);
+    const modelConfig = currentModelConfig(rt);
+    const triggerTokens = compactionTriggerTokens(modelConfig);
     const result = await runAgent({
       model: rt.model,
       tools: rt.tools,
@@ -930,22 +1153,45 @@ async function runAgentSse(
           return dryRun.content;
         },
       }),
-      system: rt.systemExtra,
+      system: [parsedTask.goalMode ? GOAL_MODE_SYSTEM : '', rt.systemExtra].filter(Boolean).join('\n\n'),
       ctx: toolCtx,
       messages: prior,
-      task,
+      task: parsedTask.task,
+      taskContentBlocks: taskBlocks,
       signal: abort.signal,
-      onEvent: (e) => sse(e.type, e),
+      // 步数不设限：任务跑到完成为止，由终止接口 / 断连中止兜底，中途摘要压缩保证不超窗。
+      contextBudgetTokens: contextBudgetTokens(modelConfig),
+      keepImages: keepImagesOf(modelConfig),
+      // 摘要压缩：runAgent 在每个轮次边界检查（含首轮，新任务与附件一并计入），长 run 中途也能压缩。
+      summarize: (stale) => summarizeMessages(rt.model, stale, abort.signal),
+      compactionTriggerTokens: triggerTokens,
+      compactionKeepRecent: COMPACTION_KEEP_RECENT,
+      compactionWatermarkTokens: compactionWatermarks.get(activeKey),
+      drainPendingMessages: activeRun.drain,
+      onEvent: (e) => {
+        if (e.type === 'context_compacted') {
+          // 摘要后仍超触发线：记跨请求水位，历史没涨够前的下一次运行不再白跑摘要。
+          if (e.afterTokens > triggerTokens) compactionWatermarks.set(activeKey, e.afterTokens + COMPACTION_RETRY_GROWTH_TOKENS);
+          else compactionWatermarks.delete(activeKey);
+          log.info({ sessionId, ...e }, '历史摘要压缩');
+        }
+        sse(e.type, e);
+      },
     });
-    // 仅持久化本轮新增消息（task + 后续），避免重复落库历史
-    for (const m of result.messages.slice(prior.length)) {
-      await rt.store.appendMessage(ctx, sessionId, m);
+    if (result.compacted) {
+      // 运行期间发生过摘要压缩：历史已被改写，整体替换落库（事务），并保持会话时间线更新。
+      await rt.store.replaceMessages(ctx, sessionId, result.messages);
+      await rt.store.touchSession(ctx, sessionId, { updatedAt: new Date() });
+    } else {
+      // 仅持久化本轮新增消息（task + 后续），一次事务批量落库，避免中途失败留下半截轮次。
+      await rt.store.appendMessages(ctx, sessionId, result.messages.slice(prior.length));
     }
+    const context = await rt.store.getSessionContextUsage(ctx, sessionId, contextWindowTokens(modelConfig));
     await rt.audit?.record({
       kind: 'usage', action: 'agent', tenantId: ctx.tenantId, sessionId,
-      detail: { ...result.usage, steps: result.steps },
+      detail: { ...result.usage, steps: result.steps, context },
     });
-    sse('done', { sessionId, steps: result.steps, text: result.text, usage: result.usage });
+    sse('done', { sessionId, steps: result.steps, text: result.text, usage: { ...result.usage, context }, context });
   } catch (err) {
     if (abort.signal.aborted) {
       sse('terminated', { sessionId, reason: abortReasonMessage(abort.signal.reason) });
@@ -954,7 +1200,17 @@ async function runAgentSse(
       sse('error', { error: err instanceof Error ? err.message : '运行失败' });
     }
   } finally {
+    // 先摘除注册再冲刷残留：摘除后新 append 直写库，不会再进内存队列。
+    // 残留消息（末次 drain 之后 / 运行报错或被终止时入队的）落库，避免用户消息静默丢失。
     removeActiveRun(activeRuns, activeKey, activeRun);
+    const leftover = activeRun.drain();
+    for (const m of leftover) {
+      try {
+        await rt.store.appendMessage(ctx, sessionId, m);
+      } catch (err) {
+        log.warn({ err, sessionId }, '运行结束后残留消息落库失败');
+      }
+    }
     res.off('close', onClose);
     if (!res.destroyed && !res.writableEnded) res.end();
   }

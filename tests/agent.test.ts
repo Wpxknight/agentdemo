@@ -33,15 +33,16 @@ describe('runAgent', () => {
       id: 'system-contract-model',
       async *stream(input: StreamInput): AsyncIterable<StreamEvent> {
         expect(input.system).toContain('默认中文回复，结论清晰，过程可追溯，不编造结果');
-        expect(input.system).toContain('只读检查可直接执行');
-        expect(input.system).toContain('涉及创建、修改、删除、重启、部署、修复、扩缩容、写配置或其他有副作用操作时，必须先向用户确认');
+        expect(input.system).toContain('只读检查、信息整理、生成草稿、编写计划或不影响现有系统状态的纯新增内容，可直接执行');
+        expect(input.system).toContain('尽量减少不必要的用户确认');
+        expect(input.system).toContain('涉及修改现有系统状态、破坏、删除、重启、部署、修复、扩缩容、写配置、生产变更、凭据暴露、费用明显增加或其他不可逆/高风险操作时，必须先向用户确认');
         expect(input.system).toContain('### 待确认变更');
         expect(input.system).toContain('- 操作内容：');
         expect(input.system).toContain('- 操作目的：');
         expect(input.system).toContain('- 影响范围：');
         expect(input.system).toContain('- 风险点：');
         expect(input.system).toContain('- 验证方式：');
-        expect(input.system).toContain('用户明确同意后才可执行变更；执行后必须验证结果');
+        expect(input.system).toContain('用户明确同意后才可执行高风险或不可逆变更；执行后必须验证结果');
         expect(input.system).toContain('任务结束必须用 Markdown 格式汇报');
         expect(input.system).toContain('尽量简洁，不写长段铺垫');
         expect(input.system).toContain('按任务类型选择一组模板');
@@ -52,6 +53,12 @@ describe('runAgent', () => {
         expect(input.system).toContain('### 执行汇报：巡检/网络检查类任务');
         expect(input.system).toContain('| 执行结果 | 列关键检查结果');
         expect(input.system).toContain('| 后续建议 |');
+        expect(input.system).toContain('互不依赖的多个操作尽量在同一轮并行发起多个工具调用');
+        expect(input.system).toContain('纯知识问答或一句话能说清的简单问题直接回答，不必套用模板');
+        expect(input.system).toContain('### 执行汇报：信息查询类任务');
+        expect(input.system).toContain('| 查询结果 | 直接给出查到的信息');
+        // 交互场景不应带无人值守规则
+        expect(input.system).not.toContain('无人值守运行说明');
         expect(input.system).toContain('existing system instructions');
         yield { type: 'text_delta', text: 'ok' };
         yield { type: 'stop', reason: 'end_turn' };
@@ -67,6 +74,28 @@ describe('runAgent', () => {
       task: 'go',
     });
 
+    expect(result.text).toBe('ok');
+  });
+
+  it('unattended runs swap confirmation rules for skip-and-report guidance', async () => {
+    const model: ChatModel = {
+      id: 'unattended-model',
+      async *stream(input: StreamInput): AsyncIterable<StreamEvent> {
+        expect(input.system).toContain('无人值守运行说明');
+        expect(input.system).toContain('一律视为不可执行——直接跳过，不要输出“待确认变更”等待回复');
+        expect(input.system).toContain('需人工处理');
+        yield { type: 'text_delta', text: 'ok' };
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+    const result = await runAgent({
+      model,
+      tools: new ToolRegistry(),
+      policy: new AllowAllPolicy(),
+      ctx: { sessionId: 't1' },
+      task: 'go',
+      unattended: true,
+    });
     expect(result.text).toBe('ok');
   });
 
@@ -165,20 +194,57 @@ describe('runAgent', () => {
 
     expect(attempts).toBe(3);
     expect(seen.filter((event) => event.type === 'model_retry')).toEqual([
-      { type: 'model_retry', attempt: 2, maxAttempts: 10, error: 'connect 1' },
-      { type: 'model_retry', attempt: 3, maxAttempts: 10, error: 'connect 2' },
+      { type: 'model_retry', attempt: 1, maxAttempts: 10, error: 'connect 1', discardTextChars: 0, discardThinkingChars: 0, discardToolIds: [] },
+      { type: 'model_retry', attempt: 2, maxAttempts: 10, error: 'connect 2', discardTextChars: 0, discardThinkingChars: 0, discardToolIds: [] },
     ]);
     expect(result.text).toBe('ok');
   });
 
-  it('does not retry a model failure after partial output', async () => {
+  it('retries a mid-stream failure, discarding the partial turn (with rollback info)', async () => {
     let attempts = 0;
+    const seen: StreamEvent[] = [];
     const model: ChatModel = {
       id: 'partial-fail',
       async *stream(): AsyncIterable<StreamEvent> {
         attempts++;
-        yield { type: 'text_delta', text: 'partial' };
-        throw new Error('stream lost');
+        if (attempts === 1) {
+          yield { type: 'text_delta', text: 'partial' };
+          yield { type: 'tool_call', call: { id: 'dead-1', name: 'echo', args: {} } };
+          throw new Error('stream lost');
+        }
+        yield { type: 'text_delta', text: 'complete answer' };
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+
+    const result = await runAgent({
+      model,
+      tools: new ToolRegistry(),
+      policy: new AllowAllPolicy(),
+      ctx: { sessionId: 't1' },
+      task: 'go',
+      modelRetryDelayMs: 0,
+      onEvent: (event) => seen.push(event),
+    });
+
+    expect(attempts).toBe(2);
+    // 失败尝试的部分输出被整轮丢弃：最终答案不含 'partial'，也不会执行 dead-1 工具调用
+    expect(result.text).toBe('complete answer');
+    expect(result.messages.at(-1)!.toolCalls).toBeUndefined();
+    expect(seen.filter((event) => event.type === 'model_retry')).toEqual([
+      { type: 'model_retry', attempt: 1, maxAttempts: 10, error: 'stream lost', discardTextChars: 'partial'.length, discardThinkingChars: 0, discardToolIds: ['dead-1'] },
+    ]);
+  });
+
+  it('fails fast on deterministic client errors (4xx) without retrying', async () => {
+    let attempts = 0;
+    const model: ChatModel = {
+      id: 'bad-request',
+      async *stream(): AsyncIterable<StreamEvent> {
+        attempts++;
+        const err = new Error('invalid request') as Error & { status: number };
+        err.status = 400;
+        throw err;
       },
     };
 
@@ -189,7 +255,7 @@ describe('runAgent', () => {
       ctx: { sessionId: 't1' },
       task: 'go',
       modelRetryDelayMs: 0,
-    })).rejects.toThrow('stream lost');
+    })).rejects.toThrow('invalid request');
     expect(attempts).toBe(1);
   });
 
@@ -326,5 +392,182 @@ describe('runAgent', () => {
     const toolMsg = result.messages.find((m) => m.role === 'tool');
     expect(toolMsg?.toolResults?.[0]?.isError).toBe(true);
     expect(toolMsg?.toolResults?.[0]?.content).toContain('nope');
+  });
+});
+
+describe('runAgent 摘要压缩', () => {
+  function longHistory(pairs: number, charsPerMsg: number): import('../src/model/types.js').Msg[] {
+    const msgs: import('../src/model/types.js').Msg[] = [];
+    for (let i = 0; i < pairs; i++) {
+      msgs.push({ role: 'user', text: `问题${i} ${'x'.repeat(charsPerMsg)}` });
+      msgs.push({ role: 'assistant', text: `回答${i} ${'y'.repeat(charsPerMsg)}` });
+    }
+    return msgs;
+  }
+
+  it('轮次边界触发摘要压缩：改写历史、上报 context_compacted、result.compacted = true', async () => {
+    const model: ChatModel = {
+      id: 'm',
+      async *stream(input: StreamInput): AsyncIterable<StreamEvent> {
+        // 首轮边界已压缩：发给模型的历史应以摘要开头
+        expect(input.messages[0]!.text).toContain('历史对话摘要');
+        yield { type: 'text_delta', text: 'ok' };
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+    const summarize = vi.fn(async () => '这是历史摘要');
+    const events: StreamEvent[] = [];
+
+    const result = await runAgent({
+      model,
+      tools: new ToolRegistry(),
+      policy: new AllowAllPolicy(),
+      ctx: { sessionId: 't1' },
+      messages: longHistory(10, 4000), // ≈20k tokens
+      task: '继续',
+      summarize,
+      compactionTriggerTokens: 5000,
+      compactionKeepRecent: 4,
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(summarize).toHaveBeenCalledTimes(1);
+    expect(result.compacted).toBe(true);
+    expect(result.messages[0]!.text).toContain('这是历史摘要');
+    // 最近 4 条 + 本轮 task 原样保留
+    expect(result.messages.some((m) => m.text?.includes('问题9'))).toBe(true);
+    expect(result.messages.some((m) => m.text === '继续')).toBe(true);
+    const ev = events.find((e) => e.type === 'context_compacted');
+    expect(ev).toBeDefined();
+    if (ev?.type === 'context_compacted') {
+      expect(ev.beforeTokens).toBeGreaterThan(5000);
+      expect(ev.afterTokens).toBeLessThan(ev.beforeTokens);
+      expect(ev.summarizedMessages).toBeGreaterThan(0);
+    }
+  });
+
+  it('摘要后仍超触发线时记水位：历史没涨够不重复摘要', async () => {
+    const tools = new ToolRegistry();
+    tools.register({
+      def: { name: 'echo', description: 'echo', inputSchema: { type: 'object' } },
+      run: async () => ({ id: '', content: 'ok' }),
+    });
+    let turn = 0;
+    const model: ChatModel = {
+      id: 'm',
+      async *stream(): AsyncIterable<StreamEvent> {
+        turn++;
+        if (turn === 1) {
+          yield { type: 'tool_call', call: { id: 'c1', name: 'echo', args: {} } };
+        } else {
+          yield { type: 'text_delta', text: 'done' };
+        }
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+    // 最近 8 条每条 ≈2000 tokens：压缩后 ≈16k 仍高于触发线 10k
+    const summarize = vi.fn(async () => '摘要');
+
+    const result = await runAgent({
+      model,
+      tools,
+      policy: new AllowAllPolicy(),
+      ctx: { sessionId: 't1' },
+      messages: longHistory(10, 8000),
+      task: '继续',
+      summarize,
+      compactionTriggerTokens: 10_000,
+      compactionKeepRecent: 8,
+    });
+
+    // 第二轮边界历史仍超触发线但低于水位：不再白跑摘要
+    expect(summarize).toHaveBeenCalledTimes(1);
+    expect(result.compacted).toBe(true);
+    expect(result.text).toBe('done');
+  });
+
+  it('摘要失败不阻断本轮（继续对话，硬裁剪兜底）', async () => {
+    const model: ChatModel = {
+      id: 'm',
+      async *stream(): AsyncIterable<StreamEvent> {
+        yield { type: 'text_delta', text: 'ok' };
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+    const events: StreamEvent[] = [];
+    const result = await runAgent({
+      model,
+      tools: new ToolRegistry(),
+      policy: new AllowAllPolicy(),
+      ctx: { sessionId: 't1' },
+      messages: longHistory(10, 4000),
+      task: '继续',
+      summarize: async () => { throw new Error('summary model down'); },
+      compactionTriggerTokens: 5000,
+      contextBudgetTokens: 8000,
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(result.compacted).toBe(false);
+    expect(result.text).toBe('ok');
+    expect(events.some((e) => e.type === 'context_compacted')).toBe(false);
+  });
+});
+
+describe('runAgent 步数限制', () => {
+  it('默认不限步数：超过 20 轮的工具循环也能跑到完成', async () => {
+    const tools = new ToolRegistry();
+    tools.register({
+      def: { name: 'echo', description: 'echo', inputSchema: { type: 'object' } },
+      run: async () => ({ id: '', content: 'ok' }),
+    });
+    let turn = 0;
+    const model: ChatModel = {
+      id: 'm',
+      async *stream(): AsyncIterable<StreamEvent> {
+        turn++;
+        if (turn <= 30) {
+          yield { type: 'tool_call', call: { id: `c${turn}`, name: 'echo', args: {} } };
+        } else {
+          yield { type: 'text_delta', text: 'finished' };
+        }
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+    const result = await runAgent({
+      model,
+      tools,
+      policy: new AllowAllPolicy(),
+      ctx: { sessionId: 't1' },
+      task: 'go',
+    });
+    expect(result.steps).toBe(31);
+    expect(result.text).toBe('finished');
+  });
+
+  it('显式 maxSteps 仍然生效（无人值守场景的兜底）', async () => {
+    const tools = new ToolRegistry();
+    tools.register({
+      def: { name: 'echo', description: 'echo', inputSchema: { type: 'object' } },
+      run: async () => ({ id: '', content: 'ok' }),
+    });
+    let turn = 0;
+    const model: ChatModel = {
+      id: 'm',
+      async *stream(): AsyncIterable<StreamEvent> {
+        turn++;
+        yield { type: 'tool_call', call: { id: `c${turn}`, name: 'echo', args: {} } }; // 永远调工具
+        yield { type: 'stop', reason: 'tool_use' };
+      },
+    };
+    const result = await runAgent({
+      model,
+      tools,
+      policy: new AllowAllPolicy(),
+      ctx: { sessionId: 't1' },
+      task: 'go',
+      maxSteps: 5,
+    });
+    expect(result.steps).toBe(5);
   });
 });

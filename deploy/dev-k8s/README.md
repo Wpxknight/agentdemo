@@ -6,8 +6,7 @@ It deploys:
 
 - MySQL 8.4 for persistent Store verification.
 - Dex as a test OIDC provider exposed on NodePort `30084`.
-- aiop server Pod using local `aiop-web:dev` + `aiop:dev` images in the same Pod. The web container proxies API/SSE to backend `127.0.0.1:8081`.
-- aiop scheduler using the local `aiop:dev` image.
+- aiop server Pod using local `aiop-web:dev` + `aiop:dev` images in the same Pod. The web container proxies API/SSE to backend `127.0.0.1:8081`, and the backend embeds the scheduler.
 - A fixed NodePort service on `30083`.
 - Example operation ServiceAccounts and RBAC.
 
@@ -49,13 +48,18 @@ kubectl apply -f deploy/dev-k8s/aiop-service-nodeport.yaml
 kubectl apply -f deploy/dev-k8s/ops-rbac.yaml
 ```
 
+If this namespace was deployed with the older standalone scheduler, remove it once:
+
+```sh
+kubectl -n aiop-dev delete deployment aiop-scheduler --ignore-not-found
+```
+
 Wait for readiness:
 
 ```sh
 kubectl -n aiop-dev rollout status deploy/mysql --timeout=180s
 kubectl -n aiop-dev rollout status deploy/dex --timeout=180s
 kubectl -n aiop-dev rollout status deploy/aiop-server --timeout=180s
-kubectl -n aiop-dev rollout status deploy/aiop-scheduler --timeout=180s
 ```
 
 ## Validate HTTP through NodePort

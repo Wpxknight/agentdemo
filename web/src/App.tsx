@@ -43,6 +43,7 @@ import { formatSandboxOutputChunk, parseSandboxOutput, sandboxOutputClassNames, 
 import type {
   Attachment,
   ChatMessage,
+  ContextUsageBody,
   ModelSettingsBody,
   PageId,
   ReasoningEffort,
@@ -186,6 +187,16 @@ function formatFileSize(size: number): string {
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function formatTokenCount(value: number): string {
+  const n = Math.max(0, Math.round(Number.isFinite(value) ? value : 0));
+  if (n >= 1000) return `${Math.round(n / 1000)}K`;
+  return String(n);
+}
+
+function formatContextUsage(usage?: ContextUsageBody): string {
+  return `${formatTokenCount(usage?.usedTokens ?? 0)}/${formatTokenCount(usage?.maxTokens ?? 200000)}`;
+}
+
 function toolCategory(name: string): string {
   if (name === 'load_skill' || name.startsWith('skill__')) return 'skill';
   if (name.startsWith('mcp__')) return 'mcp';
@@ -242,6 +253,14 @@ function parseSse(block: string): { event?: string; data?: Record<string, unknow
   } catch {
     return { event, data: { text: raw } };
   }
+}
+
+function isContextUsage(value: unknown): value is ContextUsageBody {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.usedTokens === 'number'
+    && typeof record.maxTokens === 'number'
+    && typeof record.estimated === 'boolean';
 }
 
 /** 把沙箱 / kubectl 工具调用还原成可读的命令行；非这类工具返回 null。 */
@@ -312,6 +331,9 @@ function publicAttachment(file: Attachment): Omit<Attachment, 'id'> {
   return rest;
 }
 
+/** 与后端 SUMMARY_PREFIX 对应：自动压缩落库的历史摘要消息前缀。 */
+const CONTEXT_SUMMARY_PREFIX = '【历史对话摘要（自动压缩，供参考）】';
+
 function sessionMessagesToChatMessages(body: SessionMessagesBody): ChatMessage[] {
   const messages = body.messages
     .filter((message) => message.role === 'user' || message.role === 'assistant')
@@ -320,6 +342,7 @@ function sessionMessagesToChatMessages(body: SessionMessagesBody): ChatMessage[]
       role: message.role as Role,
       text: message.text || '',
       thinking: message.thinking,
+      summary: message.role === 'user' && (message.text || '').startsWith(CONTEXT_SUMMARY_PREFIX),
       time: '',
     }));
   return messages.length ? messages : initialMessages.slice(0, 1);
@@ -490,6 +513,22 @@ function MarkdownMessage({ content }: { content: string }) {
   );
 }
 
+/** 自动压缩产生的历史摘要：折叠展示，避免占满时间线。 */
+function ContextSummaryBlock({ text }: { text: string }) {
+  const content = text.startsWith(CONTEXT_SUMMARY_PREFIX)
+    ? text.slice(CONTEXT_SUMMARY_PREFIX.length).trim()
+    : text;
+  return (
+    <details className="thinking-block context-summary">
+      <summary>
+        <Cpu />
+        历史摘要（自动压缩）
+      </summary>
+      <div className="thinking-content">{renderTextLines(content, 'context-summary')}</div>
+    </details>
+  );
+}
+
 function MessageContent({ message }: { message: ChatMessage }) {
   const segments = splitThinkingSegments(message.text);
   const thinkingSegments = [
@@ -500,8 +539,13 @@ function MessageContent({ message }: { message: ChatMessage }) {
     })),
   ];
   const textSegments = segments.filter((segment) => segment.type === 'text');
+  if (message.summary) return <ContextSummaryBlock text={message.text} />;
   return (
     <>
+      {message.notices?.map((notice, index) => (
+        <div key={`notice-${index}`} className="context-notice">{notice}</div>
+      ))}
+      {message.retrying ? <div className="context-notice retry-notice">{message.retrying}</div> : null}
       {thinkingSegments.map((segment, index) => (
         <ThinkingBlock key={`thinking-${index}`} content={segment.content} streaming={segment.streaming} />
       ))}
@@ -539,6 +583,7 @@ export default function App() {
   const [token, setToken] = useState(() => readStorage('aiop_token'));
   const [sessionId, setSessionId] = useState(() => readStorage('aiop_session_id') || numericSessionId());
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [contextUsage, setContextUsage] = useState<Record<string, ContextUsageBody>>({});
   const [tools, setTools] = useState<ToolSummary[]>([]);
   const [tasks, setTasks] = useState<ScheduledTask[]>([]);
   const [sandboxes, setSandboxes] = useState<SandboxSummary[]>([]);
@@ -554,21 +599,64 @@ export default function App() {
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [toolTestOutput, setToolTestOutput] = useState('');
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
+  const [sessionMessageCache, setSessionMessageCache] = useState<Record<string, ChatMessage[]>>({});
   const [composerValue, setComposerValue] = useState('');
   const [sessionOffset, setSessionOffset] = useState(0);
   const [sessionTotal, setSessionTotal] = useState(0);
   const [sessionHasMore, setSessionHasMore] = useState(false);
   const [runningAgentCount, setRunningAgentCount] = useState(0);
+  const [activeRunSessionIds, setActiveRunSessionIds] = useState<Set<string>>(() => new Set());
   const [terminatingSession, setTerminatingSession] = useState(false);
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogRequest | null>(null);
   const [confirmDialogBusy, setConfirmDialogBusy] = useState(false);
   const [skillShortcutDraft, setSkillShortcutDraft] = useState('');
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const sessionIdRef = useRef(sessionId);
+  const messagesRef = useRef(messages);
 
   useEffect(() => {
+    sessionIdRef.current = sessionId;
     writeStorage('aiop_session_id', sessionId);
   }, [sessionId]);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+    const currentSessionId = sessionIdRef.current;
+    if (!currentSessionId) return;
+    setSessionMessageCache((current) => (
+      current[currentSessionId] === messages ? current : { ...current, [currentSessionId]: messages }
+    ));
+  }, [messages]);
+
+  function activateSession(nextSessionId: string) {
+    sessionIdRef.current = nextSessionId;
+    setSessionId(nextSessionId);
+    writeStorage('aiop_session_id', nextSessionId);
+  }
+
+  function showSessionMessages(nextSessionId: string, nextMessages: ChatMessage[]) {
+    activateSession(nextSessionId);
+    messagesRef.current = nextMessages;
+    setMessages(nextMessages);
+    setSessionMessageCache((current) => ({ ...current, [nextSessionId]: nextMessages }));
+  }
+
+  function updateSessionMessages(targetSessionId: string, updater: (current: ChatMessage[]) => ChatMessage[]) {
+    if (!targetSessionId) return;
+    if (sessionIdRef.current === targetSessionId) {
+      setMessages((current) => {
+        const next = updater(current);
+        messagesRef.current = next;
+        return next;
+      });
+      return;
+    }
+    setSessionMessageCache((current) => {
+      const base = current[targetSessionId] || initialMessages.slice(0, 1);
+      return { ...current, [targetSessionId]: updater(base) };
+    });
+  }
 
   const redirectToLogin = useCallback(() => {
     setPage('login');
@@ -605,6 +693,21 @@ export default function App() {
     setSessionTotal(body.total ?? next.length);
     setSessionHasMore(Boolean(body.hasMore));
   }, [api]);
+
+  const loadContextUsage = useCallback(async (nextSessionId: string) => {
+    if (!nextSessionId) return;
+    try {
+      const body = await api.get<ContextUsageBody>(`/v1/sessions/${encodeURIComponent(nextSessionId)}/context`);
+      setContextUsage((current) => ({ ...current, [nextSessionId]: body }));
+    } catch (err) {
+      console.error(err);
+    }
+  }, [api]);
+
+  useEffect(() => {
+    if (!token || !sessionId) return;
+    void loadContextUsage(sessionId);
+  }, [loadContextUsage, sessionId, token]);
 
   const loadPageData = useCallback(async (target: PageId | 'login' = page) => {
     if (!token || target === 'login') return;
@@ -681,11 +784,17 @@ export default function App() {
   async function selectSession(session: SessionSummary) {
     if (!session.sessionId) return;
     try {
+      const cachedMessages = sessionMessageCache[session.sessionId];
+      if (activeRunSessionIds.has(session.sessionId) && cachedMessages?.length) {
+        showSessionMessages(session.sessionId, cachedMessages);
+        setAttachments([]);
+        void loadContextUsage(session.sessionId);
+        return;
+      }
       const body = await api.get<SessionMessagesBody>(`/v1/sessions/${encodeURIComponent(session.sessionId)}/messages`);
-      setSessionId(session.sessionId);
-      writeStorage('aiop_session_id', session.sessionId);
-      setMessages(sessionMessagesToChatMessages(body));
+      showSessionMessages(session.sessionId, sessionMessagesToChatMessages(body));
       setAttachments([]);
+      void loadContextUsage(session.sessionId);
     } catch (err) {
       setMessages([{
         id: randomId(),
@@ -696,12 +805,32 @@ export default function App() {
     }
   }
 
-  function startNewSession() {
+  async function startNewSession() {
     const id = numericSessionId();
-    setSessionId(id);
-    writeStorage('aiop_session_id', id);
-    setMessages(initialMessages.slice(0, 1));
+    showSessionMessages(id, initialMessages.slice(0, 1));
     setAttachments([]);
+    setContextUsage((current) => ({
+      ...current,
+      [id]: { sessionId: id, usedTokens: 0, maxTokens: llm.context_window_tokens || 200000, estimated: true },
+    }));
+    try {
+      const created = await api.post<{ session: SessionsBody['sessions'][number] }>('/v1/sessions', {
+        sessionId: id,
+        title: '新会话',
+      });
+      const createdSummary = mapSessionSummary(created.session);
+      const existed = sessions.some((session) => session.sessionId === createdSummary.sessionId);
+      setSessions((current) => [createdSummary, ...current.filter((session) => session.sessionId !== createdSummary.sessionId)]);
+      setSessionTotal((current) => current + (existed ? 0 : 1));
+      void loadContextUsage(id);
+    } catch (err) {
+      setMessages((current) => [...current, {
+        id: randomId(),
+        role: 'assistant',
+        text: `创建会话失败：${formatError(err)}`,
+        time: new Date().toLocaleTimeString(),
+      }]);
+    }
   }
 
   async function loadNextSessionsPage() {
@@ -825,6 +954,7 @@ export default function App() {
 
   async function runAgent(task: string, files: Omit<Attachment, 'id'>[] = [], requestSessionId = sessionId) {
     const payload = { task, sessionId: requestSessionId, attachments: files };
+    let activeSessionId = requestSessionId;
     const response = await fetch('/v1/agent', {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
@@ -835,16 +965,19 @@ export default function App() {
       return;
     }
     if (!response.ok || !response.body) {
-      setMessages((current) => [...current, { id: randomId(), role: 'assistant', text: `请求失败：${response.status}`, time: new Date().toLocaleTimeString() }]);
+      // 带出后端错误详情（如 409 会话正在运行的互斥提示），而不是只报状态码。
+      const detail = await response.json().then((body: { error?: string }) => body?.error).catch(() => undefined);
+      setMessages((current) => [...current, { id: randomId(), role: 'assistant', text: `请求失败：${detail || response.status}`, time: new Date().toLocaleTimeString() }]);
       return;
     }
     const assistantId = randomId();
     const assistant: ChatMessage = { id: assistantId, role: 'assistant', text: '', time: new Date().toLocaleTimeString(), running: true };
     const publishAssistant = () => {
-      setMessages((current) => current.map((message) => (message.id === assistantId ? { ...assistant } : message)));
+      updateSessionMessages(activeSessionId, (current) => current.map((message) => (message.id === assistantId ? { ...assistant } : message)));
     };
-    setMessages((current) => [...current, assistant]);
+    updateSessionMessages(requestSessionId, (current) => [...current, assistant]);
     setRunningAgentCount((current) => current + 1);
+    setActiveRunSessionIds((current) => new Set(current).add(requestSessionId));
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -870,14 +1003,41 @@ export default function App() {
         for (const part of parts) {
           const event = parseSse(part);
           if (event?.event === 'session' && typeof event.data?.sessionId === 'string') {
-            setSessionId(event.data.sessionId);
+            const previousSessionId = activeSessionId;
+            activeSessionId = event.data.sessionId;
+            if (previousSessionId !== activeSessionId) {
+              setSessionMessageCache((current) => {
+                if (current[activeSessionId]) return current;
+                const previousMessages = current[previousSessionId]
+                  || (sessionIdRef.current === previousSessionId ? messagesRef.current : undefined);
+                return previousMessages ? { ...current, [activeSessionId]: previousMessages } : current;
+              });
+            }
+            activateSession(event.data.sessionId);
+            setActiveRunSessionIds((current) => new Set(current).add(event.data!.sessionId as string));
           }
           if (event?.event === 'thinking_delta' && typeof event.data?.text === 'string') {
             assistant.thinking = `${assistant.thinking || ''}${event.data.text}`;
+            assistant.retrying = undefined; // 输出恢复即清除重试提示
             publishAssistant();
           }
           if (event?.event === 'text_delta' && typeof event.data?.text === 'string') {
             assistant.text += event.data.text;
+            assistant.retrying = undefined;
+            publishAssistant();
+          }
+          if (event?.event === 'model_retry' && typeof event.data?.attempt === 'number') {
+            // 重试会整轮重放：回滚失败尝试已流式展示的部分输出，丢弃未执行的工具步骤
+            const discardText = typeof event.data.discardTextChars === 'number' ? event.data.discardTextChars : 0;
+            const discardThinking = typeof event.data.discardThinkingChars === 'number' ? event.data.discardThinkingChars : 0;
+            if (discardText > 0) assistant.text = assistant.text.slice(0, -discardText);
+            if (discardThinking > 0 && assistant.thinking) assistant.thinking = assistant.thinking.slice(0, -discardThinking);
+            const discardIds = Array.isArray(event.data.discardToolIds) ? (event.data.discardToolIds as string[]) : [];
+            if (discardIds.length && assistant.steps?.length) {
+              assistant.steps = assistant.steps.filter((s) => !discardIds.includes(s.id));
+            }
+            const error = typeof event.data.error === 'string' ? event.data.error : '';
+            assistant.retrying = `模型调用异常，正在自动重试（第 ${event.data.attempt}/${event.data.maxAttempts ?? 10} 次）${error ? `：${error}` : ''}`;
             publishAssistant();
           }
           if (event?.event === 'tool_call' && event.data?.call) {
@@ -904,6 +1064,16 @@ export default function App() {
             assistant.steps = (assistant.steps || []).map((s) => (s.id === toolId ? { ...s, status } : s));
             publishAssistant();
           }
+          if (
+            event?.event === 'context_compacted'
+            && typeof event.data?.summarizedMessages === 'number'
+            && typeof event.data?.beforeTokens === 'number'
+            && typeof event.data?.afterTokens === 'number'
+          ) {
+            const notice = `已自动压缩上下文：${event.data.summarizedMessages} 条较早消息摘要为一段（${formatTokenCount(event.data.beforeTokens)} → ${formatTokenCount(event.data.afterTokens)} tokens）`;
+            assistant.notices = [...(assistant.notices || []), notice];
+            publishAssistant();
+          }
           if (event?.event === 'terminated') {
             assistant.text = assistant.text.trim()
               ? `${assistant.text}\n\n已终止当前运行。`
@@ -918,7 +1088,17 @@ export default function App() {
             publishAssistant();
           }
           if (event?.event === 'done' && typeof event.data?.sessionId === 'string') {
-            setSessionId(event.data.sessionId);
+            activateSession(event.data.sessionId);
+            // SSE payloads may provide event.data?.context or event.data?.usage?.context.
+            const eventData = event.data as { context?: unknown; usage?: { context?: unknown } };
+            const nextContext = isContextUsage(eventData.context)
+              ? eventData.context
+              : isContextUsage(eventData.usage?.context)
+                ? eventData.usage.context
+                : undefined;
+            if (nextContext) {
+              setContextUsage((current) => ({ ...current, [event.data!.sessionId as string]: nextContext }));
+            }
           }
         }
       }
@@ -931,10 +1111,34 @@ export default function App() {
       if (assistant.steps?.some((s) => s.status === 'running')) {
         assistant.steps = assistant.steps.map((s) => (s.status === 'running' ? { ...s, status: 'error' } : s));
       }
-      Object.assign(assistant, { running: false });
+      Object.assign(assistant, { running: false, retrying: undefined });
       publishAssistant();
       setRunningAgentCount((current) => Math.max(0, current - 1));
+      setActiveRunSessionIds((current) => {
+        const next = new Set(current);
+        next.delete(requestSessionId);
+        next.delete(activeSessionId);
+        return next;
+      });
       await fetchSessionsPage(0, false);
+      await loadContextUsage(activeSessionId);
+    }
+  }
+
+  async function appendToActiveSession(task: string, files: Omit<Attachment, 'id'>[]) {
+    try {
+      await api.post<{ ok: boolean; sessionId: string; queued: boolean }>(`/v1/sessions/${encodeURIComponent(sessionId)}/append`, {
+        task,
+        attachments: files,
+      });
+      await loadContextUsage(sessionId);
+    } catch (err) {
+      setMessages((current) => [...current, {
+        id: randomId(),
+        role: 'assistant',
+        text: `追加消息失败：${formatError(err)}`,
+        time: new Date().toLocaleTimeString(),
+      }]);
     }
   }
 
@@ -944,7 +1148,7 @@ export default function App() {
     if (!task && !files.length) return;
     const taskForAgent = applySkillShortcut(task, skillTools);
     const sentAttachments = attachments;
-    setMessages((current) => [...current, {
+    updateSessionMessages(sessionId, (current) => [...current, {
       id: randomId(),
       role: 'user',
       text: task || '请分析上传附件。',
@@ -954,6 +1158,10 @@ export default function App() {
     setComposerValue('');
     setSkillShortcutDraft('');
     setAttachments([]);
+    if (activeRunSessionIds.has(sessionId)) {
+      void appendToActiveSession(taskForAgent || '请分析上传附件。', files);
+      return;
+    }
     void runAgent(taskForAgent || '请分析上传附件。', files, sessionId);
   }
 
@@ -1076,6 +1284,7 @@ export default function App() {
           sessionTotal={sessionTotal}
           sessionHasMore={sessionHasMore}
           selectedSessionId={sessionId}
+          contextUsage={contextUsage[sessionId]}
           messages={messages}
           attachments={attachments}
           composerValue={composerValue}
@@ -1241,6 +1450,7 @@ function PrototypeChatShell(props: {
   sessionTotal: number;
   sessionHasMore: boolean;
   selectedSessionId: string;
+  contextUsage?: ContextUsageBody;
   messages: ChatMessage[];
   attachments: Attachment[];
   composerValue: string;
@@ -1296,6 +1506,7 @@ function PrototypeChatShell(props: {
           <PrototypeChatHeader
             runningAgentCount={props.runningAgentCount}
             terminatingSession={props.terminatingSession}
+            contextUsage={props.contextUsage}
             onNewSession={props.onNewSession}
             onRequestStopSession={props.onRequestStopSession}
             onToggleHistory={props.onToggleHistory}
@@ -1460,6 +1671,7 @@ function PrototypeSessionPanel({ sessions, total, hasMore, selectedSessionId, on
 function PrototypeChatHeader(props: {
   runningAgentCount: number;
   terminatingSession: boolean;
+  contextUsage?: ContextUsageBody;
   onNewSession: () => void;
   onRequestStopSession: () => void;
   onToggleHistory: () => void;
@@ -1473,6 +1685,7 @@ function PrototypeChatHeader(props: {
         <span>
           <i />
           {props.runningAgentCount ? `${props.runningAgentCount} 个任务运行中` : '就绪'}
+          <b>上下文 {formatContextUsage(props.contextUsage)}</b>
         </span>
       </div>
       <div className="prototype-chat-actions">
@@ -2765,16 +2978,23 @@ function SettingsPage({ llm, status, api, onLlmChange, onStatus }: {
   onLlmChange: (next: RuntimeModelConfig) => void;
   onStatus: (next: string) => void;
 }) {
-  const [form, setForm] = useState(() => ({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', effort: llm.effort || 'medium' }));
+  const [form, setForm] = useState(() => ({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) }));
 
   useEffect(() => {
-    setForm({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', effort: llm.effort || 'medium' });
-  }, [llm.api_key, llm.base_url, llm.model, llm.protocol, llm.effort]);
+    setForm({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) });
+  }, [llm.api_key, llm.base_url, llm.model, llm.protocol, llm.effort, llm.context_window_tokens]);
+
+  // 上下文窗口仅在填了合法正整数时提交，避免编辑中间态触发后端 400。
+  function formPayload() {
+    const { context_window_tokens, ...rest } = form;
+    const n = Number(context_window_tokens);
+    return Number.isFinite(n) && n > 0 ? { ...rest, context_window_tokens: Math.floor(n) } : rest;
+  }
 
   async function save() {
     onStatus('正在保存配置...');
     try {
-      const body = await api.post<ModelSettingsBody>('/v1/settings/llm', form);
+      const body = await api.post<ModelSettingsBody>('/v1/settings/llm', formPayload());
       onLlmChange({ ...body.config, options: body.options || llm.options || [] });
       onStatus('配置已保存，新的聊天请求会使用该模型。');
     } catch (err) {
@@ -2785,7 +3005,7 @@ function SettingsPage({ llm, status, api, onLlmChange, onStatus }: {
   async function test() {
     onStatus('正在测试模型连接...');
     try {
-      const body = await api.post<ModelSettingsBody & { text?: string }>('/v1/settings/llm/test', form);
+      const body = await api.post<ModelSettingsBody & { text?: string }>('/v1/settings/llm/test', formPayload());
       onLlmChange({ ...body.config, options: body.options || llm.options || [] });
       onStatus(`测试成功：${body.text || '模型已响应'}`);
     } catch (err) {
@@ -2807,6 +3027,7 @@ function SettingsPage({ llm, status, api, onLlmChange, onStatus }: {
             <Label>Base URL<Input value={form.base_url} onChange={(event) => setForm((current) => ({ ...current, base_url: event.target.value }))} /></Label>
             <Label>API Key<Input placeholder="输入 API Key" value={form.api_key} onChange={(event) => setForm((current) => ({ ...current, api_key: event.target.value }))} /></Label>
             <Label>Model<Input value={form.model} onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))} /></Label>
+            <Label>上下文窗口（tokens）<Input type="number" min={20000} step={1000} placeholder="200000" value={form.context_window_tokens} onChange={(event) => setForm((current) => ({ ...current, context_window_tokens: event.target.value }))} /></Label>
             <Label>推理深度<Select value={form.effort} onValueChange={(effort) => setForm((current) => ({ ...current, effort: effort as ReasoningEffort }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="none">none（关闭思考）</SelectItem><SelectItem value="low">low</SelectItem><SelectItem value="medium">medium</SelectItem><SelectItem value="high">high</SelectItem><SelectItem value="xhigh">xhigh</SelectItem><SelectItem value="max">max</SelectItem></SelectGroup></SelectContent></Select></Label>
             {form.protocol === 'openai' ? <div className="settings-hint">推理深度仅对 Anthropic 协议生效</div> : null}
             {status ? <div className="settings-status">{status}</div> : null}
@@ -2831,11 +3052,73 @@ function SettingsPage({ llm, status, api, onLlmChange, onStatus }: {
             <span>Base URL</span><strong>{llm.base_url || '-'}</strong>
             <span>Model</span><strong>{llm.model || '-'}</strong>
             <span>API Key</span><strong>{llm.api_key || '-'}</strong>
+            <span>上下文窗口</span><strong>{llm.context_window_tokens ? `${llm.context_window_tokens.toLocaleString()} tokens` : '-'}</strong>
           </CardContent>
         </Card>
+        <SchedulerSettingsCard api={api} onStatus={onStatus} />
       </div>
     </>
   );
+}
+
+function SchedulerSettingsCard({ api, onStatus }: {
+  api: ReturnType<typeof createApi>;
+  onStatus: (next: string) => void;
+}) {
+  const [minutes, setMinutes] = useState('240');
+
+  useEffect(() => {
+    let cancelled = false;
+    api.get<{ settings?: { max_run_minutes?: number } }>('/v1/settings/scheduler')
+      .then((body) => {
+        if (!cancelled && typeof body.settings?.max_run_minutes === 'number') {
+          setMinutes(String(body.settings.max_run_minutes));
+        }
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [api]);
+
+  async function save() {
+    const n = Number(minutes);
+    if (!Number.isFinite(n) || n < 1) {
+      onStatus('保存失败：最长运行时长必须是不小于 1 的分钟数');
+      return;
+    }
+    onStatus('正在保存定时任务配置...');
+    try {
+      const body = await api.post<{ settings: { max_run_minutes: number } }>('/v1/settings/scheduler', { max_run_minutes: Math.floor(n) });
+      setMinutes(String(body.settings.max_run_minutes));
+      onStatus(`定时任务配置已保存：单次运行最长 ${formatRunDuration(body.settings.max_run_minutes)}。`);
+    } catch (err) {
+      onStatus(`保存失败：${formatError(err)}`);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>定时任务</CardTitle>
+        <CardDescription>无人值守运行的安全兜底：超时自动中止并记录失败。</CardDescription>
+      </CardHeader>
+      <CardContent className="settings-form">
+        <Label>单次运行最长时长（分钟）
+          <Input type="number" min={1} step={10} placeholder="240" value={minutes} onChange={(event) => setMinutes(event.target.value)} />
+        </Label>
+        <div className="settings-hint">默认 240 分钟（4 小时）；当前值折合 {formatRunDuration(Number(minutes) || 0)}</div>
+        <div className="form-actions">
+          <Button type="button" onClick={() => void save()}>保存配置</Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function formatRunDuration(minutes: number): string {
+  if (!Number.isFinite(minutes) || minutes <= 0) return '-';
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = minutes / 60;
+  return Number.isInteger(hours) ? `${hours} 小时` : `${hours.toFixed(1)} 小时`;
 }
 
 function DataTable({ headers, rows, selectedRowIndex, onRowClick }: {

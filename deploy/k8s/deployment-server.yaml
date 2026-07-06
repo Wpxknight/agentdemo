@@ -40,6 +40,8 @@ spec:
               value: /config/config.jsonc
             - name: PORT
               value: "8081"
+            - name: AIOP_EMBED_SCHEDULER
+              value: "true"
           envFrom:
             - secretRef: { name: aiop-secrets }
           volumeMounts:

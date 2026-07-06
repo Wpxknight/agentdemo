@@ -144,6 +144,20 @@ describe('frontend API wiring', () => {
     expect(app).not.toContain('id="browser-control-form"');
   });
 
+  it('uses viewport-adaptive browser preview heights in chat panels', async () => {
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    const prototypeFrameRule = css.match(/\.prototype-browser-card iframe\s*\{[\s\S]*?\n  \}/)?.[0] || '';
+    const prototypeEmptyRule = css.match(/\.prototype-empty-preview\s*\{[\s\S]*?\n  \}/)?.[0] || '';
+    const legacyFrameRule = css.match(/\.browser-preview-frame\s*\{[\s\S]*?\n  \}/)?.[0] || '';
+    const legacyEmptyRule = css.match(/\.preview-empty\s*\{[\s\S]*?\n  \}/)?.[0] || '';
+
+    expect(prototypeFrameRule).toContain('height: clamp(420px, calc(100vh - 260px), 760px);');
+    expect(prototypeEmptyRule).toContain('min-height: clamp(360px, calc(100vh - 360px), 620px);');
+    expect(legacyFrameRule).toContain('height: clamp(420px, calc(100vh - 260px), 760px);');
+    expect(legacyEmptyRule).toContain('min-height: clamp(360px, calc(100vh - 360px), 620px);');
+  });
+
   it('keeps chat composer focused on input without model footer details', async () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
     const css = await readFile('web/src/index.css', 'utf8');
@@ -374,6 +388,42 @@ describe('frontend API wiring', () => {
     expect(types).toContain('offset?: number;');
     expect(types).toContain('hasMore?: boolean;');
     expect(app).not.toContain('disabled={runningAgentCount');
+  });
+
+  it('uses immediate sessions, active append, and context usage in chat runtime UI', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const types = await readFile('web/src/types.ts', 'utf8');
+    const data = await readFile('web/src/app-data.ts', 'utf8');
+
+    expect(types).toContain('export interface ContextUsageBody');
+    expect(types).toContain('context_window_tokens: number;');
+    expect(data).toContain('context_window_tokens: 200000');
+    expect(app).toContain('useState<Record<string, ContextUsageBody>>');
+    expect(app).toContain('activeRunSessionIds');
+    expect(app).toContain("api.post<{ session: SessionsBody['sessions'][number] }>('/v1/sessions'");
+    expect(app).toContain('setSessions((current) => [createdSummary, ...current.filter((session) => session.sessionId !== createdSummary.sessionId)])');
+    expect(app).toContain('api.get<ContextUsageBody>(`/v1/sessions/${encodeURIComponent(nextSessionId)}/context`)');
+    expect(app).toContain('api.post<{ ok: boolean; sessionId: string; queued: boolean }>(`/v1/sessions/${encodeURIComponent(sessionId)}/append`');
+    expect(app).toContain('activeRunSessionIds.has(sessionId)');
+    expect(app).toContain('上下文 {formatContextUsage(props.contextUsage)}');
+    expect(app).toContain('event.data?.context');
+    expect(app).toContain('event.data?.usage?.context');
+    expect(app).toContain('formatTokenCount');
+  });
+
+  it('preserves running chat state when returning to an active session', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(app).toContain('useState<Record<string, ChatMessage[]>>({})');
+    expect(app).toContain('const sessionIdRef = useRef(sessionId)');
+    expect(app).toContain('const messagesRef = useRef(messages)');
+    expect(app).toContain('function showSessionMessages(nextSessionId: string, nextMessages: ChatMessage[])');
+    expect(app).toContain('function updateSessionMessages(targetSessionId: string, updater: (current: ChatMessage[]) => ChatMessage[])');
+    expect(app).toContain('const cachedMessages = sessionMessageCache[session.sessionId]');
+    expect(app).toContain('activeRunSessionIds.has(session.sessionId) && cachedMessages?.length');
+    expect(app).toContain('showSessionMessages(session.sessionId, cachedMessages)');
+    expect(app).toContain('updateSessionMessages(requestSessionId, (current) => [...current, assistant])');
+    expect(app).toContain('updateSessionMessages(activeSessionId, (current) => current.map((message) => (message.id === assistantId ? { ...assistant } : message)))');
   });
 
   it('does not show sample sessions when the backend returns an empty history list', async () => {

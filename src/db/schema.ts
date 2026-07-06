@@ -18,6 +18,14 @@ export interface MessagesTable {
   created_at: Generated<Date>;
 }
 
+export interface SessionsTable {
+  tenant_id: string;
+  session_id: string;
+  title: string;
+  created_at: Generated<Date>;
+  updated_at: Generated<Date>;
+}
+
 export interface AuditEventsTable {
   id: Generated<number>;
   tenant_id: string | null;
@@ -78,6 +86,7 @@ export interface TenantSettingsTable {
 }
 
 export interface Database {
+  sessions: SessionsTable;
   messages: MessagesTable;
   audit_events: AuditEventsTable;
   scheduled_tasks: ScheduledTasksTable;

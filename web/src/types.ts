@@ -107,6 +107,9 @@ export interface RuntimeModelConfig {
   api_key: string;
   api_key_set: boolean;
   api_key_preview: string;
+  context_window_tokens: number;
+  /** 历史里保留图片的最近带图消息条数（更早的替换占位符），默认 1。 */
+  context_keep_images?: number;
   /** 推理深度（none 关闭思考；仅 Anthropic 协议生效）。 */
   effort?: ReasoningEffort;
   options?: RuntimeModelConfig[];
@@ -137,6 +140,12 @@ export interface ChatMessage {
   time: string;
   tools?: string[];
   attachments?: Attachment[];
+  /** 运行期系统提示（如自动压缩上下文），展示在消息气泡顶部。 */
+  notices?: string[];
+  /** 模型正在自动重试的瞬态提示；输出恢复后清除。 */
+  retrying?: string;
+  /** 该消息是自动压缩产生的历史摘要（折叠展示）。 */
+  summary?: boolean;
 }
 
 export interface SessionsBody {
@@ -159,6 +168,13 @@ export interface SessionMessagesBody {
     text?: string;
     thinking?: string;
   }>;
+}
+
+export interface ContextUsageBody {
+  sessionId?: string;
+  usedTokens: number;
+  maxTokens: number;
+  estimated: boolean;
 }
 
 export interface ToolsBody {

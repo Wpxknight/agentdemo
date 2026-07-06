@@ -2,12 +2,11 @@ import { logger } from './logger.js';
 import { loadConfig } from './config/load.js';
 import { runAgent } from './agent/core.js';
 import { buildRuntime } from './runtime.js';
-import { Scheduler } from './scheduler/ticker.js';
-import { AutoApproveGate, AutoDenyGate } from './agent/approval.js';
+import { AutoApproveGate } from './agent/approval.js';
 import { createHttpServer } from './server/http.js';
 import { LocalAuthProvider } from './auth/local.js';
-import type { ScheduledTask } from './db/store.js';
 import type { Config } from './config/schema.js';
+import { shouldEmbedScheduler, startRuntimeScheduler } from './scheduler/runner.js';
 
 /**
  * 入口：
@@ -30,6 +29,9 @@ async function main() {
 /** HTTP + SSE 服务模式。 */
 async function runServer(config: Config) {
   const rt = await buildRuntime(config);
+  const scheduler = shouldEmbedScheduler() ? startRuntimeScheduler(rt) : undefined;
+  if (scheduler) logger.info('scheduler embedded in HTTP server');
+
   const server = createHttpServer(rt);
   const port = Number(process.env.PORT ?? 8080);
   const host = process.env.HOST ?? '0.0.0.0';
@@ -38,6 +40,7 @@ async function runServer(config: Config) {
   const shutdown = async () => {
     logger.info('正在关闭 HTTP 服务…');
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    scheduler?.stop();
     await rt.dispose();
     process.exit(0);
   };
@@ -69,9 +72,7 @@ async function runOnce(config: Config, task: string) {
 
   process.stdout.write('\n');
   logger.info({ steps: result.steps, usage: result.usage }, 'done');
-  for (const m of result.messages.slice(prior.length)) {
-    await rt.store.appendMessage(rt.defaultContext, sessionId, m);
-  }
+  await rt.store.appendMessages(rt.defaultContext, sessionId, result.messages.slice(prior.length));
   await rt.audit.record({
     kind: 'usage', action: 'agent', tenantId: rt.defaultContext.tenantId, sessionId,
     detail: { ...result.usage, steps: result.steps },
@@ -82,33 +83,7 @@ async function runOnce(config: Config, task: string) {
 /** 常驻调度器模式：周期 tick 领取并执行到点定时任务。 */
 async function runScheduler(config: Config) {
   const rt = await buildRuntime(config);
-
-  const runner = async (t: ScheduledTask) => {
-    logger.info({ taskId: t.id, tenantId: t.tenantId, sessionId: t.sessionId }, 'running scheduled task');
-    const taskCtx = { tenantId: t.tenantId, userId: t.userId, role: 'user' as const };
-    const prior = await rt.store.listMessages(taskCtx, t.sessionId);
-    const result = await runAgent({
-      model: rt.model,
-      tools: rt.tools,
-      policy: t.preApproved ? rt.policyPreApproved : rt.policy,
-      approval: new AutoDenyGate(), // 无人值守：未预批准的审批一律拒绝
-      system: rt.systemExtra,
-      ctx: { sessionId: t.sessionId, ...taskCtx },
-      messages: prior,
-      task: t.task,
-    });
-    for (const m of result.messages.slice(prior.length)) {
-      await rt.store.appendMessage(taskCtx, t.sessionId, m);
-    }
-    await rt.audit.record({
-      kind: 'usage', action: 'scheduled', tenantId: t.tenantId, sessionId: t.sessionId,
-      detail: { ...result.usage, steps: result.steps, taskId: t.id },
-    });
-    return { status: 'success' as const, detail: result.text.slice(0, 4000), steps: result.steps };
-  };
-
-  const scheduler = new Scheduler({ store: rt.store, runner });
-  scheduler.start();
+  const scheduler = startRuntimeScheduler(rt);
   logger.info('scheduler running; Ctrl-C to stop');
 
   const shutdown = async () => {

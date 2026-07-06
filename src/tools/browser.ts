@@ -9,6 +9,12 @@ function asObject(args: JsonValue): Record<string, JsonValue> {
   return args && typeof args === 'object' && !Array.isArray(args) ? args : {};
 }
 
+/** 按魔数识别截图格式（不同 provider 可能返回 JPEG 或 PNG）。 */
+function sniffImageMime(bytes: Uint8Array): string {
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xd8) return 'image/jpeg';
+  return 'image/png';
+}
+
 function reqNumber(o: Record<string, JsonValue>, key: string): number {
   const v = o[key];
   const n = typeof v === 'number' ? v : Number(v);
@@ -101,14 +107,14 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
       },
       async run(_args, ctx): Promise<ToolResult> {
         const d = await resolve(ctx);
-        const png = await d.screenshot();
-        const text = `截图已捕获（${png.byteLength} 字节）。浏览器预览：${d.streamUrl()}`;
+        const img = await d.screenshot();
+        const text = `截图已捕获（${img.byteLength} 字节）。浏览器预览：${d.streamUrl()}`;
         return {
           id: '',
           content: text,
           contentBlocks: [
             { type: 'text', text },
-            { type: 'image', mimeType: 'image/png', data: Buffer.from(png).toString('base64') },
+            { type: 'image', mimeType: sniffImageMime(img), data: Buffer.from(img).toString('base64') },
           ],
         };
       },

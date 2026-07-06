@@ -59,6 +59,8 @@ export interface Msg {
   thinkingBlocks?: ThinkingBlock[]; // role === 'assistant'
   toolCalls?: ToolCall[]; // role === 'assistant'
   toolResults?: ToolResult[]; // role === 'tool'
+  /** role === 'user'：多模态内容块（如上传的图片附件），与 text 并存。 */
+  contentBlocks?: ToolContentBlock[];
 }
 
 /** 流式过程中产生的中立事件。 */
@@ -72,9 +74,22 @@ export type StreamEvent =
   | { type: 'tool_output'; toolId: string; stream: 'stdout' | 'stderr'; text: string }
   /** 单个工具调用执行完成（成功/失败），供前端实时标记任务进度。 */
   | { type: 'tool_result'; toolId: string; name: string; isError: boolean }
-  /** 模型连接在未产生任何输出前失败，agent 正在重试下一次连接。 */
-  | { type: 'model_retry'; attempt: number; maxAttempts: number; error: string }
+  /**
+   * 模型调用失败（网络异常 / 上游报错，含中途断流），agent 即将发起第 attempt/maxAttempts 次重试。
+   * 重试会整轮重放：discard* 标记失败尝试已流式发出的部分输出量，供前端回滚展示。
+   */
+  | {
+      type: 'model_retry';
+      attempt: number;
+      maxAttempts: number;
+      error: string;
+      discardTextChars: number;
+      discardThinkingChars: number;
+      discardToolIds: string[];
+    }
   | { type: 'usage'; inputTokens: number; outputTokens: number }
+  /** 历史逼近上下文窗口，已把最旧的若干消息摘要压缩成一段（供前端提示 / 日志）。 */
+  | { type: 'context_compacted'; summarizedMessages: number; beforeTokens: number; afterTokens: number }
   | { type: 'stop'; reason: string };
 
 export interface StreamInput {

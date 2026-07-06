@@ -8,8 +8,39 @@ export interface LlmSettings {
   baseURL: string;
   apiKey: string;
   model: string;
+  contextWindowTokens?: number;
+  /** 历史里保留图片的最近带图消息条数（更早的替换占位符），默认 1；0 表示一张不留。 */
+  contextKeepImages?: number;
   /** 推理深度：none 关闭思考；low..max 对应 Anthropic effort；缺省=思考开启走模型默认深度。 */
   effort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+}
+
+/** 前端新建会话时的占位标题；视为“未显式命名”，首条用户消息会将其覆盖。 */
+export const DEFAULT_SESSION_TITLE = '新会话';
+
+/** 定时任务运行设置（租户级）。 */
+export interface SchedulerSettings {
+  /** 单次定时任务运行的最长时长（毫秒）；超时中止并记录失败。 */
+  maxRunMs: number;
+}
+
+/** 定时任务单次运行的默认最长时长：4 小时。 */
+export const DEFAULT_TASK_MAX_RUN_MS = 4 * 60 * 60 * 1000;
+
+export interface SessionInput {
+  sessionId: string;
+  title?: string;
+}
+
+export interface SessionTouchInput {
+  title?: string;
+  updatedAt?: Date | string;
+}
+
+export interface SessionContextUsage {
+  usedTokens: number;
+  maxTokens: number;
+  estimated: boolean;
 }
 
 /** 审计查询过滤（租户由 ctx 强制限定）。 */
@@ -79,11 +110,18 @@ export interface UserWithSecret extends User {
  */
 export interface Store extends AuditSink {
   // —— 会话消息 ——
+  createSession(ctx: RequestContext, input: SessionInput): Promise<SessionSummary>;
+  touchSession(ctx: RequestContext, sessionId: string, input?: SessionTouchInput): Promise<void>;
   appendMessage(ctx: RequestContext, sessionId: string, msg: Msg): Promise<void>;
+  /** 批量追加消息（一次事务落库，避免中途失败留下工具配对断裂的半截轮次）。 */
+  appendMessages(ctx: RequestContext, sessionId: string, msgs: Msg[]): Promise<void>;
   listMessages(ctx: RequestContext, sessionId: string): Promise<Msg[]>;
+  /** 用压缩后的消息整体替换会话历史（摘要压缩落库；原子替换该会话全部消息）。 */
+  replaceMessages(ctx: RequestContext, sessionId: string, messages: Msg[]): Promise<void>;
   listSessions(ctx: RequestContext, limit?: number, offset?: number): Promise<SessionSummary[]>;
   countSessions(ctx: RequestContext): Promise<number>;
   deleteSession(ctx: RequestContext, sessionId: string): Promise<boolean>;
+  getSessionContextUsage(ctx: RequestContext, sessionId: string, maxTokens: number): Promise<SessionContextUsage>;
 
   // —— 审计 ——（record 来自 AuditSink；event.tenantId 标识归属）
   record(event: AuditEvent): Promise<void>;
@@ -108,6 +146,8 @@ export interface Store extends AuditSink {
   // —— 租户设置 ——
   getLlmSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<LlmSettings | undefined>;
   setLlmSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: LlmSettings): Promise<void>;
+  getSchedulerSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<SchedulerSettings | undefined>;
+  setSchedulerSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SchedulerSettings): Promise<void>;
 
   close(): Promise<void>;
 }

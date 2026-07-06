@@ -526,6 +526,225 @@ describe('HTTP server', () => {
     expect(msgs.find((m) => m.role === 'user')?.text).toContain('data:text/plain;base64,ZXJyb3IgbGluZQ==');
   });
 
+  it('turns image attachments into content blocks instead of inlined base64 text', async () => {
+    const imageData = 'iVBORw0KGgoAAAANSUhEUg=='; // 假 PNG base64
+    const r = await fetch(`${base}/v1/agent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        task: '看下这张截图',
+        sessionId: 'sess-upload-img',
+        attachments: [{
+          name: 'shot.png',
+          type: 'image/png',
+          size: 18,
+          data: `data:image/png;base64,${imageData}`,
+        }],
+      }),
+    });
+    expect(r.status).toBe(200);
+    expect(await r.text()).toContain('event: done');
+
+    const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+    const msgs = await store.listMessages(ctx, 'sess-upload-img');
+    const user = msgs.find((m) => m.role === 'user');
+    // 图像本体进 contentBlocks（受 keep-last-K / 硬裁剪治理），text 只留元信息
+    expect(user?.contentBlocks).toEqual([{ type: 'image', mimeType: 'image/png', data: imageData }]);
+    expect(user?.text).toContain('shot.png');
+    expect(user?.text).not.toContain(imageData);
+  });
+
+  it('creates empty sessions immediately and exposes context usage', async () => {
+    const created = await fetch(`${base}/v1/sessions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ sessionId: 'empty-http', title: '新会话' }),
+    });
+    expect(created.status).toBe(201);
+    expect(await created.json()).toMatchObject({
+      session: { sessionId: 'empty-http', title: '新会话', messageCount: 0 },
+    });
+
+    const listed = await fetch(`${base}/v1/sessions?limit=20`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(listed.status).toBe(200);
+    const listedBody = await listed.json() as { sessions: Array<{ sessionId: string; title: string }> };
+    expect(listedBody.sessions).toContainEqual(expect.objectContaining({ sessionId: 'empty-http', title: '新会话' }));
+
+    const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+    await store.appendMessage(ctx, 'context-http', { role: 'user', text: '1234567890' });
+    await store.appendMessage(ctx, 'context-http', { role: 'assistant', text: 'abcd' });
+    const context = await fetch(`${base}/v1/sessions/context-http/context`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(context.status).toBe(200);
+    expect(await context.json()).toEqual({
+      sessionId: 'context-http',
+      usedTokens: 4,
+      maxTokens: 200000,
+      estimated: true,
+    });
+  });
+
+  it('appends idle session messages without starting an agent run', async () => {
+    const appended = await fetch(`${base}/v1/sessions/append-idle/append`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        task: '补充一条信息',
+        attachments: [{ name: 'note.txt', type: 'text/plain', size: 4, data: 'data:text/plain;base64,bm90ZQ==' }],
+      }),
+    });
+    expect(appended.status).toBe(200);
+    expect(await appended.json()).toEqual({ ok: true, sessionId: 'append-idle', queued: false });
+
+    const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+    const msgs = await store.listMessages(ctx, 'append-idle');
+    expect(msgs).toEqual([
+      expect.objectContaining({ role: 'user', text: expect.stringContaining('补充一条信息') }),
+    ]);
+    expect(msgs[0]?.text).toContain('[上传附件]');
+    expect(msgs[0]?.text).toContain('note.txt');
+  });
+
+  it('queues active session appends into the current agent run', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'append-secret' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+
+    let firstStarted!: () => void;
+    const started = new Promise<void>((resolve) => { firstStarted = resolve; });
+    let releaseFirst!: () => void;
+    const release = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const seenMessages: Msg[][] = [];
+    const queueModel: ChatModel = {
+      id: 'queue',
+      async *stream(input): AsyncIterable<StreamEvent> {
+        seenMessages.push(input.messages.map((message) => ({ ...message })));
+        if (seenMessages.length === 1) {
+          firstStarted();
+          yield { type: 'text_delta', text: '第一段回答' };
+          await release;
+        } else {
+          yield { type: 'text_delta', text: `已纳入：${input.messages.at(-1)?.text ?? ''}` };
+        }
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+    const rt = {
+      model: queueModel,
+      tools: new ToolRegistry(),
+      store: localStore,
+      policy: new AllowAllPolicy(),
+      policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth,
+      jwtSecret: 'append-secret',
+      systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+
+    const appendServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => appendServer.listen(0, '127.0.0.1', resolve));
+    const appendBase = `http://127.0.0.1:${(appendServer.address() as AddressInfo).port}`;
+    const headers = { 'content-type': 'application/json', authorization: `Bearer ${adminToken}` };
+
+    try {
+      const run = fetch(`${appendBase}/v1/agent`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ task: '开始排查', sessionId: 'active-append' }),
+      });
+      await started;
+
+      const appended = await fetch(`${appendBase}/v1/sessions/active-append/append`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ task: '中途修正：优先看 kube-system' }),
+      });
+      expect(appended.status).toBe(200);
+      expect(await appended.json()).toEqual({ ok: true, sessionId: 'active-append', queued: true });
+      expect(seenMessages).toHaveLength(1);
+
+      releaseFirst();
+      const runResponse = await run;
+      expect(runResponse.status).toBe(200);
+      const body = await runResponse.text();
+      expect(body).toContain('已纳入：中途修正');
+      expect(seenMessages).toHaveLength(2);
+      expect(seenMessages[1]!.at(-1)).toMatchObject({ role: 'user', text: expect.stringContaining('中途修正') });
+
+      const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+      const stored = await localStore.listMessages(ctx, 'active-append');
+      expect(stored.map((message) => message.role)).toEqual(['user', 'assistant', 'user', 'assistant']);
+      expect(stored[2]?.text).toContain('中途修正');
+    } finally {
+      await new Promise<void>((resolve) => appendServer.close(() => resolve()));
+    }
+  });
+
+  it('runs /goal with an autonomous prompt and extended step budget', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'goal-secret' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    const tools = new ToolRegistry();
+    tools.register({
+      def: { name: 'noop', description: 'noop', inputSchema: { type: 'object' } },
+      run: async () => ({ id: '', content: 'ok' }),
+    });
+
+    const seenSystems: string[] = [];
+    let calls = 0;
+    const goalModel: ChatModel = {
+      id: 'goal',
+      async *stream(input): AsyncIterable<StreamEvent> {
+        calls++;
+        seenSystems.push(input.system);
+        if (calls <= 21) {
+          yield { type: 'tool_call', call: { id: `tool-${calls}`, name: 'noop', args: {} } };
+        } else {
+          yield { type: 'text_delta', text: '目标完成' };
+        }
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+    const rt = {
+      model: goalModel,
+      tools,
+      store: localStore,
+      policy: new AllowAllPolicy(),
+      policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth,
+      jwtSecret: 'goal-secret',
+      systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+
+    const goalServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => goalServer.listen(0, '127.0.0.1', resolve));
+    const goalBase = `http://127.0.0.1:${(goalServer.address() as AddressInfo).port}`;
+
+    try {
+      const run = await fetch(`${goalBase}/v1/agent`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${adminToken}` },
+        body: JSON.stringify({ task: '/goal 完成巡检并整理结果', sessionId: 'goal-sess' }),
+      });
+      expect(run.status).toBe(200);
+      const body = await run.text();
+      expect(body).toContain('目标完成');
+      expect(body).toContain('"steps":22');
+      expect(seenSystems[0]).toContain('目标模式');
+      expect(seenSystems[0]).toContain('不可逆');
+    } finally {
+      await new Promise<void>((resolve) => goalServer.close(() => resolve()));
+    }
+  });
+
   it('admin can list tenants; unknown route 404s', async () => {
     const r = await fetch(`${base}/v1/admin/tenants`, { headers: { authorization: `Bearer ${token}` } });
     expect(r.status).toBe(200);
@@ -556,6 +775,8 @@ describe('HTTP server', () => {
         api_key: 'initial-key',
         api_key_set: true,
         api_key_preview: 'ini...key',
+        context_window_tokens: 200000,
+        context_keep_images: 1,
       },
       options: [
         {
@@ -566,6 +787,8 @@ describe('HTTP server', () => {
           api_key: 'initial-key',
           api_key_set: true,
           api_key_preview: 'ini...key',
+          context_window_tokens: 200000,
+          context_keep_images: 1,
         },
         {
           id: 'glm-5',
@@ -575,6 +798,8 @@ describe('HTTP server', () => {
           api_key: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
           api_key_set: true,
           api_key_preview: 'tes...aZ3',
+          context_window_tokens: 200000,
+          context_keep_images: 1,
         },
       ],
     });
@@ -586,6 +811,7 @@ describe('HTTP server', () => {
         base_url: 'http://192.168.10.108:18317',
         api_key: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
         model: 'glm-5',
+        context_window_tokens: 128000,
       }),
     });
     expect(updated.status).toBe(200);
@@ -598,6 +824,7 @@ describe('HTTP server', () => {
         api_key: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
         api_key_set: true,
         api_key_preview: 'tes...aZ3',
+        context_window_tokens: 128000,
       },
     });
     expect(await store.getLlmSettings({ tenantId: 'default' })).toMatchObject({
@@ -606,6 +833,7 @@ describe('HTTP server', () => {
       baseURL: 'http://192.168.10.108:18317',
       apiKey: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
       model: 'glm-5',
+      contextWindowTokens: 128000,
     });
 
     const probe = await fetch(`${base}/v1/settings/llm/test`, {
@@ -1237,5 +1465,150 @@ describe('HTTP server', () => {
     } finally {
       await new Promise<void>((resolve) => approvalServer.close(() => resolve()));
     }
+  });
+});
+
+describe('HTTP server 会话互斥与自动压缩', () => {
+  async function makeServer(chatModel: ChatModel) {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'mutex-secret' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    const rt = {
+      model: chatModel,
+      tools: new ToolRegistry(),
+      store: localStore,
+      policy: new AllowAllPolicy(),
+      policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth,
+      jwtSecret: 'mutex-secret',
+      systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+    const srv = createHttpServer(rt);
+    await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+    const headers = { 'content-type': 'application/json', authorization: `Bearer ${adminToken}` };
+    return { srv, url, headers, localStore };
+  }
+
+  it('rejects a concurrent run on the same session with 409', async () => {
+    let streamStarted!: () => void;
+    const started = new Promise<void>((resolve) => { streamStarted = resolve; });
+    const slowModel: ChatModel = {
+      id: 'slow',
+      async *stream(input): AsyncIterable<StreamEvent> {
+        streamStarted();
+        const signal = (input as { signal?: AbortSignal }).signal;
+        await new Promise<void>((resolve) => {
+          signal?.addEventListener('abort', () => resolve(), { once: true });
+          setTimeout(resolve, 500);
+        });
+        yield { type: 'text_delta', text: 'ok' };
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+    const { srv, url, headers } = await makeServer(slowModel);
+    try {
+      const run = fetch(`${url}/v1/agent`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ task: '长任务', sessionId: 'mutex-sess' }),
+      });
+      await started;
+
+      const second = await fetch(`${url}/v1/agent`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ task: '并发任务', sessionId: 'mutex-sess' }),
+      });
+      expect(second.status).toBe(409);
+      expect(((await second.json()) as { error: string }).error).toContain('正在运行');
+
+      // 其他会话不受影响
+      const other = await fetch(`${url}/v1/agent`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ task: '另一个会话', sessionId: 'other-sess' }),
+      });
+      expect(other.status).toBe(200);
+      await other.text();
+
+      await fetch(`${url}/v1/sessions/mutex-sess/terminate`, { method: 'POST', headers });
+      await (await run).text();
+    } finally {
+      await new Promise<void>((resolve) => srv.close(() => resolve()));
+    }
+  });
+
+  it('auto-compacts a long history, emits context_compacted, and persists the rewritten history', async () => {
+    const chatModel: ChatModel = {
+      id: 'mock',
+      async *stream(): AsyncIterable<StreamEvent> {
+        // 同一模型也承接摘要请求：返回的文本即摘要内容
+        yield { type: 'text_delta', text: '模拟摘要或回答' };
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+    const { srv, url, headers, localStore } = await makeServer(chatModel);
+    const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+    // 默认 200k 窗口 → 预算 152k → 触发线 ≈129k tokens；30 对消息 ≈180k tokens 超线
+    for (let i = 0; i < 30; i++) {
+      await localStore.appendMessage(ctx, 'compact-sess', { role: 'user', text: `问题${i} ${'x'.repeat(24_000)}` });
+      await localStore.appendMessage(ctx, 'compact-sess', { role: 'assistant', text: `回答${i}` });
+    }
+    try {
+      const r = await fetch(`${url}/v1/agent`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ task: '继续任务', sessionId: 'compact-sess' }),
+      });
+      expect(r.status).toBe(200);
+      const body = await r.text();
+      expect(body).toContain('event: context_compacted');
+      expect(body).toContain('event: done');
+
+      const messages = await localStore.listMessages(ctx, 'compact-sess');
+      // 摘要 1 条 + 保留的最近 8 条（含本轮 task）+ 本轮 assistant 1 条
+      expect(messages).toHaveLength(10);
+      expect(messages[0]!.role).toBe('user');
+      expect(messages[0]!.text).toContain('历史对话摘要');
+      expect(messages[0]!.text).toContain('模拟摘要或回答');
+      expect(messages.at(-2)!.text).toBe('继续任务');
+    } finally {
+      await new Promise<void>((resolve) => srv.close(() => resolve()));
+    }
+  });
+});
+
+describe('HTTP server 定时任务设置', () => {
+  it('reads the default and updates the scheduler max run duration', async () => {
+    const initial = await fetch(`${base}/v1/settings/scheduler`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(initial.status).toBe(200);
+    expect(await initial.json()).toEqual({ settings: { max_run_minutes: 240 } });
+
+    const updated = await fetch(`${base}/v1/settings/scheduler`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ max_run_minutes: 90 }),
+    });
+    expect(updated.status).toBe(200);
+    expect(await updated.json()).toEqual({ settings: { max_run_minutes: 90 } });
+    expect(await store.getSchedulerSettings({ tenantId: 'default' })).toEqual({ maxRunMs: 90 * 60_000 });
+
+    const reread = await fetch(`${base}/v1/settings/scheduler`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(await reread.json()).toEqual({ settings: { max_run_minutes: 90 } });
+
+    const invalid = await fetch(`${base}/v1/settings/scheduler`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ max_run_minutes: 0 }),
+    });
+    expect(invalid.status).toBe(400);
   });
 });
