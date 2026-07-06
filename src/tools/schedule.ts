@@ -89,5 +89,69 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
         return { id: '', content: `已停用定时任务 #${id}` };
       },
     },
+    {
+      def: {
+        name: 'update_scheduled_task',
+        description: '修改定时任务：可更新 cron、任务描述、启用状态、preApproved（预批准需管理员）。仅传要改的字段。',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            id: { type: 'number', description: '任务 id' },
+            cron: { type: 'string', description: '新的 5 段 cron 表达式' },
+            task: { type: 'string', description: '新的任务描述' },
+            enabled: { type: 'boolean', description: '启用/停用' },
+            preApproved: { type: 'boolean', description: '无人值守预批准（需管理员）' },
+          },
+          required: ['id'],
+        },
+      },
+      async run(args, ctx: ToolContext): Promise<ToolResult> {
+        const o = asObject(args);
+        const id = typeof o.id === 'number' ? o.id : Number(o.id);
+        if (!Number.isInteger(id)) return { id: '', content: 'id 必须是整数', isError: true };
+
+        const rc = reqContext(ctx);
+        const patch: { cron?: string; task?: string; enabled?: boolean; preApproved?: boolean } = {};
+        if (typeof o.cron === 'string') {
+          if (!isValidCron(o.cron)) return { id: '', content: `非法 cron 表达式: ${o.cron}`, isError: true };
+          patch.cron = o.cron;
+        }
+        if (typeof o.task === 'string' && o.task.trim()) patch.task = o.task;
+        if (typeof o.enabled === 'boolean') patch.enabled = o.enabled;
+        if (typeof o.preApproved === 'boolean') {
+          if (o.preApproved && !can(rc.role, 'approve')) {
+            return { id: '', content: '仅管理员可设置预批准（preApproved）', isError: true };
+          }
+          patch.preApproved = o.preApproved;
+        }
+        if (!Object.keys(patch).length) return { id: '', content: '没有可更新的字段', isError: true };
+
+        const updated = await store.updateScheduledTask(rc, id, patch);
+        if (!updated) return { id: '', content: `定时任务 #${id} 不存在`, isError: true };
+        return {
+          id: '',
+          content: `已更新定时任务 #${id}：[${updated.enabled ? '启用' : '停用'}] cron=${updated.cron} 下次=${updated.nextRunAt.toISOString()} — ${updated.task}`,
+        };
+      },
+    },
+    {
+      def: {
+        name: 'delete_scheduled_task',
+        description: '删除一个定时任务及其全部执行记录（不可恢复；如只想暂停请用 cancel_scheduled_task）。',
+        inputSchema: {
+          type: 'object',
+          properties: { id: { type: 'number', description: '任务 id' } },
+          required: ['id'],
+        },
+      },
+      async run(args, ctx: ToolContext): Promise<ToolResult> {
+        const o = asObject(args);
+        const id = typeof o.id === 'number' ? o.id : Number(o.id);
+        if (!Number.isInteger(id)) return { id: '', content: 'id 必须是整数', isError: true };
+        const ok = await store.deleteScheduledTask(reqContext(ctx), id);
+        if (!ok) return { id: '', content: `定时任务 #${id} 不存在`, isError: true };
+        return { id: '', content: `已删除定时任务 #${id} 及其执行记录` };
+      },
+    },
   ];
 }

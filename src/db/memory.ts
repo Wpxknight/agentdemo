@@ -14,6 +14,7 @@ import type {
   SessionTouchInput,
   ScheduledTask,
   ScheduledTaskInput,
+  ScheduledTaskPatch,
   Store,
   TaskRun,
   UserWithSecret,
@@ -227,6 +228,32 @@ export class MemoryStore implements Store {
     return [...this.tasks.values()]
       .filter((t) => t.tenantId === ctx.tenantId)
       .map((t) => ({ ...t }));
+  }
+
+  async getScheduledTask(ctx: RequestContext, id: number): Promise<ScheduledTask | undefined> {
+    const t = this.tasks.get(id);
+    return t && t.tenantId === ctx.tenantId ? { ...t } : undefined;
+  }
+
+  async updateScheduledTask(ctx: RequestContext, id: number, patch: ScheduledTaskPatch): Promise<ScheduledTask | undefined> {
+    const t = this.tasks.get(id);
+    if (!t || t.tenantId !== ctx.tenantId) return undefined;
+    if (patch.task !== undefined) t.task = patch.task;
+    if (patch.preApproved !== undefined) t.preApproved = patch.preApproved;
+    if (patch.enabled !== undefined) t.enabled = patch.enabled;
+    if (patch.cron !== undefined && patch.cron !== t.cron) {
+      t.cron = patch.cron;
+      t.nextRunAt = nextRunAt(patch.cron, new Date());
+    }
+    return { ...t };
+  }
+
+  async deleteScheduledTask(ctx: RequestContext, id: number): Promise<boolean> {
+    const t = this.tasks.get(id);
+    if (!t || t.tenantId !== ctx.tenantId) return false;
+    this.tasks.delete(id);
+    this.runs = this.runs.filter((r) => r.taskId !== id);
+    return true;
   }
 
   async setTaskEnabled(ctx: RequestContext, id: number, enabled: boolean): Promise<void> {

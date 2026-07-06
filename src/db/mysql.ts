@@ -14,6 +14,7 @@ import type {
   SessionTouchInput,
   ScheduledTask,
   ScheduledTaskInput,
+  ScheduledTaskPatch,
   Store,
   TaskRun,
   UserWithSecret,
@@ -454,6 +455,49 @@ export class MysqlStore implements Store {
       .where('id', '=', id)
       .where('tenant_id', '=', ctx.tenantId)
       .execute();
+  }
+
+  async getScheduledTask(ctx: RequestContext, id: number): Promise<ScheduledTask | undefined> {
+    const row = await this.db
+      .selectFrom('scheduled_tasks')
+      .selectAll()
+      .where('id', '=', id)
+      .where('tenant_id', '=', ctx.tenantId)
+      .executeTakeFirst();
+    return row ? toTask(row) : undefined;
+  }
+
+  async updateScheduledTask(ctx: RequestContext, id: number, patch: ScheduledTaskPatch): Promise<ScheduledTask | undefined> {
+    const current = await this.getScheduledTask(ctx, id);
+    if (!current) return undefined;
+    const set: Record<string, unknown> = {};
+    if (patch.task !== undefined) set.task = patch.task;
+    if (patch.preApproved !== undefined) set.pre_approved = patch.preApproved ? 1 : 0;
+    if (patch.enabled !== undefined) set.enabled = patch.enabled ? 1 : 0;
+    if (patch.cron !== undefined && patch.cron !== current.cron) {
+      set.cron = patch.cron;
+      set.next_run_at = nextRunAt(patch.cron, new Date());
+    }
+    if (Object.keys(set).length) {
+      await this.db
+        .updateTable('scheduled_tasks')
+        .set(set)
+        .where('id', '=', id)
+        .where('tenant_id', '=', ctx.tenantId)
+        .execute();
+    }
+    return this.getScheduledTask(ctx, id);
+  }
+
+  async deleteScheduledTask(ctx: RequestContext, id: number): Promise<boolean> {
+    const res = await this.db
+      .deleteFrom('scheduled_tasks')
+      .where('id', '=', id)
+      .where('tenant_id', '=', ctx.tenantId)
+      .executeTakeFirst();
+    if (Number(res.numDeletedRows) === 0) return false;
+    await this.db.deleteFrom('task_runs').where('task_id', '=', id).execute();
+    return true;
   }
 
   /** 系统级：事务内 FOR UPDATE SKIP LOCKED 领取并推进，保证多副本不重复执行。 */

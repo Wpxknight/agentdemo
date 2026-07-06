@@ -107,7 +107,7 @@ describe('frontend API wiring', () => {
     expect(types).toContain('export interface TaskRun');
     expect(types).toContain('export interface ScheduleRunsBody');
     expect(app).toContain('useState<TaskRun[]>([])');
-    expect(app).toContain('<SchedulePage tasks={tasks.length ? tasks : fallbackTasks} api={api} />');
+    expect(app).toContain('<SchedulePage tasks={tasks} api={api} onChanged={() => void loadPageData(\'schedule\')} onRequestConfirm={requestConfirmDialog} />');
     expect(app).toContain('selectedTaskId');
     expect(app).toContain('selectedRunId');
     expect(app).toContain('setSelectedTaskId(task.id)');

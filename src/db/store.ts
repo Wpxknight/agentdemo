@@ -75,6 +75,14 @@ export interface ScheduledTask {
   lastRunAt?: Date;
 }
 
+/** 更新定时任务的可改字段（cron 变更时实现方需重算 nextRunAt）。 */
+export interface ScheduledTaskPatch {
+  cron?: string;
+  task?: string;
+  preApproved?: boolean;
+  enabled?: boolean;
+}
+
 export interface TaskRun {
   id?: number;
   taskId: number;
@@ -131,6 +139,11 @@ export interface Store extends AuditSink {
   // —— 定时任务 ——
   createScheduledTask(ctx: RequestContext, input: ScheduledTaskInput): Promise<ScheduledTask>;
   listScheduledTasks(ctx: RequestContext): Promise<ScheduledTask[]>;
+  getScheduledTask(ctx: RequestContext, id: number): Promise<ScheduledTask | undefined>;
+  /** 局部更新；cron 变更时重算 nextRunAt。任务不存在（或跨租户）返回 undefined。 */
+  updateScheduledTask(ctx: RequestContext, id: number, patch: ScheduledTaskPatch): Promise<ScheduledTask | undefined>;
+  /** 删除任务及其全部执行记录。返回是否存在。 */
+  deleteScheduledTask(ctx: RequestContext, id: number): Promise<boolean>;
   setTaskEnabled(ctx: RequestContext, id: number, enabled: boolean): Promise<void>;
   /** 系统级：原子领取到点任务（跨租户），返回任务含 tenantId/userId 供执行构造 ctx。 */
   claimDueTasks(now: Date, limit: number): Promise<ScheduledTask[]>;

@@ -19,7 +19,9 @@ import { LocalAuthProvider } from '../auth/local.js';
 import { OidcAuthProvider } from '../auth/oidc.js';
 import { createTenant, createUser, listTenants } from '../auth/admin.js';
 import type { RequestContext, Role } from '../auth/types.js';
-import { DEFAULT_TASK_MAX_RUN_MS } from '../db/store.js';
+import { DEFAULT_TASK_MAX_RUN_MS, type ScheduledTaskPatch } from '../db/store.js';
+import { isValidCron } from '../scheduler/cron.js';
+import { createScheduledTaskRunner } from '../scheduler/runner.js';
 import { createModel } from '../model/factory.js';
 import type { JsonValue, Msg, ToolCall } from '../model/types.js';
 import { importSkillZip } from '../skill/import.js';
@@ -36,6 +38,8 @@ type ActiveAgentRuns = Map<string, Set<ActiveAgentRun>>;
 type CompactionWatermarks = Map<string, number>;
 
 const OIDC_COOKIE = 'aiop_oidc';
+/** 手动“立即执行”的任务 id 去重（本进程内），防止连点重复触发。 */
+const runningManualTasks = new Set<number>();
 const RUN_TERMINATED_MESSAGE = '会话运行已终止';
 const GOAL_MODE_SYSTEM = [
   '目标模式：用户通过 /goal 授权你自主推进目标任务，直到目标完成、遇到阻塞或需要用户决策。',
@@ -1013,6 +1017,61 @@ async function handle(
     requirePermission(ctx, 'task:create');
     await rt.store.setTaskEnabled(ctx, Number(schedMatch[1]), schedMatch[2] === 'enable');
     return sendJson(res, 200, { ok: true });
+  }
+  const schedUpdateMatch = /^\/v1\/schedule\/(\d+)$/.exec(path);
+  if (method === 'PATCH' && schedUpdateMatch) {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'task:create');
+    const body = await readJson(req);
+    const patch: ScheduledTaskPatch = {};
+    const cron = str(body, 'cron');
+    if (cron !== undefined) {
+      if (!isValidCron(cron)) throw new HttpError(400, `非法 cron 表达式: ${cron}`);
+      patch.cron = cron;
+    }
+    const task = str(body, 'task');
+    if (task !== undefined) {
+      if (!task.trim()) throw new HttpError(400, 'task 不能为空');
+      patch.task = task;
+    }
+    if (body.preApproved !== undefined) {
+      if (typeof body.preApproved !== 'boolean') throw new HttpError(400, 'preApproved 必须是布尔值');
+      if (body.preApproved) requirePermission(ctx, 'approve'); // 预批准属审批权
+      patch.preApproved = body.preApproved;
+    }
+    if (body.enabled !== undefined) {
+      if (typeof body.enabled !== 'boolean') throw new HttpError(400, 'enabled 必须是布尔值');
+      patch.enabled = body.enabled;
+    }
+    if (!Object.keys(patch).length) throw new HttpError(400, '没有可更新的字段（cron/task/preApproved/enabled）');
+    const updated = await rt.store.updateScheduledTask(ctx, Number(schedUpdateMatch[1]), patch);
+    if (!updated) throw new HttpError(404, '定时任务不存在');
+    return sendJson(res, 200, { task: updated });
+  }
+  if (method === 'DELETE' && schedUpdateMatch) {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'task:create');
+    const ok = await rt.store.deleteScheduledTask(ctx, Number(schedUpdateMatch[1]));
+    if (!ok) throw new HttpError(404, '定时任务不存在');
+    return sendJson(res, 200, { ok: true });
+  }
+  const schedRunNowMatch = /^\/v1\/schedule\/(\d+)\/run$/.exec(path);
+  if (method === 'POST' && schedRunNowMatch) {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'task:create');
+    const id = Number(schedRunNowMatch[1]);
+    const task = await rt.store.getScheduledTask(ctx, id);
+    if (!task) throw new HttpError(404, '定时任务不存在');
+    if (runningManualTasks.has(id)) throw new HttpError(409, '该任务正在手动执行中');
+    // 异步执行（任务可能跑很久），结果照常写入 task_runs；前端轮询执行记录即可。
+    runningManualTasks.add(id);
+    const runner = createScheduledTaskRunner(rt);
+    void runner(task)
+      .then((result) => rt.store.recordTaskRun({ taskId: id, ...result }))
+      .catch((err) => rt.store.recordTaskRun({ taskId: id, status: 'error', detail: String(err) }))
+      .catch((err) => log.error({ taskId: id, err: String(err) }, '手动执行记录失败'))
+      .finally(() => runningManualTasks.delete(id));
+    return sendJson(res, 202, { ok: true, taskId: id, started: true });
   }
 
   // —— 审计 ——

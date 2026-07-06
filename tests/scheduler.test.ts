@@ -59,6 +59,62 @@ describe('schedule tools', () => {
 
     expect((await store.listScheduledTasks(rctx))[0]!.enabled).toBe(false);
   });
+
+  it('update_scheduled_task patches fields and recomputes next run on cron change', async () => {
+    const store = new MemoryStore();
+    const tools = buildScheduleTools(store);
+    const created = await store.createScheduledTask(rctx, { sessionId: 's1', cron: '0 1 * * *', task: '旧任务' });
+    const update = tools.find((t) => t.def.name === 'update_scheduled_task')!;
+
+    const badCron = await update.run({ id: created.id, cron: 'nope' }, ctx);
+    expect(badCron.isError).toBe(true);
+
+    const noFields = await update.run({ id: created.id }, ctx);
+    expect(noFields.isError).toBe(true);
+
+    const deniedPre = await update.run({ id: created.id, preApproved: true }, ctx); // role=user
+    expect(deniedPre.isError).toBe(true);
+
+    const ok = await update.run({ id: created.id, cron: '0 2 * * *', task: '新任务', enabled: false }, ctx);
+    expect(ok.isError).toBeFalsy();
+    const after = (await store.listScheduledTasks(rctx))[0]!;
+    expect(after.cron).toBe('0 2 * * *');
+    expect(after.task).toBe('新任务');
+    expect(after.enabled).toBe(false);
+    expect(after.nextRunAt.getUTCHours()).toBe(2);
+
+    const missing = await update.run({ id: 999, task: 'x' }, ctx);
+    expect(missing.isError).toBe(true);
+  });
+
+  it('delete_scheduled_task removes the task and its runs', async () => {
+    const store = new MemoryStore();
+    const tools = buildScheduleTools(store);
+    const created = await store.createScheduledTask(rctx, { sessionId: 's1', cron: '0 1 * * *', task: 't' });
+    await store.recordTaskRun({ taskId: created.id, status: 'success', detail: 'ok' });
+    const del = tools.find((t) => t.def.name === 'delete_scheduled_task')!;
+
+    const ok = await del.run({ id: created.id }, ctx);
+    expect(ok.isError).toBeFalsy();
+    expect(await store.listScheduledTasks(rctx)).toHaveLength(0);
+    expect(await store.listTaskRuns(rctx, created.id)).toHaveLength(0);
+
+    const missing = await del.run({ id: created.id }, ctx);
+    expect(missing.isError).toBe(true);
+  });
+});
+
+describe('MemoryStore 定时任务 get/update/delete', () => {
+  it('enforces tenant isolation', async () => {
+    const store = new MemoryStore();
+    const created = await store.createScheduledTask(rctx, { sessionId: 's1', cron: '0 1 * * *', task: 't' });
+    const other = { tenantId: 'other', userId: 'u2', role: 'user' as const };
+
+    expect(await store.getScheduledTask(other, created.id)).toBeUndefined();
+    expect(await store.updateScheduledTask(other, created.id, { task: 'hack' })).toBeUndefined();
+    expect(await store.deleteScheduledTask(other, created.id)).toBe(false);
+    expect(await store.getScheduledTask(rctx, created.id)).toMatchObject({ id: created.id, task: 't' });
+  });
 });
 
 describe('Scheduler', () => {

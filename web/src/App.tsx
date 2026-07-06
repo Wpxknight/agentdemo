@@ -37,7 +37,7 @@ import {
   User,
   X,
 } from 'lucide-react';
-import { NAV_ITEMS, defaultLlmConfig, fallbackTasks, fallbackTools } from './app-data';
+import { NAV_ITEMS, defaultLlmConfig, fallbackTools } from './app-data';
 import { MermaidDiagram } from './components/mermaid-diagram';
 import { createApi, numericSessionId, randomId, readStorage, writeStorage } from './api';
 import { formatSandboxOutputChunk, parseSandboxOutput, sandboxOutputClassNames, sandboxOutputCommand, sandboxOutputLabels } from './sandbox-output';
@@ -217,6 +217,7 @@ function humanizeCron(cron: string): string {
     '0 2 * * *': '每天 02:00',
     '0 1 * * *': '每天 01:00',
     '0 * * * *': '每小时',
+    '*/5 * * * *': '每 5 分钟',
     '0 9 * * 1': '每周一 09:00',
   };
   return map[cron] || cron || '-';
@@ -1437,7 +1438,7 @@ export default function App() {
               />
             )}
             {activePage === 'mcp' && <McpPage tools={mcpTools} api={api} output={toolTestOutput} onTest={testMcpTool} onRequestConfirm={requestConfirmDialog} onChanged={() => void loadPageData('mcp')} />}
-            {activePage === 'schedule' && <SchedulePage tasks={tasks.length ? tasks : fallbackTasks} api={api} />}
+            {activePage === 'schedule' && <SchedulePage tasks={tasks} api={api} onChanged={() => void loadPageData('schedule')} onRequestConfirm={requestConfirmDialog} />}
             {activePage === 'sandbox' && <SandboxPage sandboxes={sandboxes} profiles={sandboxProfiles} />}
             {activePage === 'settings' && <SettingsPage llm={llm} status={settingsStatus} api={api} onLlmChange={setLlm} onStatus={setSettingsStatus} />}
           </section>
@@ -3150,12 +3151,34 @@ function DetailPanel({ title, status, icon, children }: { title: string; status:
   );
 }
 
-function SchedulePage({ tasks, api }: { tasks: ScheduledTask[]; api: ReturnType<typeof createApi> }) {
+const CRON_PRESETS = [
+  { label: '每天 02:00', value: '0 2 * * *' },
+  { label: '每天 01:00', value: '0 1 * * *' },
+  { label: '每小时', value: '0 * * * *' },
+  { label: '每 5 分钟', value: '*/5 * * * *' },
+  { label: '每周一 09:00', value: '0 9 * * 1' },
+];
+
+function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
+  tasks: ScheduledTask[];
+  api: ReturnType<typeof createApi>;
+  onChanged: () => void;
+  onRequestConfirm: (request: ConfirmDialogRequest) => void;
+}) {
   const [selectedTaskId, setSelectedTaskId] = useState<number | undefined>(() => tasks.find((task) => task.id !== undefined)?.id);
   const [runs, setRuns] = useState<TaskRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<number | undefined>();
   const [runsStatus, setRunsStatus] = useState('');
-  const selectedTask = tasks.find((task) => task.id === selectedTaskId) || tasks[0] || fallbackTasks[0];
+  const [newTask, setNewTask] = useState('');
+  const [newCron, setNewCron] = useState('0 2 * * *');
+  const [newPreApproved, setNewPreApproved] = useState(false);
+  const [pageStatus, setPageStatus] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [editTask, setEditTask] = useState('');
+  const [editCron, setEditCron] = useState('');
+  const pollTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const selectedTask = tasks.find((task) => task.id === selectedTaskId) || tasks[0];
   const selectedRun = runs.find((run) => run.id === selectedRunId) || runs[0];
 
   useEffect(() => {
@@ -3167,52 +3190,180 @@ function SchedulePage({ tasks, api }: { tasks: ScheduledTask[]; api: ReturnType<
     setSelectedTaskId(tasks.find((task) => task.id !== undefined)?.id);
   }, [selectedTaskId, tasks]);
 
-  useEffect(() => {
-    let cancelled = false;
-    async function loadRuns() {
-      if (selectedTask.id === undefined) {
-        setRuns([]);
-        setSelectedRunId(undefined);
-        setRunsStatus('暂无执行结果');
-        return;
-      }
-      setRunsStatus('正在加载执行结果...');
-      try {
-        const body = await api.get<ScheduleRunsBody>(`/v1/schedule/${selectedTask.id}/runs`);
-        if (cancelled) return;
-        const next = body.runs || [];
-        setRuns(next);
-        setSelectedRunId((current) => (current !== undefined && next.some((run) => run.id === current) ? current : next[0]?.id));
-        setRunsStatus(next.length ? '' : '暂无执行结果');
-      } catch (err) {
-        if (cancelled) return;
-        setRuns([]);
-        setSelectedRunId(undefined);
-        setRunsStatus(`加载执行结果失败：${formatError(err)}`);
-      }
+  const loadRuns = useCallback(async (): Promise<TaskRun[]> => {
+    if (!selectedTask || selectedTask.id === undefined) {
+      setRuns([]);
+      setSelectedRunId(undefined);
+      setRunsStatus('暂无执行结果');
+      return [];
     }
+    try {
+      const body = await api.get<ScheduleRunsBody>(`/v1/schedule/${selectedTask.id}/runs`);
+      const next = body.runs || [];
+      setRuns(next);
+      setSelectedRunId((current) => (current !== undefined && next.some((run) => run.id === current) ? current : next[0]?.id));
+      setRunsStatus(next.length ? '' : '暂无执行结果');
+      return next;
+    } catch (err) {
+      setRuns([]);
+      setSelectedRunId(undefined);
+      setRunsStatus(`加载执行结果失败：${formatError(err)}`);
+      return [];
+    }
+  }, [api, selectedTask]);
+
+  useEffect(() => {
+    setRunsStatus('正在加载执行结果...');
     void loadRuns();
+    // 切换任务 / 卸载时停止“立即执行”的结果轮询
     return () => {
-      cancelled = true;
+      if (pollTimer.current) clearTimeout(pollTimer.current);
+      pollTimer.current = undefined;
     };
-  }, [api, selectedTask.id]);
+  }, [loadRuns]);
+
+  async function createTask() {
+    if (!newTask.trim()) {
+      setPageStatus('请填写任务描述');
+      return;
+    }
+    if (!newCron.trim()) {
+      setPageStatus('请填写 cron 表达式');
+      return;
+    }
+    setBusy(true);
+    try {
+      const body = await api.post<{ task: ScheduledTask }>('/v1/schedule', {
+        task: newTask.trim(),
+        cron: newCron.trim(),
+        preApproved: newPreApproved,
+      });
+      setPageStatus(`已创建定时任务 #${body.task.id}，下次执行 ${formatDateTime(body.task.nextRunAt)}`);
+      setNewTask('');
+      setNewPreApproved(false);
+      setSelectedTaskId(body.task.id);
+      onChanged();
+    } catch (err) {
+      setPageStatus(`创建失败：${formatError(err)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleEnabled(task: ScheduledTask) {
+    if (task.id === undefined || busy) return;
+    setBusy(true);
+    try {
+      await api.post(`/v1/schedule/${task.id}/${task.enabled ? 'disable' : 'enable'}`);
+      setPageStatus(`已${task.enabled ? '暂停' : '启用'}任务 #${task.id}`);
+      onChanged();
+    } catch (err) {
+      setPageStatus(`操作失败：${formatError(err)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runNow(task: ScheduledTask) {
+    if (task.id === undefined || busy) return;
+    setBusy(true);
+    try {
+      await api.post(`/v1/schedule/${task.id}/run`);
+      setRunsStatus('已触发立即执行，等待结果...');
+      const before = runs[0]?.id;
+      let attempts = 0;
+      const poll = async () => {
+        const next = await loadRuns();
+        const latest = next[0]?.id;
+        if ((latest !== undefined && latest !== before) || attempts++ >= 40) {
+          if (latest !== undefined && latest !== before) onChanged(); // 刷新 lastRunAt / 下次执行
+          return;
+        }
+        setRunsStatus('已触发立即执行，等待结果...');
+        pollTimer.current = setTimeout(() => void poll(), 3000);
+      };
+      pollTimer.current = setTimeout(() => void poll(), 2000);
+    } catch (err) {
+      setPageStatus(`触发失败：${formatError(err)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function requestDelete(task: ScheduledTask) {
+    if (task.id === undefined) return;
+    const id = task.id;
+    onRequestConfirm({
+      title: '删除定时任务',
+      description: `将删除「${task.task}」及其全部执行记录，不可恢复。若只想暂停请用“暂停”。`,
+      confirmLabel: '确认删除',
+      busyLabel: '正在删除...',
+      tone: 'danger',
+      onConfirm: async () => {
+        await api.delete(`/v1/schedule/${id}`);
+        setPageStatus(`已删除任务 #${id}`);
+        onChanged();
+      },
+    });
+  }
+
+  function startEdit(task: ScheduledTask) {
+    setEditTask(task.task);
+    setEditCron(task.cron);
+    setEditing(true);
+  }
+
+  async function saveEdit(task: ScheduledTask) {
+    if (task.id === undefined || busy) return;
+    if (!editTask.trim() || !editCron.trim()) {
+      setPageStatus('任务描述与 cron 均不能为空');
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.patch(`/v1/schedule/${task.id}`, { task: editTask.trim(), cron: editCron.trim() });
+      setPageStatus(`已更新任务 #${task.id}`);
+      setEditing(false);
+      onChanged();
+    } catch (err) {
+      setPageStatus(`更新失败：${formatError(err)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
 
   return (
     <>
-      <PageTitle title="定时任务" desc="按 cron 周期自动执行的运维任务" />
+      <PageTitle title="定时任务" desc="按 cron 周期自动执行的运维任务（cron 以 UTC 时区解释）" />
       <Card className="create-task">
         <CardContent className="task-create-grid">
-          <Label>创建任务<Textarea placeholder="描述你要定时执行的任务..." /></Label>
-          <Label>执行计划<Input defaultValue="每天 02:00" /></Label>
-          <Button>创建任务</Button>
+          <Label>创建任务<Textarea placeholder="描述你要定时执行的任务..." value={newTask} onChange={(event) => setNewTask(event.target.value)} /></Label>
+          <Label>执行计划（cron，UTC）
+            <Select value={CRON_PRESETS.some((p) => p.value === newCron) ? newCron : 'custom'} onValueChange={(value) => { if (value !== 'custom') setNewCron(value); }}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  {CRON_PRESETS.map((preset) => <SelectItem key={preset.value} value={preset.value}>{preset.label}</SelectItem>)}
+                  <SelectItem value="custom">自定义</SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <Input value={newCron} spellCheck={false} placeholder='如 "0 2 * * *"' onChange={(event) => setNewCron(event.target.value)} />
+          </Label>
+          <label className="schedule-preapproved">
+            <input type="checkbox" checked={newPreApproved} onChange={(event) => setNewPreApproved(event.target.checked)} />
+            预批准（无人值守自动通过生产审批，需管理员）
+          </label>
+          <Button type="button" disabled={busy} onClick={() => void createTask()}>{busy ? '处理中...' : '创建任务'}</Button>
         </CardContent>
       </Card>
+      {pageStatus ? <p className="empty-hint">{pageStatus}</p> : null}
       <div className="task-layout">
         <div className="schedule-table-scroll">
           <Table>
             <TableHeader>
               <TableRow>
-                {['任务', '计划', '下次执行', '状态', '最近结果'].map((header) => <TableHead key={header}>{header}</TableHead>)}
+                {['任务', '计划', '下次执行', '状态', '最近执行'].map((header) => <TableHead key={header}>{header}</TableHead>)}
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -3228,54 +3379,95 @@ function SchedulePage({ tasks, api }: { tasks: ScheduledTask[]; api: ReturnType<
                       }}
                     >
                       <strong>{task.task}</strong>
-                      <span>{task.sessionId || '未绑定会话'}</span>
+                      <span>#{task.id} {task.preApproved ? '· 预批准' : ''}</span>
                     </button>
                   </TableCell>
                   <TableCell>{humanizeCron(task.cron)}</TableCell>
                   <TableCell>{formatDateTime(task.nextRunAt)}</TableCell>
                   <TableCell>{formatCell(task.enabled ? '启用' : '暂停')}</TableCell>
-                  <TableCell>{formatCell(task.lastRunAt ? '成功' : '待执行')}</TableCell>
+                  <TableCell>{task.lastRunAt ? formatDateTime(task.lastRunAt) : '待执行'}</TableCell>
                 </TableRow>
               ))}
+              {!tasks.length ? (
+                <TableRow><TableCell colSpan={5}>暂无定时任务，可在上方创建，或在聊天里让 AI 帮你创建（schedule_task）。</TableCell></TableRow>
+              ) : null}
             </TableBody>
           </Table>
         </div>
         <Card className="detail-card compact">
-          <CardHeader>
-            <CardTitle>{selectedTask.task}</CardTitle>
-            <CardDescription>{humanizeCron(selectedTask.cron)} · 下次执行 {formatDateTime(selectedTask.nextRunAt)}</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow>{['时间', '状态', '步骤'].map((header) => <TableHead key={header}>{header}</TableHead>)}</TableRow>
-              </TableHeader>
-              <TableBody>
-                {runs.map((run, index) => (
-                  <TableRow key={run.id ?? `${run.taskId}-${index}`} data-state={run === selectedRun ? 'selected' : undefined}>
-                    <TableCell>
-                      <button
-                        className="schedule-run-button"
-                        type="button"
-                        onClick={() => {
-                          if (run.id === undefined) return;
-                          setSelectedRunId(run.id);
-                        }}
-                      >
-                        {formatDateTime(run.createdAt)}
-                      </button>
-                    </TableCell>
-                    <TableCell>{formatCell(run.status === 'success' ? '成功' : '异常')}</TableCell>
-                    <TableCell>{run.steps === undefined ? '-' : String(run.steps)}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-            <div className="schedule-run-detail">
-              <h3>执行结果</h3>
-              <pre>{selectedRun?.detail || runsStatus || '暂无执行结果'}</pre>
-            </div>
-          </CardContent>
+          {selectedTask ? (
+            <>
+              <CardHeader>
+                <CardTitle>{selectedTask.task}</CardTitle>
+                <CardDescription>
+                  {humanizeCron(selectedTask.cron)} · 下次执行 {formatDateTime(selectedTask.nextRunAt)}
+                  {selectedTask.preApproved ? ' · 预批准' : ''}
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="skill-detail-actions schedule-actions">
+                  <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => void runNow(selectedTask)}>
+                    <Play data-icon="inline-start" />
+                    立即执行
+                  </Button>
+                  <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => void toggleEnabled(selectedTask)}>
+                    {selectedTask.enabled ? <CircleStop data-icon="inline-start" /> : <Check data-icon="inline-start" />}
+                    {selectedTask.enabled ? '暂停' : '启用'}
+                  </Button>
+                  <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => (editing ? setEditing(false) : startEdit(selectedTask))}>
+                    <Code2 data-icon="inline-start" />
+                    {editing ? '取消编辑' : '编辑'}
+                  </Button>
+                  <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => requestDelete(selectedTask)}>
+                    <Trash2 data-icon="inline-start" />
+                    删除
+                  </Button>
+                  <Button variant="outline" size="sm" type="button" onClick={() => void loadRuns()}>
+                    <RefreshCcw data-icon="inline-start" />
+                    刷新
+                  </Button>
+                </div>
+                {editing ? (
+                  <div className="schedule-edit-form">
+                    <Label>任务描述<Textarea value={editTask} onChange={(event) => setEditTask(event.target.value)} /></Label>
+                    <Label>cron（UTC）<Input value={editCron} spellCheck={false} onChange={(event) => setEditCron(event.target.value)} /></Label>
+                    <Button type="button" size="sm" disabled={busy} onClick={() => void saveEdit(selectedTask)}>保存</Button>
+                  </div>
+                ) : null}
+                <Table>
+                  <TableHeader>
+                    <TableRow>{['时间', '状态', '步骤'].map((header) => <TableHead key={header}>{header}</TableHead>)}</TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {runs.map((run, index) => (
+                      <TableRow key={run.id ?? `${run.taskId}-${index}`} data-state={run === selectedRun ? 'selected' : undefined}>
+                        <TableCell>
+                          <button
+                            className="schedule-run-button"
+                            type="button"
+                            onClick={() => {
+                              if (run.id === undefined) return;
+                              setSelectedRunId(run.id);
+                            }}
+                          >
+                            {formatDateTime(run.createdAt)}
+                          </button>
+                        </TableCell>
+                        <TableCell>{formatCell(run.status === 'success' ? '成功' : '异常')}</TableCell>
+                        <TableCell>{run.steps === undefined ? '-' : String(run.steps)}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+                <div className="schedule-run-detail">
+                  <h3>执行结果</h3>
+                  <pre>{selectedRun?.detail || runsStatus || '暂无执行结果'}</pre>
+                </div>
+              </CardContent>
+            </>
+          ) : (
+            <CardContent><p className="empty-hint">选择左侧任务查看执行记录</p></CardContent>
+          )}
         </Card>
       </div>
     </>

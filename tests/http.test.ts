@@ -180,6 +180,7 @@ beforeAll(async () => {
     tools: new ToolRegistry(),
     mcp,
     store,
+    audit: { record: async () => {} },
     policy: new AllowAllPolicy(),
     policyPreApproved: new AllowAllPolicy(),
     authProvider: auth,
@@ -1756,5 +1757,104 @@ describe('HTTP server MCP 管理', () => {
 
     // 清理，避免影响其他用例
     await fetch(`${base}/v1/mcp/servers/down1`, { method: 'DELETE', headers: { authorization: `Bearer ${admin}` } });
+  });
+});
+
+describe('HTTP server 定时任务管理', () => {
+  async function adminToken(): Promise<string> {
+    const r = await fetch(`${base}/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tenantId: 'default', username: 'admin', password: 'pw' }),
+    });
+    return ((await r.json()) as { token: string }).token;
+  }
+
+  async function createTask(token: string): Promise<number> {
+    const r = await fetch(`${base}/v1/schedule`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ cron: '0 3 * * *', task: '巡检测试' }),
+    });
+    expect(r.status).toBe(201);
+    return ((await r.json()) as { task: { id: number } }).task.id;
+  }
+
+  it('PATCH updates fields, validates cron, recomputes next run', async () => {
+    const token = await adminToken();
+    const id = await createTask(token);
+    const patch = (payload: unknown) => fetch(`${base}/v1/schedule/${id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify(payload),
+    });
+
+    expect((await patch({ cron: 'nope' })).status).toBe(400);
+    expect((await patch({})).status).toBe(400);
+
+    const ok = await patch({ cron: '0 4 * * *', task: '更新后的巡检', enabled: false });
+    expect(ok.status).toBe(200);
+    const body = (await ok.json()) as { task: { cron: string; task: string; enabled: boolean; nextRunAt: string } };
+    expect(body.task).toMatchObject({ cron: '0 4 * * *', task: '更新后的巡检', enabled: false });
+    expect(new Date(body.task.nextRunAt).getUTCHours()).toBe(4);
+
+    const missing = await fetch(`${base}/v1/schedule/99999`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ task: 'x' }),
+    });
+    expect(missing.status).toBe(404);
+  });
+
+  it('DELETE removes task and its runs; 404 afterwards', async () => {
+    const token = await adminToken();
+    const id = await createTask(token);
+    await store.recordTaskRun({ taskId: id, status: 'success', detail: 'ok' });
+
+    const del = await fetch(`${base}/v1/schedule/${id}`, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(del.status).toBe(200);
+
+    const listed = await fetch(`${base}/v1/schedule`, { headers: { authorization: `Bearer ${token}` } });
+    const tasks = ((await listed.json()) as { tasks: Array<{ id: number }> }).tasks;
+    expect(tasks.some((t) => t.id === id)).toBe(false);
+    expect(await store.listTaskRuns({ tenantId: 'default', userId: 'admin', role: 'platform_admin' }, id)).toHaveLength(0);
+
+    const again = await fetch(`${base}/v1/schedule/${id}`, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(again.status).toBe(404);
+  });
+
+  it('POST /run triggers an immediate run recorded in task_runs', async () => {
+    const token = await adminToken();
+    const id = await createTask(token);
+
+    const run = await fetch(`${base}/v1/schedule/${id}/run`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(run.status).toBe(202);
+    expect(await run.json()).toMatchObject({ ok: true, taskId: id, started: true });
+
+    // 异步执行：轮询 task_runs 直到出现结果
+    let runs: Array<{ status: string; detail?: string }> = [];
+    for (let i = 0; i < 50 && !runs.length; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const r = await fetch(`${base}/v1/schedule/${id}/runs`, { headers: { authorization: `Bearer ${token}` } });
+      runs = ((await r.json()) as { runs: typeof runs }).runs;
+    }
+    expect(runs.length).toBeGreaterThan(0);
+    expect(runs[0]!.status).toBe('success');
+    expect(runs[0]!.detail).toBeTruthy(); // mock 模型输出（具体内容取决于当前激活的 mock 模型）
+
+    const missing = await fetch(`${base}/v1/schedule/99999/run`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(missing.status).toBe(404);
   });
 });
