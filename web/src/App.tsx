@@ -1,4 +1,4 @@
-import { Fragment, type CSSProperties, type FormEvent, type KeyboardEvent, type PointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, isValidElement, type CSSProperties, type FormEvent, type KeyboardEvent, type PointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
@@ -94,7 +94,7 @@ const iconMap = {
 const logoUrl = '/assets/logo.jpg';
 const aiAvatarUrl = logoUrl;
 const userAvatarUrl = '/assets/user-avatar.jpg';
-const SESSION_PAGE_SIZE = 20;
+const SESSION_PAGE_SIZE = 10;
 
 type ConfirmDialogTone = 'danger' | 'warning' | 'info';
 
@@ -335,16 +335,30 @@ function publicAttachment(file: Attachment): Omit<Attachment, 'id'> {
 const CONTEXT_SUMMARY_PREFIX = '【历史对话摘要（自动压缩，供参考）】';
 
 function sessionMessagesToChatMessages(body: SessionMessagesBody): ChatMessage[] {
-  const messages = body.messages
-    .filter((message) => message.role === 'user' || message.role === 'assistant')
-    .map((message, index) => ({
-      id: `history-${index}`,
+  // 一次 agent 运行会落库多条 assistant 消息（工具调用轮通常无正文、叙述与结论分轮）。
+  // 回放时跳过空消息、合并连续 assistant 为一个气泡，与流式实时展示保持一致。
+  const messages: ChatMessage[] = [];
+  for (const message of body.messages) {
+    if (message.role !== 'user' && message.role !== 'assistant') continue;
+    const text = message.text || '';
+    const thinking = message.thinking || '';
+    if (message.role === 'assistant' && !text.trim() && !thinking.trim()) continue;
+    const prev = messages[messages.length - 1];
+    if (message.role === 'assistant' && prev?.role === 'assistant' && !prev.summary) {
+      prev.text = [prev.text, text].filter((part) => part.trim()).join('\n\n');
+      const mergedThinking = [prev.thinking || '', thinking].filter((part) => part.trim()).join('\n\n');
+      prev.thinking = mergedThinking || undefined;
+      continue;
+    }
+    messages.push({
+      id: `history-${messages.length}`,
       role: message.role as Role,
-      text: message.text || '',
-      thinking: message.thinking,
-      summary: message.role === 'user' && (message.text || '').startsWith(CONTEXT_SUMMARY_PREFIX),
+      text,
+      thinking: thinking || undefined,
+      summary: message.role === 'user' && text.startsWith(CONTEXT_SUMMARY_PREFIX),
       time: '',
-    }));
+    });
+  }
   return messages.length ? messages : initialMessages.slice(0, 1);
 }
 
@@ -469,9 +483,57 @@ function TaskProgress({ steps }: { steps: TaskStep[] }) {
   );
 }
 
+/** 递归取 React 子节点纯文本，用于识别状态/警示内容。 */
+function reactNodeText(node: ReactNode): string {
+  if (node == null || typeof node === 'boolean') return '';
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(reactNodeText).join('');
+  if (isValidElement(node)) return reactNodeText((node.props as { children?: ReactNode }).children);
+  return '';
+}
+
+/**
+ * 按内容判断警示级别：优先识别模板约定的 ✅/⚠️/❌ 符号，其次按关键词兜底。
+ * 返回 'danger' | 'warning' | 'success' | ''。
+ */
+function statusTone(rawText: string): string {
+  const text = rawText.trim();
+  if (!text) return '';
+  if (/^(❌|⛔|🚫|🔴)/.test(text)) return 'danger';
+  if (/^(⚠|🟡|🟠)/.test(text)) return 'warning';
+  if (/^(✅|✔|🟢)/.test(text)) return 'success';
+  if (/(无|未发现|没有|不存在)\s*(错误|异常|失败|告警|警告)/.test(text)) return 'success';
+  if (/(失败|错误|异常|不通|不可用|已中断|崩溃|拒绝|超限|error|failed|failure|fatal|critical|down)/i.test(text)) return 'danger';
+  if (/(警告|告警|注意|超时|待确认|降级|重试中?|风险|warn|warning|timeout|degraded|pending)/i.test(text)) return 'warning';
+  if (/^(成功|正常|已恢复|通过|就绪|healthy|ok|success|passed|ready|running)$/i.test(text)) return 'success';
+  return '';
+}
+
 const markdownComponents: Components = {
   pre({ children }) {
     return <>{children}</>;
+  },
+  table({ children }) {
+    return (
+      <div className="markdown-table-wrap">
+        <table>{children}</table>
+      </div>
+    );
+  },
+  td({ node: _node, children, ...props }) {
+    const tone = statusTone(reactNodeText(children));
+    return <td className={tone ? `cell-${tone}` : undefined} {...props}>{children}</td>;
+  },
+  blockquote({ children }) {
+    const tone = statusTone(reactNodeText(children));
+    return <blockquote className={tone && tone !== 'success' ? `md-alert md-alert-${tone}` : undefined}>{children}</blockquote>;
+  },
+  p({ children }) {
+    const text = reactNodeText(children).trim();
+    let tone = '';
+    if (/^(❌|⛔|🚫|🔴)/.test(text) || /^.{0,16}(失败|错误|异常)[:：]/.test(text)) tone = 'danger';
+    else if (/^(⚠|🟡|🟠)/.test(text) || /^.{0,12}(警告|告警|注意)[:：]/.test(text)) tone = 'warning';
+    return <p className={tone ? `md-line md-line-${tone}` : undefined}>{children}</p>;
   },
   code({ className, children, ...props }) {
     const language = /language-([\w-]+)/.exec(className || '')?.[1];
@@ -603,7 +665,6 @@ export default function App() {
   const [composerValue, setComposerValue] = useState('');
   const [sessionOffset, setSessionOffset] = useState(0);
   const [sessionTotal, setSessionTotal] = useState(0);
-  const [sessionHasMore, setSessionHasMore] = useState(false);
   const [runningAgentCount, setRunningAgentCount] = useState(0);
   const [activeRunSessionIds, setActiveRunSessionIds] = useState<Set<string>>(() => new Set());
   const [terminatingSession, setTerminatingSession] = useState(false);
@@ -613,6 +674,7 @@ export default function App() {
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const sessionIdRef = useRef(sessionId);
+  const sessionOffsetRef = useRef(0);
   const messagesRef = useRef(messages);
 
   useEffect(() => {
@@ -681,18 +743,28 @@ export default function App() {
     setLlm((current) => ({ ...current, ...body.config, options: body.options || current.options || [] }));
   }, [api]);
 
-  const fetchSessionsPage = useCallback(async (sessionOffset = 0, append = false) => {
-    const body = await api.get<SessionsBody>(`/v1/sessions?limit=${SESSION_PAGE_SIZE}&offset=${sessionOffset}`);
+  const fetchSessionsPage = useCallback(async (offset = 0) => {
+    let body = await api.get<SessionsBody>(`/v1/sessions?limit=${SESSION_PAGE_SIZE}&offset=${offset}`);
+    let effectiveOffset = offset;
+    // 当前页被删空时回退到最后一页
+    if (!body.sessions?.length && offset > 0) {
+      const total = body.total ?? 0;
+      const lastPageOffset = Math.max(0, Math.ceil(Math.max(total, 1) / SESSION_PAGE_SIZE) - 1) * SESSION_PAGE_SIZE;
+      if (lastPageOffset !== offset) {
+        effectiveOffset = lastPageOffset;
+        body = await api.get<SessionsBody>(`/v1/sessions?limit=${SESSION_PAGE_SIZE}&offset=${effectiveOffset}`);
+      }
+    }
     const next = body.sessions?.map(mapSessionSummary) || [];
-    setSessions((current) => {
-      if (!append) return next.length ? next : [];
-      const seen = new Set(current.map((session) => session.sessionId).filter(Boolean));
-      return [...current, ...next.filter((session) => !session.sessionId || !seen.has(session.sessionId))];
-    });
-    setSessionOffset(sessionOffset);
+    setSessions(next);
+    setSessionOffset(effectiveOffset);
+    sessionOffsetRef.current = effectiveOffset;
     setSessionTotal(body.total ?? next.length);
-    setSessionHasMore(Boolean(body.hasMore));
   }, [api]);
+
+  const refreshSessions = useCallback(async () => {
+    await fetchSessionsPage(sessionOffsetRef.current);
+  }, [fetchSessionsPage]);
 
   const loadContextUsage = useCallback(async (nextSessionId: string) => {
     if (!nextSessionId) return;
@@ -714,7 +786,7 @@ export default function App() {
     try {
       if (target === 'chat') {
         await loadLlmSettings();
-        await fetchSessionsPage(0, false);
+        await fetchSessionsPage(0);
         const toolsBody = await api.get<ToolsBody>('/v1/tools');
         setTools(toolsBody.tools || []);
       }
@@ -814,14 +886,11 @@ export default function App() {
       [id]: { sessionId: id, usedTokens: 0, maxTokens: llm.context_window_tokens || 200000, estimated: true },
     }));
     try {
-      const created = await api.post<{ session: SessionsBody['sessions'][number] }>('/v1/sessions', {
+      await api.post<{ session: SessionsBody['sessions'][number] }>('/v1/sessions', {
         sessionId: id,
         title: '新会话',
       });
-      const createdSummary = mapSessionSummary(created.session);
-      const existed = sessions.some((session) => session.sessionId === createdSummary.sessionId);
-      setSessions((current) => [createdSummary, ...current.filter((session) => session.sessionId !== createdSummary.sessionId)]);
-      setSessionTotal((current) => current + (existed ? 0 : 1));
+      await fetchSessionsPage(0);
       void loadContextUsage(id);
     } catch (err) {
       setMessages((current) => [...current, {
@@ -833,9 +902,14 @@ export default function App() {
     }
   }
 
-  async function loadNextSessionsPage() {
-    if (!sessionHasMore) return;
-    await fetchSessionsPage(sessionOffset + SESSION_PAGE_SIZE, true);
+  async function goToPrevSessionsPage() {
+    if (sessionOffset <= 0) return;
+    await fetchSessionsPage(Math.max(0, sessionOffset - SESSION_PAGE_SIZE));
+  }
+
+  async function goToNextSessionsPage() {
+    if (sessionOffset + SESSION_PAGE_SIZE >= sessionTotal) return;
+    await fetchSessionsPage(sessionOffset + SESSION_PAGE_SIZE);
   }
 
   function requestConfirmDialog(request: ConfirmDialogRequest) {
@@ -861,32 +935,34 @@ export default function App() {
     }
   }
 
-  function requestDeleteSession(session: SessionSummary) {
-    if (!session.sessionId) return;
-    const sessionLabel = session.title || session.sessionId;
+  function requestDeleteSessions(items: SessionSummary[]) {
+    const targets = items.filter((item) => item.sessionId);
+    if (!targets.length) return;
     requestConfirmDialog({
-      title: `删除会话“${sessionLabel}”？`,
-      description: '删除后，这条会话记录和历史消息将从列表中移除。',
-      alert: '此操作不可恢复，请确认不再需要这条会话记录。',
+      title: `删除选中的 ${targets.length} 条会话？`,
+      description: '删除后，这些会话记录和历史消息将从列表中移除。',
+      alert: '此操作不可恢复，请确认不再需要这些会话记录。',
       confirmLabel: '确认删除',
       busyLabel: '删除中',
       tone: 'danger',
-      onConfirm: () => deleteSession(session),
+      onConfirm: () => deleteSessions(targets),
     });
   }
 
-  async function deleteSession(session: SessionSummary) {
-    if (!session.sessionId) return;
-    try {
-      await api.delete<{ ok: boolean }>(`/v1/sessions/${encodeURIComponent(session.sessionId)}`);
-      setSessions((current) => current.filter((item) => item.sessionId !== session.sessionId));
-      setSessionTotal((current) => Math.max(0, current - 1));
-      if (session.sessionId === sessionId) startNewSession();
-    } catch (err) {
+  async function deleteSessions(targets: SessionSummary[]) {
+    const targetIds = targets.map((item) => item.sessionId).filter((id): id is string => Boolean(id));
+    const results = await Promise.allSettled(targetIds.map((id) =>
+      api.delete<{ ok: boolean }>(`/v1/sessions/${encodeURIComponent(id)}`),
+    ));
+    const deletedIds = targetIds.filter((_, index) => results[index].status === 'fulfilled');
+    const failedCount = results.length - deletedIds.length;
+    await refreshSessions();
+    if (deletedIds.includes(sessionId)) await startNewSession();
+    if (failedCount > 0) {
       setMessages((current) => [...current, {
         id: randomId(),
         role: 'assistant',
-        text: `删除会话失败：${formatError(err)}`,
+        text: `有 ${failedCount} 条会话删除失败，请稍后重试。`,
         time: new Date().toLocaleTimeString(),
       }]);
     }
@@ -1120,7 +1196,7 @@ export default function App() {
         next.delete(activeSessionId);
         return next;
       });
-      await fetchSessionsPage(0, false);
+      await refreshSessions();
       await loadContextUsage(activeSessionId);
     }
   }
@@ -1282,7 +1358,8 @@ export default function App() {
           previewWidth={previewWidth}
           sessions={sessions}
           sessionTotal={sessionTotal}
-          sessionHasMore={sessionHasMore}
+          sessionPage={Math.floor(sessionOffset / SESSION_PAGE_SIZE) + 1}
+          sessionPageCount={Math.max(1, Math.ceil(sessionTotal / SESSION_PAGE_SIZE))}
           selectedSessionId={sessionId}
           contextUsage={contextUsage[sessionId]}
           messages={messages}
@@ -1305,8 +1382,9 @@ export default function App() {
           onNewSession={startNewSession}
           onRequestStopSession={requestStopCurrentSession}
           onSelectSession={selectSession}
-          onDeleteSession={requestDeleteSession}
-          onLoadMoreSessions={() => void loadNextSessionsPage()}
+          onDeleteSessions={requestDeleteSessions}
+          onPrevSessionsPage={() => void goToPrevSessionsPage()}
+          onNextSessionsPage={() => void goToNextSessionsPage()}
           onChooseAttachment={() => fileInputRef.current?.click()}
           onAddAttachments={(files) => void addAttachments(files)}
           onRemoveAttachment={(id) => setAttachments((current) => current.filter((file) => file.id !== id))}
@@ -1448,7 +1526,8 @@ function PrototypeChatShell(props: {
   previewWidth: number;
   sessions: SessionSummary[];
   sessionTotal: number;
-  sessionHasMore: boolean;
+  sessionPage: number;
+  sessionPageCount: number;
   selectedSessionId: string;
   contextUsage?: ContextUsageBody;
   messages: ChatMessage[];
@@ -1471,8 +1550,9 @@ function PrototypeChatShell(props: {
   onNewSession: () => void;
   onRequestStopSession: () => void;
   onSelectSession: (session: SessionSummary) => void;
-  onDeleteSession: (session: SessionSummary) => void;
-  onLoadMoreSessions: () => void;
+  onDeleteSessions: (sessions: SessionSummary[]) => void;
+  onPrevSessionsPage: () => void;
+  onNextSessionsPage: () => void;
   onChooseAttachment: () => void;
   onAddAttachments: (files: FileList | null) => void;
   onRemoveAttachment: (id: string) => void;
@@ -1494,12 +1574,14 @@ function PrototypeChatShell(props: {
           <PrototypeSessionPanel
             sessions={props.sessions}
             total={props.sessionTotal}
-            hasMore={props.sessionHasMore}
+            page={props.sessionPage}
+            pageCount={props.sessionPageCount}
             selectedSessionId={props.selectedSessionId}
             onToggle={props.onToggleHistory}
             onSelect={props.onSelectSession}
-            onDelete={props.onDeleteSession}
-            onLoadMore={props.onLoadMoreSessions}
+            onDeleteMany={props.onDeleteSessions}
+            onPrevPage={props.onPrevSessionsPage}
+            onNextPage={props.onNextSessionsPage}
           />
         ) : null}
         <main className="prototype-chat-center">
@@ -1578,36 +1660,107 @@ function PrototypeSidebarNav({ page, token, onNavigate, onLogout }: {
   );
 }
 
-function PrototypeSessionPanel({ sessions, total, hasMore, selectedSessionId, onToggle, onSelect, onDelete, onLoadMore }: {
+function PrototypeSessionPanel({ sessions, total, page, pageCount, selectedSessionId, onToggle, onSelect, onDeleteMany, onPrevPage, onNextPage }: {
   sessions: SessionSummary[];
   total: number;
-  hasMore: boolean;
+  page: number;
+  pageCount: number;
   selectedSessionId: string;
   onToggle: () => void;
   onSelect: (session: SessionSummary) => void;
-  onDelete: (session: SessionSummary) => void;
-  onLoadMore: () => void;
+  onDeleteMany: (sessions: SessionSummary[]) => void;
+  onPrevPage: () => void;
+  onNextPage: () => void;
 }) {
   const [query, setQuery] = useState('');
+  const [selectMode, setSelectMode] = useState(false);
+  const [checkedIds, setCheckedIds] = useState<Set<string>>(() => new Set());
   const trimmedQuery = query.trim().toLowerCase();
   const items = sessions.filter((session) => {
     const value = `${session.title} ${session.desc}`.toLowerCase();
     return value.includes(trimmedQuery);
   });
   const emptyCopy = trimmedQuery ? '没有匹配会话' : '暂无会话记录';
+  const selectableIds = items.map((session) => session.sessionId).filter(Boolean) as string[];
+  const checkedItems = items.filter((session) => session.sessionId && checkedIds.has(session.sessionId));
+  const allChecked = selectableIds.length > 0 && selectableIds.every((id) => checkedIds.has(id));
+
+  useEffect(() => {
+    setCheckedIds((current) => {
+      const valid = new Set(sessions.map((session) => session.sessionId).filter(Boolean) as string[]);
+      const next = new Set(Array.from(current).filter((id) => valid.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [sessions]);
+
+  function toggleChecked(id: string) {
+    setCheckedIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleAllChecked() {
+    setCheckedIds(allChecked ? new Set() : new Set(selectableIds));
+  }
+
+  function exitSelectMode() {
+    setSelectMode(false);
+    setCheckedIds(new Set());
+  }
+
+  // 未进入选择模式 → 显示复选框；已勾选 → 删除；未勾选 → 退出选择模式
+  function handleBatchDelete() {
+    if (!selectMode) {
+      setSelectMode(true);
+      return;
+    }
+    if (checkedItems.length) {
+      onDeleteMany(checkedItems);
+      return;
+    }
+    exitSelectMode();
+  }
 
   return (
-    <aside className="prototype-session-panel">
+    <aside className={cn('prototype-session-panel', selectMode && 'select-mode')}>
       <div className="prototype-session-head">
         <h2>最近会话</h2>
-        <button type="button" onClick={onToggle} aria-label="收起最近会话">
-          <ChevronLeft />
-        </button>
+        <div>
+          <button
+            type="button"
+            className={cn('prototype-batch-delete', selectMode && checkedItems.length && 'danger')}
+            onClick={handleBatchDelete}
+            aria-label={selectMode ? (checkedItems.length ? `删除选中的 ${checkedItems.length} 条会话` : '退出批量删除') : '批量删除会话'}
+          >
+            {selectMode ? (checkedItems.length ? `删除 (${checkedItems.length})` : '取消') : '批量删除'}
+          </button>
+          <button type="button" onClick={onToggle} aria-label="收起最近会话">
+            <ChevronLeft />
+          </button>
+        </div>
       </div>
       <label className="prototype-session-search">
         <Search />
         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索会话" />
       </label>
+      {selectMode ? (
+        <div className="prototype-session-toolbar">
+          <label>
+            <input
+              type="checkbox"
+              checked={allChecked}
+              disabled={!selectableIds.length}
+              onChange={toggleAllChecked}
+              aria-label="全选会话"
+            />
+            全选
+          </label>
+          <span>{checkedItems.length ? `已选 ${checkedItems.length} 条` : '勾选要删除的会话'}</span>
+        </div>
+      ) : null}
       <ScrollArea className="prototype-session-scroll">
         <div className="prototype-session-group">
           <span>今天</span>
@@ -1615,39 +1768,48 @@ function PrototypeSessionPanel({ sessions, total, hasMore, selectedSessionId, on
             const category = sessionCategoryFor(session);
             const SessionIcon = category.Icon;
             const isActive = Boolean(session.sessionId && session.sessionId === selectedSessionId);
+            const activate = () => {
+              if (selectMode) {
+                if (session.sessionId) toggleChecked(session.sessionId);
+                return;
+              }
+              onSelect(session);
+            };
             return (
               <div
                 key={`${session.sessionId || session.title}-${index}`}
                 className={cn('prototype-session-item', isActive && 'active')}
                 role="button"
                 tabIndex={0}
-                onClick={() => onSelect(session)}
+                onClick={activate}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' || event.key === ' ') {
                     event.preventDefault();
-                    onSelect(session);
+                    activate();
                   }
                 }}
               >
+                {selectMode ? (
+                  session.sessionId ? (
+                    <input
+                      type="checkbox"
+                      className="prototype-session-check"
+                      checked={checkedIds.has(session.sessionId)}
+                      onClick={(event) => event.stopPropagation()}
+                      onKeyDown={(event) => event.stopPropagation()}
+                      onChange={() => toggleChecked(session.sessionId!)}
+                      aria-label={`选择会话 ${session.title}`}
+                    />
+                  ) : (
+                    <span className="prototype-session-check" aria-hidden="true" />
+                  )
+                ) : null}
                 <span className={cn('prototype-session-icon', category.tone)}>
                   <SessionIcon />
                 </span>
                 <strong>{session.title}</strong>
                 <time>{session.time}</time>
-                {session.sessionId ? (
-                  <button
-                    className="prototype-session-delete"
-                    type="button"
-                    aria-label={`删除会话 ${session.title}`}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      onDelete(session);
-                    }}
-                  >
-                    <Trash2 />
-                  </button>
-                ) : null}
-                {session.sessionId ? <code className="prototype-session-id">{session.sessionId}</code> : null}
+                {session.sessionId ? <code className="prototype-session-id">ID: {session.sessionId}</code> : null}
                 <p>{session.desc}</p>
               </div>
             );
@@ -1661,8 +1823,11 @@ function PrototypeSessionPanel({ sessions, total, hasMore, selectedSessionId, on
         </div>
       </ScrollArea>
       <div className="prototype-session-pagination">
-        <span>{items.length} / {total || items.length}</span>
-        <button type="button" disabled={!hasMore} onClick={onLoadMore}>加载更多</button>
+        <span>第 {page}/{pageCount} 页 · 共 {total} 条</span>
+        <div>
+          <button type="button" disabled={page <= 1} onClick={onPrevPage}>上一页</button>
+          <button type="button" disabled={page >= pageCount} onClick={onNextPage}>下一页</button>
+        </div>
       </div>
     </aside>
   );

@@ -2033,7 +2033,7 @@
     padding: 10px;
     margin-bottom: 4px;
     display: grid;
-    grid-template-columns: 32px minmax(0, 1fr) auto auto;
+    grid-template-columns: 32px minmax(0, 1fr) auto;
     gap: 2px 10px;
     align-items: center;
     cursor: pointer;
@@ -2048,6 +2048,91 @@
   .prototype-session-item.active {
     background: var(--brand-soft);
     border-left: 3px solid hsl(var(--primary));
+  }
+
+  /* 批量删除选择模式：出现复选框列 */
+  .prototype-session-panel.select-mode .prototype-session-item {
+    grid-template-columns: 16px 32px minmax(0, 1fr) auto;
+    gap: 2px 8px;
+  }
+
+  .prototype-session-panel.select-mode .prototype-session-item p,
+  .prototype-session-panel.select-mode .prototype-session-id {
+    grid-column: 3 / -1;
+  }
+
+  .prototype-session-check {
+    grid-row: 1 / span 3;
+    width: 14px;
+    height: 14px;
+    margin: 0;
+    accent-color: hsl(var(--primary));
+    cursor: pointer;
+  }
+
+  span.prototype-session-check {
+    cursor: default;
+  }
+
+  .prototype-session-head > div {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .prototype-session-head button.prototype-batch-delete {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: auto;
+    height: 28px;
+    white-space: nowrap;
+    gap: 5px;
+    padding: 0 8px;
+    font-size: 12px;
+    font-weight: 650;
+  }
+
+  .prototype-session-head button.prototype-batch-delete:hover {
+    color: hsl(0 76% 52%);
+    background: hsl(0 84% 96%);
+  }
+
+  .prototype-session-head button.prototype-batch-delete.danger {
+    color: #fff;
+    background: hsl(0 76% 52%);
+  }
+
+  .prototype-session-head button.prototype-batch-delete.danger:hover {
+    color: #fff;
+    background: hsl(0 76% 46%);
+  }
+
+  .prototype-session-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 16px 6px;
+    color: hsl(215 16% 48%);
+    font-size: 12px;
+  }
+
+  .prototype-session-toolbar label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    color: hsl(217 33% 22%);
+    font-weight: 650;
+  }
+
+  .prototype-session-toolbar input {
+    width: 14px;
+    height: 14px;
+    margin: 0;
+    accent-color: hsl(var(--primary));
+    cursor: pointer;
   }
 
   .prototype-session-icon {
@@ -2119,27 +2204,6 @@
     white-space: nowrap;
   }
 
-  .prototype-session-delete {
-    width: 28px;
-    height: 28px;
-    border: 0;
-    border-radius: 8px;
-    background: transparent;
-    color: hsl(215 16% 48%);
-    display: grid;
-    place-items: center;
-  }
-
-  .prototype-session-delete:hover {
-    background: hsl(0 84% 96%);
-    color: hsl(0 76% 52%);
-  }
-
-  .prototype-session-delete svg {
-    width: 15px;
-    height: 15px;
-  }
-
   .prototype-session-empty {
     min-height: 170px;
     margin: 4px 0;
@@ -2179,9 +2243,16 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 10px;
+    flex-wrap: wrap;
+    gap: 6px 10px;
     color: hsl(215 16% 48%);
     font-size: 12px;
+  }
+
+  .prototype-session-pagination > div {
+    display: flex;
+    align-items: center;
+    gap: 6px;
   }
 
   .prototype-session-pagination button {
@@ -2637,23 +2708,114 @@
     white-space: pre;
   }
 
+  .markdown-table-wrap {
+    max-width: 100%;
+    margin: 0 0 10px;
+    overflow-x: auto;
+    border: 1px solid hsl(var(--border));
+    border-radius: 10px;
+    background: #fff;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
+  }
+
   .markdown-body table {
     border-collapse: collapse;
-    display: block;
-    max-width: 100%;
-    overflow-x: auto;
+    width: 100%;
+    margin: 0;
+    font-size: 12.5px;
   }
 
   .markdown-body th,
   .markdown-body td {
-    border: 1px solid hsl(var(--border));
-    padding: 7px 9px;
+    border: 0;
+    border-bottom: 1px solid hsl(var(--border));
+    padding: 8px 12px;
     text-align: left;
+    vertical-align: top;
+    line-height: 1.6;
   }
 
-  .markdown-body th {
+  .markdown-body th + th,
+  .markdown-body td + td {
+    border-left: 1px solid hsl(var(--border) / .6);
+  }
+
+  .markdown-body thead th {
     background: var(--brand-soft);
     color: hsl(217 33% 22%);
+    font-weight: 720;
+    white-space: nowrap;
+  }
+
+  .markdown-body tbody tr:nth-child(even) td {
+    background: hsl(var(--muted) / .45);
+  }
+
+  .markdown-body tbody tr:hover td {
+    background: var(--brand-soft);
+  }
+
+  .markdown-body tbody tr:last-child td {
+    border-bottom: 0;
+  }
+
+  /* 状态/警示单元格（✅/⚠️/❌ 或关键词识别） */
+  .markdown-body td.cell-danger {
+    color: hsl(0 72% 42%);
+    font-weight: 650;
+  }
+
+  .markdown-body td.cell-warning {
+    color: hsl(32 92% 34%);
+    font-weight: 650;
+  }
+
+  .markdown-body td.cell-success {
+    color: hsl(151 74% 28%);
+  }
+
+  /* 错误/警告引用块与段落 */
+  .markdown-body blockquote.md-alert {
+    border-radius: 8px;
+    padding: 8px 12px;
+  }
+
+  .markdown-body blockquote.md-alert-danger {
+    border-left: 3px solid hsl(0 76% 52%);
+    background: hsl(0 84% 97%);
+    color: hsl(0 60% 34%);
+  }
+
+  .markdown-body blockquote.md-alert-warning {
+    border-left: 3px solid hsl(38 92% 50%);
+    background: hsl(43 92% 95%);
+    color: hsl(30 74% 30%);
+  }
+
+  /* 警示引用块内的段落不再叠加段落级警示框，避免双层框 */
+  .markdown-body blockquote.md-alert p.md-line-danger,
+  .markdown-body blockquote.md-alert p.md-line-warning {
+    border-left: 0;
+    background: transparent;
+    color: inherit;
+    border-radius: 0;
+    padding: 0;
+  }
+
+  .markdown-body p.md-line-danger {
+    border-left: 3px solid hsl(0 76% 52%);
+    background: hsl(0 84% 97%);
+    color: hsl(0 60% 34%);
+    border-radius: 6px;
+    padding: 6px 10px;
+  }
+
+  .markdown-body p.md-line-warning {
+    border-left: 3px solid hsl(38 92% 50%);
+    background: hsl(43 92% 95%);
+    color: hsl(30 74% 30%);
+    border-radius: 6px;
+    padding: 6px 10px;
   }
 
   .markdown-body .hljs-keyword,
@@ -2900,7 +3062,7 @@
   .prototype-sandbox-body {
     flex: 1;
     min-height: 0;
-    overflow: auto;
+    overflow: hidden auto;
     padding: 14px;
     display: flex;
     flex-direction: column;
@@ -3004,9 +3166,15 @@
     gap: 7px;
   }
 
+  /* 面板较窄时按钮换行，避免撑出横向滚动条 */
+  .prototype-browser-card > div:first-child {
+    flex-wrap: wrap;
+  }
+
   .prototype-browser-card > div:first-child > div {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 8px;
   }
 

@@ -90,7 +90,7 @@ describe('frontend API wiring', () => {
   it('loads every menu page from backend endpoints', async () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
 
-    expect(app).toContain('api.get<SessionsBody>(`/v1/sessions?limit=${SESSION_PAGE_SIZE}&offset=${sessionOffset}`');
+    expect(app).toContain('api.get<SessionsBody>(`/v1/sessions?limit=${SESSION_PAGE_SIZE}&offset=${offset}`');
     expect(app).toContain("api.get<ToolsBody>('/v1/tools");
     expect(app).toContain("api.get<ScheduleBody>('/v1/schedule");
     expect(app).toContain('api.get<ScheduleRunsBody>(`/v1/schedule/${selectedTask.id}/runs`)');
@@ -272,7 +272,8 @@ describe('frontend API wiring', () => {
     expect(app).toContain('selectSession');
     expect(app).toContain("api.get<SessionMessagesBody>(`/v1/sessions/${encodeURIComponent(session.sessionId)}/messages`)");
     expect(app).toContain('onSelectSession={selectSession}');
-    expect(app).toContain('onClick={() => onSelect(session)}');
+    expect(app).toContain('onClick={activate}');
+    expect(app).toContain('onSelect(session);');
   });
 
   it('confirms before stopping the active chat run', async () => {
@@ -320,13 +321,13 @@ describe('frontend API wiring', () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
 
     expect(app).not.toMatch(/window\.(confirm|alert|prompt)/);
-    expect(app).toContain('requestDeleteSession');
+    expect(app).toContain('requestDeleteSessions');
     expect(app).toContain('requestDeleteSelectedSkill');
     expect(app).toContain("confirmLabel: '确认删除'");
     expect(app).toContain('onRequestConfirm={requestConfirmDialog}');
-    expect(app).toContain('title: `删除会话“${sessionLabel}”？`');
-    expect(app).toContain('删除后，这条会话记录和历史消息将从列表中移除。');
-    expect(app).toContain('此操作不可恢复，请确认不再需要这条会话记录。');
+    expect(app).toContain('title: `删除选中的 ${targets.length} 条会话？`');
+    expect(app).toContain('删除后，这些会话记录和历史消息将从列表中移除。');
+    expect(app).toContain('此操作不可恢复，请确认不再需要这些会话记录。');
     expect(app).toContain('删除技能');
     expect(app).not.toContain("kicker: '删除确认'");
     expect(app).not.toContain("icon: 'delete'");
@@ -374,14 +375,21 @@ describe('frontend API wiring', () => {
     expect(app).toContain('SESSION_PAGE_SIZE');
     expect(app).toContain('sessionOffset');
     expect(app).toContain('sessionTotal');
-    expect(app).toContain("`/v1/sessions?limit=${SESSION_PAGE_SIZE}&offset=${sessionOffset}`");
-    expect(app).toContain('hasMore');
-    expect(app).toContain('loadNextSessionsPage');
-    expect(app).toContain('deleteSession');
-    expect(app).toContain('api.delete<{ ok: boolean }>(`/v1/sessions/${encodeURIComponent(session.sessionId)}`');
-    expect(app).toContain('onDeleteSession');
+    expect(app).toContain("`/v1/sessions?limit=${SESSION_PAGE_SIZE}&offset=${offset}`");
+    expect(app).toContain('const SESSION_PAGE_SIZE = 10;');
+    expect(app).toContain('goToPrevSessionsPage');
+    expect(app).toContain('goToNextSessionsPage');
+    expect(app).toContain('上一页');
+    expect(app).toContain('下一页');
+    expect(app).toContain('ID: {session.sessionId}');
+    expect(app).toContain('全选');
+    expect(app).toContain('onDeleteMany');
+    expect(app).toContain('deleteSessions');
+    expect(app).toContain('api.delete<{ ok: boolean }>(`/v1/sessions/${encodeURIComponent(id)}`');
+    expect(app).toContain('onDeleteSessions');
     expect(app).toContain('event.stopPropagation()');
-    expect(app).toContain('aria-label={`删除会话 ${session.title}`}');
+    expect(app).toContain('批量删除');
+    expect(app).not.toContain('prototype-session-delete');
     expect(app).toContain('runningAgentCount');
     expect(app).toContain('running: true');
     expect(app).toContain('running: false');
@@ -407,7 +415,7 @@ describe('frontend API wiring', () => {
     expect(app).toContain('useState<Record<string, ContextUsageBody>>');
     expect(app).toContain('activeRunSessionIds');
     expect(app).toContain("api.post<{ session: SessionsBody['sessions'][number] }>('/v1/sessions'");
-    expect(app).toContain('setSessions((current) => [createdSummary, ...current.filter((session) => session.sessionId !== createdSummary.sessionId)])');
+    expect(app).toContain('await fetchSessionsPage(0);');
     expect(app).toContain('api.get<ContextUsageBody>(`/v1/sessions/${encodeURIComponent(nextSessionId)}/context`)');
     expect(app).toContain('api.post<{ ok: boolean; sessionId: string; queued: boolean }>(`/v1/sessions/${encodeURIComponent(sessionId)}/append`');
     expect(app).toContain('activeRunSessionIds.has(sessionId)');

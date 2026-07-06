@@ -389,8 +389,9 @@ function browserStreamView(sessionId: string): string {
 <head>
   <meta charset="utf-8">
   <style>
-    body { margin: 0; background: #0f172a; color: #d6e2ff; font: 14px system-ui, sans-serif; }
-    header { display: flex; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #263449; }
+    html, body { margin: 0; overflow-x: hidden; }
+    body { background: #0f172a; color: #d6e2ff; font: 14px system-ui, sans-serif; }
+    header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; padding: 10px 12px; border-bottom: 1px solid #263449; }
     img { display: block; max-width: 100%; height: auto; margin: 0 auto; }
     .error { color: #fecaca; padding: 12px; white-space: pre-wrap; }
   </style>
