@@ -24,6 +24,7 @@ import { createModel } from '../model/factory.js';
 import type { JsonValue, Msg, ToolCall } from '../model/types.js';
 import { importSkillZip } from '../skill/import.js';
 import type { Skill } from '../skill/registry.js';
+import { McpServerSchema } from '../config/schema.js';
 
 const log = logger.child({ mod: 'http' });
 
@@ -449,6 +450,25 @@ async function dispatchDirectTool(
   return { ok: !result.isError, sessionId, result };
 }
 
+/** MCP server 增删/重连后，把注册表里的 mcp__ 工具与 manager 当前状态对齐。 */
+function syncMcpTools(rt: Runtime): void {
+  if (!rt.mcp) return;
+  for (const def of rt.tools.defs()) {
+    if (def.name.startsWith('mcp__')) rt.tools.unregister(def.name);
+  }
+  for (const t of rt.mcp.tools()) rt.tools.register(t);
+}
+
+/** 持久化当前 MCP server 配置（平台级，落 default 租户设置；失败仅记日志不阻塞请求）。 */
+async function persistMcpServers(rt: Runtime): Promise<void> {
+  if (!rt.mcp) return;
+  try {
+    await rt.store.setMcpServers({ tenantId: rt.defaultContext.tenantId }, rt.mcp.configs());
+  } catch (err) {
+    log.error({ err: String(err) }, 'MCP 配置持久化失败');
+  }
+}
+
 /** 校验 Bearer token 并返回身份；失败抛 401。 */
 async function requireAuth(rt: Runtime, req: Req): Promise<RequestContext> {
   const ctx = await authenticate(rt.authProvider, req.headers.authorization);
@@ -677,6 +697,59 @@ async function handle(
     } catch (err) {
       throw skillHttpError(err);
     }
+  }
+
+  // —— MCP server 管理 ——
+  if (route === 'GET /v1/mcp/servers') {
+    await requireAuth(rt, req);
+    if (!rt.mcp) throw new HttpError(409, '未启用 MCP');
+    return sendJson(res, 200, { servers: rt.mcp.list() });
+  }
+
+  if (route === 'POST /v1/mcp/servers') {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'tenant:manage');
+    if (!rt.mcp) throw new HttpError(409, '未启用 MCP');
+    const body = await readJson(req);
+    const name = str(body, 'name');
+    if (!name || !/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(name) || name.includes('__')) {
+      throw new HttpError(400, 'name 必填，仅限字母/数字/-/_ 且不含连续下划线');
+    }
+    const parsed = McpServerSchema.safeParse(body.config ?? body);
+    if (!parsed.success) throw new HttpError(400, `配置无效：${parsed.error.issues.map((i) => i.message).join('; ')}`);
+    const cfg = parsed.data;
+    if (cfg.transport === 'stdio' && !cfg.command) throw new HttpError(400, 'stdio 需要 command');
+    if (cfg.transport !== 'stdio' && !cfg.url) throw new HttpError(400, `${cfg.transport} 需要 url`);
+    if (rt.mcp.list().some((s) => s.name === name)) throw new HttpError(409, `MCP server 已存在: ${name}`);
+    const info = await rt.mcp.add(name, cfg);
+    syncMcpTools(rt);
+    await persistMcpServers(rt);
+    return sendJson(res, 201, { server: info });
+  }
+
+  const mcpReconnectMatch = /^\/v1\/mcp\/servers\/([^/]+)\/reconnect$/.exec(path);
+  if (method === 'POST' && mcpReconnectMatch) {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'tenant:manage');
+    if (!rt.mcp) throw new HttpError(409, '未启用 MCP');
+    const name = decodeURIComponent(mcpReconnectMatch[1]!);
+    if (!rt.mcp.list().some((s) => s.name === name)) throw new HttpError(404, `MCP server 不存在: ${name}`);
+    const info = await rt.mcp.reconnect(name);
+    syncMcpTools(rt);
+    return sendJson(res, 200, { server: info });
+  }
+
+  const mcpDeleteMatch = /^\/v1\/mcp\/servers\/([^/]+)$/.exec(path);
+  if (method === 'DELETE' && mcpDeleteMatch) {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'tenant:manage');
+    if (!rt.mcp) throw new HttpError(409, '未启用 MCP');
+    const name = decodeURIComponent(mcpDeleteMatch[1]!);
+    const removed = await rt.mcp.remove(name);
+    if (!removed) throw new HttpError(404, `MCP server 不存在: ${name}`);
+    syncMcpTools(rt);
+    await persistMcpServers(rt);
+    return sendJson(res, 200, { ok: true });
   }
 
   if (route === 'POST /v1/tools/call') {

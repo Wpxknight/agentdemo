@@ -50,6 +50,8 @@ export interface Runtime {
   updateModel?(config: RuntimeModelConfig): void;
   tools: ToolRegistry;
   skillRegistry?: SkillRegistry;
+  /** MCP server 管理器（运行期增删/重连，工具同步进 tools）。 */
+  mcp?: McpManager;
   /** 会话沙箱管理器（按会话/集群复用、空闲 GC、会话关闭销毁）。 */
   sandboxes?: SandboxManager;
   /** 可供模型选择的沙箱模板/profile 列表。 */
@@ -194,12 +196,11 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     }
   }
 
-  let mcp: McpManager | undefined;
-  if (config.mcpServers && Object.keys(config.mcpServers).length) {
-    mcp = new McpManager(config.mcpServers, connectMcp);
-    await mcp.start();
-    for (const t of mcp.tools()) tools.register(t);
-  }
+  // MCP：持久化配置（UI 增删的结果）优先于 config.jsonc；常驻 manager 以支持运行期管理。
+  const persistedMcp = await store.getMcpServers({ tenantId: DEFAULT_TENANT }).catch(() => undefined);
+  const mcp = new McpManager(persistedMcp ?? config.mcpServers ?? {}, connectMcp);
+  await mcp.start();
+  for (const t of mcp.tools()) tools.register(t);
 
   // 定时任务工具（持久化已就绪）
   for (const t of buildScheduleTools(store)) tools.register(t);
@@ -262,6 +263,7 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     },
     tools,
     skillRegistry,
+    mcp,
     sandboxes,
     sandboxProfiles: publicSandboxProfiles(sandboxProfiles),
     clusters,

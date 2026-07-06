@@ -43,6 +43,26 @@ export interface SkillFileEntry {
   updatedAt: string;
 }
 
+export interface McpServerInfo {
+  name: string;
+  transport: 'stdio' | 'sse' | 'http';
+  command?: string;
+  args?: string[];
+  url?: string;
+  status: 'connected' | 'error';
+  error?: string;
+  connectedAt?: string;
+  tools: string[];
+}
+
+export interface McpServersBody {
+  servers: McpServerInfo[];
+}
+
+export interface McpServerBody {
+  server: McpServerInfo;
+}
+
 export interface ScheduledTask {
   id?: number;
   task: string;

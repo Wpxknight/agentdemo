@@ -2,6 +2,7 @@ import type { Msg } from '../model/types.js';
 import { estimateTokens } from '../agent/context.js';
 import type { AuditEvent } from '../audit/sink.js';
 import type { RequestContext, Tenant, User } from '../auth/types.js';
+import type { McpServerConfig } from '../mcp/types.js';
 import type {
   AuditFilter,
   NewUser,
@@ -53,6 +54,7 @@ export class MemoryStore implements Store {
   private users = new Map<string, UserWithSecret>(); // key: tenantId/username
   private llmSettings = new Map<string, LlmSettings>();
   private schedulerSettings = new Map<string, SchedulerSettings>();
+  private mcpServers = new Map<string, Record<string, McpServerConfig>>();
   private taskSeq = 0;
   private runSeq = 0;
   private userSeq = 0;
@@ -318,6 +320,15 @@ export class MemoryStore implements Store {
     this.schedulerSettings.set(ctx.tenantId, { ...settings });
   }
 
+  async getMcpServers(ctx: Pick<RequestContext, 'tenantId'>): Promise<Record<string, McpServerConfig> | undefined> {
+    const servers = this.mcpServers.get(ctx.tenantId);
+    return servers ? structuredClone(servers) : undefined;
+  }
+
+  async setMcpServers(ctx: Pick<RequestContext, 'tenantId'>, servers: Record<string, McpServerConfig>): Promise<void> {
+    this.mcpServers.set(ctx.tenantId, structuredClone(servers));
+  }
+
   async close(): Promise<void> {
     this.messages = [];
     this.sessions.clear();
@@ -329,5 +340,6 @@ export class MemoryStore implements Store {
     this.users.clear();
     this.llmSettings.clear();
     this.schedulerSettings.clear();
+    this.mcpServers.clear();
   }
 }

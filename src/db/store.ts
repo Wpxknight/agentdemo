@@ -1,6 +1,7 @@
 import type { Msg } from '../model/types.js';
 import type { AuditEvent, AuditSink } from '../audit/sink.js';
 import type { Role, RequestContext, Tenant, User } from '../auth/types.js';
+import type { McpServerConfig } from '../mcp/types.js';
 
 export interface LlmSettings {
   id: string;
@@ -148,6 +149,9 @@ export interface Store extends AuditSink {
   setLlmSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: LlmSettings): Promise<void>;
   getSchedulerSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<SchedulerSettings | undefined>;
   setSchedulerSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SchedulerSettings): Promise<void>;
+  /** MCP server 配置（UI 动态增删后持久化；存在时覆盖 config.jsonc 的 mcpServers）。 */
+  getMcpServers(ctx: Pick<RequestContext, 'tenantId'>): Promise<Record<string, McpServerConfig> | undefined>;
+  setMcpServers(ctx: Pick<RequestContext, 'tenantId'>, servers: Record<string, McpServerConfig>): Promise<void>;
 
   close(): Promise<void>;
 }

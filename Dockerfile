@@ -12,6 +12,8 @@ ENV NODE_ENV=production
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json tsconfig.json ./
 COPY src ./src
+# scripts 含 mcp-echo-server.ts 等辅助脚本，供 MCP stdio server 冒烟验证。
+COPY scripts ./scripts
 # skills 目录需要运行时写入，用于 zip 技能导入。
 COPY --chown=node:node skills ./skills
 

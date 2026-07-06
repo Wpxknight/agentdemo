@@ -65,6 +65,9 @@ import type {
   SessionsBody,
   TaskRun,
   TaskStep,
+  McpServerBody,
+  McpServerInfo,
+  McpServersBody,
   ToolCallBody,
   ToolSummary,
   ToolsBody,
@@ -207,11 +210,6 @@ function toolCategory(name: string): string {
 
 function toolDisplayName(name = ''): string {
   return name.replace(/^mcp__/, '').replace(/^skill__/, '').replace(/^sbx__/, '');
-}
-
-function mcpServerName(name = ''): string {
-  const parts = name.split('__');
-  return parts.length >= 3 ? parts[1] || name : name;
 }
 
 function humanizeCron(cron: string): string {
@@ -1438,7 +1436,7 @@ export default function App() {
                 onRequestConfirm={requestConfirmDialog}
               />
             )}
-            {activePage === 'mcp' && <McpPage tools={mcpTools} output={toolTestOutput} onTest={testMcpTool} />}
+            {activePage === 'mcp' && <McpPage tools={mcpTools} api={api} output={toolTestOutput} onTest={testMcpTool} onRequestConfirm={requestConfirmDialog} onChanged={() => void loadPageData('mcp')} />}
             {activePage === 'schedule' && <SchedulePage tasks={tasks.length ? tasks : fallbackTasks} api={api} />}
             {activePage === 'sandbox' && <SandboxPage sandboxes={sandboxes} profiles={sandboxProfiles} />}
             {activePage === 'settings' && <SettingsPage llm={llm} status={settingsStatus} api={api} onLlmChange={setLlm} onStatus={setSettingsStatus} />}
@@ -2840,67 +2838,294 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
   );
 }
 
-function McpPage({ tools, output, onTest }: { tools: ToolSummary[]; output: string; onTest: (tool: string, args: string) => void }) {
-  const servers = buildMcpServers(tools);
-  const selected = servers[0] || { name: '-', transport: '-', status: '未连接', tools: [] as ToolSummary[] };
-  const [tool, setTool] = useState(selected.tools[0]?.name || '');
-  const [args, setArgs] = useState('{}');
-  const hasTools = selected.tools.length > 0;
-  const serverRows = servers.length
-    ? servers.map((server) => [server.name, server.transport, server.status, String(server.tools.length), formatTime(new Date().toISOString())])
-    : [['-', '-', '未连接', '0', '-']];
+type McpTransport = McpServerInfo['transport'];
+
+const emptyMcpForm = { name: '', transport: 'stdio' as McpTransport, command: '', args: '', url: '', headers: '' };
+
+function mcpStatusText(status: McpServerInfo['status']): string {
+  return status === 'connected' ? '已连接' : '异常';
+}
+
+function McpPage({ tools, api, output, onTest, onRequestConfirm, onChanged }: {
+  tools: ToolSummary[];
+  api: ReturnType<typeof createApi>;
+  output: string;
+  onTest: (tool: string, args: string) => void;
+  onRequestConfirm: (request: ConfirmDialogRequest) => void;
+  onChanged: () => void;
+}) {
+  const [servers, setServers] = useState<McpServerInfo[]>([]);
+  const [selectedName, setSelectedName] = useState('');
+  const [search, setSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'connected'>('all');
+  const [pageStatus, setPageStatus] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [showAdd, setShowAdd] = useState(false);
+  const [form, setForm] = useState(emptyMcpForm);
+  const [testToolName, setTestToolName] = useState('');
+  const [testArgs, setTestArgs] = useState('{}');
+
+  const loadServers = useCallback(async () => {
+    try {
+      const body = await api.get<McpServersBody>('/v1/mcp/servers');
+      setServers(body.servers || []);
+    } catch (err) {
+      setServers([]);
+      setPageStatus(`加载 MCP 服务器失败：${formatError(err)}`);
+    }
+  }, [api]);
 
   useEffect(() => {
-    if (!selected.tools.some((item) => item.name === tool)) {
-      setTool(selected.tools[0]?.name || '');
+    void loadServers();
+  }, [loadServers]);
+
+  const keyword = search.trim().toLowerCase();
+  const filtered = servers.filter((server) =>
+    (statusFilter === 'all' || server.status === 'connected')
+    && (!keyword || server.name.toLowerCase().includes(keyword)));
+  const selected = filtered.find((server) => server.name === selectedName) || filtered[0];
+  const selectedTools = selected?.tools ?? [];
+  const hasTools = selectedTools.length > 0;
+
+  useEffect(() => {
+    if (!selectedTools.includes(testToolName)) setTestToolName(selectedTools[0] || '');
+  }, [selectedTools, testToolName]);
+
+  const serverRows = filtered.length
+    ? filtered.map((server) => [server.name, server.transport, mcpStatusText(server.status), String(server.tools.length), formatTime(server.connectedAt)])
+    : [['-', '-', '未连接', '0', '-']];
+
+  async function submitAdd(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const name = form.name.trim();
+    if (!name) return setPageStatus('请填写服务器名称');
+    const config: Record<string, unknown> = { transport: form.transport };
+    if (form.transport === 'stdio') {
+      if (!form.command.trim()) return setPageStatus('stdio 传输需要启动命令');
+      config.command = form.command.trim();
+      const args = form.args.trim() ? form.args.trim().split(/\s+/) : [];
+      if (args.length) config.args = args;
+    } else {
+      if (!form.url.trim()) return setPageStatus(`${form.transport} 传输需要 URL`);
+      config.url = form.url.trim();
+      if (form.headers.trim()) {
+        try {
+          config.headers = JSON.parse(form.headers) as Record<string, string>;
+        } catch {
+          return setPageStatus('headers 必须是 JSON 对象，如 {"Authorization": "Bearer xxx"}');
+        }
+      }
     }
-  }, [selected.tools, tool]);
+    setBusy(true);
+    setPageStatus(`正在连接 ${name}...`);
+    try {
+      const body = await api.post<McpServerBody>('/v1/mcp/servers', { name, config });
+      setPageStatus(body.server.status === 'connected'
+        ? `已连接 ${name}，发现 ${body.server.tools.length} 个工具`
+        : `已保存 ${name}，但连接失败：${body.server.error || '未知错误'}（可稍后重连）`);
+      setShowAdd(false);
+      setForm(emptyMcpForm);
+      setSelectedName(name);
+      await loadServers();
+      onChanged();
+    } catch (err) {
+      setPageStatus(`新增失败：${formatError(err)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function reconnectSelected() {
+    if (!selected || busy) return;
+    setBusy(true);
+    setPageStatus(`正在重连 ${selected.name}...`);
+    try {
+      const body = await api.post<McpServerBody>(`/v1/mcp/servers/${encodeURIComponent(selected.name)}/reconnect`);
+      setPageStatus(body.server.status === 'connected'
+        ? `已重连 ${selected.name}，发现 ${body.server.tools.length} 个工具`
+        : `重连 ${selected.name} 失败：${body.server.error || '未知错误'}`);
+      await loadServers();
+      onChanged();
+    } catch (err) {
+      setPageStatus(`重连失败：${formatError(err)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function requestDeleteSelected() {
+    if (!selected || busy) return;
+    const target = selected;
+    onRequestConfirm({
+      title: '删除 MCP server',
+      description: `将断开并移除「${target.name}」及其 ${target.tools.length} 个工具，AI 将无法继续调用。`,
+      confirmLabel: '确认删除',
+      busyLabel: '正在删除...',
+      tone: 'danger',
+      onConfirm: async () => {
+        await api.delete(`/v1/mcp/servers/${encodeURIComponent(target.name)}`);
+        setPageStatus(`已删除 ${target.name}`);
+        await loadServers();
+        onChanged();
+      },
+    });
+  }
+
+  function toolDescription(name: string): string {
+    return tools.find((tool) => tool.name === name)?.description || '';
+  }
 
   return (
-    <ManagementPage title="MCP" desc="接入 MCP Server，扩展 AI 可用的工具" actionLabel="新增 MCP">
-      <DataTable headers={['名称', '传输协议', '状态', '工具数', '最近心跳']} rows={serverRows} />
-      <DetailPanel title={selected.name} status={selected.status} icon={<Boxes />}>
-        <h3>连接配置</h3>
-        <div className="kv"><span>传输协议</span><strong>{selected.transport}</strong><span>命令</span><strong>registry</strong></div>
-        <h3>测试调用</h3>
-        {!hasTools ? <p className="empty-hint">暂无已连接的 MCP 工具</p> : null}
-        <Select value={tool} onValueChange={setTool} disabled={!hasTools}>
-          <SelectTrigger><SelectValue placeholder="选择工具" /></SelectTrigger>
-          <SelectContent>
-            <SelectGroup>
-              {selected.tools.map((item) => <SelectItem key={item.name} value={item.name}>{toolDisplayName(item.name)}</SelectItem>)}
-            </SelectGroup>
-          </SelectContent>
-        </Select>
-        <Textarea id="tool-test-args" value={args} onChange={(event) => setArgs(event.target.value)} rows={5} spellCheck={false} disabled={!hasTools} />
-        <Button type="button" disabled={!hasTools} onClick={() => onTest(tool, args)}>测试工具</Button>
-        {output ? <pre className="tool-output">{output}</pre> : null}
-      </DetailPanel>
+    <ManagementPage
+      title="MCP"
+      desc="接入 MCP Server，扩展 AI 可用的工具"
+      actionLabel="新增 MCP"
+      onAction={() => {
+        setShowAdd((value) => !value);
+        setPageStatus('');
+      }}
+      search={search}
+      onSearchChange={setSearch}
+      filters={[
+        { key: 'all', label: '全部', active: statusFilter === 'all', onClick: () => setStatusFilter('all') },
+        { key: 'connected', label: '已连接', active: statusFilter === 'connected', onClick: () => setStatusFilter('connected') },
+      ]}
+    >
+      <>
+        <DataTable
+          headers={['名称', '传输协议', '状态', '工具数', '最近连接']}
+          rows={serverRows}
+          selectedRowIndex={selected ? filtered.findIndex((server) => server.name === selected.name) : null}
+          onRowClick={(index) => {
+            const server = filtered[index];
+            if (server) setSelectedName(server.name);
+          }}
+        />
+        {pageStatus ? <p className="empty-hint">{pageStatus}</p> : null}
+      </>
+      {showAdd ? (
+        <div className="detail-panel">
+          <div className="detail-title">
+            <div className="large-icon"><Plus /></div>
+            <div>
+              <h2>新增 MCP</h2>
+              <Badge variant="secondary">连接后其工具自动注册</Badge>
+            </div>
+          </div>
+          <form className="settings-form" onSubmit={(event) => void submitAdd(event)}>
+            <label>名称
+              <Input value={form.name} placeholder="如 filesystem" onChange={(event) => setForm({ ...form, name: event.target.value })} />
+            </label>
+            <label>传输协议
+              <Select value={form.transport} onValueChange={(value) => setForm({ ...form, transport: value as McpTransport })}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="stdio">stdio（本地进程）</SelectItem>
+                    <SelectItem value="sse">SSE</SelectItem>
+                    <SelectItem value="http">Streamable HTTP</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </label>
+            {form.transport === 'stdio' ? (
+              <>
+                <label>命令
+                  <Input value={form.command} placeholder="如 npx" onChange={(event) => setForm({ ...form, command: event.target.value })} />
+                </label>
+                <label>参数（空格分隔）
+                  <Input value={form.args} placeholder="如 -y @modelcontextprotocol/server-filesystem /tmp" onChange={(event) => setForm({ ...form, args: event.target.value })} />
+                </label>
+              </>
+            ) : (
+              <>
+                <label>URL
+                  <Input value={form.url} placeholder="如 https://mcp.example.com/sse" onChange={(event) => setForm({ ...form, url: event.target.value })} />
+                </label>
+                <label>Headers（JSON，可选）
+                  <Textarea value={form.headers} rows={3} spellCheck={false} placeholder='{"Authorization": "Bearer xxx"}' onChange={(event) => setForm({ ...form, headers: event.target.value })} />
+                </label>
+              </>
+            )}
+            <div className="skill-detail-actions">
+              <Button type="submit" disabled={busy}>{busy ? '正在连接...' : '连接并保存'}</Button>
+              <Button type="button" variant="outline" disabled={busy} onClick={() => setShowAdd(false)}>取消</Button>
+            </div>
+          </form>
+        </div>
+      ) : (
+        <DetailPanel title={selected?.name || '-'} status={selected ? mcpStatusText(selected.status) : '未连接'} icon={<Boxes />}>
+          <h3>连接配置</h3>
+          <div className="kv">
+            <span>传输协议</span><strong>{selected?.transport || '-'}</strong>
+            {selected?.transport === 'stdio'
+              ? <><span>命令</span><strong>{[selected.command, ...(selected.args ?? [])].filter(Boolean).join(' ') || '-'}</strong></>
+              : <><span>URL</span><strong>{selected?.url || '-'}</strong></>}
+            <span>最近连接</span><strong>{formatTime(selected?.connectedAt)}</strong>
+          </div>
+          {selected?.error ? <p className="empty-hint">连接错误：{selected.error}</p> : null}
+          {selected ? (
+            <div className="skill-detail-actions">
+              <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => void reconnectSelected()}>
+                <RefreshCcw data-icon="inline-start" />
+                重连
+              </Button>
+              <Button variant="outline" size="sm" type="button" disabled={busy} onClick={requestDeleteSelected}>
+                <Trash2 data-icon="inline-start" />
+                删除
+              </Button>
+            </div>
+          ) : null}
+          <h3>测试调用</h3>
+          {!hasTools ? <p className="empty-hint">暂无已连接的 MCP 工具</p> : null}
+          <Select value={testToolName} onValueChange={setTestToolName} disabled={!hasTools}>
+            <SelectTrigger><SelectValue placeholder="选择工具" /></SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                {selectedTools.map((name) => <SelectItem key={name} value={name}>{toolDisplayName(name)}</SelectItem>)}
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+          {testToolName && toolDescription(testToolName) ? <p className="empty-hint">{toolDescription(testToolName)}</p> : null}
+          <Textarea id="tool-test-args" value={testArgs} onChange={(event) => setTestArgs(event.target.value)} rows={5} spellCheck={false} disabled={!hasTools} />
+          <Button type="button" disabled={!hasTools} onClick={() => onTest(testToolName, testArgs)}>测试工具</Button>
+          {output ? <pre className="tool-output">{output}</pre> : null}
+        </DetailPanel>
+      )}
     </ManagementPage>
   );
 }
 
-function buildMcpServers(tools: ToolSummary[]) {
-  const servers = new Map<string, { name: string; transport: string; status: string; tools: ToolSummary[] }>();
-  for (const tool of tools) {
-    const name = mcpServerName(tool.name);
-    const server = servers.get(name) || { name, transport: tool.transport || 'stdio', status: tool.status || '已连接', tools: [] };
-    server.tools.push(tool);
-    servers.set(name, server);
-  }
-  return [...servers.values()];
+interface ManagementFilter {
+  key: string;
+  label: string;
+  active: boolean;
+  onClick: () => void;
 }
 
-function ManagementPage({ title, desc, actionLabel, children }: { title: string; desc?: string; actionLabel: string; children: React.ReactNode }) {
+function ManagementPage({ title, desc, actionLabel, onAction, search, onSearchChange, filters, children }: {
+  title: string;
+  desc?: string;
+  actionLabel: string;
+  onAction?: () => void;
+  search?: string;
+  onSearchChange?: (value: string) => void;
+  filters?: ManagementFilter[];
+  children: React.ReactNode;
+}) {
   const content = Array.isArray(children) ? children : [children];
   return (
     <>
       <PageTitle title={title} desc={desc} />
       <div className="toolbar">
-        <label className="search-box"><Search /><Input placeholder={`搜索${title}`} /></label>
-        <Button variant="outline">全部</Button>
-        <Button variant="outline">已启用</Button>
-        <Button>{actionLabel}</Button>
+        <label className="search-box">
+          <Search />
+          <Input placeholder={`搜索${title}`} value={search ?? ''} onChange={(event) => onSearchChange?.(event.target.value)} />
+        </label>
+        {(filters ?? []).map((filter) => (
+          <Button key={filter.key} variant={filter.active ? 'secondary' : 'outline'} type="button" onClick={filter.onClick}>{filter.label}</Button>
+        ))}
+        <Button type="button" onClick={onAction}>{actionLabel}</Button>
       </div>
       <div className="two-pane">
         <section className="list-card">{content[0]}</section>

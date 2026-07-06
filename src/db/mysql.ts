@@ -19,6 +19,8 @@ import type {
   UserWithSecret,
 } from './store.js';
 import { DEFAULT_SESSION_TITLE } from './store.js';
+import { McpServerSchema } from '../config/schema.js';
+import type { McpServerConfig } from '../mcp/types.js';
 import { nextRunAt } from '../scheduler/cron.js';
 import { estimateTokens } from '../agent/context.js';
 
@@ -127,6 +129,17 @@ function parseLlmSettings(value: unknown): LlmSettings | undefined {
       ? { effort: o.effort as LlmSettings['effort'] }
       : {}),
   };
+}
+
+function parseMcpServers(value: unknown): Record<string, McpServerConfig> | undefined {
+  const v = parseJson(value);
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const out: Record<string, McpServerConfig> = {};
+  for (const [name, raw] of Object.entries(v as Record<string, unknown>)) {
+    const parsed = McpServerSchema.safeParse(raw);
+    if (parsed.success) out[name] = parsed.data;
+  }
+  return out;
 }
 
 function parseSchedulerSettings(value: unknown): SchedulerSettings | undefined {
@@ -609,6 +622,31 @@ export class MysqlStore implements Store {
     await this.db
       .insertInto('tenant_settings')
       .values({ tenant_id: ctx.tenantId, setting_key: 'llm.default', config })
+      .execute();
+  }
+
+  async getMcpServers(ctx: Pick<RequestContext, 'tenantId'>): Promise<Record<string, McpServerConfig> | undefined> {
+    const row = await this.db
+      .selectFrom('tenant_settings')
+      .select(['config'])
+      .where('tenant_id', '=', ctx.tenantId)
+      .where('setting_key', '=', 'mcp.servers')
+      .executeTakeFirst();
+    return row ? parseMcpServers(row.config) : undefined;
+  }
+
+  async setMcpServers(ctx: Pick<RequestContext, 'tenantId'>, servers: Record<string, McpServerConfig>): Promise<void> {
+    const config = JSON.stringify(servers);
+    const updated = await this.db
+      .updateTable('tenant_settings')
+      .set({ config })
+      .where('tenant_id', '=', ctx.tenantId)
+      .where('setting_key', '=', 'mcp.servers')
+      .executeTakeFirst();
+    if (Number(updated.numUpdatedRows) > 0) return;
+    await this.db
+      .insertInto('tenant_settings')
+      .values({ tenant_id: ctx.tenantId, setting_key: 'mcp.servers', config })
       .execute();
   }
 

@@ -12,6 +12,8 @@ import { AllowAllPolicy } from '../src/agent/policy.js';
 import type { Runtime } from '../src/runtime.js';
 import type { ChatModel, Msg, StreamEvent } from '../src/model/types.js';
 import { SkillRegistry } from '../src/skill/registry.js';
+import { McpManager } from '../src/mcp/manager.js';
+import type { McpClientLike } from '../src/mcp/types.js';
 import { SandboxManager } from '../src/sandbox/lifecycle.js';
 import { buildSandboxTools } from '../src/tools/builtin.js';
 import { buildSandboxProfileTools } from '../src/tools/sandbox-profiles.js';
@@ -114,6 +116,19 @@ beforeAll(async () => {
   await store.createTenant({ id: 'default', name: 'Default' });
   const auth = new LocalAuthProvider({ store, secret: 'test-secret' });
   await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+  await auth.createUser('default', 'bob', 'pw', 'user');
+
+  // MCP：mock connect（server 名以 down 开头则连接失败），暴露一个 echo 工具
+  const mcpConnect = async (name: string): Promise<McpClientLike> => {
+    if (name.startsWith('down')) throw new Error('connect refused');
+    return {
+      listTools: async () => ({ tools: [{ name: 'echo', description: 'echo text', inputSchema: { type: 'object' } }] }),
+      callTool: async (p) => ({ content: [{ type: 'text', text: `echo:${JSON.stringify(p.arguments ?? {})}` }] }),
+      close: async () => {},
+    };
+  };
+  const mcp = new McpManager({ fs: { transport: 'stdio', command: 'fake' } }, mcpConnect);
+  await mcp.start();
 
   let activeModel = model;
   let activeModelConfig: NonNullable<Runtime['modelConfig']> = {
@@ -163,6 +178,7 @@ beforeAll(async () => {
       },
     ],
     tools: new ToolRegistry(),
+    mcp,
     store,
     policy: new AllowAllPolicy(),
     policyPreApproved: new AllowAllPolicy(),
@@ -171,6 +187,8 @@ beforeAll(async () => {
     systemExtra: '',
     defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
   } as unknown as Runtime;
+
+  for (const t of mcp.tools()) rt.tools.register(t);
 
   server = createHttpServer(rt);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -1610,5 +1628,133 @@ describe('HTTP server 定时任务设置', () => {
       body: JSON.stringify({ max_run_minutes: 0 }),
     });
     expect(invalid.status).toBe(400);
+  });
+});
+
+describe('HTTP server MCP 管理', () => {
+  async function login(username: string): Promise<string> {
+    const r = await fetch(`${base}/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tenantId: 'default', username, password: 'pw' }),
+    });
+    return ((await r.json()) as { token: string }).token;
+  }
+
+  it('lists servers with status and tools', async () => {
+    const admin = await login('admin');
+    const r = await fetch(`${base}/v1/mcp/servers`, { headers: { authorization: `Bearer ${admin}` } });
+    expect(r.status).toBe(200);
+    const body = (await r.json()) as { servers: Array<Record<string, unknown>> };
+    const fs = body.servers.find((s) => s.name === 'fs');
+    expect(fs).toMatchObject({ transport: 'stdio', status: 'connected', tools: ['mcp__fs__echo'] });
+  });
+
+  it('requires auth to list and tenant:manage to mutate', async () => {
+    const unauth = await fetch(`${base}/v1/mcp/servers`);
+    expect(unauth.status).toBe(401);
+
+    const bob = await login('bob');
+    const denied = await fetch(`${base}/v1/mcp/servers`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${bob}` },
+      body: JSON.stringify({ name: 'x', config: { transport: 'stdio', command: 'x' } }),
+    });
+    expect(denied.status).toBe(403);
+  });
+
+  it('validates add payload', async () => {
+    const admin = await login('admin');
+    const post = (payload: unknown) => fetch(`${base}/v1/mcp/servers`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${admin}` },
+      body: JSON.stringify(payload),
+    });
+
+    expect((await post({ config: { transport: 'stdio', command: 'x' } })).status).toBe(400); // 缺 name
+    expect((await post({ name: 'a__b', config: { transport: 'stdio', command: 'x' } })).status).toBe(400); // 连续下划线
+    expect((await post({ name: 'x', config: { transport: 'ws' } })).status).toBe(400); // transport 非法
+    expect((await post({ name: 'x', config: { transport: 'stdio' } })).status).toBe(400); // stdio 缺 command
+    expect((await post({ name: 'x', config: { transport: 'sse' } })).status).toBe(400); // sse 缺 url
+    expect((await post({ name: 'fs', config: { transport: 'stdio', command: 'x' } })).status).toBe(409); // 重名
+  });
+
+  it('adds a server, registers tools, persists, then deletes', async () => {
+    const admin = await login('admin');
+    const created = await fetch(`${base}/v1/mcp/servers`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${admin}` },
+      body: JSON.stringify({ name: 'extra', config: { transport: 'stdio', command: 'fake' } }),
+    });
+    expect(created.status).toBe(201);
+    const createdBody = (await created.json()) as { server: Record<string, unknown> };
+    expect(createdBody.server).toMatchObject({ name: 'extra', status: 'connected', tools: ['mcp__extra__echo'] });
+
+    // 工具进入注册表，可直接调用
+    const call = await fetch(`${base}/v1/tools/call`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${admin}` },
+      body: JSON.stringify({ sessionId: 'mcp-test', name: 'mcp__extra__echo', args: { text: 'hi' } }),
+    });
+    expect(call.status).toBe(200);
+    const callBody = (await call.json()) as { ok: boolean; result: { content: string } };
+    expect(callBody.ok).toBe(true);
+    expect(callBody.result.content).toContain('echo:');
+
+    // 配置已持久化
+    expect(await store.getMcpServers({ tenantId: 'default' })).toMatchObject({
+      extra: { transport: 'stdio', command: 'fake' },
+    });
+
+    const removed = await fetch(`${base}/v1/mcp/servers/extra`, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${admin}` },
+    });
+    expect(removed.status).toBe(200);
+    const afterDelete = await store.getMcpServers({ tenantId: 'default' });
+    expect(afterDelete && 'extra' in afterDelete).toBe(false);
+
+    const gone = await fetch(`${base}/v1/tools/call`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${admin}` },
+      body: JSON.stringify({ sessionId: 'mcp-test', name: 'mcp__extra__echo', args: {} }),
+    });
+    expect(gone.status).toBe(409);
+
+    const missing = await fetch(`${base}/v1/mcp/servers/extra`, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${admin}` },
+    });
+    expect(missing.status).toBe(404);
+  });
+
+  it('keeps failed servers in error state and supports reconnect', async () => {
+    const admin = await login('admin');
+    const created = await fetch(`${base}/v1/mcp/servers`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${admin}` },
+      body: JSON.stringify({ name: 'down1', config: { transport: 'http', url: 'http://x' } }),
+    });
+    expect(created.status).toBe(201);
+    const createdBody = (await created.json()) as { server: Record<string, unknown> };
+    expect(createdBody.server).toMatchObject({ name: 'down1', status: 'error' });
+    expect(String(createdBody.server.error)).toContain('connect refused');
+
+    const reconnected = await fetch(`${base}/v1/mcp/servers/down1/reconnect`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${admin}` },
+    });
+    expect(reconnected.status).toBe(200);
+    const reconnectedBody = (await reconnected.json()) as { server: Record<string, unknown> };
+    expect(reconnectedBody.server).toMatchObject({ name: 'down1', status: 'error' }); // mock 仍拒绝
+
+    const unknown = await fetch(`${base}/v1/mcp/servers/nope/reconnect`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${admin}` },
+    });
+    expect(unknown.status).toBe(404);
+
+    // 清理，避免影响其他用例
+    await fetch(`${base}/v1/mcp/servers/down1`, { method: 'DELETE', headers: { authorization: `Bearer ${admin}` } });
   });
 });

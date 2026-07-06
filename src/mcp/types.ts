@@ -31,6 +31,20 @@ export interface McpServerConfig {
   headers?: Record<string, string>;
 }
 
+/** server 的公开状态信息（供管理 API / UI；不含 headers 等敏感值）。 */
+export interface McpServerInfo {
+  name: string;
+  transport: 'stdio' | 'sse' | 'http';
+  command?: string;
+  args?: string[];
+  url?: string;
+  status: 'connected' | 'error';
+  error?: string;
+  connectedAt?: string;
+  /** 命名空间化后的工具名（mcp__server__tool）。 */
+  tools: string[];
+}
+
 /** 由配置建立连接的工厂（真实实现注入 SDK，测试注入 mock）。 */
 export type McpConnectFn = (
   name: string,

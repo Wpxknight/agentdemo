@@ -680,8 +680,8 @@ describe('frontend API wiring', () => {
 
     expect(app).toContain("activePage === 'mcp' && <McpPage tools={mcpTools}");
     expect(app).not.toContain("fallbackTools.filter((tool) => tool.category === 'mcp')");
-    expect(app).toContain('const hasTools = selected.tools.length > 0');
-    expect(app).toContain('selected.tools.some((item) => item.name === tool)');
+    expect(app).toContain('const hasTools = selectedTools.length > 0');
+    expect(app).toContain('selectedTools.includes(testToolName)');
     expect(app).toContain('暂无已连接的 MCP 工具');
     expect(app).toContain('disabled={!hasTools}');
   });

@@ -41,6 +41,10 @@ export class ToolRegistry {
     return this;
   }
 
+  unregister(name: string): boolean {
+    return this.handlers.delete(name);
+  }
+
   has(name: string): boolean {
     return this.handlers.has(name);
   }
