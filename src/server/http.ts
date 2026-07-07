@@ -48,13 +48,16 @@ const GOAL_MODE_SYSTEM = [
   '持续记录关键行动和验证结果；完成后用简洁 Markdown 汇报目标是否达成、执行过的关键步骤和遗留风险。',
 ].join('\n');
 
-/** 读取并解析 JSON 请求体（限制 8MB，支持聊天附件以 base64 形式上传）。 */
-async function readJson(req: Req): Promise<Record<string, unknown>> {
+/** 技能 zip 以 base64 JSON 上传：44MB 的包编码后约 60MB，导入接口单独放宽到 128MB。 */
+const SKILL_IMPORT_MAX_BODY = 128_000_000;
+
+/** 读取并解析 JSON 请求体（默认限制 8MB，支持聊天附件以 base64 形式上传）。 */
+async function readJson(req: Req, maxSize = 8_000_000): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const c of req) {
     size += (c as Buffer).length;
-    if (size > 8_000_000) throw new HttpError(413, '请求体过大');
+    if (size > maxSize) throw new HttpError(413, '请求体过大');
     chunks.push(c as Buffer);
   }
   if (!chunks.length) return {};
@@ -627,7 +630,7 @@ async function handle(
     const ctx = await requireAuth(rt, req);
     requirePermission(ctx, 'tenant:manage');
     if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
-    const body = await readJson(req);
+    const body = await readJson(req, SKILL_IMPORT_MAX_BODY);
     const filename = str(body, 'filename');
     const data = str(body, 'data');
     if (!filename || !data) throw new HttpError(400, 'filename/data 必填');

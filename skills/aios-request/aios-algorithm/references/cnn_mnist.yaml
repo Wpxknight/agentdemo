@@ -1,0 +1,55 @@
+# CNN 手写数字识别算法配置
+# 基于 Jupyter Notebook 的交互式卷积神经网络训练与推理
+
+versions:
+  cnn_mnist:
+    name: "CNN 手写数字识别"
+    description: "基于 PaddlePaddle 2.0 的多层卷积神经网络手写数字识别，支持自定义模型结构"
+    image: "deploy.bocloud.k8s:40443/public/jupyter-cuda:paddle2.6.2-cnn"
+
+    # 任务类型：ide（IDE 启动，非训练任务）
+    task_type: "ide"
+    ide_type: "notebook"
+    tool_port: 31000
+
+    # 容器路径
+    work_dir: "/home/ubuntu"
+
+    # IDE 使用说明（任务创建成功后展示给用户）
+    ide_usage: |
+      1. 进入平台【算法开发】→【任务管理】，找到刚创建的任务，等待状态变为"运行中"
+      2. 点击【打开】进入 Jupyter IDE
+      3. 双击打开 "基于Paddle2.0的手写数字识别案例.ipynb"
+      4. 依次运行代码单元格
+      5. 自定义模型（可选）：
+         - 单元格 4：可修改模型结构，如添加卷积层、增加残差连接等
+      6. 训练模型：
+         - 单元格 7：可调整 epoch、batch_size、学习率等参数，然后运行开始训练
+      7. 模型测试：
+         - 单元格 10：展示测试集图片并使用模型预测类别
+
+    # 无训练参数（参数在 Notebook 单元格中调整）
+    params: {}
+
+    # 无数据集挂载（使用镜像自带 MNIST 数据集）
+    dataset_mount:
+      allow_builtin: false
+
+    # 任务命名前缀
+    task_prefix: "cnn-mnist"
+
+# 共享配置
+shared:
+  gpu_keywords:
+    - gpu
+    - 4090
+    - nvidia
+    - cuda
+
+  scheduler:
+    priorityClassName: "infer-med"
+    schedulerName: "volcano"
+    queue: "default"
+    podGroup: "default"
+    strategy: "spreadout"
+    minAvailable: 1

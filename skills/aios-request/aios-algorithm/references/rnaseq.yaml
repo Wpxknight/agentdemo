@@ -1,0 +1,110 @@
+# RNA-Seq 转录组分析算法配置
+# 基于镜像 deploy.bocloud.k8s:40443/person/poc02/vscode:v4.98.0-260422055726
+
+versions:
+  rnaseq:
+    name: "RNA-Seq 转录组分析"
+    description: "RNA-Seq 转录组分析流程，支持 hisat2 比对，输入 fastq.gz 测序文件和 samples.csv 样本标注"
+    image: "deploy.bocloud.k8s:40443/person/poc02/vscode:v4.98.0-260422055726"
+    require_gpu: false
+
+    # 容器路径
+    dataset_container_path: "/rnaseq"
+    # 用户挂载数据时，data_path 解析到此路径（挂载点下的 raw_data 子目录）
+    dataset_data_path: "/rnaseq/raw_data"
+    # 内置数据路径（顶层字段，供 create_train_task.py 的 data_path 解析使用）
+    builtin_data_path: "/rnaseq/raw_data"
+    # 输出挂载路径：pipeline 脚本通过 -w workdir 写到 /rnaseq，
+    # 用户数据模式下 /rnaseq 是 datasetMount，输出会通过该挂载持久化回宿主机；
+    # 内置数据模式下无 datasetMount，输出留在容器内（outputMount 挂载在独立路径，不影响内置数据读取）
+    output_container_path: "/rnaseq_output"
+    workdir: "/rnaseq"
+    samples_csv: "/rnaseq/samples.csv"
+
+    # 训练配置（供 command_template 引用）
+    pipeline_script: "/home/ubuntu/pipline/run_rnaseq_pipeline_v3docker.sh"
+
+    # 命令模板（用 {{var}} 占位，脚本渲染）
+    # pipeline 输出到 workdir 下的子目录，脚本执行后将输出复制到 output 挂载路径
+    command_template: |
+      source ~/.bashrc && \
+      bash {{pipeline_script}} -i {{data_path}} -a {{aligner}} -c {{samples_csv}} -t {{threads}} -s {{species}} -w {{workdir}} && \
+      mkdir -p {{output_container_path}} && \
+      cd {{workdir}} && for d in qc aligned counts results logs; do [ -d "$d" ] && cp -r "$d" {{output_container_path}}/; done; true
+
+    # 用户可配置参数定义
+    params:
+      aligner:
+        type: string
+        default: "hisat2"
+        label: "比对工具"
+        required: false
+        ask_in_quick: false
+        ask_in_custom: true
+        options:
+          - value: "hisat2"
+            label: "hisat2（推荐）"
+      threads:
+        type: int
+        default: 4
+        label: "线程数"
+        required: false
+        ask_in_quick: false
+        ask_in_custom: true
+      species:
+        type: string
+        default: "hs"
+        label: "物种"
+        required: false
+        ask_in_quick: false
+        ask_in_custom: true
+        options:
+          - value: "hs"
+            label: "人类（hs）"
+          - value: "mm"
+            label: "小鼠（mm）"
+
+    # 数据集检测策略
+    dataset_detection:
+      strategy: "list_all"
+      description: "需要包含 fastq.gz 测序文件的原始数据目录"
+
+    # 数据集挂载策略
+    # 镜像自带数据（SRR1039508 等样本）位于容器内 /rnaseq/raw_data
+    # 用户自定义数据需按以下结构组织：
+    #   ├── raw_data/     # 存放 *.fastq.gz 文件
+    #   └── samples.csv   # 样本标注文件（可选）
+    # 用户数据挂载到 /rnaseq，脚本通过 dataset_data_path 解析到 /rnaseq/raw_data
+    # 输出由 pipeline 脚本写到 -w workdir（/rnaseq），通过 datasetMount 持久化回宿主机
+    dataset_mount:
+      allow_builtin: true
+      builtin_data_path: "/rnaseq/raw_data"
+
+    # 任务命名前缀
+    task_prefix: "rnaseq"
+
+    # 框架配置（传给平台 API）
+    framework:
+      name: "Stardard"
+      type: "standalone"
+
+# 共享配置（所有版本继承）
+shared:
+  gpu_keywords:
+    - gpu
+    - 4090
+    - nvidia
+    - cuda
+
+  scheduler:
+    priorityClassName: "infer-med"
+    schedulerName: "volcano"
+    queue: "default"
+    podGroup: "default"
+    strategy: "spreadout"
+    minAvailable: 1
+
+  tensorboard:
+    containerPath: null
+    hostPath: null
+    autoStopTime: 1

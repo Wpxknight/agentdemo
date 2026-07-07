@@ -1,0 +1,105 @@
+# ResNet50 算法配置
+# 基于镜像 deploy.bocloud.k8s:40443/public/jupyter-cuda:paddle2.6.2-resnet50
+# PaddleClas 的 train.py 支持 -o 覆盖 yaml 中任意参数，无需修改 yaml 文件
+
+versions:
+  resnet50:
+    name: "ResNet50"
+    description: "基于 PaddleClas 的 ResNet50_vd 图像分类模型训练"
+    image: "crpi-g2y2anh4uack1czy.cn-beijing.personal.cr.aliyuncs.com/xinxin487/jupyter-cuda:paddle2.6.2-resnet50"
+    require_gpu: true
+
+    # 容器路径
+    work_dir: "/home/ubuntu"
+    # 用户自定义数据挂载到此路径，替换镜像内置数据
+    # PaddleClas 从 ResNet50_vd.yaml 中读取数据路径（默认为 data/）
+    dataset_container_path: "/home/ubuntu/data"
+    # 模型权重输出到此路径，PaddleClas 将训练产物保存到此目录
+    output_container_path: "/home/ubuntu/output/ResNet50_vd"
+
+    # 训练配置（供 command_template 引用）
+    train_script: "PaddleClas/tools/train.py"
+    yml_config: "ResNet50_vd.yaml"
+
+    # 命令模板：通过 -o 覆盖数据路径和训练参数
+    # 自定义数据：检测 data/train.txt，直接从挂载根目录读取
+    # 内置数据：使用 ResNet50_vd.yaml 默认路径 data/data2815/
+    command_template: |
+      export LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:/usr/local/nvidia/lib64:$LD_LIBRARY_PATH && \
+      cd {{work_dir}} && \
+      if [ -f data/train.txt ]; then \
+        _DATA_ROOT=./data && _TRAIN_LIST=data/train.txt && _EVAL_LIST=data/eval.txt; \
+      else \
+        _DATA_ROOT=./ && _TRAIN_LIST=data/data2815/train.txt && _EVAL_LIST=data/data2815/eval.txt; \
+      fi && \
+      python3 {{train_script}} -c {{yml_config}} \
+      -o DataLoader.Train.dataset.image_root=$_DATA_ROOT \
+      -o DataLoader.Train.dataset.cls_label_path=$_TRAIN_LIST \
+      -o DataLoader.Eval.dataset.image_root=$_DATA_ROOT \
+      -o DataLoader.Eval.dataset.cls_label_path=$_EVAL_LIST \
+      -o DataLoader.Train.sampler.batch_size={{batch_size}} \
+      -o Engine.num_epochs={{epochs}} \
+      -o Optimizer.lr.learning_rate={{lr}}
+
+    # 用户可配置参数定义
+    params:
+      epochs:
+        type: int
+        default: 100
+        label: "训练轮数"
+        required: false
+        ask_in_quick: false
+        ask_in_custom: true
+      batch_size:
+        type: int
+        default: 64
+        label: "批大小"
+        required: false
+        ask_in_quick: false
+        ask_in_custom: true
+      lr:
+        type: float
+        default: 0.1
+        label: "初始学习率"
+        required: false
+        ask_in_quick: false
+        ask_in_custom: true
+
+    # 数据集检测策略
+    dataset_detection:
+      strategy: "list_all"
+      description: "需要图像分类数据集，包含标签文件（train.txt）和图片目录（trainImageSet/）"
+
+    # 数据集挂载策略
+    dataset_mount:
+      allow_builtin: true
+      builtin_data_path: "/home/ubuntu/data"
+
+    # 任务命名前缀
+    task_prefix: "resnet50"
+
+    # 框架配置（传给平台 API）
+    framework:
+      name: "Paddlepaddle"
+      type: "standalone"
+
+# 共享配置（所有版本继承）
+shared:
+  gpu_keywords:
+    - gpu
+    - 4090
+    - nvidia
+    - cuda
+
+  scheduler:
+    priorityClassName: "infer-med"
+    schedulerName: "volcano"
+    queue: "default"
+    podGroup: "default"
+    strategy: "spreadout"
+    minAvailable: 1
+
+  tensorboard:
+    containerPath: null
+    hostPath: null
+    autoStopTime: 1

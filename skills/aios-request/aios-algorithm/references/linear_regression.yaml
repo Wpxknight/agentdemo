@@ -1,0 +1,62 @@
+# 线性回归算法配置
+# 基于镜像 deploy.bocloud.k8s:40443/person/poc02/linear-regression-demo:latest
+# 使用 sklearn 实现二元线性回归
+
+versions:
+  linear_regression:
+    name: "线性回归"
+    description: "基于 sklearn 的线性回归算法，支持自定义训练数据和预测数据"
+    image: "deploy.bocloud.k8s:40443/person/poc02/linear-regression-demo:latest"
+    require_gpu: false
+
+    # 任务类型：train（自动提交训练命令执行）
+    task_type: "train"
+
+    # 容器路径
+    work_dir: "/root/linear-demo"
+    dataset_container_path: "/root/linear-demo/data"
+    builtin_data_path: "/root/linear-demo"
+    # 输出挂载路径：不能与 work_dir 相同，否则 outputMount 会遮盖镜像内置脚本和数据
+    output_container_path: "/root/linear-output"
+
+    # 命令模板：执行脚本并通过 tee 将输出同时写入日志文件到 output 挂载目录
+    # 脚本会生成 predict_result.csv 和 linear_regression.joblib，通过 cp 复制到 output 挂载目录持久化
+    command_template: |
+      mkdir -p {{output_container_path}} && cd {{work_dir}} && python3 linear.py 2>&1 | tee {{output_container_path}}/output.log ; cp -f predict_result.csv linear_regression.joblib {{output_container_path}}/ 2>/dev/null ; true
+
+    # 无训练参数（参数需在脚本代码中修改）
+    params: {}
+
+    # 数据集检测策略
+    dataset_detection:
+      strategy: "list_all"
+      description: "CSV 格式的训练数据集（x1, x2, y）"
+
+    # 数据集挂载策略
+    dataset_mount:
+      allow_builtin: true
+      builtin_data_path: "/root/linear-demo"
+
+    # 任务命名前缀
+    task_prefix: "linear"
+
+    # 框架配置（传给平台 API）
+    framework:
+      name: "Stardard"
+      type: "standalone"
+
+# 共享配置
+shared:
+  gpu_keywords:
+    - gpu
+    - 4090
+    - nvidia
+    - cuda
+
+  scheduler:
+    priorityClassName: "infer-med"
+    schedulerName: "volcano"
+    queue: "default"
+    podGroup: "default"
+    strategy: "spreadout"
+    minAvailable: 1

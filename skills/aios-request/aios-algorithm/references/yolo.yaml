@@ -1,0 +1,100 @@
+# YOLO 算法配置
+# 添加新 YOLO 版本只需在 versions 下添加条目，无需修改脚本
+
+versions:
+  yolov5:
+    name: "YOLOv5"
+    description: "PaddleDetection YOLOv5 目标检测模型"
+    image: "crpi-g2y2anh4uack1czy.cn-beijing.personal.cr.aliyuncs.com/xinxin487/jupyter-cuda:paddle2.6.1-cuda11.8-yolo5"
+    require_gpu: true
+
+    # 容器路径
+    work_dir: "/home/ubuntu/PaddleYOLO-release-2.7"
+    dataset_container_path: "/home/ubuntu/dataset/Vehicles-OpenImages-v1-416x416-coco"
+    output_container_path: "/home/ubuntu/PaddleYOLO-release-2.7/output"
+    cudnn_ld_path: "/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:/usr/local/nvidia/lib64"
+
+    # 训练配置（供 command_template 引用）
+    train_script: "tools/train.py"
+    yml_config: "yolov5_l_30e_obj365_finetune_coco.yml"
+    command_flags: "--eval --amp"
+
+    # 命令模板（用 {{var}} 占位，脚本渲染）
+    command_template: |
+      export LD_LIBRARY_PATH={{cudnn_ld_path}}:$LD_LIBRARY_PATH && \
+      cd {{work_dir}} && \
+      python3 {{train_script}} -c ../{{yml_config}} \
+      -o epoch={{epoch}} -o batch_size={{batch_size}} -o base_lr={{base_lr}} -o num_classes={{num_classes}} \
+      {{command_flags}}
+
+    # 用户可配置参数定义
+    params:
+      epoch:
+        type: int
+        default: 30
+        label: "训练轮数"
+        required: false
+        ask_in_quick: false
+        ask_in_custom: true
+      batch_size:
+        type: int
+        default: 8
+        label: "批大小"
+        required: false
+        ask_in_quick: false
+        ask_in_custom: true
+      base_lr:
+        type: float
+        default: 0.01
+        label: "初始学习率"
+        required: false
+        ask_in_quick: false
+        ask_in_custom: true
+      num_classes:
+        type: int
+        default: null
+        label: "类别数"
+        required: true
+        ask_in_quick: true
+        ask_in_custom: true
+
+    # 数据集检测策略
+    dataset_detection:
+      strategy: "coco_json"
+      check_file: "_annotations.coco.json"
+      check_subdir: "train"
+      description: "需要 COCO JSON 格式的目标检测数据集"
+
+    # 数据集挂载策略
+    dataset_mount:
+      allow_builtin: true
+      builtin_data_path: "/home/ubuntu/dataset/Vehicles-OpenImages-v1-416x416-coco"
+
+    # 任务命名前缀
+    task_prefix: "yolov5"
+
+    # 框架配置（传给平台 API）
+    framework:
+      name: "Stardard"
+      type: "standalone"
+
+# 共享配置（所有版本继承）
+shared:
+  gpu_keywords:
+    - gpu
+    - 4090
+    - nvidia
+    - cuda
+
+  scheduler:
+    priorityClassName: "infer-med"
+    schedulerName: "volcano"
+    queue: "default"
+    podGroup: "default"
+    strategy: "spreadout"
+    minAvailable: 1
+
+  tensorboard:
+    containerPath: null
+    hostPath: null
+    autoStopTime: 1

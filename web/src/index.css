@@ -1290,6 +1290,69 @@
     overflow-wrap: anywhere;
   }
 
+  /* 沙箱页两个 tab：沙箱列表（默认）/ 沙箱模板。
+     下划线风格：整行底边线，选中项主色文字 + 底部 2px 主色条。 */
+  .sandbox-page-tabs {
+    gap: 16px;
+  }
+
+  .sandbox-page-tabs > [data-slot="tabs-list"] {
+    width: 100%;
+    height: auto;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    gap: 32px;
+    padding: 0;
+    border: 0;
+    border-bottom: 1px solid hsl(var(--border));
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  .sandbox-page-tabs [data-slot="tabs-trigger"] {
+    flex: none;
+    position: relative;
+    min-height: 40px;
+    padding: 8px 2px;
+    border-radius: 0;
+    background: transparent;
+    font-size: 14px;
+    font-weight: 500;
+    color: hsl(217 33% 22%);
+  }
+
+  .sandbox-page-tabs [data-slot="tabs-trigger"]:hover {
+    background: transparent;
+    color: hsl(var(--primary));
+  }
+
+  .sandbox-page-tabs [data-slot="tabs-trigger"][data-state="active"] {
+    background: transparent;
+    color: hsl(var(--primary));
+    font-weight: 600;
+    box-shadow: none;
+  }
+
+  .sandbox-page-tabs [data-slot="tabs-trigger"][data-state="active"]::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: -1px;
+    height: 2px;
+    border-radius: 2px;
+    background: hsl(var(--primary));
+  }
+
+  /* 特权模板标签：琥珀色警示底 + 深色文字，替代白字浅红看不清的问题 */
+  .badge-privileged {
+    border-color: hsl(38 88% 74%);
+    background: hsl(43 92% 94%);
+    color: hsl(30 84% 30%);
+    font-weight: 700;
+  }
+
   .empty-inline,
   .detail-empty {
     color: hsl(var(--muted-foreground));
@@ -1662,6 +1725,18 @@
     white-space: pre-wrap;
   }
 
+  /* Markdown 文件（.md）用富文本渲染，与聊天里的 markdown-body 共用样式 */
+  .skill-preview-markdown {
+    margin: 0;
+    min-height: 0;
+    overflow: auto;
+    background: #fff;
+    color: #26364d;
+    padding: 18px 22px;
+    font-size: 13.5px;
+    line-height: 1.7;
+  }
+
   .empty-hint {
     margin: 0;
     border: 1px dashed hsl(var(--border));
@@ -1673,6 +1748,70 @@
 
   .create-task {
     margin-bottom: 18px;
+  }
+
+  /* 定时任务：列表 / 创建表单 / 执行详情三个视图 */
+  .schedule-list-panel {
+    border: 1px solid hsl(var(--border));
+    border-radius: 8px;
+    background: hsl(var(--card));
+    padding: 10px 16px;
+    overflow-x: auto;
+  }
+
+  .schedule-task-cell {
+    display: grid;
+    gap: 4px;
+    text-align: left;
+  }
+
+  .schedule-task-cell strong {
+    color: hsl(217 33% 18%);
+    font-weight: 650;
+    overflow-wrap: anywhere;
+  }
+
+  .schedule-task-cell > span {
+    color: hsl(var(--muted-foreground));
+    font-size: 12px;
+  }
+
+  .schedule-form-card {
+    max-width: 760px;
+  }
+
+  .schedule-form-card .settings-form {
+    padding-top: 20px;
+  }
+
+  .schedule-detail-card {
+    min-width: 0;
+  }
+
+  .schedule-runs-title {
+    margin: 20px 0 10px;
+    font-size: 14px;
+    font-weight: 700;
+    color: hsl(217 33% 18%);
+  }
+
+  .schedule-page-status {
+    margin-bottom: 16px;
+  }
+
+  .schedule-runs-pagination {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: 10px;
+    font-size: 12px;
+    color: hsl(var(--muted-foreground));
+  }
+
+  .schedule-runs-pagination > div {
+    display: flex;
+    gap: 8px;
   }
 
   .task-create-grid {
@@ -2507,6 +2646,75 @@
   .confirm-dialog-actions button:disabled {
     opacity: .55;
     cursor: not-allowed;
+  }
+
+  /* 通用内容弹窗（行详情 / 表单） */
+  .modal-dialog-panel {
+    width: min(640px, 100%);
+    max-height: min(84vh, 900px);
+    display: flex;
+    flex-direction: column;
+    border: 1px solid hsl(var(--border));
+    border-radius: 8px;
+    background: #fff;
+    box-shadow: 0 18px 42px rgba(15, 23, 42, .16);
+    overflow: hidden;
+  }
+
+  .modal-dialog-head {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 16px 20px;
+    border-bottom: 1px solid hsl(var(--border));
+  }
+
+  .modal-dialog-head .large-icon {
+    width: 44px;
+    height: 44px;
+    flex: none;
+  }
+
+  .modal-dialog-head h2 {
+    font-size: 16px;
+    font-weight: 760;
+    line-height: 1.4;
+    color: hsl(217 33% 16%);
+    overflow-wrap: anywhere;
+  }
+
+  .modal-dialog-head > div:not(.large-icon) {
+    min-width: 0;
+    display: grid;
+    gap: 6px;
+    justify-items: start;
+  }
+
+  .modal-dialog-close {
+    margin-left: auto;
+    flex: none;
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+    display: grid;
+    place-items: center;
+    color: hsl(var(--muted-foreground));
+  }
+
+  .modal-dialog-close:hover {
+    background: var(--surface-muted);
+    color: hsl(217 33% 22%);
+  }
+
+  .modal-dialog-close svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  .modal-dialog-body {
+    min-height: 0;
+    overflow-y: auto;
+    padding: 20px;
   }
 
   .prototype-message-scroll {

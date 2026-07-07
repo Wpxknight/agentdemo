@@ -1,0 +1,116 @@
+# SVD 奇异值分解算法配置
+# 基于镜像 deploy.bocloud.k8s:40443/person/poc02/svd-demo:v1
+# 提供两种 SVD 算法：传统 SVD 和改进的 Surprise SVD
+
+versions:
+  svd:
+    name: "SVD 奇异值分解"
+    description: "SVD 奇异值分解推荐系统，支持传统 SVD 和改进的 Surprise SVD 两种算法"
+    image: "deploy.bocloud.k8s:40443/person/poc02/svd-demo:v1"
+    require_gpu: false
+
+    # 任务类型：train（自动提交训练命令执行）
+    task_type: "train"
+
+    # 容器路径
+    work_dir: "/root/svd-demo"
+    dataset_container_path: "/root/svd-demo/data"
+    builtin_data_path: "/root/svd-demo"
+    # 输出挂载路径：不能与 work_dir 相同，否则 outputMount 会遮盖镜像内置脚本和数据
+    output_container_path: "/root/svd-output"
+
+    # 命令模板
+    # {{train_script}} 由 SKILL.md 根据 algorithm_type 参数填入
+    # {{algo_args}} 由 SKILL.md 根据选中算法的参数构建（已解析字符串，不含 {{}}）
+    # 执行后通过 cp 将脚本生成的结果文件复制到 output 挂载目录持久化
+    command_template: |
+      mkdir -p {{output_container_path}} && cd {{work_dir}} && python3 {{train_script}} {{algo_args}} 2>&1 | tee {{output_container_path}}/output.log ; cp -f *.csv *.png *.pkl {{output_container_path}}/ 2>/dev/null ; true
+
+    # 用户可配置参数定义
+    params:
+      algorithm_type:
+        type: string
+        default: "surprise_svd"
+        label: "算法类型"
+        required: true
+        ask_in_quick: true
+        ask_in_custom: true
+        options:
+          - value: "surprise_svd"
+            label: "Surprise SVD（推荐）"
+          - value: "traditional_svd"
+            label: "传统 SVD"
+      factors:
+        type: int
+        default: 100
+        label: "隐因子数量"
+        required: false
+        ask_in_quick: false
+        ask_in_custom: true
+        show_when:
+          param: algorithm_type
+          value: surprise_svd
+      epochs:
+        type: int
+        default: 20
+        label: "训练轮数"
+        required: false
+        ask_in_quick: false
+        ask_in_custom: true
+        show_when:
+          param: algorithm_type
+          value: surprise_svd
+      k:
+        type: int
+        default: 20
+        label: "保留奇异值数量"
+        required: false
+        ask_in_quick: false
+        ask_in_custom: true
+        show_when:
+          param: algorithm_type
+          value: traditional_svd
+      top_n:
+        type: int
+        default: 10
+        label: "推荐电影数量"
+        required: false
+        ask_in_quick: false
+        ask_in_custom: true
+        show_when:
+          param: algorithm_type
+          value: traditional_svd
+
+    # 数据集检测策略
+    dataset_detection:
+      strategy: "list_all"
+      description: "CSV 格式的评分数据集（userId, movieId, rating, timestamp）"
+
+    # 数据集挂载策略
+    dataset_mount:
+      allow_builtin: true
+      builtin_data_path: "/root/svd-demo"
+
+    # 任务命名前缀
+    task_prefix: "svd"
+
+    # 框架配置（传给平台 API）
+    framework:
+      name: "Stardard"
+      type: "standalone"
+
+# 共享配置
+shared:
+  gpu_keywords:
+    - gpu
+    - 4090
+    - nvidia
+    - cuda
+
+  scheduler:
+    priorityClassName: "infer-med"
+    schedulerName: "volcano"
+    queue: "default"
+    podGroup: "default"
+    strategy: "spreadout"
+    minAvailable: 1

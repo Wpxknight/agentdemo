@@ -1,0 +1,80 @@
+# 算法注册表
+# 新增算法只需：(1) 在此注册 (2) 创建 references/<algo_id>.yaml 配置文件
+# 通用训练模式内置于 aios-algorithm SKILL.md 中，无需在此注册
+#
+# task_type 说明：
+#   train — 训练任务（调用 /trainapi/model/train），支持快捷/自定义模式
+#   ide   — IDE 任务（调用 /developkitapi/deployenv/onlineide），创建后用户在平台 IDE 操作
+
+algorithms:
+  yolo:
+    name: "YOLO 目标检测"
+    description: "PaddleDetection YOLO 系列目标检测模型训练"
+    keywords: ["yolo", "目标检测", "物体检测", "yolov5", "yolov8"]
+    config_file: "yolo.yaml"
+    has_quick_mode: true
+    task_type: "train"
+
+  lstm:
+    name: "LSTM 语言模型"
+    description: "基于 PaddlePaddle 的经典 LSTM 语言模型训练"
+    keywords: ["lstm", "语言模型", "rnn", "文本"]
+    config_file: "lstm.yaml"
+    has_quick_mode: true
+    task_type: "train"
+
+  resnet50:
+    name: "ResNet50 图像分类"
+    description: "基于 PaddleClas 的 ResNet50_vd 图像分类模型训练"
+    keywords: ["resnet", "resnet50", "图像分类", "分类"]
+    config_file: "resnet50.yaml"
+    has_quick_mode: true
+    task_type: "train"
+
+  paddleseg:
+    name: "PaddleSeg 图像分割"
+    description: "基于 PaddleSeg BiSeNetV2 的图像分割模型训练"
+    keywords: ["paddleseg", "图像分割", "分割", "bisenet", "语义分割"]
+    config_file: "paddleseg.yaml"
+    has_quick_mode: true
+    task_type: "train"
+
+  rnaseq:
+    name: "RNA-Seq 转录组分析"
+    description: "RNA-Seq 转录组分析流程，支持 hisat2 比对"
+    keywords: ["rnaseq", "rna-seq", "转录组", "转录", "测序", "基因组"]
+    config_file: "rnaseq.yaml"
+    has_quick_mode: true
+    task_type: "train"
+
+  tsf:
+    name: "时序预测"
+    description: "时间序列数据分析与特征提取，交互式可视化分析"
+    keywords: ["时序预测", "时间序列", "tsf", "时间序列分析", "客流量"]
+    config_file: "tsf.yaml"
+    has_quick_mode: true
+    task_type: "ide"
+
+  cnn_mnist:
+    name: "CNN 手写数字识别"
+    description: "基于 PaddlePaddle 的多层卷积神经网络手写数字识别"
+    keywords: ["cnn", "手写识别", "手写数字", "mnist", "卷积神经网络"]
+    config_file: "cnn_mnist.yaml"
+    has_quick_mode: true
+    task_type: "ide"
+
+  svd:
+    name: "SVD 奇异值分解"
+    description: "SVD 奇异值分解推荐系统，支持传统 SVD 和 Surprise SVD"
+    keywords: ["svd", "奇异值分解", "推荐系统", "协同过滤", "矩阵分解"]
+    config_file: "svd.yaml"
+    has_quick_mode: true
+    task_type: "train"
+
+  linear_regression:
+    name: "线性回归"
+    description: "基于 sklearn 的线性回归算法"
+    keywords: ["线性回归", "linear", "regression", "回归分析"]
+    config_file: "linear_regression.yaml"
+    has_quick_mode: true
+    task_type: "train"

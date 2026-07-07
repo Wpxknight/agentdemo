@@ -1,0 +1,79 @@
+# YOLO 版本配置中心
+# 添加新版本只需在此文件增加一个条目，无需修改 SKILL.md 或脚本
+
+versions:
+  yolov5:
+    name: "YOLOv5"
+    description: "PaddleDetection YOLOv5 目标检测模型"
+    image: "crpi-g2y2anh4uack1czy.cn-beijing.personal.cr.aliyuncs.com/xinxin487/jupyter-cuda:paddle2.6.1-cuda11.8-yolo5"
+
+    # 容器路径
+    work_dir: "/home/ubuntu/PaddleYOLO-release-2.7"
+    dataset_container_path: "/home/ubuntu/dataset/Vehicles-OpenImages-v1-416x416-coco"
+    output_container_path: "/home/ubuntu/PaddleYOLO-release-2.7/output"
+    cudnn_ld_path: "/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:/usr/local/nvidia/lib64"
+
+    # 训练配置
+    train_script: "tools/train.py"
+    yml_config: "yolov5_l_30e_obj365_finetune_coco.yml"
+    command_flags: "--eval --amp"
+
+    # 默认超参数
+    defaults:
+      epoch: 30
+      batch_size: 8
+      base_lr: 0.01
+
+    # 任务名前缀
+    task_prefix: "yolov5"
+
+    # 框架配置（传给平台 API）
+    framework:
+      name: "Stardard"
+      type: "standalone"
+
+# 未来扩展示例（取消注释即可使用）：
+#
+#   yolov8:
+#     name: "YOLOv8"
+#     description: "Ultralytics YOLOv8 目标检测模型"
+#     image: "xxx/yolov8:v1"
+#     work_dir: "/home/ubuntu/ultralytics"
+#     dataset_container_path: "/home/ubuntu/dataset"
+#     output_container_path: "/home/ubuntu/runs"
+#     cudnn_ld_path: "/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:/usr/local/nvidia/lib64"
+#     train_script: "yolo"
+#     yml_config: ""  # YOLOv8 不需要 yml
+#     command_flags: "detect train"
+#     defaults:
+#       epoch: 50
+#       batch_size: 16
+#       base_lr: 0.01
+#     task_prefix: "yolov8"
+#     framework:
+#       name: "Stardard"
+#       type: "standalone"
+
+# 共享配置（所有版本继承）
+shared:
+  # 资源组选择优先关键词
+  gpu_keywords:
+    - gpu
+    - 4090
+    - nvidia
+    - cuda
+
+  # 调度器配置
+  scheduler:
+    priorityClassName: "infer-med"
+    schedulerName: "volcano"
+    queue: "default"
+    podGroup: "default"
+    strategy: "spreadout"
+    minAvailable: 1
+
+  # tensorboard 配置
+  tensorboard:
+    containerPath: null
+    hostPath: null
+    autoStopTime: 1

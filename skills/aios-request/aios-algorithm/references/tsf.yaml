@@ -1,0 +1,52 @@
+# 时序预测算法配置
+# 基于 Jupyter Notebook 的交互式时间序列数据分析，不涉及 GPU 训练
+
+versions:
+  tsf:
+    name: "时序预测"
+    description: "时间序列数据分析与特征提取，对数据进行统计及可视化分析"
+    image: "deploy.bocloud.k8s:40443/public/jupyter-cuda:tsf"
+
+    # 任务类型：ide（IDE 启动，非训练任务）
+    task_type: "ide"
+    ide_type: "notebook"
+    tool_port: 31000
+
+    # 容器路径
+    work_dir: "/home/ubuntu"
+
+    # IDE 使用说明（任务创建成功后展示给用户）
+    ide_usage: |
+      1. 进入平台【算法开发】→【任务管理】，找到刚创建的任务，等待状态变为"运行中"
+      2. 点击【打开】进入 Jupyter IDE
+      3. 双击打开 "时间序列数据分析与特征提取.ipynb"
+      4. 依次运行前 5 个单元格的代码
+      5. 后续单元格可按需求运行：
+         - 想对每月客流量进行可视化 → 运行"抽取月份信息"单元格
+         - 想查看节假日和非节假日客流量区别 → 运行"节假日信息"单元格
+
+    # 无训练参数
+    params: {}
+
+    # 无数据集挂载（使用镜像自带数据）
+    dataset_mount:
+      allow_builtin: false
+
+    # 任务命名前缀
+    task_prefix: "tsf"
+
+# 共享配置
+shared:
+  gpu_keywords:
+    - gpu
+    - 4090
+    - nvidia
+    - cuda
+
+  scheduler:
+    priorityClassName: "infer-med"
+    schedulerName: "volcano"
+    queue: "default"
+    podGroup: "default"
+    strategy: "spreadout"
+    minAvailable: 1

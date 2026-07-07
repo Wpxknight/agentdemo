@@ -1,0 +1,145 @@
+# 自定义数据集格式指南
+# 当用户选择"从数据集选择"或"从文件路径选择"时，agent 应展示对应算法的格式要求
+# 每个算法包含：description（一句话说明）、tree（文件树结构）、notes（注意事项）
+
+algorithms:
+  yolo:
+    name: "YOLO 目标检测"
+    description: "需要 COCO JSON 格式的目标检测数据集，包含标注文件和训练图片"
+    tree: |
+      your_dataset/
+      ├── _annotations.coco.json        # COCO 格式标注文件（必需，文件名固定）
+      └── train/                        # 训练图片目录（必需）
+          ├── image001.jpg
+          ├── image002.jpg
+          └── ...
+    notes:
+      - "标注文件名必须为 _annotations.coco.json"
+      - "COCO JSON 包含 images、annotations、categories 三个字段"
+      - "图片目录名默认为 train，需与标注文件中的路径对应"
+      - "支持 jpg/png/bmp 等常见图片格式"
+    container_path_info: "数据挂载到容器内 /home/ubuntu/dataset/Vehicles-OpenImages-v1-416x416-coco"
+
+  lstm:
+    name: "LSTM 语言模型"
+    description: "需要 PTB（Penn Treebank）格式的纯文本语料数据集"
+    tree: |
+      your_dataset/
+      ├── ptb.train.txt                 # 训练集文本文件（必需）
+      ├── ptb.valid.txt                 # 验证集文本文件（必需）
+      └── ptb.test.txt                  # 测试集文本文件（可选）
+    notes:
+      - "每行一个句子，已分词（用空格分隔）"
+      - "文件名固定为 ptb.train.txt、ptb.valid.txt"
+      - "至少需要训练集和验证集两个文件"
+      - "支持自定义数据集（通过 --data_path 参数指定路径）"
+    container_path_info: "数据挂载到容器内 /home/ubuntu/workspace/data/simple-examples/data"
+
+  resnet50:
+    name: "ResNet50 图像分类"
+    description: "需要图像分类数据集，包含标签文件（记录每张图片的路径和类别ID）和图片目录"
+    tree: |
+      your_dataset/
+      ├── train.txt                     # 训练集标签文件（必需）
+      │   # 格式：每行 "图片相对路径<TAB或空格>类别ID"
+      │   # 示例：trainImageSet/20703737132_179560d0fb.jpg 0
+      │   #       trainImageSet/14332947164_9b13513c71_m.jpg 1
+      ├── eval.txt                      # 验证集标签文件（可选，格式同 train.txt）
+      ├── label_list.txt                # 类别映射文件（可选）
+      │   # 格式：每行 "类别ID 类别名"
+      │   # 示例：0 daisy
+      │   #       1 dandelion
+      │   #       2 roses
+      └── trainImageSet/                # 训练图片目录（扁平存放，不按类别分子目录）
+          ├── 20703737132_179560d0fb.jpg
+          ├── 14332947164_9b13513c71_m.jpg
+          └── ...
+    notes:
+      - "标签文件 train.txt 每行格式：图片相对路径<TAB或空格>类别ID"
+      - "图片路径相对于 image_root（ResNet50_vd.yaml 中配置为 ./ 即工作目录）"
+      - "图片放在扁平目录中（如 trainImageSet/），不按类别分子目录"
+      - "label_list.txt 记录 类别ID→类别名 的映射，PaddleClas 推理时用于显示类别名"
+      - "类别 ID 从 0 开始连续编号"
+      - "PaddleClas 通过 ResNet50_vd.yaml 的 cls_label_path 读取标签文件"
+      - "训练参数通过 -o 参数覆盖，无需修改配置文件"
+    container_path_info: "数据挂载到容器内 /home/ubuntu/data"
+
+  paddleseg:
+    name: "PaddleSeg 图像分割"
+    description: "需要图像分割数据集，包含原图目录和标注图片目录"
+    tree: |
+      your_dataset/
+      ├── JPEGImages/                   # 原始图片目录（必需）
+      │   ├── image001.jpg
+      │   ├── image002.png
+      │   └── ...
+      └── Annotations/                  # 标注图片目录（必需）
+          ├── image001.png               # 与原图同名的灰度标注图
+          ├── image002.png               # 像素值 = 类别 ID
+          └── ...
+    notes:
+      - "原图和标注图必须同名（仅后缀可不同）"
+      - "标注图为单通道灰度图，像素值表示类别 ID（0=背景，1=前景，...）"
+      - "数据集会通过软链接映射到 PaddleSeg 的 data/ 目录"
+      - "示例数据集为 OpticDiscSeg（视盘分割），二分类任务"
+    container_path_info: "数据挂载到容器内 /home/ubuntu/dataset/optic_disc_seg"
+
+  rnaseq:
+    name: "RNA-Seq 转录组分析"
+    description: "需要包含 fastq.gz 测序文件的原始数据目录，以及样本标注文件"
+    tree: |
+      your_dataset/
+      ├── raw_data/                     # 测序数据目录（必需）
+      │   ├── sample1_R1.fastq.gz       # 样本1 正向 reads
+      │   ├── sample1_R2.fastq.gz       # 样本1 反向 reads
+      │   ├── sample2_R1.fastq.gz       # 样本2 正向 reads
+      │   └── sample2_R2.fastq.gz       # 样本2 反向 reads
+      └── samples.csv                   # 样本标注文件（可选）
+          # 格式：sample_name,condition
+          # 示例：sample1,treated
+          #       sample2,control
+    notes:
+      - "测序文件必须放在 raw_data/ 子目录下（固定目录名）"
+      - "支持单端测序（_R1.fastq.gz）和双端测序（_R1.fastq.gz + _R2.fastq.gz）"
+      - "samples.csv 用于差异表达分析，标记样本的实验分组"
+      - "数据挂载到 /rnaseq，脚本自动读取 /rnaseq/raw_data/ 下的文件"
+      - "pipeline 输出：qc（质控）、aligned（比对）、counts（计数）、results（结果）、logs（日志）"
+    container_path_info: "数据挂载到容器内 /rnaseq（脚本读取 /rnaseq/raw_data）"
+
+  svd:
+    name: "SVD 奇异值分解"
+    description: "需要 CSV 格式的用户评分数据集（电影推荐场景）"
+    tree: |
+      your_dataset/
+      └── ratings_small.csv             # 评分数据文件（必需）
+          # CSV 格式，列名固定：
+          # userId,movieId,rating,timestamp
+          # 1,31,2.5,1260759144
+          # 1,1029,3.0,1260759179
+          # 1,1061,3.0,1260759180
+    notes:
+      - "文件名必须为 ratings_small.csv"
+      - "CSV 列名固定：userId, movieId, rating, timestamp"
+      - "rating 为评分值（通常 1.0-5.0），timestamp 为 Unix 时间戳"
+      - "支持两种算法：Surprise SVD（推荐，效果更好）和传统 SVD"
+      - "输出：预测结果 CSV、模型 PKL 文件、可视化 PNG 图表"
+    container_path_info: "数据挂载到容器内 /root/svd-demo/data"
+
+  linear_regression:
+    name: "线性回归"
+    description: "需要 CSV 格式的数值型训练数据集，包含特征列和目标列"
+    tree: |
+      your_dataset/
+      └── train.csv                     # 训练数据文件（必需）
+          # CSV 格式，最后一列为目标变量 y：
+          # x1,x2,y
+          # 1.0,2.0,5.0
+          # 2.0,3.0,8.0
+          # 3.0,4.0,11.0
+    notes:
+      - "文件名必须为 train.csv"
+      - "CSV 列中除最后一列外均为特征列（x1, x2, ...），最后一列为目标变量 y"
+      - "所有数据必须为数值类型"
+      - "脚本使用 sklearn 实现线性回归拟合"
+      - "输出：predict_result.csv（预测结果）、linear_regression.joblib（模型文件）"
+    container_path_info: "数据挂载到容器内 /root/linear-demo/data"

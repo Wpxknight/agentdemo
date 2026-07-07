@@ -8,7 +8,6 @@ import {
   Boxes,
   CalendarClock,
   Check,
-  CheckCircle2,
   ChevronLeft,
   ChevronRight,
   CircleStop,
@@ -1932,6 +1931,47 @@ function ConfirmDialog(props: {
   );
 }
 
+/** 通用内容弹窗：点击遮罩 / Esc / 右上角关闭。 */
+function ModalDialog({ title, status, icon, onClose, children }: {
+  title: string;
+  status?: string;
+  icon?: ReactNode;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  useEffect(() => {
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+
+  return (
+    <div className="confirm-dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <section
+        className="modal-dialog-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="modal-dialog-head">
+          {icon ? <div className="large-icon">{icon}</div> : null}
+          <div>
+            <h2>{title}</h2>
+            {status ? <Badge variant="secondary">{status}</Badge> : null}
+          </div>
+          <button type="button" className="modal-dialog-close" onClick={onClose} aria-label="关闭">
+            <X />
+          </button>
+        </div>
+        <div className="modal-dialog-body">{children}</div>
+      </section>
+    </div>
+  );
+}
+
 function PrototypeMessages({ messages }: { messages: ChatMessage[] }) {
   const messageEndRef = useRef<HTMLDivElement | null>(null);
 
@@ -2832,7 +2872,13 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
             <span>更新时间 <strong>{formatDateTime(selectedEntry?.updatedAt)}</strong></span>
             <span>当前文件 <strong>{selectedFile}</strong></span>
           </div>
-          <pre className="skill-preview">{fileBody?.content || skillPreview(selected, selectedFile)}</pre>
+          {selectedFile.toLowerCase().endsWith('.md') ? (
+            <div className="skill-preview-markdown">
+              <MarkdownMessage content={fileBody?.content || skillPreview(selected, selectedFile)} />
+            </div>
+          ) : (
+            <pre className="skill-preview">{fileBody?.content || skillPreview(selected, selectedFile)}</pre>
+          )}
         </main>
       </div>
     </section>
@@ -2884,7 +2930,8 @@ function McpPage({ tools, api, output, onTest, onRequestConfirm, onChanged }: {
   const filtered = servers.filter((server) =>
     (statusFilter === 'all' || server.status === 'connected')
     && (!keyword || server.name.toLowerCase().includes(keyword)));
-  const selected = filtered.find((server) => server.name === selectedName) || filtered[0];
+  // 详情默认不展示：只有点击某行后才以弹窗打开
+  const selected = servers.find((server) => server.name === selectedName);
   const selectedTools = selected?.tools ?? [];
   const hasTools = selectedTools.length > 0;
 
@@ -2966,6 +3013,7 @@ function McpPage({ tools, api, output, onTest, onRequestConfirm, onChanged }: {
       onConfirm: async () => {
         await api.delete(`/v1/mcp/servers/${encodeURIComponent(target.name)}`);
         setPageStatus(`已删除 ${target.name}`);
+        setSelectedName('');
         await loadServers();
         onChanged();
       },
@@ -2977,42 +3025,37 @@ function McpPage({ tools, api, output, onTest, onRequestConfirm, onChanged }: {
   }
 
   return (
-    <ManagementPage
-      title="MCP"
-      desc="接入 MCP Server，扩展 AI 可用的工具"
-      actionLabel="新增 MCP"
-      onAction={() => {
-        setShowAdd((value) => !value);
-        setPageStatus('');
-      }}
-      search={search}
-      onSearchChange={setSearch}
-      filters={[
-        { key: 'all', label: '全部', active: statusFilter === 'all', onClick: () => setStatusFilter('all') },
-        { key: 'connected', label: '已连接', active: statusFilter === 'connected', onClick: () => setStatusFilter('connected') },
-      ]}
-    >
-      <>
-        <DataTable
-          headers={['名称', '传输协议', '状态', '工具数', '最近连接']}
-          rows={serverRows}
-          selectedRowIndex={selected ? filtered.findIndex((server) => server.name === selected.name) : null}
-          onRowClick={(index) => {
-            const server = filtered[index];
-            if (server) setSelectedName(server.name);
-          }}
-        />
-        {pageStatus ? <p className="empty-hint">{pageStatus}</p> : null}
-      </>
+    <>
+      <ManagementPage
+        title="MCP"
+        desc="接入 MCP Server，扩展 AI 可用的工具"
+        actionLabel="新增 MCP"
+        onAction={() => {
+          setShowAdd(true);
+          setPageStatus('');
+        }}
+        search={search}
+        onSearchChange={setSearch}
+        filters={[
+          { key: 'all', label: '全部', active: statusFilter === 'all', onClick: () => setStatusFilter('all') },
+          { key: 'connected', label: '已连接', active: statusFilter === 'connected', onClick: () => setStatusFilter('connected') },
+        ]}
+      >
+        <>
+          <DataTable
+            headers={['名称', '传输协议', '状态', '工具数', '最近连接']}
+            rows={serverRows}
+            selectedRowIndex={selected ? filtered.findIndex((server) => server.name === selected.name) : null}
+            onRowClick={(index) => {
+              const server = filtered[index];
+              if (server) setSelectedName(server.name);
+            }}
+          />
+          {pageStatus ? <p className="empty-hint">{pageStatus}</p> : null}
+        </>
+      </ManagementPage>
       {showAdd ? (
-        <div className="detail-panel">
-          <div className="detail-title">
-            <div className="large-icon"><Plus /></div>
-            <div>
-              <h2>新增 MCP</h2>
-              <Badge variant="secondary">连接后其工具自动注册</Badge>
-            </div>
-          </div>
+        <ModalDialog title="新增 MCP" status="连接后其工具自动注册" icon={<Plus />} onClose={() => setShowAdd(false)}>
           <form className="settings-form" onSubmit={(event) => void submitAdd(event)}>
             <label>名称
               <Input value={form.name} placeholder="如 filesystem" onChange={(event) => setForm({ ...form, name: event.target.value })} />
@@ -3048,24 +3091,26 @@ function McpPage({ tools, api, output, onTest, onRequestConfirm, onChanged }: {
                 </label>
               </>
             )}
+            {pageStatus ? <p className="empty-hint">{pageStatus}</p> : null}
             <div className="skill-detail-actions">
               <Button type="submit" disabled={busy}>{busy ? '正在连接...' : '连接并保存'}</Button>
               <Button type="button" variant="outline" disabled={busy} onClick={() => setShowAdd(false)}>取消</Button>
             </div>
           </form>
-        </div>
-      ) : (
-        <DetailPanel title={selected?.name || '-'} status={selected ? mcpStatusText(selected.status) : '未连接'} icon={<Boxes />}>
-          <h3>连接配置</h3>
-          <div className="kv">
-            <span>传输协议</span><strong>{selected?.transport || '-'}</strong>
-            {selected?.transport === 'stdio'
-              ? <><span>命令</span><strong>{[selected.command, ...(selected.args ?? [])].filter(Boolean).join(' ') || '-'}</strong></>
-              : <><span>URL</span><strong>{selected?.url || '-'}</strong></>}
-            <span>最近连接</span><strong>{formatTime(selected?.connectedAt)}</strong>
-          </div>
-          {selected?.error ? <p className="empty-hint">连接错误：{selected.error}</p> : null}
-          {selected ? (
+        </ModalDialog>
+      ) : null}
+      {selected ? (
+        <ModalDialog title={selected.name} status={mcpStatusText(selected.status)} icon={<Boxes />} onClose={() => setSelectedName('')}>
+          <div className="detail-panel">
+            <h3>连接配置</h3>
+            <div className="kv">
+              <span>传输协议</span><strong>{selected.transport}</strong>
+              {selected.transport === 'stdio'
+                ? <><span>命令</span><strong>{[selected.command, ...(selected.args ?? [])].filter(Boolean).join(' ') || '-'}</strong></>
+                : <><span>URL</span><strong>{selected.url || '-'}</strong></>}
+              <span>最近连接</span><strong>{formatTime(selected.connectedAt)}</strong>
+            </div>
+            {selected.error ? <p className="empty-hint">连接错误：{selected.error}</p> : null}
             <div className="skill-detail-actions">
               <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => void reconnectSelected()}>
                 <RefreshCcw data-icon="inline-start" />
@@ -3076,24 +3121,24 @@ function McpPage({ tools, api, output, onTest, onRequestConfirm, onChanged }: {
                 删除
               </Button>
             </div>
-          ) : null}
-          <h3>测试调用</h3>
-          {!hasTools ? <p className="empty-hint">暂无已连接的 MCP 工具</p> : null}
-          <Select value={testToolName} onValueChange={setTestToolName} disabled={!hasTools}>
-            <SelectTrigger><SelectValue placeholder="选择工具" /></SelectTrigger>
-            <SelectContent>
-              <SelectGroup>
-                {selectedTools.map((name) => <SelectItem key={name} value={name}>{toolDisplayName(name)}</SelectItem>)}
-              </SelectGroup>
-            </SelectContent>
-          </Select>
-          {testToolName && toolDescription(testToolName) ? <p className="empty-hint">{toolDescription(testToolName)}</p> : null}
-          <Textarea id="tool-test-args" value={testArgs} onChange={(event) => setTestArgs(event.target.value)} rows={5} spellCheck={false} disabled={!hasTools} />
-          <Button type="button" disabled={!hasTools} onClick={() => onTest(testToolName, testArgs)}>测试工具</Button>
-          {output ? <pre className="tool-output">{output}</pre> : null}
-        </DetailPanel>
-      )}
-    </ManagementPage>
+            <h3>测试调用</h3>
+            {!hasTools ? <p className="empty-hint">暂无已连接的 MCP 工具</p> : null}
+            <Select value={testToolName} onValueChange={setTestToolName} disabled={!hasTools}>
+              <SelectTrigger><SelectValue placeholder="选择工具" /></SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  {selectedTools.map((name) => <SelectItem key={name} value={name}>{toolDisplayName(name)}</SelectItem>)}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            {testToolName && toolDescription(testToolName) ? <p className="empty-hint">{toolDescription(testToolName)}</p> : null}
+            <Textarea id="tool-test-args" value={testArgs} onChange={(event) => setTestArgs(event.target.value)} rows={5} spellCheck={false} disabled={!hasTools} />
+            <Button type="button" disabled={!hasTools} onClick={() => onTest(testToolName, testArgs)}>测试工具</Button>
+            {output ? <pre className="tool-output">{output}</pre> : null}
+          </div>
+        </ModalDialog>
+      ) : null}
+    </>
   );
 }
 
@@ -3115,6 +3160,7 @@ function ManagementPage({ title, desc, actionLabel, onAction, search, onSearchCh
   children: React.ReactNode;
 }) {
   const content = Array.isArray(children) ? children : [children];
+  const detail = content[1];
   return (
     <>
       <PageTitle title={title} desc={desc} />
@@ -3128,9 +3174,9 @@ function ManagementPage({ title, desc, actionLabel, onAction, search, onSearchCh
         ))}
         <Button type="button" onClick={onAction}>{actionLabel}</Button>
       </div>
-      <div className="two-pane">
+      <div className={cn('two-pane', !detail && 'single-pane')}>
         <section className="list-card">{content[0]}</section>
-        <aside className="detail-card">{content[1]}</aside>
+        {detail ? <aside className="detail-card">{detail}</aside> : null}
       </div>
     </>
   );
@@ -3151,6 +3197,8 @@ function DetailPanel({ title, status, icon, children }: { title: string; status:
   );
 }
 
+const RUNS_PAGE_SIZE = 5;
+
 const CRON_PRESETS = [
   { label: '每天 02:00', value: '0 2 * * *' },
   { label: '每天 01:00', value: '0 1 * * *' },
@@ -3165,9 +3213,12 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
   onChanged: () => void;
   onRequestConfirm: (request: ConfirmDialogRequest) => void;
 }) {
-  const [selectedTaskId, setSelectedTaskId] = useState<number | undefined>(() => tasks.find((task) => task.id !== undefined)?.id);
+  // 默认展示任务列表；点击“创建”进入表单，点击某行进入执行详情页
+  const [view, setView] = useState<'list' | 'create' | 'detail'>('list');
+  const [selectedTaskId, setSelectedTaskId] = useState<number | undefined>();
   const [runs, setRuns] = useState<TaskRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<number | undefined>();
+  const [runsPage, setRunsPage] = useState(1);
   const [runsStatus, setRunsStatus] = useState('');
   const [newTask, setNewTask] = useState('');
   const [newCron, setNewCron] = useState('0 2 * * *');
@@ -3178,16 +3229,23 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
   const [editTask, setEditTask] = useState('');
   const [editCron, setEditCron] = useState('');
   const pollTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const selectedTask = tasks.find((task) => task.id === selectedTaskId) || tasks[0];
+  const selectedTask = tasks.find((task) => task.id === selectedTaskId);
   const selectedRun = runs.find((run) => run.id === selectedRunId) || runs[0];
+  // 执行记录客户端分页：默认每页 5 条
+  const runsPageCount = Math.max(1, Math.ceil(runs.length / RUNS_PAGE_SIZE));
+  const pagedRuns = runs.slice((runsPage - 1) * RUNS_PAGE_SIZE, runsPage * RUNS_PAGE_SIZE);
 
+  // 记录数变化（刷新 / 切任务）后把页码收敛到有效范围
   useEffect(() => {
-    if (!tasks.length) {
-      setSelectedTaskId(undefined);
-      return;
-    }
-    if (selectedTaskId !== undefined && tasks.some((task) => task.id === selectedTaskId)) return;
-    setSelectedTaskId(tasks.find((task) => task.id !== undefined)?.id);
+    setRunsPage((current) => Math.min(current, Math.max(1, Math.ceil(runs.length / RUNS_PAGE_SIZE))));
+  }, [runs.length]);
+
+  // 详情页对应的任务被删除（或列表刷新后不存在）时回到列表
+  useEffect(() => {
+    if (selectedTaskId === undefined) return;
+    if (tasks.some((task) => task.id === selectedTaskId)) return;
+    setSelectedTaskId(undefined);
+    setView('list');
   }, [selectedTaskId, tasks]);
 
   const loadRuns = useCallback(async (): Promise<TaskRun[]> => {
@@ -3214,6 +3272,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
 
   useEffect(() => {
     setRunsStatus('正在加载执行结果...');
+    setRunsPage(1);
     void loadRuns();
     // 切换任务 / 卸载时停止“立即执行”的结果轮询
     return () => {
@@ -3241,7 +3300,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
       setPageStatus(`已创建定时任务 #${body.task.id}，下次执行 ${formatDateTime(body.task.nextRunAt)}`);
       setNewTask('');
       setNewPreApproved(false);
-      setSelectedTaskId(body.task.id);
+      setView('list');
       onChanged();
     } catch (err) {
       setPageStatus(`创建失败：${formatError(err)}`);
@@ -3302,6 +3361,8 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
       onConfirm: async () => {
         await api.delete(`/v1/schedule/${id}`);
         setPageStatus(`已删除任务 #${id}`);
+        setSelectedTaskId(undefined);
+        setView('list');
         onChanged();
       },
     });
@@ -3332,144 +3393,204 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
     }
   }
 
+  if (view === 'create') {
+    return (
+      <>
+        <PageTitle title="创建定时任务" desc="按 cron 周期自动执行的运维任务（cron 以 UTC 时区解释）" />
+        <div className="toolbar">
+          <Button variant="outline" type="button" onClick={() => { setPageStatus(''); setView('list'); }}>
+            <ChevronLeft data-icon="inline-start" />
+            返回列表
+          </Button>
+        </div>
+        <Card className="schedule-form-card">
+          <CardContent className="settings-form">
+            <Label>任务描述<Textarea placeholder="描述你要定时执行的任务..." value={newTask} onChange={(event) => setNewTask(event.target.value)} /></Label>
+            <Label>执行计划（cron，UTC）
+              <Select value={CRON_PRESETS.some((p) => p.value === newCron) ? newCron : 'custom'} onValueChange={(value) => { if (value !== 'custom') setNewCron(value); }}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    {CRON_PRESETS.map((preset) => <SelectItem key={preset.value} value={preset.value}>{preset.label}</SelectItem>)}
+                    <SelectItem value="custom">自定义</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <Input value={newCron} spellCheck={false} placeholder='如 "0 2 * * *"' onChange={(event) => setNewCron(event.target.value)} />
+            </Label>
+            <label className="schedule-preapproved">
+              <input type="checkbox" checked={newPreApproved} onChange={(event) => setNewPreApproved(event.target.checked)} />
+              预批准（无人值守自动通过生产审批，需管理员）
+            </label>
+            {pageStatus ? <p className="empty-hint">{pageStatus}</p> : null}
+            <div className="form-actions">
+              <Button type="button" disabled={busy} onClick={() => void createTask()}>{busy ? '处理中...' : '创建任务'}</Button>
+              <Button variant="outline" type="button" disabled={busy} onClick={() => { setPageStatus(''); setView('list'); }}>取消</Button>
+            </div>
+          </CardContent>
+        </Card>
+      </>
+    );
+  }
+
+  if (view === 'detail' && selectedTask) {
+    return (
+      <>
+        <PageTitle title="定时任务详情" desc={`#${selectedTask.id} · ${humanizeCron(selectedTask.cron)}（UTC）`} />
+        <div className="toolbar">
+          <Button variant="outline" type="button" onClick={() => { setPageStatus(''); setEditing(false); setView('list'); }}>
+            <ChevronLeft data-icon="inline-start" />
+            返回列表
+          </Button>
+        </div>
+        {pageStatus ? <p className="empty-hint schedule-page-status">{pageStatus}</p> : null}
+        <Card className="schedule-detail-card">
+          <CardHeader>
+            <CardTitle>{selectedTask.task}</CardTitle>
+            <CardDescription>
+              {humanizeCron(selectedTask.cron)} · 下次执行 {formatDateTime(selectedTask.nextRunAt)}
+              {selectedTask.preApproved ? ' · 预批准' : ''}
+              {` · ${selectedTask.enabled ? '启用中' : '已暂停'}`}
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="skill-detail-actions schedule-actions">
+              <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => void runNow(selectedTask)}>
+                <Play data-icon="inline-start" />
+                立即执行
+              </Button>
+              <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => void toggleEnabled(selectedTask)}>
+                {selectedTask.enabled ? <CircleStop data-icon="inline-start" /> : <Check data-icon="inline-start" />}
+                {selectedTask.enabled ? '暂停' : '启用'}
+              </Button>
+              <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => (editing ? setEditing(false) : startEdit(selectedTask))}>
+                <Code2 data-icon="inline-start" />
+                {editing ? '取消编辑' : '编辑'}
+              </Button>
+              <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => requestDelete(selectedTask)}>
+                <Trash2 data-icon="inline-start" />
+                删除
+              </Button>
+              <Button variant="outline" size="sm" type="button" onClick={() => void loadRuns()}>
+                <RefreshCcw data-icon="inline-start" />
+                刷新
+              </Button>
+            </div>
+            {editing ? (
+              <div className="schedule-edit-form">
+                <Label>任务描述<Textarea value={editTask} onChange={(event) => setEditTask(event.target.value)} /></Label>
+                <Label>cron（UTC）<Input value={editCron} spellCheck={false} onChange={(event) => setEditCron(event.target.value)} /></Label>
+                <Button type="button" size="sm" disabled={busy} onClick={() => void saveEdit(selectedTask)}>保存</Button>
+              </div>
+            ) : null}
+            <h3 className="schedule-runs-title">执行记录</h3>
+            <Table>
+              <TableHeader>
+                <TableRow>{['时间', '状态', '步骤'].map((header) => <TableHead key={header}>{header}</TableHead>)}</TableRow>
+              </TableHeader>
+              <TableBody>
+                {pagedRuns.map((run, index) => (
+                  <TableRow key={run.id ?? `${run.taskId}-${index}`} data-state={run === selectedRun ? 'selected' : undefined}>
+                    <TableCell>
+                      <button
+                        className="schedule-run-button"
+                        type="button"
+                        onClick={() => {
+                          if (run.id === undefined) return;
+                          setSelectedRunId(run.id);
+                        }}
+                      >
+                        {formatDateTime(run.createdAt)}
+                      </button>
+                    </TableCell>
+                    <TableCell>{formatCell(run.status === 'success' ? '成功' : '异常')}</TableCell>
+                    <TableCell>{run.steps === undefined ? '-' : String(run.steps)}</TableCell>
+                  </TableRow>
+                ))}
+                {!runs.length ? (
+                  <TableRow><TableCell colSpan={3}>{runsStatus || '暂无执行结果'}</TableCell></TableRow>
+                ) : null}
+              </TableBody>
+            </Table>
+            {runs.length ? (
+              <div className="schedule-runs-pagination">
+                <span>第 {runsPage}/{runsPageCount} 页 · 共 {runs.length} 条</span>
+                <div>
+                  <Button variant="outline" size="sm" type="button" disabled={runsPage <= 1} onClick={() => setRunsPage((current) => Math.max(1, current - 1))}>上一页</Button>
+                  <Button variant="outline" size="sm" type="button" disabled={runsPage >= runsPageCount} onClick={() => setRunsPage((current) => Math.min(runsPageCount, current + 1))}>下一页</Button>
+                </div>
+              </div>
+            ) : null}
+            <div className="schedule-run-detail">
+              <h3>执行结果</h3>
+              <pre>{selectedRun?.detail || runsStatus || '暂无执行结果'}</pre>
+            </div>
+          </CardContent>
+        </Card>
+      </>
+    );
+  }
+
   return (
     <>
       <PageTitle title="定时任务" desc="按 cron 周期自动执行的运维任务（cron 以 UTC 时区解释）" />
-      <Card className="create-task">
-        <CardContent className="task-create-grid">
-          <Label>创建任务<Textarea placeholder="描述你要定时执行的任务..." value={newTask} onChange={(event) => setNewTask(event.target.value)} /></Label>
-          <Label>执行计划（cron，UTC）
-            <Select value={CRON_PRESETS.some((p) => p.value === newCron) ? newCron : 'custom'} onValueChange={(value) => { if (value !== 'custom') setNewCron(value); }}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectGroup>
-                  {CRON_PRESETS.map((preset) => <SelectItem key={preset.value} value={preset.value}>{preset.label}</SelectItem>)}
-                  <SelectItem value="custom">自定义</SelectItem>
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-            <Input value={newCron} spellCheck={false} placeholder='如 "0 2 * * *"' onChange={(event) => setNewCron(event.target.value)} />
-          </Label>
-          <label className="schedule-preapproved">
-            <input type="checkbox" checked={newPreApproved} onChange={(event) => setNewPreApproved(event.target.checked)} />
-            预批准（无人值守自动通过生产审批，需管理员）
-          </label>
-          <Button type="button" disabled={busy} onClick={() => void createTask()}>{busy ? '处理中...' : '创建任务'}</Button>
-        </CardContent>
-      </Card>
-      {pageStatus ? <p className="empty-hint">{pageStatus}</p> : null}
-      <div className="task-layout">
-        <div className="schedule-table-scroll">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                {['任务', '计划', '下次执行', '状态', '最近执行'].map((header) => <TableHead key={header}>{header}</TableHead>)}
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {tasks.map((task, index) => (
-                <TableRow key={task.id ?? `${task.task}-${index}`} data-state={task === selectedTask ? 'selected' : undefined}>
-                  <TableCell>
-                    <button
-                      className="schedule-task-button"
-                      type="button"
-                      onClick={() => {
-                        if (task.id === undefined) return;
-                        setSelectedTaskId(task.id);
-                      }}
-                    >
-                      <strong>{task.task}</strong>
-                      <span>#{task.id} {task.preApproved ? '· 预批准' : ''}</span>
-                    </button>
-                  </TableCell>
-                  <TableCell>{humanizeCron(task.cron)}</TableCell>
-                  <TableCell>{formatDateTime(task.nextRunAt)}</TableCell>
-                  <TableCell>{formatCell(task.enabled ? '启用' : '暂停')}</TableCell>
-                  <TableCell>{task.lastRunAt ? formatDateTime(task.lastRunAt) : '待执行'}</TableCell>
-                </TableRow>
-              ))}
-              {!tasks.length ? (
-                <TableRow><TableCell colSpan={5}>暂无定时任务，可在上方创建，或在聊天里让 AI 帮你创建（schedule_task）。</TableCell></TableRow>
-              ) : null}
-            </TableBody>
-          </Table>
-        </div>
-        <Card className="detail-card compact">
-          {selectedTask ? (
-            <>
-              <CardHeader>
-                <CardTitle>{selectedTask.task}</CardTitle>
-                <CardDescription>
-                  {humanizeCron(selectedTask.cron)} · 下次执行 {formatDateTime(selectedTask.nextRunAt)}
-                  {selectedTask.preApproved ? ' · 预批准' : ''}
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="skill-detail-actions schedule-actions">
-                  <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => void runNow(selectedTask)}>
-                    <Play data-icon="inline-start" />
-                    立即执行
-                  </Button>
-                  <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => void toggleEnabled(selectedTask)}>
-                    {selectedTask.enabled ? <CircleStop data-icon="inline-start" /> : <Check data-icon="inline-start" />}
-                    {selectedTask.enabled ? '暂停' : '启用'}
-                  </Button>
-                  <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => (editing ? setEditing(false) : startEdit(selectedTask))}>
-                    <Code2 data-icon="inline-start" />
-                    {editing ? '取消编辑' : '编辑'}
-                  </Button>
-                  <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => requestDelete(selectedTask)}>
-                    <Trash2 data-icon="inline-start" />
-                    删除
-                  </Button>
-                  <Button variant="outline" size="sm" type="button" onClick={() => void loadRuns()}>
-                    <RefreshCcw data-icon="inline-start" />
-                    刷新
-                  </Button>
-                </div>
-                {editing ? (
-                  <div className="schedule-edit-form">
-                    <Label>任务描述<Textarea value={editTask} onChange={(event) => setEditTask(event.target.value)} /></Label>
-                    <Label>cron（UTC）<Input value={editCron} spellCheck={false} onChange={(event) => setEditCron(event.target.value)} /></Label>
-                    <Button type="button" size="sm" disabled={busy} onClick={() => void saveEdit(selectedTask)}>保存</Button>
-                  </div>
-                ) : null}
-                <Table>
-                  <TableHeader>
-                    <TableRow>{['时间', '状态', '步骤'].map((header) => <TableHead key={header}>{header}</TableHead>)}</TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {runs.map((run, index) => (
-                      <TableRow key={run.id ?? `${run.taskId}-${index}`} data-state={run === selectedRun ? 'selected' : undefined}>
-                        <TableCell>
-                          <button
-                            className="schedule-run-button"
-                            type="button"
-                            onClick={() => {
-                              if (run.id === undefined) return;
-                              setSelectedRunId(run.id);
-                            }}
-                          >
-                            {formatDateTime(run.createdAt)}
-                          </button>
-                        </TableCell>
-                        <TableCell>{formatCell(run.status === 'success' ? '成功' : '异常')}</TableCell>
-                        <TableCell>{run.steps === undefined ? '-' : String(run.steps)}</TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-                <div className="schedule-run-detail">
-                  <h3>执行结果</h3>
-                  <pre>{selectedRun?.detail || runsStatus || '暂无执行结果'}</pre>
-                </div>
-              </CardContent>
-            </>
-          ) : (
-            <CardContent><p className="empty-hint">选择左侧任务查看执行记录</p></CardContent>
-          )}
-        </Card>
+      <div className="toolbar">
+        <Button type="button" onClick={() => { setPageStatus(''); setView('create'); }}>
+          <Plus data-icon="inline-start" />
+          创建定时任务
+        </Button>
       </div>
+      {pageStatus ? <p className="empty-hint schedule-page-status">{pageStatus}</p> : null}
+      <section className="schedule-list-panel">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              {['任务', '计划', '下次执行', '状态', '最近执行'].map((header) => <TableHead key={header}>{header}</TableHead>)}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {tasks.map((task, index) => (
+              <TableRow
+                key={task.id ?? `${task.task}-${index}`}
+                className={task.id === undefined ? undefined : 'clickable-row'}
+                role={task.id === undefined ? undefined : 'button'}
+                tabIndex={task.id === undefined ? undefined : 0}
+                onClick={() => {
+                  if (task.id === undefined) return;
+                  setSelectedTaskId(task.id);
+                  setPageStatus('');
+                  setEditing(false);
+                  setView('detail');
+                }}
+                onKeyDown={(event) => {
+                  if (task.id === undefined) return;
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    setSelectedTaskId(task.id);
+                    setPageStatus('');
+                    setEditing(false);
+                    setView('detail');
+                  }
+                }}
+              >
+                <TableCell>
+                  <span className="schedule-task-cell">
+                    <strong>{task.task}</strong>
+                    <span>#{task.id} {task.preApproved ? '· 预批准' : ''}</span>
+                  </span>
+                </TableCell>
+                <TableCell>{humanizeCron(task.cron)}</TableCell>
+                <TableCell>{formatDateTime(task.nextRunAt)}</TableCell>
+                <TableCell>{formatCell(task.enabled ? '启用' : '暂停')}</TableCell>
+                <TableCell>{task.lastRunAt ? formatDateTime(task.lastRunAt) : '待执行'}</TableCell>
+              </TableRow>
+            ))}
+            {!tasks.length ? (
+              <TableRow><TableCell colSpan={5}>暂无定时任务，点击上方“创建定时任务”，或在聊天里让 AI 帮你创建（schedule_task）。</TableCell></TableRow>
+            ) : null}
+          </TableBody>
+        </Table>
+      </section>
     </>
   );
 }
@@ -3488,71 +3609,82 @@ function SandboxPage({ sandboxes, profiles }: { sandboxes: SandboxSummary[]; pro
   return (
     <>
       <PageTitle title="沙箱环境" desc="隔离的代码 / 命令执行环境" />
-      <div className="toolbar">
-        <Badge variant="secondary"><CheckCircle2 />{sandboxes.length} 个运行中</Badge>
-        <label className="search-box"><Search /><Input placeholder="搜索沙箱" /></label>
-        <Button variant="outline">模板 {profiles.length}</Button>
-      </div>
-      <section className="list-card sandbox-profile-card">
-        <div className="section-head compact">
-          <h2>支持的沙箱模板</h2>
-          <span>AI 会按任务能力选择 profile</span>
-        </div>
-        {profiles.length ? (
-          <div className="sandbox-profile-grid">
-            {profiles.map((profile) => (
-              <div key={profile.name} className="sandbox-profile-item">
-                <div>
-                  <strong>{profile.name}</strong>
-                  {profile.privileged ? <Badge variant="destructive">特权</Badge> : null}
-                  {profile.desktop ? <Badge variant="secondary">浏览器</Badge> : null}
-                </div>
-                <p>{profile.description}</p>
-                <code>{profile.image || profile.domain || '-'}</code>
-                <span>{listSummary(profile.capabilities)}</span>
+      <Tabs defaultValue="list" className="sandbox-page-tabs">
+        <TabsList>
+          <TabsTrigger value="list">沙箱列表（{sandboxes.length}）</TabsTrigger>
+          <TabsTrigger value="profiles">沙箱模板（{profiles.length}）</TabsTrigger>
+        </TabsList>
+        <TabsContent value="list">
+          <div className="two-pane single-pane">
+            <section className="list-card">
+              <div className="section-head compact">
+                <h2>运行中的沙箱</h2>
+                <span>点击某行查看详情</span>
               </div>
-            ))}
+              <DataTable
+                headers={['沙箱 ID', '状态', 'Profile', '镜像/模板', '绑定会话', 'Key', '活跃时间']}
+                rows={sandboxes.map((sandbox) => [
+                  sandbox.id,
+                  sandbox.status,
+                  sandbox.profile || sandbox.type || 'session',
+                  sandbox.image || sandbox.type || '-',
+                  sandbox.sessionId || '未绑定',
+                  sandbox.key || '-',
+                  formatDateTime(sandbox.lastUsedAt || sandbox.createdAt),
+                ])}
+                selectedRowIndex={selectedIndex >= 0 ? selectedIndex : null}
+                onRowClick={(rowIndex) => setSelectedSandboxId(sandboxes[rowIndex]?.id ?? null)}
+              />
+              {!sandboxes.length ? <div className="empty-inline">当前没有运行中的沙箱。</div> : null}
+            </section>
           </div>
-        ) : (
-          <div className="empty-inline">暂无可用沙箱模板。</div>
-        )}
-      </section>
-      <div className={cn('two-pane', !selected && 'single-pane')}>
-        <section className="list-card">
-          <DataTable
-            headers={['沙箱 ID', '状态', 'Profile', '镜像/模板', '绑定会话', 'Key', '活跃时间']}
-            rows={sandboxes.map((sandbox) => [
-              sandbox.id,
-              sandbox.status,
-              sandbox.profile || sandbox.type || 'session',
-              sandbox.image || sandbox.type || '-',
-              sandbox.sessionId || '未绑定',
-              sandbox.key || '-',
-              formatDateTime(sandbox.lastUsedAt || sandbox.createdAt),
-            ])}
-            selectedRowIndex={selectedIndex >= 0 ? selectedIndex : null}
-            onRowClick={(rowIndex) => setSelectedSandboxId(sandboxes[rowIndex]?.id ?? null)}
-          />
-          {!sandboxes.length ? <div className="empty-inline">当前没有运行中的沙箱。</div> : null}
-        </section>
-        {selected ? <aside className="detail-card sandbox-detail-card">
-            <DetailPanel title={selected.id} status={selected.status} icon={<Cuboid />}>
-              <h3>基本信息</h3>
-              <div className="kv">
-                <span>Profile</span><strong>{selected.profile || selected.type || 'session'}</strong>
-                <span>镜像/模板</span><strong>{selected.image || '-'}</strong>
-                <span>绑定会话</span><strong>{selected.sessionId || '未绑定'}</strong>
-                <span>Key</span><strong>{selected.key || '-'}</strong>
-                <span>Domain</span><strong>{selected.domain || '-'}</strong>
-                <span>权限</span><strong>{selected.privileged ? '特权' : '普通'}</strong>
-                <span>能力</span><strong>{listSummary(selected.capabilities)}</strong>
-                <span>资源</span><strong>{resourceSummary(selected.resources)}</strong>
+        </TabsContent>
+        <TabsContent value="profiles">
+          <section className="list-card sandbox-profile-card">
+            <div className="section-head compact">
+              <h2>支持的沙箱模板</h2>
+              <span>AI 会按任务能力选择 profile</span>
+            </div>
+            {profiles.length ? (
+              <div className="sandbox-profile-grid">
+                {profiles.map((profile) => (
+                  <div key={profile.name} className="sandbox-profile-item">
+                    <div>
+                      <strong>{profile.name}</strong>
+                      {profile.privileged ? <Badge className="badge-privileged" variant="outline">特权</Badge> : null}
+                      {profile.desktop ? <Badge variant="secondary">浏览器</Badge> : null}
+                    </div>
+                    <p>{profile.description}</p>
+                    <code>{profile.image || profile.domain || '-'}</code>
+                    <span>{listSummary(profile.capabilities)}</span>
+                  </div>
+                ))}
               </div>
-              <h3>连接信息</h3>
-              <div className="file-list"><span>Terminal /sandbox/{selected.id}/terminal</span><span>Browser /sandbox/{selected.id}/browser</span></div>
-            </DetailPanel>
-          </aside> : null}
-      </div>
+            ) : (
+              <div className="empty-inline">暂无可用沙箱模板。</div>
+            )}
+          </section>
+        </TabsContent>
+      </Tabs>
+      {selected ? (
+        <ModalDialog title={selected.id} status={selected.status} icon={<Cuboid />} onClose={() => setSelectedSandboxId(null)}>
+          <div className="detail-panel">
+            <h3>基本信息</h3>
+            <div className="kv">
+              <span>Profile</span><strong>{selected.profile || selected.type || 'session'}</strong>
+              <span>镜像/模板</span><strong>{selected.image || '-'}</strong>
+              <span>绑定会话</span><strong>{selected.sessionId || '未绑定'}</strong>
+              <span>Key</span><strong>{selected.key || '-'}</strong>
+              <span>Domain</span><strong>{selected.domain || '-'}</strong>
+              <span>权限</span><strong>{selected.privileged ? '特权' : '普通'}</strong>
+              <span>能力</span><strong>{listSummary(selected.capabilities)}</strong>
+              <span>资源</span><strong>{resourceSummary(selected.resources)}</strong>
+            </div>
+            <h3>连接信息</h3>
+            <div className="file-list"><span>Terminal /sandbox/{selected.id}/terminal</span><span>Browser /sandbox/{selected.id}/browser</span></div>
+          </div>
+        </ModalDialog>
+      ) : null}
     </>
   );
 }
