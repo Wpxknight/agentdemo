@@ -188,7 +188,27 @@
 
 1. **①** A2.3 `skills.sandboxEnv` 服务端注入层：做 / 不做（不做则环境信息完全靠对话提供）。
    —— 已实现（含凭据类键 schema 拒绝），2026-07-08。
-2. **②** 本次交付范围：M1，还是 M1+M2，还是 M1+M2+M3。—— 先交付 M1（本次），后续按 P0→P1 分批。
+2. **②** 本次交付范围：M1，还是 M1+M2，还是 M1+M2+M3。—— **M1+M2+M3 已全部交付**，2026-07-08。
+
+---
+
+# 交付记录：M2 + M3（2026-07-08）
+
+| 项 | 交付内容 | 关键文件 | 测试 |
+|---|---|---|---|
+| P0-1 | 权限规则引擎 allow/deny/ask，覆盖所有工具；deny(无子模式)工具注入模型前剥离；ask 融合审批门；显式 allow 跳过生产审批但危险命令底线仍拦 | `src/agent/rules.ts`、`policy.ts`、`config/schema.ts` | `tests/rules.test.ts` |
+| P0-2 | PreToolUse 钩子：shell 命令 + HTTP webhook，可 deny；共享 SSRF 防护 | `src/agent/hooks.ts`、`src/net/ssrf.ts` | `tests/hooks.test.ts` |
+| P1-1 | `todo_write` 工具 + `todo_updated` SSE + `ToolContext.emitEvent` 通道 + 前端 TodoList | `src/tools/todo.ts`、`web` App/TodoList | `tests/todo.test.ts` |
+| P1-2 | `web_fetch` 工具：HTML→文本、域名白名单、SSRF 防护、大小/超时上限 | `src/tools/webfetch.ts` | `tests/webfetch.test.ts` |
+| P1-3 | cache token 分记（anthropic 适配器）+ 定价折算 + done/audit 成本 + 前端成本展示 | `src/model/cost.ts`、`anthropic.ts`、`web` 头部 | `tests/cost.test.ts` |
+| P1-4 | `ask_user` 工具：结构化选择题，暂停/续跑（问题 store + SSE `question_required` + answer 端点）+ 前端选项卡片（含“其他”自由输入） | `src/tools/ask-user.ts`、`src/agent/question.ts`、`web` QuestionCard | `tests/ask-user.test.ts` |
+| P1-5 | `submit_change_plan` 工具：结构化变更方案审批；批准后会话内生产变更批量放行（策略层 `PlanApprovalState`）；前端方案预览 + 批准/拒绝 | `src/tools/change-plan.ts`、`src/agent/plan.ts`、`policy.ts` | `tests/change-plan.test.ts` |
+
+全量测试 **319 passed / 1 skipped**；server + web typecheck 通过；web build 通过。
+配置示例见 `config.example.jsonc` 的 permissions / hooks / webFetch / pricing 段。
+
+**语义说明**：变更计划模式采用"批准即批量放行"而非"未批准即全局阻断"——避免只读/简单任务被误拦；
+生产变更在未提交方案时仍走原有逐条审批。
 
 ---
 

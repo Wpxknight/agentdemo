@@ -13,6 +13,8 @@ import {
 } from '../agent/context.js';
 import type { ChatModel, ToolContentBlock } from '../model/types.js';
 import { InMemoryApprovalStore, InteractiveApprovalGate } from '../agent/approval.js';
+import { InMemoryQuestionStore } from '../agent/question.js';
+import type { QuestionAnswers, QuestionSpec } from '../agent/question.js';
 import { authenticate } from './context.js';
 import { AuthzError, requirePermission } from '../auth/rbac.js';
 import { LocalAuthProvider } from '../auth/local.js';
@@ -23,6 +25,7 @@ import { DEFAULT_TASK_MAX_RUN_MS, type ScheduledTaskPatch } from '../db/store.js
 import { isValidCron } from '../scheduler/cron.js';
 import { createScheduledTaskRunner } from '../scheduler/runner.js';
 import { createModel } from '../model/factory.js';
+import { estimateCost } from '../model/cost.js';
 import type { JsonValue, Msg, ToolCall } from '../model/types.js';
 import { importSkillZip } from '../skill/import.js';
 import type { Skill } from '../skill/registry.js';
@@ -487,11 +490,12 @@ async function requireAuth(rt: Runtime, req: Req): Promise<RequestContext> {
 export function createHttpServer(rt: Runtime): http.Server {
   const secret = new TextEncoder().encode(rt.jwtSecret);
   const approvals = new InMemoryApprovalStore();
+  const questions = new InMemoryQuestionStore();
   const activeRuns: ActiveAgentRuns = new Map();
   const compactionWatermarks: CompactionWatermarks = new Map();
 
   return http.createServer((req, res) => {
-    handle(rt, secret, approvals, activeRuns, compactionWatermarks, req, res).catch((err) => {
+    handle(rt, secret, approvals, questions, activeRuns, compactionWatermarks, req, res).catch((err) => {
       if (err instanceof HttpError) return sendJson(res, err.status, { error: err.message });
       if (err instanceof AuthzError) return sendJson(res, 403, { error: err.message });
       log.error({ err }, '请求处理异常');
@@ -505,6 +509,7 @@ async function handle(
   rt: Runtime,
   secret: Uint8Array,
   approvals: InMemoryApprovalStore,
+  questions: InMemoryQuestionStore,
   activeRuns: ActiveAgentRuns,
   compactionWatermarks: CompactionWatermarks,
   req: Req,
@@ -568,7 +573,7 @@ async function handle(
   }
 
   // —— 以下均需认证 ——
-  if (route === 'POST /v1/agent') return runAgentSse(rt, approvals, activeRuns, compactionWatermarks, req, res);
+  if (route === 'POST /v1/agent') return runAgentSse(rt, approvals, questions, activeRuns, compactionWatermarks, req, res);
 
   if (route === 'GET /v1/me') {
     const ctx = await requireAuth(rt, req);
@@ -938,6 +943,29 @@ async function handle(
     return sendJson(res, 200, { ok: true });
   }
 
+  // —— ask_user 交互式提问 ——
+  if (route === 'GET /v1/questions') {
+    const ctx = await requireAuth(rt, req);
+    return sendJson(res, 200, { questions: questions.list(ctx.tenantId) });
+  }
+  const questionMatch = /^\/v1\/questions\/([^/]+)\/answer$/.exec(path);
+  if (method === 'POST' && questionMatch) {
+    const ctx = await requireAuth(rt, req);
+    const id = decodeURIComponent(questionMatch[1]!);
+    const body = await readJson(req);
+    const rawAnswers = body.answers;
+    if (!rawAnswers || typeof rawAnswers !== 'object' || Array.isArray(rawAnswers)) {
+      throw new HttpError(400, 'answers 必须是 {问题: [选中项]} 对象');
+    }
+    const answers: QuestionAnswers = {};
+    for (const [q, v] of Object.entries(rawAnswers as Record<string, unknown>)) {
+      answers[q] = Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+    }
+    const ok = questions.answer(id, ctx.tenantId, answers);
+    if (!ok) throw new HttpError(404, '问题不存在或已回答');
+    return sendJson(res, 200, { ok: true });
+  }
+
   // GET /v1/sessions/{id}/messages
   const msgMatch = /^\/v1\/sessions\/([^/]+)\/messages$/.exec(path);
   if (method === 'GET' && msgMatch) {
@@ -1220,6 +1248,7 @@ function abortReasonMessage(reason: unknown): string {
 async function runAgentSse(
   rt: Runtime,
   approvals: InMemoryApprovalStore,
+  questions: InMemoryQuestionStore,
   activeRuns: ActiveAgentRuns,
   compactionWatermarks: CompactionWatermarks,
   req: Req,
@@ -1276,8 +1305,56 @@ async function runAgentSse(
       model: rt.model,
       tools: rt.tools,
       policy: rt.policy,
-      filterToolDefs: (defs) => rt.permissionRules.filterToolDefs(defs),
+      filterToolDefs: (defs) => rt.permissionRules?.filterToolDefs(defs) ?? defs,
       hooks: rt.hooks,
+      askUser: async (qs: QuestionSpec[]): Promise<QuestionAnswers | null> => {
+        if (abort.signal.aborted) return null;
+        const { pending, promise } = questions.create({
+          tenantId: ctx.tenantId ?? '',
+          sessionId,
+          userId: ctx.userId ?? '',
+          questions: qs,
+        });
+        const onAbort = () => questions.cancel(pending.id);
+        abort.signal.addEventListener('abort', onAbort, { once: true });
+        try {
+          sse('question_required', pending);
+          return await promise;
+        } finally {
+          abort.signal.removeEventListener('abort', onAbort);
+        }
+      },
+      requestPlanApproval: async (plan): Promise<boolean> => {
+        if (abort.signal.aborted) return false;
+        // 复用问题机制：一道“批准/拒绝”单选题承载变更方案审批。
+        const q: QuestionSpec = {
+          question: `请审批变更方案：${plan.summary}`,
+          header: '变更审批',
+          options: [{ label: '批准' }, { label: '拒绝' }],
+        };
+        const { pending, promise } = questions.create({
+          tenantId: ctx.tenantId ?? '',
+          sessionId,
+          userId: ctx.userId ?? '',
+          questions: [q],
+        });
+        const onAbort = () => questions.cancel(pending.id);
+        abort.signal.addEventListener('abort', onAbort, { once: true });
+        try {
+          // 附上完整方案供前端渲染（question_required 事件里带 plan）。
+          sse('change_plan_required', { ...pending, plan });
+          const answers = await promise;
+          const approved = answers?.[q.question]?.includes('批准') ?? false;
+          if (approved) rt.planState.approve(sessionId);
+          await rt.audit?.record({
+            kind: 'policy', action: approved ? 'plan-approved' : 'plan-rejected',
+            tenantId: ctx.tenantId, sessionId, detail: { plan },
+          });
+          return approved;
+        } finally {
+          abort.signal.removeEventListener('abort', onAbort);
+        }
+      },
       approval: new InteractiveApprovalGate({
         store: approvals,
         emit: (pending) => sse('approval_required', pending),
@@ -1325,11 +1402,12 @@ async function runAgentSse(
       await rt.store.appendMessages(ctx, sessionId, result.messages.slice(prior.length));
     }
     const context = await rt.store.getSessionContextUsage(ctx, sessionId, contextWindowTokens(modelConfig));
+    const cost = estimateCost(result.usage, modelConfig.pricing);
     await rt.audit?.record({
       kind: 'usage', action: 'agent', tenantId: ctx.tenantId, sessionId,
-      detail: { ...result.usage, steps: result.steps, context },
+      detail: { ...result.usage, steps: result.steps, context, cost },
     });
-    sse('done', { sessionId, steps: result.steps, text: result.text, usage: { ...result.usage, context }, context });
+    sse('done', { sessionId, steps: result.steps, text: result.text, usage: { ...result.usage, context, cost }, context, cost });
   } catch (err) {
     if (abort.signal.aborted) {
       sse('terminated', { sessionId, reason: abortReasonMessage(abort.signal.reason) });

@@ -8,7 +8,9 @@
       "model": "claude-opus-4-8",
       // 推理深度：none 关闭思考；low|medium|high|xhigh|max 对应 Anthropic effort。
       // 缺省=思考开启走模型默认深度。也可在设置页调整。仅 anthropic 协议生效。
-      "effort": "medium"
+      "effort": "medium",
+      // 每百万 token 单价（美元），用于会话成本折算；缺省不算成本。
+      "pricing": { "input": 3, "output": 15, "cacheRead": 0.3, "cacheWrite": 3.75 }
     },
     "my-gpt": {
       "protocol": "openai",

@@ -67,6 +67,8 @@ import type {
   SessionSummary,
   SessionsBody,
   TaskRun,
+  PendingQuestion,
+  QuestionSpec,
   TaskStep,
   TodoItem,
   McpServerBody,
@@ -203,6 +205,13 @@ function formatTokenCount(value: number): string {
 
 function formatContextUsage(usage?: ContextUsageBody): string {
   return `${formatTokenCount(usage?.usedTokens ?? 0)}/${formatTokenCount(usage?.maxTokens ?? 200000)}`;
+}
+
+/** 会话累计成本（美元）：小额用更多小数位，避免显示成 $0.00。 */
+function formatCostUsd(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '$0';
+  if (value < 0.01) return `$${value.toFixed(4)}`;
+  return `$${value.toFixed(2)}`;
 }
 
 function toolCategory(name: string): string {
@@ -466,6 +475,99 @@ function ThinkingBlock({ content, streaming }: { content: string; streaming?: bo
   );
 }
 
+const OTHER_LABEL = '其他…';
+
+function QuestionCard({ pending, onSubmit }: {
+  pending: PendingQuestion;
+  onSubmit: (answers: Record<string, string[]>) => void;
+}) {
+  // 每题选中的 label 集合 + “其他”自由输入文本
+  const [selected, setSelected] = useState<Record<string, Set<string>>>({});
+  const [otherText, setOtherText] = useState<Record<string, string>>({});
+
+  function toggle(q: QuestionSpec, label: string) {
+    setSelected((current) => {
+      const set = new Set(current[q.question] ?? []);
+      if (q.multiSelect) {
+        set.has(label) ? set.delete(label) : set.add(label);
+      } else {
+        set.clear();
+        set.add(label);
+      }
+      return { ...current, [q.question]: set };
+    });
+  }
+
+  function submit() {
+    const answers: Record<string, string[]> = {};
+    for (const q of pending.questions) {
+      const picked = [...(selected[q.question] ?? [])];
+      const resolved = picked.map((l) => (l === OTHER_LABEL ? (otherText[q.question] ?? '').trim() : l)).filter(Boolean);
+      answers[q.question] = resolved;
+    }
+    onSubmit(answers);
+  }
+
+  const allAnswered = pending.questions.every((q) => {
+    const picked = selected[q.question] ?? new Set<string>();
+    if (!picked.size) return false;
+    if (picked.has(OTHER_LABEL)) return Boolean((otherText[q.question] ?? '').trim());
+    return true;
+  });
+
+  return (
+    <div className="question-card">
+      {pending.plan ? (
+        <div className="change-plan">
+          <div className="change-plan-head">变更方案：{pending.plan.summary}</div>
+          <ol className="change-plan-list">
+            {pending.plan.changes.map((c, i) => (
+              <li key={i}><strong>[{c.action}]</strong> {c.target}{c.detail ? ` — ${c.detail}` : ''}</li>
+            ))}
+          </ol>
+          <div className="change-plan-meta"><span>影响面</span>{pending.plan.impact}</div>
+          <div className="change-plan-meta"><span>回滚</span>{pending.plan.rollback}</div>
+        </div>
+      ) : null}
+      {pending.questions.map((q) => {
+        const picked = selected[q.question] ?? new Set<string>();
+        return (
+          <div key={q.question} className="question-block">
+            <div className="question-head">
+              {q.header ? <span className="question-chip">{q.header}</span> : null}
+              <strong>{q.question}</strong>
+            </div>
+            <div className="question-options">
+              {[...q.options, { label: OTHER_LABEL }].map((opt) => (
+                <button
+                  key={opt.label}
+                  type="button"
+                  className={cn('question-option', picked.has(opt.label) && 'active')}
+                  onClick={() => toggle(q, opt.label)}
+                >
+                  <span className="question-option-label">{opt.label}</span>
+                  {'description' in opt && opt.description ? <small>{opt.description}</small> : null}
+                </button>
+              ))}
+            </div>
+            {picked.has(OTHER_LABEL) ? (
+              <Input
+                autoFocus
+                placeholder="请输入…"
+                value={otherText[q.question] ?? ''}
+                onChange={(e) => setOtherText((current) => ({ ...current, [q.question]: e.target.value }))}
+              />
+            ) : null}
+          </div>
+        );
+      })}
+      <div className="question-actions">
+        <Button type="button" size="sm" disabled={!allAnswered} onClick={submit}>提交回答</Button>
+      </div>
+    </div>
+  );
+}
+
 function TodoList({ todos }: { todos: TodoItem[] }) {
   const done = todos.filter((t) => t.status === 'completed').length;
   return (
@@ -675,6 +777,8 @@ export default function App() {
   const [sessionId, setSessionId] = useState(() => readStorage('aiop_session_id') || numericSessionId());
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [contextUsage, setContextUsage] = useState<Record<string, ContextUsageBody>>({});
+  const [sessionCostUsd, setSessionCostUsd] = useState<Record<string, number>>({});
+  const [pendingQuestions, setPendingQuestions] = useState<Record<string, PendingQuestion>>({});
   const [tools, setTools] = useState<ToolSummary[]>([]);
   const [tasks, setTasks] = useState<ScheduledTask[]>([]);
   const [sandboxes, setSandboxes] = useState<SandboxSummary[]>([]);
@@ -1163,6 +1267,18 @@ export default function App() {
           ) {
             pushTerminal(formatSandboxOutputChunk(event.data.stream, event.data.text));
           }
+          if (
+            (event?.event === 'question_required' || event?.event === 'change_plan_required')
+            && event.data && typeof event.data.id === 'string' && Array.isArray(event.data.questions)
+          ) {
+            const pending: PendingQuestion = {
+              id: event.data.id as string,
+              sessionId: (event.data.sessionId as string) || activeSessionId,
+              questions: event.data.questions as PendingQuestion['questions'],
+              plan: (event.data as { plan?: PendingQuestion['plan'] }).plan,
+            };
+            setPendingQuestions((current) => ({ ...current, [pending.sessionId]: pending }));
+          }
           if (event?.event === 'todo_updated' && Array.isArray(event.data?.todos)) {
             assistant.todos = (event.data.todos as TodoItem[]).filter(
               (t) => t && typeof t.content === 'string' && typeof t.status === 'string',
@@ -1210,6 +1326,10 @@ export default function App() {
             if (nextContext) {
               setContextUsage((current) => ({ ...current, [event.data!.sessionId as string]: nextContext }));
             }
+            const cost = (event.data as { cost?: { costUsd?: number } }).cost;
+            if (typeof cost?.costUsd === 'number') {
+              setSessionCostUsd((current) => ({ ...current, [event.data!.sessionId as string]: cost.costUsd as number }));
+            }
           }
         }
       }
@@ -1248,6 +1368,26 @@ export default function App() {
         id: randomId(),
         role: 'assistant',
         text: `追加消息失败：${formatError(err)}`,
+        time: new Date().toLocaleTimeString(),
+      }]);
+    }
+  }
+
+  async function submitQuestionAnswer(pending: PendingQuestion, answers: Record<string, string[]>) {
+    // 乐观清除，避免重复提交；失败则恢复。
+    setPendingQuestions((current) => {
+      const next = { ...current };
+      delete next[pending.sessionId];
+      return next;
+    });
+    try {
+      await api.post<{ ok: boolean }>(`/v1/questions/${encodeURIComponent(pending.id)}/answer`, { answers });
+    } catch (err) {
+      setPendingQuestions((current) => ({ ...current, [pending.sessionId]: pending }));
+      setMessages((currentMessages) => [...currentMessages, {
+        id: randomId(),
+        role: 'assistant',
+        text: `提交回答失败：${formatError(err)}`,
         time: new Date().toLocaleTimeString(),
       }]);
     }
@@ -1397,6 +1537,9 @@ export default function App() {
           sessionPageCount={Math.max(1, Math.ceil(sessionTotal / SESSION_PAGE_SIZE))}
           selectedSessionId={sessionId}
           contextUsage={contextUsage[sessionId]}
+          sessionCostUsd={sessionCostUsd[sessionId]}
+          pendingQuestion={pendingQuestions[sessionId]}
+          onAnswerQuestion={submitQuestionAnswer}
           messages={messages}
           attachments={attachments}
           composerValue={composerValue}
@@ -1565,6 +1708,9 @@ function PrototypeChatShell(props: {
   sessionPageCount: number;
   selectedSessionId: string;
   contextUsage?: ContextUsageBody;
+  sessionCostUsd?: number;
+  pendingQuestion?: PendingQuestion;
+  onAnswerQuestion: (pending: PendingQuestion, answers: Record<string, string[]>) => void;
   messages: ChatMessage[];
   attachments: Attachment[];
   composerValue: string;
@@ -1624,12 +1770,20 @@ function PrototypeChatShell(props: {
             runningAgentCount={props.runningAgentCount}
             terminatingSession={props.terminatingSession}
             contextUsage={props.contextUsage}
+            sessionCostUsd={props.sessionCostUsd}
             onNewSession={props.onNewSession}
             onRequestStopSession={props.onRequestStopSession}
             onToggleHistory={props.onToggleHistory}
             onTogglePreview={props.onTogglePreview}
           />
           <PrototypeMessages messages={props.messages} />
+          {props.pendingQuestion ? (
+            <QuestionCard
+              key={props.pendingQuestion.id}
+              pending={props.pendingQuestion}
+              onSubmit={(answers) => props.onAnswerQuestion(props.pendingQuestion!, answers)}
+            />
+          ) : null}
           <PrototypeComposer
             attachments={props.attachments}
             value={props.composerValue}
@@ -1872,6 +2026,7 @@ function PrototypeChatHeader(props: {
   runningAgentCount: number;
   terminatingSession: boolean;
   contextUsage?: ContextUsageBody;
+  sessionCostUsd?: number;
   onNewSession: () => void;
   onRequestStopSession: () => void;
   onToggleHistory: () => void;
@@ -1886,6 +2041,7 @@ function PrototypeChatHeader(props: {
           <i />
           {props.runningAgentCount ? `${props.runningAgentCount} 个任务运行中` : '就绪'}
           <b>上下文 {formatContextUsage(props.contextUsage)}</b>
+          {typeof props.sessionCostUsd === 'number' ? <b>成本 {formatCostUsd(props.sessionCostUsd)}</b> : null}
         </span>
       </div>
       <div className="prototype-chat-actions">

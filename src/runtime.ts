@@ -7,6 +7,7 @@ import { AllowAllPolicy, OpsPolicy } from './agent/policy.js';
 import type { PolicyMiddleware } from './agent/policy.js';
 import { PermissionRules } from './agent/rules.js';
 import { HookRunner } from './agent/hooks.js';
+import { PlanApprovalState } from './agent/plan.js';
 import { SandboxManager } from './sandbox/lifecycle.js';
 import { E2bProvider } from './sandbox/e2b.js';
 import { OpenSandboxProvider } from './sandbox/opensandbox.js';
@@ -35,6 +36,8 @@ import type { LlmSettings, Store } from './db/store.js';
 import { buildScheduleTools } from './tools/schedule.js';
 import { buildTodoTool } from './tools/todo.js';
 import { buildWebFetchTool } from './tools/webfetch.js';
+import { buildAskUserTool } from './tools/ask-user.js';
+import { buildChangePlanTool } from './tools/change-plan.js';
 import {
   findSandboxProfile,
   publicSandboxProfiles,
@@ -74,6 +77,8 @@ export interface Runtime {
   permissionRules: PermissionRules;
   /** PreToolUse 钩子运行器（外部系统联动 / 合规拦截）。 */
   hooks: HookRunner;
+  /** 变更计划审批状态（会话内批准后生产变更批量放行）。 */
+  planState: PlanApprovalState;
   /** 本地认证提供方（登录 / token 校验）。 */
   authProvider: AuthProvider;
   /** 会话 JWT 密钥（HTTP 层签发 OIDC 临时 state cookie 等用）。 */
@@ -125,13 +130,14 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
   const hasClusters = clusters.list().length > 0;
   const permissionRules = new PermissionRules(config.permissions);
   const hooks = new HookRunner(config.hooks, { allowPrivateWebhook: config.hooks?.allowPrivateWebhook });
+  const planState = new PlanApprovalState();
   // 有集群，或配置了权限规则时启用 OpsPolicy（规则覆盖所有工具，不止 kubectl）。
   const useOpsPolicy = hasClusters || !permissionRules.empty;
   const policy: PolicyMiddleware = useOpsPolicy
-    ? new OpsPolicy({ clusters, audit, rules: permissionRules })
+    ? new OpsPolicy({ clusters, audit, rules: permissionRules, planState })
     : new AllowAllPolicy();
   const policyPreApproved: PolicyMiddleware = useOpsPolicy
-    ? new OpsPolicy({ clusters, audit, preApproved: true, rules: permissionRules })
+    ? new OpsPolicy({ clusters, audit, preApproved: true, rules: permissionRules, planState })
     : new AllowAllPolicy();
 
   let sandboxes: SandboxManager | undefined;
@@ -230,6 +236,12 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
   // TodoWrite：长任务进度清单（前端实时渲染）
   tools.register(buildTodoTool());
 
+  // ask_user：运行中向用户提结构化选择题（需交互端；无交互端时工具自返回提示）
+  tools.register(buildAskUserTool());
+
+  // submit_change_plan：生产变更前提交结构化方案审批（需交互端）
+  tools.register(buildChangePlanTool());
+
   // WebFetch：抓取网页内容（域名白名单 + SSRF 防护）；默认启用
   if (config.webFetch?.enabled ?? true) {
     tools.register(buildWebFetchTool({
@@ -308,6 +320,7 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     policyPreApproved,
     permissionRules,
     hooks,
+    planState,
     authProvider,
     jwtSecret,
     defaultContext,

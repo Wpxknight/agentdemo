@@ -10,6 +10,15 @@ export const ModelConfigSchema = z.object({
   contextKeepImages: z.number().int().min(0).optional(),
   /** 推理深度：none 关闭思考；low..max 对应 Anthropic effort；缺省=思考开启走模型默认深度。 */
   effort: z.enum(['none', 'low', 'medium', 'high', 'xhigh', 'max']).optional(),
+  /** 每百万 token 单价（美元），用于会话成本折算；缺省不算成本。 */
+  pricing: z
+    .object({
+      input: z.number().nonnegative(),
+      output: z.number().nonnegative(),
+      cacheRead: z.number().nonnegative().optional(),
+      cacheWrite: z.number().nonnegative().optional(),
+    })
+    .optional(),
 });
 
 export const McpServerSchema = z.object({

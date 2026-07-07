@@ -87,7 +87,15 @@ export type StreamEvent =
       discardThinkingChars: number;
       discardToolIds: string[];
     }
-  | { type: 'usage'; inputTokens: number; outputTokens: number }
+  | {
+      type: 'usage';
+      inputTokens: number;
+      outputTokens: number;
+      /** 缓存读取的输入 token（命中提示缓存，计费更低）。 */
+      cacheReadTokens?: number;
+      /** 缓存写入/创建的输入 token（首次建缓存，计费略高于普通输入）。 */
+      cacheCreationTokens?: number;
+    }
   /** 历史逼近上下文窗口，已把最旧的若干消息摘要压缩成一段（供前端提示 / 日志）。 */
   | { type: 'context_compacted'; summarizedMessages: number; beforeTokens: number; afterTokens: number }
   /** 模型通过 todo_write 更新了任务清单（供前端实时渲染进度）。 */

@@ -137,11 +137,15 @@ export class AnthropicModel implements ChatModel {
         case 'message_start': {
           // 输入用量只在 message_start 报（含缓存读写）；输出用量走 message_delta，避免重复累计。
           const u = ev.message.usage;
-          const inputTokens =
-            (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
+          const cacheCreationTokens = u.cache_creation_input_tokens ?? 0;
+          const cacheReadTokens = u.cache_read_input_tokens ?? 0;
+          const baseInput = u.input_tokens ?? 0;
+          const inputTokens = baseInput + cacheCreationTokens + cacheReadTokens;
           if (inputTokens > 0) {
             reportedInputTokens += inputTokens;
-            yield { type: 'usage', inputTokens, outputTokens: 0 };
+            // inputTokens 为总输入（含缓存，保持既有语义与上下文估算一致）；
+            // 缓存明细单列，供成本折算区分计费档位。
+            yield { type: 'usage', inputTokens, outputTokens: 0, cacheCreationTokens, cacheReadTokens };
           }
           break;
         }
@@ -208,14 +212,18 @@ export class AnthropicModel implements ChatModel {
               cache_creation_input_tokens?: number | null;
               cache_read_input_tokens?: number | null;
             };
-            const totalInput =
-              (du.input_tokens ?? 0) + (du.cache_creation_input_tokens ?? 0) + (du.cache_read_input_tokens ?? 0);
+            const cacheCreationTokens = du.cache_creation_input_tokens ?? 0;
+            const cacheReadTokens = du.cache_read_input_tokens ?? 0;
+            const totalInput = (du.input_tokens ?? 0) + cacheCreationTokens + cacheReadTokens;
             const inputDelta = Math.max(0, totalInput - reportedInputTokens);
             reportedInputTokens += inputDelta;
             yield {
               type: 'usage',
               inputTokens: inputDelta,
               outputTokens: du.output_tokens ?? 0,
+              // 缓存明细仅在 message_start 未报输入时（inputDelta>0）随此补报，避免重复累计。
+              cacheCreationTokens: inputDelta > 0 ? cacheCreationTokens : 0,
+              cacheReadTokens: inputDelta > 0 ? cacheReadTokens : 0,
             };
           }
           if (ev.delta.stop_reason) {

@@ -1,5 +1,6 @@
 import { logger } from '../logger.js';
 import { runAgent } from '../agent/core.js';
+import { estimateCost } from '../model/cost.js';
 import { contextBudgetTokens } from '../agent/context.js';
 import { AutoDenyGate } from '../agent/approval.js';
 import type { Runtime } from '../runtime.js';
@@ -44,7 +45,7 @@ async function runScheduledTask(
     model: rt.model,
     tools: rt.tools,
     policy: t.preApproved ? rt.policyPreApproved : rt.policy,
-    filterToolDefs: (defs) => rt.permissionRules.filterToolDefs(defs),
+    filterToolDefs: (defs) => rt.permissionRules?.filterToolDefs(defs) ?? defs,
     hooks: rt.hooks,
     approval: new AutoDenyGate(), // 无人值守：未预批准的审批一律拒绝
     unattended: true, // 系统提示切换为“确认类操作跳过并汇报”，不对着空气等确认
@@ -63,7 +64,7 @@ async function runScheduledTask(
     action: 'scheduled',
     tenantId: t.tenantId,
     sessionId: t.sessionId,
-    detail: { ...result.usage, steps: result.steps, taskId: t.id },
+    detail: { ...result.usage, steps: result.steps, taskId: t.id, cost: estimateCost(result.usage, rt.modelConfig?.pricing) },
   });
   return { status: 'success' as const, detail: result.text.slice(0, 4000), steps: result.steps };
 }

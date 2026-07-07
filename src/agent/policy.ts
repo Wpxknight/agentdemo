@@ -6,6 +6,7 @@ import { LogAuditSink } from '../audit/sink.js';
 import { classifyKubectl, kubectlScope, parseKubectlArgs } from '../ops/classify.js';
 import { can } from './../auth/rbac.js';
 import { PermissionRules } from './rules.js';
+import type { PlanApprovalState } from './plan.js';
 
 /** dispatch 前的策略判定（读写分离 / dry-run / 审批 / 危险命令拦截）。 */
 export interface PolicyDecision {
@@ -34,6 +35,8 @@ export interface OpsPolicyOptions {
   guardShell?: boolean;
   /** 工具权限规则引擎（管理员配置的 allow/deny/ask），优先于内置运维策略。 */
   rules?: PermissionRules;
+  /** 变更计划审批状态：会话内批准过变更方案则生产变更批量放行。 */
+  planState?: PlanApprovalState;
 }
 
 /** rm -rf / 之类的高危 shell 片段。 */
@@ -55,6 +58,7 @@ export class OpsPolicy implements PolicyMiddleware {
   private readonly preApproved: boolean;
   private readonly guardShell: boolean;
   private readonly rules?: PermissionRules;
+  private readonly planState?: PlanApprovalState;
 
   constructor(opts: OpsPolicyOptions) {
     this.clusters = opts.clusters;
@@ -62,6 +66,7 @@ export class OpsPolicy implements PolicyMiddleware {
     this.preApproved = opts.preApproved ?? false;
     this.guardShell = opts.guardShell ?? true;
     this.rules = opts.rules;
+    this.planState = opts.planState;
   }
 
   async check(call: ToolCall, ctx?: ToolContext): Promise<PolicyDecision> {
@@ -156,6 +161,10 @@ export class OpsPolicy implements PolicyMiddleware {
         // 显式 allow 规则命中：跳过生产审批（但上面的危险命令/ACL/只读拦截仍已生效）
         if (opts?.skipApproval) {
           return this.emit('allow', { blocked: false }, { ...base, detail: { ...base.detail, allowRule: true } });
+        }
+        // 本会话已批准变更方案：生产变更批量放行（submit_change_plan 已审批）
+        if (this.planState?.isApproved(sessionId)) {
+          return this.emit('allow', { blocked: false }, { ...base, detail: { ...base.detail, planApproved: true } });
         }
         // 有审批权（管理员）→ 自动放行；否则预批准放行，再否则需人工审批
         if (can(role, 'approve')) {

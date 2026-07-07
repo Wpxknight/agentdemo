@@ -169,7 +169,7 @@ describe('runAgent', () => {
       ctx: { sessionId: 't1' },
       task: 'go',
     });
-    expect(result.usage).toEqual({ inputTokens: 10, outputTokens: 5 });
+    expect(result.usage).toEqual({ inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheCreationTokens: 0 });
   });
 
   it('retries model connection failures before any stream event up to success', async () => {

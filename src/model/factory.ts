@@ -12,6 +12,8 @@ export interface ModelConfig {
   contextKeepImages?: number;
   /** 推理深度：none 关闭思考；low..max 对应 Anthropic effort。缺省=思考开启走模型默认深度。 */
   effort?: ReasoningEffort;
+  /** 每百万 token 单价（美元），用于会话成本折算。 */
+  pricing?: { input: number; output: number; cacheRead?: number; cacheWrite?: number };
 }
 
 /** 按配置创建模型实例（自定义 baseURL/apiKey + 协议）。 */

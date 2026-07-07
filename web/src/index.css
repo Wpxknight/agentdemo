@@ -816,6 +816,112 @@
     border-radius: 50%;
   }
 
+  /* ask_user 询问卡片 */
+  .question-card {
+    margin: 8px 12px;
+    padding: 14px;
+    border: 1px solid hsl(var(--primary) / .3);
+    border-radius: 12px;
+    background: hsl(var(--primary) / .04);
+    display: grid;
+    gap: 14px;
+  }
+
+  .question-block {
+    display: grid;
+    gap: 8px;
+  }
+
+  .question-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .question-chip {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: hsl(var(--primary) / .12);
+    color: hsl(var(--primary));
+  }
+
+  .question-options {
+    display: grid;
+    gap: 8px;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  }
+
+  .question-option {
+    display: grid;
+    gap: 2px;
+    text-align: left;
+    padding: 8px 10px;
+    border: 1px solid hsl(var(--border));
+    border-radius: 8px;
+    background: hsl(var(--background));
+    cursor: pointer;
+  }
+
+  .question-option:hover {
+    border-color: hsl(var(--primary) / .5);
+  }
+
+  .question-option.active {
+    border-color: hsl(var(--primary));
+    background: hsl(var(--primary) / .1);
+  }
+
+  .question-option-label {
+    font-weight: 600;
+    font-size: 13px;
+  }
+
+  .question-option small {
+    color: hsl(var(--muted-foreground));
+    font-size: 12px;
+  }
+
+  .question-actions {
+    display: flex;
+    justify-content: flex-end;
+  }
+
+  /* 变更方案预览（submit_change_plan 审批） */
+  .change-plan {
+    border: 1px solid hsl(var(--border));
+    border-radius: 8px;
+    padding: 10px 12px;
+    background: hsl(var(--background));
+    display: grid;
+    gap: 6px;
+    font-size: 13px;
+  }
+
+  .change-plan-head {
+    font-weight: 700;
+  }
+
+  .change-plan-list {
+    margin: 0;
+    padding-left: 18px;
+    display: grid;
+    gap: 4px;
+  }
+
+  .change-plan-meta {
+    display: flex;
+    gap: 8px;
+    color: hsl(var(--muted-foreground));
+  }
+
+  .change-plan-meta span {
+    min-width: 44px;
+    font-weight: 600;
+    color: hsl(var(--foreground));
+  }
+
   .task-spinner {
     width: 12px;
     height: 12px;

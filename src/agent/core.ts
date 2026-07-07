@@ -4,6 +4,8 @@ import type { PolicyMiddleware } from './policy.js';
 import type { ToolContext, ToolRegistry } from './tools.js';
 import type { ApprovalGate } from './approval.js';
 import type { HookRunner } from './hooks.js';
+import type { QuestionAnswers, QuestionSpec } from './question.js';
+import type { ChangePlan } from './plan.js';
 
 export interface RunAgentOptions {
   model: ChatModel;
@@ -57,6 +59,10 @@ export interface RunAgentOptions {
   filterToolDefs?: (defs: ToolDef[]) => ToolDef[];
   /** PreToolUse 钩子：策略放行后、dispatch 前执行，可拒绝调用。 */
   hooks?: HookRunner;
+  /** ask_user 工具的提问回调：暂停运行、推问题、等回答（HTTP 层实现交互式；缺省则工具不可用）。 */
+  askUser?: (questions: QuestionSpec[]) => Promise<QuestionAnswers | null>;
+  /** submit_change_plan 工具的审批回调：推送变更方案、等用户批准。 */
+  requestPlanApproval?: (plan: ChangePlan) => Promise<boolean>;
   /** 无人值守运行（定时任务）：系统提示改为“确认类操作跳过并汇报”，避免对着空气等确认。 */
   unattended?: boolean;
   /** 当前运行的取消信号；由 HTTP 终止会话或客户端断开触发。 */
@@ -67,6 +73,10 @@ export interface RunAgentOptions {
 export interface Usage {
   inputTokens: number;
   outputTokens: number;
+  /** 缓存读取的输入 token（含在 inputTokens 内，单列供成本折算）。 */
+  cacheReadTokens: number;
+  /** 缓存写入的输入 token（含在 inputTokens 内，单列供成本折算）。 */
+  cacheCreationTokens: number;
 }
 
 export interface RunAgentResult {
@@ -179,7 +189,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
   let steps = 0;
   let compacted = false;
   let compactionWatermark = opts.compactionWatermarkTokens ?? 0;
-  const usage: Usage = { inputTokens: 0, outputTokens: 0 };
+  const usage: Usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
 
   while (steps < maxSteps) {
     throwIfAborted(opts.signal);
@@ -232,6 +242,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
             // 失败尝试消耗的上游 token 是真实开销，保留累计不回滚。
             usage.inputTokens += ev.inputTokens;
             usage.outputTokens += ev.outputTokens;
+            usage.cacheReadTokens += ev.cacheReadTokens ?? 0;
+            usage.cacheCreationTokens += ev.cacheCreationTokens ?? 0;
           }
         }
         break;
@@ -358,6 +370,8 @@ async function runOneCall(call: ToolCall, opts: RunAgentOptions): Promise<ToolRe
         onOutput: ({ stream, text }) =>
           opts.onEvent?.({ type: 'tool_output', toolId: call.id, stream, text }),
         emitEvent: (e) => opts.onEvent?.(e),
+        ...(opts.askUser ? { askUser: opts.askUser } : {}),
+        ...(opts.requestPlanApproval ? { requestPlanApproval: opts.requestPlanApproval } : {}),
       }
     : opts.ctx;
   const result = await opts.tools.dispatch(call, callCtx);

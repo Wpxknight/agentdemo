@@ -154,6 +154,33 @@ export interface TodoItem {
   status: 'pending' | 'in_progress' | 'completed';
 }
 
+export interface QuestionOption {
+  label: string;
+  description?: string;
+}
+
+export interface QuestionSpec {
+  question: string;
+  header?: string;
+  options: QuestionOption[];
+  multiSelect?: boolean;
+}
+
+export interface ChangePlan {
+  summary: string;
+  changes: { action: string; target: string; detail?: string }[];
+  impact: string;
+  rollback: string;
+}
+
+export interface PendingQuestion {
+  id: string;
+  sessionId: string;
+  questions: QuestionSpec[];
+  /** 变更方案审批时携带的结构化方案（change_plan_required）。 */
+  plan?: ChangePlan;
+}
+
 export interface ChatMessage {
   id?: string;
   role: Role;

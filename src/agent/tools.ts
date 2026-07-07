@@ -1,6 +1,8 @@
 import type { JsonValue, StreamEvent, ToolCall, ToolDef, ToolResult } from '../model/types.js';
 import type { RequestContext, Role } from '../auth/types.js';
 import type { OutputSink } from '../sandbox/types.js';
+import type { QuestionAnswers, QuestionSpec } from './question.js';
+import type { ChangePlan } from './plan.js';
 
 /** 工具执行时可用的运行上下文（含租户身份，用于隔离与鉴权）。 */
 export interface ToolContext {
@@ -12,6 +14,13 @@ export interface ToolContext {
   onOutput?: OutputSink;
   /** 流式事件回调：工具主动推送结构化事件（如 todo_updated），由 agent loop 注入转发到 SSE。 */
   emitEvent?: (e: StreamEvent) => void;
+  /**
+   * 向用户提问并等待回答（ask_user 工具用）：暂停运行、推送问题、等前端提交答案。
+   * 返回每个问题 → 选中项列表；返回 null 表示未获回答（中止/无交互端）。
+   */
+  askUser?: (questions: QuestionSpec[]) => Promise<QuestionAnswers | null>;
+  /** 提交变更方案并等待用户审批（submit_change_plan 工具用）；返回是否批准。 */
+  requestPlanApproval?: (plan: ChangePlan) => Promise<boolean>;
   [key: string]: unknown;
 }
 
