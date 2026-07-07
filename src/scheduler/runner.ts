@@ -44,6 +44,8 @@ async function runScheduledTask(
     model: rt.model,
     tools: rt.tools,
     policy: t.preApproved ? rt.policyPreApproved : rt.policy,
+    filterToolDefs: (defs) => rt.permissionRules.filterToolDefs(defs),
+    hooks: rt.hooks,
     approval: new AutoDenyGate(), // 无人值守：未预批准的审批一律拒绝
     unattended: true, // 系统提示切换为“确认类操作跳过并汇报”，不对着空气等确认
     system: rt.systemExtra,

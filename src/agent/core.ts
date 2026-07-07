@@ -1,8 +1,9 @@
-import type { ChatModel, Msg, StreamEvent, ToolCall, ToolContentBlock, ToolResult } from '../model/types.js';
+import type { ChatModel, Msg, StreamEvent, ToolCall, ToolContentBlock, ToolDef, ToolResult } from '../model/types.js';
 import { compactMessages, estimateTokens, planCompaction, summaryMessage } from './context.js';
 import type { PolicyMiddleware } from './policy.js';
 import type { ToolContext, ToolRegistry } from './tools.js';
 import type { ApprovalGate } from './approval.js';
+import type { HookRunner } from './hooks.js';
 
 export interface RunAgentOptions {
   model: ChatModel;
@@ -49,6 +50,13 @@ export interface RunAgentOptions {
   modelRetryDelayMs?: number;
   /** needApproval 时的审批门；缺省则直接拒绝。 */
   approval?: ApprovalGate;
+  /**
+   * 注入模型前对工具定义做过滤（如权限规则剥离被无条件 deny 的工具）；缺省用全部已注册工具。
+   * 只影响模型可见的工具集，dispatch 时仍以 tools 注册表为准。
+   */
+  filterToolDefs?: (defs: ToolDef[]) => ToolDef[];
+  /** PreToolUse 钩子：策略放行后、dispatch 前执行，可拒绝调用。 */
+  hooks?: HookRunner;
   /** 无人值守运行（定时任务）：系统提示改为“确认类操作跳过并汇报”，避免对着空气等确认。 */
   unattended?: boolean;
   /** 当前运行的取消信号；由 HTTP 终止会话或客户端断开触发。 */
@@ -207,10 +215,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
         const sendMessages = opts.contextBudgetTokens
           ? compactMessages(messages, opts.contextBudgetTokens, opts.keepImages ?? 1)
           : messages;
+        const toolDefs = opts.filterToolDefs ? opts.filterToolDefs(opts.tools.defs()) : opts.tools.defs();
         for await (const ev of opts.model.stream({
           system,
           messages: sendMessages,
-          tools: opts.tools.defs(),
+          tools: toolDefs,
           signal: opts.signal,
         })) {
           throwIfAborted(opts.signal);
@@ -333,6 +342,14 @@ async function runOneCall(call: ToolCall, opts: RunAgentOptions): Promise<ToolRe
     }
   }
   throwIfAborted(opts.signal);
+  // PreToolUse 钩子：策略与审批都放行后、真正 dispatch 前执行；被拒绝则把原因回给模型。
+  if (opts.hooks && !opts.hooks.empty) {
+    const decision = await opts.hooks.preTool(call, opts.ctx);
+    throwIfAborted(opts.signal);
+    if (decision.denied) {
+      return { id: call.id, content: `blocked by hook: ${decision.reason ?? 'denied'}`, isError: true };
+    }
+  }
   // 为每个工具调用派生独立 ctx，注入按 call.id 归集的实时输出回调，
   // 供沙箱 stdout/stderr 流式回传到前端（不污染共享 opts.ctx，避免并发串台）。
   const callCtx: ToolContext = opts.onEvent
@@ -340,6 +357,7 @@ async function runOneCall(call: ToolCall, opts: RunAgentOptions): Promise<ToolRe
         ...opts.ctx,
         onOutput: ({ stream, text }) =>
           opts.onEvent?.({ type: 'tool_output', toolId: call.id, stream, text }),
+        emitEvent: (e) => opts.onEvent?.(e),
       }
     : opts.ctx;
   const result = await opts.tools.dispatch(call, callCtx);

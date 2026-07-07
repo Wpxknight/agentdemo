@@ -24,6 +24,29 @@
     }
   },
   "defaultModel": "my-claude",
+  // 工具权限规则（叠加在运维策略之上，覆盖所有工具）。语法：`工具名` 或 `工具名(子模式)`。
+  // deny > ask > allow；deny 且不带子模式的工具在发给模型前即被剥离。
+  // 子模式对 kubectl 是 `<verb>` / `<verb>:<资源名>`，对 sbx__run_command 是命令文本（shell 通配 * ?）。
+  // "permissions": {
+  //   "deny": ["kubectl(delete:*)", "sbx__run_command(*rm -rf /*)"],
+  //   "ask": ["kubectl(drain:*)", "mcp__github*"],
+  //   "allow": ["kubectl(get:*)", "kubectl(logs:*)"]
+  // },
+  // PreToolUse 钩子：工具执行前调外部处理器（可拒绝）。command 用退出码非 0 / stdout 含 "deny" 表示拒绝；
+  // webhook POST JSON，响应 {"decision":"deny","reason":"..."} 或非 2xx 表示拒绝。webhook 默认禁止打私网(SSRF)。
+  // "hooks": {
+  //   "preToolUse": [
+  //     { "type": "command", "command": "/opt/aiop/hooks/audit.sh", "tools": ["kubectl", "sbx__run_command"] },
+  //     { "type": "webhook", "url": "https://approval.example.com/aiop/pretool", "tools": ["kubectl(delete:*)"] }
+  //   ]
+  //   // "allowPrivateWebhook": true  // 仅内网自建审批系统时开启
+  // },
+  // web_fetch 工具：抓网页查文档。默认启用；allowedDomains 限制可访问域名（含子域）；默认禁止打私网。
+  // "webFetch": {
+  //   "enabled": true,
+  //   "allowedDomains": ["kubernetes.io", "docs.example.com"]
+  //   // "allowPrivate": true  // 仅内网文档站点时开启
+  // },
   // 技能目录。summaryBudget：技能摘要注入 system prompt 的字符预算（默认 4000）。
   // sandboxEnv：把稳定环境信息（如平台地址）注入会话沙箱环境变量；凭据类键（PASSWORD/TOKEN/SECRET 等）会被 schema 拒绝。
   "skills": {

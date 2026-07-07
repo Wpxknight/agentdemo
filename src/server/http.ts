@@ -1276,6 +1276,8 @@ async function runAgentSse(
       model: rt.model,
       tools: rt.tools,
       policy: rt.policy,
+      filterToolDefs: (defs) => rt.permissionRules.filterToolDefs(defs),
+      hooks: rt.hooks,
       approval: new InteractiveApprovalGate({
         store: approvals,
         emit: (pending) => sse('approval_required', pending),

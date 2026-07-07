@@ -68,6 +68,7 @@ import type {
   SessionsBody,
   TaskRun,
   TaskStep,
+  TodoItem,
   McpServerBody,
   McpServerInfo,
   McpServersBody,
@@ -465,6 +466,27 @@ function ThinkingBlock({ content, streaming }: { content: string; streaming?: bo
   );
 }
 
+function TodoList({ todos }: { todos: TodoItem[] }) {
+  const done = todos.filter((t) => t.status === 'completed').length;
+  return (
+    <div className="task-progress todo-list">
+      <div className="task-progress-head">
+        任务清单 <span className="task-progress-count">{done}/{todos.length}</span>
+      </div>
+      <ul className="task-progress-list">
+        {todos.map((todo, index) => (
+          <li key={`${index}-${todo.content}`} className={`task-step todo-${todo.status}`}>
+            <span className="task-step-icon">
+              {todo.status === 'completed' ? <Check /> : todo.status === 'in_progress' ? <span className="task-spinner" /> : <span className="todo-dot" />}
+            </span>
+            <span className="task-step-label">{todo.content}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 function TaskProgress({ steps }: { steps: TaskStep[] }) {
   const done = steps.filter((s) => s.status !== 'running').length;
   return (
@@ -617,6 +639,7 @@ function MessageContent({ message }: { message: ChatMessage }) {
       {thinkingSegments.map((segment, index) => (
         <ThinkingBlock key={`thinking-${index}`} content={segment.content} streaming={segment.streaming} />
       ))}
+      {message.todos?.length ? <TodoList todos={message.todos} /> : null}
       {message.steps?.length ? <TaskProgress steps={message.steps} /> : null}
       {textSegments.map((segment, index) => (
         <Fragment key={`text-${index}`}>
@@ -1139,6 +1162,12 @@ export default function App() {
             && (event.data?.stream === 'stdout' || event.data?.stream === 'stderr')
           ) {
             pushTerminal(formatSandboxOutputChunk(event.data.stream, event.data.text));
+          }
+          if (event?.event === 'todo_updated' && Array.isArray(event.data?.todos)) {
+            assistant.todos = (event.data.todos as TodoItem[]).filter(
+              (t) => t && typeof t.content === 'string' && typeof t.status === 'string',
+            );
+            publishAssistant();
           }
           if (event?.event === 'tool_result' && typeof event.data?.toolId === 'string') {
             const toolId = event.data.toolId;

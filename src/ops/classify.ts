@@ -30,13 +30,21 @@ const VALUE_FLAGS = new Set([
 
 /** 取 verb：跳过前置 flag 及其值（`-n ns logs ...` → logs）。 */
 function firstVerb(args: string[]): string {
+  return positionals(args)[0] ?? '';
+}
+
+/** 提取位置参数（跳过所有 flag 及带值 flag 的值），第一个是 verb，其余是目标。 */
+export function positionals(args: string[]): string[] {
+  const out: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
-    if (!a.startsWith('-')) return a;
-    // `--flag=value` 自带值；`-n value` 形式需跳过下一个 token
-    if (!a.includes('=') && VALUE_FLAGS.has(a)) i++;
+    if (!a.startsWith('-')) {
+      out.push(a);
+      continue;
+    }
+    if (!a.includes('=') && VALUE_FLAGS.has(a)) i++; // 跳过 `-n value` 的 value
   }
-  return '';
+  return out;
 }
 
 function hasFlag(args: string[], ...flags: string[]): boolean {

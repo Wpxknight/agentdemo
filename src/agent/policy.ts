@@ -5,6 +5,7 @@ import type { AuditSink } from '../audit/sink.js';
 import { LogAuditSink } from '../audit/sink.js';
 import { classifyKubectl, kubectlScope, parseKubectlArgs } from '../ops/classify.js';
 import { can } from './../auth/rbac.js';
+import { PermissionRules } from './rules.js';
 
 /** dispatch 前的策略判定（读写分离 / dry-run / 审批 / 危险命令拦截）。 */
 export interface PolicyDecision {
@@ -31,6 +32,8 @@ export interface OpsPolicyOptions {
   preApproved?: boolean;
   /** sbx__run_command 高危 shell 拦截开关，默认开。 */
   guardShell?: boolean;
+  /** 工具权限规则引擎（管理员配置的 allow/deny/ask），优先于内置运维策略。 */
+  rules?: PermissionRules;
 }
 
 /** rm -rf / 之类的高危 shell 片段。 */
@@ -51,16 +54,40 @@ export class OpsPolicy implements PolicyMiddleware {
   private readonly audit: AuditSink;
   private readonly preApproved: boolean;
   private readonly guardShell: boolean;
+  private readonly rules?: PermissionRules;
 
   constructor(opts: OpsPolicyOptions) {
     this.clusters = opts.clusters;
     this.audit = opts.audit ?? new LogAuditSink();
     this.preApproved = opts.preApproved ?? false;
     this.guardShell = opts.guardShell ?? true;
+    this.rules = opts.rules;
   }
 
   async check(call: ToolCall, ctx?: ToolContext): Promise<PolicyDecision> {
-    if (call.name === 'kubectl') return this.checkKubectl(call, ctx);
+    // 规则引擎优先：deny 直接拦截；ask 转审批；allow 跳过内置策略（但危险命令底线仍拦，见下）。
+    const match = this.rules?.evaluate(call);
+    if (match?.effect === 'deny') {
+      return this.emit('block', { blocked: true, reason: `规则拒绝：${match.rule}` }, {
+        tenantId: ctx?.tenantId, sessionId: ctx?.sessionId, tool: call.name, detail: { rule: match.rule },
+      });
+    }
+    if (match?.effect === 'ask') {
+      if (this.preApproved || (ctx?.role && can(ctx.role, 'approve'))) {
+        return this.emit('allow', { blocked: false }, {
+          tenantId: ctx?.tenantId, sessionId: ctx?.sessionId, tool: call.name, detail: { rule: match.rule, preApproved: this.preApproved },
+        });
+      }
+      return this.emit('approve-required', { blocked: false, needApproval: true }, {
+        tenantId: ctx?.tenantId, sessionId: ctx?.sessionId, tool: call.name, detail: { rule: match.rule },
+      });
+    }
+
+    // 危险命令底线：即使被 allow 规则命中，rm -rf / 之类仍拦截（allow 不应绕过硬安全）。
+    if (call.name === 'kubectl') {
+      if (match?.effect === 'allow') return this.checkKubectl(call, ctx, { skipApproval: true });
+      return this.checkKubectl(call, ctx);
+    }
     if (call.name === 'sbx__run_command' && this.guardShell) {
       return this.checkShell(call, ctx);
     }
@@ -76,7 +103,7 @@ export class OpsPolicy implements PolicyMiddleware {
     return decision;
   }
 
-  private async checkKubectl(call: ToolCall, ctx?: ToolContext): Promise<PolicyDecision> {
+  private async checkKubectl(call: ToolCall, ctx?: ToolContext, opts?: { skipApproval?: boolean }): Promise<PolicyDecision> {
     const { cluster, args } = parseKubectlArgs(call.args);
     const sessionId = ctx?.sessionId;
     const tenantId = ctx?.tenantId;
@@ -126,6 +153,10 @@ export class OpsPolicy implements PolicyMiddleware {
         return this.emit('block', { blocked: true, reason: `集群 ${cluster} 为只读，拒绝变更（${cls.verb}）` }, base);
       }
       if (info.production) {
+        // 显式 allow 规则命中：跳过生产审批（但上面的危险命令/ACL/只读拦截仍已生效）
+        if (opts?.skipApproval) {
+          return this.emit('allow', { blocked: false }, { ...base, detail: { ...base.detail, allowRule: true } });
+        }
         // 有审批权（管理员）→ 自动放行；否则预批准放行，再否则需人工审批
         if (can(role, 'approve')) {
           return this.emit('allow', { blocked: false }, { ...base, detail: { ...base.detail, approvedBy: role } });

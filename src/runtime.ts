@@ -5,6 +5,8 @@ import type { ChatModel } from './model/types.js';
 import { ToolRegistry } from './agent/tools.js';
 import { AllowAllPolicy, OpsPolicy } from './agent/policy.js';
 import type { PolicyMiddleware } from './agent/policy.js';
+import { PermissionRules } from './agent/rules.js';
+import { HookRunner } from './agent/hooks.js';
 import { SandboxManager } from './sandbox/lifecycle.js';
 import { E2bProvider } from './sandbox/e2b.js';
 import { OpenSandboxProvider } from './sandbox/opensandbox.js';
@@ -31,6 +33,8 @@ import { readMysqlConfig } from './config/mysql.js';
 import { createStore } from './db/index.js';
 import type { LlmSettings, Store } from './db/store.js';
 import { buildScheduleTools } from './tools/schedule.js';
+import { buildTodoTool } from './tools/todo.js';
+import { buildWebFetchTool } from './tools/webfetch.js';
 import {
   findSandboxProfile,
   publicSandboxProfiles,
@@ -66,6 +70,10 @@ export interface Runtime {
   policy: PolicyMiddleware;
   /** 无人值守策略（定时任务 preApproved 时使用）。 */
   policyPreApproved: PolicyMiddleware;
+  /** 工具权限规则引擎（用于注入模型前剥离被无条件 deny 的工具）。 */
+  permissionRules: PermissionRules;
+  /** PreToolUse 钩子运行器（外部系统联动 / 合规拦截）。 */
+  hooks: HookRunner;
   /** 本地认证提供方（登录 / token 校验）。 */
   authProvider: AuthProvider;
   /** 会话 JWT 密钥（HTTP 层签发 OIDC 临时 state cookie 等用）。 */
@@ -115,9 +123,15 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
 
   const clusters = new ClusterRegistry(config.clusters);
   const hasClusters = clusters.list().length > 0;
-  const policy: PolicyMiddleware = hasClusters ? new OpsPolicy({ clusters, audit }) : new AllowAllPolicy();
-  const policyPreApproved: PolicyMiddleware = hasClusters
-    ? new OpsPolicy({ clusters, audit, preApproved: true })
+  const permissionRules = new PermissionRules(config.permissions);
+  const hooks = new HookRunner(config.hooks, { allowPrivateWebhook: config.hooks?.allowPrivateWebhook });
+  // 有集群，或配置了权限规则时启用 OpsPolicy（规则覆盖所有工具，不止 kubectl）。
+  const useOpsPolicy = hasClusters || !permissionRules.empty;
+  const policy: PolicyMiddleware = useOpsPolicy
+    ? new OpsPolicy({ clusters, audit, rules: permissionRules })
+    : new AllowAllPolicy();
+  const policyPreApproved: PolicyMiddleware = useOpsPolicy
+    ? new OpsPolicy({ clusters, audit, preApproved: true, rules: permissionRules })
     : new AllowAllPolicy();
 
   let sandboxes: SandboxManager | undefined;
@@ -213,6 +227,18 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
   // 定时任务工具（持久化已就绪）
   for (const t of buildScheduleTools(store)) tools.register(t);
 
+  // TodoWrite：长任务进度清单（前端实时渲染）
+  tools.register(buildTodoTool());
+
+  // WebFetch：抓取网页内容（域名白名单 + SSRF 防护）；默认启用
+  if (config.webFetch?.enabled ?? true) {
+    tools.register(buildWebFetchTool({
+      allowedDomains: config.webFetch?.allowedDomains,
+      allowPrivate: config.webFetch?.allowPrivate,
+      timeoutMs: config.webFetch?.timeoutMs,
+    }));
+  }
+
   let systemExtra = '';
   let skillRegistry: SkillRegistry | undefined;
   if (config.skills?.dir) {
@@ -280,6 +306,8 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     systemExtra,
     policy,
     policyPreApproved,
+    permissionRules,
+    hooks,
     authProvider,
     jwtSecret,
     defaultContext,

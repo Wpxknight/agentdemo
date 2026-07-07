@@ -1,4 +1,4 @@
-import type { JsonValue, ToolCall, ToolDef, ToolResult } from '../model/types.js';
+import type { JsonValue, StreamEvent, ToolCall, ToolDef, ToolResult } from '../model/types.js';
 import type { RequestContext, Role } from '../auth/types.js';
 import type { OutputSink } from '../sandbox/types.js';
 
@@ -10,6 +10,8 @@ export interface ToolContext {
   role?: Role;
   /** 实时输出回调：工具执行期把 stdout/stderr 分片回传（由 agent loop 注入，按工具调用归集）。 */
   onOutput?: OutputSink;
+  /** 流式事件回调：工具主动推送结构化事件（如 todo_updated），由 agent loop 注入转发到 SSE。 */
+  emitEvent?: (e: StreamEvent) => void;
   [key: string]: unknown;
 }
 

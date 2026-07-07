@@ -149,6 +149,11 @@ export interface TaskStep {
   status: 'running' | 'done' | 'error';
 }
 
+export interface TodoItem {
+  content: string;
+  status: 'pending' | 'in_progress' | 'completed';
+}
+
 export interface ChatMessage {
   id?: string;
   role: Role;
@@ -156,6 +161,8 @@ export interface ChatMessage {
   thinking?: string;
   /** 任务执行进度：每个工具调用一步，实时标记完成/失败。 */
   steps?: TaskStep[];
+  /** 模型通过 todo_write 维护的任务清单（长任务进度）。 */
+  todos?: TodoItem[];
   running?: boolean;
   time: string;
   tools?: string[];

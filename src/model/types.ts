@@ -90,7 +90,15 @@ export type StreamEvent =
   | { type: 'usage'; inputTokens: number; outputTokens: number }
   /** 历史逼近上下文窗口，已把最旧的若干消息摘要压缩成一段（供前端提示 / 日志）。 */
   | { type: 'context_compacted'; summarizedMessages: number; beforeTokens: number; afterTokens: number }
+  /** 模型通过 todo_write 更新了任务清单（供前端实时渲染进度）。 */
+  | { type: 'todo_updated'; todos: TodoItem[] }
   | { type: 'stop'; reason: string };
+
+/** 任务清单项（todo_write 工具维护）。 */
+export interface TodoItem {
+  content: string;
+  status: 'pending' | 'in_progress' | 'completed';
+}
 
 export interface StreamInput {
   system: string;

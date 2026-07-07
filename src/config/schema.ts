@@ -124,9 +124,54 @@ export const AuthConfigSchema = z.object({
   oidc: OidcConfigSchema.optional(),
 });
 
+/** 工具权限规则：allow/deny/ask，语法 `工具名` 或 `工具名(子模式)`。deny 优先级最高。 */
+export const PermissionRulesSchema = z.object({
+  allow: z.array(z.string()).optional(),
+  deny: z.array(z.string()).optional(),
+  ask: z.array(z.string()).optional(),
+});
+
+/** PreToolUse 钩子：工具执行前调用外部处理器，可拒绝调用。 */
+export const HookSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('command'),
+    command: z.string(),
+    tools: z.array(z.string()).optional(),
+    timeoutMs: z.number().int().positive().optional(),
+  }),
+  z.object({
+    type: z.literal('webhook'),
+    url: z.string(),
+    headers: z.record(z.string(), z.string()).optional(),
+    tools: z.array(z.string()).optional(),
+    timeoutMs: z.number().int().positive().optional(),
+  }),
+]);
+
+export const HooksConfigSchema = z.object({
+  preToolUse: z.array(HookSchema).optional(),
+  /** 允许 webhook 目标解析到私网地址（仅内网自建审批系统时开启）。默认禁止（防 SSRF）。 */
+  allowPrivateWebhook: z.boolean().optional(),
+});
+
 export const ConfigSchema = z.object({
   models: z.record(z.string(), ModelConfigSchema),
   defaultModel: z.string(),
+  /** 工具权限规则引擎（叠加在运维策略之上，覆盖所有工具）。 */
+  permissions: PermissionRulesSchema.optional(),
+  /** PreToolUse 钩子（外部系统联动 / 合规拦截）。 */
+  hooks: HooksConfigSchema.optional(),
+  /** web_fetch 工具配置；不配置则不注册该工具。 */
+  webFetch: z
+    .object({
+      enabled: z.boolean().default(true),
+      /** 允许访问的域名白名单（含子域）；为空表示不限制（仍受私网防护约束）。 */
+      allowedDomains: z.array(z.string()).optional(),
+      /** 允许目标解析到私网地址（仅内网文档站点时开启）。 */
+      allowPrivate: z.boolean().optional(),
+      timeoutMs: z.number().int().positive().optional(),
+    })
+    .optional(),
   skills: z
     .object({
       dir: z.string(),
