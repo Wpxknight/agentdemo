@@ -24,7 +24,13 @@
     }
   },
   "defaultModel": "my-claude",
-  "skills": { "dir": "./skills" },
+  // 技能目录。summaryBudget：技能摘要注入 system prompt 的字符预算（默认 4000）。
+  // sandboxEnv：把稳定环境信息（如平台地址）注入会话沙箱环境变量；凭据类键（PASSWORD/TOKEN/SECRET 等）会被 schema 拒绝。
+  "skills": {
+    "dir": "./skills"
+    // "summaryBudget": 4000,
+    // "sandboxEnv": { "AIOS_BASE_URL": "http://10.10.72.20:30001/paas-web", "AIOS_CLIENT_ID": "..." }
+  },
   // 认证：local（默认，用户名口令）或 oidc（SSO）。HTTP 服务接入后生效
   "auth": {
     "provider": "local"

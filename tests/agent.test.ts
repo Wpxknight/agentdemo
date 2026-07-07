@@ -1,3 +1,6 @@
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { runAgent } from '../src/agent/core.js';
 import { ToolRegistry } from '../src/agent/tools.js';
@@ -329,7 +332,14 @@ describe('runAgent', () => {
   });
 
   it('exposes skill summaries so the model can auto-load a relevant skill during chat', async () => {
-    const skills = new SkillRegistry('skills');
+    // 独立 fixture：不依赖仓库 skills/ 目录的真实技能集合（其内容会随业务变化）。
+    const skillsDir = await mkdtemp(join(tmpdir(), 'aiop-agent-skills-'));
+    await mkdir(join(skillsDir, 'inspect'));
+    await writeFile(
+      join(skillsDir, 'inspect', 'SKILL.md'),
+      '---\nname: inspect\ndescription: 集群健康巡检\n---\n# 集群巡检\n1. kubectl get pods',
+    );
+    const skills = new SkillRegistry(skillsDir);
     await skills.scan();
 
     const tools = new ToolRegistry();

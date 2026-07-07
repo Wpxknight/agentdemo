@@ -127,7 +127,26 @@ export const AuthConfigSchema = z.object({
 export const ConfigSchema = z.object({
   models: z.record(z.string(), ModelConfigSchema),
   defaultModel: z.string(),
-  skills: z.object({ dir: z.string() }).optional(),
+  skills: z
+    .object({
+      dir: z.string(),
+      /** summaries() 注入 system prompt 的总字符预算（默认 4000）。 */
+      summaryBudget: z.number().int().positive().optional(),
+      /** 注入会话沙箱的稳定环境信息（如 AIOS_BASE_URL）；凭据禁止走此通道。 */
+      sandboxEnv: z.record(z.string(), z.string()).optional(),
+    })
+    .superRefine((value, ctx) => {
+      for (const key of Object.keys(value.sandboxEnv ?? {})) {
+        if (/(PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|CREDENTIAL)/i.test(key)) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['sandboxEnv', key],
+            message: `skills.sandboxEnv 禁止注入疑似凭据的键：${key}（凭据只能在对话中运行时提供）`,
+          });
+        }
+      }
+    })
+    .optional(),
   auth: AuthConfigSchema.optional(),
   sandbox: SandboxConfigSchema.optional(),
   mcpServers: z.record(z.string(), McpServerSchema).optional(),

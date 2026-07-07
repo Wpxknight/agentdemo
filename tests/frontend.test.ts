@@ -112,11 +112,11 @@ describe('frontend API wiring', () => {
     expect(app).toContain('selectedRunId');
     expect(app).toContain('setSelectedTaskId(task.id)');
     expect(app).toContain('setSelectedRunId(run.id)');
-    expect(app).toContain('className="schedule-task-button"');
+    expect(app).toContain('className="schedule-task-cell"');
     expect(app).toContain('className="schedule-run-button"');
     expect(app).toContain('className="schedule-run-detail"');
     expect(app).toContain('执行结果');
-    expect(css).toContain('.schedule-task-button');
+    expect(css).toContain('.schedule-task-cell');
     expect(css).toContain('.schedule-run-button');
     expect(css).toContain('.schedule-run-detail');
   });
@@ -477,7 +477,7 @@ describe('frontend API wiring', () => {
     expect(app).toContain('const [selectedSandboxId, setSelectedSandboxId] = useState<string | null>(null)');
     expect(app).toContain('selectedRowIndex={selectedIndex >= 0 ? selectedIndex : null}');
     expect(app).toContain('onRowClick={(rowIndex) => setSelectedSandboxId(sandboxes[rowIndex]?.id ?? null)}');
-    expect(app).toContain('{selected ? <aside className="detail-card sandbox-detail-card">');
+    expect(app).toContain('<ModalDialog title={selected.id} status={selected.status} icon={<Cuboid />}');
     expect(app).toContain('当前没有运行中的沙箱。');
     expect(app).not.toContain('选择沙箱查看详情');
     expect(app).not.toContain('暂无运行中沙箱');

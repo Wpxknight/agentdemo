@@ -16,6 +16,8 @@ import { LocalDesktopProvider } from './sandbox/local-desktop.js';
 import { OpenSandboxDesktopProvider } from './sandbox/opensandbox-desktop.js';
 import type { DesktopHandle, DesktopProvider } from './sandbox/desktop.js';
 import { buildSandboxTools } from './tools/builtin.js';
+import type { SpecResolver } from './tools/builtin.js';
+import { buildSkillTools } from './tools/skill.js';
 import { buildSandboxProfileTools } from './tools/sandbox-profiles.js';
 import { buildBrowserTools } from './tools/browser.js';
 import { McpManager } from './mcp/manager.js';
@@ -120,6 +122,7 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
 
   let sandboxes: SandboxManager | undefined;
   let sandboxProfiles: SandboxProfile[] = [];
+  let sessionSandboxResolver: SpecResolver | undefined;
   let warmPoolRef: WarmPool | undefined;
   let sandboxSweepTimer: ReturnType<typeof setInterval> | undefined;
   const desktops = new Map<string, Promise<DesktopHandle>>();
@@ -163,8 +166,13 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     }, sweepMs);
     sandboxSweepTimer.unref?.();
     const defaultProfile = selectDefaultProfile(sandboxProfiles);
-    const defaultResolver = (ctx: { sessionId: string }) =>
-      defaultProfile ? sandboxSpecForProfile(defaultProfile, ctx) : { key: ctx.sessionId };
+    // skills.sandboxEnv：管理员配置的稳定环境信息（如 AIOS_BASE_URL），注入会话沙箱环境变量。
+    const skillSandboxEnv = config.skills?.sandboxEnv;
+    const defaultResolver: SpecResolver = (ctx) => {
+      const spec = defaultProfile ? sandboxSpecForProfile(defaultProfile, ctx) : { key: ctx.sessionId };
+      return skillSandboxEnv ? { ...spec, envs: { ...skillSandboxEnv, ...spec.envs } } : spec;
+    };
+    sessionSandboxResolver = defaultResolver;
     for (const t of buildSandboxTools(sandboxes, defaultResolver)) tools.register(t);
     for (const t of buildSandboxProfileTools(sandboxes, sandboxProfiles)) tools.register(t);
     logger.info({ sweepMs }, 'sandbox tools enabled');
@@ -208,9 +216,9 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
   let systemExtra = '';
   let skillRegistry: SkillRegistry | undefined;
   if (config.skills?.dir) {
-    const skills = new SkillRegistry(config.skills.dir);
+    const skills = new SkillRegistry(config.skills.dir, { summaryBudget: config.skills.summaryBudget });
     await skills.scan();
-    tools.register(skills.tool());
+    for (const t of buildSkillTools(skills, sandboxes, sessionSandboxResolver)) tools.register(t);
     skillRegistry = skills;
     systemExtra = skills.summaries();
   }

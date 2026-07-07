@@ -128,6 +128,9 @@ export class AnthropicModel implements ChatModel {
     const pending = new Map<number, { id: string; name: string; json: string }>();
     // 累积进行中的思考块（index -> 文本 + 签名），结束时整块上报供回填
     const thinkingBlocks = new Map<number, { thinking: string; signature: string }>();
+    // 已上报的输入用量：兼容只在 message_delta 末尾才报 input_tokens 的网关（如部分 anthropic 协议代理），
+    // 两处都读、按增量去重，避免重复累计。
+    let reportedInputTokens = 0;
 
     for await (const ev of stream) {
       switch (ev.type) {
@@ -136,7 +139,10 @@ export class AnthropicModel implements ChatModel {
           const u = ev.message.usage;
           const inputTokens =
             (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
-          if (inputTokens > 0) yield { type: 'usage', inputTokens, outputTokens: 0 };
+          if (inputTokens > 0) {
+            reportedInputTokens += inputTokens;
+            yield { type: 'usage', inputTokens, outputTokens: 0 };
+          }
           break;
         }
 
@@ -196,10 +202,20 @@ export class AnthropicModel implements ChatModel {
 
         case 'message_delta':
           if (ev.usage) {
+            const du = ev.usage as {
+              output_tokens?: number | null;
+              input_tokens?: number | null;
+              cache_creation_input_tokens?: number | null;
+              cache_read_input_tokens?: number | null;
+            };
+            const totalInput =
+              (du.input_tokens ?? 0) + (du.cache_creation_input_tokens ?? 0) + (du.cache_read_input_tokens ?? 0);
+            const inputDelta = Math.max(0, totalInput - reportedInputTokens);
+            reportedInputTokens += inputDelta;
             yield {
               type: 'usage',
-              inputTokens: 0,
-              outputTokens: ev.usage.output_tokens ?? 0,
+              inputTokens: inputDelta,
+              outputTokens: du.output_tokens ?? 0,
             };
           }
           if (ev.delta.stop_reason) {
