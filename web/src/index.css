@@ -1649,6 +1649,13 @@
     height: 16px;
   }
 
+  /* 传统文件管理器审美：文件夹恒为琥珀色（含悬浮态），文件保持中性色 */
+  .skill-tree-node.directory svg {
+    color: #d97706;
+    fill: #fbbf24;
+    fill-opacity: .28;
+  }
+
   .skill-file-row span {
     overflow: hidden;
     text-overflow: ellipsis;

@@ -15,6 +15,9 @@ import {
   Cuboid,
   Cpu,
   Database,
+  FileText,
+  Folder,
+  FolderTree,
   Globe,
   KeyRound,
   Link2,
@@ -30,6 +33,7 @@ import {
   Search,
   Send,
   Settings,
+  SquarePen,
   Terminal,
   TerminalSquare,
   Trash2,
@@ -2579,7 +2583,7 @@ function skillIconFor(tool?: ToolSummary) {
   const text = `${tool?.name || ''} ${tool?.description || ''}`.toLowerCase();
   if (text.includes('kubectl') || text.includes('集群')) return TerminalSquare;
   if (text.includes('web') || text.includes('browser')) return Globe;
-  if (text.includes('pdf') || text.includes('doc')) return Code2;
+  if (text.includes('pdf') || text.includes('doc')) return FileText;
   return Boxes;
 }
 
@@ -2835,7 +2839,7 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
                     else void loadSkillFile(entry.path);
                   }}
                 >
-                  {entry.isDirectory ? <Boxes /> : <Code2 />}
+                  {entry.isDirectory ? <Folder /> : <FileText />}
                   <span>{entry.name}</span>
                 </button>
               ))}
@@ -2853,7 +2857,7 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
             </div>
             <div className="skill-detail-actions">
               <Button variant="outline" size="sm" type="button" onClick={() => setShowSkillFiles((value) => !value)}>
-                <Boxes data-icon="inline-start" />
+                <FolderTree data-icon="inline-start" />
                 {showSkillFiles ? '隐藏目录' : '目录'}
               </Button>
               <Button variant="outline" size="sm" type="button" onClick={() => void toggleSkillEnabled()}>
@@ -3100,7 +3104,7 @@ function McpPage({ tools, api, output, onTest, onRequestConfirm, onChanged }: {
         </ModalDialog>
       ) : null}
       {selected ? (
-        <ModalDialog title={selected.name} status={mcpStatusText(selected.status)} icon={<Boxes />} onClose={() => setSelectedName('')}>
+        <ModalDialog title={selected.name} status={mcpStatusText(selected.status)} icon={<Link2 />} onClose={() => setSelectedName('')}>
           <div className="detail-panel">
             <h3>连接配置</h3>
             <div className="kv">
@@ -3464,7 +3468,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
                 {selectedTask.enabled ? '暂停' : '启用'}
               </Button>
               <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => (editing ? setEditing(false) : startEdit(selectedTask))}>
-                <Code2 data-icon="inline-start" />
+                <SquarePen data-icon="inline-start" />
                 {editing ? '取消编辑' : '编辑'}
               </Button>
               <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => requestDelete(selectedTask)}>
