@@ -187,4 +187,31 @@
 # 待确认
 
 1. **①** A2.3 `skills.sandboxEnv` 服务端注入层：做 / 不做（不做则环境信息完全靠对话提供）。
-2. **②** 本次交付范围：M1，还是 M1+M2，还是 M1+M2+M3。
+   —— 已实现（含凭据类键 schema 拒绝），2026-07-08。
+2. **②** 本次交付范围：M1，还是 M1+M2，还是 M1+M2+M3。—— 先交付 M1（本次），后续按 P0→P1 分批。
+
+---
+
+# 附录：M1 端到端验证记录（2026-07-08）
+
+代码 `f0d2c70`，281 测试全过，部署 `aiop-dev`。验证会话 `9900000000000002`，
+任务原话："用aios-request技能 统计下 http://10.10.72.20:30001/ 平台任务资源占用情况…（凭据对话内提供）"。
+
+**轨迹（13 步，与设计的六步流程一致）：**
+
+1. `load_skill("aios-request")` ✓
+2. `skill__read_file` 读 `aios-base/SKILL.md`、`aios-report/SKILL.md` ✓
+3. `skill__sync_to_sandbox`（全量）→ 触发 16MB 总量上限报错（guide-knowledge 47MB 为大量
+   ≤2MB 小文件，绕过单文件过滤）→ 模型按报错指引改用
+   `paths: ["aios-base","aios-report"]` 重试成功（47 文件 / 174KB）——双保险按设计工作 ✓
+4. 沙箱内 `env | grep AIOS_` 检查环境变量 ✓
+5. 探测平台：会话沙箱与 netdiag 沙箱双路探测 `30001` 均超时（该地址从宿主机也不可达，
+   属环境网络问题，非 aiop 缺陷）；模型未回显密码、未执行修改操作，正确汇报阻塞并列出
+   所需信息（网络可达性 + `AIOS_CLIENT_ID`）✓
+6. usage 统计修复生效：`inputTokens=125335, outputTokens=2129`（此前恒 0）✓
+
+**遗留（环境侧，非代码问题）：**
+
+- `10.10.72.20:30001` 需从沙箱可达（当前整机不可达，需网络打通或改地址）；
+- `AIOS_CLIENT_ID` 需用户提供（建议配入 `skills.sandboxEnv`）；
+- 沙箱镜像缺 `requests`/`cryptography`，建议预装进 opensandbox 模板镜像（需单独确认）。
