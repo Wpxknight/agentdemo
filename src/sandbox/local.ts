@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -85,6 +85,13 @@ class LocalSandboxHandle implements SandboxHandle {
   async runCommand(command: string, opts?: RunCommandOpts): Promise<ExecResult> {
     if (this.killed) return { stdout: '', stderr: '', exitCode: 1, error: 'sandbox already killed' };
     return runProcess('bash', ['-lc', command], { cwd: this.dir, timeoutMs: opts?.timeoutMs, onOutput: opts?.onOutput });
+  }
+
+  async readFile(p: string): Promise<Uint8Array> {
+    if (this.killed) throw new Error('sandbox already killed');
+    // 相对路径按沙箱工作目录解析（命令默认 cwd 即此目录）；绝对路径原样读取。
+    const target = path.isAbsolute(p) ? p : path.resolve(this.dir, p);
+    return readFile(target);
   }
 
   async setTimeout(_ms: number): Promise<void> {

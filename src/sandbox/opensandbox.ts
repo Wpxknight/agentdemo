@@ -108,6 +108,10 @@ class OpenSandboxHandle implements SandboxHandle {
     return toExecResult(exec);
   }
 
+  async readFile(path: string): Promise<Uint8Array> {
+    return this.sbx.files.readBytes(path);
+  }
+
   async setTimeout(ms: number): Promise<void> {
     await this.sbx.renew(Math.ceil(ms / 1000)); // 续期防回收
   }

@@ -83,6 +83,12 @@ function sendHtml(res: Res, status: number, html: string): void {
   res.end(buf);
 }
 
+/** attachment 头：ASCII 兜底 filename + RFC 5987 filename*（保留中文等非 ASCII 文件名）。 */
+function contentDisposition(name: string): string {
+  const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+
 async function sendWebAsset(res: Res, path: string): Promise<boolean> {
   if (path === '/favicon.ico') {
     res.writeHead(204);
@@ -526,6 +532,24 @@ async function handle(
   if (route === 'GET /v1/browser/stream-view') {
     return sendHtml(res, 200, browserStreamView(url.searchParams.get('sessionId') || 'default'));
   }
+
+  // —— 文件下载（能力 URL：令牌自带签名，无需 Bearer，锚点点击即可下载）——
+  const downloadMatch = /^\/v1\/files\/([^/]+)$/.exec(path);
+  if (method === 'GET' && downloadMatch) {
+    if (!rt.downloads) throw new HttpError(404, '下载未启用');
+    const opened = await rt.downloads.open(decodeURIComponent(downloadMatch[1]!)).catch(() => undefined);
+    if (!opened) throw new HttpError(404, '下载链接无效或已过期');
+    res.writeHead(200, {
+      'content-type': opened.meta.mime || 'application/octet-stream',
+      'content-length': opened.size,
+      'content-disposition': contentDisposition(opened.meta.name),
+      'cache-control': 'private, no-store',
+    });
+    opened.stream.on('error', () => { if (!res.writableEnded) res.end(); });
+    opened.stream.pipe(res);
+    return;
+  }
+
   if (method === 'GET' && await sendWebAsset(res, path)) return;
 
   // —— 本地登录 ——

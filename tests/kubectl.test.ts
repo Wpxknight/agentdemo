@@ -16,6 +16,7 @@ function echoManager() {
       lastCmd.value = cmd;
       return { stdout: `OK: ${cmd}`, stderr: '', exitCode: 0 };
     }),
+    readFile: vi.fn(async () => new Uint8Array()),
     setTimeout: vi.fn(async () => {}),
     kill: vi.fn(async () => {}),
   };
@@ -90,6 +91,7 @@ describe('kubectl tool', () => {
       sandboxId: 'sb',
       runCode: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '' })),
       runCommand: vi.fn(async (): Promise<ExecResult> => ({ stdout: 'ok', stderr: '', exitCode: 0 })),
+      readFile: vi.fn(async () => new Uint8Array()),
       setTimeout: vi.fn(async () => {}),
       kill: vi.fn(async () => {}),
     };

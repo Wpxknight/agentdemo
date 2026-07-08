@@ -34,6 +34,7 @@ function mockSandboxProvider() {
     sandboxId: id,
     runCode: vi.fn(async (code: string): Promise<ExecResult> => ({ stdout: `code:${code}`, stderr: '', exitCode: 0 })),
     runCommand: vi.fn(async (command: string): Promise<ExecResult> => ({ stdout: `cmd:${command}`, stderr: '', exitCode: 0 })),
+    readFile: vi.fn(async () => new Uint8Array()),
     setTimeout: vi.fn(async () => {}),
     kill: vi.fn(async () => {}),
   });

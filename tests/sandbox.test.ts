@@ -29,6 +29,7 @@ function mockProvider() {
       }),
     ),
     setTimeout: vi.fn(async () => {}),
+    readFile: vi.fn(async () => new Uint8Array()),
     kill: vi.fn(async () => {
       killed.push(id);
     }),
@@ -322,6 +323,7 @@ describe('OpenSandboxDesktopProvider', () => {
       runCode: vi.fn(async (code: string) => ({ stdout: `code:${code}`, stderr: '', exitCode: 0 })),
       runCommand: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
       setTimeout: vi.fn(async () => {}),
+      readFile: vi.fn(async () => new Uint8Array()),
       kill: vi.fn(async () => {}),
     };
     const provider: SandboxProvider = {
@@ -360,6 +362,7 @@ describe('OpenSandboxDesktopProvider', () => {
       runCode: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
       runCommand,
       setTimeout: vi.fn(async () => {}),
+      readFile: vi.fn(async () => new Uint8Array()),
       kill: vi.fn(async () => {}),
     };
     const provider: SandboxProvider = {

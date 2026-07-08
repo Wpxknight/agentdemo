@@ -62,6 +62,10 @@ class E2bHandle implements SandboxHandle {
     };
   }
 
+  async readFile(path: string): Promise<Uint8Array> {
+    return this.sbx.files.read(path, { format: 'bytes' });
+  }
+
   async setTimeout(ms: number): Promise<void> {
     await this.sbx.setTimeout(ms);
   }

@@ -95,6 +95,15 @@
     // "desktop": true,
     // "defaultImage": "aiop/opensandbox-browser:latest" // 需包含 node + chromium/python
   },
+  // 文件导出 / 下载：注册 sbx__export_file 工具，把沙箱内生成的文件（Excel/CSV/Markdown/PDF…）
+  // 落到中转目录并签发带时效的下载链接（/v1/files/<令牌>，令牌自带签名，无需登录态即可下载）。
+  // 沙箱启用时默认开启；如需自定义可打开下面的配置。
+  // "downloads": {
+  //   "enabled": true,
+  //   "dir": "/var/lib/aiop/downloads", // 缺省用系统临时目录下的 aiop-downloads
+  //   "maxBytes": 52428800,             // 单文件上限，默认 50 MiB
+  //   "ttlMs": 86400000                 // 链接有效期，默认 24 小时
+  // },
   // MCP server：stdio / sse / http 三种 transport，工具以 mcp__<server>__<tool> 暴露
   "mcpServers": {
     "local": {

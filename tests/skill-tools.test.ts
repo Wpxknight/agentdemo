@@ -24,6 +24,9 @@ class FakeSandbox implements SandboxHandle {
   }
 
   async setTimeout(): Promise<void> {}
+  async readFile(): Promise<Uint8Array> {
+    return new Uint8Array();
+  }
   async kill(): Promise<void> {}
 }
 

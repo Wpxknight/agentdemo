@@ -18,8 +18,12 @@ import { E2bDesktopProvider } from './sandbox/e2b-desktop.js';
 import { LocalDesktopProvider } from './sandbox/local-desktop.js';
 import { OpenSandboxDesktopProvider } from './sandbox/opensandbox-desktop.js';
 import type { DesktopHandle, DesktopProvider } from './sandbox/desktop.js';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { buildSandboxTools } from './tools/builtin.js';
 import type { SpecResolver } from './tools/builtin.js';
+import { buildExportTool } from './tools/export.js';
+import { DownloadStore } from './server/downloads.js';
 import { buildSkillTools } from './tools/skill.js';
 import { buildSandboxProfileTools } from './tools/sandbox-profiles.js';
 import { buildBrowserTools } from './tools/browser.js';
@@ -63,6 +67,8 @@ export interface Runtime {
   mcp?: McpManager;
   /** 会话沙箱管理器（按会话/集群复用、空闲 GC、会话关闭销毁）。 */
   sandboxes?: SandboxManager;
+  /** 文件下载中转（sbx__export_file 落盘 + /v1/files 能力 URL 下载）。 */
+  downloads?: DownloadStore;
   /** 可供模型选择的沙箱模板/profile 列表。 */
   sandboxProfiles?: PublicSandboxProfile[];
   clusters: ClusterRegistry;
@@ -118,6 +124,11 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
   const modelOptions: RuntimeModelConfig[] = Object.entries(config.models).map(([id, cfg]) => ({ id, ...cfg }));
   const tools = new ToolRegistry();
 
+  // JWT 密钥（认证 token、OIDC state、下载能力 URL 共用）；缺省用开发占位。
+  const jwtSecretEnv = process.env.AIOP_JWT_SECRET;
+  if (!jwtSecretEnv) logger.warn('AIOP_JWT_SECRET 未设置，使用开发占位密钥（勿用于生产）');
+  const jwtSecret = jwtSecretEnv ?? 'dev-insecure-secret';
+
   const store = await createStore(readMysqlConfig());
   const logSink = new LogAuditSink();
   const audit: AuditSink = {
@@ -145,6 +156,8 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
   let sessionSandboxResolver: SpecResolver | undefined;
   let warmPoolRef: WarmPool | undefined;
   let sandboxSweepTimer: ReturnType<typeof setInterval> | undefined;
+  let downloads: DownloadStore | undefined;
+  let downloadSweepTimer: ReturnType<typeof setInterval> | undefined;
   const desktops = new Map<string, Promise<DesktopHandle>>();
   if (config.sandbox?.enabled) {
     sandboxProfiles = resolveSandboxProfiles(config.sandbox);
@@ -196,6 +209,24 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     for (const t of buildSandboxTools(sandboxes, defaultResolver)) tools.register(t);
     for (const t of buildSandboxProfileTools(sandboxes, sandboxProfiles)) tools.register(t);
     logger.info({ sweepMs }, 'sandbox tools enabled');
+
+    // 文件导出 / 下载：把沙箱内生成的文件落到中转目录并签发能力 URL 供用户下载。
+    if (config.downloads?.enabled ?? true) {
+      downloads = new DownloadStore({
+        dir: config.downloads?.dir ?? join(tmpdir(), 'aiop-downloads'),
+        secret: jwtSecret,
+        maxBytes: config.downloads?.maxBytes,
+        ttlMs: config.downloads?.ttlMs,
+      });
+      tools.register(buildExportTool(sandboxes, defaultResolver, downloads));
+      // 周期清理过期落盘文件（每小时一次）。
+      const dl = downloads;
+      downloadSweepTimer = setInterval(() => {
+        void dl.sweep().catch((err) => logger.warn({ err: String(err) }, 'download sweep failed'));
+      }, 60 * 60_000);
+      downloadSweepTimer.unref?.();
+      logger.info('file export/download enabled');
+    }
     if (hasClusters) {
       tools.register(buildKubectlTool({ clusters, sandboxes, audit }));
       logger.info({ clusters: clusters.names() }, 'kubectl tool enabled');
@@ -261,10 +292,7 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     systemExtra = skills.summaries();
   }
 
-  // 认证：本地或 OIDC（JWT 密钥取自 env，缺省用开发占位）
-  const secret = process.env.AIOP_JWT_SECRET;
-  if (!secret) logger.warn('AIOP_JWT_SECRET 未设置，使用开发占位密钥（勿用于生产）');
-  const jwtSecret = secret ?? 'dev-insecure-secret';
+  // 认证：本地或 OIDC（复用上方派生的 jwtSecret）
   const ttl = config.auth?.jwtTtl;
   let authProvider: AuthProvider;
   if (config.auth?.provider === 'oidc' && config.auth.oidc) {
@@ -311,6 +339,7 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     skillRegistry,
     mcp,
     sandboxes,
+    downloads,
     sandboxProfiles: publicSandboxProfiles(sandboxProfiles),
     clusters,
     audit,
@@ -326,6 +355,7 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     defaultContext,
     async dispose() {
       if (sandboxSweepTimer) clearInterval(sandboxSweepTimer);
+      if (downloadSweepTimer) clearInterval(downloadSweepTimer);
       await Promise.all(
         [...desktops.values()].map((d) => d.then((h) => h.kill()).catch(() => {})),
       );

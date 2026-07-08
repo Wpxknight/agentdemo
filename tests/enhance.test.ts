@@ -107,6 +107,7 @@ describe('WarmPool', () => {
         sandboxId: `w${++n}`,
         runCode: async (): Promise<ExecResult> => ({ stdout: '', stderr: '' }),
         runCommand: async (): Promise<ExecResult> => ({ stdout: '', stderr: '' }),
+        readFile: async (): Promise<Uint8Array> => new Uint8Array(),
         setTimeout: async () => {},
         kill: async () => {},
       }),

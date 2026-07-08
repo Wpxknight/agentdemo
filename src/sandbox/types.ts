@@ -66,6 +66,8 @@ export interface SandboxHandle {
   runCode(code: string, opts?: RunCodeOpts): Promise<ExecResult>;
   /** 在沙箱里执行 shell 命令。 */
   runCommand(command: string, opts?: RunCommandOpts): Promise<ExecResult>;
+  /** 读取沙箱内文件的原始字节（用于导出 / 下载）。文件不存在或不可读时抛错。 */
+  readFile(path: string): Promise<Uint8Array>;
   /** 续命，防止被回收。 */
   setTimeout(ms: number): Promise<void>;
   /** 销毁沙箱。 */

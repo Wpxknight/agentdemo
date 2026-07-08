@@ -202,6 +202,18 @@ export const ConfigSchema = z.object({
     })
     .optional(),
   auth: AuthConfigSchema.optional(),
+  /** 文件导出 / 下载中转（sbx__export_file 工具 + /v1/files 下载路由）；沙箱启用时默认开启。 */
+  downloads: z
+    .object({
+      enabled: z.boolean().optional(),
+      /** 落盘中转目录；缺省用系统临时目录下的 aiop-downloads。 */
+      dir: z.string().optional(),
+      /** 单文件上限（字节），默认 50 MiB。 */
+      maxBytes: z.number().int().positive().optional(),
+      /** 下载链接有效期（毫秒），默认 24 小时。 */
+      ttlMs: z.number().int().positive().optional(),
+    })
+    .optional(),
   sandbox: SandboxConfigSchema.optional(),
   mcpServers: z.record(z.string(), McpServerSchema).optional(),
   clusters: z.record(z.string(), ClusterSchema).optional(),
