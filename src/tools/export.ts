@@ -121,13 +121,15 @@ export function buildExportTool(
           tenantId: ctx.tenantId,
           sessionId: ctx.sessionId,
         });
+        // 推结构化事件：前端据此渲染下载按钮，不依赖模型把长 URL 原样转述。
+        ctx.emitEvent?.({ type: 'file_exported', name, url, size: bytes.byteLength, mime, expiresAt });
         const hours = Math.round(sink.ttlMs / 3_600_000);
         return {
           id: '',
           content:
             `文件已导出：${name}（${formatBytes(bytes.byteLength)}）。`
-            + `请把下面的下载链接提供给用户（约 ${hours} 小时内有效，至 ${expiresAt}）：\n`
-            + `[${name}](${url})`,
+            + `界面已自动显示下载按钮（约 ${hours} 小时内有效，至 ${expiresAt}）。`
+            + `请在回复中也把链接按原样以 Markdown 形式给出（不要改写 URL）：[${name}](${url})`,
         };
       } catch (err) {
         return { id: '', content: `导出失败：${String(err)}`, isError: true };

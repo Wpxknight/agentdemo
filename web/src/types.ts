@@ -149,6 +149,15 @@ export interface TaskStep {
   status: 'running' | 'done' | 'error';
 }
 
+/** 智能体导出的可下载文件（file_exported 事件；前端渲染下载按钮）。 */
+export interface ExportedFile {
+  name: string;
+  url: string;
+  size: number;
+  mime: string;
+  expiresAt: string;
+}
+
 export interface TodoItem {
   content: string;
   status: 'pending' | 'in_progress' | 'completed';
@@ -190,6 +199,8 @@ export interface ChatMessage {
   steps?: TaskStep[];
   /** 模型通过 todo_write 维护的任务清单（长任务进度）。 */
   todos?: TodoItem[];
+  /** 智能体导出的可下载文件（file_exported 事件）。 */
+  files?: ExportedFile[];
   running?: boolean;
   time: string;
   tools?: string[];

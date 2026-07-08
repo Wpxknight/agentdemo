@@ -100,6 +100,8 @@ export type StreamEvent =
   | { type: 'context_compacted'; summarizedMessages: number; beforeTokens: number; afterTokens: number }
   /** 模型通过 todo_write 更新了任务清单（供前端实时渲染进度）。 */
   | { type: 'todo_updated'; todos: TodoItem[] }
+  /** 工具导出了一个可下载文件（供前端渲染下载按钮，不依赖模型转述链接）。 */
+  | { type: 'file_exported'; name: string; url: string; size: number; mime: string; expiresAt: string }
   | { type: 'stop'; reason: string };
 
 /** 任务清单项（todo_write 工具维护）。 */

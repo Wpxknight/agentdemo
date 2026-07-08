@@ -17,6 +17,7 @@ import {
   Database,
   FileText,
   Folder,
+  Download,
   FolderTree,
   Globe,
   KeyRound,
@@ -47,6 +48,7 @@ import { formatSandboxOutputChunk, parseSandboxOutput, sandboxOutputClassNames, 
 import type {
   Attachment,
   ChatMessage,
+  ExportedFile,
   ContextUsageBody,
   ModelSettingsBody,
   PageId,
@@ -610,6 +612,28 @@ function TaskProgress({ steps }: { steps: TaskStep[] }) {
   );
 }
 
+/** 智能体导出文件的下载按钮组：href 指向 /v1/files/<令牌>，download 触发浏览器下载。 */
+function DownloadFiles({ files }: { files: ExportedFile[] }) {
+  return (
+    <div className="export-files">
+      {files.map((file) => (
+        <a
+          key={file.url}
+          className="export-file"
+          href={file.url}
+          download={file.name}
+          target="_blank"
+          rel="noreferrer"
+        >
+          <Download className="export-file-icon" />
+          <span className="export-file-name">{file.name}</span>
+          {file.size ? <span className="export-file-size">{formatFileSize(file.size)}</span> : null}
+        </a>
+      ))}
+    </div>
+  );
+}
+
 /** 递归取 React 子节点纯文本，用于识别状态/警示内容。 */
 function reactNodeText(node: ReactNode): string {
   if (node == null || typeof node === 'boolean') return '';
@@ -750,6 +774,7 @@ function MessageContent({ message }: { message: ChatMessage }) {
             : renderTextLines(segment.content, `text-${index}`)}
         </Fragment>
       ))}
+      {message.files?.length ? <DownloadFiles files={message.files} /> : null}
     </>
   );
 }
@@ -1289,6 +1314,22 @@ export default function App() {
             const toolId = event.data.toolId;
             const status: TaskStep['status'] = event.data.isError === true ? 'error' : 'done';
             assistant.steps = (assistant.steps || []).map((s) => (s.id === toolId ? { ...s, status } : s));
+            publishAssistant();
+          }
+          if (
+            event?.event === 'file_exported'
+            && typeof event.data?.url === 'string'
+            && typeof event.data?.name === 'string'
+          ) {
+            const file: ExportedFile = {
+              name: event.data.name as string,
+              url: event.data.url as string,
+              size: typeof event.data.size === 'number' ? event.data.size : 0,
+              mime: typeof event.data.mime === 'string' ? event.data.mime : '',
+              expiresAt: typeof event.data.expiresAt === 'string' ? event.data.expiresAt : '',
+            };
+            // 去重：同一 URL 只保留一份。
+            assistant.files = [...(assistant.files || []).filter((f) => f.url !== file.url), file];
             publishAssistant();
           }
           if (
