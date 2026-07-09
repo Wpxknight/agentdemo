@@ -8,3 +8,6 @@ coverage
 tests
 docs
 .DS_Store
+# 技能运行期生成的凭据缓存，禁止打进镜像
+skills/**/token.json
+token.json

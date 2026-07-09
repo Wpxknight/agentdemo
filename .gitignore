@@ -13,3 +13,6 @@ __pycache__/
 
 # vendored kubectl binary for offline browser-sandbox image build (see Dockerfile.browser)
 deploy/opensandbox/kubectl
+
+# 技能运行期生成的凭据缓存，不要提交
+skills/**/token.json
