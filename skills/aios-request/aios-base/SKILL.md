@@ -24,6 +24,21 @@ description: "模型训推平台的基础操作，包括登录认证、切换租
 当用户请求不支持的操作时，只需告知：
 `该操作暂不支持，当前可用功能请参考：<列出脚本速查表中的操作名称>`
 
+## 环境变量配置
+
+所有可变平台配置必须通过环境变量传递，脚本不内置具体环境地址。
+
+必填：
+- `AIOS_BASE_URL` — 平台 API 地址，例如 `http://<host>:<port>/paas-web`
+- `AIOS_LOGIN_URL` — 平台登录地址，例如 `http://<host>:<port>`
+- `AIOS_CLUSTER_NAME` — 平台集群名称
+
+可选：
+- `AIOS_CLIENT_ID` — 客户端 ID；未提供时登录请求会自动生成
+- `AIOS_SYSTEM_ID` — 系统 ID，默认 `1`
+- `AIOS_INFER_SERVICE_ENDPOINT` — 推理服务访问地址；未提供时按 `<平台根地址>/<集群名>-infer` 拼接
+- `AIOS_TOKEN_FILE` / `AIOS_CONTEXT_FILE` — 覆盖本地缓存文件路径
+
 ## 核心原则
 
 这套 skill 采用"脚本驱动，外显消息最少化"的方式执行。

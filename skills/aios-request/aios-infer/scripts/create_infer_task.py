@@ -41,7 +41,7 @@ import sys
 from _import_base import *  # noqa: F401,F403
 from api_utils import api_post
 from auth import get_auth_headers
-from config import BASE_URL
+from config import BASE_URL, INFER_SERVICE_ENDPOINT
 from context import get_current_project_id, get_default_project_id
 
 
@@ -134,7 +134,7 @@ def create_infer_task(args) -> dict:
         "replicas": args.replicas,
         "command": args.command,
         "envs": envs,
-        "serviceEndpoint": f"{BASE_URL.rsplit('/paas-web', 1)[0]}/portal-cluster-infer",
+        "serviceEndpoint": INFER_SERVICE_ENDPOINT,
         "servicePath": None,
         "imageSource": args.image_source,
         "image": args.image,

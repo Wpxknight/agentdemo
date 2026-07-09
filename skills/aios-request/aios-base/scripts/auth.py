@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import sys
+import uuid
 from datetime import datetime
 from typing import Optional
 
@@ -93,6 +94,10 @@ def _encrypt_password(plaintext: str) -> str:
     return base64.b64encode(ct).decode("utf-8")
 
 
+def _get_client_id() -> str:
+    return str(CLIENT_ID or "").strip() or uuid.uuid4().hex
+
+
 def login_with_credentials(username: str, password: str) -> dict:
     if not str(username or "").strip():
         raise AuthError("账号不能为空。")
@@ -109,7 +114,7 @@ def login_with_credentials(username: str, password: str) -> dict:
             "typeConfigId": 0,
             "userName": username,
             "password": _encrypt_password(password),
-            "clientId": CLIENT_ID,
+            "clientId": _get_client_id(),
             "multfactor": "Y",
         },
         timeout=15,

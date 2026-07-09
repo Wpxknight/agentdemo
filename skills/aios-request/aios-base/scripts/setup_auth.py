@@ -17,20 +17,12 @@ from context import clear_context, has_context
 
 def main():
     parser = argparse.ArgumentParser(description="登录模型训推平台并缓存 token")
-    parser.add_argument("--username", help="平台账号；缺省读环境变量 AIOS_USERNAME")
-    parser.add_argument("--password", help="平台密码；缺省读环境变量 AIOS_PASSWORD（推荐：避免密码出现在进程列表）")
+    parser.add_argument("--username", required=True, help="平台账号")
+    parser.add_argument("--password", required=True, help="平台密码")
     args = parser.parse_args()
 
-    username = args.username or os.environ.get("AIOS_USERNAME", "")
-    password = args.password or os.environ.get("AIOS_PASSWORD", "")
-    if not username or not password:
-        raise SystemExit(
-            "缺少账号或密码。请向用户索取后执行："
-            "export AIOS_USERNAME='<账号>' AIOS_PASSWORD='<密码>' && python setup_auth.py"
-        )
-
     try:
-        login_with_credentials(username=username, password=password)
+        login_with_credentials(username=args.username, password=args.password)
     except requests.HTTPError as exc:
         detail = exc.response.text if exc.response is not None else str(exc)
         raise SystemExit(f"认证失败：{detail}")

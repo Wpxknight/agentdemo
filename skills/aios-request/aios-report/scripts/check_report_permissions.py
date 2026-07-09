@@ -13,7 +13,7 @@ import requests
 from auth import get_token_data
 from config import BASE_URL, SYSTEM_ID
 
-ADMIN_ROLE_ID = 1
+PLATFORM_TENANT_NAME = "Platform"
 
 
 def main():
@@ -58,7 +58,7 @@ def main():
         return
 
     tenants = result["data"]
-    is_admin = any(ADMIN_ROLE_ID in t.get("roleIds", []) for t in tenants)
+    is_admin = any(t.get("name") == PLATFORM_TENANT_NAME for t in tenants)
     username = token_data.get("username", "unknown")
 
     if is_admin:
@@ -68,10 +68,10 @@ def main():
             "next_step": "run_business_script",
         }, ensure_ascii=False))
     else:
-        roles = [t.get("roleIds", []) for t in tenants]
+        tenant_names = [t.get("name") for t in tenants]
         print(json.dumps({
             "success": False,
-            "message": f"用户 {username} 不是管理员（roleIds: {roles}），报表功能仅限管理员使用",
+            "message": f"用户 {username} 不是平台管理员（tenants: {tenant_names}），报表功能仅限平台管理员使用",
             "next_step": "forbidden",
         }, ensure_ascii=False))
 
