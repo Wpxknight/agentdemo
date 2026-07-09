@@ -465,8 +465,16 @@ function renderTextLines(text: string, keyPrefix: string) {
   ));
 }
 
+/** 清洗模型 thinking：去掉其作为分隔符输出的 HTML 注释（含流式过程中未闭合的残尾），折叠多余空行。 */
+function stripThinkingArtifacts(text: string): string {
+  return text
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<!--[\s\S]*$/, '')
+    .replace(/\n{3,}/g, '\n\n');
+}
+
 function ThinkingBlock({ content, streaming }: { content: string; streaming?: boolean }) {
-  const trimmed = content.trim();
+  const trimmed = stripThinkingArtifacts(content).trim();
   const [open, setOpen] = useState(true);
 
   useEffect(() => {
