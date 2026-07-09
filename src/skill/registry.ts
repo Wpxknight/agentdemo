@@ -131,6 +131,7 @@ export class SkillRegistry {
       '可用技能（用 load_skill 加载完整指令）：',
       '用户请求与某个技能描述匹配时，请先调用 load_skill 加载该技能，再按技能指令执行。',
       '即使用户没有点名技能或 API，且浏览器、shell 等通用工具也能完成同类任务，只要主题命中某个技能描述，就必须优先加载并使用该技能。',
+      '每次加载技能后，先用一句话明确告知用户已加载的技能名称（如“已加载技能：aios-request”），再按技能指令继续。',
     ];
     let used = header.join('\n').length;
     const lines: string[] = [];

@@ -313,6 +313,14 @@ function stepLabel(call: unknown): string {
     const argv = Array.isArray(a.args) ? a.args.join(' ') : '';
     return `kubectl ${truncate(argv, 60)}`;
   }
+  if (name === 'load_skill') {
+    const skill = typeof a.name === 'string' ? a.name : '';
+    return skill ? `加载技能：${skill}` : '加载技能';
+  }
+  if ((name === 'skill__read_file' || name === 'skill__sync_to_sandbox') && typeof a.name === 'string') {
+    const label = name === 'skill__read_file' ? '读取技能文件' : '同步技能到沙箱';
+    return `${label}：${a.name}`;
+  }
   return `调用工具：${toolDisplayName(name)}`;
 }
 
@@ -765,8 +773,9 @@ function MessageContent({ message }: { message: ChatMessage }) {
       {thinkingSegments.map((segment, index) => (
         <ThinkingBlock key={`thinking-${index}`} content={segment.content} streaming={segment.streaming} />
       ))}
+      {/* 有 todo 计划时以 todo 清单作为进度；无计划的简单任务才回退到按工具调用展示步骤。 */}
       {message.todos?.length ? <TodoList todos={message.todos} /> : null}
-      {message.steps?.length ? <TaskProgress steps={message.steps} /> : null}
+      {!message.todos?.length && message.steps?.length ? <TaskProgress steps={message.steps} /> : null}
       {textSegments.map((segment, index) => (
         <Fragment key={`text-${index}`}>
           {message.role === 'assistant'
