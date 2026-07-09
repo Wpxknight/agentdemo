@@ -486,9 +486,14 @@ function ThinkingBlock({ content, streaming }: { content: string; streaming?: bo
     <details className="thinking-block" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
       <summary>
         <Cpu />
-        模型 thinking
+        thinking
       </summary>
-      <div className="thinking-content">{renderTextLines(trimmed, 'thinking')}</div>
+      {/* 模型 thinking 本身是 Markdown（加粗小标题等），按 Markdown 渲染；skipHtml 丢弃残留 HTML。 */}
+      <div className="thinking-content markdown-body">
+        <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>
+          {trimmed}
+        </ReactMarkdown>
+      </div>
     </details>
   );
 }
