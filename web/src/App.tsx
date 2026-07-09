@@ -465,11 +465,13 @@ function renderTextLines(text: string, keyPrefix: string) {
   ));
 }
 
-/** 清洗模型 thinking：去掉其作为分隔符输出的 HTML 注释（含流式过程中未闭合的残尾），折叠多余空行。 */
+/** 清洗模型 thinking（纯文本渲染）：去掉其输出的 Markdown 噪声——HTML 注释分隔符、加粗标记，折叠多余空行。 */
 function stripThinkingArtifacts(text: string): string {
   return text
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/<!--[\s\S]*$/, '')
+    .replace(/<!--[\s\S]*?-->/g, '')   // 完整 HTML 注释（模型用 <!-- --> 作分隔符）
+    .replace(/<!--[\s\S]*$/, '')        // 流式过程中未闭合的注释残尾
+    .replace(/\*\*(.*?)\*\*/g, '$1')    // 去掉成对的加粗标记，保留文字
+    .replace(/\*\*/g, '')               // 去掉流式中途残留/未配对的 **
     .replace(/\n{3,}/g, '\n\n');
 }
 
@@ -488,12 +490,8 @@ function ThinkingBlock({ content, streaming }: { content: string; streaming?: bo
         <Cpu />
         thinking
       </summary>
-      {/* 模型 thinking 本身是 Markdown（加粗小标题等），按 Markdown 渲染；skipHtml 丢弃残留 HTML。 */}
-      <div className="thinking-content markdown-body">
-        <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>
-          {trimmed}
-        </ReactMarkdown>
-      </div>
+      {/* thinking 按纯文本渲染；stripThinkingArtifacts 已去掉模型输出的 Markdown 噪声。 */}
+      <div className="thinking-content">{renderTextLines(trimmed, 'thinking')}</div>
     </details>
   );
 }
