@@ -6,6 +6,7 @@ export const NAV_ITEMS: NavItem[] = [
   { id: 'mcp', label: 'MCP', icon: 'mcp' },
   { id: 'schedule', label: '定时任务', icon: 'schedule' },
   { id: 'sandbox', label: '沙箱环境', icon: 'sandbox' },
+  { id: 'users', label: '用户管理', icon: 'users', adminOnly: true },
   { id: 'settings', label: '设置', icon: 'settings' },
 ];
 
@@ -15,6 +16,7 @@ export const PAGES: Record<string, PageMeta> = {
   mcp: { title: 'MCP', hasSandboxWorkspace: false },
   schedule: { title: '定时任务', hasSandboxWorkspace: false },
   sandbox: { title: '沙箱环境', hasSandboxWorkspace: false },
+  users: { title: '用户管理', hasSandboxWorkspace: false },
   settings: { title: '设置', hasSandboxWorkspace: false },
 };
 

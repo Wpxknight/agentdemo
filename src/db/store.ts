@@ -1,6 +1,6 @@
 import type { Msg } from '../model/types.js';
 import type { AuditEvent, AuditSink } from '../audit/sink.js';
-import type { Role, RequestContext, Tenant, User } from '../auth/types.js';
+import type { AuthProviderKind, Role, RequestContext, Tenant, User, UserStatus } from '../auth/types.js';
 import type { McpServerConfig } from '../mcp/types.js';
 
 export interface LlmSettings {
@@ -121,11 +121,28 @@ export interface NewUser {
   username: string;
   role: Role;
   passwordHash: string;
+  /** 登录来源，默认 local。 */
+  authProvider?: AuthProviderKind;
+  displayName?: string;
 }
 
 /** 含密钥的用户记录（仅登录校验内部使用）。 */
 export interface UserWithSecret extends User {
   passwordHash: string;
+}
+
+/** 用户局部更新（管理与生命周期用：禁用/启用、墓碑改名、角色/展示名刷新）。 */
+export interface UserPatch {
+  status?: UserStatus;
+  username?: string;
+  role?: Role;
+  displayName?: string;
+}
+
+/** 用户下游凭据缓存记录（payload 为加密后的不透明字符串，加解密在 auth/credentials.ts）。 */
+export interface UserCredentialRecord {
+  payload: string;
+  expiresAt?: Date;
 }
 
 /**
@@ -171,6 +188,16 @@ export interface Store extends AuditSink {
   createUser(user: NewUser): Promise<User>;
   getUserByUsername(tenantId: string, username: string): Promise<UserWithSecret | undefined>;
   getUser(tenantId: string, userId: string): Promise<User | undefined>;
+  listUsers(tenantId: string): Promise<User[]>;
+  /** 局部更新用户（状态/墓碑改名/角色/展示名）；不存在返回 undefined。 */
+  updateUser(tenantId: string, userId: string, patch: UserPatch): Promise<User | undefined>;
+  /** 禁用某用户名下全部定时任务（软删除流程用）；返回受影响任务数。 */
+  disableTasksByUser(tenantId: string, userId: string): Promise<number>;
+
+  // —— 用户下游凭据缓存（payload 已加密，Store 只存不解）——
+  setUserCredential(tenantId: string, userId: string, provider: string, record: UserCredentialRecord): Promise<void>;
+  getUserCredential(tenantId: string, userId: string, provider: string): Promise<UserCredentialRecord | undefined>;
+  deleteUserCredentials(tenantId: string, userId: string): Promise<void>;
 
   // —— 租户设置 ——
   getLlmSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<LlmSettings | undefined>;

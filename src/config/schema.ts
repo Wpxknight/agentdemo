@@ -124,6 +124,53 @@ export const OidcConfigSchema = z.object({
   mapping: OidcMappingSchema,
 });
 
+/** AIOS userinfo/claims 字段映射（支持 a.b.c 点路径；顶层取不到时自动回退 data.<path>）。 */
+export const AiosFieldMapSchema = z.object({
+  /** 稳定唯一标识（工号/userId）——作为 aiop username，禁止用可变显示名。 */
+  userId: z.string().default('userId'),
+  displayName: z.string().default('displayName'),
+  /** 角色/组字段（值可为 string 或 string[]）。 */
+  roles: z.string().default('roles'),
+});
+
+/**
+ * AIOS 嵌入登录（token exchange）配置。配置即启用（与 local/oidc 并存，aiop 用户体系不依赖它）。
+ * 见 docs/DESIGN-aios-integration.md §2。
+ */
+export const AiosConfigSchema = z
+  .object({
+    /** token 校验方式：userinfo=回调 AIOS 用户信息接口；jwks=本地验签（AIOS token 是标准 JWT 时）。 */
+    verify: z.enum(['userinfo', 'jwks']).default('userinfo'),
+    /** userinfo 模式：校验 token 并返回用户信息的端点（请求头带 token/systemId）。 */
+    userinfoUrl: z.string().optional(),
+    systemId: z.string().default('1'),
+    /** jwks 模式：AIOS 的 JWKS 公钥端点。 */
+    jwks: z
+      .object({
+        url: z.string(),
+        issuer: z.string().optional(),
+        audience: z.string().optional(),
+      })
+      .optional(),
+    /** AIOS 用户落入的租户。 */
+    tenantId: z.string().default('default'),
+    /** 允许嵌入 aiop 的宿主页 origin 白名单（CSP frame-ancestors + postMessage 校验）。 */
+    allowedParentOrigins: z.array(z.string()).default([]),
+    fields: AiosFieldMapSchema.default({ userId: 'userId', displayName: 'displayName', roles: 'roles' }),
+    /** AIOS 角色值命中任一项 → tenant_admin；否则 user。AIOS 用户永不映射 platform_admin。 */
+    adminRoles: z.array(z.string()).default([]),
+    /** 凭据缓存兜底 TTL（毫秒）；AIOS 未返回 expiredTime 时使用，默认 12h。 */
+    credentialTtlMs: z.number().int().positive().optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.verify === 'userinfo' && !value.userinfoUrl) {
+      ctx.addIssue({ code: 'custom', path: ['userinfoUrl'], message: 'verify=userinfo 时 userinfoUrl 必填' });
+    }
+    if (value.verify === 'jwks' && !value.jwks) {
+      ctx.addIssue({ code: 'custom', path: ['jwks'], message: 'verify=jwks 时 jwks.url 必填' });
+    }
+  });
+
 export const AuthConfigSchema = z.object({
   provider: z.enum(['local', 'oidc']).default('local'),
   /** 会话 token 有效期（jose 时间串），默认 12h。 */
@@ -131,6 +178,8 @@ export const AuthConfigSchema = z.object({
   /** 本地开发/部署引导管理员；仅 local 认证模式生效，已存在则跳过。 */
   bootstrapAdmin: BootstrapAdminSchema.optional(),
   oidc: OidcConfigSchema.optional(),
+  /** AIOS 嵌入登录；配置即在 provider 之外追加启用（token exchange 通道）。 */
+  aios: AiosConfigSchema.optional(),
 });
 
 /** 工具权限规则：allow/deny/ask，语法 `工具名` 或 `工具名(子模式)`。deny 优先级最高。 */

@@ -11,6 +11,8 @@ interface Entry {
   /** 该沙箱的存活超时(ms)，复用时据此续期。 */
   timeoutMs: number;
   spec: SandboxSpec;
+  /** 已注入用户凭据（污染标记）：严禁跨用户复用，只能随会话销毁，不得回池。 */
+  credentialInjected?: boolean;
 }
 
 export interface SandboxSummary {
@@ -19,6 +21,8 @@ export interface SandboxSummary {
   key: string;
   status: 'ready';
   type: string;
+  /** 已注入用户凭据（污染标记，销毁不回收）。 */
+  credentialInjected?: boolean;
   profile?: string;
   image?: string;
   domain?: string;
@@ -121,6 +125,18 @@ export class SandboxManager {
     return this.entries.has(key);
   }
 
+  /**
+   * 标记沙箱已注入用户凭据（污染）：该沙箱与用户绑定，生命周期只能随会话终结（sweep/dispose 即 kill），
+   * 永不进入任何复用池。当前实现所有回收路径都是 kill，此标记兜底未来的复用型回收并供运维页展示。
+   */
+  markCredentialInjected(key: string): void {
+    const e = this.entries.get(key);
+    if (e && !e.credentialInjected) {
+      e.credentialInjected = true;
+      log.info({ key }, 'sandbox marked credential-injected (no reuse)');
+    }
+  }
+
   size(): number {
     return this.entries.size;
   }
@@ -147,6 +163,7 @@ export class SandboxManager {
         ...(entry.spec.serviceAccount ? { serviceAccount: entry.spec.serviceAccount } : {}),
         ...(capabilities?.length ? { capabilities } : {}),
         ...(entry.spec.metadata?.privileged === 'true' ? { privileged: true } : {}),
+        ...(entry.credentialInjected ? { credentialInjected: true } : {}),
         sessionId,
         createdAt: new Date(entry.createdAt).toISOString(),
         lastUsedAt: new Date(entry.lastUsed).toISOString(),

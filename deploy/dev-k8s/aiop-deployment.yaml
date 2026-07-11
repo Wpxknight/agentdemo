@@ -17,6 +17,10 @@ spec:
         - name: aiop-web
           image: aiop-web:dev
           imagePullPolicy: IfNotPresent
+          env:
+            # CSP frame-ancestors 追加白名单（嵌入 AIOS 时填宿主域名，如 https://aios.example.com）；空 = 仅同源
+            - name: AIOP_FRAME_ANCESTORS
+              value: ""
           ports:
             - containerPort: 8080
           readinessProbe:

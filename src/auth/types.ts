@@ -13,11 +13,21 @@ export interface Tenant {
   name: string;
 }
 
+/** 用户状态：active 正常；disabled 软删除/封禁（行保留，登录与访问被拒）。 */
+export type UserStatus = 'active' | 'disabled';
+
+/** 登录来源：本地账密 / OIDC SSO / AIOS 平台嵌入。 */
+export type AuthProviderKind = 'local' | 'oidc' | 'aios';
+
 export interface User {
   id: string;
   tenantId: string;
   username: string;
   role: Role;
+  status: UserStatus;
+  authProvider: AuthProviderKind;
+  displayName?: string;
+  createdAt?: string;
 }
 
 /** 平台级系统上下文（调度器跨租户扫描、迁移种子等用）。 */

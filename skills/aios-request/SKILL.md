@@ -1,6 +1,8 @@
 ---
 name: aios-request
 description: 查询或操作 AIOS 平台(包含ACE/BMP平台)时必须优先使用本技能。能力：资源使用报表、任务统计、用户活跃度、资源管理、推理任务、模型训练（算法/通用/YOLO/LSTM）、大模型微调、平台功能引导。关键词：AIOS、报表、资源使用、用户报表、状态查询、训练、推理、微调。
+credentials: aios
+credential_file: aios-base/token.json
 ---
 
 # AIOS平台专家
@@ -67,3 +69,9 @@ aios-guide（独立：平台用户引导，不依赖 aios-base）
 - `AIOS_CONTEXT_FILE` — 上下文缓存文件路径；未提供时使用 skill 默认缓存位置
 
 各业务 skill 会自动复用 aios-base 的认证和上下文能力。
+
+## 认证说明
+
+技能同步进沙箱时，平台会**自动按当前登录用户注入** AIOS 凭据（`aios-base/token.json`），无需登录。
+若同步结果提示"未找到当前用户的 aios 凭据"，直接告知用户：**请在 AIOS 平台重新登录后重试**。
+**任何情况下都不要在对话中向用户索要密码。**

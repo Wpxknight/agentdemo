@@ -53,6 +53,8 @@ import {
 import type { PublicSandboxProfile, SandboxProfile } from './sandbox/profiles.js';
 import { LocalAuthProvider } from './auth/local.js';
 import { OidcAuthProvider } from './auth/oidc.js';
+import { AiosAuthProvider } from './auth/aios.js';
+import { UserCredentials } from './auth/credentials.js';
 import type { AuthProvider } from './auth/provider.js';
 import type { RequestContext } from './auth/types.js';
 
@@ -97,6 +99,12 @@ export interface Runtime {
   planState: PlanApprovalState;
   /** 本地认证提供方（登录 / token 校验）。 */
   authProvider: AuthProvider;
+  /** AIOS 嵌入登录（token exchange）；配置 auth.aios 后启用，与 authProvider 并存。 */
+  aiosAuth?: AiosAuthProvider;
+  /** 用户下游平台凭据缓存（加密存储；exchange 写入、技能同步时按用户注入）。 */
+  credentials: UserCredentials;
+  /** 允许嵌入 aiop 的宿主 origin（CSP frame-ancestors）；未配置时仅允许同源。 */
+  frameAncestors?: string[];
   /** 会话 JWT 密钥（HTTP 层签发 OIDC 临时 state cookie 等用）。 */
   jwtSecret: string;
   /** 无认证（CLI）场景的默认身份。 */
@@ -296,12 +304,15 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     }));
   }
 
+  // 用户下游凭据缓存（AES-GCM 加密后交给 Store；exchange 写入、技能同步按用户注入）
+  const credentials = new UserCredentials(store, jwtSecret);
+
   let systemExtra = '';
   let skillRegistry: SkillRegistry | undefined;
   if (config.skills?.dir) {
     const skills = new SkillRegistry(config.skills.dir, { summaryBudget: config.skills.summaryBudget });
     await skills.scan();
-    for (const t of buildSkillTools(skills, sandboxes, sessionSandboxResolver)) tools.register(t);
+    for (const t of buildSkillTools(skills, sandboxes, sessionSandboxResolver, { credentials, audit })) tools.register(t);
     skillRegistry = skills;
     systemExtra = skills.summaries();
   }
@@ -314,6 +325,12 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     logger.info({ issuer: config.auth.oidc.issuer }, 'OIDC SSO 已启用');
   } else {
     authProvider = new LocalAuthProvider({ store, secret: jwtSecret, ttl });
+  }
+  // AIOS 嵌入登录：与 local/oidc 并存的第三种登录方式（aiop 用户体系不依赖它，可独立部署）。
+  let aiosAuth: AiosAuthProvider | undefined;
+  if (config.auth?.aios) {
+    aiosAuth = new AiosAuthProvider({ store, secret: jwtSecret, ttl, config: config.auth.aios, credentials });
+    logger.info({ verify: config.auth.aios.verify }, 'AIOS 嵌入登录已启用');
   }
 
   // CLI 默认身份：确保默认租户存在
@@ -375,6 +392,9 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     hooks,
     planState,
     authProvider,
+    aiosAuth,
+    credentials,
+    frameAncestors: config.auth?.aios?.allowedParentOrigins,
     jwtSecret,
     defaultContext,
     async dispose() {

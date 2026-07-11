@@ -1,11 +1,39 @@
-export type PageId = 'chat' | 'skills' | 'mcp' | 'schedule' | 'sandbox' | 'settings';
+export type PageId = 'chat' | 'skills' | 'mcp' | 'schedule' | 'sandbox' | 'users' | 'settings';
 
 export type Role = 'user' | 'assistant';
 
 export interface NavItem {
   id: PageId;
   label: string;
-  icon: 'chat' | 'skills' | 'mcp' | 'schedule' | 'sandbox' | 'settings';
+  icon: 'chat' | 'skills' | 'mcp' | 'schedule' | 'sandbox' | 'users' | 'settings';
+  /** 仅管理员可见的一级菜单（前端隐藏只是 UX，真正的防线是后端 RBAC）。 */
+  adminOnly?: boolean;
+}
+
+/** 当前登录身份（GET /v1/me）。 */
+export interface MeBody {
+  tenantId: string;
+  userId: string;
+  role: 'platform_admin' | 'tenant_admin' | 'user';
+  username?: string;
+  displayName?: string;
+  authProvider?: 'local' | 'oidc' | 'aios';
+}
+
+/** 用户管理列表项（GET /v1/admin/users）。 */
+export interface AdminUser {
+  id: string;
+  tenantId: string;
+  username: string;
+  role: 'platform_admin' | 'tenant_admin' | 'user';
+  status: 'active' | 'disabled';
+  authProvider: 'local' | 'oidc' | 'aios';
+  displayName?: string;
+  createdAt?: string;
+}
+
+export interface AdminUsersBody {
+  users: AdminUser[];
 }
 
 export interface PageMeta {
@@ -28,6 +56,12 @@ export interface ToolSummary {
   source?: string;
   status?: string;
   enabled?: boolean;
+  /** 技能所有者用户 id（'' 表示无主存量公共技能）。 */
+  owner?: string;
+  /** 技能可见性：public 全员 / private 仅所有者 / shared 租户内共享。 */
+  visibility?: 'public' | 'private' | 'shared';
+  /** 当前用户是否可管理该技能（启停/删除/共享）；服务端计算。 */
+  canManage?: boolean;
   lastUsed?: string;
   transport?: string;
   files?: string[];

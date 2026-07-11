@@ -104,10 +104,13 @@ export class OidcAuthProvider implements AuthProvider {
         username,
         role,
         passwordHash: 'oidc', // SSO 用户无本地口令
+        authProvider: 'oidc',
       });
       log.info({ tenantId, username }, 'JIT 建号');
       return { tenantId, userId: created.id, role };
     }
+    // 软删除/封禁的行仍占用 username：命中即拒绝，防止经 JIT 复活（§8.5 护栏）。
+    if (user.status === 'disabled') throw new Error('账号已被禁用，请联系管理员');
     // 角色以 IdP 最新映射为准（反映 IdP 侧变更）
     return { tenantId, userId: user.id, role };
   }

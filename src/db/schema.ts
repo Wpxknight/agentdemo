@@ -11,6 +11,8 @@ type NullableJsonColumn = ColumnType<unknown, string | null, string | null>;
 export interface MessagesTable {
   id: Generated<number>;
   tenant_id: string;
+  /** 会话归属用户（用户级隔离）；'' 表示 0006 迁移前的遗留数据。 */
+  user_id: string;
   session_id: string;
   role: string;
   /** JSON：{ text?, toolCalls?, toolResults? } */
@@ -20,6 +22,8 @@ export interface MessagesTable {
 
 export interface SessionsTable {
   tenant_id: string;
+  /** 会话归属用户（用户级隔离）；'' 表示 0006 迁移前的遗留数据。 */
+  user_id: string;
   session_id: string;
   title: string;
   created_at: Generated<Date>;
@@ -75,7 +79,22 @@ export interface UsersTable {
   username: string;
   role: string;
   password_hash: string;
+  /** active | disabled（软删除/封禁，行不硬删）。 */
+  status: Generated<string>;
+  /** 登录来源：local | oidc | aios。 */
+  auth_provider: Generated<string>;
+  display_name: string | null;
   created_at: Generated<Date>;
+}
+
+export interface UserCredentialsTable {
+  tenant_id: string;
+  user_id: string;
+  provider: string;
+  /** AES-256-GCM 加密后的 JSON payload。 */
+  payload: string;
+  expires_at: Date | null;
+  updated_at: Generated<Date>;
 }
 
 export interface TenantSettingsTable {
@@ -94,5 +113,6 @@ export interface Database {
   task_runs: TaskRunsTable;
   tenants: TenantsTable;
   users: UsersTable;
+  user_credentials: UserCredentialsTable;
   tenant_settings: TenantSettingsTable;
 }

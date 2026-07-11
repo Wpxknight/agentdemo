@@ -49,7 +49,8 @@ async function runScheduledTask(
     hooks: rt.hooks,
     approval: new AutoDenyGate(), // 无人值守：未预批准的审批一律拒绝
     unattended: true, // 系统提示切换为“确认类操作跳过并汇报”，不对着空气等确认
-    system: rt.systemExtra,
+    // 技能摘要按任务归属用户过滤（他人私有技能不可见），与交互链路同一套可见性规则。
+    system: rt.skillRegistry?.summariesFor({ userId: t.userId, role: taskCtx.role }) ?? rt.systemExtra,
     ctx: { sessionId: t.sessionId, ...taskCtx },
     messages: prior,
     task: t.task,

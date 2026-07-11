@@ -741,7 +741,7 @@ describe('frontend data APIs', () => {
     const auth = new LocalAuthProvider({ store, secret: 'ui-secret' });
     await auth.createUser('default', 'admin', 'pw', 'platform_admin');
     const token = (await auth.login('default', 'admin', 'pw'))!;
-    const ctx = { tenantId: 'default', userId: 'u1', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
     await store.appendMessage(ctx, 'sess-a', { role: 'user', text: '检查 Pod 异常' });
     await store.appendMessage(ctx, 'sess-a', { role: 'assistant', text: '发现 OOMKilled' });
     await store.createScheduledTask(ctx, {

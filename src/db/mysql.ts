@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { sql, type Kysely } from 'kysely';
 import type { Msg, Role as MsgRole } from '../model/types.js';
 import type { AuditEvent } from '../audit/sink.js';
@@ -18,6 +19,8 @@ import type {
   ScheduledTaskPatch,
   Store,
   TaskRun,
+  UserCredentialRecord,
+  UserPatch,
   UserWithSecret,
 } from './store.js';
 import { DEFAULT_SESSION_TITLE } from './store.js';
@@ -174,22 +177,23 @@ export class MysqlStore implements Store {
   async createSession(ctx: RequestContext, input: SessionInput): Promise<SessionSummary> {
     const title = summarize(input.title ?? input.sessionId);
     const now = new Date();
-    // upsert：并发下先查后写会撞唯一键
+    // upsert：并发下先查后写会撞唯一键；主键含 user_id，不同用户同名会话互不冲突
     await this.db
       .insertInto('sessions')
-      .values({ tenant_id: ctx.tenantId, session_id: input.sessionId, title, updated_at: now })
+      .values({ tenant_id: ctx.tenantId, user_id: ctx.userId, session_id: input.sessionId, title, updated_at: now })
       .onDuplicateKeyUpdate({ title, updated_at: now })
       .execute();
 
     // 只取条数 + 最后一条，避免为拼摘要加载整段历史（大会话含截图时很重）
     const { rows } = await sql<{ total: number | string | bigint }>`
       SELECT COUNT(*) AS total FROM messages
-      WHERE tenant_id = ${ctx.tenantId} AND session_id = ${input.sessionId}
+      WHERE tenant_id = ${ctx.tenantId} AND user_id = ${ctx.userId} AND session_id = ${input.sessionId}
     `.execute(this.db);
     const last = await this.db
       .selectFrom('messages')
       .select(['content'])
       .where('tenant_id', '=', ctx.tenantId)
+      .where('user_id', '=', ctx.userId)
       .where('session_id', '=', input.sessionId)
       .orderBy('id', 'desc')
       .limit(1)
@@ -211,6 +215,7 @@ export class MysqlStore implements Store {
       .insertInto('sessions')
       .values({
         tenant_id: ctx.tenantId,
+        user_id: ctx.userId,
         session_id: sessionId,
         title: nextTitle ?? summarize(sessionId),
         updated_at: updatedAt,
@@ -232,7 +237,7 @@ export class MysqlStore implements Store {
     const content = serializeMsgContent(msg);
     await this.db
       .insertInto('messages')
-      .values({ tenant_id: ctx.tenantId, session_id: sessionId, role: msg.role, content })
+      .values({ tenant_id: ctx.tenantId, user_id: ctx.userId, session_id: sessionId, role: msg.role, content })
       .execute();
     await this.touchSession(ctx, sessionId, {
       title: msg.role === 'user' ? msg.text : undefined,
@@ -247,6 +252,7 @@ export class MysqlStore implements Store {
       .values(
         msgs.map((msg) => ({
           tenant_id: ctx.tenantId,
+          user_id: ctx.userId,
           session_id: sessionId,
           role: msg.role,
           content: serializeMsgContent(msg),
@@ -264,6 +270,7 @@ export class MysqlStore implements Store {
       await trx
         .deleteFrom('messages')
         .where('tenant_id', '=', ctx.tenantId)
+        .where('user_id', '=', ctx.userId)
         .where('session_id', '=', sessionId)
         .execute();
       if (!messages.length) return;
@@ -272,6 +279,7 @@ export class MysqlStore implements Store {
         .values(
           messages.map((msg) => ({
             tenant_id: ctx.tenantId,
+            user_id: ctx.userId,
             session_id: sessionId,
             role: msg.role,
             content: serializeMsgContent(msg),
@@ -286,6 +294,7 @@ export class MysqlStore implements Store {
       .selectFrom('messages')
       .select(['role', 'content'])
       .where('tenant_id', '=', ctx.tenantId)
+      .where('user_id', '=', ctx.userId)
       .where('session_id', '=', sessionId)
       .orderBy('id', 'asc')
       .execute();
@@ -312,6 +321,7 @@ export class MysqlStore implements Store {
       .selectFrom('sessions')
       .select(['session_id', 'title', 'updated_at'])
       .where('tenant_id', '=', ctx.tenantId)
+      .where('user_id', '=', ctx.userId)
       .orderBy('updated_at', 'desc')
       .limit(safeLimit)
       .offset(safeOffset)
@@ -323,6 +333,7 @@ export class MysqlStore implements Store {
       .selectFrom('messages')
       .select(['id', 'session_id', 'role', 'content', 'created_at'])
       .where('tenant_id', '=', ctx.tenantId)
+      .where('user_id', '=', ctx.userId)
       .where('session_id', 'in', sessionIds)
       .orderBy('id', 'asc')
       .execute() as MessageRow[];
@@ -357,7 +368,7 @@ export class MysqlStore implements Store {
     const { rows } = await sql<{ total: number | string | bigint }>`
       SELECT COUNT(*) AS total
       FROM sessions
-      WHERE tenant_id = ${ctx.tenantId}
+      WHERE tenant_id = ${ctx.tenantId} AND user_id = ${ctx.userId}
     `.execute(this.db);
     return Number(rows[0]?.total ?? 0);
   }
@@ -366,11 +377,13 @@ export class MysqlStore implements Store {
     const messageResult = await this.db
       .deleteFrom('messages')
       .where('tenant_id', '=', ctx.tenantId)
+      .where('user_id', '=', ctx.userId)
       .where('session_id', '=', sessionId)
       .executeTakeFirst();
     const sessionResult = await this.db
       .deleteFrom('sessions')
       .where('tenant_id', '=', ctx.tenantId)
+      .where('user_id', '=', ctx.userId)
       .where('session_id', '=', sessionId)
       .executeTakeFirst();
     return Number(messageResult.numDeletedRows ?? 0) > 0 || Number(sessionResult.numDeletedRows ?? 0) > 0;
@@ -456,32 +469,35 @@ export class MysqlStore implements Store {
     };
   }
 
+  // 任务可见范围：普通用户仅见自己创建的；租户/平台管理员见全租户。
   async listScheduledTasks(ctx: RequestContext): Promise<ScheduledTask[]> {
-    const rows = await this.db
+    let q = this.db
       .selectFrom('scheduled_tasks')
       .selectAll()
-      .where('tenant_id', '=', ctx.tenantId)
-      .orderBy('id', 'asc')
-      .execute();
+      .where('tenant_id', '=', ctx.tenantId);
+    if (ctx.role === 'user') q = q.where('user_id', '=', ctx.userId);
+    const rows = await q.orderBy('id', 'asc').execute();
     return rows.map(toTask);
   }
 
   async setTaskEnabled(ctx: RequestContext, id: number, enabled: boolean): Promise<void> {
-    await this.db
+    let q = this.db
       .updateTable('scheduled_tasks')
       .set({ enabled: enabled ? 1 : 0 })
       .where('id', '=', id)
-      .where('tenant_id', '=', ctx.tenantId)
-      .execute();
+      .where('tenant_id', '=', ctx.tenantId);
+    if (ctx.role === 'user') q = q.where('user_id', '=', ctx.userId);
+    await q.execute();
   }
 
   async getScheduledTask(ctx: RequestContext, id: number): Promise<ScheduledTask | undefined> {
-    const row = await this.db
+    let q = this.db
       .selectFrom('scheduled_tasks')
       .selectAll()
       .where('id', '=', id)
-      .where('tenant_id', '=', ctx.tenantId)
-      .executeTakeFirst();
+      .where('tenant_id', '=', ctx.tenantId);
+    if (ctx.role === 'user') q = q.where('user_id', '=', ctx.userId);
+    const row = await q.executeTakeFirst();
     return row ? toTask(row) : undefined;
   }
 
@@ -509,11 +525,12 @@ export class MysqlStore implements Store {
   }
 
   async deleteScheduledTask(ctx: RequestContext, id: number): Promise<boolean> {
-    const res = await this.db
+    let q = this.db
       .deleteFrom('scheduled_tasks')
       .where('id', '=', id)
-      .where('tenant_id', '=', ctx.tenantId)
-      .executeTakeFirst();
+      .where('tenant_id', '=', ctx.tenantId);
+    if (ctx.role === 'user') q = q.where('user_id', '=', ctx.userId);
+    const res = await q.executeTakeFirst();
     if (Number(res.numDeletedRows) === 0) return false;
     await this.db.deleteFrom('task_runs').where('task_id', '=', id).execute();
     return true;
@@ -558,7 +575,7 @@ export class MysqlStore implements Store {
   }
 
   async listTaskRuns(ctx: RequestContext, taskId: number): Promise<TaskRun[]> {
-    const rows = await this.db
+    let q = this.db
       .selectFrom('task_runs')
       .innerJoin('scheduled_tasks', 'scheduled_tasks.id', 'task_runs.task_id')
       .select([
@@ -570,9 +587,9 @@ export class MysqlStore implements Store {
         'task_runs.created_at as created_at',
       ])
       .where('scheduled_tasks.tenant_id', '=', ctx.tenantId)
-      .where('task_runs.task_id', '=', taskId)
-      .orderBy('task_runs.id', 'desc')
-      .execute();
+      .where('task_runs.task_id', '=', taskId);
+    if (ctx.role === 'user') q = q.where('scheduled_tasks.user_id', '=', ctx.userId);
+    const rows = await q.orderBy('task_runs.id', 'desc').execute();
     return rows.map((r): TaskRun => ({
       id: r.id,
       taskId: r.task_id,
@@ -596,7 +613,8 @@ export class MysqlStore implements Store {
   }
 
   async createUser(user: NewUser): Promise<User> {
-    const id = `u_${user.tenantId}_${user.username}`;
+    // id 带随机后缀去关联 username：墓碑改名释放用户名后，新建同名用户不会撞旧行主键。
+    const id = `u_${user.tenantId}_${user.username}_${randomUUID().slice(0, 8)}`;
     await this.db
       .insertInto('users')
       .values({
@@ -605,37 +623,136 @@ export class MysqlStore implements Store {
         username: user.username,
         role: user.role,
         password_hash: user.passwordHash,
+        status: 'active',
+        auth_provider: user.authProvider ?? 'local',
+        display_name: user.displayName ?? null,
       })
       .execute();
-    return { id, tenantId: user.tenantId, username: user.username, role: user.role };
+    return {
+      id,
+      tenantId: user.tenantId,
+      username: user.username,
+      role: user.role,
+      status: 'active',
+      authProvider: user.authProvider ?? 'local',
+      displayName: user.displayName,
+    };
   }
 
-  async getUserByUsername(tenantId: string, username: string): Promise<UserWithSecret | undefined> {
-    const r = await this.db
-      .selectFrom('users')
-      .select(['id', 'tenant_id', 'username', 'role', 'password_hash'])
-      .where('tenant_id', '=', tenantId)
-      .where('username', '=', username)
-      .executeTakeFirst();
-    if (!r) return undefined;
+  private toUser(r: {
+    id: string;
+    tenant_id: string;
+    username: string;
+    role: string;
+    status: string;
+    auth_provider: string;
+    display_name: string | null;
+    created_at?: Date | string;
+  }): User {
     return {
       id: r.id,
       tenantId: r.tenant_id,
       username: r.username,
       role: r.role as Role,
-      passwordHash: r.password_hash,
+      status: (r.status === 'disabled' ? 'disabled' : 'active'),
+      authProvider: (r.auth_provider === 'oidc' || r.auth_provider === 'aios' ? r.auth_provider : 'local'),
+      displayName: r.display_name ?? undefined,
+      ...(r.created_at ? { createdAt: toDate(r.created_at).toISOString() } : {}),
     };
+  }
+
+  async getUserByUsername(tenantId: string, username: string): Promise<UserWithSecret | undefined> {
+    const r = await this.db
+      .selectFrom('users')
+      .select(['id', 'tenant_id', 'username', 'role', 'password_hash', 'status', 'auth_provider', 'display_name', 'created_at'])
+      .where('tenant_id', '=', tenantId)
+      .where('username', '=', username)
+      .executeTakeFirst();
+    if (!r) return undefined;
+    return { ...this.toUser(r), passwordHash: r.password_hash };
   }
 
   async getUser(tenantId: string, userId: string): Promise<User | undefined> {
     const r = await this.db
       .selectFrom('users')
-      .select(['id', 'tenant_id', 'username', 'role'])
+      .select(['id', 'tenant_id', 'username', 'role', 'status', 'auth_provider', 'display_name', 'created_at'])
       .where('tenant_id', '=', tenantId)
       .where('id', '=', userId)
       .executeTakeFirst();
+    return r ? this.toUser(r) : undefined;
+  }
+
+  async listUsers(tenantId: string): Promise<User[]> {
+    const rows = await this.db
+      .selectFrom('users')
+      .select(['id', 'tenant_id', 'username', 'role', 'status', 'auth_provider', 'display_name', 'created_at'])
+      .where('tenant_id', '=', tenantId)
+      .orderBy('created_at', 'asc')
+      .execute();
+    return rows.map((r) => this.toUser(r));
+  }
+
+  async updateUser(tenantId: string, userId: string, patch: UserPatch): Promise<User | undefined> {
+    const set: Record<string, unknown> = {};
+    if (patch.status !== undefined) set.status = patch.status;
+    if (patch.username !== undefined) set.username = patch.username;
+    if (patch.role !== undefined) set.role = patch.role;
+    if (patch.displayName !== undefined) set.display_name = patch.displayName;
+    if (Object.keys(set).length) {
+      await this.db
+        .updateTable('users')
+        .set(set)
+        .where('tenant_id', '=', tenantId)
+        .where('id', '=', userId)
+        .execute();
+    }
+    return this.getUser(tenantId, userId);
+  }
+
+  async disableTasksByUser(tenantId: string, userId: string): Promise<number> {
+    const res = await this.db
+      .updateTable('scheduled_tasks')
+      .set({ enabled: 0 })
+      .where('tenant_id', '=', tenantId)
+      .where('user_id', '=', userId)
+      .where('enabled', '=', 1)
+      .executeTakeFirst();
+    return Number(res.numUpdatedRows ?? 0);
+  }
+
+  async setUserCredential(tenantId: string, userId: string, provider: string, record: UserCredentialRecord): Promise<void> {
+    const values = {
+      tenant_id: tenantId,
+      user_id: userId,
+      provider,
+      payload: record.payload,
+      expires_at: record.expiresAt ?? null,
+    };
+    await this.db
+      .insertInto('user_credentials')
+      .values(values)
+      .onDuplicateKeyUpdate({ payload: record.payload, expires_at: record.expiresAt ?? null })
+      .execute();
+  }
+
+  async getUserCredential(tenantId: string, userId: string, provider: string): Promise<UserCredentialRecord | undefined> {
+    const r = await this.db
+      .selectFrom('user_credentials')
+      .select(['payload', 'expires_at'])
+      .where('tenant_id', '=', tenantId)
+      .where('user_id', '=', userId)
+      .where('provider', '=', provider)
+      .executeTakeFirst();
     if (!r) return undefined;
-    return { id: r.id, tenantId: r.tenant_id, username: r.username, role: r.role as Role };
+    return { payload: r.payload, expiresAt: r.expires_at ? new Date(r.expires_at) : undefined };
+  }
+
+  async deleteUserCredentials(tenantId: string, userId: string): Promise<void> {
+    await this.db
+      .deleteFrom('user_credentials')
+      .where('tenant_id', '=', tenantId)
+      .where('user_id', '=', userId)
+      .execute();
   }
 
   async getLlmSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<LlmSettings | undefined> {

@@ -18,6 +18,8 @@ import type {
   ScheduledTaskPatch,
   Store,
   TaskRun,
+  UserCredentialRecord,
+  UserPatch,
   UserWithSecret,
 } from './store.js';
 import { DEFAULT_SESSION_TITLE } from './store.js';
@@ -25,6 +27,7 @@ import { nextRunAt } from '../scheduler/cron.js';
 
 interface MsgRow {
   tenantId: string;
+  userId: string;
   sessionId: string;
   msg: Msg;
   createdAt: Date;
@@ -32,6 +35,7 @@ interface MsgRow {
 
 interface SessionRow {
   tenantId: string;
+  userId: string;
   sessionId: string;
   title: string;
   explicitTitle: boolean;
@@ -54,6 +58,7 @@ export class MemoryStore implements Store {
   private runs: TaskRun[] = [];
   private tenants = new Map<string, Tenant>();
   private users = new Map<string, UserWithSecret>(); // key: tenantId/username
+  private credentials = new Map<string, UserCredentialRecord>(); // key: tenantId/userId/provider
   private llmSettings = new Map<string, LlmSettings>();
   private schedulerSettings = new Map<string, SchedulerSettings>();
   private sandboxSettings = new Map<string, SandboxSettings>();
@@ -62,12 +67,15 @@ export class MemoryStore implements Store {
   private runSeq = 0;
   private userSeq = 0;
 
-  private sessionKey(ctx: Pick<RequestContext, 'tenantId'>, sessionId: string): string {
-    return `${ctx.tenantId}/${sessionId}`;
+  // 会话/消息按 (tenant, user) 双重隔离：不同用户的同名 sessionId 互不可见、互不冲突。
+  private sessionKey(ctx: Pick<RequestContext, 'tenantId' | 'userId'>, sessionId: string): string {
+    return `${ctx.tenantId}/${ctx.userId}/${sessionId}`;
   }
 
   private sessionMessages(ctx: RequestContext, sessionId: string): MsgRow[] {
-    return this.messages.filter((r) => r.tenantId === ctx.tenantId && r.sessionId === sessionId);
+    return this.messages.filter(
+      (r) => r.tenantId === ctx.tenantId && r.userId === ctx.userId && r.sessionId === sessionId,
+    );
   }
 
   private sessionSummary(ctx: RequestContext, session: SessionRow): SessionSummary {
@@ -99,6 +107,7 @@ export class MemoryStore implements Store {
 
     const session: SessionRow = {
       tenantId: ctx.tenantId,
+      userId: ctx.userId,
       sessionId: input.sessionId,
       title: summarize(input.title ?? input.sessionId),
       explicitTitle,
@@ -125,6 +134,7 @@ export class MemoryStore implements Store {
 
     this.sessions.set(key, {
       tenantId: ctx.tenantId,
+      userId: ctx.userId,
       sessionId,
       title: summarize(input.title ?? sessionId),
       explicitTitle: Boolean(input.title) && input.title !== DEFAULT_SESSION_TITLE,
@@ -135,7 +145,7 @@ export class MemoryStore implements Store {
 
   async appendMessage(ctx: RequestContext, sessionId: string, msg: Msg): Promise<void> {
     const createdAt = new Date();
-    this.messages.push({ tenantId: ctx.tenantId, sessionId, msg, createdAt });
+    this.messages.push({ tenantId: ctx.tenantId, userId: ctx.userId, sessionId, msg, createdAt });
     await this.touchSession(ctx, sessionId, {
       title: msg.role === 'user' ? msg.text : undefined,
       updatedAt: createdAt,
@@ -145,7 +155,7 @@ export class MemoryStore implements Store {
   async appendMessages(ctx: RequestContext, sessionId: string, msgs: Msg[]): Promise<void> {
     if (!msgs.length) return;
     const createdAt = new Date();
-    for (const msg of msgs) this.messages.push({ tenantId: ctx.tenantId, sessionId, msg, createdAt });
+    for (const msg of msgs) this.messages.push({ tenantId: ctx.tenantId, userId: ctx.userId, sessionId, msg, createdAt });
     await this.touchSession(ctx, sessionId, {
       title: msgs.find((m) => m.role === 'user' && m.text)?.text,
       updatedAt: createdAt,
@@ -158,8 +168,10 @@ export class MemoryStore implements Store {
 
   async replaceMessages(ctx: RequestContext, sessionId: string, messages: Msg[]): Promise<void> {
     const createdAt = new Date();
-    this.messages = this.messages.filter((r) => !(r.tenantId === ctx.tenantId && r.sessionId === sessionId));
-    for (const msg of messages) this.messages.push({ tenantId: ctx.tenantId, sessionId, msg, createdAt });
+    this.messages = this.messages.filter(
+      (r) => !(r.tenantId === ctx.tenantId && r.userId === ctx.userId && r.sessionId === sessionId),
+    );
+    for (const msg of messages) this.messages.push({ tenantId: ctx.tenantId, userId: ctx.userId, sessionId, msg, createdAt });
   }
 
   async listSessions(ctx: RequestContext, limit = 50, offset = 0): Promise<SessionSummary[]> {
@@ -168,19 +180,21 @@ export class MemoryStore implements Store {
     if (safeLimit <= 0) return [];
 
     return [...this.sessions.values()]
-      .filter((r) => r.tenantId === ctx.tenantId)
+      .filter((r) => r.tenantId === ctx.tenantId && r.userId === ctx.userId)
       .map((session) => this.sessionSummary(ctx, session))
       .sort((a, b) => String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')))
       .slice(safeOffset, safeOffset + safeLimit);
   }
 
   async countSessions(ctx: RequestContext): Promise<number> {
-    return [...this.sessions.values()].filter((r) => r.tenantId === ctx.tenantId).length;
+    return [...this.sessions.values()].filter((r) => r.tenantId === ctx.tenantId && r.userId === ctx.userId).length;
   }
 
   async deleteSession(ctx: RequestContext, sessionId: string): Promise<boolean> {
     const before = this.messages.length;
-    this.messages = this.messages.filter((r) => !(r.tenantId === ctx.tenantId && r.sessionId === sessionId));
+    this.messages = this.messages.filter(
+      (r) => !(r.tenantId === ctx.tenantId && r.userId === ctx.userId && r.sessionId === sessionId),
+    );
     const deletedSession = this.sessions.delete(this.sessionKey(ctx, sessionId));
     return this.messages.length < before || deletedSession;
   }
@@ -227,20 +241,26 @@ export class MemoryStore implements Store {
     return { ...task };
   }
 
+  /** 任务可见性：普通用户仅见自己创建的；租户/平台管理员见全租户。 */
+  private canSeeTask(ctx: RequestContext, t: ScheduledTask): boolean {
+    if (t.tenantId !== ctx.tenantId) return false;
+    return ctx.role !== 'user' || t.userId === ctx.userId;
+  }
+
   async listScheduledTasks(ctx: RequestContext): Promise<ScheduledTask[]> {
     return [...this.tasks.values()]
-      .filter((t) => t.tenantId === ctx.tenantId)
+      .filter((t) => this.canSeeTask(ctx, t))
       .map((t) => ({ ...t }));
   }
 
   async getScheduledTask(ctx: RequestContext, id: number): Promise<ScheduledTask | undefined> {
     const t = this.tasks.get(id);
-    return t && t.tenantId === ctx.tenantId ? { ...t } : undefined;
+    return t && this.canSeeTask(ctx, t) ? { ...t } : undefined;
   }
 
   async updateScheduledTask(ctx: RequestContext, id: number, patch: ScheduledTaskPatch): Promise<ScheduledTask | undefined> {
     const t = this.tasks.get(id);
-    if (!t || t.tenantId !== ctx.tenantId) return undefined;
+    if (!t || !this.canSeeTask(ctx, t)) return undefined;
     if (patch.title !== undefined) t.title = patch.title;
     if (patch.task !== undefined) t.task = patch.task;
     if (patch.preApproved !== undefined) t.preApproved = patch.preApproved;
@@ -254,7 +274,7 @@ export class MemoryStore implements Store {
 
   async deleteScheduledTask(ctx: RequestContext, id: number): Promise<boolean> {
     const t = this.tasks.get(id);
-    if (!t || t.tenantId !== ctx.tenantId) return false;
+    if (!t || !this.canSeeTask(ctx, t)) return false;
     this.tasks.delete(id);
     this.runs = this.runs.filter((r) => r.taskId !== id);
     return true;
@@ -262,7 +282,7 @@ export class MemoryStore implements Store {
 
   async setTaskEnabled(ctx: RequestContext, id: number, enabled: boolean): Promise<void> {
     const t = this.tasks.get(id);
-    if (t && t.tenantId === ctx.tenantId) t.enabled = enabled;
+    if (t && this.canSeeTask(ctx, t)) t.enabled = enabled;
   }
 
   // 单进程内 JS 单线程：select→推进之间无 await，天然原子，并发 tick 不会重复领取。
@@ -289,7 +309,7 @@ export class MemoryStore implements Store {
 
   async listTaskRuns(ctx: RequestContext, taskId: number): Promise<TaskRun[]> {
     const t = this.tasks.get(taskId);
-    if (!t || t.tenantId !== ctx.tenantId) return [];
+    if (!t || !this.canSeeTask(ctx, t)) return [];
     return this.runs
       .filter((r) => r.taskId === taskId)
       .sort((a, b) => (b.id ?? 0) - (a.id ?? 0))
@@ -305,12 +325,20 @@ export class MemoryStore implements Store {
   }
 
   async createUser(user: NewUser): Promise<User> {
-    const id = `u${++this.userSeq}`;
+    // 确定性 id（便于测试与排查）；墓碑改名后重建同名用户时追加序号保证唯一。
+    const base = `u_${user.tenantId}_${user.username}`;
+    const taken = new Set([...this.users.values()].map((u) => u.id));
+    let id = base;
+    while (taken.has(id)) id = `${base}_${++this.userSeq}`;
     const rec: UserWithSecret = {
       id,
       tenantId: user.tenantId,
       username: user.username,
       role: user.role,
+      status: 'active',
+      authProvider: user.authProvider ?? 'local',
+      displayName: user.displayName,
+      createdAt: new Date().toISOString(),
       passwordHash: user.passwordHash,
     };
     this.users.set(`${user.tenantId}/${user.username}`, rec);
@@ -331,6 +359,57 @@ export class MemoryStore implements Store {
       }
     }
     return undefined;
+  }
+
+  async listUsers(tenantId: string): Promise<User[]> {
+    return [...this.users.values()]
+      .filter((u) => u.tenantId === tenantId)
+      .map(({ passwordHash: _omit, ...pub }) => ({ ...pub }));
+  }
+
+  async updateUser(tenantId: string, userId: string, patch: UserPatch): Promise<User | undefined> {
+    for (const [key, u] of this.users.entries()) {
+      if (u.tenantId !== tenantId || u.id !== userId) continue;
+      if (patch.status !== undefined) u.status = patch.status;
+      if (patch.role !== undefined) u.role = patch.role;
+      if (patch.displayName !== undefined) u.displayName = patch.displayName;
+      if (patch.username !== undefined && patch.username !== u.username) {
+        // username 是 Map 键的一部分（墓碑改名需重挂）。
+        this.users.delete(key);
+        u.username = patch.username;
+        this.users.set(`${u.tenantId}/${u.username}`, u);
+      }
+      const { passwordHash: _omit, ...pub } = u;
+      return { ...pub };
+    }
+    return undefined;
+  }
+
+  async disableTasksByUser(tenantId: string, userId: string): Promise<number> {
+    let n = 0;
+    for (const t of this.tasks.values()) {
+      if (t.tenantId === tenantId && t.userId === userId && t.enabled) {
+        t.enabled = false;
+        n++;
+      }
+    }
+    return n;
+  }
+
+  async setUserCredential(tenantId: string, userId: string, provider: string, record: UserCredentialRecord): Promise<void> {
+    this.credentials.set(`${tenantId}/${userId}/${provider}`, { ...record });
+  }
+
+  async getUserCredential(tenantId: string, userId: string, provider: string): Promise<UserCredentialRecord | undefined> {
+    const rec = this.credentials.get(`${tenantId}/${userId}/${provider}`);
+    return rec ? { ...rec } : undefined;
+  }
+
+  async deleteUserCredentials(tenantId: string, userId: string): Promise<void> {
+    const prefix = `${tenantId}/${userId}/`;
+    for (const key of this.credentials.keys()) {
+      if (key.startsWith(prefix)) this.credentials.delete(key);
+    }
   }
 
   async getLlmSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<LlmSettings | undefined> {
@@ -378,6 +457,7 @@ export class MemoryStore implements Store {
     this.runSeq = 0;
     this.tenants.clear();
     this.users.clear();
+    this.credentials.clear();
     this.llmSettings.clear();
     this.schedulerSettings.clear();
     this.mcpServers.clear();

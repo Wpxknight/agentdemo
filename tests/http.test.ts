@@ -248,7 +248,7 @@ describe('HTTP server', () => {
     expect(body).toContain('event: done');
 
     // 消息已落库（user + assistant）
-    const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
     const msgs = await store.listMessages(ctx, 'sess-1');
     expect(msgs.map((m) => m.role)).toContain('assistant');
   });
@@ -317,7 +317,7 @@ describe('HTTP server', () => {
       expect(body).toContain('event: thinking_delta');
       expect(body).toContain('event: text_delta');
 
-      const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+      const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
       const msgs = await localStore.listMessages(ctx, 'think-sess');
       const assistant = msgs.find((m) => m.role === 'assistant');
       expect(assistant?.thinking).toBe('先分析上下文。');
@@ -333,7 +333,7 @@ describe('HTTP server', () => {
       headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
       body: JSON.stringify({ task: 'again', sessionId: 'sess-1' }),
     }).then((r) => r.text());
-    const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
     const msgs = await store.listMessages(ctx, 'sess-1');
     // 两轮：user/assistant ×2
     expect(msgs.filter((m) => m.role === 'user').length).toBe(2);
@@ -345,7 +345,7 @@ describe('HTTP server', () => {
     const auth = new LocalAuthProvider({ store: localStore, secret: 'context-secret' });
     await auth.createUser('default', 'admin', 'pw', 'platform_admin');
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
-    const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
     await localStore.appendMessage(ctx, 'ctx-sess', { role: 'user', text: '上一轮问题' });
     await localStore.appendMessage(ctx, 'ctx-sess', { role: 'assistant', text: '上一轮回答' });
 
@@ -399,7 +399,7 @@ describe('HTTP server', () => {
     const auth = new LocalAuthProvider({ store: localStore, secret: 'terminate-secret' });
     await auth.createUser('default', 'admin', 'pw', 'platform_admin');
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
-    const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
     await localStore.appendMessage(ctx, 'term-sess', { role: 'user', text: '保留的问题' });
     await localStore.appendMessage(ctx, 'term-sess', { role: 'assistant', text: '保留的回答' });
 
@@ -476,7 +476,7 @@ describe('HTTP server', () => {
   });
 
   it('paginates and deletes chat sessions', async () => {
-    const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
     for (let i = 0; i < 3; i++) {
       await store.appendMessage(ctx, `paged-${i}`, { role: 'user', text: `分页会话 ${i}` });
       await store.appendMessage(ctx, `paged-${i}`, { role: 'assistant', text: `回答 ${i}` });
@@ -539,7 +539,7 @@ describe('HTTP server', () => {
     expect(r.status).toBe(200);
     expect(await r.text()).toContain('event: done');
 
-    const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
     const msgs = await store.listMessages(ctx, 'sess-upload');
     expect(msgs.find((m) => m.role === 'user')?.text).toContain('[上传附件]');
     expect(msgs.find((m) => m.role === 'user')?.text).toContain('error.log');
@@ -565,7 +565,7 @@ describe('HTTP server', () => {
     expect(r.status).toBe(200);
     expect(await r.text()).toContain('event: done');
 
-    const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
     const msgs = await store.listMessages(ctx, 'sess-upload-img');
     const user = msgs.find((m) => m.role === 'user');
     // 图像本体进 contentBlocks（受 keep-last-K / 硬裁剪治理），text 只留元信息
@@ -592,7 +592,7 @@ describe('HTTP server', () => {
     const listedBody = await listed.json() as { sessions: Array<{ sessionId: string; title: string }> };
     expect(listedBody.sessions).toContainEqual(expect.objectContaining({ sessionId: 'empty-http', title: '新会话' }));
 
-    const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
     await store.appendMessage(ctx, 'context-http', { role: 'user', text: '1234567890' });
     await store.appendMessage(ctx, 'context-http', { role: 'assistant', text: 'abcd' });
     const context = await fetch(`${base}/v1/sessions/context-http/context`, {
@@ -619,7 +619,7 @@ describe('HTTP server', () => {
     expect(appended.status).toBe(200);
     expect(await appended.json()).toEqual({ ok: true, sessionId: 'append-idle', queued: false });
 
-    const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
     const msgs = await store.listMessages(ctx, 'append-idle');
     expect(msgs).toEqual([
       expect.objectContaining({ role: 'user', text: expect.stringContaining('补充一条信息') }),
@@ -696,7 +696,7 @@ describe('HTTP server', () => {
       expect(seenMessages).toHaveLength(2);
       expect(seenMessages[1]!.at(-1)).toMatchObject({ role: 'user', text: expect.stringContaining('中途修正') });
 
-      const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+      const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
       const stored = await localStore.listMessages(ctx, 'active-append');
       expect(stored.map((message) => message.role)).toEqual(['user', 'assistant', 'user', 'assistant']);
       expect(stored[2]?.text).toContain('中途修正');
@@ -1572,7 +1572,7 @@ describe('HTTP server 会话互斥与自动压缩', () => {
       },
     };
     const { srv, url, headers, localStore } = await makeServer(chatModel);
-    const ctx = { tenantId: 'default', userId: 'admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
     // 默认 200k 窗口 → 预算 152k → 触发线 ≈129k tokens；30 对消息 ≈180k tokens 超线
     for (let i = 0; i < 30; i++) {
       await localStore.appendMessage(ctx, 'compact-sess', { role: 'user', text: `问题${i} ${'x'.repeat(24_000)}` });
@@ -1821,7 +1821,7 @@ describe('HTTP server 定时任务管理', () => {
     const listed = await fetch(`${base}/v1/schedule`, { headers: { authorization: `Bearer ${token}` } });
     const tasks = ((await listed.json()) as { tasks: Array<{ id: number }> }).tasks;
     expect(tasks.some((t) => t.id === id)).toBe(false);
-    expect(await store.listTaskRuns({ tenantId: 'default', userId: 'admin', role: 'platform_admin' }, id)).toHaveLength(0);
+    expect(await store.listTaskRuns({ tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' }, id)).toHaveLength(0);
 
     const again = await fetch(`${base}/v1/schedule/${id}`, {
       method: 'DELETE',

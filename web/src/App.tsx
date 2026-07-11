@@ -33,11 +33,13 @@ import {
   Search,
   Send,
   Settings,
+  Share2,
   SquarePen,
   Terminal,
   TerminalSquare,
   Trash2,
   User,
+  Users,
   X,
 } from 'lucide-react';
 import { NAV_ITEMS, defaultLlmConfig, fallbackTools } from './app-data';
@@ -45,8 +47,11 @@ import { MermaidDiagram } from './components/mermaid-diagram';
 import { createApi, numericSessionId, randomId, readStorage, writeStorage } from './api';
 import { formatSandboxOutputChunk, parseSandboxOutput, sandboxOutputClassNames, sandboxOutputCommand, sandboxOutputLabels } from './sandbox-output';
 import type {
+  AdminUser,
+  AdminUsersBody,
   Attachment,
   ChatMessage,
+  MeBody,
   ExportedFile,
   ContextUsageBody,
   ModelSettingsBody,
@@ -99,8 +104,22 @@ const iconMap = {
   mcp: Link2,
   schedule: CalendarClock,
   sandbox: Cuboid,
+  users: Users,
   settings: Settings,
 };
+
+/** 是否运行在 iframe 内（嵌入 AIOS 等宿主页）。 */
+const inIframe = typeof window !== 'undefined' && window.self !== window.top;
+
+/** 解析 JWT 过期时间（毫秒）；解析失败返回 undefined。 */
+function jwtExpiryMs(token: string): number | undefined {
+  try {
+    const payload = JSON.parse(atob(token.split('.')[1]!.replace(/-/g, '+').replace(/_/g, '/'))) as { exp?: number };
+    return typeof payload.exp === 'number' ? payload.exp * 1000 : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 const logoUrl = '/assets/logo.jpg';
 const aiAvatarUrl = logoUrl;
@@ -904,6 +923,10 @@ export default function App() {
     if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
       window.history.replaceState({}, '', '/login');
     }
+    // 嵌入模式下向宿主页重新请求授权（宿主监听到 ready 会回发新 token）。
+    if (inIframe && typeof window !== 'undefined') {
+      window.parent.postMessage({ type: 'aiop:ready' }, '*');
+    }
   }, []);
 
   const routeAfterLogin = useCallback(() => {
@@ -914,6 +937,70 @@ export default function App() {
   }, []);
 
   const api = useMemo(() => createApi(token, redirectToLogin), [token, redirectToLogin]);
+
+  // 当前登录身份（角色驱动管理员菜单的显隐；服务端 RBAC 才是权限边界）。
+  const [me, setMe] = useState<MeBody | null>(null);
+  useEffect(() => {
+    if (!token) {
+      setMe(null);
+      return;
+    }
+    api.get<MeBody>('/v1/me').then(setMe).catch(() => setMe(null));
+  }, [api, token]);
+
+  // AIOS token exchange：宿主页 postMessage 传来的平台 token 换 aiop JWT。
+  const exchangeAiosToken = useCallback(async (data: { token: string; refreshToken?: string; expiredTime?: string }) => {
+    setAuthStatus('正在通过 AIOS 平台登录...');
+    try {
+      const response = await fetch('/auth/aios/exchange', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({})) as { error?: string };
+        setAuthStatus(`AIOS 登录失败：${body.error || response.status}`);
+        return;
+      }
+      const body = await response.json() as { token: string };
+      setToken(body.token);
+      writeStorage('aiop_token', body.token);
+      setAuthStatus('');
+      routeAfterLogin();
+    } catch {
+      setAuthStatus('AIOS 登录失败：网络错误');
+    }
+  }, [routeAfterLogin]);
+
+  // 嵌入模式握手：iframe 就绪后向宿主页发 ready，宿主回发 {type:'aiop:auth', token}。
+  // token 不走 URL（防日志/历史泄露）；宿主真伪由后端 CSP frame-ancestors 白名单 + exchange 服务端校验兜底。
+  useEffect(() => {
+    if (!inIframe || typeof window === 'undefined') return;
+    const onMessage = (event: MessageEvent) => {
+      const data = event.data as { type?: string; token?: string; refreshToken?: string; expiredTime?: string } | null;
+      if (!data || data.type !== 'aiop:auth' || typeof data.token !== 'string' || !data.token) return;
+      void exchangeAiosToken({
+        token: data.token,
+        refreshToken: typeof data.refreshToken === 'string' ? data.refreshToken : undefined,
+        expiredTime: typeof data.expiredTime === 'string' ? data.expiredTime : undefined,
+      });
+    };
+    window.addEventListener('message', onMessage);
+    window.parent.postMessage({ type: 'aiop:ready' }, '*');
+    return () => window.removeEventListener('message', onMessage);
+  }, [exchangeAiosToken]);
+
+  // 静默续期：JWT 到期前 5 分钟重新向宿主页要 token（仅嵌入模式；AIOS 侧已登出则 exchange 失败自然退出）。
+  useEffect(() => {
+    if (!inIframe || !token || typeof window === 'undefined') return;
+    const exp = jwtExpiryMs(token);
+    if (!exp) return;
+    const delay = Math.max(30_000, exp - Date.now() - 5 * 60_000);
+    const timer = window.setTimeout(() => {
+      window.parent.postMessage({ type: 'aiop:ready' }, '*');
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [token]);
 
   const loadLlmSettings = useCallback(async () => {
     const body = await api.get<ModelSettingsBody>('/v1/settings/llm');
@@ -1588,6 +1675,7 @@ export default function App() {
       <TooltipProvider>
         <PrototypeChatShell
           token={token}
+          me={me}
           historyOpen={historyOpen}
           previewOpen={previewOpen}
           previewWidth={previewWidth}
@@ -1661,7 +1749,7 @@ export default function App() {
     <TooltipProvider>
       <div className="prototype-chat-page management-page">
         <div className="prototype-main-content management-main-content">
-          <PrototypeSidebarNav page={activePage} token={token} onNavigate={navigate} onLogout={redirectToLogin} />
+          <PrototypeSidebarNav page={activePage} token={token} me={me} onNavigate={navigate} onLogout={redirectToLogin} />
           <main className="main-shell">
           <section className="content-shell content-wide">
             {activePage === 'skills' && (
@@ -1675,6 +1763,7 @@ export default function App() {
             {activePage === 'mcp' && <McpPage tools={mcpTools} api={api} output={toolTestOutput} onTest={testMcpTool} onRequestConfirm={requestConfirmDialog} onChanged={() => void loadPageData('mcp')} />}
             {activePage === 'schedule' && <SchedulePage tasks={tasks} api={api} onChanged={() => void loadPageData('schedule')} onRequestConfirm={requestConfirmDialog} />}
             {activePage === 'sandbox' && <SandboxPage sandboxes={sandboxes} profiles={sandboxProfiles} />}
+            {activePage === 'users' && <UsersPage api={api} me={me} onRequestConfirm={requestConfirmDialog} />}
             {activePage === 'settings' && <SettingsPage llm={llm} status={settingsStatus} api={api} onLlmChange={setLlm} onStatus={setSettingsStatus} />}
           </section>
           </main>
@@ -1724,7 +1813,7 @@ function Sidebar({ page, token, onNavigate, onLogout }: {
   );
 }
 
-function SidebarAccountMenu({ token, onLogout }: { token: string; onLogout: () => void }) {
+function SidebarAccountMenu({ token, me, onLogout }: { token: string; me?: MeBody | null; onLogout: () => void }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="sidebar-account">
@@ -1742,8 +1831,8 @@ function SidebarAccountMenu({ token, onLogout }: { token: string; onLogout: () =
           <div className="account-popover-user">
             <img src={userAvatarUrl} alt="" />
             <div>
-              <strong>{token ? 'platform_admin' : '未登录'}</strong>
-              <span>租户 default</span>
+              <strong>{token ? (me?.displayName || me?.username || me?.role || '已登录') : '未登录'}</strong>
+              <span>租户 {me?.tenantId || 'default'}{me?.role ? ` · ${roleLabel(me.role)}` : ''}</span>
             </div>
           </div>
           <Separator />
@@ -1759,6 +1848,7 @@ function SidebarAccountMenu({ token, onLogout }: { token: string; onLogout: () =
 
 function PrototypeChatShell(props: {
   token: string;
+  me?: MeBody | null;
   historyOpen: boolean;
   previewOpen: boolean;
   previewWidth: number;
@@ -1810,7 +1900,7 @@ function PrototypeChatShell(props: {
   return (
     <div className="prototype-chat-page">
       <div className="prototype-main-content" id="main-content" style={{ '--sandbox-width': `${props.previewWidth}px` } as CSSProperties}>
-        <PrototypeSidebarNav page="chat" token={props.token} onNavigate={props.onNavigate} onLogout={props.onLogout} />
+        <PrototypeSidebarNav page="chat" token={props.token} me={props.me} onNavigate={props.onNavigate} onLogout={props.onLogout} />
         {props.historyOpen ? (
           <PrototypeSessionPanel
             sessions={props.sessions}
@@ -1876,16 +1966,19 @@ function PrototypeChatShell(props: {
   );
 }
 
-function PrototypeSidebarNav({ page, token, onNavigate, onLogout }: {
+function PrototypeSidebarNav({ page, token, me, onNavigate, onLogout }: {
   page: PageId;
   token: string;
+  me?: MeBody | null;
   onNavigate: (page: PageId) => void;
   onLogout: () => void;
 }) {
+  // 管理员专属菜单仅对 tenant_admin/platform_admin 渲染；隐藏只是 UX，权限边界在后端 RBAC。
+  const isAdmin = me?.role === 'platform_admin' || me?.role === 'tenant_admin';
   return (
     <aside className="prototype-sidebar-nav" aria-label="主导航">
       <BrandLogo className="prototype-sidebar-logo" />
-      {NAV_ITEMS.map((item) => {
+      {NAV_ITEMS.filter((item) => !item.adminOnly || isAdmin).map((item) => {
         const Icon = iconMap[item.icon];
         return (
           <Tooltip key={item.id}>
@@ -1904,7 +1997,7 @@ function PrototypeSidebarNav({ page, token, onNavigate, onLogout }: {
           </Tooltip>
         );
       })}
-      <SidebarAccountMenu token={token} onLogout={onLogout} />
+      <SidebarAccountMenu token={token} me={me} onLogout={onLogout} />
     </aside>
   );
 }
@@ -2843,6 +2936,243 @@ function parentPathOf(path: string): string {
   return parts.slice(0, -1).join('/');
 }
 
+function roleLabel(role: string): string {
+  if (role === 'platform_admin') return '平台管理员';
+  if (role === 'tenant_admin') return '租户管理员';
+  return '普通用户';
+}
+
+function providerLabel(provider?: string): string {
+  if (provider === 'aios') return 'AIOS 平台';
+  if (provider === 'oidc') return 'SSO';
+  return '本地';
+}
+
+function visibilityLabel(visibility?: string): string {
+  if (visibility === 'private') return '私有';
+  if (visibility === 'shared') return '已共享';
+  return '公共';
+}
+
+const emptyUserForm = { username: '', password: '', displayName: '', role: 'user' as AdminUser['role'] };
+
+/** 用户管理（独立一级菜单，仅管理员可见；权限边界在后端 /v1/admin/users* 的 RBAC）。 */
+function UsersPage({ api, me, onRequestConfirm }: {
+  api: ReturnType<typeof createApi>;
+  me: MeBody | null;
+  onRequestConfirm: (request: ConfirmDialogRequest) => void;
+}) {
+  const [users, setUsers] = useState<AdminUser[]>([]);
+  const [pageStatus, setPageStatus] = useState('');
+  const [showCreate, setShowCreate] = useState(false);
+  const [form, setForm] = useState(emptyUserForm);
+
+  const loadUsers = useCallback(async () => {
+    try {
+      const body = await api.get<AdminUsersBody>('/v1/admin/users');
+      setUsers(body.users || []);
+    } catch (err) {
+      setUsers([]);
+      setPageStatus(`加载用户失败：${formatError(err)}`);
+    }
+  }, [api]);
+
+  useEffect(() => {
+    void loadUsers();
+  }, [loadUsers]);
+
+  // 与后端护栏一致：不能操作自己；仅平台管理员可操作管理员账号。前端置灰只是提示，最终由后端裁决。
+  function canOperate(target: AdminUser): boolean {
+    if (!me) return false;
+    if (target.id === me.userId) return false;
+    if ((target.role === 'platform_admin' || target.role === 'tenant_admin') && me.role !== 'platform_admin') return false;
+    return true;
+  }
+
+  async function submitCreate(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!form.username.trim() || !form.password) {
+      setPageStatus('请填写用户名和密码。');
+      return;
+    }
+    setPageStatus('正在创建用户...');
+    try {
+      await api.post('/v1/admin/users', {
+        tenantId: me?.tenantId,
+        username: form.username.trim(),
+        password: form.password,
+        role: form.role,
+        displayName: form.displayName.trim() || undefined,
+      });
+      setForm(emptyUserForm);
+      setShowCreate(false);
+      await loadUsers();
+      setPageStatus('用户已创建。');
+    } catch (err) {
+      setPageStatus(`创建失败：${formatError(err)}`);
+    }
+  }
+
+  async function toggleUserEnabled(target: AdminUser) {
+    const action = target.status === 'disabled' ? 'enable' : 'disable';
+    setPageStatus(action === 'disable' ? '正在禁用...' : '正在恢复...');
+    try {
+      await api.post(`/v1/admin/users/${encodeURIComponent(target.id)}/${action}`);
+      await loadUsers();
+      setPageStatus(action === 'disable' ? '用户已禁用。' : '用户已恢复。');
+    } catch (err) {
+      setPageStatus(`操作失败：${formatError(err)}`);
+    }
+  }
+
+  function requestDeleteUser(target: AdminUser, tombstone: boolean) {
+    onRequestConfirm({
+      title: `删除用户 ${target.displayName || target.username}？`,
+      description: tombstone
+        ? '软删除并释放用户名（打墓碑）：同名新用户可重新注册，历史数据仍保留在原账号下。'
+        : '软删除：账号被禁用且用户名保持占用（该用户无法再登录，也无法通过平台登录自动重建）。数据不会被删除。',
+      alert: (target.authProvider !== 'local' && tombstone)
+        ? '注意：释放用户名后，该用户从 AIOS/SSO 再次登录会自动创建全新账号。'
+        : '此操作可由"启用"恢复访问，数据归属不变。',
+      confirmLabel: tombstone ? '删除并释放用户名' : '确认删除',
+      busyLabel: '删除中',
+      tone: 'danger',
+      onConfirm: async () => {
+        try {
+          await api.delete(`/v1/admin/users/${encodeURIComponent(target.id)}${tombstone ? '?tombstone=true' : ''}`);
+          await loadUsers();
+          setPageStatus('用户已删除（软删除）。');
+        } catch (err) {
+          setPageStatus(`删除失败：${formatError(err)}`);
+        }
+      },
+    });
+  }
+
+  return (
+    <section className="skills-page">
+      <div className="skills-page-header">
+        <div className="page-heading">
+          <h1>用户管理</h1>
+          <p className="page-subtitle">租户 {me?.tenantId || 'default'} 的用户：创建本地账号、禁用/恢复、软删除</p>
+        </div>
+        <Button type="button" onClick={() => setShowCreate((value) => !value)}>
+          <Plus data-icon="inline-start" />
+          {showCreate ? '收起表单' : '新建本地用户'}
+        </Button>
+      </div>
+      {pageStatus ? <div className="skill-import-status">{pageStatus}</div> : null}
+      {showCreate ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>新建本地用户</CardTitle>
+            <CardDescription>AIOS / SSO 用户由平台登录时自动创建，无需在此新建。</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <form className="settings-form" onSubmit={(event) => void submitCreate(event)}>
+              <label>用户名
+                <Input value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} placeholder="登录用户名" />
+              </label>
+              <label>初始密码
+                <Input type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder="初始密码" />
+              </label>
+              <label>显示名（可选）
+                <Input value={form.displayName} onChange={(e) => setForm({ ...form, displayName: e.target.value })} placeholder="展示用姓名" />
+              </label>
+              <label>角色
+                <Select value={form.role} onValueChange={(value) => setForm({ ...form, role: value as AdminUser['role'] })}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      <SelectItem value="user">普通用户</SelectItem>
+                      <SelectItem value="tenant_admin">租户管理员</SelectItem>
+                      {me?.role === 'platform_admin' ? <SelectItem value="platform_admin">平台管理员</SelectItem> : null}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+              </label>
+              <div>
+                <Button type="submit">创建</Button>
+              </div>
+            </form>
+          </CardContent>
+        </Card>
+      ) : null}
+      <Card>
+        <CardContent>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>用户名</TableHead>
+                <TableHead>显示名</TableHead>
+                <TableHead>角色</TableHead>
+                <TableHead>来源</TableHead>
+                <TableHead>状态</TableHead>
+                <TableHead>创建时间</TableHead>
+                <TableHead>操作</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {users.map((user) => (
+                <TableRow key={user.id}>
+                  <TableCell>
+                    {user.username}
+                    {user.id === me?.userId ? <Badge variant="secondary">当前账号</Badge> : null}
+                  </TableCell>
+                  <TableCell>{user.displayName || '-'}</TableCell>
+                  <TableCell>{roleLabel(user.role)}</TableCell>
+                  <TableCell>{providerLabel(user.authProvider)}</TableCell>
+                  <TableCell>
+                    <Badge variant={user.status === 'disabled' ? 'destructive' : 'secondary'}>
+                      {user.status === 'disabled' ? '已禁用' : '正常'}
+                    </Badge>
+                  </TableCell>
+                  <TableCell>{user.createdAt ? formatDateTime(user.createdAt) : '-'}</TableCell>
+                  <TableCell>
+                    <div className="skill-detail-actions">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        type="button"
+                        disabled={!canOperate(user)}
+                        onClick={() => void toggleUserEnabled(user)}
+                      >
+                        {user.status === 'disabled' ? '启用' : '禁用'}
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        type="button"
+                        disabled={!canOperate(user)}
+                        onClick={() => requestDeleteUser(user, false)}
+                      >
+                        <Trash2 data-icon="inline-start" />
+                        删除
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        type="button"
+                        disabled={!canOperate(user)}
+                        onClick={() => requestDeleteUser(user, true)}
+                      >
+                        删除并释放用户名
+                      </Button>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              ))}
+              {!users.length ? (
+                <TableRow><TableCell colSpan={7}>暂无用户</TableCell></TableRow>
+              ) : null}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+    </section>
+  );
+}
+
 function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
   tools: ToolSummary[];
   api: ReturnType<typeof createApi>;
@@ -2920,6 +3250,22 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
         entry,
         content: `${skillPreview(selected, path)}\n\n读取失败：${formatError(err)}`,
       });
+    }
+  }
+
+  async function toggleSkillShared() {
+    if (!selectedName) return;
+    const share = selected?.visibility === 'private';
+    setImportStatus(share ? '正在共享技能...' : '正在取消共享...');
+    try {
+      const body = await api.post<SkillActionBody>(
+        `/v1/skills/${encodeURIComponent(selectedName)}/${share ? 'share' : 'unshare'}`,
+      );
+      await onImported();
+      if (body.skill?.name) setSelectedName(body.skill.name);
+      setImportStatus(share ? '技能已共享：租户内所有人可查看使用。' : '技能已设为私有。');
+    } catch (err) {
+      setImportStatus(`操作失败：${formatError(err)}`);
     }
   }
 
@@ -3047,6 +3393,7 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
                       <em>{tool.description || '后端已注册的 AI 助手技能。'}</em>
                       <span className="skill-list-foot">
                         <Badge variant="secondary">{tool.status || '已启用'}</Badge>
+                        {tool.visibility ? <Badge variant="outline">{visibilityLabel(tool.visibility)}</Badge> : null}
                         <small>{isSkillEnabled(tool) ? '可被助手加载' : '不会被助手加载'}</small>
                       </span>
                     </span>
@@ -3105,14 +3452,26 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
                 <FolderTree data-icon="inline-start" />
                 {showSkillFiles ? '隐藏目录' : '目录'}
               </Button>
-              <Button variant="outline" size="sm" type="button" onClick={() => void toggleSkillEnabled()}>
-                {isSkillEnabled(selected) ? <X data-icon="inline-start" /> : <Check data-icon="inline-start" />}
-                {isSkillEnabled(selected) ? '禁用' : '启用'}
-              </Button>
-              <Button variant="outline" size="sm" type="button" onClick={requestDeleteSelectedSkill}>
-                <Trash2 data-icon="inline-start" />
-                删除
-              </Button>
+              {/* 只有所有者能启停/删除/共享（canManage 由服务端计算；按钮隐藏只是 UX，权限在后端）。 */}
+              {selected?.canManage !== false ? (
+                <>
+                  {selected?.visibility === 'private' || selected?.visibility === 'shared' ? (
+                    <Button variant="outline" size="sm" type="button" onClick={() => void toggleSkillShared()}>
+                      <Share2 data-icon="inline-start" />
+                      {selected?.visibility === 'shared' ? '取消共享' : '共享'}
+                    </Button>
+                  ) : null}
+                  <Button variant="outline" size="sm" type="button" onClick={() => void toggleSkillEnabled()}>
+                    {isSkillEnabled(selected) ? <X data-icon="inline-start" /> : <Check data-icon="inline-start" />}
+                    {isSkillEnabled(selected) ? '禁用' : '启用'}
+                  </Button>
+                  <Button variant="outline" size="sm" type="button" onClick={requestDeleteSelectedSkill}>
+                    <Trash2 data-icon="inline-start" />
+                    删除
+                  </Button>
+                </>
+              ) : null}
+              {selected?.visibility ? <Badge variant="outline">{visibilityLabel(selected.visibility)}</Badge> : null}
               <Badge variant="secondary">{selected?.status || '已启用'}</Badge>
             </div>
           </div>
@@ -4258,6 +4617,23 @@ function PageTitle({ title, desc }: { title: string; desc?: string }) {
 }
 
 function LoginPage({ authStatus, onSubmit }: { authStatus: string; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
+  // 嵌入模式：等待宿主页（AIOS）postMessage 授权，不展示本地登录表单。
+  if (inIframe) {
+    return (
+      <main className="login-page">
+        <section className="login-card">
+          <div className="login-brand">
+            <BrandLogo className="brand-logo-login" />
+            <div>
+              <h1>AIOP</h1>
+              <p>正在等待 AIOS 平台授权...</p>
+            </div>
+          </div>
+          {authStatus ? <div className="settings-status">{authStatus}</div> : null}
+        </section>
+      </main>
+    );
+  }
   return (
     <main className="login-page">
       <section className="login-card">

@@ -97,11 +97,14 @@ python scripts/check_prerequisites.py
 
 1. 检查本地是否存在 `token.json` 文件（即 `TOKEN_FILE`）。若存在则直接进入下一步，不要弹窗。
 
-2. 若 `token.json` 不存在，使用**一次** `AskUserQuestion` 同时询问账号和密码（两个 question）：
+2. 若 `token.json` 不存在：**不要向用户索要账号或密码**。凭据应由 aiop 平台在技能同步进沙箱时按当前登录用户自动注入（`aios-base/token.json`）。此时直接终止流程并告知用户：
+   `平台凭据缺失或已过期，请在 AIOS 平台重新登录后重试。`
+
+3. 例外（仅本地/独立部署调试）：当环境变量 `AIOS_ALLOW_PASSWORD_LOGIN=1` 显式开启时，才允许使用**一次** `AskUserQuestion` 同时询问账号和密码（两个 question）：
    - question 1: `请输入您的平台账号`，header: `账号`，options: `输入账号`（Other）、`取消本次请求`
    - question 2: `请输入您的平台密码`，header: `密码`，options: `输入密码`（Other）、`取消本次请求`
 
-3. 任意一项用户选择"取消本次请求"则终止流程；两项均填写后静默执行：
+   任意一项用户选择"取消本次请求"则终止流程；两项均填写后静默执行：
    ```
    python scripts/setup_auth.py --username <账号> --password <密码>
    ```

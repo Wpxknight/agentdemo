@@ -16,9 +16,11 @@ import { InMemoryApprovalStore, InteractiveApprovalGate } from '../agent/approva
 import { InMemoryQuestionStore } from '../agent/question.js';
 import type { QuestionAnswers, QuestionSpec } from '../agent/question.js';
 import { authenticate } from './context.js';
-import { AuthzError, requirePermission } from '../auth/rbac.js';
+import { AuthzError, canManageUsersOf, requirePermission } from '../auth/rbac.js';
 import { LocalAuthProvider } from '../auth/local.js';
 import { OidcAuthProvider } from '../auth/oidc.js';
+import { AiosAuthError } from '../auth/aios.js';
+import { softDeleteUser, setUserEnabled } from '../auth/lifecycle.js';
 import { createTenant, createUser, listTenants } from '../auth/admin.js';
 import type { RequestContext, Role } from '../auth/types.js';
 import { DEFAULT_TASK_MAX_RUN_MS, type SandboxSettings, type ScheduledTaskPatch } from '../db/store.js';
@@ -28,7 +30,7 @@ import { createModel } from '../model/factory.js';
 import { estimateCost } from '../model/cost.js';
 import type { JsonValue, Msg, ToolCall } from '../model/types.js';
 import { importSkillZip } from '../skill/import.js';
-import type { Skill } from '../skill/registry.js';
+import type { Skill, SkillRegistry } from '../skill/registry.js';
 import { McpServerSchema } from '../config/schema.js';
 
 const log = logger.child({ mod: 'http' });
@@ -89,7 +91,7 @@ function contentDisposition(name: string): string {
   return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
 }
 
-async function sendWebAsset(res: Res, path: string): Promise<boolean> {
+async function sendWebAsset(res: Res, path: string, frameAncestors?: string[]): Promise<boolean> {
   if (path === '/favicon.ico') {
     res.writeHead(204);
     res.end();
@@ -102,7 +104,16 @@ async function sendWebAsset(res: Res, path: string): Promise<boolean> {
   if (!isSpaRoute && !assetPath.startsWith('assets/')) return false;
   const buf = await readWebFile(`dist/${assetPath}`).catch(() => undefined);
   if (!buf) return false;
-  res.writeHead(200, { 'content-type': contentType(assetPath), 'content-length': buf.length });
+  const headers: Record<string, string | number> = {
+    'content-type': contentType(assetPath),
+    'content-length': buf.length,
+  };
+  if (assetPath === 'index.html') {
+    // 嵌入防护：仅允许同源 + 配置白名单里的宿主页（如 AIOS）嵌入，防第三方站点 iframe 钓鱼。
+    const ancestors = ['\'self\'', ...(frameAncestors ?? [])].join(' ');
+    headers['content-security-policy'] = `frame-ancestors ${ancestors}`;
+  }
+  res.writeHead(200, headers);
   res.end(buf);
   return true;
 }
@@ -499,10 +510,39 @@ async function persistMcpServers(rt: Runtime): Promise<void> {
   }
 }
 
+/** 用户状态短缓存（60s）：禁用/软删除用户的存量 JWT 在分钟级内失效，又不至于每请求打库。 */
+const USER_STATUS_TTL_MS = 60_000;
+const statusCaches = new WeakMap<Runtime, Map<string, { active: boolean; at: number }>>();
+
+async function assertUserActive(rt: Runtime, ctx: RequestContext): Promise<void> {
+  let cache = statusCaches.get(rt);
+  if (!cache) {
+    cache = new Map();
+    statusCaches.set(rt, cache);
+  }
+  const key = `${ctx.tenantId}/${ctx.userId}`;
+  const cached = cache.get(key);
+  if (cached && Date.now() - cached.at < USER_STATUS_TTL_MS) {
+    if (!cached.active) throw new HttpError(401, '账号已被禁用');
+    return;
+  }
+  // 无用户行（CLI 默认身份 / 遗留数据）不拦：状态门只对存在且被禁用的账号生效。
+  const user = await rt.store.getUser(ctx.tenantId, ctx.userId).catch(() => undefined);
+  const active = !user || user.status !== 'disabled';
+  cache.set(key, { active, at: Date.now() });
+  if (!active) throw new HttpError(401, '账号已被禁用');
+}
+
+/** 用户状态变更后清缓存，让禁用/恢复立即生效。 */
+function invalidateUserStatus(rt: Runtime, tenantId: string, userId: string): void {
+  statusCaches.get(rt)?.delete(`${tenantId}/${userId}`);
+}
+
 /** 校验 Bearer token 并返回身份；失败抛 401。 */
 async function requireAuth(rt: Runtime, req: Req): Promise<RequestContext> {
   const ctx = await authenticate(rt.authProvider, req.headers.authorization);
   if (!ctx) throw new HttpError(401, '未认证或 token 无效');
+  await assertUserActive(rt, ctx);
   return ctx;
 }
 
@@ -564,7 +604,7 @@ async function handle(
     return;
   }
 
-  if (method === 'GET' && await sendWebAsset(res, path)) return;
+  if (method === 'GET' && await sendWebAsset(res, path, rt.frameAncestors)) return;
 
   // —— 本地登录 ——
   if (route === 'POST /auth/login') {
@@ -576,6 +616,36 @@ async function handle(
     const token = await rt.authProvider.login(tenantId, username, password);
     if (!token) throw new HttpError(401, '登录失败：用户名或口令错误');
     return sendJson(res, 200, { token });
+  }
+
+  // —— AIOS 嵌入登录：token exchange（宿主页 postMessage 传来的 AIOS token → aiop JWT）——
+  if (route === 'POST /auth/aios/exchange') {
+    if (!rt.aiosAuth) throw new HttpError(400, '未启用 AIOS 登录');
+    const body = await readJson(req);
+    const aiosToken = str(body, 'token');
+    if (!aiosToken) throw new HttpError(400, 'token 必填');
+    try {
+      const { token, ctx, user } = await rt.aiosAuth.exchange({
+        token: aiosToken,
+        refreshToken: str(body, 'refreshToken'),
+        expiredTime: str(body, 'expiredTime'),
+      });
+      invalidateUserStatus(rt, ctx.tenantId, ctx.userId);
+      await rt.audit?.record({
+        kind: 'auth', action: 'aios-exchange', tenantId: ctx.tenantId,
+        detail: { userId: ctx.userId, role: ctx.role },
+      });
+      return sendJson(res, 200, {
+        token,
+        tenantId: ctx.tenantId,
+        userId: ctx.userId,
+        role: ctx.role,
+        displayName: user.displayName ?? user.username,
+      });
+    } catch (err) {
+      if (err instanceof AiosAuthError) throw new HttpError(401, err.message);
+      throw err;
+    }
   }
 
   // —— OIDC：发起登录 ——
@@ -615,7 +685,15 @@ async function handle(
 
   if (route === 'GET /v1/me') {
     const ctx = await requireAuth(rt, req);
-    return sendJson(res, 200, { tenantId: ctx.tenantId, userId: ctx.userId, role: ctx.role });
+    const user = await rt.store.getUser(ctx.tenantId, ctx.userId).catch(() => undefined);
+    return sendJson(res, 200, {
+      tenantId: ctx.tenantId,
+      userId: ctx.userId,
+      role: ctx.role,
+      username: user?.username,
+      displayName: user?.displayName ?? user?.username,
+      authProvider: user?.authProvider,
+    });
   }
 
   if (route === 'GET /v1/sessions') {
@@ -649,7 +727,7 @@ async function handle(
   }
 
   if (route === 'GET /v1/tools') {
-    await requireAuth(rt, req);
+    const ctx = await requireAuth(rt, req);
     const tools = [
       ...rt.tools.defs()
         .filter((def) => !(rt.skillRegistry && (def.name === 'load_skill' || def.name.startsWith('skill__'))))
@@ -659,7 +737,8 @@ async function handle(
           category: toolCategory(def.name),
           inputSchema: def.inputSchema,
         })),
-      ...(rt.skillRegistry?.list().map(publicSkill) ?? []),
+      // 技能按查看者过滤：public ∪ 自己的 ∪ shared（服务端过滤，不信前端）。
+      ...(rt.skillRegistry?.listFor(ctx).map((skill) => publicSkill(skill, rt.skillRegistry!, ctx)) ?? []),
     ];
     const groups = tools.reduce<Record<string, number>>((acc, tool) => {
       const category = typeof tool.category === 'string' ? tool.category : 'builtin';
@@ -670,8 +749,8 @@ async function handle(
   }
 
   if (route === 'POST /v1/skills/import') {
+    // 上传放开给所有登录用户：管理员 → _public（全员可见）；普通用户 → users/<uid>（默认私有）。
     const ctx = await requireAuth(rt, req);
-    requirePermission(ctx, 'tenant:manage');
     if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
     const body = await readJson(req, SKILL_IMPORT_MAX_BODY);
     const filename = str(body, 'filename');
@@ -680,22 +759,49 @@ async function handle(
     if (!/\.zip$/i.test(filename)) throw new HttpError(400, '仅支持导入 zip 技能包');
 
     const imported = await importSkillZip({
-      rootDir: rt.skillRegistry.rootDir(),
+      rootDir: rt.skillRegistry.importRootFor(ctx),
       filename,
       data: decodeSkillImportData(data),
     });
+    await rt.skillRegistry.setOwner(imported.skillDir, ctx.userId);
     await rt.skillRegistry.scan();
     rt.systemExtra = rt.skillRegistry.summaries();
     const skill = rt.skillRegistry.list().find((item) => resolve(item.dir) === resolve(imported.skillDir));
     if (!skill) throw new HttpError(422, '导入后未发现有效技能');
-    return sendJson(res, 201, { skill: publicSkill(skill) });
+    await rt.audit?.record({
+      kind: 'auth', action: 'skill-imported', tenantId: ctx.tenantId,
+      detail: { skill: skill.name, by: ctx.userId, visibility: skill.visibility },
+    });
+    return sendJson(res, 201, { skill: publicSkill(skill, rt.skillRegistry, ctx) });
+  }
+
+  // 共享 / 取消共享：仅所有者（private ↔ shared；对应前端"共享"按钮）。
+  const skillShareMatch = /^\/v1\/skills\/([^/]+)\/(share|unshare)$/.exec(path);
+  if (method === 'POST' && skillShareMatch) {
+    const ctx = await requireAuth(rt, req);
+    if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
+    const name = decodeURIComponent(skillShareMatch[1]!);
+    const skill = requireManagedSkill(rt, ctx, name);
+    try {
+      const updated = await rt.skillRegistry.setShared(skill.name, skillShareMatch[2] === 'share');
+      rt.systemExtra = rt.skillRegistry.summaries();
+      await rt.audit?.record({
+        kind: 'auth', action: skillShareMatch[2] === 'share' ? 'skill-shared' : 'skill-unshared',
+        tenantId: ctx.tenantId, detail: { skill: skill.name, by: ctx.userId },
+      });
+      return sendJson(res, 200, { skill: publicSkill(updated, rt.skillRegistry, ctx) });
+    } catch (err) {
+      throw skillHttpError(err);
+    }
   }
 
   const skillFilesMatch = /^\/v1\/skills\/([^/]+)\/files$/.exec(path);
   if (method === 'GET' && skillFilesMatch) {
-    await requireAuth(rt, req);
+    const ctx = await requireAuth(rt, req);
     if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
     const name = decodeURIComponent(skillFilesMatch[1]!);
+    // 可见性检查：越权技能等同不存在（404，不泄露存在性）。
+    if (!rt.skillRegistry.getFor(name, ctx)) throw new HttpError(404, `未找到技能 ${name}`);
     const requestedPath = url.searchParams.get('path') ?? '';
     try {
       const entries = await rt.skillRegistry.listDir(name, requestedPath);
@@ -719,14 +825,14 @@ async function handle(
   const skillActionMatch = /^\/v1\/skills\/([^/]+)\/(enable|disable)$/.exec(path);
   if (method === 'POST' && skillActionMatch) {
     const ctx = await requireAuth(rt, req);
-    requirePermission(ctx, 'tenant:manage');
     if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
     const name = decodeURIComponent(skillActionMatch[1]!);
+    const managed = requireManagedSkill(rt, ctx, name);
     const enabled = skillActionMatch[2] === 'enable';
     try {
-      const skill = await rt.skillRegistry.setEnabled(name, enabled);
+      const skill = await rt.skillRegistry.setEnabled(managed.name, enabled);
       rt.systemExtra = rt.skillRegistry.summaries();
-      return sendJson(res, 200, { skill: publicSkill(skill) });
+      return sendJson(res, 200, { skill: publicSkill(skill, rt.skillRegistry, ctx) });
     } catch (err) {
       throw skillHttpError(err);
     }
@@ -735,14 +841,18 @@ async function handle(
   const skillDeleteMatch = /^\/v1\/skills\/([^/]+)$/.exec(path);
   if (method === 'DELETE' && skillDeleteMatch) {
     const ctx = await requireAuth(rt, req);
-    requirePermission(ctx, 'tenant:manage');
     if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
     const body = await readJson(req);
     if (body.confirm !== true) throw new HttpError(400, '删除技能需要 confirm=true');
     const name = decodeURIComponent(skillDeleteMatch[1]!);
+    const managed = requireManagedSkill(rt, ctx, name);
     try {
-      await rt.skillRegistry.delete(name);
+      await rt.skillRegistry.delete(managed.name);
       rt.systemExtra = rt.skillRegistry.summaries();
+      await rt.audit?.record({
+        kind: 'auth', action: 'skill-deleted', tenantId: ctx.tenantId,
+        detail: { skill: managed.name, by: ctx.userId },
+      });
       return sendJson(res, 200, { ok: true });
     } catch (err) {
       throw skillHttpError(err);
@@ -1212,13 +1322,57 @@ async function handle(
       throw new HttpError(400, 'OIDC 模式下用户由 IdP 管理，不支持本地建号');
     }
     const body = await readJson(req);
-    const tenantId = str(body, 'tenantId');
+    const tenantId = str(body, 'tenantId') ?? ctx.tenantId;
     const username = str(body, 'username');
     const password = str(body, 'password');
     const role = (str(body, 'role') ?? 'user') as Role;
-    if (!tenantId || !username || !password) throw new HttpError(400, 'tenantId/username/password 必填');
+    if (!username || !password) throw new HttpError(400, 'username/password 必填');
+    // 占位即封禁：同名行（含 disabled）存在时拒绝，防止新建同名账号继承视觉身份。
+    if (await rt.store.getUserByUsername(tenantId, username)) {
+      throw new HttpError(409, `用户名已存在：${username}`);
+    }
     const user = await createUser(ctx, rt.authProvider, { tenantId, username, password, role });
-    return sendJson(res, 201, { user });
+    if (str(body, 'displayName')) {
+      await rt.store.updateUser(tenantId, user.id, { displayName: str(body, 'displayName') });
+    }
+    await rt.audit?.record({
+      kind: 'auth', action: 'user-created', tenantId,
+      detail: { by: ctx.userId, target: user.id, role },
+    });
+    return sendJson(res, 201, { user: await rt.store.getUser(tenantId, user.id) ?? user });
+  }
+
+  // —— 管理：用户列表 / 软删除 / 禁用恢复（DESIGN-aios-integration §8.5）——
+  if (route === 'GET /v1/admin/users') {
+    const ctx = await requireAuth(rt, req);
+    const tenantId = url.searchParams.get('tenantId') ?? ctx.tenantId;
+    if (!canManageUsersOf(ctx, tenantId)) throw new AuthzError(`权限不足：无法管理租户 ${tenantId} 的用户`);
+    return sendJson(res, 200, { users: await rt.store.listUsers(tenantId) });
+  }
+
+  const adminUserActionMatch = /^\/v1\/admin\/users\/([^/]+)\/(disable|enable)$/.exec(path);
+  if (method === 'POST' && adminUserActionMatch) {
+    const ctx = await requireAuth(rt, req);
+    const tenantId = url.searchParams.get('tenantId') ?? ctx.tenantId;
+    const target = await rt.store.getUser(tenantId, decodeURIComponent(adminUserActionMatch[1]!));
+    if (!target) throw new HttpError(404, '用户不存在');
+    const enabled = adminUserActionMatch[2] === 'enable';
+    const updated = await setUserEnabled({ store: rt.store, credentials: rt.credentials, audit: rt.audit }, ctx, target, enabled);
+    invalidateUserStatus(rt, tenantId, target.id);
+    return sendJson(res, 200, { user: updated });
+  }
+
+  const adminUserDeleteMatch = /^\/v1\/admin\/users\/([^/]+)$/.exec(path);
+  if (method === 'DELETE' && adminUserDeleteMatch) {
+    const ctx = await requireAuth(rt, req);
+    const tenantId = url.searchParams.get('tenantId') ?? ctx.tenantId;
+    const target = await rt.store.getUser(tenantId, decodeURIComponent(adminUserDeleteMatch[1]!));
+    if (!target) throw new HttpError(404, '用户不存在');
+    // 默认保留原 username（占位即封禁，防经 JIT 复活）；?tombstone=true 显式释放用户名。
+    const tombstone = url.searchParams.get('tombstone') === 'true';
+    const updated = await softDeleteUser({ store: rt.store, credentials: rt.credentials, audit: rt.audit }, ctx, target, { tombstone });
+    invalidateUserStatus(rt, tenantId, target.id);
+    return sendJson(res, 200, { user: updated });
   }
 
   sendJson(res, 404, { error: `未知路由: ${route}` });
@@ -1250,7 +1404,7 @@ function decodeBase64(raw: string): Buffer {
   return data;
 }
 
-function publicSkill(skill: Skill): Record<string, unknown> {
+function publicSkill(skill: Skill, registry: SkillRegistry, viewer?: RequestContext): Record<string, unknown> {
   return {
     name: skill.name,
     description: skill.description,
@@ -1258,9 +1412,26 @@ function publicSkill(skill: Skill): Record<string, unknown> {
     source: '本地',
     enabled: skill.enabled,
     status: skill.enabled ? '已启用' : '已禁用',
+    owner: skill.owner,
+    visibility: skill.visibility,
+    // 前端据此显示管理按钮；真正的权限判定始终在服务端各路由。
+    canManage: registry.canManage(skill, viewer),
     files: skill.files.filter((file) => !file.isDirectory && file.path !== 'SKILL.md').map((file) => file.path),
     fileEntries: skill.files,
   };
+}
+
+/**
+ * 技能管理护栏：不可见 → 404（不泄露存在性）；可见但非所有者 → 403。
+ * 只有所有者能启停/删除/共享自己的技能；无主存量技能由 tenant:manage 管理员代管。
+ */
+function requireManagedSkill(rt: Runtime, ctx: RequestContext, name: string): Skill {
+  const registry = rt.skillRegistry;
+  if (!registry) throw new HttpError(409, '未启用技能目录');
+  const skill = registry.get(name);
+  if (!skill || !registry.visibleTo(skill, ctx)) throw new HttpError(404, `未找到技能 ${name}`);
+  if (!registry.canManage(skill, ctx)) throw new HttpError(403, '仅技能所有者可执行该操作');
+  return skill;
 }
 
 function parentSkillPath(path: string): string | null {
@@ -1443,7 +1614,11 @@ async function runAgentSse(
           return dryRun.content;
         },
       }),
-      system: [parsedTask.goalMode ? GOAL_MODE_SYSTEM : '', rt.systemExtra].filter(Boolean).join('\n\n'),
+      // 技能摘要按当前用户过滤（他人私有技能对模型也不可见），与列表/执行链路同一套可见性。
+      system: [
+        parsedTask.goalMode ? GOAL_MODE_SYSTEM : '',
+        rt.skillRegistry ? rt.skillRegistry.summariesFor(ctx) : rt.systemExtra,
+      ].filter(Boolean).join('\n\n'),
       ctx: toolCtx,
       messages: prior,
       task: parsedTask.task,

@@ -192,34 +192,25 @@ exchange 时后端已拿到该用户的 AIOS token，将其存入**独立的服�
 
 > 共享粒度先做"租户内全员"（`shared` 一个状态），若后续要精确到指定用户，追加 `skill_shares(skill_name, shared_to_user_id)` 表即可，模型兼容。
 
-### 4.2 存储设计：文件保留 + 元数据表管权限
+### 4.2 存储设计：文件系统为唯一事实源（实现定稿）
 
-技能内容仍是文件目录（渐进式披露机制不变），权限元数据入库：
+> 实现说明：原方案设想 `skills_meta` 数据库表；实现时改为**文件标记**（沿用既有 `.disabled` 模式），
+> 原因：技能内容本就在文件系统，元数据入库会产生双事实源漂移；标记随技能目录走，MemoryStore 开发模式
+> 与多副本共享盘天然可用（多副本本就需要共享技能目录，见 §9-5）。
 
-```sql
--- 0007_skills_meta.sql
-CREATE TABLE skills_meta (
-  tenant_id     VARCHAR(64)  NOT NULL,
-  skill_name    VARCHAR(128) NOT NULL,
-  owner_user_id VARCHAR(64)  NOT NULL,
-  visibility    ENUM('public','private','shared') NOT NULL DEFAULT 'private',
-  created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY (tenant_id, skill_name)
-);
-```
-
-目录分层（防不同用户同名冲突）：
+技能内容仍是文件目录（渐进式披露机制不变），归属与可见性由目录布局 + 标记文件表达：
 
 ```
 skills/
-├── _public/<name>/          # 管理员上传（visibility=public）
-└── users/<userId>/<name>/   # 个人上传（private/shared）
+├── <name>/                  # 存量技能：原地视为 public（不搬家——目录可能是只读挂载），无主由管理员代管
+├── _public/<name>/          # 管理员上传（visibility=public；.owner 文件记录上传者）
+└── users/<userId>/<name>/   # 个人上传；默认 private，存在 .shared 标记则 shared
 ```
 
-- `SkillRegistry`（`src/skill/registry.ts`）改为多根扫描，`Skill` 接口增加 `owner/visibility` 字段（从 meta 表联查或启动时加载）；
-- 同名解析：public 命名空间内唯一；用户技能与 public 同名时，列表展示带所有者标识，工具名内部用 `<name>@<owner>` 消歧（对 LLM 暴露的工具描述里注明来源）；
-- 存量技能迁移：现有 `skills/*` 一次性移入 `_public/`，owner 记为管理员账号。
+- `SkillRegistry`（`src/skill/registry.ts`）多根扫描，`Skill` 接口增加 `owner/visibility/credentials` 字段；
+  `listFor(viewer)/visibleTo/canManage/setShared/importRootFor` 承载全部权限语义；
+- 同名解析：public 命名空间优先占用裸名；个人技能与之冲突时内部键挂 `<name>@<owner>` 后缀；
+- 用户 id 做目录段时过滤非安全字符（防路径注入）。
 
 ### 4.3 API 变更（均在 `src/server/http.ts` 现有路由改造）
 
@@ -246,12 +237,13 @@ skills/
 
 ### 5.1 数据库迁移
 
-| 迁移 | 内容 |
+| 迁移（已实现） | 内容 |
 |---|---|
-| `0006_sessions_user.sql` | `sessions`/`messages` 加 `user_id` + 索引，存量回填 |
-| `0007_skills_meta.sql` | 技能元数据表 |
-| `0008_users_provider.sql` | `users` 加 `status`（软删除必需）；`auth_provider`/`display_name`（可选） |
-| `0009_user_credentials.sql`（多副本时） | 用户 AIOS token 加密缓存表 |
+| `0006_sessions_user.sql` | `sessions`/`messages` 加 `user_id`；**sessions 主键改为 (tenant_id, user_id, session_id)**（不同用户同名 sessionId 互不冲突，写入只落自己名下）；存量 user_id 置空串（遗留公共，运维可手动归属） |
+| `0007_users_identity.sql` | `users` 加 `status`（软删除）、`auth_provider`、`display_name` |
+| `0008_user_credentials.sql` | 用户下游凭据加密缓存表（内存 Store 亦有同语义实现） |
+
+（技能元数据不入库，见 §4.2 实现说明。）
 
 ### 5.2 后端模块
 
@@ -259,7 +251,7 @@ skills/
 |---|---|
 | `src/auth/aios.ts`（新增） | `AiosAuthProvider`：token 校验（introspect/jwks 可配）→ JIT 建号 → 签发 JWT → 写凭据缓存 |
 | `src/server/http.ts` | `POST /auth/aios/exchange`；技能路由权限改造；CSP `frame-ancestors`；用户管理接口补齐（list/delete/disable，§8.5） |
-| `src/db/store.ts` / `memory.ts` | 会话按 `(tenant_id, user_id)` 过滤；skills_meta / user_credentials CRUD |
+| `src/db/store.ts` / `memory.ts` | 会话按 `(tenant_id, user_id)` 过滤；定时任务普通用户仅见自己的；listUsers/updateUser/凭据 CRUD |
 | `src/skill/registry.ts` / `import.ts` | 多根目录、owner/visibility、按 ctx 过滤的 `listFor(ctx)` |
 | `src/tools/skill.ts` | 可见性检查；凭据文件注入（`credentials: [aios]` frontmatter） |
 | `src/sandbox/lifecycle.ts` / `warmpool.ts` | "已注入凭据"污染标记，禁止回池复用 |

@@ -19,8 +19,8 @@ from config import BASE_URL, CLIENT_ID, SYSTEM_ID, TOKEN_FILE
 
 
 SETUP_AUTH_HINT = (
-    "未找到有效 token。请先让 agent 在对话中提示用户输入账号和密码，"
-    "然后执行 python ../aios-base/scripts/setup_auth.py --username <账号> --password <密码>。"
+    "未找到有效 token。平台凭据应由 aiop 在技能同步时按当前用户自动注入（token.json）；"
+    "请告知用户在 AIOS 平台重新登录后重试，不要在对话中索要账号密码。"
 )
 
 

@@ -3,7 +3,7 @@ import { logger } from '../logger.js';
 const log = logger.child({ mod: 'audit' });
 
 /** 审计事件类别。 */
-export type AuditKind = 'policy' | 'kubectl' | 'sandbox' | 'usage';
+export type AuditKind = 'policy' | 'kubectl' | 'sandbox' | 'usage' | 'auth';
 
 export interface AuditEvent {
   kind: AuditKind;

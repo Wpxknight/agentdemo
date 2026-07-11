@@ -36,6 +36,11 @@ export function can(role: Role, perm: Permission): boolean {
   return MATRIX[role]?.has(perm) ?? false;
 }
 
+/** 是否管理员角色（租户/平台）；技能上传落 public、无主存量技能代管等按此判定。 */
+export function isAdminRole(role: Role): boolean {
+  return role === 'platform_admin' || role === 'tenant_admin';
+}
+
 /** 越权错误（鉴权中间件抛出）。 */
 export class AuthzError extends Error {
   constructor(message: string) {

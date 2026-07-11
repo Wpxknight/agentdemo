@@ -1,12 +1,15 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { posix } from 'node:path';
 import { logger } from '../logger.js';
 import type { JsonValue, ToolResult } from '../model/types.js';
 import type { ToolContext, ToolHandler } from '../agent/tools.js';
-import type { SkillRegistry } from '../skill/registry.js';
+import type { Skill, SkillRegistry } from '../skill/registry.js';
 import type { SandboxManager } from '../sandbox/lifecycle.js';
 import type { ExecResult, SandboxHandle, SandboxSpec } from '../sandbox/types.js';
 import type { SpecResolver } from './builtin.js';
+import type { UserCredentials } from '../auth/credentials.js';
+import type { AuditSink } from '../audit/sink.js';
 
 const log = logger.child({ mod: 'skill-tools' });
 const execFileAsync = promisify(execFile);
@@ -71,16 +74,24 @@ async function pushChunk(sbx: SandboxHandle, b64Path: string, chunk: string): Pr
   }
 }
 
+export interface SkillToolDeps {
+  /** 用户下游凭据缓存：同步声明了 credentials 的技能时按当前用户注入凭据文件（P3）。 */
+  credentials?: UserCredentials;
+  audit?: AuditSink;
+}
+
 /**
  * 技能 agent 工具集：
  * - load_skill：渐进披露（registry.tool()）；
  * - skill__read_file：按需读技能子文档 / 脚本源码；
  * - skill__sync_to_sandbox（需沙箱）：把技能文件推进会话沙箱以便执行。
+ * 三条链路都做可见性检查（不信 LLM）：越权技能等同不存在。
  */
 export function buildSkillTools(
   registry: SkillRegistry,
   manager?: SandboxManager,
   resolve?: SpecResolver,
+  deps: SkillToolDeps = {},
 ): ToolHandler[] {
   const hasSandboxSync = Boolean(manager);
   const tools: ToolHandler[] = [registry.tool({ hasSandboxSync })];
@@ -99,11 +110,11 @@ export function buildSkillTools(
         required: ['name'],
       },
     },
-    async run(args: JsonValue): Promise<ToolResult> {
+    async run(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
       const o = asObject(args);
       const name = reqString(o, 'name');
       const path = typeof o.path === 'string' ? o.path : '';
-      if (!registry.get(name)) {
+      if (!registry.getFor(name, ctx)) {
         return { id: '', content: `未找到技能 ${name}`, isError: true };
       }
       const listDir = async (dirPath: string): Promise<ToolResult> => {
@@ -159,6 +170,8 @@ export function buildSkillTools(
         const o = asObject(args);
         const name = reqString(o, 'name');
         const paths = optStringArray(o, 'paths');
+        const skill = registry.getFor(name, ctx);
+        if (!skill) return { id: '', content: `未找到技能 ${name}`, isError: true };
         const { dir, files } = await registry.collectFiles(name, paths);
 
         // 显式 paths 表示模型明确要这些内容，不做单文件过滤；默认全量同步时跳过大文件。
@@ -217,6 +230,12 @@ export function buildSkillTools(
         }
         log.info({ skill: name, files: kept.length, bytes: total, sessionId: ctx.sessionId }, 'skill synced to sandbox');
 
+        // 凭据注入（P3）：技能声明了 credentials 时，把当前用户的平台凭据写入沙箱内的凭据文件。
+        // 凭据来自服务端缓存（按 toolCtx 的 tenant/user 查找），身份不可能被聊天内容改变。
+        const credentialNote = await injectSkillCredentials({
+          skill, sbx, dest, ctx, manager, spec: resolveSpec(ctx), deps,
+        });
+
         const skippedNote = skipped.length
           ? `\n跳过的大文件（>${fmtSize(SYNC_SKIP_FILE_BYTES)}，需要时用 paths 显式同步）：\n`
             + skipped.slice(0, 20).map((f) => `- ${f.path} (${fmtSize(f.size)})`).join('\n')
@@ -225,11 +244,66 @@ export function buildSkillTools(
         return {
           id: '',
           content: `已同步技能 ${name} 到沙箱 ${dest}/（${kept.length} 个文件，${fmtSize(total)}）。`
-            + `在沙箱内执行脚本请以该目录为根，例如 cd '${dest}' 后运行相应 scripts。${skippedNote}`,
+            + `在沙箱内执行脚本请以该目录为根，例如 cd '${dest}' 后运行相应 scripts。${credentialNote}${skippedNote}`,
         };
       },
     });
   }
 
   return tools;
+}
+
+/**
+ * 按当前用户注入技能声明的下游凭据（写文件而非创建期 env：warmpool 预创建的沙箱没有用户上下文）。
+ * 返回追加到工具结果的提示文本；凭据缺失不视为同步失败，只给出指引。
+ */
+async function injectSkillCredentials(opts: {
+  skill: Skill;
+  sbx: SandboxHandle;
+  dest: string;
+  ctx: ToolContext;
+  manager: SandboxManager;
+  spec: SandboxSpec;
+  deps: SkillToolDeps;
+}): Promise<string> {
+  const { skill, sbx, dest, ctx, manager, spec, deps } = opts;
+  if (!skill.credentials.length) return '';
+  if (!deps.credentials || !ctx.tenantId || !ctx.userId) {
+    return '\n注意：该技能需要平台凭据，但当前环境未启用凭据注入。';
+  }
+  const notes: string[] = [];
+  for (const provider of skill.credentials) {
+    const payload = await deps.credentials.get(ctx.tenantId, ctx.userId, provider);
+    if (payload === undefined) {
+      notes.push(
+        `\n注意：未找到当前用户的 ${provider} 凭据。请提示用户在 ${provider.toUpperCase()} 平台重新登录后重试；`
+        + '绝不要在对话中向用户索要密码。',
+      );
+      continue;
+    }
+    const relFile = skill.credentialFile ?? 'token.json';
+    const filePath = posix.join(dest, relFile);
+    const fileDir = posix.dirname(filePath);
+    const b64 = Buffer.from(JSON.stringify(payload, null, 2)).toString('base64');
+    const write = await sbx.runCommand(
+      `mkdir -p '${fileDir}' && printf '%s' '${b64}' | base64 -d > '${filePath}' && chmod 600 '${filePath}' && echo AIOP_CRED_OK`,
+    );
+    if (failed(write) || !write.stdout.includes('AIOP_CRED_OK')) {
+      notes.push(`\n注意：${provider} 凭据写入沙箱失败：${execErrorText(write)}`);
+      continue;
+    }
+    // 沙箱污染标记：写入过用户凭据的沙箱严禁跨用户复用，销毁而非回收。
+    manager.markCredentialInjected(spec.key);
+    await deps.audit?.record({
+      kind: 'sandbox',
+      action: 'credential-injected',
+      tenantId: ctx.tenantId,
+      sessionId: ctx.sessionId,
+      tool: 'skill__sync_to_sandbox',
+      detail: { skill: skill.name, provider, file: relFile },
+    });
+    log.info({ skill: skill.name, provider, sessionId: ctx.sessionId }, 'skill credential injected');
+    notes.push(`\n已按当前用户注入 ${provider} 凭据（${relFile}），脚本可直接使用，无需登录。`);
+  }
+  return notes.join('');
 }

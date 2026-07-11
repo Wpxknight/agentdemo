@@ -21,6 +21,14 @@ def main():
     parser.add_argument("--password", required=True, help="平台密码")
     args = parser.parse_args()
 
+    # 嵌入部署下凭据由 aiop 平台按当前用户注入 token.json，禁止账密登录；
+    # 仅本地/独立部署调试时通过 AIOS_ALLOW_PASSWORD_LOGIN=1 显式开启。
+    if os.environ.get("AIOS_ALLOW_PASSWORD_LOGIN", "").strip().lower() not in ("1", "true"):
+        raise SystemExit(
+            "账密登录未启用：平台凭据应由 aiop 自动注入。"
+            "请在 AIOS 平台重新登录后重试；本地调试可设置 AIOS_ALLOW_PASSWORD_LOGIN=1 开启。"
+        )
+
     try:
         login_with_credentials(username=args.username, password=args.password)
     except requests.HTTPError as exc:

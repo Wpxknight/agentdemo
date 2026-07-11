@@ -33,15 +33,20 @@ export class LocalAuthProvider implements AuthProvider {
     username: string,
     password: string,
     role: Role,
+    displayName?: string,
   ): Promise<User> {
     const passwordHash = await hashPassword(password);
-    return this.store.createUser({ tenantId, username, role, passwordHash });
+    return this.store.createUser({ tenantId, username, role, passwordHash, authProvider: 'local', displayName });
   }
 
   async login(tenantId: string, username: string, password: string): Promise<string | undefined> {
     const user = await this.store.getUserByUsername(tenantId, username);
     if (!user) {
       log.warn({ tenantId, username }, 'login: 用户不存在');
+      return undefined;
+    }
+    if (user.status === 'disabled') {
+      log.warn({ tenantId, username }, 'login: 账号已禁用');
       return undefined;
     }
     if (!(await verifyPassword(password, user.passwordHash))) {
