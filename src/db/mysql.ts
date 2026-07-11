@@ -7,6 +7,7 @@ import type {
   AuditFilter,
   LlmSettings,
   NewUser,
+  SandboxSettings,
   SchedulerSettings,
   SessionContextUsage,
   SessionInput,
@@ -30,6 +31,7 @@ interface TaskRow {
   tenant_id: string;
   user_id: string;
   session_id: string;
+  title: string;
   cron: string;
   task: string;
   pre_approved: number;
@@ -59,6 +61,7 @@ function toTask(r: TaskRow): ScheduledTask {
     userId: r.user_id,
     sessionId: r.session_id,
     cron: r.cron,
+    title: r.title ?? '',
     task: r.task,
     preApproved: Boolean(r.pre_approved),
     enabled: Boolean(r.enabled),
@@ -141,6 +144,19 @@ function parseMcpServers(value: unknown): Record<string, McpServerConfig> | unde
     if (parsed.success) out[name] = parsed.data;
   }
   return out;
+}
+
+function parseSandboxSettings(value: unknown): SandboxSettings | undefined {
+  const v = parseJson(value);
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const o = v as Record<string, unknown>;
+  const out: SandboxSettings = {};
+  if (o.provider === 'local' || o.provider === 'e2b' || o.provider === 'opensandbox') out.provider = o.provider;
+  if (typeof o.domain === 'string') out.domain = o.domain;
+  if (o.protocol === 'http' || o.protocol === 'https') out.protocol = o.protocol;
+  if (typeof o.apiKey === 'string') out.apiKey = o.apiKey;
+  if (typeof o.defaultImage === 'string') out.defaultImage = o.defaultImage;
+  return Object.keys(out).length ? out : undefined;
 }
 
 function parseSchedulerSettings(value: unknown): SchedulerSettings | undefined {
@@ -419,6 +435,7 @@ export class MysqlStore implements Store {
         user_id: ctx.userId,
         session_id: input.sessionId,
         cron: input.cron,
+        title: input.title ?? '',
         task: input.task,
         pre_approved: input.preApproved ? 1 : 0,
         enabled: input.enabled === false ? 0 : 1,
@@ -431,6 +448,7 @@ export class MysqlStore implements Store {
       userId: ctx.userId,
       sessionId: input.sessionId,
       cron: input.cron,
+      title: input.title ?? '',
       task: input.task,
       preApproved: input.preApproved ?? false,
       enabled: input.enabled ?? true,
@@ -471,6 +489,7 @@ export class MysqlStore implements Store {
     const current = await this.getScheduledTask(ctx, id);
     if (!current) return undefined;
     const set: Record<string, unknown> = {};
+    if (patch.title !== undefined) set.title = patch.title;
     if (patch.task !== undefined) set.task = patch.task;
     if (patch.preApproved !== undefined) set.pre_approved = patch.preApproved ? 1 : 0;
     if (patch.enabled !== undefined) set.enabled = patch.enabled ? 1 : 0;
@@ -651,6 +670,31 @@ export class MysqlStore implements Store {
     await this.db
       .insertInto('tenant_settings')
       .values({ tenant_id: ctx.tenantId, setting_key: 'scheduler.default', config })
+      .execute();
+  }
+
+  async getSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<SandboxSettings | undefined> {
+    const row = await this.db
+      .selectFrom('tenant_settings')
+      .select(['config'])
+      .where('tenant_id', '=', ctx.tenantId)
+      .where('setting_key', '=', 'sandbox.default')
+      .executeTakeFirst();
+    return row ? parseSandboxSettings(row.config) : undefined;
+  }
+
+  async setSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SandboxSettings): Promise<void> {
+    const config = JSON.stringify(settings);
+    const updated = await this.db
+      .updateTable('tenant_settings')
+      .set({ config })
+      .where('tenant_id', '=', ctx.tenantId)
+      .where('setting_key', '=', 'sandbox.default')
+      .executeTakeFirst();
+    if (Number(updated.numUpdatedRows) > 0) return;
+    await this.db
+      .insertInto('tenant_settings')
+      .values({ tenant_id: ctx.tenantId, setting_key: 'sandbox.default', config })
       .execute();
   }
 

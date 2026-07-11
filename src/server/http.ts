@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { SignJWT, jwtVerify } from 'jose';
 import { logger } from '../logger.js';
-import type { Runtime, RuntimeModelConfig } from '../runtime.js';
+import type { Runtime, RuntimeModelConfig, SandboxConnectionInfo } from '../runtime.js';
 import { COMPACTION_RETRY_GROWTH_TOKENS, runAgent } from '../agent/core.js';
 import {
   DEFAULT_CONTEXT_WINDOW_TOKENS,
@@ -21,7 +21,7 @@ import { LocalAuthProvider } from '../auth/local.js';
 import { OidcAuthProvider } from '../auth/oidc.js';
 import { createTenant, createUser, listTenants } from '../auth/admin.js';
 import type { RequestContext, Role } from '../auth/types.js';
-import { DEFAULT_TASK_MAX_RUN_MS, type ScheduledTaskPatch } from '../db/store.js';
+import { DEFAULT_TASK_MAX_RUN_MS, type SandboxSettings, type ScheduledTaskPatch } from '../db/store.js';
 import { isValidCron } from '../scheduler/cron.js';
 import { createScheduledTaskRunner } from '../scheduler/runner.js';
 import { createModel } from '../model/factory.js';
@@ -183,6 +183,20 @@ function publicModelConfig(config: RuntimeModelConfig): Record<string, unknown> 
     context_window_tokens: contextWindowTokens(config),
     context_keep_images: keepImagesOf(config),
     effort: config.effort,
+  };
+}
+
+function sandboxSettingsBody(s: SandboxConnectionInfo): Record<string, unknown> {
+  return {
+    settings: {
+      enabled: s.enabled,
+      provider: s.provider,
+      domain: s.domain ?? '',
+      protocol: s.protocol ?? 'http',
+      default_image: s.defaultImage ?? '',
+      api_key_set: Boolean(s.apiKey),
+      api_key_preview: maskApiKey(s.apiKey ?? ''),
+    },
   };
 }
 
@@ -638,7 +652,7 @@ async function handle(
     await requireAuth(rt, req);
     const tools = [
       ...rt.tools.defs()
-        .filter((def) => !(rt.skillRegistry && def.name === 'load_skill'))
+        .filter((def) => !(rt.skillRegistry && (def.name === 'load_skill' || def.name.startsWith('skill__'))))
         .map((def) => ({
           name: def.name,
           description: def.description,
@@ -929,6 +943,40 @@ async function handle(
     return sendJson(res, 200, { ok: true, text: text.trim(), ...modelSettingsBody(config, rt.modelOptions) });
   }
 
+  // —— 设置：沙箱服务端连接 ——
+  if (route === 'GET /v1/settings/sandbox') {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'tenant:manage');
+    return sendJson(res, 200, sandboxSettingsBody(rt.sandboxSettings ?? { enabled: false, provider: 'e2b' }));
+  }
+  if (route === 'POST /v1/settings/sandbox') {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'tenant:manage');
+    const body = await readJson(req);
+    const current = rt.sandboxSettings ?? { enabled: false, provider: 'e2b' as const };
+    const provider = str(body, 'provider') ?? current.provider;
+    if (provider !== 'local' && provider !== 'e2b' && provider !== 'opensandbox') {
+      throw new HttpError(400, 'provider 只支持 local / e2b / opensandbox');
+    }
+    const protocol = str(body, 'protocol');
+    if (protocol !== undefined && protocol !== 'http' && protocol !== 'https') {
+      throw new HttpError(400, 'protocol 只支持 http / https');
+    }
+    const apiKeyRaw = str(body, 'api_key');
+    const next: SandboxSettings = {
+      provider,
+      domain: (str(body, 'domain') ?? current.domain ?? '').trim() || undefined,
+      protocol: (protocol as 'http' | 'https' | undefined) ?? current.protocol,
+      // api_key 缺省保持不变；传空字符串表示清除
+      apiKey: apiKeyRaw === undefined ? current.apiKey : apiKeyRaw.trim() || undefined,
+      defaultImage: (str(body, 'default_image') ?? current.defaultImage ?? '').trim() || undefined,
+    };
+    await rt.store.setSandboxSettings(ctx, next);
+    if (rt.updateSandbox) rt.updateSandbox(next);
+    else rt.sandboxSettings = { ...current, ...next };
+    return sendJson(res, 200, sandboxSettingsBody(rt.sandboxSettings ?? { ...next, provider, enabled: current.enabled }));
+  }
+
   // —— 设置：定时任务运行时长 ——
   if (route === 'GET /v1/settings/scheduler') {
     const ctx = await requireAuth(rt, req);
@@ -1053,10 +1101,11 @@ async function handle(
     const cron = str(body, 'cron');
     const task = str(body, 'task');
     if (!cron || !task) throw new HttpError(400, 'cron/task 必填');
+    const title = str(body, 'title')?.trim() ?? '';
     const preApproved = body.preApproved === true;
     if (preApproved) requirePermission(ctx, 'approve'); // 预批准属审批权
     const created = await rt.store.createScheduledTask(ctx, {
-      sessionId, cron, task, preApproved, enabled: body.enabled !== false,
+      sessionId, cron, title, task, preApproved, enabled: body.enabled !== false,
     });
     return sendJson(res, 201, { task: created });
   }
@@ -1089,6 +1138,8 @@ async function handle(
       if (!task.trim()) throw new HttpError(400, 'task 不能为空');
       patch.task = task;
     }
+    const title = str(body, 'title');
+    if (title !== undefined) patch.title = title.trim();
     if (body.preApproved !== undefined) {
       if (typeof body.preApproved !== 'boolean') throw new HttpError(400, 'preApproved 必须是布尔值');
       if (body.preApproved) requirePermission(ctx, 'approve'); // 预批准属审批权
@@ -1098,7 +1149,7 @@ async function handle(
       if (typeof body.enabled !== 'boolean') throw new HttpError(400, 'enabled 必须是布尔值');
       patch.enabled = body.enabled;
     }
-    if (!Object.keys(patch).length) throw new HttpError(400, '没有可更新的字段（cron/task/preApproved/enabled）');
+    if (!Object.keys(patch).length) throw new HttpError(400, '没有可更新的字段（cron/title/task/preApproved/enabled）');
     const updated = await rt.store.updateScheduledTask(ctx, Number(schedUpdateMatch[1]), patch);
     if (!updated) throw new HttpError(404, '定时任务不存在');
     return sendJson(res, 200, { task: updated });

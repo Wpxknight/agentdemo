@@ -20,6 +20,17 @@ export interface LlmSettings {
 export const DEFAULT_SESSION_TITLE = '新会话';
 
 /** 定时任务运行设置（租户级）。 */
+/** 沙箱服务端连接配置（设置页保存；启动时合并覆盖 config.jsonc 的 sandbox 连接字段）。 */
+export interface SandboxSettings {
+  provider?: 'local' | 'e2b' | 'opensandbox';
+  /** 网关域名 host[:port]，无 scheme。 */
+  domain?: string;
+  protocol?: 'http' | 'https';
+  apiKey?: string;
+  /** OpenSandbox 未指定模板时的默认镜像。 */
+  defaultImage?: string;
+}
+
 export interface SchedulerSettings {
   /** 单次定时任务运行的最长时长（毫秒）；超时中止并记录失败。 */
   maxRunMs: number;
@@ -55,6 +66,8 @@ export interface AuditFilter {
 export interface ScheduledTaskInput {
   sessionId: string;
   cron: string;
+  /** 列表展示用的简短标题（可空，展示层回退到 task）。 */
+  title?: string;
   /** 触发时下发给 agent 的任务描述（自然语言）。 */
   task: string;
   /** 无人值守预批准：触发执行时把生产变更审批降级为放行。 */
@@ -68,6 +81,7 @@ export interface ScheduledTask {
   userId: string;
   sessionId: string;
   cron: string;
+  title: string;
   task: string;
   preApproved: boolean;
   enabled: boolean;
@@ -78,6 +92,7 @@ export interface ScheduledTask {
 /** 更新定时任务的可改字段（cron 变更时实现方需重算 nextRunAt）。 */
 export interface ScheduledTaskPatch {
   cron?: string;
+  title?: string;
   task?: string;
   preApproved?: boolean;
   enabled?: boolean;
@@ -162,6 +177,9 @@ export interface Store extends AuditSink {
   setLlmSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: LlmSettings): Promise<void>;
   getSchedulerSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<SchedulerSettings | undefined>;
   setSchedulerSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SchedulerSettings): Promise<void>;
+  /** 沙箱服务端连接配置（设置页保存；覆盖 config.jsonc 的连接字段）。 */
+  getSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<SandboxSettings | undefined>;
+  setSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SandboxSettings): Promise<void>;
   /** MCP server 配置（UI 动态增删后持久化；存在时覆盖 config.jsonc 的 mcpServers）。 */
   getMcpServers(ctx: Pick<RequestContext, 'tenantId'>): Promise<Record<string, McpServerConfig> | undefined>;
   setMcpServers(ctx: Pick<RequestContext, 'tenantId'>, servers: Record<string, McpServerConfig>): Promise<void>;

@@ -211,7 +211,7 @@ describe('createScheduledTaskRunner', () => {
 
     const result = await createScheduledTaskRunner(rt)({
       id: 1, tenantId: 't1', userId: 'u1', sessionId: 'cron-sess',
-      cron: '* * * * *', task: '巡检', preApproved: true, enabled: true,
+      cron: '* * * * *', title: '巡检', task: '巡检', preApproved: true, enabled: true,
       nextRunAt: new Date(),
     });
 

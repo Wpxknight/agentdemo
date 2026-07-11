@@ -36,7 +36,7 @@ import { LogAuditSink } from './audit/sink.js';
 import type { AuditSink } from './audit/sink.js';
 import { readMysqlConfig } from './config/mysql.js';
 import { createStore } from './db/index.js';
-import type { LlmSettings, Store } from './db/store.js';
+import type { LlmSettings, SandboxSettings, Store } from './db/store.js';
 import { buildScheduleTools } from './tools/schedule.js';
 import { buildTodoTool } from './tools/todo.js';
 import { buildWebFetchTool } from './tools/webfetch.js';
@@ -56,11 +56,21 @@ import { OidcAuthProvider } from './auth/oidc.js';
 import type { AuthProvider } from './auth/provider.js';
 import type { RequestContext } from './auth/types.js';
 
+/** 当前生效的沙箱服务端连接配置（设置页展示 / 保存）。 */
+export interface SandboxConnectionInfo extends SandboxSettings {
+  enabled: boolean;
+  provider: 'local' | 'e2b' | 'opensandbox';
+}
+
 export interface Runtime {
   model: ChatModel;
   modelConfig?: RuntimeModelConfig;
   modelOptions?: RuntimeModelConfig[];
   updateModel?(config: RuntimeModelConfig): void;
+  /** 当前生效的沙箱服务端连接配置。 */
+  sandboxSettings?: SandboxConnectionInfo;
+  /** 运行期应用新的沙箱连接配置（新建沙箱走新后端；已存在沙箱不受影响）。 */
+  updateSandbox?(settings: SandboxSettings): void;
   tools: ToolRegistry;
   skillRegistry?: SkillRegistry;
   /** MCP server 管理器（运行期增删/重连，工具同步进 tools）。 */
@@ -159,40 +169,44 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
   let downloads: DownloadStore | undefined;
   let downloadSweepTimer: ReturnType<typeof setInterval> | undefined;
   const desktops = new Map<string, Promise<DesktopHandle>>();
-  if (config.sandbox?.enabled) {
-    sandboxProfiles = resolveSandboxProfiles(config.sandbox);
-    const provider: SandboxProvider =
-      config.sandbox.provider === 'local'
-        ? new LocalSandboxProvider()
-        : config.sandbox.provider === 'opensandbox'
-        ? new OpenSandboxProvider({
-            domain: config.sandbox.domain,
-            protocol: config.sandbox.protocol,
-            apiKey: config.sandbox.apiKey,
-            defaultImage: config.sandbox.defaultImage,
-          })
-        : new E2bProvider({ apiKey: config.sandbox.apiKey, domain: config.sandbox.domain });
-    logger.info({ provider: config.sandbox.provider, profiles: sandboxProfiles.map((profile) => profile.name) }, 'sandbox provider selected');
+  // 设置页保存的沙箱连接配置优先于 config.jsonc（仅覆盖连接字段；是否启用仍由文件配置决定）。
+  const persistedSandbox = await store.getSandboxSettings({ tenantId: DEFAULT_TENANT }).catch(() => undefined);
+  const sandboxCfg = config.sandbox ? { ...config.sandbox, ...persistedSandbox } : undefined;
+  const makeSandboxProvider = (cfg: SandboxSettings & { provider: 'local' | 'e2b' | 'opensandbox' }): SandboxProvider =>
+    cfg.provider === 'local'
+      ? new LocalSandboxProvider()
+      : cfg.provider === 'opensandbox'
+      ? new OpenSandboxProvider({
+          domain: cfg.domain,
+          protocol: cfg.protocol,
+          apiKey: cfg.apiKey,
+          defaultImage: cfg.defaultImage,
+        })
+      : new E2bProvider({ apiKey: cfg.apiKey, domain: cfg.domain });
+  if (sandboxCfg?.enabled) {
+    sandboxProfiles = resolveSandboxProfiles(sandboxCfg);
+    const provider = makeSandboxProvider(sandboxCfg);
+    logger.info({ provider: sandboxCfg.provider, profiles: sandboxProfiles.map((profile) => profile.name) }, 'sandbox provider selected');
 
     // 预热池：仅在未配置集群时启用（集群需专用模板，避免发错沙箱）
     let warmPool: WarmPool | undefined;
-    if (config.sandbox.warmPoolSize && !hasClusters) {
-      warmPool = new WarmPool({ provider, spec: {}, size: config.sandbox.warmPoolSize });
+    if (sandboxCfg.warmPoolSize && !hasClusters) {
+      warmPool = new WarmPool({ provider, spec: {}, size: sandboxCfg.warmPoolSize });
       await warmPool.start();
       warmPoolRef = warmPool;
-      logger.info({ size: config.sandbox.warmPoolSize }, 'sandbox warm pool ready');
-    } else if (config.sandbox.warmPoolSize && hasClusters) {
+      logger.info({ size: sandboxCfg.warmPoolSize }, 'sandbox warm pool ready');
+    } else if (sandboxCfg.warmPoolSize && hasClusters) {
       logger.warn('配置了集群，warmPoolSize 被忽略（集群需专用模板）');
     }
 
     sandboxes = new SandboxManager({
       provider,
-      idleMs: config.sandbox.idleMs,
-      timeoutMs: config.sandbox.timeoutMs,
+      idleMs: sandboxCfg.idleMs,
+      timeoutMs: sandboxCfg.timeoutMs,
       warmPool,
     });
     // 空闲 GC：周期性 sweep() 回收空闲超 idleMs 的沙箱（最长每分钟检一次）。
-    const sweepMs = Math.max(30_000, Math.min(config.sandbox.idleMs ?? 10 * 60_000, 60_000));
+    const sweepMs = Math.max(30_000, Math.min(sandboxCfg.idleMs ?? 10 * 60_000, 60_000));
     const sweeper = sandboxes;
     sandboxSweepTimer = setInterval(() => {
       void sweeper.sweep().catch((err) => logger.warn({ err: String(err) }, 'sandbox sweep failed'));
@@ -233,13 +247,13 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     }
 
     // 桌面 / 浏览器工具：opensandbox 复用同一会话沙箱；local/e2b 保持各自后端。
-    if (config.sandbox.desktop) {
+    if (sandboxCfg.desktop) {
       const browserProfile = selectBrowserProfile(sandboxProfiles);
-      const dp: DesktopProvider = config.sandbox.provider === 'local'
+      const dp: DesktopProvider = sandboxCfg.provider === 'local'
         ? new LocalDesktopProvider()
-        : config.sandbox.provider === 'opensandbox'
+        : sandboxCfg.provider === 'opensandbox'
           ? new OpenSandboxDesktopProvider(sandboxes)
-          : new E2bDesktopProvider({ apiKey: config.sandbox.apiKey, domain: config.sandbox.domain });
+          : new E2bDesktopProvider({ apiKey: sandboxCfg.apiKey, domain: sandboxCfg.domain });
       const resolve = (ctx: { sessionId: string }): Promise<DesktopHandle> => {
         const profile = browserProfile ?? findSandboxProfile(sandboxProfiles);
         const spec = sandboxSpecForProfile(profile, ctx);
@@ -339,6 +353,16 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     skillRegistry,
     mcp,
     sandboxes,
+    sandboxSettings: sandboxCfg
+      ? {
+          enabled: sandboxCfg.enabled,
+          provider: sandboxCfg.provider,
+          domain: sandboxCfg.domain,
+          protocol: sandboxCfg.protocol,
+          apiKey: sandboxCfg.apiKey,
+          defaultImage: sandboxCfg.defaultImage,
+        }
+      : { enabled: false, provider: 'e2b' },
     downloads,
     sandboxProfiles: publicSandboxProfiles(sandboxProfiles),
     clusters,
@@ -366,5 +390,17 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
       await store.close();
     },
   };
+  if (sandboxes) {
+    const manager = sandboxes;
+    runtime.updateSandbox = (next: SandboxSettings) => {
+      const merged: SandboxConnectionInfo = {
+        ...(runtime.sandboxSettings ?? { enabled: true, provider: 'e2b' }),
+        ...next,
+      };
+      manager.setProvider(makeSandboxProvider(merged));
+      runtime.sandboxSettings = merged;
+      logger.info({ provider: merged.provider, domain: merged.domain }, 'sandbox provider updated');
+    };
+  }
   return runtime;
 }

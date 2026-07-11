@@ -632,7 +632,7 @@ describe('frontend API wiring', () => {
     expect(app).toContain('接入 MCP Server，扩展 AI 可用的工具');
     expect(app).toContain('按 cron 周期自动执行的运维任务');
     expect(app).toContain('隔离的代码 / 命令执行环境');
-    expect(app).toContain('模型与运行时配置');
+    expect(app).toContain('模型、沙箱与定时任务配置');
     expect(app).toContain('管理本地与导入的 Skill，供 AI 调用');
     // 标题与描述同一行（横向基线对齐）
     expect(css).toContain('.page-subtitle');

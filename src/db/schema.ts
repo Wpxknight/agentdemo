@@ -44,6 +44,7 @@ export interface ScheduledTasksTable {
   tenant_id: string;
   user_id: string;
   session_id: string;
+  title: string;
   cron: string;
   task: string;
   pre_approved: number;

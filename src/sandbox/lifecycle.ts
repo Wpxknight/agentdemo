@@ -51,7 +51,7 @@ export interface SandboxManagerOptions {
  * - 空闲超 idleMs 由 sweep() 回收（idle GC）。
  */
 export class SandboxManager {
-  private readonly provider: SandboxProvider;
+  private provider: SandboxProvider;
   private readonly idleMs: number;
   private readonly timeoutMs: number;
   private readonly now: () => number;
@@ -66,6 +66,11 @@ export class SandboxManager {
     this.timeoutMs = opts.timeoutMs ?? 60 * 60_000;
     this.now = opts.now ?? Date.now;
     this.warmPool = opts.warmPool;
+  }
+
+  /** 运行期切换沙箱后端（设置页保存连接配置后生效）：已有沙箱句柄不受影响，新建走新 provider。 */
+  setProvider(provider: SandboxProvider): void {
+    this.provider = provider;
   }
 
   /** 取得（必要时创建 / 连接）一个沙箱句柄，并刷新其活跃时间。 */

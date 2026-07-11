@@ -24,10 +24,11 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
           type: 'object',
           properties: {
             cron: { type: 'string', description: '标准 5 段 cron 表达式，如 "0 1 * * *"' },
+            title: { type: 'string', description: '任务标题（列表展示用的简短名称，如"每日集群巡检"）' },
             task: { type: 'string', description: '到点要执行的任务描述（自然语言）' },
             preApproved: { type: 'boolean', description: '无人值守预批准（默认 false）' },
           },
-          required: ['cron', 'task'],
+          required: ['cron', 'title', 'task'],
         },
       },
       async run(args, ctx: ToolContext): Promise<ToolResult> {
@@ -43,15 +44,17 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
           return { id: '', content: '仅管理员可创建预批准（preApproved）定时任务', isError: true };
         }
 
+        const title = typeof o.title === 'string' ? o.title.trim() : '';
         const created = await store.createScheduledTask(rc, {
           sessionId: ctx.sessionId,
           cron,
+          title,
           task,
           preApproved,
         });
         return {
           id: '',
-          content: `已创建定时任务 #${created.id}（cron=${cron}），下次执行：${created.nextRunAt.toISOString()}`,
+          content: `已创建定时任务 #${created.id}「${created.title || created.task}」（cron=${cron}），下次执行：${created.nextRunAt.toISOString()}`,
         };
       },
     },
@@ -66,7 +69,7 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
         if (!tasks.length) return { id: '', content: '（无定时任务）' };
         const lines = tasks.map(
           (t) =>
-            `#${t.id} [${t.enabled ? '启用' : '停用'}] cron=${t.cron} 下次=${t.nextRunAt.toISOString()} — ${t.task}`,
+            `#${t.id} [${t.enabled ? '启用' : '停用'}]${t.title ? ` ${t.title} ·` : ''} cron=${t.cron} 下次=${t.nextRunAt.toISOString()} — ${t.task}`,
         );
         return { id: '', content: lines.join('\n') };
       },
@@ -98,6 +101,7 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
           properties: {
             id: { type: 'number', description: '任务 id' },
             cron: { type: 'string', description: '新的 5 段 cron 表达式' },
+            title: { type: 'string', description: '新的任务标题' },
             task: { type: 'string', description: '新的任务描述' },
             enabled: { type: 'boolean', description: '启用/停用' },
             preApproved: { type: 'boolean', description: '无人值守预批准（需管理员）' },
@@ -111,11 +115,12 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
         if (!Number.isInteger(id)) return { id: '', content: 'id 必须是整数', isError: true };
 
         const rc = reqContext(ctx);
-        const patch: { cron?: string; task?: string; enabled?: boolean; preApproved?: boolean } = {};
+        const patch: { cron?: string; title?: string; task?: string; enabled?: boolean; preApproved?: boolean } = {};
         if (typeof o.cron === 'string') {
           if (!isValidCron(o.cron)) return { id: '', content: `非法 cron 表达式: ${o.cron}`, isError: true };
           patch.cron = o.cron;
         }
+        if (typeof o.title === 'string') patch.title = o.title.trim();
         if (typeof o.task === 'string' && o.task.trim()) patch.task = o.task;
         if (typeof o.enabled === 'boolean') patch.enabled = o.enabled;
         if (typeof o.preApproved === 'boolean') {

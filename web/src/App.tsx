@@ -20,7 +20,6 @@ import {
   Download,
   FolderTree,
   Globe,
-  KeyRound,
   Link2,
   LogOut,
   MessageSquare,
@@ -3470,12 +3469,14 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
   const [selectedRunId, setSelectedRunId] = useState<number | undefined>();
   const [runsPage, setRunsPage] = useState(1);
   const [runsStatus, setRunsStatus] = useState('');
+  const [newTitle, setNewTitle] = useState('');
   const [newTask, setNewTask] = useState('');
   const [newCron, setNewCron] = useState('0 2 * * *');
   const [newPreApproved, setNewPreApproved] = useState(false);
   const [pageStatus, setPageStatus] = useState('');
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [editTitle, setEditTitle] = useState('');
   const [editTask, setEditTask] = useState('');
   const [editCron, setEditCron] = useState('');
   const pollTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -3532,6 +3533,10 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
   }, [loadRuns]);
 
   async function createTask() {
+    if (!newTitle.trim()) {
+      setPageStatus('请填写任务标题');
+      return;
+    }
     if (!newTask.trim()) {
       setPageStatus('请填写任务描述');
       return;
@@ -3543,11 +3548,13 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
     setBusy(true);
     try {
       const body = await api.post<{ task: ScheduledTask }>('/v1/schedule', {
+        title: newTitle.trim(),
         task: newTask.trim(),
         cron: newCron.trim(),
         preApproved: newPreApproved,
       });
       setPageStatus(`已创建定时任务 #${body.task.id}，下次执行 ${formatDateTime(body.task.nextRunAt)}`);
+      setNewTitle('');
       setNewTask('');
       setNewPreApproved(false);
       setView('list');
@@ -3604,7 +3611,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
     const id = task.id;
     onRequestConfirm({
       title: '删除定时任务',
-      description: `将删除「${task.task}」及其全部执行记录，不可恢复。若只想暂停请用“暂停”。`,
+      description: `将删除「${task.title || task.task}」及其全部执行记录，不可恢复。若只想暂停请用“暂停”。`,
       confirmLabel: '确认删除',
       busyLabel: '正在删除...',
       tone: 'danger',
@@ -3619,6 +3626,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
   }
 
   function startEdit(task: ScheduledTask) {
+    setEditTitle(task.title || '');
     setEditTask(task.task);
     setEditCron(task.cron);
     setEditing(true);
@@ -3632,7 +3640,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
     }
     setBusy(true);
     try {
-      await api.patch(`/v1/schedule/${task.id}`, { task: editTask.trim(), cron: editCron.trim() });
+      await api.patch(`/v1/schedule/${task.id}`, { title: editTitle.trim(), task: editTask.trim(), cron: editCron.trim() });
       setPageStatus(`已更新任务 #${task.id}`);
       setEditing(false);
       onChanged();
@@ -3655,6 +3663,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
         </div>
         <Card className="schedule-form-card">
           <CardContent className="settings-form">
+            <Label>任务标题<Input placeholder="如：每日集群巡检" value={newTitle} onChange={(event) => setNewTitle(event.target.value)} /></Label>
             <Label>任务描述<Textarea placeholder="描述你要定时执行的任务..." value={newTask} onChange={(event) => setNewTask(event.target.value)} /></Label>
             <Label>执行计划（cron，UTC）
               <Select value={CRON_PRESETS.some((p) => p.value === newCron) ? newCron : 'custom'} onValueChange={(value) => { if (value !== 'custom') setNewCron(value); }}>
@@ -3696,12 +3705,13 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
         {pageStatus ? <p className="empty-hint schedule-page-status">{pageStatus}</p> : null}
         <Card className="schedule-detail-card">
           <CardHeader>
-            <CardTitle>{selectedTask.task}</CardTitle>
+            <CardTitle>{selectedTask.title || selectedTask.task}</CardTitle>
             <CardDescription>
               {humanizeCron(selectedTask.cron)} · 下次执行 {formatDateTime(selectedTask.nextRunAt)}
               {selectedTask.preApproved ? ' · 预批准' : ''}
               {` · ${selectedTask.enabled ? '启用中' : '已暂停'}`}
             </CardDescription>
+            {selectedTask.title ? <CardDescription>任务描述：{selectedTask.task}</CardDescription> : null}
           </CardHeader>
           <CardContent>
             <div className="skill-detail-actions schedule-actions">
@@ -3728,6 +3738,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
             </div>
             {editing ? (
               <div className="schedule-edit-form">
+                <Label>任务标题<Input value={editTitle} placeholder="如：每日集群巡检" onChange={(event) => setEditTitle(event.target.value)} /></Label>
                 <Label>任务描述<Textarea value={editTask} onChange={(event) => setEditTask(event.target.value)} /></Label>
                 <Label>cron（UTC）<Input value={editCron} spellCheck={false} onChange={(event) => setEditCron(event.target.value)} /></Label>
                 <Button type="button" size="sm" disabled={busy} onClick={() => void saveEdit(selectedTask)}>保存</Button>
@@ -3795,7 +3806,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
         <Table>
           <TableHeader>
             <TableRow>
-              {['任务', '计划', '下次执行', '状态', '最近执行'].map((header) => <TableHead key={header}>{header}</TableHead>)}
+              {['标题', '计划', '下次执行', '状态', '最近执行'].map((header) => <TableHead key={header}>{header}</TableHead>)}
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -3825,7 +3836,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
               >
                 <TableCell>
                   <span className="schedule-task-cell">
-                    <strong>{task.task}</strong>
+                    <strong>{task.title || task.task}</strong>
                     <span>#{task.id} {task.preApproved ? '· 预批准' : ''}</span>
                   </span>
                 </TableCell>
@@ -3983,54 +3994,158 @@ function SettingsPage({ llm, status, api, onLlmChange, onStatus }: {
 
   return (
     <>
-      <PageTitle title="设置" desc="模型与运行时配置" />
-      <div className="settings-layout">
-        <Card>
-          <CardHeader>
-            <CardTitle>LLM 配置</CardTitle>
-            <CardDescription>当前模型会用于新的聊天请求。</CardDescription>
-          </CardHeader>
-          <CardContent className="settings-form">
-            <Label>协议<Select value={form.protocol} onValueChange={(protocol) => setForm((current) => ({ ...current, protocol: protocol as RuntimeModelConfig['protocol'] }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="anthropic">Anthropic</SelectItem><SelectItem value="openai">OpenAI Compatible</SelectItem></SelectGroup></SelectContent></Select></Label>
-            <Label>Base URL<Input value={form.base_url} onChange={(event) => setForm((current) => ({ ...current, base_url: event.target.value }))} /></Label>
-            <Label>API Key<Input placeholder="输入 API Key" value={form.api_key} onChange={(event) => setForm((current) => ({ ...current, api_key: event.target.value }))} /></Label>
-            <Label>Model<Input value={form.model} onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))} /></Label>
-            <Label>上下文窗口（tokens）<Input type="number" min={20000} step={1000} placeholder="200000" value={form.context_window_tokens} onChange={(event) => setForm((current) => ({ ...current, context_window_tokens: event.target.value }))} /></Label>
-            <Label>推理深度<Select value={form.effort} onValueChange={(effort) => setForm((current) => ({ ...current, effort: effort as ReasoningEffort }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="none">none（关闭思考）</SelectItem><SelectItem value="low">low</SelectItem><SelectItem value="medium">medium</SelectItem><SelectItem value="high">high</SelectItem><SelectItem value="xhigh">xhigh</SelectItem><SelectItem value="max">max</SelectItem></SelectGroup></SelectContent></Select></Label>
-            {form.protocol === 'openai' ? <div className="settings-hint">推理深度仅对 Anthropic 协议生效</div> : null}
-            {status ? <div className="settings-status">{status}</div> : null}
-            <div className="form-actions">
-              <Button variant="outline" type="button" onClick={() => void test()}>测试连接</Button>
-              <Button type="button" onClick={() => void save()}>保存配置</Button>
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <div className="detail-title">
-              <div className="large-icon"><KeyRound /></div>
-              <div>
-                <CardTitle>{llm.model || '未配置'}</CardTitle>
-                <CardDescription>{llm.api_key_set ? '密钥已配置' : '密钥未配置'}</CardDescription>
-              </div>
-            </div>
-          </CardHeader>
-          <CardContent className="kv">
-            <span>协议</span><strong>{llm.protocol}</strong>
-            <span>Base URL</span><strong>{llm.base_url || '-'}</strong>
-            <span>Model</span><strong>{llm.model || '-'}</strong>
-            <span>API Key</span><strong>{llm.api_key || '-'}</strong>
-            <span>上下文窗口</span><strong>{llm.context_window_tokens ? `${llm.context_window_tokens.toLocaleString()} tokens` : '-'}</strong>
-          </CardContent>
-        </Card>
-        <SchedulerSettingsCard api={api} onStatus={onStatus} />
-      </div>
+      <PageTitle title="设置" desc="模型、沙箱与定时任务配置" />
+      <Tabs defaultValue="llm" className="sandbox-page-tabs settings-tabs">
+        <TabsList>
+          <TabsTrigger value="llm">模型</TabsTrigger>
+          <TabsTrigger value="sandbox">沙箱</TabsTrigger>
+          <TabsTrigger value="scheduler">定时任务</TabsTrigger>
+        </TabsList>
+        <TabsContent value="llm">
+          <div className="settings-layout">
+            <Card>
+              <CardHeader>
+                <CardTitle>LLM 配置</CardTitle>
+                <CardDescription>当前模型会用于新的聊天请求。</CardDescription>
+              </CardHeader>
+              <CardContent className="settings-form">
+                <Label>协议<Select value={form.protocol} onValueChange={(protocol) => setForm((current) => ({ ...current, protocol: protocol as RuntimeModelConfig['protocol'] }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="anthropic">Anthropic</SelectItem><SelectItem value="openai">OpenAI Compatible</SelectItem></SelectGroup></SelectContent></Select></Label>
+                <Label>Base URL<Input value={form.base_url} onChange={(event) => setForm((current) => ({ ...current, base_url: event.target.value }))} /></Label>
+                <Label>API Key<Input placeholder="输入 API Key" value={form.api_key} onChange={(event) => setForm((current) => ({ ...current, api_key: event.target.value }))} /></Label>
+                <Label>Model<Input value={form.model} onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))} /></Label>
+                <Label>上下文窗口（tokens）<Input type="number" min={20000} step={1000} placeholder="200000" value={form.context_window_tokens} onChange={(event) => setForm((current) => ({ ...current, context_window_tokens: event.target.value }))} /></Label>
+                <Label>推理深度<Select value={form.effort} onValueChange={(effort) => setForm((current) => ({ ...current, effort: effort as ReasoningEffort }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="none">none（关闭思考）</SelectItem><SelectItem value="low">low</SelectItem><SelectItem value="medium">medium</SelectItem><SelectItem value="high">high</SelectItem><SelectItem value="xhigh">xhigh</SelectItem><SelectItem value="max">max</SelectItem></SelectGroup></SelectContent></Select></Label>
+                {form.protocol === 'openai' ? <div className="settings-hint">推理深度仅对 Anthropic 协议生效</div> : null}
+                {status ? <div className="settings-status">{status}</div> : null}
+                <div className="form-actions">
+                  <Button variant="outline" type="button" onClick={() => void test()}>测试连接</Button>
+                  <Button type="button" onClick={() => void save()}>保存配置</Button>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        </TabsContent>
+        <TabsContent value="sandbox">
+          <div className="settings-layout">
+            <SandboxSettingsCard api={api} status={status} onStatus={onStatus} />
+          </div>
+        </TabsContent>
+        <TabsContent value="scheduler">
+          <div className="settings-layout">
+            <SchedulerSettingsCard api={api} status={status} onStatus={onStatus} />
+          </div>
+        </TabsContent>
+      </Tabs>
     </>
   );
 }
 
-function SchedulerSettingsCard({ api, onStatus }: {
+interface SandboxSettingsInfo {
+  enabled: boolean;
+  provider: 'local' | 'e2b' | 'opensandbox';
+  domain: string;
+  protocol: 'http' | 'https';
+  default_image: string;
+  api_key_set: boolean;
+  api_key_preview: string;
+}
+
+function SandboxSettingsCard({ api, status, onStatus }: {
   api: ReturnType<typeof createApi>;
+  status: string;
+  onStatus: (next: string) => void;
+}) {
+  const [info, setInfo] = useState<SandboxSettingsInfo | null>(null);
+  const [form, setForm] = useState({ provider: 'opensandbox' as SandboxSettingsInfo['provider'], domain: '', protocol: 'http' as 'http' | 'https', apiKey: '', defaultImage: '' });
+
+  useEffect(() => {
+    let cancelled = false;
+    api.get<{ settings: SandboxSettingsInfo }>('/v1/settings/sandbox')
+      .then((body) => {
+        if (cancelled) return;
+        setInfo(body.settings);
+        setForm({
+          provider: body.settings.provider,
+          domain: body.settings.domain || '',
+          protocol: body.settings.protocol || 'http',
+          apiKey: '',
+          defaultImage: body.settings.default_image || '',
+        });
+      })
+      .catch((err) => {
+        if (!cancelled) onStatus(`加载沙箱配置失败：${formatError(err)}`);
+      });
+    return () => { cancelled = true; };
+  }, [api, onStatus]);
+
+  async function save() {
+    onStatus('正在保存沙箱配置...');
+    try {
+      const payload: Record<string, unknown> = {
+        provider: form.provider,
+        domain: form.domain.trim(),
+        protocol: form.protocol,
+        default_image: form.defaultImage.trim(),
+      };
+      // API Key 留空表示保持现有配置不变
+      if (form.apiKey.trim()) payload.api_key = form.apiKey.trim();
+      const body = await api.post<{ settings: SandboxSettingsInfo }>('/v1/settings/sandbox', payload);
+      setInfo(body.settings);
+      setForm((current) => ({ ...current, apiKey: '' }));
+      onStatus('沙箱配置已保存，新建的沙箱将连接新的服务端。');
+    } catch (err) {
+      onStatus(`保存失败：${formatError(err)}`);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>沙箱服务端</CardTitle>
+        <CardDescription>
+          会话沙箱后端的连接配置，保存后对新建的沙箱生效。
+          {info && !info.enabled ? '（沙箱功能当前未启用，需在服务端配置 sandbox.enabled 开启）' : ''}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="settings-form">
+        <Label>Provider
+          <Select value={form.provider} onValueChange={(value) => setForm((current) => ({ ...current, provider: value as SandboxSettingsInfo['provider'] }))}>
+            <SelectTrigger><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                <SelectItem value="opensandbox">OpenSandbox（k8s）</SelectItem>
+                <SelectItem value="e2b">E2B</SelectItem>
+                <SelectItem value="local">Local（本地开发）</SelectItem>
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+        </Label>
+        <Label>服务地址<Input value={form.domain} spellCheck={false} placeholder="host[:port]，如 opensandbox.aiop-dev.svc:8080" onChange={(event) => setForm((current) => ({ ...current, domain: event.target.value }))} /></Label>
+        <Label>协议
+          <Select value={form.protocol} onValueChange={(value) => setForm((current) => ({ ...current, protocol: value as 'http' | 'https' }))}>
+            <SelectTrigger><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                <SelectItem value="http">http</SelectItem>
+                <SelectItem value="https">https</SelectItem>
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+        </Label>
+        <Label>API Key<Input value={form.apiKey} placeholder={info?.api_key_set ? `留空保持不变（当前 ${info.api_key_preview}）` : '当前未配置'} onChange={(event) => setForm((current) => ({ ...current, apiKey: event.target.value }))} /></Label>
+        <Label>默认镜像（OpenSandbox）<Input value={form.defaultImage} spellCheck={false} placeholder="未指定模板时使用的镜像" onChange={(event) => setForm((current) => ({ ...current, defaultImage: event.target.value }))} /></Label>
+        {status ? <div className="settings-status">{status}</div> : null}
+        <div className="form-actions">
+          <Button type="button" disabled={!info} onClick={() => void save()}>保存配置</Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function SchedulerSettingsCard({ api, status, onStatus }: {
+  api: ReturnType<typeof createApi>;
+  status: string;
   onStatus: (next: string) => void;
 }) {
   const [minutes, setMinutes] = useState('240');
@@ -4074,6 +4189,7 @@ function SchedulerSettingsCard({ api, onStatus }: {
           <Input type="number" min={1} step={10} placeholder="240" value={minutes} onChange={(event) => setMinutes(event.target.value)} />
         </Label>
         <div className="settings-hint">默认 240 分钟（4 小时）；当前值折合 {formatRunDuration(Number(minutes) || 0)}</div>
+        {status ? <div className="settings-status">{status}</div> : null}
         <div className="form-actions">
           <Button type="button" onClick={() => void save()}>保存配置</Button>
         </div>

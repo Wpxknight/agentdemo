@@ -7,6 +7,7 @@ import type {
   AuditFilter,
   NewUser,
   LlmSettings,
+  SandboxSettings,
   SchedulerSettings,
   SessionContextUsage,
   SessionInput,
@@ -55,6 +56,7 @@ export class MemoryStore implements Store {
   private users = new Map<string, UserWithSecret>(); // key: tenantId/username
   private llmSettings = new Map<string, LlmSettings>();
   private schedulerSettings = new Map<string, SchedulerSettings>();
+  private sandboxSettings = new Map<string, SandboxSettings>();
   private mcpServers = new Map<string, Record<string, McpServerConfig>>();
   private taskSeq = 0;
   private runSeq = 0;
@@ -215,6 +217,7 @@ export class MemoryStore implements Store {
       userId: ctx.userId,
       sessionId: input.sessionId,
       cron: input.cron,
+      title: input.title ?? '',
       task: input.task,
       preApproved: input.preApproved ?? false,
       enabled: input.enabled ?? true,
@@ -238,6 +241,7 @@ export class MemoryStore implements Store {
   async updateScheduledTask(ctx: RequestContext, id: number, patch: ScheduledTaskPatch): Promise<ScheduledTask | undefined> {
     const t = this.tasks.get(id);
     if (!t || t.tenantId !== ctx.tenantId) return undefined;
+    if (patch.title !== undefined) t.title = patch.title;
     if (patch.task !== undefined) t.task = patch.task;
     if (patch.preApproved !== undefined) t.preApproved = patch.preApproved;
     if (patch.enabled !== undefined) t.enabled = patch.enabled;
@@ -341,6 +345,15 @@ export class MemoryStore implements Store {
   async getSchedulerSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<SchedulerSettings | undefined> {
     const settings = this.schedulerSettings.get(ctx.tenantId);
     return settings ? { ...settings } : undefined;
+  }
+
+  async getSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<SandboxSettings | undefined> {
+    const settings = this.sandboxSettings.get(ctx.tenantId);
+    return settings ? { ...settings } : undefined;
+  }
+
+  async setSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SandboxSettings): Promise<void> {
+    this.sandboxSettings.set(ctx.tenantId, { ...settings });
   }
 
   async setSchedulerSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SchedulerSettings): Promise<void> {

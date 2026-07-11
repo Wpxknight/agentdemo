@@ -2134,9 +2134,10 @@
     overflow-x: auto;
   }
 
+  /* 设置页按 tab 分类后每个 tab 单卡片：单列、限宽 */
   .settings-layout {
     display: grid;
-    grid-template-columns: minmax(0, .95fr) minmax(360px, .55fr);
+    grid-template-columns: minmax(0, 760px);
     gap: 16px;
   }
 

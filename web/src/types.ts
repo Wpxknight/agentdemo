@@ -65,6 +65,8 @@ export interface McpServerBody {
 
 export interface ScheduledTask {
   id?: number;
+  /** 列表展示用标题（旧任务可能为空，展示层回退到 task）。 */
+  title?: string;
   task: string;
   cron: string;
   nextRunAt?: string;
