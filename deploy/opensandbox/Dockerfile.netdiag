@@ -51,6 +51,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       nodejs \
   && rm -rf /var/lib/apt/lists/*
 
+# aios-request 技能脚本（沙箱内以 python3 执行）所需的第三方库：
+#   requests / PyYAML / cryptography / openpyxl（用途见 Dockerfile.browser 同名注释）。
+# Ubuntu 24.04 受 PEP 668 约束，装 python3-pip 后以 --break-system-packages 装入系统环境。
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends python3-pip \
+  && rm -rf /var/lib/apt/lists/* \
+  && pip3 install --no-cache-dir --break-system-packages \
+       requests \
+       PyYAML \
+       cryptography \
+       openpyxl \
+  && python3 -c "import requests, yaml, cryptography, openpyxl; print('aios-request deps OK')"
+
 # kubectl：沙箱 Pod 内用 in-cluster config 查询集群 / exec 进 fabric-ovs 容器看流表。
 # 构建前把与集群版本对齐的二进制放进构建上下文（deploy/opensandbox/kubectl，已被 .gitignore 忽略）。
 COPY deploy/opensandbox/kubectl /usr/local/bin/kubectl

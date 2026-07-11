@@ -14,6 +14,22 @@ FROM mcr.microsoft.com/playwright:v1.57.0-noble
 COPY deploy/opensandbox/kubectl /usr/local/bin/kubectl
 RUN chmod +x /usr/local/bin/kubectl && kubectl version --client
 
+# aios-request 技能脚本（code 沙箱内以 python3 执行）所需的第三方库：
+#   requests      —— 所有 API 调用
+#   PyYAML        —— yaml 配置/清单解析
+#   cryptography  —— 登录凭据 AES 加解密（auth.py）
+#   openpyxl      —— 报表导出 xlsx（aios-report/export_xlsx.py）
+# Ubuntu 24.04 base 受 PEP 668 约束，安装 python3-pip 后以 --break-system-packages 装入系统环境。
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends python3-pip \
+  && rm -rf /var/lib/apt/lists/* \
+  && pip3 install --no-cache-dir --break-system-packages \
+       requests \
+       PyYAML \
+       cryptography \
+       openpyxl \
+  && python3 -c "import requests, yaml, cryptography, openpyxl; print('aios-request deps OK')"
+
 RUN test -x /usr/bin/python3 \
   && test -x /usr/bin/node \
   && CHROME_BIN="$(find /ms-playwright -path '*/chrome-linux*/chrome' -type f | head -n 1)" \
