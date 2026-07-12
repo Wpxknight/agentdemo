@@ -3,6 +3,8 @@ import { runAgent } from '../agent/core.js';
 import { estimateCost } from '../model/cost.js';
 import { contextBudgetTokens } from '../agent/context.js';
 import { AutoDenyGate } from '../agent/approval.js';
+import { boundUserHomeNote } from '../sandbox/userhome.js';
+import { SANDBOX_SERVICE_NOTE } from '../sandbox/notes.js';
 import type { Runtime } from '../runtime.js';
 import { DEFAULT_TASK_MAX_RUN_MS, type ScheduledTask } from '../db/store.js';
 import { Scheduler, type TaskRunner } from './ticker.js';
@@ -41,6 +43,10 @@ async function runScheduledTask(
   signal: AbortSignal,
 ): Promise<{ status: 'success'; detail: string; steps: number }> {
   const prior = await rt.store.listMessages(taskCtx, t.sessionId);
+  // 用户绑定了主目录：与交互链路一致，告知模型挂载点、交付物默认写入持久化目录。
+  const userHomeNote = rt.sandboxes && rt.userHome
+    ? await boundUserHomeNote(rt.store, t.tenantId, t.userId, rt.userHome)
+    : '';
   const result = await runAgent({
     model: rt.model,
     tools: rt.tools,
@@ -50,7 +56,11 @@ async function runScheduledTask(
     approval: new AutoDenyGate(), // 无人值守：未预批准的审批一律拒绝
     unattended: true, // 系统提示切换为“确认类操作跳过并汇报”，不对着空气等确认
     // 技能摘要按任务归属用户过滤（他人私有技能不可见），与交互链路同一套可见性规则。
-    system: rt.skillRegistry?.summariesFor({ userId: t.userId, role: taskCtx.role }) ?? rt.systemExtra,
+    system: [
+      rt.skillRegistry?.summariesFor({ userId: t.userId, role: taskCtx.role }) ?? rt.systemExtra,
+      rt.sandboxes ? SANDBOX_SERVICE_NOTE : '',
+      userHomeNote,
+    ].filter(Boolean).join('\n\n'),
     ctx: { sessionId: t.sessionId, ...taskCtx },
     messages: prior,
     task: t.task,

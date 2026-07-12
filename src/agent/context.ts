@@ -33,6 +33,17 @@ export function summaryMessage(summary: string): Msg {
   return { role: 'user', text: SUMMARY_PREFIX + summary };
 }
 
+/**
+ * 是否用户的真实输入（压缩时原样保留、永不摘要吞掉）：
+ * user 角色、带正文或附件，且不是历史摘要消息本身（摘要以 user 角色落库）。
+ */
+export function isUserInputMsg(msg: Msg): boolean {
+  return msg.role === 'user'
+    && !msg.toolResults?.length
+    && Boolean(msg.text?.trim() || msg.contentBlocks?.length)
+    && !(msg.text ?? '').startsWith(SUMMARY_PREFIX);
+}
+
 /** 从 base64 图片数据里读出像素尺寸（仅 PNG / JPEG，失败返回 undefined）。 */
 export function imageDimensions(base64: string): { width: number; height: number } | undefined {
   const buf = Buffer.from(base64, 'base64');

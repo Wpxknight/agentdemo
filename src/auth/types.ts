@@ -27,6 +27,8 @@ export interface User {
   status: UserStatus;
   authProvider: AuthProviderKind;
   displayName?: string;
+  /** 绑定的主机主目录（绝对路径）；启动沙箱时默认挂载进沙箱。 */
+  homeDir?: string;
   createdAt?: string;
 }
 

@@ -14,6 +14,17 @@ export interface ExecResult {
   error?: string;
 }
 
+/** 挂载进沙箱的卷（宿主机 hostPath 绑定）。仅 opensandbox 后端支持；local/e2b 忽略。 */
+export interface SandboxVolume {
+  /** 卷名（沙箱内唯一）。 */
+  name: string;
+  /** 宿主机绝对路径。 */
+  hostPath: string;
+  /** 沙箱容器内挂载点（绝对路径）。 */
+  mountPath: string;
+  readOnly?: boolean;
+}
+
 /** 一个沙箱的创建 / 连接规格。 */
 export interface SandboxSpec {
   /** 逻辑缓存键：同一 (session × cluster) 复用同一个沙箱。 */
@@ -36,6 +47,8 @@ export interface SandboxSpec {
   domain?: string;
   /** 注入沙箱的环境变量（如 in-cluster 标记）。 */
   envs?: Record<string, string>;
+  /** 创建时挂载的卷（如用户绑定的主机主目录）。带卷的沙箱不走预热池（卷必须创建时生效）。 */
+  volumes?: SandboxVolume[];
 }
 
 /** 沙箱执行过程中的实时输出分片（用于前端终端预览）。 */

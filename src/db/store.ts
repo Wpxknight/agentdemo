@@ -137,6 +137,8 @@ export interface UserPatch {
   username?: string;
   role?: Role;
   displayName?: string;
+  /** 绑定的主机主目录；null 表示解绑。 */
+  homeDir?: string | null;
 }
 
 /** 用户下游凭据缓存记录（payload 为加密后的不透明字符串，加解密在 auth/credentials.ts）。 */

@@ -150,6 +150,14 @@ export class OpenSandboxProvider implements SandboxProvider {
       timeoutSeconds: spec.timeoutMs ? Math.ceil(spec.timeoutMs / 1000) : undefined,
       env: spec.envs,
       metadata: Object.keys(metadata).length ? metadata : undefined,
+      volumes: spec.volumes?.length
+        ? spec.volumes.map((v) => ({
+            name: v.name,
+            host: { path: v.hostPath },
+            mountPath: v.mountPath,
+            ...(v.readOnly ? { readOnly: true } : {}),
+          }))
+        : undefined,
     });
     return new OpenSandboxHandle(sbx);
   }

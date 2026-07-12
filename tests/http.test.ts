@@ -1590,11 +1590,15 @@ describe('HTTP server 会话互斥与自动压缩', () => {
       expect(body).toContain('event: done');
 
       const messages = await localStore.listMessages(ctx, 'compact-sess');
-      // 摘要 1 条 + 保留的最近 8 条（含本轮 task）+ 本轮 assistant 1 条
-      expect(messages).toHaveLength(10);
+      // 用户输入永不吞掉：压缩区间的 27 条用户消息原样保留在摘要之前
+      // + 摘要 1 条 + 保留的最近 8 条（含本轮 task）+ 本轮 assistant 1 条 = 37
+      expect(messages).toHaveLength(37);
       expect(messages[0]!.role).toBe('user');
-      expect(messages[0]!.text).toContain('历史对话摘要');
-      expect(messages[0]!.text).toContain('模拟摘要或回答');
+      expect(messages[0]!.text).toContain('问题0');
+      const summaryIdx = messages.findIndex((m) => m.text?.includes('历史对话摘要'));
+      expect(summaryIdx).toBeGreaterThan(0);
+      expect(messages[summaryIdx]!.text).toContain('模拟摘要或回答');
+      expect(messages.slice(0, summaryIdx).every((m) => m.role === 'user')).toBe(true);
       expect(messages.at(-2)!.text).toBe('继续任务');
     } finally {
       await new Promise<void>((resolve) => srv.close(() => resolve()));

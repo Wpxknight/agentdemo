@@ -626,6 +626,7 @@ export class MysqlStore implements Store {
         status: 'active',
         auth_provider: user.authProvider ?? 'local',
         display_name: user.displayName ?? null,
+        home_dir: null,
       })
       .execute();
     return {
@@ -647,6 +648,7 @@ export class MysqlStore implements Store {
     status: string;
     auth_provider: string;
     display_name: string | null;
+    home_dir: string | null;
     created_at?: Date | string;
   }): User {
     return {
@@ -657,6 +659,7 @@ export class MysqlStore implements Store {
       status: (r.status === 'disabled' ? 'disabled' : 'active'),
       authProvider: (r.auth_provider === 'oidc' || r.auth_provider === 'aios' ? r.auth_provider : 'local'),
       displayName: r.display_name ?? undefined,
+      homeDir: r.home_dir ?? undefined,
       ...(r.created_at ? { createdAt: toDate(r.created_at).toISOString() } : {}),
     };
   }
@@ -664,7 +667,7 @@ export class MysqlStore implements Store {
   async getUserByUsername(tenantId: string, username: string): Promise<UserWithSecret | undefined> {
     const r = await this.db
       .selectFrom('users')
-      .select(['id', 'tenant_id', 'username', 'role', 'password_hash', 'status', 'auth_provider', 'display_name', 'created_at'])
+      .select(['id', 'tenant_id', 'username', 'role', 'password_hash', 'status', 'auth_provider', 'display_name', 'home_dir', 'created_at'])
       .where('tenant_id', '=', tenantId)
       .where('username', '=', username)
       .executeTakeFirst();
@@ -675,7 +678,7 @@ export class MysqlStore implements Store {
   async getUser(tenantId: string, userId: string): Promise<User | undefined> {
     const r = await this.db
       .selectFrom('users')
-      .select(['id', 'tenant_id', 'username', 'role', 'status', 'auth_provider', 'display_name', 'created_at'])
+      .select(['id', 'tenant_id', 'username', 'role', 'status', 'auth_provider', 'display_name', 'home_dir', 'created_at'])
       .where('tenant_id', '=', tenantId)
       .where('id', '=', userId)
       .executeTakeFirst();
@@ -685,7 +688,7 @@ export class MysqlStore implements Store {
   async listUsers(tenantId: string): Promise<User[]> {
     const rows = await this.db
       .selectFrom('users')
-      .select(['id', 'tenant_id', 'username', 'role', 'status', 'auth_provider', 'display_name', 'created_at'])
+      .select(['id', 'tenant_id', 'username', 'role', 'status', 'auth_provider', 'display_name', 'home_dir', 'created_at'])
       .where('tenant_id', '=', tenantId)
       .orderBy('created_at', 'asc')
       .execute();
@@ -698,6 +701,7 @@ export class MysqlStore implements Store {
     if (patch.username !== undefined) set.username = patch.username;
     if (patch.role !== undefined) set.role = patch.role;
     if (patch.displayName !== undefined) set.display_name = patch.displayName;
+    if (patch.homeDir !== undefined) set.home_dir = patch.homeDir;
     if (Object.keys(set).length) {
       await this.db
         .updateTable('users')

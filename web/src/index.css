@@ -386,7 +386,7 @@
     min-height: 160px;
     border: 1px dashed hsl(var(--border));
     border-radius: 8px;
-    background: hsl(var(--surface-muted) / .7);
+    background: rgba(245, 247, 250, .7);
     display: grid;
     place-items: center;
     align-content: center;
@@ -428,7 +428,7 @@
   }
 
   .session-row:hover {
-    background: hsl(var(--surface-muted));
+    background: var(--surface-muted);
     border-color: hsl(var(--border));
   }
 
@@ -620,7 +620,7 @@
   .thinking-block {
     border: 1px solid hsl(var(--border));
     border-radius: 8px;
-    background: hsl(var(--surface-muted));
+    background: var(--surface-muted);
     margin-bottom: 10px;
     overflow: hidden;
   }
@@ -655,6 +655,81 @@
     padding: 9px 10px 10px;
   }
 
+  /* 历史摘要正文：内容是给用户回看的上下文，用正文对比度（thinking 才用弱化灰）。 */
+  .context-summary-content {
+    color: hsl(var(--foreground));
+  }
+
+  /* 聊天内媒体预览：图片缩略（点击放大）、音视频原生控件 */
+  .chat-media-image {
+    display: block;
+    max-width: 100%;
+    max-height: 320px;
+    border: 1px solid hsl(var(--border));
+    border-radius: 8px;
+    cursor: zoom-in;
+    margin: 6px 0;
+  }
+
+  .chat-media-audio {
+    display: block;
+    width: 100%;
+    max-width: 420px;
+    margin: 6px 0;
+  }
+
+  .chat-media-video {
+    display: block;
+    max-width: 100%;
+    max-height: 360px;
+    border-radius: 8px;
+    background: #000;
+    margin: 6px 0;
+  }
+
+  .media-lightbox {
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(15, 23, 42, .82);
+    cursor: zoom-out;
+  }
+
+  .media-lightbox img {
+    max-width: 94vw;
+    max-height: 94vh;
+    border-radius: 8px;
+    box-shadow: 0 12px 48px rgba(0, 0, 0, .5);
+  }
+
+  .media-lightbox-close {
+    position: absolute;
+    top: 16px;
+    right: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    border: none;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, .14);
+    color: #fff;
+    cursor: pointer;
+  }
+
+  .media-lightbox-close svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  .export-file-item {
+    min-width: 0;
+  }
+
   /* 自动压缩上下文的运行期提示：显示在消息气泡顶部 */
   .context-notice {
     display: flex;
@@ -662,7 +737,7 @@
     gap: 6px;
     border: 1px dashed hsl(var(--border));
     border-radius: 8px;
-    background: hsl(var(--surface-muted));
+    background: var(--surface-muted);
     color: hsl(var(--muted-foreground));
     font-size: 12px;
     padding: 6px 10px;
@@ -721,7 +796,7 @@
   .task-progress {
     border: 1px solid hsl(var(--border));
     border-radius: 8px;
-    background: hsl(var(--surface-muted));
+    background: var(--surface-muted);
     margin-bottom: 10px;
     overflow: hidden;
   }
@@ -791,7 +866,7 @@
     padding: 8px 12px;
     border: 1px solid hsl(var(--border));
     border-radius: 8px;
-    background: hsl(var(--surface-muted));
+    background: var(--surface-muted);
     color: hsl(var(--foreground));
     font-size: 13px;
     text-decoration: none;
@@ -996,7 +1071,7 @@
     min-height: 34px;
     border: 1px solid hsl(var(--border));
     border-radius: 8px;
-    background: hsl(var(--surface-muted));
+    background: var(--surface-muted);
     display: inline-flex;
     align-items: center;
     gap: 7px;
@@ -1068,7 +1143,7 @@
     border: 0;
     box-shadow: none;
     padding: 9px 10px;
-    background: hsl(var(--surface-muted));
+    background: var(--surface-muted);
   }
 
   .composer-action-row {
@@ -1629,7 +1704,7 @@
 
   .skill-list-panel {
     border-right: 1px solid hsl(var(--border));
-    background: hsl(var(--surface-muted) / .68);
+    background: rgba(245, 247, 250, .68);
     display: grid;
     grid-template-rows: auto auto minmax(0, 1fr);
     gap: 10px;
@@ -1806,7 +1881,7 @@
     min-height: 32px;
     border: 1px solid hsl(var(--border));
     border-radius: 8px;
-    background: hsl(var(--surface-muted));
+    background: var(--surface-muted);
     color: hsl(var(--muted-foreground));
     display: grid;
     grid-template-columns: 18px minmax(0, 1fr);
@@ -2119,7 +2194,7 @@
     overflow: auto;
     border: 1px solid hsl(var(--border));
     border-radius: 8px;
-    background: hsl(var(--surface-muted));
+    background: var(--surface-muted);
     color: hsl(var(--foreground));
     padding: 12px;
     white-space: pre-wrap;
@@ -2148,7 +2223,7 @@
 
   .settings-status {
     border: 1px solid hsl(var(--border));
-    background: hsl(var(--surface-muted));
+    background: var(--surface-muted);
     border-radius: 8px;
     padding: 12px 14px;
     color: hsl(var(--foreground));

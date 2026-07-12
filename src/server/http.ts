@@ -24,6 +24,8 @@ import { softDeleteUser, setUserEnabled } from '../auth/lifecycle.js';
 import { createTenant, createUser, listTenants } from '../auth/admin.js';
 import type { RequestContext, Role } from '../auth/types.js';
 import { DEFAULT_TASK_MAX_RUN_MS, type SandboxSettings, type ScheduledTaskPatch } from '../db/store.js';
+import { boundUserHomeNote, normalizeUserHomeDir } from '../sandbox/userhome.js';
+import { SANDBOX_SERVICE_NOTE } from '../sandbox/notes.js';
 import { isValidCron } from '../scheduler/cron.js';
 import { createScheduledTaskRunner } from '../scheduler/runner.js';
 import { createModel } from '../model/factory.js';
@@ -85,10 +87,10 @@ function sendHtml(res: Res, status: number, html: string): void {
   res.end(buf);
 }
 
-/** attachment 头：ASCII 兜底 filename + RFC 5987 filename*（保留中文等非 ASCII 文件名）。 */
-function contentDisposition(name: string): string {
+/** Content-Disposition 头：ASCII 兜底 filename + RFC 5987 filename*（保留中文等非 ASCII 文件名）。 */
+function contentDisposition(name: string, kind: 'attachment' | 'inline' = 'attachment'): string {
   const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
-  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+  return `${kind}; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
 }
 
 async function sendWebAsset(res: Res, path: string, frameAncestors?: string[]): Promise<boolean> {
@@ -430,6 +432,7 @@ function browserStreamView(sessionId: string): string {
 <html>
 <head>
   <meta charset="utf-8">
+  <title>浏览器预览</title>
   <style>
     html, body { margin: 0; overflow-x: hidden; }
     body { background: #0f172a; color: #d6e2ff; font: 14px system-ui, sans-serif; }
@@ -439,7 +442,7 @@ function browserStreamView(sessionId: string): string {
   </style>
 </head>
 <body>
-  <header><strong>Local browser preview</strong><span id="status">connecting</span></header>
+  <header><strong>浏览器预览</strong><span id="status">connecting</span></header>
   <img id="screen" alt="browser preview" />
   <div id="error" class="error"></div>
   <script>
@@ -593,10 +596,12 @@ async function handle(
     if (!rt.downloads) throw new HttpError(404, '下载未启用');
     const opened = await rt.downloads.open(decodeURIComponent(downloadMatch[1]!)).catch(() => undefined);
     if (!opened) throw new HttpError(404, '下载链接无效或已过期');
+    // 图片/音视频用 inline：聊天内联预览与新标签页直接播放；其余仍强制下载。
+    const inlineMedia = /^(image|audio|video)\//.test(opened.meta.mime || '');
     res.writeHead(200, {
       'content-type': opened.meta.mime || 'application/octet-stream',
       'content-length': opened.size,
-      'content-disposition': contentDisposition(opened.meta.name),
+      'content-disposition': contentDisposition(opened.meta.name, inlineMedia ? 'inline' : 'attachment'),
       'cache-control': 'private, no-store',
     });
     opened.stream.on('error', () => { if (!res.writableEnded) res.end(); });
@@ -693,6 +698,43 @@ async function handle(
       username: user?.username,
       displayName: user?.displayName ?? user?.username,
       authProvider: user?.authProvider,
+      homeDir: user?.homeDir ?? '',
+    });
+  }
+
+  // —— 个人设置：绑定主机主目录（任意登录用户自助；启动沙箱时默认挂载）——
+  if (route === 'GET /v1/me/home-dir') {
+    const ctx = await requireAuth(rt, req);
+    const user = await rt.store.getUser(ctx.tenantId, ctx.userId).catch(() => undefined);
+    return sendJson(res, 200, {
+      home_dir: user?.homeDir ?? '',
+      mount_path: rt.userHome?.mountPath ?? '/home/user/host',
+      root: rt.userHome?.root ?? '',
+    });
+  }
+  if (route === 'POST /v1/me/home-dir') {
+    const ctx = await requireAuth(rt, req);
+    const body = await readJson(req);
+    const raw = str(body, 'home_dir');
+    if (raw === undefined) throw new HttpError(400, '缺少 home_dir（传空字符串表示解绑）');
+    let homeDir: string | null = null;
+    if (raw.trim()) {
+      try {
+        homeDir = normalizeUserHomeDir(raw, rt.userHome?.root);
+      } catch (err) {
+        throw new HttpError(400, err instanceof Error ? err.message : '主目录不合法');
+      }
+    }
+    const user = await rt.store.updateUser(ctx.tenantId, ctx.userId, { homeDir });
+    if (!user) throw new HttpError(404, '用户不存在');
+    await rt.audit?.record({
+      kind: 'auth', action: homeDir ? 'home-dir-bound' : 'home-dir-unbound', tenantId: ctx.tenantId,
+      detail: { userId: ctx.userId, ...(homeDir ? { homeDir } : {}) },
+    });
+    return sendJson(res, 200, {
+      home_dir: user.homeDir ?? '',
+      mount_path: rt.userHome?.mountPath ?? '/home/user/host',
+      root: rt.userHome?.root ?? '',
     });
   }
 
@@ -1007,6 +1049,12 @@ async function handle(
     const ctx = await requireAuth(rt, req);
     const body = await readJson(req);
     return sendJson(res, 200, await dispatchDirectTool(rt, ctx, sessionIdFromBody(body), 'browser_screenshot', {}));
+  }
+
+  if (route === 'POST /v1/browser/url') {
+    const ctx = await requireAuth(rt, req);
+    const body = await readJson(req);
+    return sendJson(res, 200, await dispatchDirectTool(rt, ctx, sessionIdFromBody(body), 'browser_current_url', {}));
   }
 
   // —— 设置：运行时 LLM 配置 ——
@@ -1545,6 +1593,10 @@ async function runAgentSse(
     // 必须在 addActiveRun 之后加载：此后并发 append 都进内存队列走 drain，
     // 不会在 listMessages 与 replaceMessages 之间直写库被压缩覆盖。
     const prior = await rt.store.listMessages(ctx, sessionId);
+    // 用户绑定了主目录：在系统提示中告知挂载点，引导交付物默认写入持久化目录。
+    const userHomeNote = rt.sandboxes && rt.userHome
+      ? await boundUserHomeNote(rt.store, ctx.tenantId, ctx.userId, rt.userHome)
+      : '';
     const modelConfig = currentModelConfig(rt);
     const triggerTokens = compactionTriggerTokens(modelConfig);
     const result = await runAgent({
@@ -1618,6 +1670,8 @@ async function runAgentSse(
       system: [
         parsedTask.goalMode ? GOAL_MODE_SYSTEM : '',
         rt.skillRegistry ? rt.skillRegistry.summariesFor(ctx) : rt.systemExtra,
+        rt.sandboxes ? SANDBOX_SERVICE_NOTE : '',
+        userHomeNote,
       ].filter(Boolean).join('\n\n'),
       ctx: toolCtx,
       messages: prior,

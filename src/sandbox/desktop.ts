@@ -23,6 +23,8 @@ export interface DesktopHandle {
   streamUrl(): string;
   /** 启动应用（如 google-chrome）并可选打开 URL。 */
   launch(application: string, uri?: string): Promise<void>;
+  /** 远端浏览器当前页面 URL（用户可在本地浏览器新标签页直接打开）；后端不支持时缺省。 */
+  currentUrl?(): Promise<string>;
   leftClick(x: number, y: number): Promise<void>;
   write(text: string): Promise<void>;
   screenshot(): Promise<Uint8Array>;

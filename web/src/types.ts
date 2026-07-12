@@ -18,6 +18,8 @@ export interface MeBody {
   username?: string;
   displayName?: string;
   authProvider?: 'local' | 'oidc' | 'aios';
+  /** 绑定的宿主机主目录（启动沙箱时默认挂载）；空串表示未绑定。 */
+  homeDir?: string;
 }
 
 /** 用户管理列表项（GET /v1/admin/users）。 */

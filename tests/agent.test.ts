@@ -419,8 +419,9 @@ describe('runAgent 摘要压缩', () => {
     const model: ChatModel = {
       id: 'm',
       async *stream(input: StreamInput): AsyncIterable<StreamEvent> {
-        // 首轮边界已压缩：发给模型的历史应以摘要开头
-        expect(input.messages[0]!.text).toContain('历史对话摘要');
+        // 首轮边界已压缩：用户输入原样保留在最前，摘要消息跟在其后
+        expect(input.messages[0]!.text).toContain('问题0');
+        expect(input.messages.some((m) => m.text?.includes('历史对话摘要'))).toBe(true);
         yield { type: 'text_delta', text: 'ok' };
         yield { type: 'stop', reason: 'end_turn' };
       },
@@ -443,7 +444,9 @@ describe('runAgent 摘要压缩', () => {
 
     expect(summarize).toHaveBeenCalledTimes(1);
     expect(result.compacted).toBe(true);
-    expect(result.messages[0]!.text).toContain('这是历史摘要');
+    // 用户输入永不吞掉：压缩区间的用户消息保留在摘要之前
+    expect(result.messages[0]!.text).toContain('问题0');
+    expect(result.messages.some((m) => m.text?.includes('这是历史摘要'))).toBe(true);
     // 最近 4 条 + 本轮 task 原样保留
     expect(result.messages.some((m) => m.text?.includes('问题9'))).toBe(true);
     expect(result.messages.some((m) => m.text === '继续')).toBe(true);

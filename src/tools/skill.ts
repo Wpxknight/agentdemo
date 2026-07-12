@@ -143,9 +143,9 @@ export function buildSkillTools(
   });
 
   if (manager) {
-    const resolveSpec = (ctx: ToolContext): SandboxSpec => ({
+    const resolveSpec = async (ctx: ToolContext): Promise<SandboxSpec> => ({
       key: ctx.sessionId,
-      ...(resolve ? resolve(ctx) : {}),
+      ...(resolve ? await resolve(ctx) : {}),
     });
     tools.push({
       def: {
@@ -201,7 +201,7 @@ export function buildSkillTools(
         const safe = safeName(name);
         const dest = `${SANDBOX_SKILLS_ROOT}/${safe}`;
         const tmp = `/tmp/aiop-skill-${safe}`;
-        const sbx = await manager.get(resolveSpec(ctx));
+        const sbx = await manager.get(await resolveSpec(ctx));
 
         // 预检 + 准备：全量同步先清空目标目录保证幂等；子集同步原地覆盖。
         const prep = await sbx.runCommand(
@@ -233,7 +233,7 @@ export function buildSkillTools(
         // 凭据注入（P3）：技能声明了 credentials 时，把当前用户的平台凭据写入沙箱内的凭据文件。
         // 凭据来自服务端缓存（按 toolCtx 的 tenant/user 查找），身份不可能被聊天内容改变。
         const credentialNote = await injectSkillCredentials({
-          skill, sbx, dest, ctx, manager, spec: resolveSpec(ctx), deps,
+          skill, sbx, dest, ctx, manager, spec: await resolveSpec(ctx), deps,
         });
 
         const skippedNote = skipped.length

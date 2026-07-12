@@ -3,8 +3,8 @@ import type { ToolContext, ToolHandler } from '../agent/tools.js';
 import type { SandboxManager } from '../sandbox/lifecycle.js';
 import type { ExecResult, SandboxSpec } from '../sandbox/types.js';
 
-/** 由 ctx 推导出本次该用哪个沙箱（缓存键 / 是否连接远端）。 */
-export type SpecResolver = (ctx: ToolContext) => Partial<SandboxSpec>;
+/** 由 ctx 推导出本次该用哪个沙箱（缓存键 / 是否连接远端）；可异步（如按用户查主目录挂载）。 */
+export type SpecResolver = (ctx: ToolContext) => Partial<SandboxSpec> | Promise<Partial<SandboxSpec>>;
 
 /** 默认：每个会话一个沙箱（S4 起按 session×cluster）。 */
 const defaultResolver: SpecResolver = (ctx) => ({ key: ctx.sessionId });
@@ -35,8 +35,8 @@ function formatExec(r: ExecResult): ToolResult {
   };
 }
 
-function resolveSpec(resolve: SpecResolver, ctx: ToolContext): SandboxSpec {
-  const partial = resolve(ctx);
+async function resolveSpec(resolve: SpecResolver, ctx: ToolContext): Promise<SandboxSpec> {
+  const partial = await resolve(ctx);
   return { key: ctx.sessionId, ...partial };
 }
 
@@ -67,7 +67,7 @@ export function buildSandboxTools(
         const o = asObject(args);
         const code = reqString(o, 'code');
         const language = typeof o.language === 'string' ? o.language : undefined;
-        const sbx = await manager.get(resolveSpec(resolve, ctx));
+        const sbx = await manager.get(await resolveSpec(resolve, ctx));
         return formatExec(await sbx.runCode(code, { language, onOutput: ctx.onOutput }));
       },
     },
@@ -86,7 +86,7 @@ export function buildSandboxTools(
       async run(args, ctx): Promise<ToolResult> {
         const o = asObject(args);
         const command = reqString(o, 'command');
-        const sbx = await manager.get(resolveSpec(resolve, ctx));
+        const sbx = await manager.get(await resolveSpec(resolve, ctx));
         return formatExec(await sbx.runCommand(command, { onOutput: ctx.onOutput }));
       },
     },

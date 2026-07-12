@@ -4,8 +4,9 @@ import type { ExecResult, SandboxHandle } from './types.js';
 
 const WORK_DIR = '/tmp/aiop-browser';
 const SCREENSHOT_MARKER = '__AIOP_SCREENSHOT__';
+const URL_MARKER = '__AIOP_URL__';
 
-type CdpAction = 'navigate' | 'click' | 'type' | 'screenshot';
+type CdpAction = 'navigate' | 'click' | 'type' | 'screenshot' | 'url';
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -127,9 +128,16 @@ class CdpClient {
 async function main() {
   const payload = decodePayload(rawPayload);
   const target = await ensurePageTarget();
+  if (action === 'url') {
+    console.log('__AIOP_URL__' + (target.url || ''));
+    return;
+  }
   const page = await CdpClient.connect(target.webSocketDebuggerUrl);
   try {
     await page.send('Page.enable');
+    // 所有动作统一固定视口：Chrome 可能被沙箱内其他进程以小窗口先拉起（启动脚本探测到 9222 即复用，
+    // --window-size 不再生效），窄视口会截出右侧残缺、带横向滚动条的页面；点击坐标也必须与截图视口一致。
+    await page.send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 850, deviceScaleFactor: 1, mobile: false });
     if (action === 'navigate') {
       await page.send('Page.navigate', { url: payload.url });
       await sleep(900);
@@ -142,7 +150,15 @@ async function main() {
       return;
     }
     if (action === 'type') {
-      await page.send('Input.insertText', { text: payload.text });
+      // 尾部换行符表示回车提交：insertText 不会触发键盘事件，Enter 需按键事件模拟。
+      const raw = String(payload.text || '');
+      const pressEnter = raw.endsWith('\n');
+      const body = pressEnter ? raw.replace(/\n+$/, '') : raw;
+      if (body) await page.send('Input.insertText', { text: body });
+      if (pressEnter) {
+        await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, text: '\r' });
+        await page.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+      }
       return;
     }
     if (action === 'screenshot') {
@@ -253,6 +269,12 @@ class OpenSandboxDesktopHandle implements DesktopHandle {
 
   async write(text: string): Promise<void> {
     await this.runCdp('type', { text });
+  }
+
+  async currentUrl(): Promise<string> {
+    const res = await this.runCdp('url', {});
+    const line = res.stdout.split(/\r?\n/).find((item) => item.startsWith(URL_MARKER));
+    return line ? line.slice(URL_MARKER.length).trim() : '';
   }
 
   async screenshot(): Promise<Uint8Array> {

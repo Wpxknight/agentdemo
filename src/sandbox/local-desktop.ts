@@ -110,6 +110,12 @@ class LocalDesktopHandle implements DesktopHandle {
     });
   }
 
+  async currentUrl(): Promise<string> {
+    await this.ensureChrome();
+    const target = await this.pageTarget();
+    return target.url || '';
+  }
+
   async leftClick(x: number, y: number): Promise<void> {
     await this.ensureChrome();
     await this.withPage(async (page) => {

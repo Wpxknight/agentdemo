@@ -84,7 +84,7 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
     {
       def: {
         name: 'browser_type',
-        description: '在远端浏览器当前焦点处键入文本。',
+        description: '在远端浏览器当前焦点处键入文本；文本以换行符结尾时额外按一次回车（提交表单/搜索）。',
         inputSchema: {
           type: 'object',
           properties: { text: { type: 'string' } },
@@ -97,6 +97,21 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
         const d = await resolve(ctx);
         await d.write(text);
         return { id: '', content: `已输入 ${text.length} 个字符` };
+      },
+    },
+    {
+      def: {
+        name: 'browser_current_url',
+        description: '获取远端浏览器当前页面的 URL；用户可在本地浏览器新标签页直接打开该地址操作。',
+        inputSchema: { type: 'object', properties: {} },
+      },
+      async run(_args, ctx): Promise<ToolResult> {
+        const d = await resolve(ctx);
+        if (!d.currentUrl) return { id: '', content: '当前沙箱后端不支持获取页面地址', isError: true };
+        const url = await d.currentUrl();
+        // chrome://intro、about:blank 等内部页对用户无意义，只放行 http(s)。
+        if (!url || !/^https?:\/\//i.test(url)) return { id: '', content: '浏览器尚未打开任何页面' };
+        return { id: '', content: `当前页面：${url}` };
       },
     },
     {

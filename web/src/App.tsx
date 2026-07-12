@@ -1,4 +1,5 @@
 import { Fragment, isValidElement, type CSSProperties, type FormEvent, type KeyboardEvent, type PointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
@@ -15,6 +16,7 @@ import {
   Cuboid,
   Cpu,
   Database,
+  ExternalLink,
   FileText,
   Folder,
   Download,
@@ -650,22 +652,70 @@ function TaskProgress({ steps }: { steps: TaskStep[] }) {
 }
 
 /** 智能体导出文件的下载按钮组：href 指向 /v1/files/<令牌>，download 触发浏览器下载。 */
+/** 聊天内图片：内联缩略 + 点击灯箱放大（portal 到 body，避免被消息容器裁剪/变换影响）。 */
+function ZoomableImage({ src, alt }: { src: string; alt?: string }) {
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open]);
+
+  return (
+    <>
+      <img
+        className="chat-media-image"
+        src={src}
+        alt={alt || ''}
+        loading="lazy"
+        title="点击放大"
+        onClick={() => setOpen(true)}
+      />
+      {open
+        ? createPortal(
+            <div className="media-lightbox" role="dialog" aria-label={alt || '图片预览'} onClick={() => setOpen(false)}>
+              <img src={src} alt={alt || ''} />
+              <button type="button" className="media-lightbox-close" aria-label="关闭预览">
+                <X />
+              </button>
+            </div>,
+            document.body,
+          )
+        : null}
+    </>
+  );
+}
+
+/** 按 MIME 渲染导出文件的媒体预览；非媒体类型返回 null（只保留下载入口）。 */
+function mediaPreview(url: string, mime: string, name: string): ReactNode {
+  if (mime.startsWith('image/')) return <ZoomableImage src={url} alt={name} />;
+  if (mime.startsWith('audio/')) return <audio className="chat-media-audio" controls preload="metadata" src={url} />;
+  if (mime.startsWith('video/')) return <video className="chat-media-video" controls preload="metadata" src={url} />;
+  return null;
+}
+
 function DownloadFiles({ files }: { files: ExportedFile[] }) {
   return (
     <div className="export-files">
       {files.map((file) => (
-        <a
-          key={file.url}
-          className="export-file"
-          href={file.url}
-          download={file.name}
-          target="_blank"
-          rel="noreferrer"
-        >
-          <Download className="export-file-icon" />
-          <span className="export-file-name">{file.name}</span>
-          {file.size ? <span className="export-file-size">{formatFileSize(file.size)}</span> : null}
-        </a>
+        <div key={file.url} className="export-file-item">
+          {mediaPreview(file.url, file.mime || '', file.name)}
+          <a
+            className="export-file"
+            href={file.url}
+            download={file.name}
+            target="_blank"
+            rel="noreferrer"
+          >
+            <Download className="export-file-icon" />
+            <span className="export-file-name">{file.name}</span>
+            {file.size ? <span className="export-file-size">{formatFileSize(file.size)}</span> : null}
+          </a>
+        </div>
       ))}
     </div>
   );
@@ -749,6 +799,13 @@ const markdownComponents: Components = {
       </a>
     );
   },
+  img({ src, alt }) {
+    if (!src || typeof src !== 'string') return null;
+    // 音视频文件被写成 markdown 图片时按扩展名纠正为播放器（模型偶尔混用 ![]() 语法）。
+    if (/\.(mp3|wav|m4a|ogg|flac|aac)(\?|$)/i.test(src)) return <audio className="chat-media-audio" controls preload="metadata" src={src} />;
+    if (/\.(mp4|webm|mov|m4v)(\?|$)/i.test(src)) return <video className="chat-media-video" controls preload="metadata" src={src} />;
+    return <ZoomableImage src={src} alt={alt} />;
+  },
 };
 
 function MarkdownMessage({ content }: { content: string }) {
@@ -777,7 +834,10 @@ function ContextSummaryBlock({ text }: { text: string }) {
         <Cpu />
         历史摘要（自动压缩）
       </summary>
-      <div className="thinking-content">{renderTextLines(content, 'context-summary')}</div>
+      {/* 摘要是模型生成的 Markdown，按正文样式渲染，避免弱化灰纯文本看不清。 */}
+      <div className="thinking-content context-summary-content">
+        <MarkdownMessage content={content} />
+      </div>
     </details>
   );
 }
@@ -945,7 +1005,37 @@ export default function App() {
       setMe(null);
       return;
     }
-    api.get<MeBody>('/v1/me').then(setMe).catch(() => setMe(null));
+    let cancelled = false;
+    api.get<MeBody>('/v1/me').then((body) => {
+      if (cancelled) return;
+      // 切换登录用户：清空上一账号的聊天状态与本地会话锚点，防止对话内容跨账号泄漏。
+      const userKey = `${body.tenantId}/${body.userId}`;
+      const prevKey = readStorage('aiop_user');
+      if (prevKey && prevKey !== userKey) {
+        const fresh = numericSessionId();
+        sessionIdRef.current = fresh;
+        setSessionId(fresh);
+        writeStorage('aiop_session_id', fresh);
+        const freshMessages = initialMessages.slice(0, 1);
+        messagesRef.current = freshMessages;
+        setMessages(freshMessages);
+        setSessionMessageCache({});
+        // 会话列表不在这里清：loadPageData 已用新 token 拉取新用户自己的列表，清空反而会与之竞态。
+        setContextUsage({});
+        setSessionCostUsd({});
+        setPendingQuestions({});
+        setActiveRunSessionIds(new Set());
+        setAttachments([]);
+        setComposerValue('');
+        setSandboxOutput('');
+        setBrowserStreamUrl('');
+      }
+      writeStorage('aiop_user', userKey);
+      setMe(body);
+    }).catch(() => {
+      if (!cancelled) setMe(null);
+    });
+    return () => { cancelled = true; };
   }, [api, token]);
 
   // AIOS token exchange：宿主页 postMessage 传来的平台 token 换 aiop JWT。
@@ -1049,7 +1139,8 @@ export default function App() {
     if (!token || target === 'login') return;
     try {
       if (target === 'chat') {
-        await loadLlmSettings();
+        // 模型配置读取需要管理权限：普通用户 403 不能阻断会话列表 / 工具加载。
+        await loadLlmSettings().catch(() => {});
         await fetchSessionsPage(0);
         const toolsBody = await api.get<ToolsBody>('/v1/tools');
         setTools(toolsBody.tools || []);
@@ -1067,7 +1158,7 @@ export default function App() {
         setSandboxes(body.sandboxes || []);
         setSandboxProfiles(body.profiles || []);
       }
-      if (target === 'settings') await loadLlmSettings();
+      if (target === 'settings') await loadLlmSettings().catch(() => {});
     } catch (err) {
       console.error(err);
     }
@@ -1610,6 +1701,24 @@ export default function App() {
     }
   }
 
+  /** 把沙箱浏览器当前页面的真实 URL 在本地浏览器新标签页打开（可直接点击、输入）。 */
+  async function openBrowserInNewTab() {
+    setSandboxOutput('$ browser url\n正在获取当前页面地址...');
+    try {
+      const body = await api.post<ToolCallBody>('/v1/browser/url', { sessionId });
+      const text = formatToolResponse(body);
+      const pageUrl = text.match(/https?:\/\/[^\s)]+/)?.[0];
+      if (pageUrl) {
+        window.open(pageUrl, '_blank', 'noopener');
+        setSandboxOutput(`$ browser url\n${text}\n已在新标签页打开。`);
+      } else {
+        setSandboxOutput(`$ browser url\n${text}`);
+      }
+    } catch (err) {
+      setSandboxOutput(`$ browser url\n[error]\n获取页面地址失败：${formatError(err)}`);
+    }
+  }
+
   async function switchComposerModel(id: string) {
     if (!id) return;
     setSettingsStatus('正在切换模型...');
@@ -1733,6 +1842,7 @@ export default function App() {
           onRunSandbox={runSandboxCode}
           onOpenPreview={() => void openBrowserStream()}
           onRefreshPreview={() => void captureBrowserScreenshot()}
+          onOpenTab={() => void openBrowserInNewTab()}
           onStartResize={startPreviewResize}
         />
         <ConfirmDialog
@@ -1764,7 +1874,7 @@ export default function App() {
             {activePage === 'schedule' && <SchedulePage tasks={tasks} api={api} onChanged={() => void loadPageData('schedule')} onRequestConfirm={requestConfirmDialog} />}
             {activePage === 'sandbox' && <SandboxPage sandboxes={sandboxes} profiles={sandboxProfiles} />}
             {activePage === 'users' && <UsersPage api={api} me={me} onRequestConfirm={requestConfirmDialog} />}
-            {activePage === 'settings' && <SettingsPage llm={llm} status={settingsStatus} api={api} onLlmChange={setLlm} onStatus={setSettingsStatus} />}
+            {activePage === 'settings' && <SettingsPage llm={llm} status={settingsStatus} api={api} me={me} onLlmChange={setLlm} onStatus={setSettingsStatus} />}
           </section>
           </main>
         </div>
@@ -1895,6 +2005,7 @@ function PrototypeChatShell(props: {
   onRunSandbox: (code: string, language: string) => void;
   onOpenPreview: () => void;
   onRefreshPreview: () => void;
+  onOpenTab: () => void;
   onStartResize: (event: PointerEvent<HTMLButtonElement>) => void;
 }) {
   return (
@@ -1957,6 +2068,7 @@ function PrototypeChatShell(props: {
             onRunSandbox={props.onRunSandbox}
             onOpenPreview={props.onOpenPreview}
             onRefreshPreview={props.onRefreshPreview}
+            onOpenTab={props.onOpenTab}
             onStartResize={props.onStartResize}
             onClose={props.onTogglePreview}
           />
@@ -2325,7 +2437,8 @@ function PrototypeMessages({ messages }: { messages: ChatMessage[] }) {
     <ScrollArea className="prototype-message-scroll">
       <div className="prototype-message-list">
         {messages.map((message, index) => {
-          const isUser = message.role === 'user';
+          // 历史摘要虽以 user 角色落库（模型协议要求），但内容是 aiop 生成的，展示在助手侧。
+          const isUser = message.role === 'user' && !message.summary;
           return (
             <article key={message.id || `${message.role}-${index}`} className={cn('prototype-message', isUser && 'user')}>
               <MessageAvatar isUser={isUser} />
@@ -2440,6 +2553,7 @@ function PrototypeSandboxPanel(props: {
   onRunSandbox: (code: string, language: string) => void;
   onOpenPreview: () => void;
   onRefreshPreview: () => void;
+  onOpenTab: () => void;
   onStartResize: (event: PointerEvent<HTMLButtonElement>) => void;
   onClose: () => void;
 }) {
@@ -2533,6 +2647,10 @@ function PrototypeSandboxPanel(props: {
                   <RefreshCcw />
                   刷新截图
                 </button>
+                <button type="button" title="在本地浏览器新标签页打开当前页面（可直接点击、输入）" onClick={props.onOpenTab}>
+                  <ExternalLink />
+                  新标签页打开
+                </button>
               </div>
             </div>
             {props.browserStreamUrl ? (
@@ -2541,7 +2659,7 @@ function PrototypeSandboxPanel(props: {
               <div className="prototype-empty-preview">
                 <Globe />
                 <strong>浏览器预览区域</strong>
-                <span>加载后会在这里显示截图流。</span>
+                <span>加载后会在这里显示截图流；「新标签页打开」可在本地浏览器直接操作当前页面。</span>
               </div>
             )}
           </div>
@@ -2714,7 +2832,8 @@ function Messages({ messages }: { messages: ChatMessage[] }) {
     <ScrollArea className="messages-scroll">
       <div className="messages-grid">
         {messages.map((message, index) => {
-          const isUser = message.role === 'user';
+          // 历史摘要虽以 user 角色落库（模型协议要求），但内容是 aiop 生成的，展示在助手侧。
+          const isUser = message.role === 'user' && !message.summary;
           return (
             <article key={message.id || `${message.role}-${index}`} className={cn('message', isUser && 'message-user')}>
               <MessageAvatar isUser={isUser} />
@@ -2740,8 +2859,13 @@ function Messages({ messages }: { messages: ChatMessage[] }) {
 }
 
 function AttachmentChips({ attachments, onRemove }: { attachments: Attachment[]; onRemove?: (id: string) => void }) {
+  const images = attachments.filter((file) => file.type.startsWith('image/') && file.data);
   return (
     <div className="attachment-list">
+      {/* 图片附件直接内联缩略图（可点击放大）；其余仍以文件名 chip 展示 */}
+      {images.map((file) => (
+        <ZoomableImage key={`img-${file.id}`} src={file.data} alt={file.name} />
+      ))}
       {attachments.map((file) => (
         <span className="attachment-chip" key={file.id} title={file.name}>
           <Paperclip />
@@ -4309,13 +4433,16 @@ function SandboxPage({ sandboxes, profiles }: { sandboxes: SandboxSummary[]; pro
   );
 }
 
-function SettingsPage({ llm, status, api, onLlmChange, onStatus }: {
+function SettingsPage({ llm, status, api, me, onLlmChange, onStatus }: {
   llm: RuntimeModelConfig;
   status: string;
   api: ReturnType<typeof createApi>;
+  me: MeBody | null;
   onLlmChange: (next: RuntimeModelConfig) => void;
   onStatus: (next: string) => void;
 }) {
+  // 隐藏只是 UX，权限边界在后端 RBAC：普通用户只保留我的主目录。
+  const isAdmin = me?.role === 'platform_admin' || me?.role === 'tenant_admin';
   const [form, setForm] = useState(() => ({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) }));
 
   useEffect(() => {
@@ -4353,14 +4480,15 @@ function SettingsPage({ llm, status, api, onLlmChange, onStatus }: {
 
   return (
     <>
-      <PageTitle title="设置" desc="模型、沙箱与定时任务配置" />
-      <Tabs defaultValue="llm" className="sandbox-page-tabs settings-tabs">
+      <PageTitle title="设置" desc={isAdmin ? '模型、沙箱与定时任务配置' : '我的主目录'} />
+      <Tabs defaultValue={isAdmin ? 'llm' : 'homedir'} className="sandbox-page-tabs settings-tabs">
         <TabsList>
-          <TabsTrigger value="llm">模型</TabsTrigger>
-          <TabsTrigger value="sandbox">沙箱</TabsTrigger>
-          <TabsTrigger value="scheduler">定时任务</TabsTrigger>
+          {isAdmin ? <TabsTrigger value="llm">模型</TabsTrigger> : null}
+          {isAdmin ? <TabsTrigger value="sandbox">沙箱</TabsTrigger> : null}
+          {isAdmin ? <TabsTrigger value="scheduler">定时任务</TabsTrigger> : null}
+          <TabsTrigger value="homedir">我的主目录</TabsTrigger>
         </TabsList>
-        <TabsContent value="llm">
+        {isAdmin ? <TabsContent value="llm">
           <div className="settings-layout">
             <Card>
               <CardHeader>
@@ -4383,19 +4511,85 @@ function SettingsPage({ llm, status, api, onLlmChange, onStatus }: {
               </CardContent>
             </Card>
           </div>
-        </TabsContent>
-        <TabsContent value="sandbox">
+        </TabsContent> : null}
+        {isAdmin ? <TabsContent value="sandbox">
           <div className="settings-layout">
             <SandboxSettingsCard api={api} status={status} onStatus={onStatus} />
           </div>
-        </TabsContent>
-        <TabsContent value="scheduler">
+        </TabsContent> : null}
+        {isAdmin ? <TabsContent value="scheduler">
           <div className="settings-layout">
             <SchedulerSettingsCard api={api} status={status} onStatus={onStatus} />
+          </div>
+        </TabsContent> : null}
+        <TabsContent value="homedir">
+          <div className="settings-layout">
+            <UserHomeDirCard api={api} />
           </div>
         </TabsContent>
       </Tabs>
     </>
+  );
+}
+
+interface HomeDirBody {
+  home_dir: string;
+  mount_path: string;
+  root: string;
+}
+
+/** 个人主目录绑定（任意用户自助）：绑定宿主机目录，新建会话沙箱时默认挂载进沙箱。 */
+function UserHomeDirCard({ api }: { api: ReturnType<typeof createApi> }) {
+  const [info, setInfo] = useState<HomeDirBody | null>(null);
+  const [value, setValue] = useState('');
+  const [msg, setMsg] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    api.get<HomeDirBody>('/v1/me/home-dir')
+      .then((body) => {
+        if (cancelled) return;
+        setInfo(body);
+        setValue(body.home_dir);
+      })
+      .catch((err) => {
+        if (!cancelled) setMsg(`加载主目录绑定失败：${formatError(err)}`);
+      });
+    return () => { cancelled = true; };
+  }, [api]);
+
+  async function save() {
+    setMsg(value.trim() ? '正在绑定主目录...' : '正在解绑主目录...');
+    try {
+      const body = await api.post<HomeDirBody>('/v1/me/home-dir', { home_dir: value.trim() });
+      setInfo(body);
+      setValue(body.home_dir);
+      setMsg(body.home_dir
+        ? `已绑定 ${body.home_dir}，新启动的沙箱会挂载到 ${body.mount_path}。`
+        : '已解绑，新启动的沙箱不再挂载主目录。');
+    } catch (err) {
+      setMsg(`保存失败：${formatError(err)}`);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>我的主目录</CardTitle>
+        <CardDescription>
+          绑定宿主机上属于你的目录后，新启动的会话沙箱会默认把它挂载到 {info?.mount_path || '/home/user/host'}
+          （沙箱内环境变量 AIOP_USER_HOME 指向挂载点）。对已在运行的沙箱不生效。
+          {info?.root ? `目录必须位于 ${info.root} 之下。` : ''}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="settings-form">
+        <Label>宿主机目录<Input value={value} spellCheck={false} placeholder="绝对路径，如 /data/homes/alice；留空表示解绑" onChange={(event) => setValue(event.target.value)} /></Label>
+        {msg ? <div className="settings-status">{msg}</div> : null}
+        <div className="form-actions">
+          <Button type="button" disabled={!info} onClick={() => void save()}>保存绑定</Button>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 

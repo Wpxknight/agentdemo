@@ -96,9 +96,10 @@ export class SandboxManager {
     const effectiveTimeout = spec.timeoutMs ?? this.timeoutMs;
     const full: SandboxSpec = { ...spec, timeoutMs: effectiveTimeout };
     const task = (async () => {
+      // 带卷的沙箱不走预热池：卷挂载只能在创建时生效，池中沙箱没有该用户的挂载。
       const handle = full.sandboxId
         ? await this.provider.connect(full.sandboxId, full)
-        : this.warmPool
+        : this.warmPool && !full.volumes?.length
           ? await this.warmPool.acquire()
           : await this.provider.create(full);
       const readyAt = this.now();

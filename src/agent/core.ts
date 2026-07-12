@@ -1,5 +1,5 @@
 import type { ChatModel, Msg, StreamEvent, ToolCall, ToolContentBlock, ToolDef, ToolResult } from '../model/types.js';
-import { compactMessages, estimateTokens, planCompaction, summaryMessage } from './context.js';
+import { compactMessages, estimateTokens, isUserInputMsg, planCompaction, summaryMessage } from './context.js';
 import type { PolicyMiddleware } from './policy.js';
 import type { ToolContext, ToolRegistry } from './tools.js';
 import type { ApprovalGate } from './approval.js';
@@ -311,8 +311,11 @@ async function maybeCompact(messages: Msg[], watermark: number, opts: RunAgentOp
     const summary = (await opts.summarize(stale)).trim();
     throwIfAborted(opts.signal);
     if (!summary) return false;
+    // 用户输入永不吞掉：摘要只替代 assistant/tool 轮次，用户消息按原顺序保留在摘要之前
+    // （历史上一轮的摘要消息除外——其内容已并入新摘要）。发送时仍受硬预算截断兜底。
+    const keptUserInputs = stale.filter(isUserInputMsg);
     // 同步剥离 recent 里较旧的图片：残留大图会让历史始终高于触发线，每轮白跑一次摘要。
-    const next = compactMessages([summaryMessage(summary), ...recent], 0, opts.keepImages ?? 1);
+    const next = compactMessages([...keptUserInputs, summaryMessage(summary), ...recent], 0, opts.keepImages ?? 1);
     messages.splice(0, messages.length, ...next);
     opts.onEvent?.({
       type: 'context_compacted',

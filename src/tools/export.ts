@@ -16,8 +16,8 @@ function reqString(o: Record<string, JsonValue>, key: string): string {
   return v;
 }
 
-function resolveSpec(resolve: SpecResolver, ctx: ToolContext): SandboxSpec {
-  return { key: ctx.sessionId, ...resolve(ctx) };
+async function resolveSpec(resolve: SpecResolver, ctx: ToolContext): Promise<SandboxSpec> {
+  return { key: ctx.sessionId, ...(await resolve(ctx)) };
 }
 
 /** 扩展名 → MIME，覆盖导出常见格式；未知回退 octet-stream（浏览器仍会当附件下载）。 */
@@ -39,7 +39,19 @@ const MIME_BY_EXT: Record<string, string> = {
   jpeg: 'image/jpeg',
   gif: 'image/gif',
   svg: 'image/svg+xml',
+  webp: 'image/webp',
   zip: 'application/zip',
+  // 音视频：前端按 audio/* video/* 渲染播放器
+  mp3: 'audio/mpeg',
+  wav: 'audio/wav',
+  m4a: 'audio/mp4',
+  ogg: 'audio/ogg',
+  flac: 'audio/flac',
+  aac: 'audio/aac',
+  mp4: 'video/mp4',
+  webm: 'video/webm',
+  mov: 'video/quicktime',
+  m4v: 'video/mp4',
 };
 
 function guessMime(name: string): string {
@@ -96,7 +108,7 @@ export function buildExportTool(
       const name = safeDownloadName(typeof o.filename === 'string' && o.filename ? o.filename : path);
       const mime = typeof o.mime === 'string' && o.mime ? o.mime : guessMime(name);
 
-      const sbx = await manager.get(resolveSpec(resolve, ctx));
+      const sbx = await manager.get(await resolveSpec(resolve, ctx));
       let bytes: Uint8Array;
       try {
         bytes = await sbx.readFile(path);

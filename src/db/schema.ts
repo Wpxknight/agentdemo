@@ -84,6 +84,8 @@ export interface UsersTable {
   /** 登录来源：local | oidc | aios。 */
   auth_provider: Generated<string>;
   display_name: string | null;
+  /** 用户绑定的主机主目录（绝对路径）；启动沙箱时默认挂载进沙箱。 */
+  home_dir: string | null;
   created_at: Generated<Date>;
 }
 

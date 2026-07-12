@@ -373,6 +373,7 @@ export class MemoryStore implements Store {
       if (patch.status !== undefined) u.status = patch.status;
       if (patch.role !== undefined) u.role = patch.role;
       if (patch.displayName !== undefined) u.displayName = patch.displayName;
+      if (patch.homeDir !== undefined) u.homeDir = patch.homeDir ?? undefined;
       if (patch.username !== undefined && patch.username !== u.username) {
         // username 是 Map 键的一部分（墓碑改名需重挂）。
         this.users.delete(key);

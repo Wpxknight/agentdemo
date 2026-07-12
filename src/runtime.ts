@@ -13,6 +13,7 @@ import { E2bProvider } from './sandbox/e2b.js';
 import { OpenSandboxProvider } from './sandbox/opensandbox.js';
 import { LocalSandboxProvider } from './sandbox/local.js';
 import type { SandboxProvider } from './sandbox/types.js';
+import { normalizeUserHomeDir } from './sandbox/userhome.js';
 import { WarmPool } from './sandbox/warmpool.js';
 import { E2bDesktopProvider } from './sandbox/e2b-desktop.js';
 import { LocalDesktopProvider } from './sandbox/local-desktop.js';
@@ -71,6 +72,8 @@ export interface Runtime {
   updateModel?(config: RuntimeModelConfig): void;
   /** 当前生效的沙箱服务端连接配置。 */
   sandboxSettings?: SandboxConnectionInfo;
+  /** 用户主目录挂载配置：root 为允许绑定的宿主机根前缀（安全边界），mountPath 为沙箱内挂载点。 */
+  userHome?: { root?: string; mountPath: string };
   /** 运行期应用新的沙箱连接配置（新建沙箱走新后端；已存在沙箱不受影响）。 */
   updateSandbox?(settings: SandboxSettings): void;
   tools: ToolRegistry;
@@ -223,9 +226,28 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     const defaultProfile = selectDefaultProfile(sandboxProfiles);
     // skills.sandboxEnv：管理员配置的稳定环境信息（如 AIOS_BASE_URL），注入会话沙箱环境变量。
     const skillSandboxEnv = config.skills?.sandboxEnv;
-    const defaultResolver: SpecResolver = (ctx) => {
-      const spec = defaultProfile ? sandboxSpecForProfile(defaultProfile, ctx) : { key: ctx.sessionId };
-      return skillSandboxEnv ? { ...spec, envs: { ...skillSandboxEnv, ...spec.envs } } : spec;
+    const userHomeMountPath = sandboxCfg.userHomeMountPath ?? '/home/user/host';
+    const userHomeRoot = sandboxCfg.userHomeRoot;
+    const defaultResolver: SpecResolver = async (ctx) => {
+      const base = defaultProfile ? sandboxSpecForProfile(defaultProfile, ctx) : { key: ctx.sessionId };
+      const spec = skillSandboxEnv ? { ...base, envs: { ...skillSandboxEnv, ...base.envs } } : base;
+      // 用户绑定了主目录：默认以 hostPath 卷挂载进沙箱（仅创建时生效；同会话已存在的沙箱不受影响）。
+      if (!ctx.tenantId || !ctx.userId) return spec;
+      const user = await store.getUser(ctx.tenantId, ctx.userId).catch(() => undefined);
+      if (!user?.homeDir) return spec;
+      let homeDir: string;
+      try {
+        // 绑定后管理员若收紧了 userHomeRoot，存量绑定重新校验不过则不挂载。
+        homeDir = normalizeUserHomeDir(user.homeDir, userHomeRoot);
+      } catch (err) {
+        logger.warn({ userId: ctx.userId, homeDir: user.homeDir, err: String(err) }, 'user home dir rejected, skip mount');
+        return spec;
+      }
+      return {
+        ...spec,
+        volumes: [{ name: 'user-home', hostPath: homeDir, mountPath: userHomeMountPath }],
+        envs: { ...spec.envs, AIOP_USER_HOME: userHomeMountPath },
+      };
     };
     sessionSandboxResolver = defaultResolver;
     for (const t of buildSandboxTools(sandboxes, defaultResolver)) tools.register(t);
@@ -380,6 +402,9 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
           defaultImage: sandboxCfg.defaultImage,
         }
       : { enabled: false, provider: 'e2b' },
+    userHome: sandboxCfg
+      ? { root: sandboxCfg.userHomeRoot, mountPath: sandboxCfg.userHomeMountPath ?? '/home/user/host' }
+      : undefined,
     downloads,
     sandboxProfiles: publicSandboxProfiles(sandboxProfiles),
     clusters,

@@ -73,6 +73,10 @@ export const SandboxConfigSchema = z.object({
   warmPoolSize: z.number().int().positive().optional(),
   /** 可供模型选择的沙箱模板列表。缺省时自动生成 default profile。 */
   profiles: z.record(z.string(), SandboxProfileSchema).optional(),
+  /** 用户可绑定主目录的宿主机根前缀（安全边界）：绑定路径必须位于其下；缺省不限制前缀（仅要求绝对路径）。 */
+  userHomeRoot: z.string().optional(),
+  /** 用户主目录在沙箱内的挂载点，默认 /home/user/host。 */
+  userHomeMountPath: z.string().default('/home/user/host'),
 });
 
 export const ClusterSchema = z.object({
