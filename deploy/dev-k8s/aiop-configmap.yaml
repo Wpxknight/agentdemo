@@ -21,32 +21,10 @@ data:
         "jwtTtl": "12h"
       },
       "sandbox": {
-        "enabled": true,
-        "provider": "opensandbox",
-        "domain": "opensandbox-server.opensandbox-system.svc:80",
-        "protocol": "http",
-        "defaultImage": "aiop/opensandbox-browser:dev",
+        "enabled": false,
+        "provider": "e2b",
         "idleMs": 600000,
         "timeoutMs": 3600000,
-        "desktop": true,
-        "profiles": {
-          "code": {
-            "description": "普通代码和 shell 执行",
-            "image": "aiop/opensandbox-browser:dev",
-            "capabilities": ["python", "node", "shell"]
-          },
-          "browser": {
-            "description": "浏览器访问、截图和页面自动化",
-            "image": "aiop/opensandbox-browser:dev",
-            "desktop": true,
-            "capabilities": ["browser", "screenshot", "web", "python", "node", "shell"]
-          },
-          "netdiag": {
-            "description": "集群网络、fabric/ovs、tcpdump、kubectl 运维排查",
-            "image": "aiop/opensandbox-netdiag:dev",
-            "privileged": true,
-            "capabilities": ["kubectl", "tcpdump", "fabric-admin", "ovs", "conntrack", "dns"]
-          }
-        }
+        "desktop": false
       }
     }

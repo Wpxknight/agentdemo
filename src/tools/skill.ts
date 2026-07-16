@@ -5,9 +5,10 @@ import { logger } from '../logger.js';
 import type { JsonValue, ToolResult } from '../model/types.js';
 import type { ToolContext, ToolHandler } from '../agent/tools.js';
 import type { Skill, SkillRegistry } from '../skill/registry.js';
-import type { SandboxManager } from '../sandbox/lifecycle.js';
+import type { SandboxManagerLike } from '../sandbox/lifecycle.js';
+import { isSandboxAcquirer } from '../sandbox/acquisition.js';
 import type { ExecResult, SandboxHandle, SandboxSpec } from '../sandbox/types.js';
-import type { SpecResolver } from './builtin.js';
+import { resolveSandboxSpec, type SpecResolver } from './builtin.js';
 import type { UserCredentials } from '../auth/credentials.js';
 import type { AuditSink } from '../audit/sink.js';
 
@@ -89,7 +90,7 @@ export interface SkillToolDeps {
  */
 export function buildSkillTools(
   registry: SkillRegistry,
-  manager?: SandboxManager,
+  manager?: SandboxManagerLike,
   resolve?: SpecResolver,
   deps: SkillToolDeps = {},
 ): ToolHandler[] {
@@ -143,10 +144,8 @@ export function buildSkillTools(
   });
 
   if (manager) {
-    const resolveSpec = async (ctx: ToolContext): Promise<SandboxSpec> => ({
-      key: ctx.sessionId,
-      ...(resolve ? await resolve(ctx) : {}),
-    });
+    const resolveSpec = async (ctx: ToolContext): Promise<SandboxSpec> =>
+      resolveSandboxSpec(resolve ?? (() => ({})), ctx);
     tools.push({
       def: {
         name: 'skill__sync_to_sandbox',
@@ -201,7 +200,17 @@ export function buildSkillTools(
         const safe = safeName(name);
         const dest = `${SANDBOX_SKILLS_ROOT}/${safe}`;
         const tmp = `/tmp/aiop-skill-${safe}`;
-        const sbx = await manager.get(await resolveSpec(ctx));
+        const acquired = isSandboxAcquirer(manager)
+          ? await manager.acquire(ctx)
+          : await (async () => {
+              const spec = await resolveSpec(ctx);
+              return {
+                handle: await manager.get(spec),
+                spec,
+                markCredentialInjected: () => manager.markCredentialInjected(spec.key),
+              };
+            })();
+        const sbx = acquired.handle;
 
         // 预检 + 准备：全量同步先清空目标目录保证幂等；子集同步原地覆盖。
         const prep = await sbx.runCommand(
@@ -233,7 +242,12 @@ export function buildSkillTools(
         // 凭据注入（P3）：技能声明了 credentials 时，把当前用户的平台凭据写入沙箱内的凭据文件。
         // 凭据来自服务端缓存（按 toolCtx 的 tenant/user 查找），身份不可能被聊天内容改变。
         const credentialNote = await injectSkillCredentials({
-          skill, sbx, dest, ctx, manager, spec: await resolveSpec(ctx), deps,
+          skill,
+          sbx,
+          dest,
+          ctx,
+          markCredentialInjected: acquired.markCredentialInjected,
+          deps,
         });
 
         const skippedNote = skipped.length
@@ -262,11 +276,10 @@ async function injectSkillCredentials(opts: {
   sbx: SandboxHandle;
   dest: string;
   ctx: ToolContext;
-  manager: SandboxManager;
-  spec: SandboxSpec;
+  markCredentialInjected: () => void;
   deps: SkillToolDeps;
 }): Promise<string> {
-  const { skill, sbx, dest, ctx, manager, spec, deps } = opts;
+  const { skill, sbx, dest, ctx, markCredentialInjected, deps } = opts;
   if (!skill.credentials.length) return '';
   if (!deps.credentials || !ctx.tenantId || !ctx.userId) {
     return '\n注意：该技能需要平台凭据，但当前环境未启用凭据注入。';
@@ -293,7 +306,7 @@ async function injectSkillCredentials(opts: {
       continue;
     }
     // 沙箱污染标记：写入过用户凭据的沙箱严禁跨用户复用，销毁而非回收。
-    manager.markCredentialInjected(spec.key);
+    markCredentialInjected();
     await deps.audit?.record({
       kind: 'sandbox',
       action: 'credential-injected',

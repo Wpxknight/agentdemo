@@ -315,6 +315,32 @@ export interface SandboxesBody {
   profiles?: SandboxProfileSummary[];
 }
 
+export type SandboxSettingsMode = 'standard_e2b' | 'aios_lifecycle' | 'opensandbox' | 'local';
+
+export interface SandboxSettingsInfo {
+  enabled: boolean;
+  mode: SandboxSettingsMode;
+  domain?: string;
+  protocol?: 'http' | 'https';
+  default_image?: string;
+  lifecycle_url?: string;
+  placement?: {
+    cluster_id: string;
+    namespace: string;
+  };
+  api_key_set: boolean;
+}
+
+export interface SandboxSettingsBody {
+  scope: 'platform';
+  settings: SandboxSettingsInfo;
+  runtime?: {
+    enabled: boolean;
+    mode?: SandboxSettingsMode;
+    status?: string;
+  };
+}
+
 export interface ModelSettingsBody {
   config: RuntimeModelConfig;
   options?: RuntimeModelConfig[];

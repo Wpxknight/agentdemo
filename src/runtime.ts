@@ -1,5 +1,5 @@
 import { logger } from './logger.js';
-import type { Config } from './config/schema.js';
+import { SandboxConfigSchema, type Config, type SandboxConfig } from './config/schema.js';
 import { createModel, type ModelConfig as FactoryModelConfig } from './model/factory.js';
 import type { ChatModel } from './model/types.js';
 import { ToolRegistry } from './agent/tools.js';
@@ -8,7 +8,8 @@ import type { PolicyMiddleware } from './agent/policy.js';
 import { PermissionRules } from './agent/rules.js';
 import { HookRunner } from './agent/hooks.js';
 import { PlanApprovalState } from './agent/plan.js';
-import { SandboxManager } from './sandbox/lifecycle.js';
+import { SandboxManager, type SandboxManagerLike } from './sandbox/lifecycle.js';
+import { SandboxRuntimeController, type SandboxGenerationInput } from './sandbox/runtime-controller.js';
 import { E2bProvider } from './sandbox/e2b.js';
 import { OpenSandboxProvider } from './sandbox/opensandbox.js';
 import { LocalSandboxProvider } from './sandbox/local.js';
@@ -22,7 +23,7 @@ import type { DesktopHandle, DesktopProvider } from './sandbox/desktop.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildSandboxTools } from './tools/builtin.js';
-import type { SpecResolver } from './tools/builtin.js';
+import type { SpecResolver } from './sandbox/acquisition.js';
 import { buildExportTool } from './tools/export.js';
 import { DownloadStore } from './server/downloads.js';
 import { buildSkillTools } from './tools/skill.js';
@@ -38,6 +39,16 @@ import type { AuditSink } from './audit/sink.js';
 import { readMysqlConfig } from './config/mysql.js';
 import { createStore } from './db/index.js';
 import type { LlmSettings, SandboxSettings, Store } from './db/store.js';
+import {
+  SandboxSettingsPersistence,
+  credentialTargetForSandboxSettings,
+  parseSandboxSettings,
+  parseStoredSandboxSettings,
+  sandboxSettingsToConfig,
+  type LoadedSandboxSettings,
+  type SandboxApiKeyUpdate,
+} from './sandbox/settings.js';
+import { createSettingsSecretBox } from './security/secret-box.js';
 import { buildScheduleTools } from './tools/schedule.js';
 import { buildTodoTool } from './tools/todo.js';
 import { buildWebFetchTool } from './tools/webfetch.js';
@@ -59,10 +70,26 @@ import { UserCredentials } from './auth/credentials.js';
 import type { AuthProvider } from './auth/provider.js';
 import type { RequestContext } from './auth/types.js';
 
-/** 当前生效的沙箱服务端连接配置（设置页展示 / 保存）。 */
-export interface SandboxConnectionInfo extends SandboxSettings {
-  enabled: boolean;
-  provider: 'local' | 'e2b' | 'opensandbox';
+/** 当前生效的非敏感 Sandbox 设置（默认 Key 绝不进入该结构）。 */
+export type SandboxConnectionInfo = SandboxSettings;
+
+export interface SandboxSettingsState {
+  settings: SandboxSettings;
+  apiKeySet: boolean;
+  runtime?: {
+    enabled: boolean;
+    mode?: SandboxSettings['mode'];
+    status?: string;
+  };
+}
+
+interface PreparedSandboxGeneration {
+  input: SandboxGenerationInput;
+}
+
+export interface SandboxSettingsUpdate {
+  settings: SandboxSettings;
+  keyAction: SandboxApiKeyUpdate;
 }
 
 export interface Runtime {
@@ -70,18 +97,20 @@ export interface Runtime {
   modelConfig?: RuntimeModelConfig;
   modelOptions?: RuntimeModelConfig[];
   updateModel?(config: RuntimeModelConfig): void;
-  /** 当前生效的沙箱服务端连接配置。 */
+  /** 当前生效的非敏感 Sandbox 设置。 */
   sandboxSettings?: SandboxConnectionInfo;
+  /** 页面读取的平台级设置状态，不返回完整 Key 或密文。 */
+  getSandboxSettings?(): Promise<SandboxSettingsState>;
   /** 用户主目录挂载配置：root 为允许绑定的宿主机根前缀（安全边界），mountPath 为沙箱内挂载点。 */
   userHome?: { root?: string; mountPath: string };
-  /** 运行期应用新的沙箱连接配置（新建沙箱走新后端；已存在沙箱不受影响）。 */
-  updateSandbox?(settings: SandboxSettings): void;
+  /** 持久化并热应用 Sandbox 设置；新建沙箱进入新 generation，旧 handle 继续回收。 */
+  updateSandbox?(update: SandboxSettingsUpdate): Promise<SandboxSettingsState>;
   tools: ToolRegistry;
   skillRegistry?: SkillRegistry;
   /** MCP server 管理器（运行期增删/重连，工具同步进 tools）。 */
   mcp?: McpManager;
-  /** 会话沙箱管理器（按会话/集群复用、空闲 GC、会话关闭销毁）。 */
-  sandboxes?: SandboxManager;
+  /** 稳定的会话 Sandbox facade；禁用时保留 facade 以继续回收 draining generations。 */
+  sandboxes?: SandboxManagerLike;
   /** 文件下载中转（sbx__export_file 落盘 + /v1/files 能力 URL 下载）。 */
   downloads?: DownloadStore;
   /** 可供模型选择的沙箱模板/profile 列表。 */
@@ -139,8 +168,20 @@ export async function resolveRuntimeModelConfig(
   return persisted ? toRuntimeModelConfig(persisted) : fallback;
 }
 
+/** 数据库页面设置优先；config.sandbox 仅在数据库尚无记录时作为启动 bootstrap。 */
+export function resolveRuntimeSandboxConfig(
+  startup: SandboxConfig | undefined,
+  persisted?: SandboxSettings,
+  _env: NodeJS.ProcessEnv = process.env,
+): SandboxConfig | undefined {
+  return persisted ? sandboxSettingsToConfig(persisted) : startup;
+}
+
 /** 组装一次运行所需的全部组件（模型/工具/策略/持久化）。 */
-export async function buildRuntime(config: Config): Promise<Runtime> {
+export async function buildRuntime(
+  config: Config,
+  options: { store?: Store; settingsSecretBox?: ReturnType<typeof createSettingsSecretBox> } = {},
+): Promise<Runtime> {
   let modelConfig = defaultRuntimeModelConfig(config);
   const modelOptions: RuntimeModelConfig[] = Object.entries(config.models).map(([id, cfg]) => ({ id, ...cfg }));
   const tools = new ToolRegistry();
@@ -150,7 +191,7 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
   if (!jwtSecretEnv) logger.warn('AIOP_JWT_SECRET 未设置，使用开发占位密钥（勿用于生产）');
   const jwtSecret = jwtSecretEnv ?? 'dev-insecure-secret';
 
-  const store = await createStore(readMysqlConfig());
+  const store = options.store ?? await createStore(readMysqlConfig());
   const logSink = new LogAuditSink();
   const audit: AuditSink = {
     async record(e) {
@@ -172,132 +213,191 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     ? new OpsPolicy({ clusters, audit, preApproved: true, rules: permissionRules, planState })
     : new AllowAllPolicy();
 
-  let sandboxes: SandboxManager | undefined;
-  let sandboxProfiles: SandboxProfile[] = [];
-  let sessionSandboxResolver: SpecResolver | undefined;
-  let warmPoolRef: WarmPool | undefined;
-  let sandboxSweepTimer: ReturnType<typeof setInterval> | undefined;
+  const sandboxController = new SandboxRuntimeController();
+  const sandboxPersistence = new SandboxSettingsPersistence(store, options.settingsSecretBox ?? createSettingsSecretBox());
+  let sandboxState: LoadedSandboxSettings | undefined;
+  let sandboxCfg: SandboxConfig | undefined;
   let downloads: DownloadStore | undefined;
   let downloadSweepTimer: ReturnType<typeof setInterval> | undefined;
-  const desktops = new Map<string, Promise<DesktopHandle>>();
-  // 设置页保存的沙箱连接配置优先于 config.jsonc（仅覆盖连接字段；是否启用仍由文件配置决定）。
-  const persistedSandbox = await store.getSandboxSettings({ tenantId: DEFAULT_TENANT }).catch(() => undefined);
-  const sandboxCfg = config.sandbox ? { ...config.sandbox, ...persistedSandbox } : undefined;
-  const makeSandboxProvider = (cfg: SandboxSettings & { provider: 'local' | 'e2b' | 'opensandbox' }): SandboxProvider =>
+  let sandboxUpdateTail: Promise<void> = Promise.resolve();
+  let sandboxUpdatesClosed = false;
+
+  const serializeSandboxUpdate = async <T>(fn: () => Promise<T>): Promise<T> => {
+    const previous = sandboxUpdateTail;
+    let release!: () => void;
+    sandboxUpdateTail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  };
+
+  const makeSandboxProvider = (cfg: SandboxConfig): SandboxProvider =>
     cfg.provider === 'local'
       ? new LocalSandboxProvider()
       : cfg.provider === 'opensandbox'
-      ? new OpenSandboxProvider({
-          domain: cfg.domain,
-          protocol: cfg.protocol,
-          apiKey: cfg.apiKey,
-          defaultImage: cfg.defaultImage,
-        })
-      : new E2bProvider({ apiKey: cfg.apiKey, domain: cfg.domain });
-  if (sandboxCfg?.enabled) {
-    sandboxProfiles = resolveSandboxProfiles(sandboxCfg);
-    const provider = makeSandboxProvider(sandboxCfg);
-    logger.info({ provider: sandboxCfg.provider, profiles: sandboxProfiles.map((profile) => profile.name) }, 'sandbox provider selected');
+        ? new OpenSandboxProvider({
+            domain: cfg.domain,
+            protocol: cfg.protocol,
+            apiKey: cfg.apiKey,
+            defaultImage: cfg.defaultImage,
+          })
+        : new E2bProvider({
+            apiKey: cfg.apiKey,
+            domain: cfg.domain,
+            ...(cfg.aios ? { aios: { ...cfg.aios, apiKey: cfg.apiKey } } : {}),
+          });
 
-    // 预热池：仅在未配置集群时启用（集群需专用模板，避免发错沙箱）
+  const prepareGeneration = async (cfg: SandboxConfig): Promise<PreparedSandboxGeneration> => {
+    const profiles = resolveSandboxProfiles(cfg);
+    const provider = makeSandboxProvider(cfg);
     let warmPool: WarmPool | undefined;
-    if (sandboxCfg.warmPoolSize && !hasClusters) {
-      warmPool = new WarmPool({ provider, spec: {}, size: sandboxCfg.warmPoolSize });
-      await warmPool.start();
-      warmPoolRef = warmPool;
-      logger.info({ size: sandboxCfg.warmPoolSize }, 'sandbox warm pool ready');
-    } else if (sandboxCfg.warmPoolSize && hasClusters) {
+    if (cfg.warmPoolSize && !hasClusters) {
+      warmPool = new WarmPool({ provider, spec: {}, size: cfg.warmPoolSize });
+      void warmPool.start().catch((err) => {
+        logger.warn({ err: String(err) }, 'sandbox warm pool start failed');
+      });
+    } else if (cfg.warmPoolSize && hasClusters) {
       logger.warn('配置了集群，warmPoolSize 被忽略（集群需专用模板）');
     }
-
-    sandboxes = new SandboxManager({
-      provider,
-      idleMs: sandboxCfg.idleMs,
-      timeoutMs: sandboxCfg.timeoutMs,
-      warmPool,
-    });
-    // 空闲 GC：周期性 sweep() 回收空闲超 idleMs 的沙箱（最长每分钟检一次）。
-    const sweepMs = Math.max(30_000, Math.min(sandboxCfg.idleMs ?? 10 * 60_000, 60_000));
-    const sweeper = sandboxes;
-    sandboxSweepTimer = setInterval(() => {
-      void sweeper.sweep().catch((err) => logger.warn({ err: String(err) }, 'sandbox sweep failed'));
-    }, sweepMs);
-    sandboxSweepTimer.unref?.();
-    const defaultProfile = selectDefaultProfile(sandboxProfiles);
-    // skills.sandboxEnv：管理员配置的稳定环境信息（如 AIOS_BASE_URL），注入会话沙箱环境变量。
+    const defaultProfile = selectDefaultProfile(profiles);
     const skillSandboxEnv = config.skills?.sandboxEnv;
-    const userHomeMountPath = sandboxCfg.userHomeMountPath ?? '/home/user/host';
-    const userHomeRoot = sandboxCfg.userHomeRoot;
-    const defaultResolver: SpecResolver = async (ctx) => {
-      const base = defaultProfile ? sandboxSpecForProfile(defaultProfile, ctx) : { key: ctx.sessionId };
+    const userHomeMountPath = cfg.userHomeMountPath ?? '/home/user/host';
+    const userHomeRoot = cfg.userHomeRoot;
+    const resolver: SpecResolver = async (ctx, profileName) => {
+      const selectedProfile = profileName ? findSandboxProfile(profiles, profileName) : defaultProfile;
+      const base = selectedProfile ? sandboxSpecForProfile(selectedProfile, ctx) : { key: ctx.sessionId };
       const spec = skillSandboxEnv ? { ...base, envs: { ...skillSandboxEnv, ...base.envs } } : base;
-      // 用户绑定了主目录：默认以 hostPath 卷挂载进沙箱（仅创建时生效；同会话已存在的沙箱不受影响）。
-      if (!ctx.tenantId || !ctx.userId) return spec;
+      if (cfg.aios || !ctx.tenantId || !ctx.userId) return spec;
       const user = await store.getUser(ctx.tenantId, ctx.userId).catch(() => undefined);
       if (!user?.homeDir) return spec;
-      let homeDir: string;
       try {
-        // 绑定后管理员若收紧了 userHomeRoot，存量绑定重新校验不过则不挂载。
-        homeDir = normalizeUserHomeDir(user.homeDir, userHomeRoot);
+        const homeDir = normalizeUserHomeDir(user.homeDir, userHomeRoot);
+        return {
+          ...spec,
+          volumes: [{ name: 'user-home', hostPath: homeDir, mountPath: userHomeMountPath }],
+          envs: { ...spec.envs, AIOP_USER_HOME: userHomeMountPath },
+        };
       } catch (err) {
-        logger.warn({ userId: ctx.userId, homeDir: user.homeDir, err: String(err) }, 'user home dir rejected, skip mount');
+        logger.warn({ userId: ctx.userId, err: String(err) }, 'user home dir rejected, skip mount');
         return spec;
       }
-      return {
-        ...spec,
-        volumes: [{ name: 'user-home', hostPath: homeDir, mountPath: userHomeMountPath }],
-        envs: { ...spec.envs, AIOP_USER_HOME: userHomeMountPath },
-      };
     };
-    sessionSandboxResolver = defaultResolver;
-    for (const t of buildSandboxTools(sandboxes, defaultResolver)) tools.register(t);
-    for (const t of buildSandboxProfileTools(sandboxes, sandboxProfiles)) tools.register(t);
-    logger.info({ sweepMs }, 'sandbox tools enabled');
 
-    // 文件导出 / 下载：把沙箱内生成的文件落到中转目录并签发能力 URL 供用户下载。
-    if (config.downloads?.enabled ?? true) {
-      downloads = new DownloadStore({
-        dir: config.downloads?.dir ?? join(tmpdir(), 'aiop-downloads'),
-        secret: jwtSecret,
-        maxBytes: config.downloads?.maxBytes,
-        ttlMs: config.downloads?.ttlMs,
-      });
-      tools.register(buildExportTool(sandboxes, defaultResolver, downloads));
-      // 周期清理过期落盘文件（每小时一次）。
-      const dl = downloads;
-      downloadSweepTimer = setInterval(() => {
-        void dl.sweep().catch((err) => logger.warn({ err: String(err) }, 'download sweep failed'));
-      }, 60 * 60_000);
-      downloadSweepTimer.unref?.();
-      logger.info('file export/download enabled');
-    }
-    if (hasClusters) {
-      tools.register(buildKubectlTool({ clusters, sandboxes, audit }));
-      logger.info({ clusters: clusters.names() }, 'kubectl tool enabled');
-    }
-
-    // 桌面 / 浏览器工具：opensandbox 复用同一会话沙箱；local/e2b 保持各自后端。
-    if (sandboxCfg.desktop) {
-      const browserProfile = selectBrowserProfile(sandboxProfiles);
-      const dp: DesktopProvider = sandboxCfg.provider === 'local'
+    const manager = new SandboxManager({
+      provider,
+      idleMs: cfg.idleMs,
+      timeoutMs: cfg.timeoutMs,
+      warmPool,
+    });
+    let resolveDesktop: SandboxGenerationInput['resolveDesktop'];
+    if (cfg.desktop) {
+      const browserProfile = selectBrowserProfile(profiles);
+      const dp: DesktopProvider = cfg.provider === 'local'
         ? new LocalDesktopProvider()
-        : sandboxCfg.provider === 'opensandbox'
-          ? new OpenSandboxDesktopProvider(sandboxes)
-          : new E2bDesktopProvider({ apiKey: sandboxCfg.apiKey, domain: sandboxCfg.domain });
-      const resolve = (ctx: { sessionId: string }): Promise<DesktopHandle> => {
-        const profile = browserProfile ?? findSandboxProfile(sandboxProfiles);
+        : cfg.provider === 'opensandbox'
+          ? new OpenSandboxDesktopProvider(manager)
+          : new E2bDesktopProvider({ apiKey: cfg.apiKey, domain: cfg.domain });
+      resolveDesktop = async (ctx) => {
+        const profile = browserProfile ?? findSandboxProfile(profiles);
         const spec = sandboxSpecForProfile(profile, ctx);
-        let d = desktops.get(spec.key);
-        if (!d) {
-          d = dp.create(spec);
-          desktops.set(spec.key, d);
-        }
-        return d;
+        return { key: spec.key, create: () => dp.create(spec) };
       };
-      for (const t of buildBrowserTools(resolve)) tools.register(t);
-      logger.info('desktop/browser tools enabled');
     }
+    return {
+      input: {
+        manager,
+        profiles,
+        resolveSpec: resolver,
+        sweepMs: Math.max(30_000, Math.min(cfg.idleMs ?? 10 * 60_000, 60_000)),
+        ...(warmPool ? {
+          drainWarmPool: () => warmPool.drain(),
+          disposePrepared: () => warmPool.drain(),
+        } : {}),
+        ...(resolveDesktop ? { resolveDesktop } : {}),
+      },
+    };
+  };
+
+  const disposePreparedGeneration = async (
+    prepared: PreparedSandboxGeneration | undefined,
+    message: string,
+  ): Promise<void> => {
+    await Promise.resolve()
+      .then(() => prepared?.input.disposePrepared?.())
+      .catch((err) => logger.warn({ err: String(err) }, message));
+  };
+
+  let sandboxLoadError: Error | undefined;
+  try {
+    const persistedSandbox = await sandboxPersistence.load();
+    if (persistedSandbox) {
+      sandboxState = persistedSandbox;
+      sandboxCfg = sandboxSettingsToConfig(persistedSandbox.settings, persistedSandbox.apiKey);
+    } else if (config.sandbox) {
+      sandboxCfg = SandboxConfigSchema.parse(config.sandbox);
+      const bootstrap = parseStoredSandboxSettings(config.sandbox as unknown as Record<string, unknown>);
+      sandboxState = await sandboxPersistence.save(
+        bootstrap.settings,
+        config.sandbox.apiKey ? { action: 'replace', apiKey: config.sandbox.apiKey } : { action: 'retain' },
+      );
+    } else {
+      sandboxState = { settings: { enabled: false, mode: 'local' }, apiKeySet: false };
+    }
+  } catch (err) {
+    sandboxLoadError = err instanceof Error ? err : new Error(String(err));
+    logger.error({ err: sandboxLoadError.message }, 'persisted sandbox settings unavailable');
+    const persistedRecord = await store.getSandboxSettingsRecord({ tenantId: DEFAULT_TENANT }).catch(() => undefined);
+    if (persistedRecord) {
+      sandboxState = {
+        settings: persistedRecord.settings,
+        apiKeySet: Boolean(persistedRecord.encryptedApiKey || persistedRecord.legacyApiKey),
+      };
+    } else {
+      sandboxState = { settings: { enabled: false, mode: 'local' }, apiKeySet: false };
+    }
+    sandboxCfg = undefined;
   }
+  if (sandboxCfg?.enabled) {
+    const prepared = await prepareGeneration(sandboxCfg);
+    await sandboxController.commit(prepared.input);
+  }
+
+  let skillSyncTool: ReturnType<typeof buildSkillTools>[number] | undefined;
+  const SANDBOX_TOOL_NAMES = [
+    'sbx__run_code', 'sbx__run_command', 'sandbox_list_profiles', 'sandbox_ensure',
+    'sandbox_run_code', 'sandbox_run_command', 'sbx__export_file', 'kubectl',
+    'desktop_stream_url', 'browser_navigate', 'browser_click', 'browser_type',
+    'browser_current_url', 'browser_screenshot', 'skill__sync_to_sandbox',
+  ] as const;
+  const syncSandboxTools = () => {
+    for (const name of SANDBOX_TOOL_NAMES) tools.unregister(name);
+    if (!sandboxController.enabled()) return;
+    for (const tool of buildSandboxTools(sandboxController)) tools.register(tool);
+    for (const tool of buildSandboxProfileTools(sandboxController, () => sandboxController.profileDefinitions())) tools.register(tool);
+    if (downloads) tools.register(buildExportTool(sandboxController, async () => ({}), downloads));
+    if (hasClusters && !sandboxCfg?.aios) tools.register(buildKubectlTool({ clusters, sandboxes: sandboxController, audit }));
+    if (sandboxCfg?.desktop) {
+      for (const tool of buildBrowserTools((ctx) => sandboxController.desktop(ctx))) tools.register(tool);
+    }
+    if (skillSyncTool) tools.register(skillSyncTool);
+  };
+
+  if (config.downloads?.enabled ?? true) {
+    downloads = new DownloadStore({
+      dir: config.downloads?.dir ?? join(tmpdir(), 'aiop-downloads'),
+      secret: jwtSecret,
+      maxBytes: config.downloads?.maxBytes,
+      ttlMs: config.downloads?.ttlMs,
+    });
+    downloadSweepTimer = setInterval(() => {
+      void downloads?.sweep().catch((err) => logger.warn({ err: String(err) }, 'download sweep failed'));
+    }, 60 * 60_000);
+    downloadSweepTimer.unref?.();
+  }
+  syncSandboxTools();
 
   // MCP：持久化配置（UI 增删的结果）优先于 config.jsonc；常驻 manager 以支持运行期管理。
   const persistedMcp = await store.getMcpServers({ tenantId: DEFAULT_TENANT }).catch(() => undefined);
@@ -305,19 +405,10 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
   await mcp.start();
   for (const t of mcp.tools()) tools.register(t);
 
-  // 定时任务工具（持久化已就绪）
   for (const t of buildScheduleTools(store)) tools.register(t);
-
-  // TodoWrite：长任务进度清单（前端实时渲染）
   tools.register(buildTodoTool());
-
-  // ask_user：运行中向用户提结构化选择题（需交互端；无交互端时工具自返回提示）
   tools.register(buildAskUserTool());
-
-  // submit_change_plan：生产变更前提交结构化方案审批（需交互端）
   tools.register(buildChangePlanTool());
-
-  // WebFetch：抓取网页内容（域名白名单 + SSRF 防护）；默认启用
   if (config.webFetch?.enabled ?? true) {
     tools.register(buildWebFetchTool({
       allowedDomains: config.webFetch?.allowedDomains,
@@ -326,15 +417,16 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     }));
   }
 
-  // 用户下游凭据缓存（AES-GCM 加密后交给 Store；exchange 写入、技能同步按用户注入）
   const credentials = new UserCredentials(store, jwtSecret);
-
   let systemExtra = '';
   let skillRegistry: SkillRegistry | undefined;
   if (config.skills?.dir) {
     const skills = new SkillRegistry(config.skills.dir, { summaryBudget: config.skills.summaryBudget });
     await skills.scan();
-    for (const t of buildSkillTools(skills, sandboxes, sessionSandboxResolver, { credentials, audit })) tools.register(t);
+    const skillTools = buildSkillTools(skills, sandboxController, undefined, { credentials, audit });
+    for (const tool of skillTools) tools.register(tool);
+    skillSyncTool = skillTools.find((tool) => tool.def.name === 'skill__sync_to_sandbox');
+    if (!sandboxController.enabled()) tools.unregister('skill__sync_to_sandbox');
     skillRegistry = skills;
     systemExtra = skills.summaries();
   }
@@ -380,6 +472,20 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
   modelConfig = await resolveRuntimeModelConfig(config, store, DEFAULT_TENANT);
   const model = createModel(modelConfig.id, modelConfig);
 
+  const publicSandboxState = (): SandboxSettingsState => ({
+    settings: sandboxState?.settings ?? { enabled: false, mode: 'local' },
+    apiKeySet: sandboxState?.apiKeySet ?? false,
+    runtime: {
+      enabled: sandboxController.enabled(),
+      mode: sandboxState?.settings.mode,
+      status: sandboxLoadError
+        ? 'credentials_reconfiguration_required'
+        : sandboxController.enabled()
+          ? 'active'
+          : 'disabled',
+    },
+  });
+
   const runtime: Runtime = {
     model,
     modelConfig,
@@ -391,22 +497,16 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     tools,
     skillRegistry,
     mcp,
-    sandboxes,
-    sandboxSettings: sandboxCfg
-      ? {
-          enabled: sandboxCfg.enabled,
-          provider: sandboxCfg.provider,
-          domain: sandboxCfg.domain,
-          protocol: sandboxCfg.protocol,
-          apiKey: sandboxCfg.apiKey,
-          defaultImage: sandboxCfg.defaultImage,
-        }
-      : { enabled: false, provider: 'e2b' },
-    userHome: sandboxCfg
+    sandboxes: sandboxController,
+    sandboxSettings: sandboxState.settings,
+    async getSandboxSettings() {
+      return publicSandboxState();
+    },
+    userHome: sandboxCfg && !sandboxCfg.aios
       ? { root: sandboxCfg.userHomeRoot, mountPath: sandboxCfg.userHomeMountPath ?? '/home/user/host' }
       : undefined,
     downloads,
-    sandboxProfiles: publicSandboxProfiles(sandboxProfiles),
+    sandboxProfiles: sandboxController.profiles(),
     clusters,
     audit,
     store,
@@ -422,30 +522,67 @@ export async function buildRuntime(config: Config): Promise<Runtime> {
     frameAncestors: config.auth?.aios?.allowedParentOrigins,
     jwtSecret,
     defaultContext,
+    async updateSandbox(update: SandboxSettingsUpdate) {
+      if (sandboxUpdatesClosed) throw new Error('runtime is disposed');
+      return serializeSandboxUpdate(async () => {
+        if (sandboxUpdatesClosed) throw new Error('runtime is disposed');
+        const settings = parseSandboxSettings(update.settings);
+        let effectiveApiKey: string | undefined;
+        if (update.keyAction.action === 'replace') {
+          effectiveApiKey = update.keyAction.apiKey.trim();
+        } else if (update.keyAction.action === 'retain') {
+          if (sandboxLoadError && sandboxState?.apiKeySet) {
+            throw new Error('设置凭据无法解密，请重新配置 API key');
+          }
+          if (sandboxState?.apiKey) {
+            if (credentialTargetForSandboxSettings(sandboxState.settings) !== credentialTargetForSandboxSettings(settings)) {
+              throw new Error('Sandbox 凭据目标已变化，请重新输入或清除 API key');
+            }
+            effectiveApiKey = sandboxState.apiKey;
+          }
+        }
+        const nextCfg = sandboxSettingsToConfig(settings, effectiveApiKey);
+        const prepared = nextCfg.enabled ? await prepareGeneration(nextCfg) : undefined;
+        let saved: LoadedSandboxSettings;
+        try {
+          saved = await sandboxPersistence.save(settings, update.keyAction);
+        } catch (err) {
+          await disposePreparedGeneration(
+            prepared,
+            'prepared sandbox generation cleanup failed',
+          );
+          throw err;
+        }
+        try {
+          await sandboxController.commit(prepared?.input);
+        } catch (err) {
+          await disposePreparedGeneration(
+            prepared,
+            'prepared sandbox generation cleanup failed after commit error',
+          );
+          throw err;
+        }
+        sandboxState = saved;
+        sandboxCfg = nextCfg;
+        sandboxLoadError = undefined;
+        runtime.sandboxSettings = saved.settings;
+        runtime.sandboxProfiles = sandboxController.profiles();
+        runtime.userHome = nextCfg.enabled && !nextCfg.aios
+          ? { root: nextCfg.userHomeRoot, mountPath: nextCfg.userHomeMountPath ?? '/home/user/host' }
+          : undefined;
+        syncSandboxTools();
+        return publicSandboxState();
+      });
+    },
     async dispose() {
-      if (sandboxSweepTimer) clearInterval(sandboxSweepTimer);
+      sandboxUpdatesClosed = true;
       if (downloadSweepTimer) clearInterval(downloadSweepTimer);
-      await Promise.all(
-        [...desktops.values()].map((d) => d.then((h) => h.kill()).catch(() => {})),
-      );
-      desktops.clear();
-      await sandboxes?.disposeAll();
-      await warmPoolRef?.drain();
+      await sandboxUpdateTail;
+      await sandboxController.disposeAll();
       await mcp?.close();
-      await store.close();
+      if (!options.store) await store.close();
     },
   };
-  if (sandboxes) {
-    const manager = sandboxes;
-    runtime.updateSandbox = (next: SandboxSettings) => {
-      const merged: SandboxConnectionInfo = {
-        ...(runtime.sandboxSettings ?? { enabled: true, provider: 'e2b' }),
-        ...next,
-      };
-      manager.setProvider(makeSandboxProvider(merged));
-      runtime.sandboxSettings = merged;
-      logger.info({ provider: merged.provider, domain: merged.domain }, 'sandbox provider updated');
-    };
-  }
+
   return runtime;
 }

@@ -1,13 +1,17 @@
 import type { JsonValue, ToolResult } from '../model/types.js';
 import type { ToolContext, ToolHandler } from '../agent/tools.js';
-import type { SandboxManager } from '../sandbox/lifecycle.js';
+import type { SandboxManagerLike } from '../sandbox/lifecycle.js';
+import { isSandboxAcquirer, type SpecResolver } from '../sandbox/acquisition.js';
+import { sandboxIdentityKey, sandboxIdentityMetadata } from '../sandbox/keys.js';
 import type { ExecResult, SandboxSpec } from '../sandbox/types.js';
 
-/** 由 ctx 推导出本次该用哪个沙箱（缓存键 / 是否连接远端）；可异步（如按用户查主目录挂载）。 */
-export type SpecResolver = (ctx: ToolContext) => Partial<SandboxSpec> | Promise<Partial<SandboxSpec>>;
+export type { SpecResolver } from '../sandbox/acquisition.js';
 
-/** 默认：每个会话一个沙箱（S4 起按 session×cluster）。 */
-const defaultResolver: SpecResolver = (ctx) => ({ key: ctx.sessionId });
+/** 默认：每个租户用户会话一个沙箱。 */
+const defaultResolver: SpecResolver = (ctx) => ({
+  key: sandboxIdentityKey(ctx),
+  metadata: sandboxIdentityMetadata(ctx),
+});
 
 function asObject(args: JsonValue): Record<string, JsonValue> {
   return args && typeof args === 'object' && !Array.isArray(args) ? args : {};
@@ -35,16 +39,25 @@ function formatExec(r: ExecResult): ToolResult {
   };
 }
 
-async function resolveSpec(resolve: SpecResolver, ctx: ToolContext): Promise<SandboxSpec> {
+export async function resolveSandboxSpec(resolve: SpecResolver, ctx: ToolContext): Promise<SandboxSpec> {
   const partial = await resolve(ctx);
-  return { key: ctx.sessionId, ...partial };
+  return {
+    key: sandboxIdentityKey(ctx),
+    ...partial,
+    metadata: { ...sandboxIdentityMetadata(ctx), ...partial.metadata },
+  };
 }
 
 /** 构造 E2B 沙箱内置工具：sbx__run_code / sbx__run_command。 */
 export function buildSandboxTools(
-  manager: SandboxManager,
+  manager: SandboxManagerLike,
   resolve: SpecResolver = defaultResolver,
 ): ToolHandler[] {
+  const acquire = async (ctx: ToolContext) => {
+    if (isSandboxAcquirer(manager)) return manager.acquire(ctx);
+    const spec = await resolveSandboxSpec(resolve, ctx);
+    return { handle: await manager.get(spec), spec };
+  };
   return [
     {
       def: {
@@ -67,7 +80,7 @@ export function buildSandboxTools(
         const o = asObject(args);
         const code = reqString(o, 'code');
         const language = typeof o.language === 'string' ? o.language : undefined;
-        const sbx = await manager.get(await resolveSpec(resolve, ctx));
+        const sbx = (await acquire(ctx)).handle;
         return formatExec(await sbx.runCode(code, { language, onOutput: ctx.onOutput }));
       },
     },
@@ -86,7 +99,7 @@ export function buildSandboxTools(
       async run(args, ctx): Promise<ToolResult> {
         const o = asObject(args);
         const command = reqString(o, 'command');
-        const sbx = await manager.get(await resolveSpec(resolve, ctx));
+        const sbx = (await acquire(ctx)).handle;
         return formatExec(await sbx.runCommand(command, { onOutput: ctx.onOutput }));
       },
     },

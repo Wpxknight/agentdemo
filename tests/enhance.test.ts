@@ -131,6 +131,108 @@ describe('WarmPool', () => {
     expect(pool.available()).toBe(2);
   });
 
+  it('drain waits for an in-flight refill and kills the late handle', async () => {
+    let resolveCreate!: (handle: SandboxHandle) => void;
+    const late = new Promise<SandboxHandle>((resolve) => { resolveCreate = resolve; });
+    const kill = vi.fn(async () => {});
+    const p: SandboxProvider = {
+      create: vi.fn(async () => late),
+      connect: vi.fn(async () => late),
+    };
+    const pool = new WarmPool({ provider: p, spec: { template: 'k8s' }, size: 1 });
+    const starting = pool.start();
+    await vi.waitFor(() => expect(p.create).toHaveBeenCalledOnce());
+
+    const draining = pool.drain();
+    resolveCreate({
+      sandboxId: 'late',
+      runCode: async (): Promise<ExecResult> => ({ stdout: '', stderr: '' }),
+      runCommand: async (): Promise<ExecResult> => ({ stdout: '', stderr: '' }),
+      readFile: async (): Promise<Uint8Array> => new Uint8Array(),
+      setTimeout: async () => {},
+      kill,
+    });
+    await Promise.all([starting, draining]);
+
+    expect(kill).toHaveBeenCalledOnce();
+    expect(pool.available()).toBe(0);
+    await expect(pool.acquire()).rejects.toThrow(/drained/);
+  });
+
+  it('cancels the default drain timeout when refill settles first', async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveCreate!: (handle: SandboxHandle) => void;
+      const late = new Promise<SandboxHandle>((resolve) => { resolveCreate = resolve; });
+      const kill = vi.fn(async () => {});
+      const p: SandboxProvider = {
+        create: vi.fn(async () => late),
+        connect: vi.fn(async () => late),
+      };
+      const pool = new WarmPool({ provider: p, spec: { template: 'k8s' }, size: 1 });
+      const starting = pool.start();
+      expect(p.create).toHaveBeenCalledOnce();
+
+      const draining = pool.drain();
+      await Promise.resolve();
+      expect(vi.getTimerCount()).toBe(1);
+
+      resolveCreate({
+        sandboxId: 'refill-before-timeout',
+        runCode: async (): Promise<ExecResult> => ({ stdout: '', stderr: '' }),
+        runCommand: async (): Promise<ExecResult> => ({ stdout: '', stderr: '' }),
+        readFile: async (): Promise<Uint8Array> => new Uint8Array(),
+        setTimeout: async () => {},
+        kill,
+      });
+      await Promise.all([starting, draining]);
+
+      expect(kill).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('drain returns after a bounded wait and kills a refill that completes later', async () => {
+    let resolveCreate!: (handle: SandboxHandle) => void;
+    const late = new Promise<SandboxHandle>((resolve) => { resolveCreate = resolve; });
+    let releaseTimeout!: () => void;
+    const timeout = new Promise<void>((resolve) => { releaseTimeout = resolve; });
+    const kill = vi.fn(async () => {});
+    const p: SandboxProvider = {
+      create: vi.fn(async () => late),
+      connect: vi.fn(async () => late),
+    };
+    const pool = new WarmPool({
+      provider: p,
+      spec: { template: 'k8s' },
+      size: 1,
+      drainTimeoutMs: 10,
+      sleep: async () => timeout,
+    });
+    const starting = pool.start();
+    await vi.waitFor(() => expect(p.create).toHaveBeenCalledOnce());
+
+    const draining = pool.drain();
+    releaseTimeout();
+    await draining;
+    await expect(pool.acquire()).rejects.toThrow(/drained/);
+
+    resolveCreate({
+      sandboxId: 'late-after-timeout',
+      runCode: async (): Promise<ExecResult> => ({ stdout: '', stderr: '' }),
+      runCommand: async (): Promise<ExecResult> => ({ stdout: '', stderr: '' }),
+      readFile: async (): Promise<Uint8Array> => new Uint8Array(),
+      setTimeout: async () => {},
+      kill,
+    });
+    await starting;
+
+    expect(kill).toHaveBeenCalledOnce();
+    expect(pool.available()).toBe(0);
+  });
+
   it('SandboxManager draws new sandboxes from the pool', async () => {
     const { p, create } = provider();
     const pool = new WarmPool({ provider: p, spec: { template: 'k8s' }, size: 1 });

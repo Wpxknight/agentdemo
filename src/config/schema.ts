@@ -51,12 +51,27 @@ export const SandboxProfileSchema = z.object({
   timeoutMs: z.number().int().positive().optional(),
 });
 
-export const SandboxConfigSchema = z.object({
+const AiosSandboxConfigSchema = z.object({
+  /** AIOS Lifecycle API 完整 URL；显式配置即启用 AIOS E2B 兼容模式。 */
+  lifecycleUrl: z.string().url().refine((url) => /^https?:\/\//.test(url), {
+    message: 'lifecycleUrl 必须是完整 HTTP(S) URL',
+  }),
+  /** AIOS 调度目标；固定于启动配置，不接受每个 SandboxSpec 覆盖。 */
+  placement: z.object({
+    clusterId: z.string().trim().min(1),
+    namespace: z.string().trim().min(1),
+  }),
+});
+
+export const SandboxConfigSchema = z
+  .object({
   enabled: z.boolean().default(false),
   /** 沙箱后端：local（本地开发）、e2b 或 opensandbox（阿里开源，k8s 运行时）。 */
   provider: z.enum(['local', 'e2b', 'opensandbox']).default('e2b'),
   /** API key；E2B 为 ${E2B_API_KEY}，OpenSandbox 为 Lifecycle API key（可空）。 */
   apiKey: z.string().optional(),
+  /** AIOS Lifecycle 模式配置；仅支持 E2B provider，凭据优先 sandbox.apiKey 后 AIOS_SANDBOX_KEY。 */
+  aios: AiosSandboxConfigSchema.optional(),
   /** 网关域名：E2B 自托管网关 / OpenSandbox Lifecycle API（host[:port]，无 scheme）。 */
   domain: z.string().optional(),
   /** OpenSandbox：http / https。 */
@@ -77,7 +92,62 @@ export const SandboxConfigSchema = z.object({
   userHomeRoot: z.string().optional(),
   /** 用户主目录在沙箱内的挂载点，默认 /home/user/host。 */
   userHomeMountPath: z.string().default('/home/user/host'),
-});
+})
+  .superRefine((value, ctx) => {
+    if (!value.aios) return;
+    if (value.provider !== 'e2b') {
+      ctx.addIssue({ code: 'custom', path: ['provider'], message: 'sandbox.aios 仅支持 provider=e2b' });
+    }
+    if (value.desktop) {
+      ctx.addIssue({ code: 'custom', path: ['desktop'], message: 'sandbox.aios 模式要求 desktop=false' });
+    }
+    if (value.warmPoolSize) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['warmPoolSize'],
+        message: 'sandbox.aios 第一阶段不支持 warmPoolSize',
+      });
+    }
+    if (value.userHomeRoot || value.userHomeMountPath !== '/home/user/host') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['userHomeRoot'],
+        message: 'sandbox.aios 第一阶段不支持用户主目录挂载',
+      });
+    }
+    const profiles = Object.entries(value.profiles ?? {});
+    if (profiles.length !== 1 || profiles[0]?.[0] !== 'code') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['profiles'],
+        message: 'sandbox.aios 第一阶段仅允许一个 code profile',
+      });
+    }
+    for (const [name, profile] of profiles) {
+      if (profile.desktop) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['profiles', name, 'desktop'],
+          message: 'sandbox.aios 模式不得配置 desktop profile',
+        });
+      }
+      if (profile.privileged) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['profiles', name, 'privileged'],
+          message: 'sandbox.aios 第一阶段不得配置 privileged profile',
+        });
+      }
+      const template = profile.image ?? profile.template;
+      if (template !== 'code-interpreter' || (profile.image && profile.template && profile.image !== profile.template)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['profiles', name, 'image'],
+          message: 'sandbox.aios 第一阶段仅允许 code-interpreter 模板',
+        });
+      }
+    }
+  });
 
 export const ClusterSchema = z.object({
   /** 该集群对应的 E2B 控制面端点（集群内动态拉起沙箱）。 */

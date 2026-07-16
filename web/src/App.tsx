@@ -64,6 +64,9 @@ import type {
   SandboxSummary,
   SandboxProfileSummary,
   SandboxesBody,
+  SandboxSettingsBody,
+  SandboxSettingsInfo,
+  SandboxSettingsMode,
   ScheduleBody,
   ScheduleRunsBody,
   ScheduledTask,
@@ -1874,7 +1877,7 @@ export default function App() {
             {activePage === 'schedule' && <SchedulePage tasks={tasks} api={api} onChanged={() => void loadPageData('schedule')} onRequestConfirm={requestConfirmDialog} />}
             {activePage === 'sandbox' && <SandboxPage sandboxes={sandboxes} profiles={sandboxProfiles} />}
             {activePage === 'users' && <UsersPage api={api} me={me} onRequestConfirm={requestConfirmDialog} />}
-            {activePage === 'settings' && <SettingsPage llm={llm} status={settingsStatus} api={api} me={me} onLlmChange={setLlm} onStatus={setSettingsStatus} />}
+            {activePage === 'settings' && <SettingsPage llm={llm} status={settingsStatus} api={api} me={me} onLlmChange={setLlm} onStatus={setSettingsStatus} onRequestConfirm={requestConfirmDialog} />}
           </section>
           </main>
         </div>
@@ -4433,16 +4436,18 @@ function SandboxPage({ sandboxes, profiles }: { sandboxes: SandboxSummary[]; pro
   );
 }
 
-function SettingsPage({ llm, status, api, me, onLlmChange, onStatus }: {
+function SettingsPage({ llm, status, api, me, onLlmChange, onStatus, onRequestConfirm }: {
   llm: RuntimeModelConfig;
   status: string;
   api: ReturnType<typeof createApi>;
   me: MeBody | null;
   onLlmChange: (next: RuntimeModelConfig) => void;
   onStatus: (next: string) => void;
+  onRequestConfirm: (request: ConfirmDialogRequest) => void;
 }) {
-  // 隐藏只是 UX，权限边界在后端 RBAC：普通用户只保留我的主目录。
+  // 隐藏只是 UX，权限边界在后端 RBAC：普通用户只保留我的主目录；全局沙箱仅平台管理员可见。
   const isAdmin = me?.role === 'platform_admin' || me?.role === 'tenant_admin';
+  const isPlatformAdmin = me?.role === 'platform_admin';
   const [form, setForm] = useState(() => ({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) }));
 
   useEffect(() => {
@@ -4484,7 +4489,7 @@ function SettingsPage({ llm, status, api, me, onLlmChange, onStatus }: {
       <Tabs defaultValue={isAdmin ? 'llm' : 'homedir'} className="sandbox-page-tabs settings-tabs">
         <TabsList>
           {isAdmin ? <TabsTrigger value="llm">模型</TabsTrigger> : null}
-          {isAdmin ? <TabsTrigger value="sandbox">沙箱</TabsTrigger> : null}
+          {isPlatformAdmin ? <TabsTrigger value="sandbox">沙箱</TabsTrigger> : null}
           {isAdmin ? <TabsTrigger value="scheduler">定时任务</TabsTrigger> : null}
           <TabsTrigger value="homedir">我的主目录</TabsTrigger>
         </TabsList>
@@ -4512,9 +4517,9 @@ function SettingsPage({ llm, status, api, me, onLlmChange, onStatus }: {
             </Card>
           </div>
         </TabsContent> : null}
-        {isAdmin ? <TabsContent value="sandbox">
+        {isPlatformAdmin ? <TabsContent value="sandbox">
           <div className="settings-layout">
-            <SandboxSettingsCard api={api} status={status} onStatus={onStatus} />
+            <SandboxSettingsCard api={api} status={status} onStatus={onStatus} onRequestConfirm={onRequestConfirm} />
           </div>
         </TabsContent> : null}
         {isAdmin ? <TabsContent value="scheduler">
@@ -4593,37 +4598,82 @@ function UserHomeDirCard({ api }: { api: ReturnType<typeof createApi> }) {
   );
 }
 
-interface SandboxSettingsInfo {
+type SandboxSettingsForm = {
   enabled: boolean;
-  provider: 'local' | 'e2b' | 'opensandbox';
+  mode: SandboxSettingsMode;
   domain: string;
   protocol: 'http' | 'https';
-  default_image: string;
-  api_key_set: boolean;
-  api_key_preview: string;
+  defaultImage: string;
+  lifecycleUrl: string;
+  clusterId: string;
+  namespace: string;
+  apiKey: string;
+};
+
+function sandboxSettingsForm(settings?: SandboxSettingsInfo): SandboxSettingsForm {
+  return {
+    enabled: settings?.enabled ?? false,
+    mode: settings?.mode ?? 'aios_lifecycle',
+    domain: settings?.domain ?? '',
+    protocol: settings?.protocol ?? 'http',
+    defaultImage: settings?.default_image ?? '',
+    lifecycleUrl: settings?.lifecycle_url ?? '',
+    clusterId: settings?.placement?.cluster_id ?? '',
+    namespace: settings?.placement?.namespace ?? '',
+    apiKey: '',
+  };
 }
 
-function SandboxSettingsCard({ api, status, onStatus }: {
+function sandboxCredentialTarget(value: SandboxSettingsForm | SandboxSettingsInfo): string {
+  if (value.mode === 'standard_e2b') return `standard_e2b:${(value.domain ?? '').trim().toLowerCase()}`;
+  if (value.mode === 'aios_lifecycle') {
+    const url = 'lifecycleUrl' in value ? value.lifecycleUrl : value.lifecycle_url;
+    return `aios_lifecycle:${(url ?? '').trim().replace(/\/+$/, '').toLowerCase()}`;
+  }
+  if (value.mode === 'opensandbox') {
+    return `opensandbox:${value.protocol ?? 'http'}://${(value.domain ?? '').trim().toLowerCase()}`;
+  }
+  return 'local';
+}
+
+function sandboxSettingsPayload(form: SandboxSettingsForm): Record<string, unknown> {
+  const payload: Record<string, unknown> = { enabled: form.enabled, mode: form.mode };
+  if (form.mode === 'standard_e2b') {
+    payload.domain = form.domain.trim();
+  } else if (form.mode === 'aios_lifecycle') {
+    payload.lifecycle_url = form.lifecycleUrl.trim();
+    payload.placement = { cluster_id: form.clusterId.trim(), namespace: form.namespace.trim() };
+  } else if (form.mode === 'opensandbox') {
+    payload.domain = form.domain.trim();
+    payload.protocol = form.protocol;
+    payload.default_image = form.defaultImage.trim();
+  }
+  if (form.apiKey.trim()) payload.api_key = form.apiKey.trim();
+  return payload;
+}
+
+function sandboxClearPayload(form: SandboxSettingsForm): Record<string, unknown> {
+  const { api_key: _apiKey, ...payload } = sandboxSettingsPayload(form);
+  return { ...payload, clear_api_key: true };
+}
+
+function SandboxSettingsCard({ api, status, onStatus, onRequestConfirm }: {
   api: ReturnType<typeof createApi>;
   status: string;
   onStatus: (next: string) => void;
+  onRequestConfirm: (request: ConfirmDialogRequest) => void;
 }) {
   const [info, setInfo] = useState<SandboxSettingsInfo | null>(null);
-  const [form, setForm] = useState({ provider: 'opensandbox' as SandboxSettingsInfo['provider'], domain: '', protocol: 'http' as 'http' | 'https', apiKey: '', defaultImage: '' });
+  const [form, setForm] = useState<SandboxSettingsForm>(() => sandboxSettingsForm());
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
-    api.get<{ settings: SandboxSettingsInfo }>('/v1/settings/sandbox')
+    api.get<SandboxSettingsBody>('/v1/settings/sandbox')
       .then((body) => {
         if (cancelled) return;
         setInfo(body.settings);
-        setForm({
-          provider: body.settings.provider,
-          domain: body.settings.domain || '',
-          protocol: body.settings.protocol || 'http',
-          apiKey: '',
-          defaultImage: body.settings.default_image || '',
-        });
+        setForm(sandboxSettingsForm(body.settings));
       })
       .catch((err) => {
         if (!cancelled) onStatus(`加载沙箱配置失败：${formatError(err)}`);
@@ -4631,65 +4681,113 @@ function SandboxSettingsCard({ api, status, onStatus }: {
     return () => { cancelled = true; };
   }, [api, onStatus]);
 
-  async function save() {
-    onStatus('正在保存沙箱配置...');
+  async function apply(payload: Record<string, unknown>, success: string) {
+    setBusy(true);
+    onStatus('正在应用沙箱配置...');
     try {
-      const payload: Record<string, unknown> = {
-        provider: form.provider,
-        domain: form.domain.trim(),
-        protocol: form.protocol,
-        default_image: form.defaultImage.trim(),
-      };
-      // API Key 留空表示保持现有配置不变
-      if (form.apiKey.trim()) payload.api_key = form.apiKey.trim();
-      const body = await api.post<{ settings: SandboxSettingsInfo }>('/v1/settings/sandbox', payload);
+      const body = await api.post<SandboxSettingsBody>('/v1/settings/sandbox', payload);
       setInfo(body.settings);
-      setForm((current) => ({ ...current, apiKey: '' }));
-      onStatus('沙箱配置已保存，新建的沙箱将连接新的服务端。');
+      setForm(sandboxSettingsForm(body.settings));
+      onStatus(success);
     } catch (err) {
       onStatus(`保存失败：${formatError(err)}`);
+    } finally {
+      setBusy(false);
     }
+  }
+
+  async function save() {
+    if (
+      info?.api_key_set
+      && !form.apiKey.trim()
+      && sandboxCredentialTarget(form) !== sandboxCredentialTarget(info)
+    ) {
+      onStatus('保存失败：凭据目标已变更，请重新输入 API Key 或先明确清除旧 Key。');
+      return;
+    }
+    await apply(sandboxSettingsPayload(form), '沙箱配置已保存，新建的沙箱将使用新的运行时配置。');
+  }
+
+  function requestClearApiKey() {
+    if (!info?.api_key_set || busy) return;
+    onRequestConfirm({
+      title: '清除沙箱 API Key？',
+      description: '清除后，依赖凭据的沙箱模式可能无法启用或创建新沙箱。',
+      alert: '这是显式凭据删除操作；如需更换 Key，请直接在密码框输入新值并保存。',
+      confirmLabel: '确认清除',
+      busyLabel: '清除中',
+      tone: 'danger',
+      onConfirm: () => apply(
+        sandboxClearPayload(form),
+        '沙箱 API Key 已清除。',
+      ),
+    });
   }
 
   return (
     <Card>
       <CardHeader>
-        <CardTitle>沙箱服务端</CardTitle>
-        <CardDescription>
-          会话沙箱后端的连接配置，保存后对新建的沙箱生效。
-          {info && !info.enabled ? '（沙箱功能当前未启用，需在服务端配置 sandbox.enabled 开启）' : ''}
-        </CardDescription>
+        <CardTitle>沙箱运行时</CardTitle>
+        <CardDescription>平台全局配置；保存会异步应用到新建沙箱，已有沙箱继续由原运行时回收。</CardDescription>
       </CardHeader>
       <CardContent className="settings-form">
-        <Label>Provider
-          <Select value={form.provider} onValueChange={(value) => setForm((current) => ({ ...current, provider: value as SandboxSettingsInfo['provider'] }))}>
+        <Label className="settings-checkbox-row">
+          <input type="checkbox" checked={form.enabled} disabled={busy} onChange={(event) => setForm((current) => ({ ...current, enabled: event.target.checked }))} />
+          启用沙箱能力
+        </Label>
+        <Label>模式
+          <Select disabled={busy} value={form.mode} onValueChange={(value) => setForm((current) => ({ ...current, mode: value as SandboxSettingsMode }))}>
             <SelectTrigger><SelectValue /></SelectTrigger>
             <SelectContent>
               <SelectGroup>
+                <SelectItem value="standard_e2b">标准 E2B</SelectItem>
+                <SelectItem value="aios_lifecycle">AIOS Lifecycle</SelectItem>
                 <SelectItem value="opensandbox">OpenSandbox（k8s）</SelectItem>
-                <SelectItem value="e2b">E2B</SelectItem>
                 <SelectItem value="local">Local（本地开发）</SelectItem>
               </SelectGroup>
             </SelectContent>
           </Select>
         </Label>
-        <Label>服务地址<Input value={form.domain} spellCheck={false} placeholder="host[:port]，如 opensandbox.aiop-dev.svc:8080" onChange={(event) => setForm((current) => ({ ...current, domain: event.target.value }))} /></Label>
-        <Label>协议
-          <Select value={form.protocol} onValueChange={(value) => setForm((current) => ({ ...current, protocol: value as 'http' | 'https' }))}>
-            <SelectTrigger><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectGroup>
-                <SelectItem value="http">http</SelectItem>
-                <SelectItem value="https">https</SelectItem>
-              </SelectGroup>
-            </SelectContent>
-          </Select>
-        </Label>
-        <Label>API Key<Input value={form.apiKey} placeholder={info?.api_key_set ? `留空保持不变（当前 ${info.api_key_preview}）` : '当前未配置'} onChange={(event) => setForm((current) => ({ ...current, apiKey: event.target.value }))} /></Label>
-        <Label>默认镜像（OpenSandbox）<Input value={form.defaultImage} spellCheck={false} placeholder="未指定模板时使用的镜像" onChange={(event) => setForm((current) => ({ ...current, defaultImage: event.target.value }))} /></Label>
+        {form.mode === 'standard_e2b' ? (
+          <Label>E2B Domain<Input disabled={busy} value={form.domain} spellCheck={false} placeholder="留空使用 E2B 默认服务" onChange={(event) => setForm((current) => ({ ...current, domain: event.target.value }))} /></Label>
+        ) : null}
+        {form.mode === 'aios_lifecycle' ? (
+          <>
+            <Label>Lifecycle URL<Input disabled={busy} value={form.lifecycleUrl} spellCheck={false} placeholder="http(s)://lifecycle-service" onChange={(event) => setForm((current) => ({ ...current, lifecycleUrl: event.target.value }))} /></Label>
+            <Label>Cluster ID<Input disabled={busy} value={form.clusterId} spellCheck={false} onChange={(event) => setForm((current) => ({ ...current, clusterId: event.target.value }))} /></Label>
+            <Label>Namespace<Input disabled={busy} value={form.namespace} spellCheck={false} onChange={(event) => setForm((current) => ({ ...current, namespace: event.target.value }))} /></Label>
+            <div className="settings-hint">固定使用 code-interpreter，仅提供代码与命令能力；不支持 Desktop、用户主目录和 warm pool。</div>
+          </>
+        ) : null}
+        {form.mode === 'opensandbox' ? (
+          <>
+            <Label>服务地址<Input disabled={busy} value={form.domain} spellCheck={false} placeholder="host[:port]，如 opensandbox.aiop-dev.svc:8080" onChange={(event) => setForm((current) => ({ ...current, domain: event.target.value }))} /></Label>
+            <Label>协议
+              <Select disabled={busy} value={form.protocol} onValueChange={(value) => setForm((current) => ({ ...current, protocol: value as 'http' | 'https' }))}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent><SelectGroup><SelectItem value="http">http</SelectItem><SelectItem value="https">https</SelectItem></SelectGroup></SelectContent>
+              </Select>
+            </Label>
+            <Label>默认镜像<Input disabled={busy} value={form.defaultImage} spellCheck={false} placeholder="未指定模板时使用的镜像" onChange={(event) => setForm((current) => ({ ...current, defaultImage: event.target.value }))} /></Label>
+          </>
+        ) : null}
+        {form.mode !== 'local' ? (
+          <Label>API Key
+            <Input
+              type="password"
+              autoComplete="new-password"
+              disabled={busy}
+              value={form.apiKey}
+              placeholder={info?.api_key_set ? '留空保留已配置 Key' : '输入 API Key'}
+              onChange={(event) => setForm((current) => ({ ...current, apiKey: event.target.value }))}
+            />
+            <span className="settings-hint">当前凭据：{info?.api_key_set ? '已配置' : '未配置'}。页面不会读取或回显已保存的 Key。</span>
+          </Label>
+        ) : null}
         {status ? <div className="settings-status">{status}</div> : null}
         <div className="form-actions">
-          <Button type="button" disabled={!info} onClick={() => void save()}>保存配置</Button>
+          {info?.api_key_set ? <Button variant="outline" type="button" disabled={busy} onClick={requestClearApiKey}>清除 API Key</Button> : null}
+          <Button type="button" disabled={busy || !info} onClick={() => void save()}>{busy ? '应用中...' : '保存配置'}</Button>
         </div>
       </CardContent>
     </Card>

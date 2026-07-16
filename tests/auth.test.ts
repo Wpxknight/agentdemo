@@ -141,6 +141,44 @@ describe('local auth bootstrap', () => {
     }
   });
 
+  it('registers AIOS lifecycle sandbox tools without desktop/browser tools', async () => {
+    const cfg = parseConfig(`{
+      "models": { "mock": { "protocol": "openai", "baseURL": "http://localhost/v1", "apiKey": "x", "model": "mock" } },
+      "defaultModel": "mock",
+      "sandbox": {
+        "enabled": true,
+        "provider": "e2b",
+        "apiKey": "test-aios-key",
+        "aios": {
+          "lifecycleUrl": "http://aios-sandbox-server:8080",
+          "placement": { "clusterId": "local", "namespace": "aios-sandbox-local" }
+        },
+        "desktop": false,
+        "profiles": {
+          "code": { "image": "code-interpreter", "capabilities": ["python", "node", "shell"] }
+        }
+      }
+    }`);
+
+    const rt = await buildRuntime(cfg);
+    try {
+      expect(rt.tools.has('sbx__run_code')).toBe(true);
+      expect(rt.tools.has('sbx__run_command')).toBe(true);
+      expect(rt.tools.has('sandbox_list_profiles')).toBe(true);
+      expect(rt.tools.has('sandbox_ensure')).toBe(true);
+      expect(rt.tools.has('desktop_stream_url')).toBe(false);
+      expect(rt.tools.has('browser_navigate')).toBe(false);
+      expect(rt.tools.has('browser_screenshot')).toBe(false);
+      expect(rt.sandboxProfiles).toEqual([
+        expect.objectContaining({ name: 'code', image: 'code-interpreter', capabilities: ['python', 'node', 'shell'] }),
+      ]);
+      expect(rt.userHome).toBeUndefined();
+      expect(rt.sandboxSettings).not.toHaveProperty('apiKey');
+    } finally {
+      await rt.dispose();
+    }
+  });
+
   it('registers OpenSandbox browser tools from config', async () => {
     const cfg = parseConfig(`{
       "models": { "mock": { "protocol": "openai", "baseURL": "http://localhost/v1", "apiKey": "x", "model": "mock" } },

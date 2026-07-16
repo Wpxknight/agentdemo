@@ -1,6 +1,7 @@
 import type { JsonValue, ToolResult } from '../model/types.js';
 import type { ToolContext, ToolHandler } from '../agent/tools.js';
-import type { SandboxManager } from '../sandbox/lifecycle.js';
+import type { SandboxManagerLike } from '../sandbox/lifecycle.js';
+import { isSandboxAcquirer } from '../sandbox/acquisition.js';
 import type { SandboxProfile } from '../sandbox/profiles.js';
 import { findSandboxProfile, publicSandboxProfiles, sandboxSpecForProfile } from '../sandbox/profiles.js';
 import type { ExecResult } from '../sandbox/types.js';
@@ -46,8 +47,16 @@ function markdownProfiles(profiles: SandboxProfile[]): string {
   ].join('\n');
 }
 
-export function buildSandboxProfileTools(manager: SandboxManager, profiles: SandboxProfile[]): ToolHandler[] {
-  const select = (args: Record<string, JsonValue>) => findSandboxProfile(profiles, optString(args, 'profile'));
+export type SandboxProfilesAccessor = SandboxProfile[] | (() => SandboxProfile[]);
+
+export function buildSandboxProfileTools(manager: SandboxManagerLike, source: SandboxProfilesAccessor): ToolHandler[] {
+  const profiles = () => typeof source === 'function' ? source() : source;
+  const acquire = async (ctx: ToolContext, profileName?: string) => {
+    if (isSandboxAcquirer(manager)) return manager.acquire(ctx, profileName);
+    const profile = findSandboxProfile(profiles(), profileName);
+    const spec = sandboxSpecForProfile(profile, ctx);
+    return { handle: await manager.get(spec), spec };
+  };
   return [
     {
       def: {
@@ -58,8 +67,8 @@ export function buildSandboxProfileTools(manager: SandboxManager, profiles: Sand
       async run(): Promise<ToolResult> {
         return {
           id: '',
-          content: markdownProfiles(profiles),
-          contentBlocks: [{ type: 'text', text: JSON.stringify({ profiles: publicSandboxProfiles(profiles) }) }],
+          content: markdownProfiles(profiles()),
+          contentBlocks: [{ type: 'text', text: JSON.stringify({ profiles: publicSandboxProfiles(profiles()) }) }],
         };
       },
     },
@@ -75,12 +84,11 @@ export function buildSandboxProfileTools(manager: SandboxManager, profiles: Sand
         },
       },
       async run(args, ctx: ToolContext): Promise<ToolResult> {
-        const profile = select(asObject(args));
-        const spec = sandboxSpecForProfile(profile, ctx);
-        const handle = await manager.get(spec);
+        const profileName = optString(asObject(args), 'profile');
+        const acquired = await acquire(ctx, profileName);
         return {
           id: '',
-          content: `沙箱已就绪：profile=${profile.name}，sandboxId=${handle.sandboxId}，key=${spec.key}`,
+          content: `沙箱已就绪：profile=${acquired.spec.profile ?? profileName ?? 'default'}，sandboxId=${acquired.handle.sandboxId}，key=${acquired.spec.key}`,
         };
       },
     },
@@ -100,10 +108,9 @@ export function buildSandboxProfileTools(manager: SandboxManager, profiles: Sand
       },
       async run(args, ctx: ToolContext): Promise<ToolResult> {
         const o = asObject(args);
-        const profile = select(o);
         const code = reqString(o, 'code');
         const language = optString(o, 'language');
-        const sbx = await manager.get(sandboxSpecForProfile(profile, ctx));
+        const sbx = (await acquire(ctx, optString(o, 'profile'))).handle;
         return formatExec(await sbx.runCode(code, { language, onOutput: ctx.onOutput }));
       },
     },
@@ -122,9 +129,8 @@ export function buildSandboxProfileTools(manager: SandboxManager, profiles: Sand
       },
       async run(args, ctx: ToolContext): Promise<ToolResult> {
         const o = asObject(args);
-        const profile = select(o);
         const command = reqString(o, 'command');
-        const sbx = await manager.get(sandboxSpecForProfile(profile, ctx));
+        const sbx = (await acquire(ctx, optString(o, 'profile'))).handle;
         return formatExec(await sbx.runCommand(command, { onOutput: ctx.onOutput }));
       },
     },

@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { SignJWT, jwtVerify } from 'jose';
 import { logger } from '../logger.js';
-import type { Runtime, RuntimeModelConfig, SandboxConnectionInfo } from '../runtime.js';
+import type { Runtime, RuntimeModelConfig } from '../runtime.js';
 import { COMPACTION_RETRY_GROWTH_TOKENS, runAgent } from '../agent/core.js';
 import {
   DEFAULT_CONTEXT_WINDOW_TOKENS,
@@ -34,6 +34,10 @@ import type { JsonValue, Msg, ToolCall } from '../model/types.js';
 import { importSkillZip } from '../skill/import.js';
 import type { Skill, SkillRegistry } from '../skill/registry.js';
 import { McpServerSchema } from '../config/schema.js';
+import {
+  parseSandboxSettings,
+  type SandboxApiKeyUpdate,
+} from '../sandbox/settings.js';
 
 const log = logger.child({ mod: 'http' });
 
@@ -199,17 +203,129 @@ function publicModelConfig(config: RuntimeModelConfig): Record<string, unknown> 
   };
 }
 
-function sandboxSettingsBody(s: SandboxConnectionInfo): Record<string, unknown> {
+interface SandboxSettingsState {
+  settings: SandboxSettings;
+  apiKeySet: boolean;
+  runtime?: {
+    enabled: boolean;
+    mode?: SandboxSettings['mode'];
+    status?: string;
+  };
+}
+
+function publicSandboxSettings(settings: SandboxSettings, apiKeySet: boolean): Record<string, unknown> {
+  const common = { enabled: settings.enabled, mode: settings.mode };
+  switch (settings.mode) {
+    case 'standard_e2b':
+      return { ...common, ...(settings.domain ? { domain: settings.domain } : {}), api_key_set: apiKeySet };
+    case 'aios_lifecycle':
+      return {
+        ...common,
+        lifecycle_url: settings.lifecycleUrl,
+        placement: {
+          cluster_id: settings.placement?.clusterId,
+          namespace: settings.placement?.namespace,
+        },
+        api_key_set: apiKeySet,
+      };
+    case 'opensandbox':
+      return {
+        ...common,
+        ...(settings.domain ? { domain: settings.domain } : {}),
+        protocol: settings.protocol ?? 'http',
+        ...(settings.defaultImage ? { default_image: settings.defaultImage } : {}),
+        api_key_set: apiKeySet,
+      };
+    case 'local':
+      return { ...common, api_key_set: false };
+  }
+}
+
+function sandboxSettingsBody(state: SandboxSettingsState): Record<string, unknown> {
   return {
-    settings: {
-      enabled: s.enabled,
-      provider: s.provider,
-      domain: s.domain ?? '',
-      protocol: s.protocol ?? 'http',
-      default_image: s.defaultImage ?? '',
-      api_key_set: Boolean(s.apiKey),
-      api_key_preview: maskApiKey(s.apiKey ?? ''),
-    },
+    scope: 'platform',
+    settings: publicSandboxSettings(state.settings, state.apiKeySet),
+    ...(state.runtime ? { runtime: state.runtime } : {}),
+  };
+}
+
+function sandboxSettingsFromBody(body: Record<string, unknown>): SandboxSettings {
+  const enabled = body.enabled;
+  const mode = body.mode;
+  if (typeof enabled !== 'boolean') throw new HttpError(400, 'enabled 必须是布尔值');
+  if (typeof mode !== 'string') throw new HttpError(400, 'mode 必填');
+  const allowed = new Set(['enabled', 'mode', 'api_key', 'clear_api_key']);
+  if (mode === 'standard_e2b') allowed.add('domain');
+  else if (mode === 'aios_lifecycle') { allowed.add('lifecycle_url'); allowed.add('placement'); }
+  else if (mode === 'opensandbox') { allowed.add('domain'); allowed.add('protocol'); allowed.add('default_image'); }
+  for (const key of Object.keys(body)) {
+    if (!allowed.has(key)) throw new HttpError(400, `当前 Sandbox mode 不支持字段 ${key}`);
+  }
+
+  const placement = body.placement && typeof body.placement === 'object' && !Array.isArray(body.placement)
+    ? body.placement as Record<string, unknown>
+    : body.placement;
+  const input = mode === 'aios_lifecycle'
+    ? {
+        enabled,
+        mode,
+        lifecycleUrl: str(body, 'lifecycle_url'),
+        placement: placement && typeof placement === 'object'
+          ? { clusterId: str(placement as Record<string, unknown>, 'cluster_id'), namespace: str(placement as Record<string, unknown>, 'namespace') }
+          : placement,
+      }
+    : mode === 'opensandbox'
+      ? {
+          enabled,
+          mode,
+          domain: str(body, 'domain')?.trim() || undefined,
+          protocol: str(body, 'protocol') || undefined,
+          defaultImage: str(body, 'default_image')?.trim() || undefined,
+        }
+      : mode === 'standard_e2b'
+        ? { enabled, mode, domain: str(body, 'domain')?.trim() || undefined }
+        : { enabled, mode };
+  try {
+    return parseSandboxSettings(input);
+  } catch (err) {
+    throw new HttpError(400, err instanceof Error ? err.message : 'Sandbox 配置无效');
+  }
+}
+
+function sandboxApiKeyUpdate(body: Record<string, unknown>, settings: SandboxSettings): SandboxApiKeyUpdate {
+  const apiKey = body.api_key;
+  const clear = body.clear_api_key;
+  if (clear !== undefined && typeof clear !== 'boolean') throw new HttpError(400, 'clear_api_key 必须是布尔值');
+  if (apiKey !== undefined && typeof apiKey !== 'string') throw new HttpError(400, 'api_key 必须是字符串');
+  if (typeof apiKey === 'string' && clear === true) throw new HttpError(400, 'api_key 与 clear_api_key 不能同时设置');
+  if (typeof apiKey === 'string') {
+    const trimmed = apiKey.trim();
+    if (!trimmed) throw new HttpError(400, 'api_key 不能为空；清除凭据请使用 clear_api_key');
+    if (settings.mode === 'local') throw new HttpError(400, 'local 模式不支持 API key');
+    return { action: 'replace', apiKey: trimmed };
+  }
+  if (
+    clear === true
+    && settings.enabled
+    && (settings.mode === 'standard_e2b' || settings.mode === 'aios_lifecycle')
+  ) {
+    throw new HttpError(400, '启用当前模式时必须配置 API key');
+  }
+  return clear === true ? { action: 'clear' } : { action: 'retain' };
+}
+
+function sandboxAuditDetail(settings: SandboxSettings, keyAction: SandboxApiKeyUpdate['action']): Record<string, unknown> {
+  return {
+    enabled: settings.enabled,
+    mode: settings.mode,
+    ...(settings.mode === 'aios_lifecycle'
+      ? { endpoint: settings.lifecycleUrl, placement: settings.placement }
+      : settings.mode === 'standard_e2b'
+        ? { endpoint: settings.domain ?? 'default' }
+        : settings.mode === 'opensandbox'
+          ? { endpoint: `${settings.protocol ?? 'http'}://${settings.domain ?? 'default'}` }
+          : {}),
+    keyAction,
   };
 }
 
@@ -965,8 +1081,8 @@ async function handle(
   }
 
   if (route === 'GET /v1/sandboxes') {
-    await requireAuth(rt, req);
-    return sendJson(res, 200, { sandboxes: rt.sandboxes?.list() ?? [], profiles: rt.sandboxProfiles ?? [] });
+    const ctx = await requireAuth(rt, req);
+    return sendJson(res, 200, { sandboxes: rt.sandboxes?.list(ctx) ?? [], profiles: rt.sandboxProfiles ?? [] });
   }
 
   if (route === 'POST /v1/sandbox/run-code') {
@@ -1101,38 +1217,48 @@ async function handle(
     return sendJson(res, 200, { ok: true, text: text.trim(), ...modelSettingsBody(config, rt.modelOptions) });
   }
 
-  // —— 设置：沙箱服务端连接 ——
+  // —— 设置：平台全局 Sandbox Runtime ——
   if (route === 'GET /v1/settings/sandbox') {
     const ctx = await requireAuth(rt, req);
     requirePermission(ctx, 'tenant:manage');
-    return sendJson(res, 200, sandboxSettingsBody(rt.sandboxSettings ?? { enabled: false, provider: 'e2b' }));
+    const state = rt.getSandboxSettings
+      ? await rt.getSandboxSettings()
+      : {
+          settings: rt.sandboxSettings ?? { enabled: false, mode: 'local' },
+          apiKeySet: false,
+          runtime: {
+            enabled: Boolean(rt.sandboxSettings?.enabled),
+            mode: rt.sandboxSettings?.mode,
+            status: rt.sandboxSettings?.enabled ? 'active' : 'disabled',
+          },
+        };
+    return sendJson(res, 200, sandboxSettingsBody(state));
   }
   if (route === 'POST /v1/settings/sandbox') {
     const ctx = await requireAuth(rt, req);
     requirePermission(ctx, 'tenant:manage');
+    if (!rt.updateSandbox) throw new HttpError(503, 'Sandbox Runtime 不支持动态设置');
     const body = await readJson(req);
-    const current = rt.sandboxSettings ?? { enabled: false, provider: 'e2b' as const };
-    const provider = str(body, 'provider') ?? current.provider;
-    if (provider !== 'local' && provider !== 'e2b' && provider !== 'opensandbox') {
-      throw new HttpError(400, 'provider 只支持 local / e2b / opensandbox');
+    const settings = sandboxSettingsFromBody(body);
+    const keyAction = sandboxApiKeyUpdate(body, settings);
+    let state: SandboxSettingsState;
+    try {
+      state = await rt.updateSandbox({ settings, keyAction });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '';
+      if (/凭据目标.*变化|重新输入或清除 API key|无法解密.*重新配置 API key|必须配置 API key|local 模式不支持 API key|apiKey 不能为空/.test(message)) {
+        throw new HttpError(400, message);
+      }
+      log.warn({ err: message }, 'sandbox settings apply failed');
+      throw new HttpError(500, '沙箱配置应用失败');
     }
-    const protocol = str(body, 'protocol');
-    if (protocol !== undefined && protocol !== 'http' && protocol !== 'https') {
-      throw new HttpError(400, 'protocol 只支持 http / https');
-    }
-    const apiKeyRaw = str(body, 'api_key');
-    const next: SandboxSettings = {
-      provider,
-      domain: (str(body, 'domain') ?? current.domain ?? '').trim() || undefined,
-      protocol: (protocol as 'http' | 'https' | undefined) ?? current.protocol,
-      // api_key 缺省保持不变；传空字符串表示清除
-      apiKey: apiKeyRaw === undefined ? current.apiKey : apiKeyRaw.trim() || undefined,
-      defaultImage: (str(body, 'default_image') ?? current.defaultImage ?? '').trim() || undefined,
-    };
-    await rt.store.setSandboxSettings(ctx, next);
-    if (rt.updateSandbox) rt.updateSandbox(next);
-    else rt.sandboxSettings = { ...current, ...next };
-    return sendJson(res, 200, sandboxSettingsBody(rt.sandboxSettings ?? { ...next, provider, enabled: current.enabled }));
+    await rt.audit.record({
+      kind: 'sandbox',
+      action: 'sandbox-settings-updated',
+      tenantId: 'default',
+      detail: sandboxAuditDetail(settings, keyAction.action),
+    });
+    return sendJson(res, 200, sandboxSettingsBody(state));
   }
 
   // —— 设置：定时任务运行时长 ——
@@ -1242,7 +1368,7 @@ async function handle(
     if (!ok) throw new HttpError(404, '会话不存在');
     compactionWatermarks.delete(activeRunKey(ctx, sessionId));
     // 会话关闭即销毁其名下沙箱（含集群 sessionId:cluster 键）；best-effort，不阻塞响应。
-    void rt.sandboxes?.disposeSession(sessionId);
+    void rt.sandboxes?.disposeSession(ctx, sessionId);
     return sendJson(res, 200, { ok: true });
   }
 
@@ -1594,7 +1720,7 @@ async function runAgentSse(
     // 不会在 listMessages 与 replaceMessages 之间直写库被压缩覆盖。
     const prior = await rt.store.listMessages(ctx, sessionId);
     // 用户绑定了主目录：在系统提示中告知挂载点，引导交付物默认写入持久化目录。
-    const userHomeNote = rt.sandboxes && rt.userHome
+    const userHomeNote = rt.sandboxSettings?.enabled && rt.userHome
       ? await boundUserHomeNote(rt.store, ctx.tenantId, ctx.userId, rt.userHome)
       : '';
     const modelConfig = currentModelConfig(rt);
@@ -1670,7 +1796,7 @@ async function runAgentSse(
       system: [
         parsedTask.goalMode ? GOAL_MODE_SYSTEM : '',
         rt.skillRegistry ? rt.skillRegistry.summariesFor(ctx) : rt.systemExtra,
-        rt.sandboxes ? SANDBOX_SERVICE_NOTE : '',
+        rt.sandboxSettings?.enabled ? SANDBOX_SERVICE_NOTE : '',
         userHomeNote,
       ].filter(Boolean).join('\n\n'),
       ctx: toolCtx,

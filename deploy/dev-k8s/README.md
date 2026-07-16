@@ -37,6 +37,7 @@ This cluster uses Docker as the container runtime on the same node, so the local
 
 ```sh
 kubectl apply -f deploy/dev-k8s/namespace.yaml
+# Replace example secret values through your approved secret-management workflow before deploying.
 kubectl apply -f deploy/dev-k8s/aiop-secret.example.yaml
 kubectl apply -f deploy/dev-k8s/mysql.yaml
 kubectl apply -f deploy/dev-k8s/oidc-test.yaml
@@ -141,22 +142,30 @@ kubectl -n aiop-dev patch deploy aiop-server --type=json \
 kubectl -n aiop-dev rollout status deploy/aiop-server --timeout=180s
 ```
 
-## OpenSandbox
+## AIOS Sandbox Lifecycle
 
-The aiop config uses the existing in-cluster OpenSandbox service:
+The checked-in `aiop-config` deliberately starts with `sandbox.enabled: false`. AIOS Lifecycle configuration is platform-global operational data, managed only by a platform administrator and stored under the `default` tenant record: enable and configure it through **Settings → Sandbox** after the server and MySQL are ready. Once that database row exists, the saved settings are authoritative for new sandboxes; `config.jsonc` is no longer the source for AIOS lifecycle URL, placement, template, or API key.
 
-```json
-"domain": "opensandbox-server.opensandbox-system.svc:80"
-```
+### Configure and protect settings
 
-Check that OpenSandbox is ready:
+1. Replace `AIOP_SETTINGS_SECRET` in `aiop-dev-secrets` with a strong, independent value through your approved secret-management workflow before production use. It protects sensitive settings persisted in the database and must not be reused as `AIOP_JWT_SECRET`.
+2. Sign in with a principal that has `tenant:manage`, then save the AIOS Lifecycle endpoint, placement, template/profile, and API key on **Settings → Sandbox**.
+3. The page/API stores credentials as sensitive settings. Do not put the AIOS key in `AIOS_SANDBOX_KEY`, `config.jsonc`, ConfigMaps, shell arguments, shell history, patches, logs, tickets, or command output.
+4. Verify only that the deployment rolls out and the saved configuration is available to the authorized administrator. Do not use `kubectl get secret ... -o yaml`, `kubectl describe secret`, or base64 decoding to inspect credentials.
+
+After saving settings, execute the smoke script in the AIOP container:
 
 ```sh
-kubectl -n opensandbox-system get pods
-kubectl -n opensandbox-system get svc opensandbox-server
+kubectl -n aiop-dev exec deploy/aiop-server -c aiop -- npx tsx scripts/verify-aios-e2b.ts
 ```
 
-Because the default aiop config uses a placeholder model endpoint, agent-driven sandbox tool calls require a real model endpoint before they can be exercised through `/v1/agent`. The OpenSandbox provider itself is verified by the repository tests and by the existing `deploy/opensandbox/README.md` procedure.
+The script loads the effective saved configuration, then verifies create, readiness, commands, Python code fallback, file read, timeout and cleanup. It reports only status and sandbox IDs, never credentials. See `docs/DESIGN-aios-e2b-integration.md` for the lifecycle contract, settings authority, and bootstrap compatibility boundaries.
+
+### Bootstrap compatibility
+
+Existing deployments that already use startup `sandbox` configuration remain supported only as a one-time bootstrap path when the database has no `sandbox.default` row. After the first persisted page/API setting exists, the database is authoritative on every restart and startup configuration cannot overwrite it. Move legacy AIOS settings to **Settings → Sandbox**, then remove `sandbox.aios` and `AIOS_SANDBOX_KEY`; new deployments must not add `AIOS_SANDBOX_KEY`.
+
+Because the default model endpoint is a placeholder, calling sandbox tools through `/v1/agent` additionally requires a real model endpoint.
 
 ### Switch this dev stack to the ops/netdiag sandbox
 
@@ -214,13 +223,13 @@ ls -la /etc/cni/net.d
 kubectl auth can-i --list
 ```
 
-## E2B
+## Standard E2B
 
-External E2B verification is credential-gated. If `E2B_API_KEY` is available, set it in `aiop-dev-secrets`, switch `sandbox.provider` to `e2b`, and redeploy aiop.
+External standard E2B verification is credential-gated. Enable the official E2B provider and save its connection through **Settings → Sandbox**. Provide `E2B_API_KEY` through `aiop-dev-secrets` only when the selected E2B deployment requires it. Do not send an AIOS Lifecycle key to standard E2B.
 
-Without `E2B_API_KEY`, this dev stack verifies the implemented E2B path by unit tests only:
+Without `E2B_API_KEY`, this dev stack verifies the standard E2B path by unit tests only:
 
-- `tests/e2b.test.ts` asserts template / namespace / ServiceAccount metadata is forwarded to `Sandbox.create`.
+- `tests/e2b.test.ts` locks the official SDK create/connect option shape and verifies no AIOS-only placement is sent.
 - `tests/kubectl.test.ts` asserts cluster config becomes `SandboxSpec` metadata.
 
 ## Cleanup

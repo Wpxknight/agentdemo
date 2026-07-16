@@ -1,4 +1,6 @@
 import { Sandbox } from '@e2b/code-interpreter';
+import { AiosE2bProvider } from './aios-e2b.js';
+import type { AiosE2bProviderOptions } from './aios-e2b.js';
 import type {
   ExecResult,
   RunCodeOpts,
@@ -14,6 +16,8 @@ export interface E2bProviderOptions {
   apiKey?: string;
   /** 自定义 E2B API 域名（自托管 / 集群内网关）。 */
   domain?: string;
+  /** 配置时改走 AIOS Lifecycle REST；未配置时保持官方 E2B SDK 路径。 */
+  aios?: AiosE2bProviderOptions;
 }
 
 type E2bCreateOptions = {
@@ -77,7 +81,13 @@ class E2bHandle implements SandboxHandle {
 
 /** 基于 @e2b/code-interpreter 的沙箱后端：新建 / 连接远端。 */
 export class E2bProvider implements SandboxProvider {
-  constructor(private readonly opts: E2bProviderOptions = {}) {}
+  private readonly aios?: AiosE2bProvider;
+
+  constructor(private readonly opts: E2bProviderOptions = {}) {
+    this.aios = opts.aios
+      ? new AiosE2bProvider({ ...opts.aios, apiKey: opts.aios.apiKey ?? opts.apiKey })
+      : undefined;
+  }
 
   private connectOpts(spec: SandboxSpec) {
     return {
@@ -87,6 +97,7 @@ export class E2bProvider implements SandboxProvider {
   }
 
   async create(spec: SandboxSpec): Promise<SandboxHandle> {
+    if (this.aios) return this.aios.create(spec);
     const metadata = {
       ...spec.metadata,
       ...(spec.namespace ? { namespace: spec.namespace } : {}),
@@ -104,6 +115,7 @@ export class E2bProvider implements SandboxProvider {
   }
 
   async connect(sandboxId: string, spec: SandboxSpec): Promise<SandboxHandle> {
+    if (this.aios) return this.aios.connect(sandboxId, spec);
     const sbx = await Sandbox.connect(sandboxId, this.connectOpts(spec));
     if (spec.timeoutMs) await sbx.setTimeout(spec.timeoutMs); // 续命防回收
     return new E2bHandle(sbx);

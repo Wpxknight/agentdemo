@@ -44,7 +44,7 @@ async function runScheduledTask(
 ): Promise<{ status: 'success'; detail: string; steps: number }> {
   const prior = await rt.store.listMessages(taskCtx, t.sessionId);
   // 用户绑定了主目录：与交互链路一致，告知模型挂载点、交付物默认写入持久化目录。
-  const userHomeNote = rt.sandboxes && rt.userHome
+  const userHomeNote = rt.sandboxSettings?.enabled && rt.userHome
     ? await boundUserHomeNote(rt.store, t.tenantId, t.userId, rt.userHome)
     : '';
   const result = await runAgent({
@@ -58,7 +58,7 @@ async function runScheduledTask(
     // 技能摘要按任务归属用户过滤（他人私有技能不可见），与交互链路同一套可见性规则。
     system: [
       rt.skillRegistry?.summariesFor({ userId: t.userId, role: taskCtx.role }) ?? rt.systemExtra,
-      rt.sandboxes ? SANDBOX_SERVICE_NOTE : '',
+      rt.sandboxSettings?.enabled ? SANDBOX_SERVICE_NOTE : '',
       userHomeNote,
     ].filter(Boolean).join('\n\n'),
     ctx: { sessionId: t.sessionId, ...taskCtx },

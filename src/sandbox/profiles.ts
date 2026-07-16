@@ -1,4 +1,5 @@
 import type { SandboxConfig } from '../config/schema.js';
+import { sandboxIdentityKey, sandboxIdentityMetadata, sandboxScopedKey, type SandboxIdentity } from './keys.js';
 import type { SandboxSpec } from './types.js';
 
 export interface SandboxProfile {
@@ -117,13 +118,15 @@ export function findSandboxProfile(profiles: SandboxProfile[], name?: string): S
   return selected;
 }
 
-export function sandboxProfileKey(sessionId: string, profile: SandboxProfile): string {
-  return profile.name === 'default' ? sessionId : `${sessionId}:profile:${profile.name}`;
+export function sandboxProfileKey(identity: SandboxIdentity, profile: SandboxProfile): string {
+  return profile.name === 'default'
+    ? sandboxIdentityKey(identity)
+    : sandboxScopedKey(identity, `profile:${profile.name}`);
 }
 
-export function sandboxSpecForProfile(profile: SandboxProfile, ctx: { sessionId: string }): SandboxSpec {
+export function sandboxSpecForProfile(profile: SandboxProfile, ctx: SandboxIdentity): SandboxSpec {
   return {
-    key: sandboxProfileKey(ctx.sessionId, profile),
+    key: sandboxProfileKey(ctx, profile),
     profile: profile.name,
     template: profile.image,
     domain: profile.domain,
@@ -135,7 +138,7 @@ export function sandboxSpecForProfile(profile: SandboxProfile, ctx: { sessionId:
       AIOP_SANDBOX_PROFILE: profile.name,
     },
     metadata: {
-      sessionId: ctx.sessionId,
+      ...sandboxIdentityMetadata(ctx),
       profile: profile.name,
       ...(profile.privileged ? { privileged: 'true' } : {}),
       ...(profile.capabilities.length ? { capabilities: profile.capabilities.join(',') } : {}),

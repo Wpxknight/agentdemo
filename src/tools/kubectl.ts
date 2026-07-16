@@ -1,7 +1,9 @@
 import type { ToolResult } from '../model/types.js';
 import type { ToolContext, ToolHandler } from '../agent/tools.js';
 import type { ClusterRegistry, ClusterInfo } from '../config/clusters.js';
-import type { SandboxManager } from '../sandbox/lifecycle.js';
+import type { SandboxManagerLike } from '../sandbox/lifecycle.js';
+import { isSandboxAcquirer } from '../sandbox/acquisition.js';
+import { sandboxIdentityMetadata, sandboxScopedKey, type SandboxIdentity } from '../sandbox/keys.js';
 import type { SandboxSpec } from '../sandbox/types.js';
 import type { AuditSink } from '../audit/sink.js';
 import { LogAuditSink } from '../audit/sink.js';
@@ -9,17 +11,17 @@ import { classifyKubectl, parseKubectlArgs } from '../ops/classify.js';
 
 export interface KubectlToolOptions {
   clusters: ClusterRegistry;
-  sandboxes: SandboxManager;
+  sandboxes: SandboxManagerLike;
   audit?: AuditSink;
 }
 
 /** 把集群信息映射为 in-cluster 沙箱规格（按 session×cluster 复用）。 */
-function specFor(sessionId: string, info: ClusterInfo): SandboxSpec {
-  const metadata: Record<string, string> = { cluster: info.name };
+function specFor(identity: SandboxIdentity, info: ClusterInfo): SandboxSpec {
+  const metadata: Record<string, string> = { ...sandboxIdentityMetadata(identity), cluster: info.name };
   if (info.namespace) metadata.namespace = info.namespace;
   if (info.serviceAccount) metadata.serviceAccount = info.serviceAccount;
   return {
-    key: `${sessionId}:${info.name}`,
+    key: sandboxScopedKey(identity, `cluster:${info.name}`),
     template: info.template,
     namespace: info.namespace,
     serviceAccount: info.serviceAccount,
@@ -83,7 +85,10 @@ export function buildKubectlTool(opts: KubectlToolOptions): ToolHandler {
       const finalArgs = withDryRun(args, dryRun);
       const command = `kubectl ${finalArgs.map(shellQuote).join(' ')}`;
 
-      const sbx = await opts.sandboxes.get(specFor(ctx.sessionId, info));
+      const spec = specFor(ctx, info);
+      const sbx = isSandboxAcquirer(opts.sandboxes)
+        ? (await opts.sandboxes.acquireSpec(ctx, spec)).handle
+        : await opts.sandboxes.get(spec);
       const res = await sbx.runCommand(command, { onOutput: ctx.onOutput });
 
       await audit.record({

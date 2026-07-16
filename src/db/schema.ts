@@ -107,6 +107,15 @@ export interface TenantSettingsTable {
   updated_at: Generated<Date>;
 }
 
+export interface SettingSecretsTable {
+  tenant_id: string;
+  setting_key: string;
+  /** AES-256-GCM 加密 envelope；由平台设置 codec 加解密。 */
+  payload: string;
+  created_at: Generated<Date>;
+  updated_at: Generated<Date>;
+}
+
 export interface Database {
   sessions: SessionsTable;
   messages: MessagesTable;
@@ -117,4 +126,5 @@ export interface Database {
   users: UsersTable;
   user_credentials: UserCredentialsTable;
   tenant_settings: TenantSettingsTable;
+  setting_secrets: SettingSecretsTable;
 }

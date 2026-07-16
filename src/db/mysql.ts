@@ -9,6 +9,8 @@ import type {
   LlmSettings,
   NewUser,
   SandboxSettings,
+  SandboxSettingsRecord,
+  SandboxSettingsSecretUpdate,
   SchedulerSettings,
   SessionContextUsage,
   SessionInput,
@@ -28,6 +30,7 @@ import { McpServerSchema } from '../config/schema.js';
 import type { McpServerConfig } from '../mcp/types.js';
 import { nextRunAt } from '../scheduler/cron.js';
 import { estimateTokens } from '../agent/context.js';
+import { parseStoredSandboxSettings } from '../sandbox/settings.js';
 
 interface TaskRow {
   id: number;
@@ -147,19 +150,6 @@ function parseMcpServers(value: unknown): Record<string, McpServerConfig> | unde
     if (parsed.success) out[name] = parsed.data;
   }
   return out;
-}
-
-function parseSandboxSettings(value: unknown): SandboxSettings | undefined {
-  const v = parseJson(value);
-  if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
-  const o = v as Record<string, unknown>;
-  const out: SandboxSettings = {};
-  if (o.provider === 'local' || o.provider === 'e2b' || o.provider === 'opensandbox') out.provider = o.provider;
-  if (typeof o.domain === 'string') out.domain = o.domain;
-  if (o.protocol === 'http' || o.protocol === 'https') out.protocol = o.protocol;
-  if (typeof o.apiKey === 'string') out.apiKey = o.apiKey;
-  if (typeof o.defaultImage === 'string') out.defaultImage = o.defaultImage;
-  return Object.keys(out).length ? out : undefined;
 }
 
 function parseSchedulerSettings(value: unknown): SchedulerSettings | undefined {
@@ -794,29 +784,68 @@ export class MysqlStore implements Store {
       .execute();
   }
 
+  async getSandboxSettingsRecord(ctx: Pick<RequestContext, 'tenantId'>): Promise<SandboxSettingsRecord | undefined> {
+    return this.db.transaction().execute(async (trx) => {
+      const configRow = await trx
+        .selectFrom('tenant_settings')
+        .select(['config'])
+        .where('tenant_id', '=', ctx.tenantId)
+        .where('setting_key', '=', 'sandbox.default')
+        .executeTakeFirst();
+      if (!configRow) return undefined;
+      const secretRow = await trx
+        .selectFrom('setting_secrets')
+        .select(['payload'])
+        .where('tenant_id', '=', ctx.tenantId)
+        .where('setting_key', '=', 'sandbox.default.api_key')
+        .executeTakeFirst();
+      const parsed = parseStoredSandboxSettings(parseJson(configRow.config));
+      return {
+        settings: parsed.settings,
+        ...(secretRow?.payload ? { encryptedApiKey: secretRow.payload } : {}),
+        ...(!secretRow?.payload && parsed.legacyApiKey ? { legacyApiKey: parsed.legacyApiKey } : {}),
+      };
+    });
+  }
+
+  async setSandboxSettingsRecord(
+    ctx: Pick<RequestContext, 'tenantId'>,
+    settings: SandboxSettings,
+    secret: SandboxSettingsSecretUpdate,
+  ): Promise<void> {
+    const config = JSON.stringify(settings);
+    await this.db.transaction().execute(async (trx) => {
+      await trx
+        .insertInto('tenant_settings')
+        .values({ tenant_id: ctx.tenantId, setting_key: 'sandbox.default', config })
+        .onDuplicateKeyUpdate({ config })
+        .execute();
+      if (secret.action === 'replace') {
+        await trx
+          .insertInto('setting_secrets')
+          .values({
+            tenant_id: ctx.tenantId,
+            setting_key: 'sandbox.default.api_key',
+            payload: secret.encryptedApiKey,
+          })
+          .onDuplicateKeyUpdate({ payload: secret.encryptedApiKey })
+          .execute();
+      } else if (secret.action === 'clear') {
+        await trx
+          .deleteFrom('setting_secrets')
+          .where('tenant_id', '=', ctx.tenantId)
+          .where('setting_key', '=', 'sandbox.default.api_key')
+          .execute();
+      }
+    });
+  }
+
   async getSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<SandboxSettings | undefined> {
-    const row = await this.db
-      .selectFrom('tenant_settings')
-      .select(['config'])
-      .where('tenant_id', '=', ctx.tenantId)
-      .where('setting_key', '=', 'sandbox.default')
-      .executeTakeFirst();
-    return row ? parseSandboxSettings(row.config) : undefined;
+    return (await this.getSandboxSettingsRecord(ctx))?.settings;
   }
 
   async setSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SandboxSettings): Promise<void> {
-    const config = JSON.stringify(settings);
-    const updated = await this.db
-      .updateTable('tenant_settings')
-      .set({ config })
-      .where('tenant_id', '=', ctx.tenantId)
-      .where('setting_key', '=', 'sandbox.default')
-      .executeTakeFirst();
-    if (Number(updated.numUpdatedRows) > 0) return;
-    await this.db
-      .insertInto('tenant_settings')
-      .values({ tenant_id: ctx.tenantId, setting_key: 'sandbox.default', config })
-      .execute();
+    await this.setSandboxSettingsRecord(ctx, settings, { action: 'retain' });
   }
 
   async setLlmSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: LlmSettings): Promise<void> {

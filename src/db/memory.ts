@@ -8,6 +8,8 @@ import type {
   NewUser,
   LlmSettings,
   SandboxSettings,
+  SandboxSettingsRecord,
+  SandboxSettingsSecretUpdate,
   SchedulerSettings,
   SessionContextUsage,
   SessionInput,
@@ -61,7 +63,7 @@ export class MemoryStore implements Store {
   private credentials = new Map<string, UserCredentialRecord>(); // key: tenantId/userId/provider
   private llmSettings = new Map<string, LlmSettings>();
   private schedulerSettings = new Map<string, SchedulerSettings>();
-  private sandboxSettings = new Map<string, SandboxSettings>();
+  private sandboxSettings = new Map<string, SandboxSettingsRecord>();
   private mcpServers = new Map<string, Record<string, McpServerConfig>>();
   private taskSeq = 0;
   private runSeq = 0;
@@ -427,13 +429,32 @@ export class MemoryStore implements Store {
     return settings ? { ...settings } : undefined;
   }
 
+  async getSandboxSettingsRecord(ctx: Pick<RequestContext, 'tenantId'>): Promise<SandboxSettingsRecord | undefined> {
+    const record = this.sandboxSettings.get(ctx.tenantId);
+    return record ? structuredClone(record) : undefined;
+  }
+
+  async setSandboxSettingsRecord(
+    ctx: Pick<RequestContext, 'tenantId'>,
+    settings: SandboxSettings,
+    secret: SandboxSettingsSecretUpdate,
+  ): Promise<void> {
+    const current = this.sandboxSettings.get(ctx.tenantId);
+    const next: SandboxSettingsRecord = { settings: structuredClone(settings) };
+    if (secret.action === 'replace') next.encryptedApiKey = secret.encryptedApiKey;
+    if (secret.action === 'retain') {
+      if (current?.encryptedApiKey) next.encryptedApiKey = current.encryptedApiKey;
+      if (current?.legacyApiKey) next.legacyApiKey = current.legacyApiKey;
+    }
+    this.sandboxSettings.set(ctx.tenantId, next);
+  }
+
   async getSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<SandboxSettings | undefined> {
-    const settings = this.sandboxSettings.get(ctx.tenantId);
-    return settings ? { ...settings } : undefined;
+    return (await this.getSandboxSettingsRecord(ctx))?.settings;
   }
 
   async setSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SandboxSettings): Promise<void> {
-    this.sandboxSettings.set(ctx.tenantId, { ...settings });
+    await this.setSandboxSettingsRecord(ctx, settings, { action: 'retain' });
   }
 
   async setSchedulerSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SchedulerSettings): Promise<void> {
@@ -461,6 +482,7 @@ export class MemoryStore implements Store {
     this.credentials.clear();
     this.llmSettings.clear();
     this.schedulerSettings.clear();
+    this.sandboxSettings.clear();
     this.mcpServers.clear();
   }
 }

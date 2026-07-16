@@ -42,5 +42,8 @@ kubectl -n aiop exec deploy/aiop-server -c aiop -- npm run start seed-admin defa
 ## 密钥
 
 - `AIOP_JWT_SECRET`：会话 JWT 签名密钥，必须强随机。
+- `AIOP_SETTINGS_SECRET`：加密数据库中保存的敏感设置（包括沙箱 API key）；必须强随机，且不得与 JWT 密钥复用。
 - `MYSQL_PASSWORD_BASE64`：MySQL 口令的 base64（`echo -n 'pw' | base64`）。注意 base64 是编码非加密，仅避免明文直读；真正的机密保护靠 k8s Secret / 外部 KMS。
 - `E2B_API_KEY` / `OIDC_CLIENT_SECRET`：按需。
+
+AIOS Lifecycle 的 endpoint、placement、profile/template 和 API key 由拥有 `tenant:manage` 权限的管理员通过 **Settings → Sandbox** 保存到数据库。新部署不要在 `config.jsonc`、ConfigMap 或环境变量中配置 `AIOS_SANDBOX_KEY`。详见 `docs/DESIGN-aios-e2b-integration.md`。

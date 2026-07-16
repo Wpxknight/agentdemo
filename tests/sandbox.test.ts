@@ -11,6 +11,18 @@ import type {
   SandboxSpec,
 } from '../src/sandbox/types.js';
 
+function deferredHandle() {
+  let resolve!: (handle: SandboxHandle) => void;
+  const promise = new Promise<SandboxHandle>((res) => { resolve = res; });
+  return { promise, resolve };
+}
+
+function deferredVoid() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((res) => { resolve = res; });
+  return { promise, resolve };
+}
+
 /** 一个可控的 mock 沙箱句柄 + provider，记录调用次数。 */
 function mockProvider() {
   let seq = 0;
@@ -43,6 +55,50 @@ function mockProvider() {
 }
 
 describe('SandboxManager', () => {
+  it('reports inflight activity and rejects new work after draining starts', async () => {
+    let release!: (handle: SandboxHandle) => void;
+    const creating = new Promise<SandboxHandle>((resolve) => { release = resolve; });
+    const provider: SandboxProvider = {
+      create: vi.fn(async () => creating),
+      connect: vi.fn(async () => creating),
+    };
+    const mgr = new SandboxManager({ provider });
+    const pending = mgr.get({ key: 'started' });
+
+    expect(mgr.activity()).toEqual({ active: 0, inflight: 1, cleanup: 0 });
+    mgr.beginDrain();
+    await expect(mgr.get({ key: 'new' })).rejects.toThrow(/draining|禁用/);
+
+    const handle = mockProvider().provider.create({ key: 'unused' });
+    release(await handle);
+    await pending;
+    expect(mgr.activity()).toEqual({ active: 1, inflight: 0, cleanup: 0 });
+  });
+
+  it('filters listings and session disposal by tenant and user', async () => {
+    const { provider, killed } = mockProvider();
+    const mgr = new SandboxManager({ provider });
+    await mgr.get({
+      key: 'tenant-a:user-a:same',
+      metadata: { tenantId: 'tenant-a', userId: 'user-a', sessionId: 'same' },
+    });
+    await mgr.get({
+      key: 'tenant-b:user-b:same',
+      metadata: { tenantId: 'tenant-b', userId: 'user-b', sessionId: 'same' },
+    });
+
+    expect(mgr.list({ tenantId: 'tenant-a', userId: 'user-a', role: 'user' })).toHaveLength(1);
+    expect(mgr.list({ tenantId: 'tenant-a', userId: 'admin', role: 'platform_admin' })).toHaveLength(2);
+
+    const disposed = await mgr.disposeSession(
+      { tenantId: 'tenant-a', userId: 'user-a', role: 'user' },
+      'same',
+    );
+    expect(disposed).toEqual(['tenant-a:user-a:same']);
+    expect(killed).toEqual(['new-1']);
+    expect(mgr.size()).toBe(1);
+  });
+
   it('caches by key: repeated get creates only once', async () => {
     const { provider } = mockProvider();
     const mgr = new SandboxManager({ provider });
@@ -185,6 +241,78 @@ describe('SandboxManager', () => {
     expect(mgr.has('other')).toBe(true);
   });
 
+  it('disposeAll kills a handle that completes after disposal without caching it', async () => {
+    const creating = deferredHandle();
+    const killed: string[] = [];
+    const provider: SandboxProvider = {
+      create: vi.fn(async () => creating.promise),
+      connect: vi.fn(async () => creating.promise),
+    };
+    const mgr = new SandboxManager({ provider });
+    const pending = mgr.get({ key: 'late' });
+
+    await mgr.disposeAll();
+    creating.resolve({
+      sandboxId: 'late',
+      runCode: vi.fn(async () => ({ stdout: '', stderr: '' })),
+      runCommand: vi.fn(async () => ({ stdout: '', stderr: '' })),
+      setTimeout: vi.fn(async () => {}),
+      readFile: vi.fn(async () => new Uint8Array()),
+      kill: vi.fn(async () => { killed.push('late'); }),
+    });
+
+    await expect(pending).rejects.toThrow(/disposed/);
+    expect(killed).toEqual(['late']);
+    expect(mgr.size()).toBe(0);
+  });
+
+  it('serializes overlapping sweeps until pending kills complete', async () => {
+    const killing = deferredVoid();
+    const { provider } = mockProvider();
+    let now = 10;
+    const mgr = new SandboxManager({ provider, idleMs: 1, now: () => now });
+    const handle = await mgr.get({ key: 'old' });
+    vi.mocked(handle.kill).mockImplementation(async () => killing.promise);
+    now = 12;
+
+    const first = mgr.sweep();
+    const second = mgr.sweep();
+    expect(mgr.activity().cleanup).toBe(1);
+    killing.resolve();
+
+    await expect(first).resolves.toEqual(['old']);
+    await expect(second).resolves.toEqual(['old']);
+    expect(handle.kill).toHaveBeenCalledOnce();
+    expect(mgr.activity().cleanup).toBe(0);
+  });
+
+  it('disposeSession invalidates a matching in-flight create', async () => {
+    const creating = deferredHandle();
+    const killed: string[] = [];
+    const provider: SandboxProvider = {
+      create: vi.fn(async () => creating.promise),
+      connect: vi.fn(async () => creating.promise),
+    };
+    const mgr = new SandboxManager({ provider });
+    const pending = mgr.get({
+      key: 'tenant-a:user-a:late-session',
+      metadata: { tenantId: 'tenant-a', userId: 'user-a', sessionId: 'late-session' },
+    });
+    await mgr.disposeSession({ tenantId: 'tenant-a', userId: 'user-a', role: 'user' }, 'late-session');
+    creating.resolve({
+      sandboxId: 'late-session',
+      runCode: vi.fn(async () => ({ stdout: '', stderr: '' })),
+      runCommand: vi.fn(async () => ({ stdout: '', stderr: '' })),
+      setTimeout: vi.fn(async () => {}),
+      readFile: vi.fn(async () => new Uint8Array()),
+      kill: vi.fn(async () => { killed.push('late-session'); }),
+    });
+
+    await expect(pending).rejects.toThrow(/session is disposed/);
+    expect(killed).toEqual(['late-session']);
+    expect(mgr.size()).toBe(0);
+  });
+
   it('disposeAll kills everything', async () => {
     const { provider, killed } = mockProvider();
     const mgr = new SandboxManager({ provider });
@@ -195,6 +323,24 @@ describe('SandboxManager', () => {
 
     expect(killed.sort()).toEqual(['new-1', 'new-2']);
     expect(mgr.size()).toBe(0);
+  });
+
+  it('merges concurrent disposeAll calls until active kills finish', async () => {
+    const killing = deferredVoid();
+    const { provider } = mockProvider();
+    const mgr = new SandboxManager({ provider });
+    const handle = await mgr.get({ key: 'active' });
+    vi.mocked(handle.kill).mockImplementation(async () => killing.promise);
+
+    const first = mgr.disposeAll();
+    const second = mgr.disposeAll();
+    expect(first).toBe(second);
+    expect(mgr.activity().cleanup).toBe(1);
+
+    killing.resolve();
+    await Promise.all([first, second]);
+    expect(handle.kill).toHaveBeenCalledOnce();
+    expect(mgr.activity().cleanup).toBe(0);
   });
 });
 
@@ -231,6 +377,28 @@ describe('sandbox tools', () => {
     const [runCode] = buildSandboxTools(mgr);
 
     await expect(runCode!.run({}, ctx)).rejects.toThrow(/code/);
+  });
+
+  it('isolates same-named sessions by tenant and user identity', async () => {
+    const { provider } = mockProvider();
+    const mgr = new SandboxManager({ provider });
+    const [runCode] = buildSandboxTools(mgr);
+
+    await runCode!.run({ code: 'print("a")' }, {
+      sessionId: 'same', tenantId: 'tenant-a', userId: 'user-a', role: 'user',
+    });
+    await runCode!.run({ code: 'print("b")' }, {
+      sessionId: 'same', tenantId: 'tenant-b', userId: 'user-b', role: 'user',
+    });
+
+    expect(provider.create).toHaveBeenCalledTimes(2);
+    expect(mgr.list().map((item) => item.key)).toEqual([
+      '["tenant-a","user-a","same"]',
+      '["tenant-b","user-b","same"]',
+    ]);
+    expect(mgr.list()[0]?.metadata).toMatchObject({
+      tenantId: 'tenant-a', userId: 'user-a', sessionId: 'same',
+    });
   });
 
   it('isolates sandbox tools by session and exposes both bindings', async () => {

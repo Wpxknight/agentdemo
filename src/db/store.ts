@@ -20,16 +20,30 @@ export interface LlmSettings {
 export const DEFAULT_SESSION_TITLE = '新会话';
 
 /** 定时任务运行设置（租户级）。 */
-/** 沙箱服务端连接配置（设置页保存；启动时合并覆盖 config.jsonc 的 sandbox 连接字段）。 */
+/** 平台 Sandbox 设置：只含非敏感字段，API key 独立加密保存。 */
 export interface SandboxSettings {
-  provider?: 'local' | 'e2b' | 'opensandbox';
-  /** 网关域名 host[:port]，无 scheme。 */
+  enabled: boolean;
+  mode: 'standard_e2b' | 'aios_lifecycle' | 'opensandbox' | 'local';
+  /** E2B/OpenSandbox 域名 host[:port]。 */
   domain?: string;
   protocol?: 'http' | 'https';
-  apiKey?: string;
-  /** OpenSandbox 未指定模板时的默认镜像。 */
   defaultImage?: string;
+  /** AIOS Lifecycle API 完整 HTTP(S) URL。 */
+  lifecycleUrl?: string;
+  placement?: { clusterId: string; namespace: string };
 }
+
+/** Store 内部的 Sandbox 配置和不透明密文；legacyApiKey 只用于一次性旧数据迁移。 */
+export interface SandboxSettingsRecord {
+  settings: SandboxSettings;
+  encryptedApiKey?: string;
+  legacyApiKey?: string;
+}
+
+export type SandboxSettingsSecretUpdate =
+  | { action: 'retain' }
+  | { action: 'replace'; encryptedApiKey: string }
+  | { action: 'clear' };
 
 export interface SchedulerSettings {
   /** 单次定时任务运行的最长时长（毫秒）；超时中止并记录失败。 */
@@ -206,7 +220,14 @@ export interface Store extends AuditSink {
   setLlmSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: LlmSettings): Promise<void>;
   getSchedulerSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<SchedulerSettings | undefined>;
   setSchedulerSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SchedulerSettings): Promise<void>;
-  /** 沙箱服务端连接配置（设置页保存；覆盖 config.jsonc 的连接字段）。 */
+  /** 平台 Sandbox 配置与独立密文；实现需保证配置和 secret 更新原子提交。 */
+  getSandboxSettingsRecord(ctx: Pick<RequestContext, 'tenantId'>): Promise<SandboxSettingsRecord | undefined>;
+  setSandboxSettingsRecord(
+    ctx: Pick<RequestContext, 'tenantId'>,
+    settings: SandboxSettings,
+    secret: SandboxSettingsSecretUpdate,
+  ): Promise<void>;
+  /** 兼容旧调用：仅读写非敏感配置，不得写 API key。 */
   getSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<SandboxSettings | undefined>;
   setSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SandboxSettings): Promise<void>;
   /** MCP server 配置（UI 动态增删后持久化；存在时覆盖 config.jsonc 的 mcpServers）。 */

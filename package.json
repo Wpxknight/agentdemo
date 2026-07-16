@@ -12,7 +12,7 @@
     "serve": "tsx src/index.ts serve",
     "scheduler": "tsx src/index.ts scheduler",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run",
+    "test": "vitest run --exclude 'dist/**'",
     "test:watch": "vitest"
   },
   "dependencies": {

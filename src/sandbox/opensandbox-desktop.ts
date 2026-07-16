@@ -1,5 +1,5 @@
 import type { DesktopHandle, DesktopProvider, DesktopSpec } from './desktop.js';
-import type { SandboxManager } from './lifecycle.js';
+import type { SandboxManagerLike } from './lifecycle.js';
 import type { ExecResult, SandboxHandle } from './types.js';
 
 const WORK_DIR = '/tmp/aiop-browser';
@@ -316,7 +316,7 @@ if [ -f ${WORK_DIR}/xvfb.pid ]; then kill "$(cat ${WORK_DIR}/xvfb.pid)" >/dev/nu
 }
 
 export class OpenSandboxDesktopProvider implements DesktopProvider {
-  constructor(private readonly manager: SandboxManager) {}
+  constructor(private readonly manager: SandboxManagerLike) {}
 
   async create(spec: DesktopSpec): Promise<DesktopHandle> {
     const handle = await this.manager.get({ ...spec });

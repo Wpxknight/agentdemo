@@ -1,10 +1,10 @@
 import { posix } from 'node:path';
 import type { JsonValue, ToolResult } from '../model/types.js';
 import type { ToolContext, ToolHandler } from '../agent/tools.js';
-import type { SandboxManager } from '../sandbox/lifecycle.js';
-import type { SandboxSpec } from '../sandbox/types.js';
+import type { SandboxManagerLike } from '../sandbox/lifecycle.js';
+import { isSandboxAcquirer } from '../sandbox/acquisition.js';
 import type { ExportSink } from '../server/downloads.js';
-import type { SpecResolver } from './builtin.js';
+import { resolveSandboxSpec, type SpecResolver } from './builtin.js';
 
 function asObject(args: JsonValue): Record<string, JsonValue> {
   return args && typeof args === 'object' && !Array.isArray(args) ? args : {};
@@ -14,10 +14,6 @@ function reqString(o: Record<string, JsonValue>, key: string): string {
   const v = o[key];
   if (typeof v !== 'string' || !v) throw new Error(`参数 ${key} 必须是非空字符串`);
   return v;
-}
-
-async function resolveSpec(resolve: SpecResolver, ctx: ToolContext): Promise<SandboxSpec> {
-  return { key: ctx.sessionId, ...(await resolve(ctx)) };
 }
 
 /** 扩展名 → MIME，覆盖导出常见格式；未知回退 octet-stream（浏览器仍会当附件下载）。 */
@@ -81,7 +77,7 @@ function formatBytes(n: number): string {
  * 由模型转达给用户（下载路由是能力令牌，锚点点击即可下载）。
  */
 export function buildExportTool(
-  manager: SandboxManager,
+  manager: SandboxManagerLike,
   resolve: SpecResolver,
   sink: ExportSink,
 ): ToolHandler {
@@ -108,7 +104,9 @@ export function buildExportTool(
       const name = safeDownloadName(typeof o.filename === 'string' && o.filename ? o.filename : path);
       const mime = typeof o.mime === 'string' && o.mime ? o.mime : guessMime(name);
 
-      const sbx = await manager.get(await resolveSpec(resolve, ctx));
+      const sbx = isSandboxAcquirer(manager)
+        ? (await manager.acquire(ctx)).handle
+        : await manager.get(await resolveSandboxSpec(resolve, ctx));
       let bytes: Uint8Array;
       try {
         bytes = await sbx.readFile(path);

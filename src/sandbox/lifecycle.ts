@@ -1,4 +1,5 @@
 import { logger } from '../logger.js';
+import type { RequestContext } from '../auth/types.js';
 import type { SandboxHandle, SandboxProvider, SandboxSpec } from './types.js';
 import type { WarmPool } from './warmpool.js';
 
@@ -13,6 +14,12 @@ interface Entry {
   spec: SandboxSpec;
   /** 已注入用户凭据（污染标记）：严禁跨用户复用，只能随会话销毁，不得回池。 */
   credentialInjected?: boolean;
+}
+
+interface InflightEntry {
+  task: Promise<SandboxHandle>;
+  spec: SandboxSpec;
+  epoch: number;
 }
 
 export interface SandboxSummary {
@@ -36,6 +43,18 @@ export interface SandboxSummary {
   metadata?: Record<string, string>;
 }
 
+export interface SandboxManagerLike {
+  get(spec: SandboxSpec): Promise<SandboxHandle>;
+  has(key: string): boolean;
+  markCredentialInjected(key: string): void;
+  size(): number;
+  list(ctx?: RequestContext): SandboxSummary[];
+  dispose(key: string): Promise<void>;
+  disposeSession(ctx: RequestContext, sessionId: string): Promise<string[]>;
+  disposeSession(sessionId: string): Promise<string[]>;
+  disposeAll(): Promise<void>;
+}
+
 export interface SandboxManagerOptions {
   provider: SandboxProvider;
   /** 空闲多久(ms)后 GC 回收，默认 10 分钟。 */
@@ -54,15 +73,22 @@ export interface SandboxManagerOptions {
  * - 并发 get 同键只创建一次（inflight 去重）；
  * - 空闲超 idleMs 由 sweep() 回收（idle GC）。
  */
-export class SandboxManager {
+export class SandboxManager implements SandboxManagerLike {
   private provider: SandboxProvider;
+  private draining = false;
+  private disposed = false;
   private readonly idleMs: number;
   private readonly timeoutMs: number;
   private readonly now: () => number;
   private readonly warmPool?: WarmPool;
 
   private readonly entries = new Map<string, Entry>();
-  private readonly inflight = new Map<string, Promise<SandboxHandle>>();
+  private readonly inflight = new Map<string, InflightEntry>();
+  private inflightActivity = 0;
+  private readonly keyEpochs = new Map<string, number>();
+  private cleanupActivity = 0;
+  private sweepPromise?: Promise<string[]>;
+  private disposePromise?: Promise<void>;
 
   constructor(opts: SandboxManagerOptions) {
     this.provider = opts.provider;
@@ -77,8 +103,22 @@ export class SandboxManager {
     this.provider = provider;
   }
 
+  beginDrain(): void {
+    this.draining = true;
+  }
+
+  activity(): { active: number; inflight: number; cleanup: number } {
+    return {
+      active: this.entries.size,
+      inflight: this.inflightActivity,
+      cleanup: this.cleanupActivity,
+    };
+  }
+
   /** 取得（必要时创建 / 连接）一个沙箱句柄，并刷新其活跃时间。 */
   async get(spec: SandboxSpec): Promise<SandboxHandle> {
+    if (this.disposed) throw new Error('sandbox manager is disposed');
+    if (this.draining) throw new Error('sandbox generation is draining');
     const cached = this.entries.get(spec.key);
     if (cached) {
       cached.lastUsed = this.now();
@@ -91,34 +131,45 @@ export class SandboxManager {
     }
 
     const existing = this.inflight.get(spec.key);
-    if (existing) return existing;
+    if (existing) return existing.task;
 
     const effectiveTimeout = spec.timeoutMs ?? this.timeoutMs;
     const full: SandboxSpec = { ...spec, timeoutMs: effectiveTimeout };
+    const epoch = this.keyEpochs.get(spec.key) ?? 0;
+    this.inflightActivity++;
     const task = (async () => {
-      // 带卷的沙箱不走预热池：卷挂载只能在创建时生效，池中沙箱没有该用户的挂载。
-      const handle = full.sandboxId
-        ? await this.provider.connect(full.sandboxId, full)
-        : this.warmPool && !full.volumes?.length
-          ? await this.warmPool.acquire()
-          : await this.provider.create(full);
-      const readyAt = this.now();
-      this.entries.set(spec.key, {
-        handle,
-        lastUsed: readyAt,
-        createdAt: readyAt,
-        timeoutMs: effectiveTimeout,
-        spec: full,
-      });
-      log.info({ key: spec.key, sandboxId: handle.sandboxId, mode: full.sandboxId ? 'connect' : 'create' }, 'sandbox ready');
-      return handle;
+      try {
+        // 带卷的沙箱不走预热池：卷挂载只能在创建时生效，池中沙箱没有该用户的挂载。
+        const handle = full.sandboxId
+          ? await this.provider.connect(full.sandboxId, full)
+          : this.warmPool && !full.volumes?.length
+            ? await this.warmPool.acquire()
+            : await this.provider.create(full);
+        if (this.disposed || (this.keyEpochs.get(spec.key) ?? 0) !== epoch) {
+          await this.kill(handle);
+          throw new Error(this.disposed ? 'sandbox manager is disposed' : 'sandbox session is disposed');
+        }
+        const readyAt = this.now();
+        this.entries.set(spec.key, {
+          handle,
+          lastUsed: readyAt,
+          createdAt: readyAt,
+          timeoutMs: effectiveTimeout,
+          spec: full,
+        });
+        log.info({ key: spec.key, sandboxId: handle.sandboxId, mode: full.sandboxId ? 'connect' : 'create' }, 'sandbox ready');
+        return handle;
+      } finally {
+        this.inflightActivity--;
+      }
     })();
 
-    this.inflight.set(spec.key, task);
+    const inflight: InflightEntry = { task, spec: full, epoch };
+    this.inflight.set(spec.key, inflight);
     try {
       return await task;
     } finally {
-      this.inflight.delete(spec.key);
+      if (this.inflight.get(spec.key) === inflight) this.inflight.delete(spec.key);
     }
   }
 
@@ -143,8 +194,14 @@ export class SandboxManager {
   }
 
   /** 列出当前活跃沙箱，供运维页面展示会话绑定关系。 */
-  list(): SandboxSummary[] {
-    return [...this.entries.entries()].map(([key, entry]) => {
+  list(ctx?: RequestContext): SandboxSummary[] {
+    return [...this.entries.entries()]
+      .filter(([, entry]) => {
+        if (!ctx || ctx.role === 'platform_admin') return true;
+        return entry.spec.metadata?.tenantId === ctx.tenantId
+          && entry.spec.metadata?.userId === ctx.userId;
+      })
+      .map(([key, entry]) => {
       const sessionId = entry.spec.metadata?.sessionId ?? key.split(':')[0] ?? key;
       const profile = entry.spec.profile ?? entry.spec.metadata?.profile;
       const capabilities = entry.spec.metadata?.capabilities
@@ -173,54 +230,98 @@ export class SandboxManager {
     });
   }
 
-  /** 回收空闲超时的沙箱；返回被回收的键。 */
-  async sweep(): Promise<string[]> {
+  /** 回收空闲超时的沙箱；重叠调用合并到同一次 kill 清理。 */
+  sweep(): Promise<string[]> {
+    if (!this.sweepPromise) {
+      const task = this.runSweep();
+      this.sweepPromise = task;
+      void task.then(
+        () => { if (this.sweepPromise === task) this.sweepPromise = undefined; },
+        () => { if (this.sweepPromise === task) this.sweepPromise = undefined; },
+      );
+    }
+    return this.sweepPromise;
+  }
+
+  private async runSweep(): Promise<string[]> {
     const cutoff = this.now() - this.idleMs;
     const expired = [...this.entries.entries()].filter(([, e]) => e.lastUsed <= cutoff);
-    await Promise.all(
-      expired.map(async ([key, e]) => {
-        this.entries.delete(key);
-        try {
-          await e.handle.kill();
-        } catch (err) {
-          log.warn({ key, err: String(err) }, 'sandbox kill failed during sweep');
-        }
-        log.info({ key }, 'sandbox reclaimed (idle)');
-      }),
-    );
+    for (const [key] of expired) this.entries.delete(key);
+    await Promise.all(expired.map(async ([key, entry]) => {
+      try {
+        await this.kill(entry.handle);
+      } catch (err) {
+        log.warn({ key, err: String(err) }, 'sandbox kill failed during sweep');
+      }
+      log.info({ key }, 'sandbox reclaimed (idle)');
+    }));
     return expired.map(([key]) => key);
   }
 
-  /** 主动销毁某个沙箱。 */
+  /** 主动销毁某个沙箱；同时使相同 key 的并发创建失效。 */
   async dispose(key: string): Promise<void> {
-    const e = this.entries.get(key);
-    if (!e) return;
+    this.invalidate(key);
+    const entry = this.entries.get(key);
+    if (!entry) return;
     this.entries.delete(key);
-    await e.handle.kill();
+    await this.kill(entry.handle);
   }
 
   /**
    * 销毁某会话名下的全部沙箱（会话关闭时调用）：
    * 默认键 = sessionId，集群键 = `${sessionId}:${cluster}`。单个 kill 失败仅告警，不影响其余。
    */
-  async disposeSession(sessionId: string): Promise<string[]> {
-    const prefix = `${sessionId}:`;
-    const keys = [...this.entries.keys()].filter((k) => k === sessionId || k.startsWith(prefix));
+  async disposeSession(ctx: RequestContext, sessionId: string): Promise<string[]>;
+  async disposeSession(sessionId: string): Promise<string[]>;
+  async disposeSession(ctxOrSessionId: RequestContext | string, requestedSessionId?: string): Promise<string[]> {
+    const ctx = typeof ctxOrSessionId === 'string' ? undefined : ctxOrSessionId;
+    const sessionId = typeof ctxOrSessionId === 'string' ? ctxOrSessionId : requestedSessionId!;
+    const matches = (spec: SandboxSpec) => {
+      if ((spec.metadata?.sessionId ?? spec.key.split(':')[0]) !== sessionId) return false;
+      if (!ctx || ctx.role === 'platform_admin') return true;
+      return spec.metadata?.tenantId === ctx.tenantId && spec.metadata?.userId === ctx.userId;
+    };
+    const keys = new Set([
+      ...[...this.entries.entries()].filter(([, entry]) => matches(entry.spec)).map(([key]) => key),
+      ...[...this.inflight.entries()].filter(([, entry]) => matches(entry.spec)).map(([key]) => key),
+    ]);
     await Promise.all(
-      keys.map((k) =>
+      [...keys].map((k) =>
         this.dispose(k).catch((err) =>
           log.warn({ key: k, err: String(err) }, 'sandbox dispose (session) failed'),
         ),
       ),
     );
-    if (keys.length) log.info({ sessionId, count: keys.length }, 'sandboxes disposed (session closed)');
-    return keys;
+    if (keys.size) log.info({ sessionId, count: keys.size }, 'sandboxes disposed (session closed)');
+    return [...keys];
   }
 
-  /** 销毁全部（进程退出时调用）。 */
-  async disposeAll(): Promise<void> {
+  /** 销毁全部（进程退出时调用）；晚完成的 provider create 会自毁且不写入缓存。 */
+  disposeAll(): Promise<void> {
+    if (!this.disposePromise) this.disposePromise = this.runDisposeAll();
+    return this.disposePromise;
+  }
+
+  private async runDisposeAll(): Promise<void> {
+    this.disposed = true;
+    this.draining = true;
+    for (const key of this.inflight.keys()) this.invalidate(key);
     const all = [...this.entries.values()];
     this.entries.clear();
-    await Promise.all(all.map((e) => e.handle.kill().catch(() => {})));
+    await Promise.all(all.map((entry) => this.kill(entry.handle).catch(() => {})));
+  }
+
+  private invalidate(key: string): void {
+    this.keyEpochs.set(key, (this.keyEpochs.get(key) ?? 0) + 1);
+    this.inflight.delete(key);
+  }
+
+  private async kill(handle: SandboxHandle): Promise<void> {
+    this.cleanupActivity++;
+    try {
+      await handle.kill();
+    } finally {
+      this.cleanupActivity--;
+    }
   }
 }

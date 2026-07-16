@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import type { Server } from 'node:http';
 import { createHttpServer } from '../src/server/http.js';
 import { MemoryStore } from '../src/db/memory.js';
+import type { SandboxSettings } from '../src/db/store.js';
 import { LocalAuthProvider } from '../src/auth/local.js';
 import { ToolRegistry } from '../src/agent/tools.js';
 import { AllowAllPolicy } from '../src/agent/policy.js';
@@ -1117,11 +1118,13 @@ describe('HTTP server', () => {
         expect.objectContaining({ name: 'netdiag', image: 'aiop/opensandbox-netdiag:dev', capabilities: ['kubectl', 'tcpdump'] }),
       ]);
       expect(body.sandboxes).toEqual([
-        expect.objectContaining({ id: 'sandbox-1', sandboxId: 'sandbox-1', key: 'session-a', sessionId: 'session-a', status: 'ready', type: 'session' }),
+        expect.objectContaining({
+          id: 'sandbox-1', sandboxId: 'sandbox-1', sessionId: 'session-a', status: 'ready', type: 'session',
+          metadata: expect.objectContaining({ tenantId: 'default', userId: expect.any(String), sessionId: 'session-a' }),
+        }),
         expect.objectContaining({
           id: 'sandbox-2',
           sandboxId: 'sandbox-2',
-          key: 'session-b:profile:netdiag',
           sessionId: 'session-b',
           status: 'ready',
           type: 'netdiag',
@@ -1861,5 +1864,361 @@ describe('HTTP server 定时任务管理', () => {
       headers: { authorization: `Bearer ${token}` },
     });
     expect(missing.status).toBe(404);
+  });
+});
+
+type SandboxSettingsState = {
+  settings: SandboxSettings;
+  apiKeySet: boolean;
+  runtime?: {
+    enabled: boolean;
+    mode?: SandboxSettings['mode'];
+    status?: string;
+  };
+};
+
+type SandboxSettingsUpdate = {
+  settings: SandboxSettings;
+  keyAction:
+    | { action: 'retain' }
+    | { action: 'replace'; apiKey: string }
+    | { action: 'clear' };
+};
+
+async function createSandboxSettingsHttpServer(options: {
+  initial?: SandboxSettingsState;
+  apply?: (input: SandboxSettingsUpdate) => Promise<SandboxSettingsState>;
+} = {}) {
+  const localStore = new MemoryStore();
+  await localStore.createTenant({ id: 'default', name: 'Default' });
+  const auth = new LocalAuthProvider({ store: localStore, secret: 'sandbox-settings-http-secret' });
+  await auth.createUser('default', 'platform', 'pw', 'platform_admin');
+  await auth.createUser('default', 'tenant', 'pw', 'tenant_admin');
+  const platformToken = (await auth.login('default', 'platform', 'pw'))!;
+  const tenantToken = (await auth.login('default', 'tenant', 'pw'))!;
+  const auditEvents: Array<Record<string, unknown>> = [];
+  let state: SandboxSettingsState = options.initial ?? {
+    settings: { enabled: false, mode: 'local' },
+    apiKeySet: false,
+    runtime: { enabled: false, mode: 'local', status: 'disabled' },
+  };
+  const getSandboxSettings = vi.fn(async () => state);
+  const updateSandbox = vi.fn(async (input: SandboxSettingsUpdate) => {
+    if (options.apply) return options.apply(input);
+    state = {
+      settings: input.settings,
+      apiKeySet: input.keyAction.action === 'replace'
+        ? true
+        : input.keyAction.action === 'clear'
+          ? false
+          : state.apiKeySet,
+      runtime: {
+        enabled: input.settings.enabled,
+        mode: input.settings.mode,
+        status: input.settings.enabled ? 'active' : 'disabled',
+      },
+    };
+    return state;
+  });
+  const rt = {
+    model,
+    tools: new ToolRegistry(),
+    store: localStore,
+    audit: { record: async (event: Record<string, unknown>) => { auditEvents.push(event); } },
+    policy: new AllowAllPolicy(),
+    policyPreApproved: new AllowAllPolicy(),
+    authProvider: auth,
+    jwtSecret: 'sandbox-settings-http-secret',
+    systemExtra: '',
+    defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    getSandboxSettings,
+    updateSandbox,
+  } as unknown as Runtime;
+  const localServer = createHttpServer(rt);
+  await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve));
+  const localBase = `http://127.0.0.1:${(localServer.address() as AddressInfo).port}`;
+  return {
+    base: localBase,
+    platformToken,
+    tenantToken,
+    auditEvents,
+    getSandboxSettings,
+    updateSandbox,
+    close: () => new Promise<void>((resolve) => localServer.close(() => resolve())),
+  };
+}
+
+describe('HTTP server 平台 Sandbox 设置', () => {
+  it('allows only platform admins and returns platform-scoped non-secret settings', async () => {
+    const fixture = await createSandboxSettingsHttpServer({
+      initial: {
+        settings: {
+          enabled: true,
+          mode: 'aios_lifecycle',
+          lifecycleUrl: 'https://sandbox.example.test/lifecycle',
+          placement: { clusterId: 'local', namespace: 'sandbox-system' },
+        },
+        apiKeySet: true,
+        runtime: { enabled: true, mode: 'aios_lifecycle', status: 'active' },
+        apiKey: 'hidden-value',
+        encryptedApiKey: 'hidden-envelope',
+      } as SandboxSettingsState,
+    });
+    try {
+      const denied = await fetch(`${fixture.base}/v1/settings/sandbox`, {
+        headers: { authorization: `Bearer ${fixture.tenantToken}` },
+      });
+      expect(denied.status).toBe(403);
+
+      const response = await fetch(`${fixture.base}/v1/settings/sandbox`, {
+        headers: { authorization: `Bearer ${fixture.platformToken}` },
+      });
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      expect(JSON.parse(text)).toEqual({
+        scope: 'platform',
+        settings: {
+          enabled: true,
+          mode: 'aios_lifecycle',
+          lifecycle_url: 'https://sandbox.example.test/lifecycle',
+          placement: { cluster_id: 'local', namespace: 'sandbox-system' },
+          api_key_set: true,
+        },
+        runtime: { enabled: true, mode: 'aios_lifecycle', status: 'active' },
+      });
+      expect(text).not.toContain('hidden-value');
+      expect(text).not.toContain('hidden-envelope');
+      expect(text).not.toContain('api_key_preview');
+      expect(text).not.toContain('encrypted');
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it('parses all four modes and translates mode-specific fields', async () => {
+    const fixture = await createSandboxSettingsHttpServer();
+    const headers = {
+      'content-type': 'application/json',
+      authorization: `Bearer ${fixture.platformToken}`,
+    };
+    try {
+      const inputs = [
+        {
+          body: { enabled: true, mode: 'standard_e2b', domain: 'E2B.EXAMPLE.TEST', api_key: 'standard-key' },
+          settings: { enabled: true, mode: 'standard_e2b', domain: 'e2b.example.test' },
+        },
+        {
+          body: {
+            enabled: true,
+            mode: 'aios_lifecycle',
+            lifecycle_url: 'https://AIOS.EXAMPLE.TEST/lifecycle/',
+            placement: { cluster_id: 'cluster-a', namespace: 'sandbox-system' },
+            api_key: 'aios-key',
+          },
+          settings: {
+            enabled: true,
+            mode: 'aios_lifecycle',
+            lifecycleUrl: 'https://aios.example.test/lifecycle',
+            placement: { clusterId: 'cluster-a', namespace: 'sandbox-system' },
+          },
+        },
+        {
+          body: {
+            enabled: true,
+            mode: 'opensandbox',
+            domain: 'OPEN.EXAMPLE.TEST:8080',
+            protocol: 'https',
+            default_image: 'code-image',
+          },
+          settings: {
+            enabled: true,
+            mode: 'opensandbox',
+            domain: 'open.example.test:8080',
+            protocol: 'https',
+            defaultImage: 'code-image',
+          },
+        },
+        {
+          body: { enabled: false, mode: 'local' },
+          settings: { enabled: false, mode: 'local' },
+        },
+      ] as const;
+
+      for (const input of inputs) {
+        const response = await fetch(`${fixture.base}/v1/settings/sandbox`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(input.body),
+        });
+        expect(response.status).toBe(200);
+        expect(fixture.updateSandbox.mock.calls.at(-1)?.[0].settings).toEqual(input.settings);
+        const text = await response.text();
+        expect(text).not.toContain('api_key_preview');
+        expect(text).not.toContain('standard-key');
+        expect(text).not.toContain('aios-key');
+      }
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it('enforces retain, replace, and explicit clear key semantics', async () => {
+    const fixture = await createSandboxSettingsHttpServer({
+      initial: {
+        settings: { enabled: false, mode: 'standard_e2b', domain: 'e2b.example.test' },
+        apiKeySet: true,
+      },
+    });
+    const post = (body: Record<string, unknown>) => fetch(`${fixture.base}/v1/settings/sandbox`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${fixture.platformToken}`,
+      },
+      body: JSON.stringify(body),
+    });
+    try {
+      expect((await post({ enabled: false, mode: 'standard_e2b', domain: 'e2b.example.test' })).status).toBe(200);
+      expect(fixture.updateSandbox.mock.calls.at(-1)?.[0].keyAction).toEqual({ action: 'retain' });
+
+      expect((await post({
+        enabled: true,
+        mode: 'standard_e2b',
+        domain: 'e2b.example.test',
+        api_key: 'replacement-key',
+      })).status).toBe(200);
+      expect(fixture.updateSandbox.mock.calls.at(-1)?.[0].keyAction).toEqual({
+        action: 'replace',
+        apiKey: 'replacement-key',
+      });
+
+      expect((await post({ enabled: false, mode: 'standard_e2b', domain: 'e2b.example.test', clear_api_key: true })).status).toBe(200);
+      expect(fixture.updateSandbox.mock.calls.at(-1)?.[0].keyAction).toEqual({ action: 'clear' });
+
+      const calls = fixture.updateSandbox.mock.calls.length;
+      expect((await post({ enabled: false, mode: 'local', api_key: '' })).status).toBe(400);
+      expect((await post({ enabled: false, mode: 'local', api_key: 'new-key' })).status).toBe(400);
+      expect((await post({ enabled: false, mode: 'local', api_key: 'new-key', clear_api_key: true })).status).toBe(400);
+      expect((await post({
+        enabled: true,
+        mode: 'standard_e2b',
+        domain: 'e2b.example.test',
+        clear_api_key: true,
+      })).status).toBe(400);
+      expect((await post({
+        enabled: true,
+        mode: 'aios_lifecycle',
+        lifecycle_url: 'https://sandbox.example.test/lifecycle',
+        placement: { cluster_id: 'local', namespace: 'sandbox-system' },
+        clear_api_key: true,
+      })).status).toBe(400);
+      expect(fixture.updateSandbox).toHaveBeenCalledTimes(calls);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it('rejects mixed fields and returns safe apply errors without changing the old state', async () => {
+    const oldState: SandboxSettingsState = {
+      settings: { enabled: false, mode: 'local' },
+      apiKeySet: false,
+      runtime: { enabled: false, mode: 'local', status: 'disabled' },
+    };
+    const fixture = await createSandboxSettingsHttpServer({
+      initial: oldState,
+      apply: async () => { throw new Error('persistence failed with internal detail'); },
+    });
+    const headers = {
+      'content-type': 'application/json',
+      authorization: `Bearer ${fixture.platformToken}`,
+    };
+    try {
+      const mixed = await fetch(`${fixture.base}/v1/settings/sandbox`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ enabled: false, mode: 'local', lifecycle_url: 'https://unexpected.example.test' }),
+      });
+      expect(mixed.status).toBe(400);
+      expect(fixture.updateSandbox).not.toHaveBeenCalled();
+
+      const failed = await fetch(`${fixture.base}/v1/settings/sandbox`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ enabled: false, mode: 'opensandbox', domain: 'new.example.test' }),
+      });
+      expect(failed.status).toBe(500);
+      const failedText = await failed.text();
+      expect(failedText).toContain('沙箱配置应用失败');
+      expect(failedText).not.toContain('internal detail');
+
+      const reread = await fetch(`${fixture.base}/v1/settings/sandbox`, {
+        headers: { authorization: `Bearer ${fixture.platformToken}` },
+      });
+      expect(await reread.json()).toMatchObject({ scope: 'platform', settings: { enabled: false, mode: 'local' } });
+      expect(fixture.auditEvents).toHaveLength(0);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it('maps endpoint-binding validation to 400 and audits only non-sensitive details on success', async () => {
+    const fixture = await createSandboxSettingsHttpServer({
+      initial: {
+        settings: { enabled: false, mode: 'standard_e2b', domain: 'old.example.test' },
+        apiKeySet: true,
+      },
+      apply: async (input) => {
+        if (input.keyAction.action === 'retain') {
+          throw new Error('Sandbox 凭据目标已变化，请重新输入或清除 API key');
+        }
+        return {
+          settings: input.settings,
+          apiKeySet: true,
+          runtime: { enabled: input.settings.enabled, mode: input.settings.mode, status: 'active' },
+        };
+      },
+    });
+    const headers = {
+      'content-type': 'application/json',
+      authorization: `Bearer ${fixture.platformToken}`,
+    };
+    try {
+      const rejected = await fetch(`${fixture.base}/v1/settings/sandbox`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ enabled: false, mode: 'standard_e2b', domain: 'new.example.test' }),
+      });
+      expect(rejected.status).toBe(400);
+      expect(await rejected.json()).toEqual({ error: 'Sandbox 凭据目标已变化，请重新输入或清除 API key' });
+
+      const replaced = await fetch(`${fixture.base}/v1/settings/sandbox`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          enabled: true,
+          mode: 'aios_lifecycle',
+          lifecycle_url: 'https://sandbox.example.test/lifecycle',
+          placement: { cluster_id: 'cluster-a', namespace: 'sandbox-system' },
+          api_key: 'replacement-key',
+        }),
+      });
+      expect(replaced.status).toBe(200);
+      expect(fixture.auditEvents).toHaveLength(1);
+      expect(fixture.auditEvents[0]).toMatchObject({
+        kind: 'sandbox',
+        action: 'sandbox-settings-updated',
+        tenantId: 'default',
+        detail: {
+          enabled: true,
+          mode: 'aios_lifecycle',
+          endpoint: 'https://sandbox.example.test/lifecycle',
+          placement: { clusterId: 'cluster-a', namespace: 'sandbox-system' },
+          keyAction: 'replace',
+        },
+      });
+      expect(JSON.stringify(fixture.auditEvents)).not.toContain('replacement-key');
+    } finally {
+      await fixture.close();
+    }
   });
 });

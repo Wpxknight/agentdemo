@@ -685,6 +685,53 @@ describe('frontend API wiring', () => {
     expect(app).toContain('暂无已连接的 MCP 工具');
     expect(app).toContain('disabled={!hasTools}');
   });
+
+  it('configures all sandbox modes without exposing persisted keys', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const types = await readFile('web/src/types.ts', 'utf8');
+
+    expect(types).toContain("export type SandboxSettingsMode = 'standard_e2b' | 'aios_lifecycle' | 'opensandbox' | 'local'");
+    const sandboxSettingsType = types.match(/export interface SandboxSettingsInfo \{[\s\S]*?\n\}/)?.[0] || '';
+    expect(sandboxSettingsType).toContain('api_key_set: boolean;');
+    expect(sandboxSettingsType).not.toContain('api_key_preview');
+    expect(app).toContain("api.get<SandboxSettingsBody>('/v1/settings/sandbox')");
+    expect(app).toContain("api.post<SandboxSettingsBody>('/v1/settings/sandbox'");
+    expect(app).toContain('<SelectItem value="standard_e2b">标准 E2B</SelectItem>');
+    expect(app).toContain('<SelectItem value="aios_lifecycle">AIOS Lifecycle</SelectItem>');
+    expect(app).toContain('<SelectItem value="opensandbox">OpenSandbox（k8s）</SelectItem>');
+    expect(app).toContain('<SelectItem value="local">Local（本地开发）</SelectItem>');
+    expect(app).toContain('Lifecycle URL');
+    expect(app).toContain('Cluster ID');
+    expect(app).toContain('Namespace');
+    expect(app).toContain('固定使用 code-interpreter');
+    expect(app).toContain('type="password"');
+    expect(app).toContain('autoComplete="new-password"');
+    expect(app).toContain("info?.api_key_set ? '已配置' : '未配置'");
+    expect(app).not.toContain('api_key_preview');
+  });
+
+  it('requires explicit confirmation before clearing a sandbox key', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(app).toContain('requestClearApiKey');
+    expect(app).toContain("title: '清除沙箱 API Key？'");
+    expect(app).toContain("confirmLabel: '确认清除'");
+    expect(app).toContain('clear_api_key: true');
+    expect(app).toContain('function sandboxClearPayload(form: SandboxSettingsForm)');
+    expect(app).toContain('const { api_key: _apiKey, ...payload } = sandboxSettingsPayload(form);');
+    expect(app).toContain('onRequestConfirm={requestConfirmDialog}');
+    expect(app).toContain('disabled={busy || !info}');
+  });
+
+  it('guards platform sandbox credentials when the binding target changes', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(app).toContain("const isPlatformAdmin = me?.role === 'platform_admin'");
+    expect(app).toContain('{isPlatformAdmin ? <TabsTrigger value="sandbox">沙箱</TabsTrigger> : null}');
+    expect(app).toContain('sandboxCredentialTarget');
+    expect(app).toContain('凭据目标已变更，请重新输入 API Key 或先明确清除旧 Key');
+    expect(app).toContain('sandboxClearPayload(form)');
+  });
 });
 
 describe('frontend data APIs', () => {
