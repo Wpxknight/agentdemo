@@ -75,6 +75,7 @@ import type {
   SkillFileEntry,
   SkillsImportBody,
   SessionMessagesBody,
+  SessionTokenUsageBody,
   SessionSummary,
   SessionsBody,
   TaskRun,
@@ -129,7 +130,7 @@ function jwtExpiryMs(token: string): number | undefined {
 const logoUrl = '/assets/logo.jpg';
 const aiAvatarUrl = logoUrl;
 const userAvatarUrl = '/assets/user-avatar.jpg';
-const SESSION_PAGE_SIZE = 10;
+const SESSION_PAGE_SIZE = 8;
 
 type ConfirmDialogTone = 'danger' | 'warning' | 'info';
 
@@ -232,11 +233,14 @@ function formatContextUsage(usage?: ContextUsageBody): string {
   return `${formatTokenCount(usage?.usedTokens ?? 0)}/${formatTokenCount(usage?.maxTokens ?? 200000)}`;
 }
 
-/** 会话累计成本（美元）：小额用更多小数位，避免显示成 $0.00。 */
-function formatCostUsd(value: number): string {
-  if (!Number.isFinite(value) || value <= 0) return '$0';
-  if (value < 0.01) return `$${value.toFixed(4)}`;
-  return `$${value.toFixed(2)}`;
+function formatElapsedTime(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = seconds % 60;
+  return hours > 0
+    ? `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`
+    : `${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`;
 }
 
 function toolCategory(name: string): string {
@@ -903,7 +907,8 @@ export default function App() {
   const [sessionId, setSessionId] = useState(() => readStorage('aiop_session_id') || numericSessionId());
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [contextUsage, setContextUsage] = useState<Record<string, ContextUsageBody>>({});
-  const [sessionCostUsd, setSessionCostUsd] = useState<Record<string, number>>({});
+  const [sessionTokenUsage, setSessionTokenUsage] = useState<Record<string, number>>({});
+  const [runStartedAt, setRunStartedAt] = useState<Record<string, number>>({});
   const [pendingQuestions, setPendingQuestions] = useState<Record<string, PendingQuestion>>({});
   const [tools, setTools] = useState<ToolSummary[]>([]);
   const [tasks, setTasks] = useState<ScheduledTask[]>([]);
@@ -1025,7 +1030,8 @@ export default function App() {
         setSessionMessageCache({});
         // 会话列表不在这里清：loadPageData 已用新 token 拉取新用户自己的列表，清空反而会与之竞态。
         setContextUsage({});
-        setSessionCostUsd({});
+        setSessionTokenUsage({});
+        setRunStartedAt({});
         setPendingQuestions({});
         setActiveRunSessionIds(new Set());
         setAttachments([]);
@@ -1133,10 +1139,23 @@ export default function App() {
     }
   }, [api]);
 
+  const loadSessionTokenUsage = useCallback(async (nextSessionId: string) => {
+    if (!nextSessionId) return;
+    try {
+      const body = await api.get<SessionTokenUsageBody>(`/v1/sessions/${encodeURIComponent(nextSessionId)}/usage`);
+      setSessionTokenUsage((current) => ({ ...current, [nextSessionId]: Math.max(0, body.totalTokens) }));
+    } catch (err) {
+      console.error(err);
+    }
+  }, [api]);
+
   useEffect(() => {
     if (!token || !sessionId) return;
     void loadContextUsage(sessionId);
-  }, [loadContextUsage, sessionId, token]);
+    if (sessions.some((session) => session.sessionId === sessionId)) {
+      void loadSessionTokenUsage(sessionId);
+    }
+  }, [loadContextUsage, loadSessionTokenUsage, sessionId, sessions, token]);
 
   const loadPageData = useCallback(async (target: PageId | 'login' = page) => {
     if (!token || target === 'login') return;
@@ -1219,12 +1238,14 @@ export default function App() {
         showSessionMessages(session.sessionId, cachedMessages);
         setAttachments([]);
         void loadContextUsage(session.sessionId);
+        void loadSessionTokenUsage(session.sessionId);
         return;
       }
       const body = await api.get<SessionMessagesBody>(`/v1/sessions/${encodeURIComponent(session.sessionId)}/messages`);
       showSessionMessages(session.sessionId, sessionMessagesToChatMessages(body));
       setAttachments([]);
       void loadContextUsage(session.sessionId);
+      void loadSessionTokenUsage(session.sessionId);
     } catch (err) {
       setMessages([{
         id: randomId(),
@@ -1243,6 +1264,7 @@ export default function App() {
       ...current,
       [id]: { sessionId: id, usedTokens: 0, maxTokens: llm.context_window_tokens || 200000, estimated: true },
     }));
+    setSessionTokenUsage((current) => ({ ...current, [id]: 0 }));
     try {
       await api.post<{ session: SessionsBody['sessions'][number] }>('/v1/sessions', {
         sessionId: id,
@@ -1250,6 +1272,7 @@ export default function App() {
       });
       await fetchSessionsPage(0);
       void loadContextUsage(id);
+      void loadSessionTokenUsage(id);
     } catch (err) {
       setMessages((current) => [...current, {
         id: randomId(),
@@ -1412,6 +1435,8 @@ export default function App() {
     updateSessionMessages(requestSessionId, (current) => [...current, assistant]);
     setRunningAgentCount((current) => current + 1);
     setActiveRunSessionIds((current) => new Set(current).add(requestSessionId));
+    const startedAt = Date.now();
+    setRunStartedAt((current) => ({ ...current, [requestSessionId]: startedAt }));
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -1446,6 +1471,16 @@ export default function App() {
                   || (sessionIdRef.current === previousSessionId ? messagesRef.current : undefined);
                 return previousMessages ? { ...current, [activeSessionId]: previousMessages } : current;
               });
+              setRunStartedAt((current) => {
+                const next = { ...current, [activeSessionId]: current[previousSessionId] ?? startedAt };
+                delete next[previousSessionId];
+                return next;
+              });
+              setSessionTokenUsage((current) => {
+                const next = { ...current, [activeSessionId]: current[previousSessionId] ?? current[activeSessionId] ?? 0 };
+                delete next[previousSessionId];
+                return next;
+              });
             }
             activateSession(event.data.sessionId);
             setActiveRunSessionIds((current) => new Set(current).add(event.data!.sessionId as string));
@@ -1459,6 +1494,18 @@ export default function App() {
             assistant.text += event.data.text;
             assistant.retrying = undefined;
             publishAssistant();
+          }
+          if (
+            event?.event === 'usage'
+            && typeof event.data?.inputTokens === 'number'
+            && typeof event.data?.outputTokens === 'number'
+          ) {
+            const inputTokens = Math.max(0, event.data.inputTokens);
+            const outputTokens = Math.max(0, event.data.outputTokens);
+            setSessionTokenUsage((current) => ({
+              ...current,
+              [activeSessionId]: (current[activeSessionId] ?? 0) + inputTokens + outputTokens,
+            }));
           }
           if (event?.event === 'model_retry' && typeof event.data?.attempt === 'number') {
             // 重试会整轮重放：回滚失败尝试已流式展示的部分输出，丢弃未执行的工具步骤
@@ -1567,10 +1614,6 @@ export default function App() {
             if (nextContext) {
               setContextUsage((current) => ({ ...current, [event.data!.sessionId as string]: nextContext }));
             }
-            const cost = (event.data as { cost?: { costUsd?: number } }).cost;
-            if (typeof cost?.costUsd === 'number') {
-              setSessionCostUsd((current) => ({ ...current, [event.data!.sessionId as string]: cost.costUsd as number }));
-            }
           }
         }
       }
@@ -1592,8 +1635,15 @@ export default function App() {
         next.delete(activeSessionId);
         return next;
       });
+      setRunStartedAt((current) => {
+        const next = { ...current };
+        delete next[requestSessionId];
+        delete next[activeSessionId];
+        return next;
+      });
       await refreshSessions();
       await loadContextUsage(activeSessionId);
+      await loadSessionTokenUsage(activeSessionId);
     }
   }
 
@@ -1797,7 +1847,8 @@ export default function App() {
           sessionPageCount={Math.max(1, Math.ceil(sessionTotal / SESSION_PAGE_SIZE))}
           selectedSessionId={sessionId}
           contextUsage={contextUsage[sessionId]}
-          sessionCostUsd={sessionCostUsd[sessionId]}
+          totalTokens={sessionTokenUsage[sessionId] ?? 0}
+          runStartedAt={runStartedAt[sessionId]}
           pendingQuestion={pendingQuestions[sessionId]}
           onAnswerQuestion={submitQuestionAnswer}
           messages={messages}
@@ -1971,7 +2022,8 @@ function PrototypeChatShell(props: {
   sessionPageCount: number;
   selectedSessionId: string;
   contextUsage?: ContextUsageBody;
-  sessionCostUsd?: number;
+  totalTokens: number;
+  runStartedAt?: number;
   pendingQuestion?: PendingQuestion;
   onAnswerQuestion: (pending: PendingQuestion, answers: Record<string, string[]>) => void;
   messages: ChatMessage[];
@@ -2031,10 +2083,12 @@ function PrototypeChatShell(props: {
         ) : null}
         <main className="prototype-chat-center">
           <PrototypeChatHeader
-            runningAgentCount={props.runningAgentCount}
-            terminatingSession={props.terminatingSession}
             contextUsage={props.contextUsage}
-            sessionCostUsd={props.sessionCostUsd}
+            totalTokens={props.totalTokens}
+            runStartedAt={props.runStartedAt}
+            terminatingSession={props.terminatingSession}
+            historyOpen={props.historyOpen}
+            previewOpen={props.previewOpen}
             onNewSession={props.onNewSession}
             onRequestStopSession={props.onRequestStopSession}
             onToggleHistory={props.onToggleHistory}
@@ -2291,34 +2345,66 @@ function PrototypeSessionPanel({ sessions, total, page, pageCount, selectedSessi
 }
 
 function PrototypeChatHeader(props: {
-  runningAgentCount: number;
-  terminatingSession: boolean;
   contextUsage?: ContextUsageBody;
-  sessionCostUsd?: number;
+  totalTokens: number;
+  runStartedAt?: number;
+  terminatingSession: boolean;
+  historyOpen: boolean;
+  previewOpen: boolean;
   onNewSession: () => void;
   onRequestStopSession: () => void;
   onToggleHistory: () => void;
   onTogglePreview: () => void;
 }) {
-  const canTerminate = props.runningAgentCount > 0 && !props.terminatingSession;
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    setNow(Date.now());
+    if (!props.runStartedAt) return undefined;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [props.runStartedAt]);
+  const canTerminate = Boolean(props.runStartedAt) && !props.terminatingSession;
+  const historyToggleLabel = props.historyOpen ? '收起左侧会话栏' : '展开左侧会话栏';
+  const previewToggleLabel = props.previewOpen ? '收起右侧沙箱栏' : '展开右侧沙箱栏';
   return (
     <div className="prototype-chat-header">
       <div>
-        <h1>AI 助手</h1>
+        <h1>智能助手</h1>
         <span>
           <i />
-          {props.runningAgentCount ? `${props.runningAgentCount} 个任务运行中` : '就绪'}
-          <b>上下文 {formatContextUsage(props.contextUsage)}</b>
-          {typeof props.sessionCostUsd === 'number' ? <b>成本 {formatCostUsd(props.sessionCostUsd)}</b> : null}
+          <em className="prototype-status-desktop">
+            {props.runStartedAt ? '运行中' : '就绪'}
+          </em>
+          <em className="prototype-status-mobile">
+            {props.runStartedAt ? '运行中' : '就绪'}
+          </em>
+          {props.runStartedAt ? (
+            <b className="prototype-run-time">{formatElapsedTime(now - props.runStartedAt)}</b>
+          ) : null}
+          <b className="prototype-chat-metric">上下文 {formatContextUsage(props.contextUsage)}</b>
+          <b className="prototype-chat-metric">
+            <em>总消耗</em>
+            {' '}{formatTokenCount(props.totalTokens)}
+          </b>
         </span>
       </div>
       <div className="prototype-chat-actions">
-        <button type="button" onClick={props.onToggleHistory} aria-label="切换会话列表">
-          <PanelLeftClose />
-        </button>
-        <button type="button" onClick={props.onTogglePreview} aria-label="切换沙箱">
-          <PanelRightClose />
-        </button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button type="button" onClick={props.onToggleHistory} aria-label={historyToggleLabel}>
+              <PanelLeftClose />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">{historyToggleLabel}</TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button type="button" onClick={props.onTogglePreview} aria-label={previewToggleLabel}>
+              <PanelRightClose />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">{previewToggleLabel}</TooltipContent>
+        </Tooltip>
         <button
           type="button"
           className="danger"
@@ -2863,13 +2949,22 @@ function Messages({ messages }: { messages: ChatMessage[] }) {
 
 function AttachmentChips({ attachments, onRemove }: { attachments: Attachment[]; onRemove?: (id: string) => void }) {
   const images = attachments.filter((file) => file.type.startsWith('image/') && file.data);
+  const files = attachments.filter((file) => !file.type.startsWith('image/') || !file.data);
   return (
     <div className="attachment-list">
       {/* 图片附件直接内联缩略图（可点击放大）；其余仍以文件名 chip 展示 */}
       {images.map((file) => (
-        <ZoomableImage key={`img-${file.id}`} src={file.data} alt={file.name} />
+        <figure className="attachment-image-card" key={`img-${file.id}`} title={file.name}>
+          <ZoomableImage src={file.data} alt={file.name} />
+          <figcaption>{file.name}</figcaption>
+          {onRemove ? (
+            <button className="attachment-image-remove" type="button" onClick={() => onRemove(file.id)} aria-label={`移除 ${file.name}`}>
+              <Trash2 />
+            </button>
+          ) : null}
+        </figure>
       ))}
-      {attachments.map((file) => (
+      {files.map((file) => (
         <span className="attachment-chip" key={file.id} title={file.name}>
           <Paperclip />
           <span>{file.name}</span>
@@ -3942,6 +4037,64 @@ const CRON_PRESETS = [
   { label: '每周一 09:00', value: '0 9 * * 1' },
 ];
 
+function ScheduleTaskForm({
+  title,
+  task,
+  cron,
+  preApproved,
+  busy,
+  status,
+  submitLabel,
+  onTitleChange,
+  onTaskChange,
+  onCronChange,
+  onPreApprovedChange,
+  onSubmit,
+  onCancel,
+}: {
+  title: string;
+  task: string;
+  cron: string;
+  preApproved: boolean;
+  busy: boolean;
+  status?: string;
+  submitLabel: string;
+  onTitleChange: (value: string) => void;
+  onTaskChange: (value: string) => void;
+  onCronChange: (value: string) => void;
+  onPreApprovedChange: (value: boolean) => void;
+  onSubmit: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="schedule-task-form">
+      <Label>任务标题<Input placeholder="如：每日集群巡检" value={title} disabled={busy} onChange={(event) => onTitleChange(event.target.value)} /></Label>
+      <Label>任务描述<Textarea placeholder="描述你要定时执行的任务..." value={task} disabled={busy} onChange={(event) => onTaskChange(event.target.value)} /></Label>
+      <Label>执行计划（cron，UTC）
+        <Select disabled={busy} value={CRON_PRESETS.some((preset) => preset.value === cron) ? cron : 'custom'} onValueChange={(value) => { if (value !== 'custom') onCronChange(value); }}>
+          <SelectTrigger><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectGroup>
+              {CRON_PRESETS.map((preset) => <SelectItem key={preset.value} value={preset.value}>{preset.label}</SelectItem>)}
+              <SelectItem value="custom">自定义</SelectItem>
+            </SelectGroup>
+          </SelectContent>
+        </Select>
+        <Input value={cron} disabled={busy} spellCheck={false} placeholder='如 "0 2 * * *"' onChange={(event) => onCronChange(event.target.value)} />
+      </Label>
+      <label className="schedule-preapproved">
+        <input type="checkbox" checked={preApproved} disabled={busy} onChange={(event) => onPreApprovedChange(event.target.checked)} />
+        <span>预批准（无人值守自动通过生产审批，需管理员）</span>
+      </label>
+      {status ? <p className="empty-hint">{status}</p> : null}
+      <div className="form-actions">
+        <Button type="button" disabled={busy} onClick={onSubmit}>{busy ? '处理中...' : submitLabel}</Button>
+        <Button variant="outline" type="button" disabled={busy} onClick={onCancel}>取消</Button>
+      </div>
+    </div>
+  );
+}
+
 function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
   tasks: ScheduledTask[];
   api: ReturnType<typeof createApi>;
@@ -3965,9 +4118,10 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
   const [editTitle, setEditTitle] = useState('');
   const [editTask, setEditTask] = useState('');
   const [editCron, setEditCron] = useState('');
+  const [editPreApproved, setEditPreApproved] = useState(false);
   const pollTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const selectedTask = tasks.find((task) => task.id === selectedTaskId);
-  const selectedRun = runs.find((run) => run.id === selectedRunId) || runs[0];
+  const selectedRun = runs.find((run) => run.id === selectedRunId);
   // 执行记录客户端分页：默认每页 5 条
   const runsPageCount = Math.max(1, Math.ceil(runs.length / RUNS_PAGE_SIZE));
   const pagedRuns = runs.slice((runsPage - 1) * RUNS_PAGE_SIZE, runsPage * RUNS_PAGE_SIZE);
@@ -3996,7 +4150,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
       const body = await api.get<ScheduleRunsBody>(`/v1/schedule/${selectedTask.id}/runs`);
       const next = body.runs || [];
       setRuns(next);
-      setSelectedRunId((current) => (current !== undefined && next.some((run) => run.id === current) ? current : next[0]?.id));
+      setSelectedRunId((current) => (current !== undefined && next.some((run) => run.id === current) ? current : undefined));
       setRunsStatus(next.length ? '' : '暂无执行结果');
       return next;
     } catch (err) {
@@ -4115,6 +4269,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
     setEditTitle(task.title || '');
     setEditTask(task.task);
     setEditCron(task.cron);
+    setEditPreApproved(Boolean(task.preApproved));
     setEditing(true);
   }
 
@@ -4126,7 +4281,12 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
     }
     setBusy(true);
     try {
-      await api.patch(`/v1/schedule/${task.id}`, { title: editTitle.trim(), task: editTask.trim(), cron: editCron.trim() });
+      await api.patch(`/v1/schedule/${task.id}`, {
+        title: editTitle.trim(),
+        task: editTask.trim(),
+        cron: editCron.trim(),
+        preApproved: editPreApproved,
+      });
       setPageStatus(`已更新任务 #${task.id}`);
       setEditing(false);
       onChanged();
@@ -4148,30 +4308,22 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
           </Button>
         </div>
         <Card className="schedule-form-card">
-          <CardContent className="settings-form">
-            <Label>任务标题<Input placeholder="如：每日集群巡检" value={newTitle} onChange={(event) => setNewTitle(event.target.value)} /></Label>
-            <Label>任务描述<Textarea placeholder="描述你要定时执行的任务..." value={newTask} onChange={(event) => setNewTask(event.target.value)} /></Label>
-            <Label>执行计划（cron，UTC）
-              <Select value={CRON_PRESETS.some((p) => p.value === newCron) ? newCron : 'custom'} onValueChange={(value) => { if (value !== 'custom') setNewCron(value); }}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectGroup>
-                    {CRON_PRESETS.map((preset) => <SelectItem key={preset.value} value={preset.value}>{preset.label}</SelectItem>)}
-                    <SelectItem value="custom">自定义</SelectItem>
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
-              <Input value={newCron} spellCheck={false} placeholder='如 "0 2 * * *"' onChange={(event) => setNewCron(event.target.value)} />
-            </Label>
-            <label className="schedule-preapproved">
-              <input type="checkbox" checked={newPreApproved} onChange={(event) => setNewPreApproved(event.target.checked)} />
-              预批准（无人值守自动通过生产审批，需管理员）
-            </label>
-            {pageStatus ? <p className="empty-hint">{pageStatus}</p> : null}
-            <div className="form-actions">
-              <Button type="button" disabled={busy} onClick={() => void createTask()}>{busy ? '处理中...' : '创建任务'}</Button>
-              <Button variant="outline" type="button" disabled={busy} onClick={() => { setPageStatus(''); setView('list'); }}>取消</Button>
-            </div>
+          <CardContent>
+            <ScheduleTaskForm
+              title={newTitle}
+              task={newTask}
+              cron={newCron}
+              preApproved={newPreApproved}
+              busy={busy}
+              status={pageStatus}
+              submitLabel="创建任务"
+              onTitleChange={setNewTitle}
+              onTaskChange={setNewTask}
+              onCronChange={setNewCron}
+              onPreApprovedChange={setNewPreApproved}
+              onSubmit={() => void createTask()}
+              onCancel={() => { setPageStatus(''); setView('list'); }}
+            />
           </CardContent>
         </Card>
       </>
@@ -4200,80 +4352,117 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
             {selectedTask.title ? <CardDescription>任务描述：{selectedTask.task}</CardDescription> : null}
           </CardHeader>
           <CardContent>
-            <div className="skill-detail-actions schedule-actions">
-              <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => void runNow(selectedTask)}>
-                <Play data-icon="inline-start" />
-                立即执行
-              </Button>
-              <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => void toggleEnabled(selectedTask)}>
-                {selectedTask.enabled ? <CircleStop data-icon="inline-start" /> : <Check data-icon="inline-start" />}
-                {selectedTask.enabled ? '暂停' : '启用'}
-              </Button>
-              <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => (editing ? setEditing(false) : startEdit(selectedTask))}>
-                <SquarePen data-icon="inline-start" />
-                {editing ? '取消编辑' : '编辑'}
-              </Button>
-              <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => requestDelete(selectedTask)}>
-                <Trash2 data-icon="inline-start" />
-                删除
-              </Button>
-              <Button variant="outline" size="sm" type="button" onClick={() => void loadRuns()}>
-                <RefreshCcw data-icon="inline-start" />
-                刷新
-              </Button>
-            </div>
-            {editing ? (
-              <div className="schedule-edit-form">
-                <Label>任务标题<Input value={editTitle} placeholder="如：每日集群巡检" onChange={(event) => setEditTitle(event.target.value)} /></Label>
-                <Label>任务描述<Textarea value={editTask} onChange={(event) => setEditTask(event.target.value)} /></Label>
-                <Label>cron（UTC）<Input value={editCron} spellCheck={false} onChange={(event) => setEditCron(event.target.value)} /></Label>
-                <Button type="button" size="sm" disabled={busy} onClick={() => void saveEdit(selectedTask)}>保存</Button>
-              </div>
-            ) : null}
-            <h3 className="schedule-runs-title">执行记录</h3>
-            <Table>
-              <TableHeader>
-                <TableRow>{['时间', '状态', '步骤'].map((header) => <TableHead key={header}>{header}</TableHead>)}</TableRow>
-              </TableHeader>
-              <TableBody>
-                {pagedRuns.map((run, index) => (
-                  <TableRow key={run.id ?? `${run.taskId}-${index}`} data-state={run === selectedRun ? 'selected' : undefined}>
-                    <TableCell>
-                      <button
-                        className="schedule-run-button"
-                        type="button"
-                        onClick={() => {
-                          if (run.id === undefined) return;
+            <Tabs defaultValue="task" className="sandbox-page-tabs schedule-detail-tabs">
+              <TabsList>
+                <TabsTrigger value="task">任务详情</TabsTrigger>
+                <TabsTrigger value="runs">执行记录</TabsTrigger>
+              </TabsList>
+              <TabsContent value="task">
+                <div className="schedule-task-summary kv">
+                  <span>任务标题</span><strong>{selectedTask.title || '-'}</strong>
+                  <span>任务描述</span><strong>{selectedTask.task}</strong>
+                  <span>执行计划</span><strong>{selectedTask.cron}（{humanizeCron(selectedTask.cron)}，UTC）</strong>
+                  <span>预批准</span><strong>{selectedTask.preApproved ? '是' : '否'}</strong>
+                  <span>状态</span><strong>{selectedTask.enabled ? '启用中' : '已暂停'}</strong>
+                  <span>下次执行</span><strong>{formatDateTime(selectedTask.nextRunAt)}</strong>
+                </div>
+                <div className="skill-detail-actions schedule-actions">
+                  <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => void runNow(selectedTask)}>
+                    <Play data-icon="inline-start" />
+                    立即执行
+                  </Button>
+                  <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => void toggleEnabled(selectedTask)}>
+                    {selectedTask.enabled ? <CircleStop data-icon="inline-start" /> : <Check data-icon="inline-start" />}
+                    {selectedTask.enabled ? '暂停' : '启用'}
+                  </Button>
+                  <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => (editing ? setEditing(false) : startEdit(selectedTask))}>
+                    <SquarePen data-icon="inline-start" />
+                    {editing ? '取消编辑' : '编辑'}
+                  </Button>
+                  <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => requestDelete(selectedTask)}>
+                    <Trash2 data-icon="inline-start" />
+                    删除
+                  </Button>
+                </div>
+                {editing ? (
+                  <ScheduleTaskForm
+                    title={editTitle}
+                    task={editTask}
+                    cron={editCron}
+                    preApproved={editPreApproved}
+                    busy={busy}
+                    submitLabel="保存修改"
+                    onTitleChange={setEditTitle}
+                    onTaskChange={setEditTask}
+                    onCronChange={setEditCron}
+                    onPreApprovedChange={setEditPreApproved}
+                    onSubmit={() => void saveEdit(selectedTask)}
+                    onCancel={() => setEditing(false)}
+                  />
+                ) : null}
+              </TabsContent>
+              <TabsContent value="runs">
+                <div className="schedule-runs-toolbar">
+                  <span>{runsStatus || `共 ${runs.length} 条执行记录`}</span>
+                  <Button variant="outline" size="sm" type="button" onClick={() => void loadRuns()}>
+                    <RefreshCcw data-icon="inline-start" />
+                    刷新
+                  </Button>
+                </div>
+                <Table>
+                  <TableHeader>
+                    <TableRow>{['时间', '状态', '步骤'].map((header) => <TableHead key={header}>{header}</TableHead>)}</TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {pagedRuns.map((run, index) => (
+                      <TableRow
+                        key={run.id ?? `${run.taskId}-${index}`}
+                        className={run.id === undefined ? undefined : 'clickable-row'}
+                        role={run.id === undefined ? undefined : 'button'}
+                        tabIndex={run.id === undefined ? undefined : 0}
+                        onClick={() => { if (run.id !== undefined) setSelectedRunId(run.id); }}
+                        onKeyDown={(event) => {
+                          if (run.id === undefined || (event.key !== 'Enter' && event.key !== ' ')) return;
+                          event.preventDefault();
                           setSelectedRunId(run.id);
                         }}
                       >
-                        {formatDateTime(run.createdAt)}
-                      </button>
-                    </TableCell>
-                    <TableCell>{formatCell(run.status === 'success' ? '成功' : '异常')}</TableCell>
-                    <TableCell>{run.steps === undefined ? '-' : String(run.steps)}</TableCell>
-                  </TableRow>
-                ))}
-                {!runs.length ? (
-                  <TableRow><TableCell colSpan={3}>{runsStatus || '暂无执行结果'}</TableCell></TableRow>
+                        <TableCell>{formatDateTime(run.createdAt)}</TableCell>
+                        <TableCell>{formatCell(run.status === 'success' ? '成功' : '异常')}</TableCell>
+                        <TableCell>{run.steps === undefined ? '-' : String(run.steps)}</TableCell>
+                      </TableRow>
+                    ))}
+                    {!runs.length ? (
+                      <TableRow><TableCell colSpan={3}>{runsStatus || '暂无执行结果'}</TableCell></TableRow>
+                    ) : null}
+                  </TableBody>
+                </Table>
+                {runs.length ? (
+                  <div className="schedule-runs-pagination">
+                    <span>第 {runsPage}/{runsPageCount} 页 · 共 {runs.length} 条</span>
+                    <div>
+                      <Button variant="outline" size="sm" type="button" disabled={runsPage <= 1} onClick={() => setRunsPage((current) => Math.max(1, current - 1))}>上一页</Button>
+                      <Button variant="outline" size="sm" type="button" disabled={runsPage >= runsPageCount} onClick={() => setRunsPage((current) => Math.min(runsPageCount, current + 1))}>下一页</Button>
+                    </div>
+                  </div>
                 ) : null}
-              </TableBody>
-            </Table>
-            {runs.length ? (
-              <div className="schedule-runs-pagination">
-                <span>第 {runsPage}/{runsPageCount} 页 · 共 {runs.length} 条</span>
-                <div>
-                  <Button variant="outline" size="sm" type="button" disabled={runsPage <= 1} onClick={() => setRunsPage((current) => Math.max(1, current - 1))}>上一页</Button>
-                  <Button variant="outline" size="sm" type="button" disabled={runsPage >= runsPageCount} onClick={() => setRunsPage((current) => Math.min(runsPageCount, current + 1))}>下一页</Button>
-                </div>
-              </div>
-            ) : null}
-            <div className="schedule-run-detail">
-              <h3>执行结果</h3>
-              <pre>{selectedRun?.detail || runsStatus || '暂无执行结果'}</pre>
-            </div>
+              </TabsContent>
+            </Tabs>
           </CardContent>
         </Card>
+        {selectedRun ? (
+          <ModalDialog title="执行记录详情" status={selectedRun.status === 'success' ? '成功' : '异常'} icon={<Activity />} onClose={() => setSelectedRunId(undefined)}>
+            <div className="schedule-run-modal">
+              <div className="kv">
+                <span>执行时间</span><strong>{formatDateTime(selectedRun.createdAt)}</strong>
+                <span>执行状态</span><strong>{selectedRun.status === 'success' ? '成功' : '异常'}</strong>
+                <span>执行步骤</span><strong>{selectedRun.steps === undefined ? '-' : String(selectedRun.steps)}</strong>
+              </div>
+              <h3>执行结果</h3>
+              <pre>{selectedRun.detail || '暂无执行结果'}</pre>
+            </div>
+          </ModalDialog>
+        ) : null}
       </>
     );
   }
@@ -4344,14 +4533,22 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
 
 function SandboxPage({ sandboxes, profiles }: { sandboxes: SandboxSummary[]; profiles: SandboxProfileSummary[] }) {
   const [selectedSandboxId, setSelectedSandboxId] = useState<string | null>(null);
+  const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
   const selectedIndex = sandboxes.findIndex((sandbox) => sandbox.id === selectedSandboxId);
   const selected = selectedIndex >= 0 ? sandboxes[selectedIndex] : undefined;
+  const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId);
 
   useEffect(() => {
     if (selectedSandboxId && !sandboxes.some((sandbox) => sandbox.id === selectedSandboxId)) {
       setSelectedSandboxId(null);
     }
   }, [sandboxes, selectedSandboxId]);
+
+  useEffect(() => {
+    if (selectedProfileId && !profiles.some((profile) => profile.id === selectedProfileId)) {
+      setSelectedProfileId(null);
+    }
+  }, [profiles, selectedProfileId]);
 
   return (
     <>
@@ -4395,21 +4592,22 @@ function SandboxPage({ sandboxes, profiles }: { sandboxes: SandboxSummary[]; pro
             {profiles.length ? (
               <div className="sandbox-profile-grid">
                 {profiles.map((profile) => (
-                  <div key={profile.id} className="sandbox-profile-item">
-                    <div>
+                  <button key={profile.id} type="button" className="sandbox-profile-item" onClick={() => setSelectedProfileId(profile.id)}>
+                    <div className="sandbox-profile-head">
                       <strong>{profile.name}</strong>
                       {profile.envType === 'browser' ? <Badge variant="secondary">浏览器</Badge> : <Badge variant="outline">代码</Badge>}
-                      {profile.runtimeRole === 'sandbox-diag' ? <Badge className="badge-privileged" variant="destructive"><strong>特权诊断</strong></Badge> : null}
+                      {profile.runtimeRole === 'sandbox-diag' ? <Badge className="badge-privileged" variant="outline"><strong>特权诊断</strong></Badge> : null}
                     </div>
-                    <p>{profile.description}</p>
-                    <div className="kv">
-                      <span>Template ID</span><strong>{profile.template || profile.id}</strong>
-                      <span>镜像</span><strong>{profile.image || '-'}</strong>
-                      <span>环境类型</span><strong>{profile.envType}</strong>
+                    <div className="sandbox-profile-row">
+                      <span>环境类型</span><strong>{profile.envType === 'browser' ? '浏览器' : '代码'}</strong>
+                    </div>
+                    <div className="sandbox-profile-row">
                       <span>Runtime Role</span><strong>{profile.runtimeRole}</strong>
-                      <span>能力</span><strong>{listSummary(profile.capabilities)}</strong>
                     </div>
-                  </div>
+                    <div className="sandbox-profile-row">
+                      <span>Template ID</span><strong>{profile.template || profile.id}</strong>
+                    </div>
+                  </button>
                 ))}
               </div>
             ) : (
@@ -4434,6 +4632,26 @@ function SandboxPage({ sandboxes, profiles }: { sandboxes: SandboxSummary[]; pro
             </div>
             <h3>连接信息</h3>
             <div className="file-list"><span>Terminal /sandbox/{selected.id}/terminal</span><span>Browser /sandbox/{selected.id}/browser</span></div>
+          </div>
+        </ModalDialog>
+      ) : null}
+      {selectedProfile ? (
+        <ModalDialog title="沙箱模板详情" status={selectedProfile.name} icon={<Cuboid />} onClose={() => setSelectedProfileId(null)}>
+          <div className="detail-panel sandbox-profile-detail">
+            <p>{selectedProfile.description || '暂无模板说明。'}</p>
+            <div className="kv">
+              <span>Template ID</span><strong>{selectedProfile.template || selectedProfile.id}</strong>
+              <span>镜像</span><strong>{selectedProfile.image || '-'}</strong>
+              <span>环境类型</span><strong>{selectedProfile.envType === 'browser' ? '浏览器' : '代码'}</strong>
+              <span>Runtime Role</span><strong>{selectedProfile.runtimeRole}</strong>
+              <span>Domain</span><strong>{selectedProfile.domain || '-'}</strong>
+              <span>Namespace</span><strong>{selectedProfile.namespace || '-'}</strong>
+              <span>Service Account</span><strong>{selectedProfile.serviceAccount || '-'}</strong>
+              <span>桌面能力</span><strong>{selectedProfile.desktop ? '支持' : '不支持'}</strong>
+              <span>权限</span><strong>{selectedProfile.privileged ? '特权' : '普通'}</strong>
+              <span>能力</span><strong>{listSummary(selectedProfile.capabilities)}</strong>
+              <span>超时时间</span><strong>{selectedProfile.timeoutMs ? `${selectedProfile.timeoutMs} ms` : '-'}</strong>
+            </div>
           </div>
         </ModalDialog>
       ) : null}
@@ -4767,7 +4985,7 @@ function SandboxSettingsCard({ api, status, onStatus, onRequestConfirm }: {
       <CardContent className="settings-form">
         <Label className="settings-checkbox-row">
           <input type="checkbox" checked={form.enabled} disabled={busy} onChange={(event) => setForm((current) => ({ ...current, enabled: event.target.checked }))} />
-          启用沙箱能力
+          <span>启用沙箱能力</span>
         </Label>
         <Label>模式
           <Select disabled={busy} value={form.mode} onValueChange={(value) => setForm((current) => ({ ...current, mode: value as SandboxSettingsMode }))}>

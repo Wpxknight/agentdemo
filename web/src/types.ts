@@ -284,6 +284,11 @@ export interface ContextUsageBody {
   estimated: boolean;
 }
 
+export interface SessionTokenUsageBody {
+  sessionId: string;
+  totalTokens: number;
+}
+
 export interface ToolsBody {
   tools: ToolSummary[];
   groups?: Record<string, number>;

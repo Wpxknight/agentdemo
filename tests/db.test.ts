@@ -46,6 +46,18 @@ describe('readMysqlConfig', () => {
   });
 });
 
+describe('MysqlStore session summaries', () => {
+  it('sorts wide message rows in application memory instead of MySQL filesort', async () => {
+    const source = await readFile('src/db/mysql.ts', 'utf8');
+    const start = source.indexOf('async listSessions(');
+    const end = source.indexOf('async countSessions(', start);
+    const listSessionsSource = source.slice(start, end);
+
+    expect(listSessionsSource).not.toContain(".orderBy('id', 'asc')");
+    expect(listSessionsSource).toContain('rows.sort((a, b) => a.id - b.id);');
+  });
+});
+
 describe('MemoryStore', () => {
   const msg = (role: Msg['role'], text: string): Msg => ({ role, text });
 
@@ -159,6 +171,18 @@ describe('MemoryStore', () => {
     expect(await s.listAudit(ctxA, { sessionId: 'a' })).toHaveLength(2);
     expect(await s.listAudit(ctxA, { kind: 'kubectl' })).toHaveLength(1);
     expect(await s.listAudit(ctxB)).toHaveLength(1);
+  });
+
+  it('aggregates agent token usage for one tenant session without double-counting cache tokens', async () => {
+    const s = new MemoryStore();
+    await s.record({ kind: 'usage', action: 'agent', tenantId: 't1', sessionId: 'usage-a', detail: { inputTokens: 100, outputTokens: 25, cacheReadTokens: 40 } });
+    await s.record({ kind: 'usage', action: 'agent', tenantId: 't1', sessionId: 'usage-a', detail: { inputTokens: 50, outputTokens: 10 } });
+    await s.record({ kind: 'usage', action: 'scheduler', tenantId: 't1', sessionId: 'usage-a', detail: { inputTokens: 999, outputTokens: 999 } });
+    await s.record({ kind: 'usage', action: 'agent', tenantId: 't1', sessionId: 'usage-b', detail: { inputTokens: 500, outputTokens: 500 } });
+    await s.record({ kind: 'usage', action: 'agent', tenantId: 't2', sessionId: 'usage-a', detail: { inputTokens: 800, outputTokens: 200 } });
+
+    await expect(s.getSessionTokenUsage(ctxA, 'usage-a')).resolves.toEqual({ totalTokens: 185 });
+    await expect(s.getSessionTokenUsage(ctxB, 'usage-a')).resolves.toEqual({ totalTokens: 1000 });
   });
 
   it('persists LLM settings per tenant', async () => {

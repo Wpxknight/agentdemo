@@ -69,6 +69,10 @@ export interface SessionContextUsage {
   estimated: boolean;
 }
 
+export interface SessionTokenUsage {
+  totalTokens: number;
+}
+
 /** 审计查询过滤（租户由 ctx 强制限定）。 */
 export interface AuditFilter {
   sessionId?: string;
@@ -179,6 +183,7 @@ export interface Store extends AuditSink {
   countSessions(ctx: RequestContext): Promise<number>;
   deleteSession(ctx: RequestContext, sessionId: string): Promise<boolean>;
   getSessionContextUsage(ctx: RequestContext, sessionId: string, maxTokens: number): Promise<SessionContextUsage>;
+  getSessionTokenUsage(ctx: RequestContext, sessionId: string): Promise<SessionTokenUsage>;
 
   // —— 审计 ——（record 来自 AuditSink；event.tenantId 标识归属）
   record(event: AuditEvent): Promise<void>;

@@ -1405,6 +1405,16 @@ async function handle(
     return sendJson(res, 200, { sessionId, ...usage });
   }
 
+  const sessionUsageMatch = /^\/v1\/sessions\/([^/]+)\/usage$/.exec(path);
+  if (method === 'GET' && sessionUsageMatch) {
+    const ctx = await requireAuth(rt, req);
+    const sessionId = decodeURIComponent(sessionUsageMatch[1]!);
+    const owned = (await rt.store.listSessions(ctx)).some((session) => session.sessionId === sessionId);
+    if (!owned) throw new HttpError(404, '会话不存在');
+    const usage = await rt.store.getSessionTokenUsage(ctx, sessionId);
+    return sendJson(res, 200, { sessionId, ...usage });
+  }
+
   const sessionTerminateMatch = /^\/v1\/sessions\/([^/]+)\/terminate$/.exec(path);
   if (method === 'POST' && sessionTerminateMatch) {
     const ctx = await requireAuth(rt, req);

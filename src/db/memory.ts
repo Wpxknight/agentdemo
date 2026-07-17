@@ -12,6 +12,7 @@ import type {
   SandboxSettingsSecretUpdate,
   SchedulerSettings,
   SessionContextUsage,
+  SessionTokenUsage,
   SessionInput,
   SessionSummary,
   SessionTouchInput,
@@ -211,6 +212,20 @@ export class MemoryStore implements Store {
       maxTokens,
       estimated: true,
     };
+  }
+
+  async getSessionTokenUsage(ctx: RequestContext, sessionId: string): Promise<SessionTokenUsage> {
+    const totalTokens = this.audit
+      .filter((event) => event.tenantId === ctx.tenantId
+        && event.sessionId === sessionId
+        && event.kind === 'usage'
+        && event.action === 'agent')
+      .reduce((total, event) => {
+        const inputTokens = typeof event.detail?.inputTokens === 'number' ? event.detail.inputTokens : 0;
+        const outputTokens = typeof event.detail?.outputTokens === 'number' ? event.detail.outputTokens : 0;
+        return total + Math.max(0, inputTokens) + Math.max(0, outputTokens);
+      }, 0);
+    return { totalTokens };
   }
 
   async record(event: AuditEvent): Promise<void> {

@@ -13,6 +13,7 @@ import type {
   SandboxSettingsSecretUpdate,
   SchedulerSettings,
   SessionContextUsage,
+  SessionTokenUsage,
   SessionInput,
   SessionSummary,
   SessionTouchInput,
@@ -325,8 +326,8 @@ export class MysqlStore implements Store {
       .where('tenant_id', '=', ctx.tenantId)
       .where('user_id', '=', ctx.userId)
       .where('session_id', 'in', sessionIds)
-      .orderBy('id', 'asc')
       .execute() as MessageRow[];
+    rows.sort((a, b) => a.id - b.id);
 
     const grouped = new Map<string, Array<{ role: string; text?: string; createdAt: Date }>>();
     for (const row of rows) {
@@ -389,6 +390,26 @@ export class MysqlStore implements Store {
       maxTokens,
       estimated: true,
     };
+  }
+
+  async getSessionTokenUsage(ctx: RequestContext, sessionId: string): Promise<SessionTokenUsage> {
+    const rows = await this.db
+      .selectFrom('audit_events')
+      .select('detail')
+      .where('tenant_id', '=', ctx.tenantId)
+      .where('session_id', '=', sessionId)
+      .where('kind', '=', 'usage')
+      .where('action', '=', 'agent')
+      .execute();
+    const totalTokens = rows.reduce((total, row) => {
+      const detail = parseJson(row.detail);
+      if (!detail || typeof detail !== 'object' || Array.isArray(detail)) return total;
+      const record = detail as Record<string, unknown>;
+      const inputTokens = typeof record.inputTokens === 'number' ? record.inputTokens : 0;
+      const outputTokens = typeof record.outputTokens === 'number' ? record.outputTokens : 0;
+      return total + Math.max(0, inputTokens) + Math.max(0, outputTokens);
+    }, 0);
+    return { totalTokens };
   }
 
   async record(event: AuditEvent): Promise<void> {

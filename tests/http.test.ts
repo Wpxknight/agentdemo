@@ -608,6 +608,34 @@ describe('HTTP server', () => {
     });
   });
 
+  it('exposes current-user session cumulative token usage', async () => {
+    const login = await fetch(`${base}/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tenantId: 'default', username: 'admin', password: 'pw' }),
+    });
+    const authToken = ((await login.json()) as { token: string }).token;
+    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+    await store.createSession(ctx, { sessionId: 'usage-http', title: '用量会话' });
+    await store.record({ kind: 'usage', action: 'agent', tenantId: 'default', sessionId: 'usage-http', detail: { inputTokens: 100, outputTokens: 25, cacheReadTokens: 40 } });
+    await store.record({ kind: 'usage', action: 'agent', tenantId: 'default', sessionId: 'usage-http', detail: { inputTokens: 50, outputTokens: 10 } });
+    await store.record({ kind: 'usage', action: 'scheduler', tenantId: 'default', sessionId: 'usage-http', detail: { inputTokens: 999, outputTokens: 999 } });
+
+    const response = await fetch(`${base}/v1/sessions/usage-http/usage`, {
+      headers: { authorization: `Bearer ${authToken}` },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ sessionId: 'usage-http', totalTokens: 185 });
+
+    const unauthorized = await fetch(`${base}/v1/sessions/usage-http/usage`);
+    expect(unauthorized.status).toBe(401);
+
+    const missing = await fetch(`${base}/v1/sessions/not-owned/usage`, {
+      headers: { authorization: `Bearer ${authToken}` },
+    });
+    expect(missing.status).toBe(404);
+  });
+
   it('appends idle session messages without starting an agent run', async () => {
     const appended = await fetch(`${base}/v1/sessions/append-idle/append`, {
       method: 'POST',

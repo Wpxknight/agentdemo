@@ -113,12 +113,12 @@ describe('frontend API wiring', () => {
     expect(app).toContain('setSelectedTaskId(task.id)');
     expect(app).toContain('setSelectedRunId(run.id)');
     expect(app).toContain('className="schedule-task-cell"');
-    expect(app).toContain('className="schedule-run-button"');
-    expect(app).toContain('className="schedule-run-detail"');
+    expect(app).toContain('<TabsTrigger value="runs">执行记录</TabsTrigger>');
+    expect(app).toContain('title="执行记录详情"');
     expect(app).toContain('执行结果');
     expect(css).toContain('.schedule-task-cell');
-    expect(css).toContain('.schedule-run-button');
-    expect(css).toContain('.schedule-run-detail');
+    expect(css).toContain('.schedule-detail-tabs');
+    expect(css).toContain('.schedule-run-modal');
   });
 
   it('keeps the chat browser area as preview-only UI', async () => {
@@ -376,7 +376,7 @@ describe('frontend API wiring', () => {
     expect(app).toContain('sessionOffset');
     expect(app).toContain('sessionTotal');
     expect(app).toContain("`/v1/sessions?limit=${SESSION_PAGE_SIZE}&offset=${offset}`");
-    expect(app).toContain('const SESSION_PAGE_SIZE = 10;');
+    expect(app).toContain('const SESSION_PAGE_SIZE = 8;');
     expect(app).toContain('goToPrevSessionsPage');
     expect(app).toContain('goToNextSessionsPage');
     expect(app).toContain('上一页');
@@ -419,10 +419,134 @@ describe('frontend API wiring', () => {
     expect(app).toContain('api.get<ContextUsageBody>(`/v1/sessions/${encodeURIComponent(nextSessionId)}/context`)');
     expect(app).toContain('api.post<{ ok: boolean; sessionId: string; queued: boolean }>(`/v1/sessions/${encodeURIComponent(sessionId)}/append`');
     expect(app).toContain('activeRunSessionIds.has(sessionId)');
-    expect(app).toContain('上下文 {formatContextUsage(props.contextUsage)}');
     expect(app).toContain('event.data?.context');
     expect(app).toContain('event.data?.usage?.context');
     expect(app).toContain('formatTokenCount');
+  });
+
+  it('shows current session cumulative token usage and elapsed run time in the smart assistant header', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const types = await readFile('web/src/types.ts', 'utf8');
+
+    expect(types).toContain('export interface SessionTokenUsageBody');
+    expect(types).toContain('totalTokens: number;');
+    expect(app).toContain('useState<Record<string, number>>({})');
+    expect(app).toContain('runStartedAt');
+    expect(app).toContain('formatElapsedTime');
+    expect(app).toContain('api.get<SessionTokenUsageBody>(`/v1/sessions/${encodeURIComponent(nextSessionId)}/usage`)');
+    expect(app).toContain("event?.event === 'usage'");
+    expect(app).toContain('event.data?.inputTokens');
+    expect(app).toContain('event.data?.outputTokens');
+    expect(app).toContain('<h1>智能助手</h1>');
+    expect(app).toContain('contextUsage={contextUsage[sessionId]}');
+    expect(app).toContain('contextUsage?: ContextUsageBody;');
+    expect(app).toContain("props.runStartedAt ? '运行中' : '就绪'");
+    expect(app).toContain('className="prototype-run-time"');
+    expect(app).toContain('{formatElapsedTime(now - props.runStartedAt)}');
+    expect(app).toContain('上下文 {formatContextUsage(props.contextUsage)}');
+    expect(app).toContain('总消耗</em>');
+    expect(app).toContain('formatTokenCount(props.totalTokens)');
+    expect(app).toContain('className="prototype-status-mobile"');
+    expect(app).not.toContain('累计 Token');
+    expect(app).not.toContain('成本 {formatCostUsd(props.sessionCostUsd)}');
+  });
+
+  it('uses a compact smart assistant header and controls', async () => {
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(css).toMatch(/\.prototype-chat-header\s*\{[\s\S]*?min-height:\s*50px;[\s\S]*?padding:\s*8px 14px;/);
+    expect(css).toMatch(/\.prototype-chat-header h1\s*\{[\s\S]*?font-size:\s*16px;/);
+    expect(css).toMatch(/\.prototype-chat-actions\s*\{[\s\S]*?gap:\s*6px;/);
+    expect(css).toMatch(/\.prototype-chat-actions button\s*\{[\s\S]*?min-width:\s*30px;[\s\S]*?height:\s*30px;/);
+    expect(css).toContain('.prototype-chat-actions button svg');
+    expect(css).toContain('.prototype-status-mobile');
+    expect(css).toMatch(/@media \(max-width: 760px\)[\s\S]*?\.prototype-chat-header span\s*\{[\s\S]*?display:\s*inline-flex;/);
+  });
+
+  it('uses smaller regular-weight chat metrics', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(app).toContain('className="prototype-chat-metric"');
+    expect(css).toMatch(/\.prototype-chat-header span b\.prototype-chat-metric\s*\{[\s\S]*?font-size:\s*10px;[\s\S]*?font-weight:\s*400;/);
+    expect(css).toMatch(/@media \(max-width: 760px\)[\s\S]*?\.prototype-chat-header span b\.prototype-chat-metric\s*\{[\s\S]*?font-size:\s*9px;/);
+  });
+
+  it('renders interactive sandbox template cards', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(app).toContain('const [selectedProfileId, setSelectedProfileId]');
+    expect(app).toContain('className="sandbox-profile-item"');
+    expect(app).toContain('className="sandbox-profile-row"');
+    expect(app).toContain('title="沙箱模板详情"');
+    expect(app).toContain('onClick={() => setSelectedProfileId(profile.id)}');
+    expect(app).not.toContain('className="badge-privileged" variant="destructive"');
+    expect(app).toContain('className="badge-privileged" variant="outline"');
+    expect(css).toMatch(/\.sandbox-profile-item:hover[\s\S]*?border-color:/);
+    expect(css).toMatch(/span\.badge-privileged\s*\{[\s\S]*?background:\s*hsl\(43 92% 94%\);/);
+  });
+
+  it('shows image attachment filenames below thumbnails', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(app).toContain('const files = attachments.filter');
+    expect(app).toContain('<figure className="attachment-image-card"');
+    expect(app).toContain('<figcaption>{file.name}</figcaption>');
+    expect(app).toContain('className="attachment-image-remove"');
+    expect(app).toContain('{files.map((file) => (');
+    expect(css).toMatch(/\.attachment-image-card figcaption\s*\{[\s\S]*?font-size:\s*11px;/);
+  });
+
+  it('shares scheduled task create and edit form layout', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(app).toContain('function ScheduleTaskForm(');
+    expect(app.match(/<ScheduleTaskForm/g)).toHaveLength(2);
+    expect(app).toContain('const [editPreApproved, setEditPreApproved]');
+    expect(app).toContain('preApproved: editPreApproved');
+    expect(app).toContain('className="schedule-preapproved"');
+    expect(css).toMatch(/\.schedule-preapproved\s*\{[\s\S]*?width:\s*100%;[\s\S]*?white-space:\s*normal;/);
+    expect(css).toMatch(/\.schedule-preapproved input\s*\{[\s\S]*?flex:\s*0 0 auto;/);
+  });
+
+  it('uses task detail and execution record tabs', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(app).toContain('<TabsTrigger value="task">任务详情</TabsTrigger>');
+    expect(app).toContain('<TabsTrigger value="runs">执行记录</TabsTrigger>');
+    expect(app).toContain('<TabsContent value="task">');
+    expect(app).toContain('<TabsContent value="runs">');
+    expect(app).toContain('title="执行记录详情"');
+    expect(app).toContain('onClose={() => setSelectedRunId(undefined)}');
+    expect(app).not.toContain('className="schedule-run-detail"');
+    expect(css).toMatch(/\.schedule-run-modal pre\s*\{[\s\S]*?max-height:/);
+  });
+
+  it('aligns the sandbox enable checkbox with its label', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(app).toContain('className="settings-checkbox-row"');
+    expect(app).toContain('<span>启用沙箱能力</span>');
+    expect(css).toMatch(/\.settings-form label\.settings-checkbox-row\s*\{[\s\S]*?display:\s*flex;[\s\S]*?align-items:\s*center;/);
+    expect(css).toMatch(/\.settings-checkbox-row input\s*\{[\s\S]*?width:\s*16px;[\s\S]*?height:\s*16px;/);
+  });
+
+  it('shows state-aware sidebar toggle help', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(app).toContain('historyOpen={props.historyOpen}');
+    expect(app).toContain('previewOpen={props.previewOpen}');
+    expect(app).toContain("const historyToggleLabel = props.historyOpen ? '收起左侧会话栏' : '展开左侧会话栏';");
+    expect(app).toContain("const previewToggleLabel = props.previewOpen ? '收起右侧沙箱栏' : '展开右侧沙箱栏';");
+    expect(app).toContain('aria-label={historyToggleLabel}');
+    expect(app).toContain('aria-label={previewToggleLabel}');
+    expect(app).toContain('<TooltipContent side="bottom">{historyToggleLabel}</TooltipContent>');
+    expect(app).toContain('<TooltipContent side="bottom">{previewToggleLabel}</TooltipContent>');
   });
 
   it('preserves running chat state when returning to an active session', async () => {
