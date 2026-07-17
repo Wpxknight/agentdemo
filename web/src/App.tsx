@@ -4395,15 +4395,20 @@ function SandboxPage({ sandboxes, profiles }: { sandboxes: SandboxSummary[]; pro
             {profiles.length ? (
               <div className="sandbox-profile-grid">
                 {profiles.map((profile) => (
-                  <div key={profile.name} className="sandbox-profile-item">
+                  <div key={profile.id} className="sandbox-profile-item">
                     <div>
                       <strong>{profile.name}</strong>
-                      {profile.privileged ? <Badge className="badge-privileged" variant="outline">特权</Badge> : null}
-                      {profile.desktop ? <Badge variant="secondary">浏览器</Badge> : null}
+                      {profile.envType === 'browser' ? <Badge variant="secondary">浏览器</Badge> : <Badge variant="outline">代码</Badge>}
+                      {profile.runtimeRole === 'sandbox-diag' ? <Badge className="badge-privileged" variant="destructive"><strong>特权诊断</strong></Badge> : null}
                     </div>
                     <p>{profile.description}</p>
-                    <code>{profile.image || profile.domain || '-'}</code>
-                    <span>{listSummary(profile.capabilities)}</span>
+                    <div className="kv">
+                      <span>Template ID</span><strong>{profile.template || profile.id}</strong>
+                      <span>镜像</span><strong>{profile.image || '-'}</strong>
+                      <span>环境类型</span><strong>{profile.envType}</strong>
+                      <span>Runtime Role</span><strong>{profile.runtimeRole}</strong>
+                      <span>能力</span><strong>{listSummary(profile.capabilities)}</strong>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -4664,8 +4669,11 @@ function SandboxSettingsCard({ api, status, onStatus, onRequestConfirm }: {
   onRequestConfirm: (request: ConfirmDialogRequest) => void;
 }) {
   const [info, setInfo] = useState<SandboxSettingsInfo | null>(null);
+  const [runtime, setRuntime] = useState<SandboxSettingsBody['runtime']>();
   const [form, setForm] = useState<SandboxSettingsForm>(() => sandboxSettingsForm());
   const [busy, setBusy] = useState(false);
+  const [refreshBusy, setRefreshBusy] = useState(false);
+  const refreshBusyRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -4673,6 +4681,7 @@ function SandboxSettingsCard({ api, status, onStatus, onRequestConfirm }: {
       .then((body) => {
         if (cancelled) return;
         setInfo(body.settings);
+        setRuntime(body.runtime);
         setForm(sandboxSettingsForm(body.settings));
       })
       .catch((err) => {
@@ -4687,6 +4696,7 @@ function SandboxSettingsCard({ api, status, onStatus, onRequestConfirm }: {
     try {
       const body = await api.post<SandboxSettingsBody>('/v1/settings/sandbox', payload);
       setInfo(body.settings);
+      setRuntime(body.runtime);
       setForm(sandboxSettingsForm(body.settings));
       onStatus(success);
     } catch (err) {
@@ -4706,6 +4716,30 @@ function SandboxSettingsCard({ api, status, onStatus, onRequestConfirm }: {
       return;
     }
     await apply(sandboxSettingsPayload(form), '沙箱配置已保存，新建的沙箱将使用新的运行时配置。');
+  }
+
+  async function refreshTemplates() {
+    if (refreshBusyRef.current) return;
+    refreshBusyRef.current = true;
+    setRefreshBusy(true);
+    onStatus('正在刷新 AIOS 模板目录...');
+    try {
+      const body = await api.post<SandboxSettingsBody & {
+        refresh?: { changed: boolean; template_count: number };
+      }>('/v1/settings/sandbox/refresh-templates', {});
+      setInfo(body.settings);
+      setRuntime(body.runtime);
+      setForm(sandboxSettingsForm(body.settings));
+      const count = body.refresh?.template_count ?? body.runtime?.template_count ?? 0;
+      onStatus(body.refresh?.changed
+        ? `AIOS 模板目录已更新，共 ${count} 个模板。`
+        : `AIOS 模板目录无变化，共 ${count} 个模板。`);
+    } catch (err) {
+      onStatus(`刷新失败：${formatError(err)}`);
+    } finally {
+      refreshBusyRef.current = false;
+      setRefreshBusy(false);
+    }
   }
 
   function requestClearApiKey() {
@@ -4756,7 +4790,14 @@ function SandboxSettingsCard({ api, status, onStatus, onRequestConfirm }: {
             <Label>Lifecycle URL<Input disabled={busy} value={form.lifecycleUrl} spellCheck={false} placeholder="http(s)://lifecycle-service" onChange={(event) => setForm((current) => ({ ...current, lifecycleUrl: event.target.value }))} /></Label>
             <Label>Cluster ID<Input disabled={busy} value={form.clusterId} spellCheck={false} onChange={(event) => setForm((current) => ({ ...current, clusterId: event.target.value }))} /></Label>
             <Label>Namespace<Input disabled={busy} value={form.namespace} spellCheck={false} onChange={(event) => setForm((current) => ({ ...current, namespace: event.target.value }))} /></Label>
-            <div className="settings-hint">固定使用 code-interpreter，仅提供代码与命令能力；不支持 Desktop、用户主目录和 warm pool。</div>
+            <div className="settings-hint">模板由 AIOS 目录动态加载；browser 模板接入现有截图预览，sandbox-diag 仅平台管理员可见可用。</div>
+            <div className={runtime?.status === 'catalog_unavailable' ? 'settings-status' : 'settings-hint'}>
+              {runtime?.status === 'catalog_unavailable'
+                ? '模板目录当前不可用；请检查连接配置后重试刷新。'
+                : `目录状态：${runtime?.status || '未知'}`}
+              {' · '}模板数：{runtime?.template_count ?? 0}
+              {' · '}上次成功刷新：{runtime?.last_successful_refresh_at ? formatDateTime(runtime.last_successful_refresh_at) : '暂无'}
+            </div>
           </>
         ) : null}
         {form.mode === 'opensandbox' ? (
@@ -4787,6 +4828,12 @@ function SandboxSettingsCard({ api, status, onStatus, onRequestConfirm }: {
         {status ? <div className="settings-status">{status}</div> : null}
         <div className="form-actions">
           {info?.api_key_set ? <Button variant="outline" type="button" disabled={busy} onClick={requestClearApiKey}>清除 API Key</Button> : null}
+          {info?.enabled && info.mode === 'aios_lifecycle' ? (
+            <Button variant="outline" type="button" disabled={refreshBusy || busy || !info} onClick={() => void refreshTemplates()}>
+              <RefreshCcw data-icon="inline-start" />
+              {refreshBusy ? '刷新中...' : '刷新模板'}
+            </Button>
+          ) : null}
           <Button type="button" disabled={busy || !info} onClick={() => void save()}>{busy ? '应用中...' : '保存配置'}</Button>
         </div>
       </CardContent>

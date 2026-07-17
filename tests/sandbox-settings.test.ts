@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { MemoryStore } from '../src/db/memory.js';
 import type { RequestContext } from '../src/auth/types.js';
+import { SandboxConfigSchema } from '../src/config/schema.js';
 import type { Store } from '../src/db/store.js';
 import { SecretBox, createSettingsSecretBox } from '../src/security/secret-box.js';
 import {
@@ -11,6 +12,13 @@ import {
   parseSandboxSettings,
   sandboxSettingsToConfig,
 } from '../src/sandbox/settings.js';
+import {
+  findSandboxProfile,
+  resolveSandboxProfiles,
+  sandboxSpecForProfile,
+  selectBrowserProfile,
+  selectDefaultProfile,
+} from '../src/sandbox/profiles.js';
 
 const platform: Pick<RequestContext, 'tenantId'> = { tenantId: 'default' };
 
@@ -38,17 +46,139 @@ describe('sandbox settings validation and conversion', () => {
         placement: { clusterId: 'local', namespace: 'sandbox-system' },
       },
       desktop: false,
-      profiles: {
-        code: {
-          description: 'AIOS code interpreter',
-          image: 'code-interpreter',
-          desktop: false,
-          privileged: false,
-          capabilities: ['python', 'node', 'shell'],
-        },
-      },
       userHomeMountPath: '/home/user/host',
     });
+  });
+
+  it('keeps AIOS safety rules while allowing runtime catalog browser profiles', () => {
+    expect(SandboxConfigSchema.parse({
+      enabled: true,
+      provider: 'e2b',
+      apiKey: 'configured-key',
+      aios: {
+        lifecycleUrl: 'https://sandbox.example.test/lifecycle',
+        placement: { clusterId: 'local', namespace: 'sandbox-system' },
+      },
+      desktop: true,
+      profiles: {
+        browser: { template: 'browser-id', desktop: true },
+        code: { template: 'code-id' },
+      },
+    })).toMatchObject({ desktop: true });
+
+    expect(() => SandboxConfigSchema.parse({
+      enabled: true,
+      provider: 'e2b',
+      aios: {
+        lifecycleUrl: 'https://sandbox.example.test/lifecycle',
+        placement: { clusterId: 'local', namespace: 'sandbox-system' },
+      },
+      profiles: {
+        diag: { template: 'diag-id', privileged: true },
+      },
+    })).toThrow(/privileged|特权/i);
+  });
+
+  it('normalizes legacy profiles with stable ids and separate templates', () => {
+    const profiles = resolveSandboxProfiles(SandboxConfigSchema.parse({
+      enabled: true,
+      provider: 'e2b',
+      desktop: false,
+      profiles: {
+        named: {
+          image: 'display-image',
+          template: 'template-id',
+          desktop: true,
+        },
+      },
+    }));
+
+    expect(profiles).toEqual([
+      expect.objectContaining({
+        id: 'default',
+        name: 'default',
+        envType: 'code',
+        runtimeRole: 'sandbox-reader',
+      }),
+      expect.objectContaining({
+        id: 'named',
+        name: 'named',
+        image: 'display-image',
+        template: 'template-id',
+        desktop: true,
+        envType: 'browser',
+        runtimeRole: 'sandbox-reader',
+      }),
+    ]);
+    expect(sandboxSpecForProfile(profiles[1]!, {
+      tenantId: 'tenant-a', userId: 'user-a', sessionId: 'session-a',
+    })).toMatchObject({
+      key: '["tenant-a","user-a","session-a"]:profile:named',
+      profile: 'named',
+      template: 'template-id',
+      metadata: { profile: 'named' },
+    });
+  });
+
+  it('keeps legacy desktop profiles available to code and browser acquisition', () => {
+    const profiles = resolveSandboxProfiles(SandboxConfigSchema.parse({
+      enabled: true,
+      provider: 'local',
+      desktop: true,
+    }));
+
+    expect(profiles).toEqual([
+      expect.objectContaining({
+        id: 'default',
+        name: 'default',
+        envType: 'code',
+        desktop: true,
+        capabilities: expect.arrayContaining(['python', 'browser']),
+      }),
+    ]);
+    expect(selectDefaultProfile(profiles, 'user')?.id).toBe('default');
+    expect(selectBrowserProfile(profiles, 'user')).toBeUndefined();
+    expect(selectBrowserProfile(profiles, 'user', { fallbackToCode: true })?.id).toBe('default');
+
+    const explicit = resolveSandboxProfiles(SandboxConfigSchema.parse({
+      enabled: true,
+      provider: 'opensandbox',
+      desktop: true,
+      profiles: {
+        code: { image: 'dual-use:latest', desktop: true },
+        browser: { image: 'browser:latest', desktop: true },
+      },
+    }));
+    expect(explicit).toEqual([
+      expect.objectContaining({ id: 'code', envType: 'code', desktop: true }),
+      expect.objectContaining({ id: 'browser', envType: 'browser', desktop: true }),
+    ]);
+    expect(selectDefaultProfile(explicit, 'user')?.id).toBe('code');
+    expect(selectBrowserProfile(explicit, 'user', { fallbackToCode: true })?.id).toBe('browser');
+  });
+
+  it('selects authorized profiles by stable id and unique display name', () => {
+    const profiles = [
+      {
+        id: 'browser-id', name: 'browser', description: 'Browser', envType: 'browser' as const,
+        runtimeRole: 'sandbox-reader' as const, desktop: true, privileged: false, capabilities: ['browser'],
+      },
+      {
+        id: 'diag-id', name: 'netdiag', description: 'Diagnostic', envType: 'code' as const,
+        runtimeRole: 'sandbox-diag' as const, desktop: false, privileged: true, capabilities: ['diagnostics'],
+      },
+      {
+        id: 'code-id', name: 'code-interpreter', description: 'Code', envType: 'code' as const,
+        runtimeRole: 'sandbox-reader' as const, desktop: false, privileged: false, capabilities: ['shell'],
+      },
+    ];
+
+    expect(findSandboxProfile(profiles, 'code-id', 'user').id).toBe('code-id');
+    expect(findSandboxProfile(profiles, 'code-interpreter', 'user').id).toBe('code-id');
+    expect(() => findSandboxProfile(profiles, 'diag-id', 'user')).toThrow(/platform_admin|无权/);
+    expect(selectDefaultProfile(profiles, 'user')?.id).toBe('code-id');
+    expect(selectBrowserProfile(profiles, 'user')?.id).toBe('browser-id');
+    expect(selectBrowserProfile(profiles.filter((profile) => profile.envType === 'code'), 'user')).toBeUndefined();
   });
 
   it('rejects fields belonging to another mode', () => {

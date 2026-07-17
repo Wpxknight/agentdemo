@@ -143,8 +143,12 @@ export interface SandboxSummary {
 }
 
 export interface SandboxProfileSummary {
+  id: string;
   name: string;
+  template?: string;
   description: string;
+  envType: 'code' | 'browser';
+  runtimeRole: 'sandbox-reader' | 'sandbox-diag';
   image?: string;
   domain?: string;
   namespace?: string;
@@ -337,7 +341,9 @@ export interface SandboxSettingsBody {
   runtime?: {
     enabled: boolean;
     mode?: SandboxSettingsMode;
-    status?: string;
+    status?: 'disabled' | 'active' | 'catalog_unavailable' | 'refreshing' | string;
+    template_count?: number;
+    last_successful_refresh_at?: string;
   };
 }
 

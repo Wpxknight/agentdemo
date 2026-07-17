@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { sandboxIdentityKey } from '../src/sandbox/keys.js';
 import { SandboxRuntimeController } from '../src/sandbox/runtime-controller.js';
 import type { DesktopHandle } from '../src/sandbox/desktop.js';
+import { buildSandboxProfileTools } from '../src/tools/sandbox-profiles.js';
+import type { SandboxProfile } from '../src/sandbox/profiles.js';
 import type { SandboxHandle, SandboxProvider, SandboxSpec } from '../src/sandbox/types.js';
 
 function deferred<T>() {
@@ -49,6 +51,31 @@ function provider(prefix: string) {
 }
 
 const userA = { tenantId: 'tenant-a', userId: 'user-a', role: 'user' as const };
+const platformAdmin = { tenantId: 'tenant-a', userId: 'admin-a', role: 'platform_admin' as const };
+const authorizedProfiles: SandboxProfile[] = [
+  {
+    id: 'reader-id',
+    name: 'code',
+    template: 'reader-template',
+    description: 'Reader profile',
+    envType: 'code',
+    runtimeRole: 'sandbox-reader',
+    desktop: false,
+    privileged: false,
+    capabilities: ['shell'],
+  },
+  {
+    id: 'diag-id',
+    name: 'netdiag',
+    template: 'diag-template',
+    description: 'Diagnostic profile',
+    envType: 'code',
+    runtimeRole: 'sandbox-diag',
+    desktop: false,
+    privileged: true,
+    capabilities: ['diagnostics'],
+  },
+];
 const spec = (sessionId: string) => ({
   key: `tenant-a:user-a:${sessionId}`,
   metadata: { tenantId: 'tenant-a', userId: 'user-a', sessionId },
@@ -116,6 +143,83 @@ describe('SandboxRuntimeController', () => {
       expect(disposed).toHaveBeenCalledOnce();
     });
     expect(controller.list(userA)).toEqual([]);
+    await controller.disposeAll();
+  });
+
+  it('refreshes browser activity so an actively reused desktop is not swept as idle', async () => {
+    let now = 0;
+    const backend = provider('browser-active');
+    const desktopKills: string[] = [];
+    const controller = new SandboxRuntimeController();
+    const ctx = { ...userA, sessionId: 'active-browser' };
+
+    await controller.commit({
+      manager: { provider: backend.instance, idleMs: 10, now: () => now },
+      profiles: [],
+      sweepMs: 100_000,
+      resolveDesktop: async (desktopCtx) => ({
+        key: sandboxIdentityKey(desktopCtx),
+        create: async () => {
+          await controller.get({
+            ...spec('active-browser'),
+            key: sandboxIdentityKey(desktopCtx),
+          });
+          return desktopHandle('desktop-active', desktopKills);
+        },
+      }),
+    });
+    const desktop = await controller.desktop(ctx);
+    now = 9;
+    expect(await controller.desktop(ctx)).toBe(desktop);
+    now = 11;
+
+    const generation = controller as unknown as {
+      current?: { manager: { sweep(): Promise<string[]> } };
+    };
+    await expect(generation.current!.manager.sweep()).resolves.toEqual([]);
+    expect(backend.killed).toEqual([]);
+    expect(desktopKills).toEqual([]);
+
+    now = 20;
+    await expect(generation.current!.manager.sweep()).resolves.toEqual([sandboxIdentityKey(ctx)]);
+    expect(backend.killed).toEqual(['browser-active-1']);
+    await controller.disposeAll();
+  });
+
+  it('evicts an idle desktop entry so a draining generation can finish cleanup', async () => {
+    let now = 0;
+    const first = provider('first');
+    const second = provider('second');
+    const disposed = vi.fn(async () => {});
+    const desktopKills: string[] = [];
+    const controller = new SandboxRuntimeController();
+    const ctx = { ...userA, sessionId: 'idle-browser' };
+
+    await controller.commit({
+      manager: { provider: first.instance, idleMs: 1, now: () => now },
+      profiles: [],
+      sweepMs: 5,
+      disposeResources: disposed,
+      resolveDesktop: async (desktopCtx) => ({
+        key: sandboxIdentityKey(desktopCtx),
+        create: async () => {
+          await controller.get({
+            ...spec('idle-browser'),
+            key: sandboxIdentityKey(desktopCtx),
+          });
+          return desktopHandle('desktop-idle', desktopKills);
+        },
+      }),
+    });
+    await controller.desktop(ctx);
+    await controller.commit({ manager: { provider: second.instance }, profiles: [] });
+
+    now = 2;
+    await vi.waitFor(() => {
+      expect(first.killed).toEqual(['first-1']);
+      expect(desktopKills).toEqual(['desktop-idle']);
+      expect(disposed).toHaveBeenCalledOnce();
+    });
     await controller.disposeAll();
   });
 
@@ -299,6 +403,90 @@ describe('SandboxRuntimeController', () => {
     creating.resolve(desktopHandle('desktop-after-shutdown', killed));
     await expect(desktop).rejects.toThrow(/disposed/);
     expect(killed).toEqual(['desktop-after-shutdown']);
+  });
+
+  it('filters diagnostic profiles and rejects direct unauthorized acquisition before resolution', async () => {
+    const backend = provider('authorized');
+    const resolveSpec = vi.fn((_ctx, profileId?: string) => {
+      const profile = authorizedProfiles.find((item) => item.id === (profileId ?? 'reader-id'))!;
+      return { key: `profile:${profile.id}`, profile: profile.id, template: profile.template };
+    });
+    const controller = new SandboxRuntimeController();
+    await controller.commit({ manager: { provider: backend.instance }, profiles: authorizedProfiles, resolveSpec });
+
+    expect(controller.profiles(userA)).toEqual([
+      expect.objectContaining({ id: 'reader-id', runtimeRole: 'sandbox-reader' }),
+    ]);
+    expect(controller.profiles(platformAdmin)).toHaveLength(2);
+    await expect(controller.acquire({ ...userA, sessionId: 'blocked' }, 'diag-id'))
+      .rejects.toThrow(/platform_admin|无权/);
+    expect(resolveSpec).not.toHaveBeenCalled();
+    expect(backend.instance.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unauthorized resolved profile before manager acquisition', async () => {
+    const backend = provider('authorized');
+    const controller = new SandboxRuntimeController();
+    await controller.commit({
+      manager: { provider: backend.instance },
+      profiles: authorizedProfiles,
+      resolveSpec: () => ({ key: 'resolved-diag', profile: 'diag-id', template: 'diag-template' }),
+    });
+
+    await expect(controller.acquire({ ...userA, sessionId: 'blocked' }))
+      .rejects.toThrow(/platform_admin|无权/);
+    expect(backend.instance.create).not.toHaveBeenCalled();
+  });
+
+  it('lists only profiles visible to the tool caller', async () => {
+    const backend = provider('authorized');
+    const controller = new SandboxRuntimeController();
+    await controller.commit({ manager: { provider: backend.instance }, profiles: authorizedProfiles });
+    const tools = buildSandboxProfileTools(
+      controller,
+      (ctx) => controller.profileDefinitions({ role: ctx.role ?? 'user' }),
+    );
+    const list = tools.find((tool) => tool.def.name === 'sandbox_list_profiles')!;
+
+    const userResult = await list.run({}, { ...userA, sessionId: 'user-list' });
+    const adminResult = await list.run({}, { ...platformAdmin, sessionId: 'admin-list' });
+
+    expect(userResult.content).toContain('Reader profile');
+    expect(userResult.content).not.toContain('Diagnostic profile');
+    expect(adminResult.content).toContain('Diagnostic profile');
+  });
+
+  it('exposes cloned catalog metadata and current desktop capability', async () => {
+    const backend = provider('catalog');
+    const controller = new SandboxRuntimeController();
+    await controller.commit({
+      manager: { provider: backend.instance },
+      profiles: authorizedProfiles,
+      catalog: {
+        fingerprint: 'fingerprint-one',
+        templateCount: 2,
+        loadedAt: '2026-07-16T10:00:00.000Z',
+      },
+      resolveDesktop: async () => ({
+        key: 'catalog-desktop',
+        create: async () => desktopHandle('catalog-desktop', []),
+      }),
+    });
+
+    expect(controller.desktopEnabled()).toBe(true);
+    const info = controller.catalogInfo();
+    expect(info).toEqual({
+      fingerprint: 'fingerprint-one',
+      templateCount: 2,
+      loadedAt: '2026-07-16T10:00:00.000Z',
+    });
+    if (info) info.fingerprint = 'mutated';
+    expect(controller.catalogInfo()?.fingerprint).toBe('fingerprint-one');
+
+    await controller.commit({ manager: { provider: backend.instance }, profiles: [] });
+    expect(controller.desktopEnabled()).toBe(false);
+    expect(controller.catalogInfo()).toBeUndefined();
+    await controller.disposeAll();
   });
 
   it('exposes current profiles dynamically and drains superseded warm pools', async () => {

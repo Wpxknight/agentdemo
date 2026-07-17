@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { hashPassword, verifyPassword } from '../src/auth/password.js';
 import { LocalAuthProvider } from '../src/auth/local.js';
 import { MemoryStore } from '../src/db/memory.js';
@@ -135,13 +135,27 @@ describe('local auth bootstrap', () => {
       expect(rt.tools.has('desktop_stream_url')).toBe(true);
       expect(rt.tools.has('browser_navigate')).toBe(true);
       expect(rt.tools.has('browser_screenshot')).toBe(true);
-      expect(rt.sandboxProfiles?.map((profile) => profile.name)).toEqual(['default']);
+      expect(rt.sandboxProfiles).toEqual([
+        expect.objectContaining({
+          id: 'default',
+          name: 'default',
+          envType: 'code',
+          desktop: true,
+        }),
+      ]);
+      const command = await rt.tools.dispatch({
+        id: 'legacy-command',
+        name: 'sbx__run_command',
+        args: { command: 'printf legacy-dual-use' },
+      }, { sessionId: 'legacy-desktop', tenantId: 'default', userId: 'user', role: 'user' });
+      expect(command).toMatchObject({ isError: false });
+      expect(command.content).toContain('legacy-dual-use');
     } finally {
       await rt.dispose();
     }
   });
 
-  it('registers AIOS lifecycle sandbox tools without desktop/browser tools', async () => {
+  it('registers AIOS lifecycle tools from the dynamic template catalog', async () => {
     const cfg = parseConfig(`{
       "models": { "mock": { "protocol": "openai", "baseURL": "http://localhost/v1", "apiKey": "x", "model": "mock" } },
       "defaultModel": "mock",
@@ -153,15 +167,31 @@ describe('local auth bootstrap', () => {
           "lifecycleUrl": "http://aios-sandbox-server:8080",
           "placement": { "clusterId": "local", "namespace": "aios-sandbox-local" }
         },
-        "desktop": false,
-        "profiles": {
-          "code": { "image": "code-interpreter", "capabilities": ["python", "node", "shell"] }
-        }
+        "desktop": false
       }
     }`);
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify([
+      {
+        templateID: 'code-id',
+        names: ['code-interpreter'],
+        aliases: ['code'],
+        buildStatus: 'ready',
+        aios: {
+          description: 'Code sandbox',
+          envType: 'code',
+          runtimeRole: 'sandbox-reader',
+          image: 'code:latest',
+          defaultTimeoutHours: 1
+        }
+      }
+    ]), { status: 200, headers: { 'content-type': 'application/json' } }));
 
     const rt = await buildRuntime(cfg);
     try {
+      expect(fetch).toHaveBeenCalledWith(
+        'http://aios-sandbox-server:8080/templates',
+        expect.objectContaining({ method: 'GET', redirect: 'error' }),
+      );
       expect(rt.tools.has('sbx__run_code')).toBe(true);
       expect(rt.tools.has('sbx__run_command')).toBe(true);
       expect(rt.tools.has('sandbox_list_profiles')).toBe(true);
@@ -170,12 +200,18 @@ describe('local auth bootstrap', () => {
       expect(rt.tools.has('browser_navigate')).toBe(false);
       expect(rt.tools.has('browser_screenshot')).toBe(false);
       expect(rt.sandboxProfiles).toEqual([
-        expect.objectContaining({ name: 'code', image: 'code-interpreter', capabilities: ['python', 'node', 'shell'] }),
+        expect.objectContaining({
+          id: 'code-id',
+          name: 'code-interpreter',
+          template: 'code-id',
+          capabilities: ['python', 'node', 'shell'],
+        }),
       ]);
       expect(rt.userHome).toBeUndefined();
       expect(rt.sandboxSettings).not.toHaveProperty('apiKey');
     } finally {
       await rt.dispose();
+      fetch.mockRestore();
     }
   });
 

@@ -98,9 +98,6 @@ export const SandboxConfigSchema = z
     if (value.provider !== 'e2b') {
       ctx.addIssue({ code: 'custom', path: ['provider'], message: 'sandbox.aios 仅支持 provider=e2b' });
     }
-    if (value.desktop) {
-      ctx.addIssue({ code: 'custom', path: ['desktop'], message: 'sandbox.aios 模式要求 desktop=false' });
-    }
     if (value.warmPoolSize) {
       ctx.addIssue({
         code: 'custom',
@@ -115,35 +112,12 @@ export const SandboxConfigSchema = z
         message: 'sandbox.aios 第一阶段不支持用户主目录挂载',
       });
     }
-    const profiles = Object.entries(value.profiles ?? {});
-    if (profiles.length !== 1 || profiles[0]?.[0] !== 'code') {
-      ctx.addIssue({
-        code: 'custom',
-        path: ['profiles'],
-        message: 'sandbox.aios 第一阶段仅允许一个 code profile',
-      });
-    }
-    for (const [name, profile] of profiles) {
-      if (profile.desktop) {
-        ctx.addIssue({
-          code: 'custom',
-          path: ['profiles', name, 'desktop'],
-          message: 'sandbox.aios 模式不得配置 desktop profile',
-        });
-      }
+    for (const [name, profile] of Object.entries(value.profiles ?? {})) {
       if (profile.privileged) {
         ctx.addIssue({
           code: 'custom',
           path: ['profiles', name, 'privileged'],
-          message: 'sandbox.aios 第一阶段不得配置 privileged profile',
-        });
-      }
-      const template = profile.image ?? profile.template;
-      if (template !== 'code-interpreter' || (profile.image && profile.template && profile.image !== profile.template)) {
-        ctx.addIssue({
-          code: 'custom',
-          path: ['profiles', name, 'image'],
-          message: 'sandbox.aios 第一阶段仅允许 code-interpreter 模板',
+          message: 'sandbox.aios 不允许手动配置 privileged profile；权限由模板目录的 Runtime Role 决定',
         });
       }
     }

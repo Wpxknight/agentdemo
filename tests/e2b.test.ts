@@ -97,6 +97,7 @@ describe('E2bProvider standard SDK mode', () => {
       aios: {
         lifecycleUrl: 'http://aios.local',
         placement: { clusterId: 'local', namespace: 'aios-sandbox-local' },
+        allowedTemplateIds: new Set(['code-interpreter']),
         fetch,
         readinessDelayMs: 0,
       },

@@ -150,6 +150,31 @@ describe('SandboxManager', () => {
     expect(mgr.has('fresh')).toBe(true);
   });
 
+  it('does not sweep an idle sandbox while an active operation is still using it', async () => {
+    const { provider, killed } = mockProvider();
+    const active = deferredVoid();
+    let clock = 0;
+    const mgr = new SandboxManager({ provider, idleMs: 10, now: () => clock });
+    await mgr.get({ key: 'browser' });
+
+    clock = 11;
+    const operation = mgr.use('browser', async () => active.promise);
+    await expect(mgr.sweep()).resolves.toEqual([]);
+    expect(killed).toEqual([]);
+    expect(mgr.activity().inflight).toBe(1);
+
+    clock = 20;
+    active.resolve();
+    await operation;
+    expect(mgr.activity().inflight).toBe(0);
+
+    clock = 29;
+    await expect(mgr.sweep()).resolves.toEqual([]);
+    clock = 30;
+    await expect(mgr.sweep()).resolves.toEqual(['browser']);
+    expect(killed).toEqual(['new-1']);
+  });
+
   it('renews backend timeout on reuse', async () => {
     const { provider } = mockProvider();
     const mgr = new SandboxManager({ provider, timeoutMs: 5_000 });

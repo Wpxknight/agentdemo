@@ -9,15 +9,29 @@ import {
 } from './lifecycle.js';
 import type { DesktopHandle } from './desktop.js';
 import { sandboxIdentityKey, sandboxIdentityMetadata } from './keys.js';
-import { publicSandboxProfiles, type PublicSandboxProfile, type SandboxProfile } from './profiles.js';
+import {
+  canUseSandboxProfile,
+  findSandboxProfile,
+  publicSandboxProfiles,
+  visibleSandboxProfiles,
+  type PublicSandboxProfile,
+  type SandboxProfile,
+} from './profiles.js';
 import type { SandboxHandle, SandboxSpec } from './types.js';
 import type { SandboxAcquisition, SandboxAcquirer, SpecResolver } from './acquisition.js';
 
 const log = logger.child({ mod: 'sandbox-runtime' });
 
+export interface SandboxCatalogGenerationInfo {
+  fingerprint: string;
+  templateCount: number;
+  loadedAt: string;
+}
+
 export interface SandboxGenerationInput {
   manager: SandboxManagerOptions | SandboxManager;
   profiles: SandboxProfile[];
+  catalog?: SandboxCatalogGenerationInfo;
   resolveSpec?: SpecResolver;
   sweepMs?: number;
   drainWarmPool?: () => Promise<void>;
@@ -38,6 +52,7 @@ interface SandboxGeneration {
   id: number;
   manager: SandboxManager;
   profiles: SandboxProfile[];
+  catalog?: SandboxCatalogGenerationInfo;
   resolveSpec: SpecResolver;
   drainWarmPool?: () => Promise<void>;
   drainPromise?: Promise<void>;
@@ -61,16 +76,30 @@ export class SandboxRuntimeController implements SandboxAcquirer {
     return Boolean(this.current) && !this.disposed;
   }
 
-  profileDefinitions(): SandboxProfile[] {
-    return (this.current?.profiles ?? []).map((profile) => ({
+  codeEnabled(): boolean {
+    return Boolean(this.current?.profiles.some((profile) => profile.envType !== 'browser'))
+      && !this.disposed;
+  }
+
+  desktopEnabled(): boolean {
+    return Boolean(this.current?.resolveDesktop) && !this.disposed;
+  }
+
+  catalogInfo(): SandboxCatalogGenerationInfo | undefined {
+    const catalog = this.current?.catalog;
+    return catalog ? { ...catalog } : undefined;
+  }
+
+  profileDefinitions(ctx: Pick<RequestContext, 'role'> = { role: 'platform_admin' }): SandboxProfile[] {
+    return visibleSandboxProfiles(this.current?.profiles ?? [], ctx.role ?? 'user').map((profile) => ({
       ...profile,
       capabilities: [...profile.capabilities],
       ...(profile.envs ? { envs: { ...profile.envs } } : {}),
     }));
   }
 
-  profiles(): PublicSandboxProfile[] {
-    return publicSandboxProfiles(this.current?.profiles ?? []);
+  profiles(ctx: Pick<RequestContext, 'role'> = { role: 'platform_admin' }): PublicSandboxProfile[] {
+    return publicSandboxProfiles(visibleSandboxProfiles(this.current?.profiles ?? [], ctx.role ?? 'user'));
   }
 
   async desktop(ctx: ToolContext): Promise<DesktopHandle> {
@@ -107,6 +136,7 @@ export class SandboxRuntimeController implements SandboxAcquirer {
         entry.promise = created;
         generation.desktops.set(resolved.key, entry);
       }
+      generation.manager.touch(resolved.key);
       return await entry.promise;
     } finally {
       await this.unpin(generation);
@@ -118,7 +148,15 @@ export class SandboxRuntimeController implements SandboxAcquirer {
     const sessionKeys = this.sessionKeys(ctx, ctx.sessionId);
     const sessionEpochs = this.captureSessionEpochs(generation, sessionKeys);
     try {
+      const role = ctx.role ?? 'user';
+      if (profile) findSandboxProfile(generation.profiles, profile, role);
       const spec = await this.resolveSpec(generation, ctx, profile);
+      const resolvedProfile = spec.profile
+        ? findSandboxProfile(generation.profiles, spec.profile, role)
+        : undefined;
+      if (resolvedProfile && !canUseSandboxProfile(resolvedProfile, role)) {
+        throw new Error('当前身份无权使用该沙箱模板；sandbox-diag 仅 platform_admin 可用');
+      }
       this.assertOperationValid(generation, sessionEpochs);
       const handle = await generation.manager.get(spec);
       if (!this.operationValid(generation, sessionEpochs)) {
@@ -184,6 +222,22 @@ export class SandboxRuntimeController implements SandboxAcquirer {
 
   has(key: string): boolean {
     return this.generations().some((generation) => generation.manager.has(key));
+  }
+
+  touch(key: string): boolean {
+    let touched = false;
+    for (const generation of this.generations()) {
+      touched = generation.manager.touch(key) || touched;
+    }
+    return touched;
+  }
+
+  async use<T>(key: string, action: () => Promise<T>): Promise<T> {
+    const generation = this.generations().find((item) => item.manager.has(key));
+    if (!generation) {
+      throw new Error('sandbox is not available');
+    }
+    return generation.manager.use(key, action);
   }
 
   markCredentialInjected(key: string): void {
@@ -258,6 +312,7 @@ export class SandboxRuntimeController implements SandboxAcquirer {
         capabilities: [...profile.capabilities],
         ...(profile.envs ? { envs: { ...profile.envs } } : {}),
       })),
+      ...(input.catalog ? { catalog: { ...input.catalog } } : {}),
       resolveSpec: input.resolveSpec ?? ((ctx) => ({ key: sandboxIdentityKey(ctx), metadata: sandboxIdentityMetadata(ctx) })),
       drainWarmPool: input.drainWarmPool,
       resolveDesktop: input.resolveDesktop,
@@ -270,7 +325,10 @@ export class SandboxRuntimeController implements SandboxAcquirer {
     if (input.sweepMs) {
       generation.sweepTimer = setInterval(() => {
         void generation.manager.sweep()
-          .then(() => this.cleanupGeneration(generation))
+          .then(async (reclaimedKeys) => {
+            await this.evictDesktops(generation, reclaimedKeys);
+            await this.cleanupGeneration(generation);
+          })
           .catch((err) => log.warn({ generation: generation.id, err: String(err) }, 'sandbox sweep failed'));
       }, input.sweepMs);
       generation.sweepTimer.unref?.();
@@ -288,6 +346,15 @@ export class SandboxRuntimeController implements SandboxAcquirer {
     const handle = entry.handle;
     entry.handle = undefined;
     await handle.kill().catch(() => {});
+  }
+
+  private async evictDesktops(generation: SandboxGeneration, keys: readonly string[]): Promise<void> {
+    await Promise.all(keys.map(async (key) => {
+      const entry = generation.desktops.get(key);
+      if (!entry) return;
+      generation.desktops.delete(key);
+      await this.killDesktop(entry);
+    }));
   }
 
   private pinCurrent(message = 'sandbox runtime is disabled'): SandboxGeneration {

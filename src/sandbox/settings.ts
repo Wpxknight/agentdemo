@@ -237,15 +237,6 @@ export function sandboxSettingsToConfig(settings: SandboxSettings, apiKey?: stri
         ...(apiKey ? { apiKey } : {}),
         aios: { lifecycleUrl: settings.lifecycleUrl, placement: { ...settings.placement } },
         desktop: false,
-        profiles: {
-          code: {
-            description: 'AIOS code interpreter',
-            image: 'code-interpreter',
-            desktop: false,
-            privileged: false,
-            capabilities: ['python', 'node', 'shell'],
-          },
-        },
         userHomeMountPath: '/home/user/host',
       };
   }

@@ -57,21 +57,25 @@ describe('Sandbox bootstrap configuration', () => {
     expect(() => SandboxConfigSchema.parse({ ...aiosSandbox, provider: 'opensandbox' })).toThrow(/provider=e2b/);
   });
 
-  it('rejects unsupported desktop, privilege, template, warm-pool, and user-home features in AIOS mode', () => {
-    expect(() => SandboxConfigSchema.parse({ ...aiosSandbox, desktop: true })).toThrow(/desktop=false/);
-    expect(() => SandboxConfigSchema.parse({
+  it('accepts catalog-owned browser/templates but rejects manual privilege, warm-pool, and user-home features', () => {
+    expect(SandboxConfigSchema.parse({ ...aiosSandbox, desktop: true }).desktop).toBe(true);
+    expect(SandboxConfigSchema.parse({
       ...aiosSandbox,
-      profiles: { code: { image: 'code-interpreter', desktop: true } },
-    })).toThrow(/desktop profile/);
+      profiles: { browser: { image: 'browser-template', desktop: true } },
+    }).profiles).toEqual({
+      browser: expect.objectContaining({ image: 'browser-template', desktop: true }),
+    });
+    expect(SandboxConfigSchema.parse({
+      ...aiosSandbox,
+      profiles: { code: { image: 'other-template' } },
+    }).profiles).toEqual({
+      code: expect.objectContaining({ image: 'other-template' }),
+    });
+    expect(SandboxConfigSchema.parse({ ...aiosSandbox, profiles: undefined }).profiles).toBeUndefined();
     expect(() => SandboxConfigSchema.parse({
       ...aiosSandbox,
       profiles: { diag: { image: 'sandbox-diag', privileged: true } },
-    })).toThrow(/code profile|privileged|code-interpreter/);
-    expect(() => SandboxConfigSchema.parse({
-      ...aiosSandbox,
-      profiles: { code: { image: 'other-template' } },
-    })).toThrow(/code-interpreter/);
-    expect(() => SandboxConfigSchema.parse({ ...aiosSandbox, profiles: undefined })).toThrow(/code profile/);
+    })).toThrow(/privileged|Runtime Role/);
     expect(() => SandboxConfigSchema.parse({ ...aiosSandbox, warmPoolSize: 1 })).toThrow(/warmPoolSize/);
     expect(() => SandboxConfigSchema.parse({ ...aiosSandbox, userHomeRoot: '/home/users' }))
       .toThrow(/用户主目录挂载/);

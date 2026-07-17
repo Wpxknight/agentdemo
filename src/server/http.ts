@@ -210,6 +210,8 @@ interface SandboxSettingsState {
     enabled: boolean;
     mode?: SandboxSettings['mode'];
     status?: string;
+    templateCount?: number;
+    lastSuccessfulRefreshAt?: string;
   };
 }
 
@@ -242,10 +244,23 @@ function publicSandboxSettings(settings: SandboxSettings, apiKeySet: boolean): R
 }
 
 function sandboxSettingsBody(state: SandboxSettingsState): Record<string, unknown> {
+  const runtime = state.runtime
+    ? {
+        enabled: state.runtime.enabled,
+        ...(state.runtime.mode ? { mode: state.runtime.mode } : {}),
+        ...(state.runtime.status ? { status: state.runtime.status } : {}),
+        ...(state.runtime.templateCount !== undefined
+          ? { template_count: state.runtime.templateCount }
+          : {}),
+        ...(state.runtime.lastSuccessfulRefreshAt
+          ? { last_successful_refresh_at: state.runtime.lastSuccessfulRefreshAt }
+          : {}),
+      }
+    : undefined;
   return {
     scope: 'platform',
     settings: publicSandboxSettings(state.settings, state.apiKeySet),
-    ...(state.runtime ? { runtime: state.runtime } : {}),
+    ...(runtime ? { runtime } : {}),
   };
 }
 
@@ -1082,7 +1097,10 @@ async function handle(
 
   if (route === 'GET /v1/sandboxes') {
     const ctx = await requireAuth(rt, req);
-    return sendJson(res, 200, { sandboxes: rt.sandboxes?.list(ctx) ?? [], profiles: rt.sandboxProfiles ?? [] });
+    return sendJson(res, 200, {
+      sandboxes: rt.sandboxes?.list(ctx) ?? [],
+      profiles: rt.sandboxProfilesFor?.(ctx) ?? rt.sandboxProfiles ?? [],
+    });
   }
 
   if (route === 'POST /v1/sandbox/run-code') {
@@ -1259,6 +1277,41 @@ async function handle(
       detail: sandboxAuditDetail(settings, keyAction.action),
     });
     return sendJson(res, 200, sandboxSettingsBody(state));
+  }
+  if (route === 'POST /v1/settings/sandbox/refresh-templates') {
+    const ctx = await requireAuth(rt, req);
+    requirePermission(ctx, 'tenant:manage');
+    if (ctx.role !== 'platform_admin') throw new AuthzError('仅平台管理员可刷新 Sandbox 模板目录');
+    const current = await rt.getSandboxSettings?.();
+    const settings = current?.settings ?? rt.sandboxSettings;
+    if (!settings?.enabled || settings.mode !== 'aios_lifecycle') {
+      throw new HttpError(409, '当前未启用 AIOS Lifecycle Sandbox 模式');
+    }
+    if (!rt.refreshSandboxTemplates) throw new HttpError(503, 'Sandbox Runtime 不支持模板目录刷新');
+    let result: Awaited<ReturnType<NonNullable<Runtime['refreshSandboxTemplates']>>>;
+    try {
+      result = await rt.refreshSandboxTemplates();
+    } catch (err) {
+      log.warn({ err: err instanceof Error ? err.name : typeof err }, 'sandbox template catalog refresh failed');
+      throw new HttpError(502, 'AIOS 模板目录刷新失败');
+    }
+    await rt.audit.record({
+      kind: 'sandbox',
+      action: 'sandbox-templates-refreshed',
+      tenantId: 'default',
+      detail: {
+        mode: 'aios_lifecycle',
+        changed: result.changed,
+        templateCount: result.templateCount,
+      },
+    });
+    return sendJson(res, 200, {
+      ...sandboxSettingsBody(result.state),
+      refresh: {
+        changed: result.changed,
+        template_count: result.templateCount,
+      },
+    });
   }
 
   // —— 设置：定时任务运行时长 ——

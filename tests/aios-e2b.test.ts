@@ -5,6 +5,7 @@ interface RecordedRequest {
   url: string;
   method: string;
   headers: Record<string, string>;
+  signal?: AbortSignal;
   body?: unknown;
 }
 
@@ -23,6 +24,7 @@ function queuedFetch(responses: Response[]) {
       url: String(input),
       method: init?.method ?? 'GET',
       headers,
+      ...(init?.signal ? { signal: init.signal } : {}),
       ...(typeof init?.body === 'string' ? { body: JSON.parse(init.body) } : {}),
     });
     const response = responses.shift();
@@ -37,6 +39,7 @@ function provider(fetch: typeof globalThis.fetch, overrides: Record<string, unkn
     lifecycleUrl: 'http://aios.local:8080/',
     apiKey: 'secret-aios-key',
     placement: { clusterId: 'local', namespace: 'aios-sandbox-local' },
+    allowedTemplateIds: new Set(['code-id', 'browser-id', 'diag-id']),
     fetch,
     readinessDelayMs: 0,
     sleep: vi.fn(async () => {}),
@@ -51,7 +54,7 @@ describe('AiosE2bProvider', () => {
     expect(() => provider(fetch, { readinessDelayMs: -1 })).toThrow(/readinessDelayMs/);
   });
 
-  it('creates with fixed placement, converts timeout, and retries a 409 readiness response', async () => {
+  it('creates an allowlisted browser template with fixed placement, converts timeout, and retries readiness', async () => {
     const { fetch, requests } = queuedFetch([
       jsonResponse(201, { sandboxID: 'sb-aios', state: 'starting' }),
       jsonResponse(409, { code: 'sandbox_not_ready' }),
@@ -61,8 +64,8 @@ describe('AiosE2bProvider', () => {
     const p = provider(fetch, { sleep, readinessAttempts: 3 });
 
     const handle = await p.create({
-      key: 'session:code',
-      template: 'code-interpreter',
+      key: 'session:browser',
+      template: 'browser-id',
       timeoutMs: 1501,
       envs: { A: 'one' },
       metadata: { sessionId: 'session', profile: 'code' },
@@ -72,7 +75,7 @@ describe('AiosE2bProvider', () => {
 
     expect(handle.sandboxId).toBe('sb-aios');
     expect(requests).toHaveLength(3);
-    expect(requests[0]).toEqual({
+    expect(requests[0]).toMatchObject({
       url: 'http://aios.local:8080/sandboxes',
       method: 'POST',
       headers: {
@@ -80,7 +83,7 @@ describe('AiosE2bProvider', () => {
         'x-api-key': 'secret-aios-key',
       },
       body: {
-        template: 'code-interpreter',
+        template: 'browser-id',
         timeout: 2,
         env: { A: 'one' },
         metadata: { sessionId: 'session', profile: 'code' },
@@ -105,7 +108,7 @@ describe('AiosE2bProvider', () => {
     ]);
     const p = provider(fetch, { readinessAttempts: 2 });
 
-    await expect(p.create({ key: 'session:code', template: 'code-interpreter' }))
+    await expect(p.create({ key: 'session:code', template: 'code-id' }))
       .rejects.toThrow(/did not become ready/);
     expect(requests.at(-1)).toMatchObject({
       url: 'http://aios.local:8080/sandboxes/sb-stuck',
@@ -120,7 +123,11 @@ describe('AiosE2bProvider', () => {
     ]);
     const p = provider(fetch);
 
-    const handle = await p.connect('sb-existing', { key: 'session:code', timeoutMs: 60_001 });
+    const handle = await p.connect('sb-existing', {
+      key: 'session:code',
+      template: 'code-id',
+      timeoutMs: 60_001,
+    });
 
     expect(handle.sandboxId).toBe('sb-existing');
     expect(requests[0]).toMatchObject({
@@ -138,7 +145,7 @@ describe('AiosE2bProvider', () => {
       jsonResponse(200, { stdout: 'out', stderr: 'err', exitCode: 7, timedOut: false }),
     ]);
     const output: unknown[] = [];
-    const handle = await provider(fetch).create({ key: 'session:code', template: 'code-interpreter' });
+    const handle = await provider(fetch).create({ key: 'session:code', template: 'code-id' });
 
     await expect(handle.runCommand('exit 7', {
       timeoutMs: 1001,
@@ -150,13 +157,41 @@ describe('AiosE2bProvider', () => {
     ]);
   });
 
+  it('keeps the transport request alive for the caller command timeout plus grace', async () => {
+    vi.useFakeTimers();
+    try {
+      let recorded: RecordedRequest | undefined;
+      const fetch = vi.fn((input: string | URL | Request, init?: RequestInit) => new Promise<Response>((resolve, reject) => {
+        recorded = {
+          url: String(input),
+          method: init?.method ?? 'GET',
+          headers: Object.fromEntries(new Headers(init?.headers).entries()),
+          ...(init?.signal ? { signal: init.signal } : {}),
+          ...(typeof init?.body === 'string' ? { body: JSON.parse(init.body) } : {}),
+        };
+        init?.signal?.addEventListener('abort', () => reject(new Error('transport aborted')), { once: true });
+        setTimeout(() => resolve(jsonResponse(200, { stdout: 'done', stderr: '', exitCode: 0 })), 11_000);
+      })) as unknown as typeof globalThis.fetch;
+      const p = provider(fetch, { timeoutMs: 10_000 });
+
+      const command = p.command('sb-command', 'sleep 30', 30_000);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(recorded?.signal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(command).resolves.toMatchObject({ stdout: 'done', exitCode: 0 });
+      expect(recorded?.body).toEqual({ command: 'sleep 30', timeout: 30 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('returns the partial result from an HTTP 408 command timeout', async () => {
     const { fetch } = queuedFetch([
       jsonResponse(201, { sandboxID: 'sb-timeout' }),
       jsonResponse(200, { stdout: '', stderr: '', exitCode: 0 }),
       jsonResponse(408, { stdout: 'partial', stderr: 'timed out', exitCode: 137, timedOut: true }),
     ]);
-    const handle = await provider(fetch).create({ key: 'session:code', template: 'code-interpreter' });
+    const handle = await provider(fetch).create({ key: 'session:code', template: 'code-id' });
 
     await expect(handle.runCommand('sleep 10', { timeoutMs: 20 }))
       .resolves.toEqual({
@@ -173,13 +208,29 @@ describe('AiosE2bProvider', () => {
       jsonResponse(200, { stdout: '', stderr: '', exitCode: 0 }),
       jsonResponse(200, { stdout: '42\n', stderr: '', exitCode: 0 }),
     ]);
-    const handle = await provider(fetch).create({ key: 'session:code', template: 'code-interpreter' });
+    const handle = await provider(fetch).create({ key: 'session:code', template: 'code-id' });
 
     await expect(handle.runCode('console.log(42)', { language: 'javascript' }))
       .resolves.toEqual({ stdout: '42\n', stderr: '', exitCode: 0 });
     const command = (requests[2].body as { command: string }).command;
     expect(command).toContain(Buffer.from('console.log(42)', 'utf8').toString('base64'));
     expect(command).toMatch(/base64 -d \| node$/);
+  });
+
+  it('allows base64 file responses large enough for the export download limit', async () => {
+    const content = Buffer.alloc(800_000, 7);
+    const { fetch } = queuedFetch([
+      jsonResponse(201, { sandboxID: 'sb-large' }),
+      jsonResponse(200, { stdout: '', stderr: '', exitCode: 0 }),
+      jsonResponse(200, {
+        path: '/workspace/large.bin',
+        encoding: 'base64',
+        content: content.toString('base64'),
+      }),
+    ]);
+    const handle = await provider(fetch).create({ key: 'session:code', template: 'code-id' });
+
+    await expect(handle.readFile('/workspace/large.bin')).resolves.toEqual(Uint8Array.from(content));
   });
 
   it('reads base64 files, updates timeout, and treats a repeated 404 kill as success', async () => {
@@ -191,7 +242,7 @@ describe('AiosE2bProvider', () => {
       jsonResponse(200, { sandboxID: 'sb-files' }),
       jsonResponse(404, { code: 'not_found' }),
     ]);
-    const handle = await provider(fetch).create({ key: 'session:code', template: 'code-interpreter' });
+    const handle = await provider(fetch).create({ key: 'session:code', template: 'code-id' });
 
     await expect(handle.readFile('/workspace/file.bin')).resolves.toEqual(content);
     await handle.setTimeout(1);
@@ -211,27 +262,48 @@ describe('AiosE2bProvider', () => {
       return jsonResponse(401, { code: 'redirect_blocked' });
     }) as unknown as typeof globalThis.fetch;
 
-    await expect(provider(fetch).create({ key: 'session:code', template: 'code-interpreter' }))
+    await expect(provider(fetch).create({ key: 'session:code', template: 'code-id' }))
       .rejects.toThrow(/HTTP 401/);
     expect(fetch).toHaveBeenCalledOnce();
   });
 
-  it('rejects unsupported volumes/templates and never leaks the key in HTTP or network errors', async () => {
+  it('rejects missing, unknown, or volume-backed create specs before any HTTP request', async () => {
     const unused = vi.fn() as unknown as typeof globalThis.fetch;
     const p = provider(unused);
+
+    await expect(p.create({ key: 'session:missing' }))
+      .rejects.toThrow(/not present in the current AIOS template catalog/);
+    await expect(p.create({ key: 'session:unknown', template: 'unknown-id' }))
+      .rejects.toThrow(/not present in the current AIOS template catalog/);
     await expect(p.create({
       key: 'session:code',
-      template: 'code-interpreter',
+      template: 'code-id',
       volumes: [{ name: 'home', hostPath: '/home/user', mountPath: '/mnt/home' }],
     })).rejects.toThrow(/does not support sandbox volumes/);
-    await expect(p.create({ key: 'session:diag', template: 'sandbox-diag' }))
-      .rejects.toThrow(/requires template=code-interpreter/);
     expect(unused).not.toHaveBeenCalled();
+  });
 
+  it('rejects missing, unknown, or volume-backed connect specs before any HTTP request', async () => {
+    const unused = vi.fn() as unknown as typeof globalThis.fetch;
+    const p = provider(unused);
+
+    await expect(p.connect('sb-existing', { key: 'session:missing' }))
+      .rejects.toThrow(/not present in the current AIOS template catalog/);
+    await expect(p.connect('sb-existing', { key: 'session:unknown', template: 'unknown-id' }))
+      .rejects.toThrow(/not present in the current AIOS template catalog/);
+    await expect(p.connect('sb-existing', {
+      key: 'session:code',
+      template: 'code-id',
+      volumes: [{ name: 'home', hostPath: '/home/user', mountPath: '/mnt/home' }],
+    })).rejects.toThrow(/does not support sandbox volumes/);
+    expect(unused).not.toHaveBeenCalled();
+  });
+
+  it('never leaks the key in HTTP or network errors', async () => {
     const unauthorized = provider(vi.fn(async () => jsonResponse(401, {
       message: 'bad key secret-aios-key',
     })) as unknown as typeof globalThis.fetch);
-    const authError = await unauthorized.create({ key: 'session:code', template: 'code-interpreter' })
+    const authError = await unauthorized.create({ key: 'session:code', template: 'code-id' })
       .catch((error: unknown) => String(error));
     expect(authError).toContain('HTTP 401');
     expect(authError).not.toContain('secret-aios-key');
@@ -239,7 +311,7 @@ describe('AiosE2bProvider', () => {
     const offline = provider(vi.fn(async () => {
       throw new Error('request with secret-aios-key failed');
     }) as unknown as typeof globalThis.fetch);
-    const networkError = await offline.create({ key: 'session:code', template: 'code-interpreter' })
+    const networkError = await offline.create({ key: 'session:code', template: 'code-id' })
       .catch((error: unknown) => String(error));
     expect(networkError).toContain('AIOS Lifecycle request failed');
     expect(networkError).not.toContain('secret-aios-key');

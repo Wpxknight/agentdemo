@@ -1049,23 +1049,35 @@ describe('HTTP server', () => {
     await localStore.createTenant({ id: 'default', name: 'Default' });
     const auth = new LocalAuthProvider({ store: localStore, secret: 'sandbox-list-secret' });
     await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    await auth.createUser('default', 'tenant', 'pw', 'tenant_admin');
+    await auth.createUser('default', 'user', 'pw', 'user');
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    const tenantToken = (await auth.login('default', 'tenant', 'pw'))!;
+    const userToken = (await auth.login('default', 'user', 'pw'))!;
     const { provider } = mockSandboxProvider();
     const manager = new SandboxManager({ provider });
     const tools = new ToolRegistry();
     for (const tool of buildSandboxTools(manager)) tools.register(tool);
     const profiles = [
       {
+        id: 'code-id',
         name: 'code',
+        template: 'code-id',
         description: '普通代码沙箱',
+        envType: 'code' as const,
+        runtimeRole: 'sandbox-reader' as const,
         image: 'aiop/opensandbox-code:dev',
         desktop: false,
         privileged: false,
         capabilities: ['python', 'shell'],
       },
       {
+        id: 'diag-id',
         name: 'netdiag',
+        template: 'diag-id',
         description: '网络排查沙箱',
+        envType: 'code' as const,
+        runtimeRole: 'sandbox-diag' as const,
         image: 'aiop/opensandbox-netdiag:dev',
         desktop: false,
         privileged: true,
@@ -1078,6 +1090,9 @@ describe('HTTP server', () => {
       tools,
       sandboxes: manager,
       sandboxProfiles: profiles,
+      sandboxProfilesFor: (ctx: { role: string }) => profiles.filter(
+        (profile) => profile.runtimeRole !== 'sandbox-diag' || ctx.role === 'platform_admin',
+      ),
       store: localStore,
       policy: new AllowAllPolicy(),
       policyPreApproved: new AllowAllPolicy(),
@@ -1114,9 +1129,18 @@ describe('HTTP server', () => {
         profiles: Array<{ name: string; image?: string; capabilities: string[] }>;
       };
       expect(body.profiles).toEqual([
-        expect.objectContaining({ name: 'code', image: 'aiop/opensandbox-code:dev', capabilities: ['python', 'shell'] }),
-        expect.objectContaining({ name: 'netdiag', image: 'aiop/opensandbox-netdiag:dev', capabilities: ['kubectl', 'tcpdump'] }),
+        expect.objectContaining({ id: 'code-id', name: 'code', image: 'aiop/opensandbox-code:dev', capabilities: ['python', 'shell'] }),
+        expect.objectContaining({ id: 'diag-id', name: 'netdiag', image: 'aiop/opensandbox-netdiag:dev', capabilities: ['kubectl', 'tcpdump'] }),
       ]);
+      for (const authToken of [tenantToken, userToken]) {
+        const roleListed = await fetch(`${sandboxBase}/v1/sandboxes`, {
+          headers: { authorization: `Bearer ${authToken}` },
+        });
+        expect(roleListed.status).toBe(200);
+        expect((await roleListed.json() as { profiles: Array<{ id: string }> }).profiles).toEqual([
+          expect.objectContaining({ id: 'code-id' }),
+        ]);
+      }
       expect(body.sandboxes).toEqual([
         expect.objectContaining({
           id: 'sandbox-1', sandboxId: 'sandbox-1', sessionId: 'session-a', status: 'ready', type: 'session',
@@ -1127,9 +1151,9 @@ describe('HTTP server', () => {
           sandboxId: 'sandbox-2',
           sessionId: 'session-b',
           status: 'ready',
-          type: 'netdiag',
-          profile: 'netdiag',
-          image: 'aiop/opensandbox-netdiag:dev',
+          type: 'diag-id',
+          profile: 'diag-id',
+          image: 'diag-id',
           privileged: true,
         }),
       ]);
@@ -1874,7 +1898,15 @@ type SandboxSettingsState = {
     enabled: boolean;
     mode?: SandboxSettings['mode'];
     status?: string;
+    templateCount?: number;
+    lastSuccessfulRefreshAt?: string;
   };
+};
+
+type SandboxTemplateRefreshResult = {
+  changed: boolean;
+  templateCount: number;
+  state: SandboxSettingsState;
 };
 
 type SandboxSettingsUpdate = {
@@ -1888,14 +1920,17 @@ type SandboxSettingsUpdate = {
 async function createSandboxSettingsHttpServer(options: {
   initial?: SandboxSettingsState;
   apply?: (input: SandboxSettingsUpdate) => Promise<SandboxSettingsState>;
+  refresh?: () => Promise<SandboxTemplateRefreshResult>;
 } = {}) {
   const localStore = new MemoryStore();
   await localStore.createTenant({ id: 'default', name: 'Default' });
   const auth = new LocalAuthProvider({ store: localStore, secret: 'sandbox-settings-http-secret' });
   await auth.createUser('default', 'platform', 'pw', 'platform_admin');
   await auth.createUser('default', 'tenant', 'pw', 'tenant_admin');
+  await auth.createUser('default', 'user', 'pw', 'user');
   const platformToken = (await auth.login('default', 'platform', 'pw'))!;
   const tenantToken = (await auth.login('default', 'tenant', 'pw'))!;
+  const userToken = (await auth.login('default', 'user', 'pw'))!;
   const auditEvents: Array<Record<string, unknown>> = [];
   let state: SandboxSettingsState = options.initial ?? {
     settings: { enabled: false, mode: 'local' },
@@ -1920,6 +1955,10 @@ async function createSandboxSettingsHttpServer(options: {
     };
     return state;
   });
+  const refreshSandboxTemplates = vi.fn(async () => {
+    if (options.refresh) return options.refresh();
+    return { changed: false, templateCount: state.runtime?.templateCount ?? 0, state };
+  });
   const rt = {
     model,
     tools: new ToolRegistry(),
@@ -1933,6 +1972,7 @@ async function createSandboxSettingsHttpServer(options: {
     defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     getSandboxSettings,
     updateSandbox,
+    refreshSandboxTemplates,
   } as unknown as Runtime;
   const localServer = createHttpServer(rt);
   await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve));
@@ -1941,9 +1981,11 @@ async function createSandboxSettingsHttpServer(options: {
     base: localBase,
     platformToken,
     tenantToken,
+    userToken,
     auditEvents,
     getSandboxSettings,
     updateSandbox,
+    refreshSandboxTemplates,
     close: () => new Promise<void>((resolve) => localServer.close(() => resolve())),
   };
 }
@@ -1992,6 +2034,164 @@ describe('HTTP server 平台 Sandbox 设置', () => {
       expect(text).not.toContain('encrypted');
     } finally {
       await fixture.close();
+    }
+  });
+
+  it('serializes non-sensitive catalog runtime status fields', async () => {
+    const fixture = await createSandboxSettingsHttpServer({
+      initial: {
+        settings: {
+          enabled: true,
+          mode: 'aios_lifecycle',
+          lifecycleUrl: 'https://sandbox.example.test/lifecycle',
+          placement: { clusterId: 'local', namespace: 'sandbox-system' },
+        },
+        apiKeySet: true,
+        runtime: {
+          enabled: true,
+          mode: 'aios_lifecycle',
+          status: 'active',
+          templateCount: 3,
+          lastSuccessfulRefreshAt: '2026-07-16T10:00:00.000Z',
+        },
+      },
+    });
+    try {
+      const response = await fetch(`${fixture.base}/v1/settings/sandbox`, {
+        headers: { authorization: `Bearer ${fixture.platformToken}` },
+      });
+      expect(response.status).toBe(200);
+      const body = await response.json() as { runtime: Record<string, unknown> };
+      expect(body.runtime).toEqual({
+        enabled: true,
+        mode: 'aios_lifecycle',
+        status: 'active',
+        template_count: 3,
+        last_successful_refresh_at: '2026-07-16T10:00:00.000Z',
+      });
+      expect(body.runtime).not.toHaveProperty('fingerprint');
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it('refreshes AIOS templates only for platform admins and audits safe details', async () => {
+    const state: SandboxSettingsState = {
+      settings: {
+        enabled: true,
+        mode: 'aios_lifecycle',
+        lifecycleUrl: 'https://sandbox.example.test/lifecycle',
+        placement: { clusterId: 'cluster-a', namespace: 'sandbox-system' },
+      },
+      apiKeySet: true,
+      runtime: {
+        enabled: true,
+        mode: 'aios_lifecycle',
+        status: 'active',
+        templateCount: 3,
+        lastSuccessfulRefreshAt: '2026-07-16T10:00:00.000Z',
+      },
+    };
+    const fixture = await createSandboxSettingsHttpServer({
+      initial: state,
+      refresh: async () => ({ changed: true, templateCount: 3, state }),
+    });
+    const refresh = (token?: string) => fetch(
+      `${fixture.base}/v1/settings/sandbox/refresh-templates`,
+      {
+        method: 'POST',
+        headers: token
+          ? { authorization: `Bearer ${token}`, 'content-type': 'application/json' }
+          : { 'content-type': 'application/json' },
+        body: '{}',
+      },
+    );
+    try {
+      expect((await refresh()).status).toBe(401);
+      expect((await refresh(fixture.userToken)).status).toBe(403);
+      expect((await refresh(fixture.tenantToken)).status).toBe(403);
+      expect(fixture.refreshSandboxTemplates).not.toHaveBeenCalled();
+
+      const response = await refresh(fixture.platformToken);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        scope: 'platform',
+        settings: {
+          enabled: true,
+          mode: 'aios_lifecycle',
+          lifecycle_url: 'https://sandbox.example.test/lifecycle',
+          placement: { cluster_id: 'cluster-a', namespace: 'sandbox-system' },
+          api_key_set: true,
+        },
+        runtime: {
+          enabled: true,
+          mode: 'aios_lifecycle',
+          status: 'active',
+          template_count: 3,
+          last_successful_refresh_at: '2026-07-16T10:00:00.000Z',
+        },
+        refresh: { changed: true, template_count: 3 },
+      });
+      expect(fixture.refreshSandboxTemplates).toHaveBeenCalledTimes(1);
+      expect(fixture.auditEvents).toEqual([
+        expect.objectContaining({
+          kind: 'sandbox',
+          action: 'sandbox-templates-refreshed',
+          tenantId: 'default',
+          detail: { mode: 'aios_lifecycle', changed: true, templateCount: 3 },
+        }),
+      ]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it('returns sanitized refresh errors and rejects unsupported runtimes', async () => {
+    const failed = await createSandboxSettingsHttpServer({
+      initial: {
+        settings: {
+          enabled: true,
+          mode: 'aios_lifecycle',
+          lifecycleUrl: 'https://sandbox.example.test/lifecycle',
+          placement: { clusterId: 'cluster-a', namespace: 'sandbox-system' },
+        },
+        apiKeySet: true,
+      },
+      refresh: async () => {
+        throw new Error('remote body contained X-API-KEY and secret-value');
+      },
+    });
+    try {
+      const response = await fetch(`${failed.base}/v1/settings/sandbox/refresh-templates`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${failed.platformToken}` },
+      });
+      expect(response.status).toBe(502);
+      const text = await response.text();
+      expect(text).toContain('AIOS 模板目录刷新失败');
+      expect(text).not.toContain('X-API-KEY');
+      expect(text).not.toContain('secret-value');
+      expect(failed.auditEvents).toHaveLength(0);
+    } finally {
+      await failed.close();
+    }
+
+    const unsupported = await createSandboxSettingsHttpServer({
+      initial: {
+        settings: { enabled: false, mode: 'local' },
+        apiKeySet: false,
+        runtime: { enabled: false, mode: 'local', status: 'disabled' },
+      },
+    });
+    try {
+      const response = await fetch(`${unsupported.base}/v1/settings/sandbox/refresh-templates`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${unsupported.platformToken}` },
+      });
+      expect(response.status).toBe(409);
+      expect(unsupported.refreshSandboxTemplates).not.toHaveBeenCalled();
+    } finally {
+      await unsupported.close();
     }
   });
 

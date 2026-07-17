@@ -463,7 +463,11 @@ describe('frontend API wiring', () => {
     const css = await readFile('web/src/index.css', 'utf8');
     const types = await readFile('web/src/types.ts', 'utf8');
 
-    expect(types).toContain('export interface SandboxProfileSummary');
+    const sandboxProfileType = types.match(/export interface SandboxProfileSummary \{[\s\S]*?\n\}/)?.[0] || '';
+    expect(sandboxProfileType).toContain('id: string;');
+    expect(sandboxProfileType).toContain('template?: string;');
+    expect(sandboxProfileType).toContain("envType: 'code' | 'browser';");
+    expect(sandboxProfileType).toContain("runtimeRole: 'sandbox-reader' | 'sandbox-diag';");
     expect(types).toContain('profiles?: SandboxProfileSummary[]');
     expect(types).toContain('profile?: string;');
     expect(types).toContain('capabilities?: string[];');
@@ -472,6 +476,11 @@ describe('frontend API wiring', () => {
     expect(app).not.toContain('sandboxes.length ? sandboxes : fallbackSandboxes');
     expect(app).toContain('支持的沙箱模板');
     expect(app).toContain('AI 会按任务能力选择 profile');
+    expect(app).toContain('key={profile.id}');
+    expect(app).toContain('profile.template');
+    expect(app).toContain('profile.envType');
+    expect(app).toContain('profile.runtimeRole');
+    expect(app).toContain('特权诊断');
     expect(app).toContain("headers={['沙箱 ID', '状态', 'Profile', '镜像/模板', '绑定会话', 'Key', '活跃时间']}");
     expect(app).toContain('sandbox.sessionId ||');
     expect(app).toContain('const [selectedSandboxId, setSelectedSandboxId] = useState<string | null>(null)');
@@ -692,8 +701,12 @@ describe('frontend API wiring', () => {
 
     expect(types).toContain("export type SandboxSettingsMode = 'standard_e2b' | 'aios_lifecycle' | 'opensandbox' | 'local'");
     const sandboxSettingsType = types.match(/export interface SandboxSettingsInfo \{[\s\S]*?\n\}/)?.[0] || '';
+    const sandboxSettingsBodyType = types.match(/export interface SandboxSettingsBody \{[\s\S]*?\n\}/)?.[0] || '';
     expect(sandboxSettingsType).toContain('api_key_set: boolean;');
     expect(sandboxSettingsType).not.toContain('api_key_preview');
+    expect(sandboxSettingsBodyType).toContain("status?: 'disabled' | 'active' | 'catalog_unavailable' | 'refreshing' | string;");
+    expect(sandboxSettingsBodyType).toContain('template_count?: number;');
+    expect(sandboxSettingsBodyType).toContain('last_successful_refresh_at?: string;');
     expect(app).toContain("api.get<SandboxSettingsBody>('/v1/settings/sandbox')");
     expect(app).toContain("api.post<SandboxSettingsBody>('/v1/settings/sandbox'");
     expect(app).toContain('<SelectItem value="standard_e2b">标准 E2B</SelectItem>');
@@ -703,7 +716,15 @@ describe('frontend API wiring', () => {
     expect(app).toContain('Lifecycle URL');
     expect(app).toContain('Cluster ID');
     expect(app).toContain('Namespace');
-    expect(app).toContain('固定使用 code-interpreter');
+    expect(app).toContain('模板由 AIOS 目录动态加载；browser 模板接入现有截图预览，sandbox-diag 仅平台管理员可见可用。');
+    expect(app).not.toContain('固定使用 code-interpreter');
+    expect(app).toContain('template_count');
+    expect(app).toContain('last_successful_refresh_at');
+    expect(app).toContain('catalog_unavailable');
+    expect(app).toContain("'/v1/settings/sandbox/refresh-templates'");
+    expect(app).toContain('刷新模板');
+    expect(app).toContain('refreshBusy');
+    expect(app).toContain('refreshBusyRef.current');
     expect(app).toContain('type="password"');
     expect(app).toContain('autoComplete="new-password"');
     expect(app).toContain("info?.api_key_set ? '已配置' : '未配置'");

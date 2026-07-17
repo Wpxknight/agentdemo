@@ -47,13 +47,13 @@ function markdownProfiles(profiles: SandboxProfile[]): string {
   ].join('\n');
 }
 
-export type SandboxProfilesAccessor = SandboxProfile[] | (() => SandboxProfile[]);
+export type SandboxProfilesAccessor = SandboxProfile[] | ((ctx: ToolContext) => SandboxProfile[]);
 
 export function buildSandboxProfileTools(manager: SandboxManagerLike, source: SandboxProfilesAccessor): ToolHandler[] {
-  const profiles = () => typeof source === 'function' ? source() : source;
+  const profiles = (ctx: ToolContext) => typeof source === 'function' ? source(ctx) : source;
   const acquire = async (ctx: ToolContext, profileName?: string) => {
     if (isSandboxAcquirer(manager)) return manager.acquire(ctx, profileName);
-    const profile = findSandboxProfile(profiles(), profileName);
+    const profile = findSandboxProfile(profiles(ctx), profileName, ctx.role);
     const spec = sandboxSpecForProfile(profile, ctx);
     return { handle: await manager.get(spec), spec };
   };
@@ -64,11 +64,12 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
         description: '列出当前支持的沙箱模板/profile，便于根据任务选择 code/browser/netdiag 等沙箱。',
         inputSchema: { type: 'object', properties: {} },
       },
-      async run(): Promise<ToolResult> {
+      async run(_args, ctx: ToolContext): Promise<ToolResult> {
+        const visible = profiles(ctx);
         return {
           id: '',
-          content: markdownProfiles(profiles()),
-          contentBlocks: [{ type: 'text', text: JSON.stringify({ profiles: publicSandboxProfiles(profiles()) }) }],
+          content: markdownProfiles(visible),
+          contentBlocks: [{ type: 'text', text: JSON.stringify({ profiles: publicSandboxProfiles(visible) }) }],
         };
       },
     },
@@ -79,7 +80,7 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
         inputSchema: {
           type: 'object',
           properties: {
-            profile: { type: 'string', description: '沙箱模板名，如 code / browser / netdiag' },
+            profile: { type: 'string', description: '稳定的沙箱 Profile ID；可先用 sandbox_list_profiles 查询' },
           },
         },
       },
@@ -99,7 +100,7 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
         inputSchema: {
           type: 'object',
           properties: {
-            profile: { type: 'string', description: '沙箱模板名，如 code / browser / netdiag' },
+            profile: { type: 'string', description: '稳定的沙箱 Profile ID；可先用 sandbox_list_profiles 查询' },
             code: { type: 'string', description: '要执行的源代码' },
             language: { type: 'string', description: '语言，如 python / javascript；缺省 python' },
           },
@@ -121,7 +122,7 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
         inputSchema: {
           type: 'object',
           properties: {
-            profile: { type: 'string', description: '沙箱模板名，如 code / browser / netdiag' },
+            profile: { type: 'string', description: '稳定的沙箱 Profile ID；可先用 sandbox_list_profiles 查询' },
             command: { type: 'string', description: '要执行的 shell 命令' },
           },
           required: ['command'],

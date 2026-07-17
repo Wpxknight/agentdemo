@@ -8,6 +8,7 @@ const log = logger.child({ mod: 'sandbox' });
 interface Entry {
   handle: SandboxHandle;
   lastUsed: number;
+  activeUses: number;
   createdAt: number;
   /** 该沙箱的存活超时(ms)，复用时据此续期。 */
   timeoutMs: number;
@@ -46,6 +47,8 @@ export interface SandboxSummary {
 export interface SandboxManagerLike {
   get(spec: SandboxSpec): Promise<SandboxHandle>;
   has(key: string): boolean;
+  touch(key: string): boolean;
+  use<T>(key: string, action: () => Promise<T>): Promise<T>;
   markCredentialInjected(key: string): void;
   size(): number;
   list(ctx?: RequestContext): SandboxSummary[];
@@ -110,7 +113,11 @@ export class SandboxManager implements SandboxManagerLike {
   activity(): { active: number; inflight: number; cleanup: number } {
     return {
       active: this.entries.size,
-      inflight: this.inflightActivity,
+      inflight: this.inflightActivity
+        + [...this.entries.values()].reduce(
+          (total, entry) => total + entry.activeUses,
+          0,
+        ),
       cleanup: this.cleanupActivity,
     };
   }
@@ -153,6 +160,7 @@ export class SandboxManager implements SandboxManagerLike {
         this.entries.set(spec.key, {
           handle,
           lastUsed: readyAt,
+          activeUses: 0,
           createdAt: readyAt,
           timeoutMs: effectiveTimeout,
           spec: full,
@@ -175,6 +183,32 @@ export class SandboxManager implements SandboxManagerLike {
 
   has(key: string): boolean {
     return this.entries.has(key);
+  }
+
+  /** 刷新缓存沙箱的本地活跃时间；用于已缓存 Desktop 的后续浏览器操作。 */
+  touch(key: string): boolean {
+    const entry = this.entries.get(key);
+    if (!entry) return false;
+    entry.lastUsed = this.now();
+    return true;
+  }
+
+  /** 在一次外部操作期间固定缓存 entry，避免 idle sweep 回收仍在执行的浏览器命令。 */
+  async use<T>(key: string, action: () => Promise<T>): Promise<T> {
+    const entry = this.entries.get(key);
+    if (!entry) {
+      throw new Error('sandbox is not available');
+    }
+    entry.activeUses++;
+    entry.lastUsed = this.now();
+    try {
+      return await action();
+    } finally {
+      entry.activeUses = Math.max(0, entry.activeUses - 1);
+      if (this.entries.get(key) === entry) {
+        entry.lastUsed = this.now();
+      }
+    }
   }
 
   /**
@@ -245,7 +279,11 @@ export class SandboxManager implements SandboxManagerLike {
 
   private async runSweep(): Promise<string[]> {
     const cutoff = this.now() - this.idleMs;
-    const expired = [...this.entries.entries()].filter(([, e]) => e.lastUsed <= cutoff);
+    const expired = [...this.entries.entries()].filter(
+      ([, entry]) =>
+        entry.activeUses === 0
+        && entry.lastUsed <= cutoff,
+    );
     for (const [key] of expired) this.entries.delete(key);
     await Promise.all(expired.map(async ([key, entry]) => {
       try {

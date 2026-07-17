@@ -9,7 +9,10 @@ import { PermissionRules } from './agent/rules.js';
 import { HookRunner } from './agent/hooks.js';
 import { PlanApprovalState } from './agent/plan.js';
 import { SandboxManager, type SandboxManagerLike } from './sandbox/lifecycle.js';
-import { SandboxRuntimeController, type SandboxGenerationInput } from './sandbox/runtime-controller.js';
+import {
+  SandboxRuntimeController,
+  type SandboxGenerationInput,
+} from './sandbox/runtime-controller.js';
 import { E2bProvider } from './sandbox/e2b.js';
 import { OpenSandboxProvider } from './sandbox/opensandbox.js';
 import { LocalSandboxProvider } from './sandbox/local.js';
@@ -19,6 +22,7 @@ import { WarmPool } from './sandbox/warmpool.js';
 import { E2bDesktopProvider } from './sandbox/e2b-desktop.js';
 import { LocalDesktopProvider } from './sandbox/local-desktop.js';
 import { OpenSandboxDesktopProvider } from './sandbox/opensandbox-desktop.js';
+import { CommandDesktopProvider } from './sandbox/command-desktop.js';
 import type { DesktopHandle, DesktopProvider } from './sandbox/desktop.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -69,6 +73,10 @@ import { AiosAuthProvider } from './auth/aios.js';
 import { UserCredentials } from './auth/credentials.js';
 import type { AuthProvider } from './auth/provider.js';
 import type { RequestContext } from './auth/types.js';
+import {
+  AiosTemplateCatalog,
+  sandboxProfilesFromAiosCatalog,
+} from './sandbox/aios-template-catalog.js';
 
 /** 当前生效的非敏感 Sandbox 设置（默认 Key 绝不进入该结构）。 */
 export type SandboxConnectionInfo = SandboxSettings;
@@ -80,7 +88,15 @@ export interface SandboxSettingsState {
     enabled: boolean;
     mode?: SandboxSettings['mode'];
     status?: string;
+    templateCount?: number;
+    lastSuccessfulRefreshAt?: string;
   };
+}
+
+export interface SandboxTemplateRefreshResult {
+  changed: boolean;
+  templateCount: number;
+  state: SandboxSettingsState;
 }
 
 interface PreparedSandboxGeneration {
@@ -115,6 +131,10 @@ export interface Runtime {
   downloads?: DownloadStore;
   /** 可供模型选择的沙箱模板/profile 列表。 */
   sandboxProfiles?: PublicSandboxProfile[];
+  /** 按调用方角色过滤的当前 generation profiles。 */
+  sandboxProfilesFor?(ctx: RequestContext): PublicSandboxProfile[];
+  /** 重新加载当前 AIOS 模板目录，并在指纹变化时原子切换 generation。 */
+  refreshSandboxTemplates?(): Promise<SandboxTemplateRefreshResult>;
   clusters: ClusterRegistry;
   audit: AuditSink;
   store: Store;
@@ -219,6 +239,10 @@ export async function buildRuntime(
   let sandboxCfg: SandboxConfig | undefined;
   let downloads: DownloadStore | undefined;
   let downloadSweepTimer: ReturnType<typeof setInterval> | undefined;
+  let sandboxCatalogRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  let sandboxCatalogRefreshQueued = false;
+  let sandboxCatalogUnavailable = false;
+  let lastSuccessfulSandboxRefreshAt: string | undefined;
   let sandboxUpdateTail: Promise<void> = Promise.resolve();
   let sandboxUpdatesClosed = false;
 
@@ -244,15 +268,29 @@ export async function buildRuntime(
             apiKey: cfg.apiKey,
             defaultImage: cfg.defaultImage,
           })
-        : new E2bProvider({
-            apiKey: cfg.apiKey,
-            domain: cfg.domain,
-            ...(cfg.aios ? { aios: { ...cfg.aios, apiKey: cfg.apiKey } } : {}),
-          });
+        : new E2bProvider({ apiKey: cfg.apiKey, domain: cfg.domain });
 
   const prepareGeneration = async (cfg: SandboxConfig): Promise<PreparedSandboxGeneration> => {
-    const profiles = resolveSandboxProfiles(cfg);
-    const provider = makeSandboxProvider(cfg);
+    const catalogSnapshot = cfg.aios
+      ? await new AiosTemplateCatalog({
+          lifecycleUrl: cfg.aios.lifecycleUrl,
+          apiKey: cfg.apiKey,
+        }).load()
+      : undefined;
+    const profiles = catalogSnapshot
+      ? sandboxProfilesFromAiosCatalog(catalogSnapshot.templates)
+      : resolveSandboxProfiles(cfg);
+    const provider = cfg.aios
+      ? new E2bProvider({
+          apiKey: cfg.apiKey,
+          aios: {
+            lifecycleUrl: cfg.aios.lifecycleUrl,
+            apiKey: cfg.apiKey,
+            placement: { ...cfg.aios.placement },
+            allowedTemplateIds: new Set(catalogSnapshot!.templates.map((template) => template.templateId)),
+          },
+        })
+      : makeSandboxProvider(cfg);
     let warmPool: WarmPool | undefined;
     if (cfg.warmPoolSize && !hasClusters) {
       warmPool = new WarmPool({ provider, spec: {}, size: cfg.warmPoolSize });
@@ -262,12 +300,15 @@ export async function buildRuntime(
     } else if (cfg.warmPoolSize && hasClusters) {
       logger.warn('配置了集群，warmPoolSize 被忽略（集群需专用模板）');
     }
-    const defaultProfile = selectDefaultProfile(profiles);
     const skillSandboxEnv = config.skills?.sandboxEnv;
     const userHomeMountPath = cfg.userHomeMountPath ?? '/home/user/host';
     const userHomeRoot = cfg.userHomeRoot;
     const resolver: SpecResolver = async (ctx, profileName) => {
-      const selectedProfile = profileName ? findSandboxProfile(profiles, profileName) : defaultProfile;
+      const role = ctx.role ?? 'user';
+      const selectedProfile = profileName
+        ? findSandboxProfile(profiles, profileName, role)
+        : selectDefaultProfile(profiles, role);
+      if (cfg.aios && !selectedProfile) throw new Error('当前身份没有可用的代码沙箱模板');
       const base = selectedProfile ? sandboxSpecForProfile(selectedProfile, ctx) : { key: ctx.sessionId };
       const spec = skillSandboxEnv ? { ...base, envs: { ...skillSandboxEnv, ...base.envs } } : base;
       if (cfg.aios || !ctx.tenantId || !ctx.userId) return spec;
@@ -293,15 +334,26 @@ export async function buildRuntime(
       warmPool,
     });
     let resolveDesktop: SandboxGenerationInput['resolveDesktop'];
-    if (cfg.desktop) {
-      const browserProfile = selectBrowserProfile(profiles);
+    if (cfg.aios && profiles.some((profile) => profile.envType === 'browser')) {
+      const dp = new CommandDesktopProvider(manager);
+      resolveDesktop = async (ctx) => {
+        const profile = selectBrowserProfile(profiles, ctx.role ?? 'user');
+        if (!profile) throw new Error('当前身份没有可用的浏览器沙箱模板');
+        const spec = sandboxSpecForProfile(profile, ctx);
+        return { key: spec.key, create: () => dp.create(spec) };
+      };
+    } else if (cfg.desktop) {
       const dp: DesktopProvider = cfg.provider === 'local'
         ? new LocalDesktopProvider()
         : cfg.provider === 'opensandbox'
           ? new OpenSandboxDesktopProvider(manager)
           : new E2bDesktopProvider({ apiKey: cfg.apiKey, domain: cfg.domain });
       resolveDesktop = async (ctx) => {
-        const profile = browserProfile ?? findSandboxProfile(profiles);
+        const profile = selectBrowserProfile(
+          profiles,
+          ctx.role ?? 'user',
+          { fallbackToCode: true },
+        ) ?? findSandboxProfile(profiles, undefined, ctx.role ?? 'user');
         const spec = sandboxSpecForProfile(profile, ctx);
         return { key: spec.key, create: () => dp.create(spec) };
       };
@@ -310,12 +362,20 @@ export async function buildRuntime(
       input: {
         manager,
         profiles,
+        ...(catalogSnapshot ? {
+          catalog: {
+            fingerprint: catalogSnapshot.fingerprint,
+            templateCount: catalogSnapshot.templates.length,
+            loadedAt: catalogSnapshot.loadedAt,
+          },
+        } : {}),
         resolveSpec: resolver,
         sweepMs: Math.max(30_000, Math.min(cfg.idleMs ?? 10 * 60_000, 60_000)),
-        ...(warmPool ? {
-          drainWarmPool: () => warmPool.drain(),
-          disposePrepared: () => warmPool.drain(),
-        } : {}),
+        ...(warmPool ? { drainWarmPool: () => warmPool.drain() } : {}),
+        disposePrepared: async () => {
+          await warmPool?.drain();
+          await manager.disposeAll();
+        },
         ...(resolveDesktop ? { resolveDesktop } : {}),
       },
     };
@@ -361,8 +421,15 @@ export async function buildRuntime(
     sandboxCfg = undefined;
   }
   if (sandboxCfg?.enabled) {
-    const prepared = await prepareGeneration(sandboxCfg);
-    await sandboxController.commit(prepared.input);
+    try {
+      const prepared = await prepareGeneration(sandboxCfg);
+      await sandboxController.commit(prepared.input);
+      lastSuccessfulSandboxRefreshAt = prepared.input.catalog?.loadedAt;
+    } catch (err) {
+      if (!sandboxCfg.aios) throw err;
+      sandboxCatalogUnavailable = true;
+      logger.warn({ err: String(err) }, 'AIOS template catalog unavailable at startup');
+    }
   }
 
   let skillSyncTool: ReturnType<typeof buildSkillTools>[number] | undefined;
@@ -375,14 +442,29 @@ export async function buildRuntime(
   const syncSandboxTools = () => {
     for (const name of SANDBOX_TOOL_NAMES) tools.unregister(name);
     if (!sandboxController.enabled()) return;
-    for (const tool of buildSandboxTools(sandboxController)) tools.register(tool);
-    for (const tool of buildSandboxProfileTools(sandboxController, () => sandboxController.profileDefinitions())) tools.register(tool);
-    if (downloads) tools.register(buildExportTool(sandboxController, async () => ({}), downloads));
-    if (hasClusters && !sandboxCfg?.aios) tools.register(buildKubectlTool({ clusters, sandboxes: sandboxController, audit }));
-    if (sandboxCfg?.desktop) {
+    const codeEnabled = sandboxController.codeEnabled();
+    if (codeEnabled) {
+      for (const tool of buildSandboxTools(sandboxController)) tools.register(tool);
+    }
+    const profileTools = buildSandboxProfileTools(
+      sandboxController,
+      (ctx) => sandboxController.profileDefinitions({ role: ctx.role ?? 'user' }),
+    );
+    for (const tool of codeEnabled
+      ? profileTools
+      : profileTools.filter((tool) => tool.def.name === 'sandbox_list_profiles')) {
+      tools.register(tool);
+    }
+    if (codeEnabled && downloads) {
+      tools.register(buildExportTool(sandboxController, async () => ({}), downloads));
+    }
+    if (codeEnabled && hasClusters && !sandboxCfg?.aios) {
+      tools.register(buildKubectlTool({ clusters, sandboxes: sandboxController, audit }));
+    }
+    if (sandboxController.desktopEnabled()) {
       for (const tool of buildBrowserTools((ctx) => sandboxController.desktop(ctx))) tools.register(tool);
     }
-    if (skillSyncTool) tools.register(skillSyncTool);
+    if (codeEnabled && skillSyncTool) tools.register(skillSyncTool);
   };
 
   if (config.downloads?.enabled ?? true) {
@@ -426,7 +508,7 @@ export async function buildRuntime(
     const skillTools = buildSkillTools(skills, sandboxController, undefined, { credentials, audit });
     for (const tool of skillTools) tools.register(tool);
     skillSyncTool = skillTools.find((tool) => tool.def.name === 'skill__sync_to_sandbox');
-    if (!sandboxController.enabled()) tools.unregister('skill__sync_to_sandbox');
+    if (!sandboxController.codeEnabled()) tools.unregister('skill__sync_to_sandbox');
     skillRegistry = skills;
     systemExtra = skills.summaries();
   }
@@ -472,19 +554,105 @@ export async function buildRuntime(
   modelConfig = await resolveRuntimeModelConfig(config, store, DEFAULT_TENANT);
   const model = createModel(modelConfig.id, modelConfig);
 
-  const publicSandboxState = (): SandboxSettingsState => ({
-    settings: sandboxState?.settings ?? { enabled: false, mode: 'local' },
-    apiKeySet: sandboxState?.apiKeySet ?? false,
-    runtime: {
-      enabled: sandboxController.enabled(),
-      mode: sandboxState?.settings.mode,
-      status: sandboxLoadError
-        ? 'credentials_reconfiguration_required'
-        : sandboxController.enabled()
-          ? 'active'
-          : 'disabled',
-    },
+  const publicSandboxState = (): SandboxSettingsState => {
+    const catalog = sandboxController.catalogInfo();
+    return {
+      settings: sandboxState?.settings ?? { enabled: false, mode: 'local' },
+      apiKeySet: sandboxState?.apiKeySet ?? false,
+      runtime: {
+        enabled: sandboxController.enabled(),
+        mode: sandboxState?.settings.mode,
+        status: sandboxLoadError
+          ? 'credentials_reconfiguration_required'
+          : sandboxCatalogUnavailable
+            ? 'catalog_unavailable'
+            : sandboxController.enabled()
+              ? 'active'
+              : 'disabled',
+        ...(sandboxState?.settings.mode === 'aios_lifecycle'
+          ? { templateCount: catalog?.templateCount ?? 0 }
+          : {}),
+        ...(lastSuccessfulSandboxRefreshAt
+          ? { lastSuccessfulRefreshAt: lastSuccessfulSandboxRefreshAt }
+          : {}),
+      },
+    };
+  };
+
+  const clearSandboxCatalogRefreshTimer = () => {
+    if (!sandboxCatalogRefreshTimer) return;
+    clearInterval(sandboxCatalogRefreshTimer);
+    sandboxCatalogRefreshTimer = undefined;
+  };
+
+  const refreshSandboxTemplatesInternal = () => serializeSandboxUpdate(async (): Promise<SandboxTemplateRefreshResult> => {
+    if (sandboxUpdatesClosed) throw new Error('runtime is disposed');
+    const currentState = sandboxState;
+    if (!currentState?.settings.enabled || currentState.settings.mode !== 'aios_lifecycle') {
+      throw new Error('AIOS Sandbox 模式未启用');
+    }
+    if (sandboxLoadError && currentState.apiKeySet) {
+      throw new Error('设置凭据无法解密，请重新配置 API key');
+    }
+    const currentTarget = credentialTargetForSandboxSettings(currentState.settings);
+    const currentCfg = sandboxSettingsToConfig(currentState.settings, currentState.apiKey);
+    const prepared = await prepareGeneration(currentCfg);
+    let committed = false;
+    try {
+      if (
+        !sandboxState
+        || credentialTargetForSandboxSettings(sandboxState.settings) !== currentTarget
+        || sandboxState.apiKey !== currentState.apiKey
+      ) {
+        throw new Error('Sandbox 凭据目标已变化，请重试模板刷新');
+      }
+      const nextCatalog = prepared.input.catalog;
+      if (!nextCatalog) throw new Error('AIOS template catalog metadata is missing');
+      const currentCatalog = sandboxController.catalogInfo();
+      if (currentCatalog?.fingerprint === nextCatalog.fingerprint) {
+        await disposePreparedGeneration(prepared, 'unchanged sandbox generation cleanup failed');
+        sandboxCatalogUnavailable = false;
+        lastSuccessfulSandboxRefreshAt = nextCatalog.loadedAt;
+        return {
+          changed: false,
+          templateCount: nextCatalog.templateCount,
+          state: publicSandboxState(),
+        };
+      }
+      await sandboxController.commit(prepared.input);
+      committed = true;
+      sandboxCatalogUnavailable = false;
+      lastSuccessfulSandboxRefreshAt = nextCatalog.loadedAt;
+      runtime.sandboxProfiles = sandboxController.profiles();
+      syncSandboxTools();
+      return {
+        changed: true,
+        templateCount: nextCatalog.templateCount,
+        state: publicSandboxState(),
+      };
+    } catch (err) {
+      if (!committed) {
+        await disposePreparedGeneration(prepared, 'prepared sandbox generation cleanup failed after refresh');
+      }
+      throw err;
+    }
   });
+
+  const syncSandboxCatalogRefreshTimer = () => {
+    clearSandboxCatalogRefreshTimer();
+    sandboxCatalogRefreshQueued = false;
+    if (!sandboxState?.settings.enabled || sandboxState.settings.mode !== 'aios_lifecycle') return;
+    sandboxCatalogRefreshTimer = setInterval(() => {
+      if (sandboxCatalogRefreshQueued) return;
+      sandboxCatalogRefreshQueued = true;
+      void refreshSandboxTemplatesInternal()
+        .catch((err) => {
+          logger.warn({ err: String(err) }, 'AIOS template catalog background refresh failed');
+        })
+        .finally(() => { sandboxCatalogRefreshQueued = false; });
+    }, 60_000);
+    sandboxCatalogRefreshTimer.unref?.();
+  };
 
   const runtime: Runtime = {
     model,
@@ -507,6 +675,12 @@ export async function buildRuntime(
       : undefined,
     downloads,
     sandboxProfiles: sandboxController.profiles(),
+    sandboxProfilesFor(ctx: RequestContext) {
+      return sandboxController.profiles(ctx);
+    },
+    refreshSandboxTemplates() {
+      return refreshSandboxTemplatesInternal();
+    },
     clusters,
     audit,
     store,
@@ -565,17 +739,21 @@ export async function buildRuntime(
         sandboxState = saved;
         sandboxCfg = nextCfg;
         sandboxLoadError = undefined;
+        sandboxCatalogUnavailable = false;
+        lastSuccessfulSandboxRefreshAt = prepared?.input.catalog?.loadedAt;
         runtime.sandboxSettings = saved.settings;
         runtime.sandboxProfiles = sandboxController.profiles();
         runtime.userHome = nextCfg.enabled && !nextCfg.aios
           ? { root: nextCfg.userHomeRoot, mountPath: nextCfg.userHomeMountPath ?? '/home/user/host' }
           : undefined;
         syncSandboxTools();
+        syncSandboxCatalogRefreshTimer();
         return publicSandboxState();
       });
     },
     async dispose() {
       sandboxUpdatesClosed = true;
+      clearSandboxCatalogRefreshTimer();
       if (downloadSweepTimer) clearInterval(downloadSweepTimer);
       await sandboxUpdateTail;
       await sandboxController.disposeAll();
@@ -584,5 +762,6 @@ export async function buildRuntime(
     },
   };
 
+  syncSandboxCatalogRefreshTimer();
   return runtime;
 }

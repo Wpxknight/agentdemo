@@ -1,3 +1,8 @@
+import {
+  AiosLifecycleHttpClient,
+  AiosLifecycleHttpError,
+} from './aios-http.js';
+import type { AiosLifecycleHttpOptions } from './aios-http.js';
 import type {
   ExecResult,
   OutputSink,
@@ -9,9 +14,12 @@ import type {
 } from './types.js';
 
 const READY_PROBE = 'true';
-const CODE_INTERPRETER_TEMPLATE = 'code-interpreter';
 const DEFAULT_READY_ATTEMPTS = 20;
 const DEFAULT_READY_DELAY_MS = 500;
+const COMMAND_TRANSPORT_GRACE_MS = 5_000;
+const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+const MAX_FILE_BYTES = 50 * 1024 * 1024;
+const FILE_RESPONSE_BYTES = Math.ceil(MAX_FILE_BYTES * 4 / 3) + 64 * 1024;
 
 /** AIOS Lifecycle REST API 所需的固定调度位置。 */
 export interface AiosSandboxPlacement {
@@ -19,15 +27,11 @@ export interface AiosSandboxPlacement {
   namespace?: string;
 }
 
-export interface AiosE2bProviderOptions {
-  /** AIOS Lifecycle API 完整 URL（含 http(s) scheme）。 */
-  lifecycleUrl: string;
-  /** AIOS Sandbox Key；缺省读 AIOS_SANDBOX_KEY，不回退 E2B_API_KEY。 */
-  apiKey?: string;
+export interface AiosE2bProviderOptions extends AiosLifecycleHttpOptions {
   /** Generic Key 创建所需的固定调度位置。 */
   placement: AiosSandboxPlacement;
-  /** 可注入 HTTP 客户端，供测试 mock Lifecycle 请求。 */
-  fetch?: typeof globalThis.fetch;
+  /** 当前 Runtime generation 从 AIOS 目录加载的模板 ID。 */
+  allowedTemplateIds: ReadonlySet<string>;
   /** readiness probe 最大次数；仅供测试或特殊部署调整。 */
   readinessAttempts?: number;
   /** readiness probe 重试间隔(ms)。 */
@@ -44,13 +48,6 @@ type CommandResponse = {
   timedOut?: boolean;
 };
 type FileReadResponse = { content?: string; encoding?: string };
-
-class LifecycleHttpError extends Error {
-  constructor(readonly status: number) {
-    super(`AIOS Lifecycle request failed (HTTP ${status})`);
-    this.name = 'LifecycleHttpError';
-  }
-}
 
 function timeoutSeconds(ms?: number): number | undefined {
   return ms === undefined ? undefined : Math.max(1, Math.ceil(ms / 1000));
@@ -102,6 +99,7 @@ class AiosE2bHandle implements SandboxHandle {
     const response = await this.provider.request<FileReadResponse>(
       `/sandboxes/${encodeURIComponent(this.sandboxId)}/filesystem/read`,
       { method: 'POST', body: { path, encoding: 'base64' } },
+      { maxResponseBytes: FILE_RESPONSE_BYTES },
     );
     if (response.encoding !== 'base64' || typeof response.content !== 'string') {
       throw new Error('AIOS Lifecycle returned an invalid file response');
@@ -120,7 +118,7 @@ class AiosE2bHandle implements SandboxHandle {
     try {
       await this.provider.request(`/sandboxes/${encodeURIComponent(this.sandboxId)}`, { method: 'DELETE' });
     } catch (err) {
-      if (err instanceof LifecycleHttpError && err.status === 404) return;
+      if (err instanceof AiosLifecycleHttpError && err.status === 404) return;
       throw err;
     }
   }
@@ -128,20 +126,14 @@ class AiosE2bHandle implements SandboxHandle {
 
 /** 通过 AIOS E2B-compatible Lifecycle REST API 创建和连接沙箱。 */
 export class AiosE2bProvider implements SandboxProvider {
-  private readonly apiKey: string;
-  private readonly fetchImpl: typeof globalThis.fetch;
-  private readonly lifecycleUrl: string;
+  private readonly http: AiosLifecycleHttpClient;
   private readonly readinessAttempts: number;
   private readonly readinessDelayMs: number;
   private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(private readonly opts: AiosE2bProviderOptions) {
-    this.apiKey = opts.apiKey ?? process.env.AIOS_SANDBOX_KEY ?? '';
-    if (!this.apiKey) throw new Error('AIOS Sandbox Key is required');
-    if (!opts.lifecycleUrl) throw new Error('AIOS Lifecycle URL is required');
     if (!opts.placement.clusterId) throw new Error('AIOS placement.clusterId is required');
-    this.lifecycleUrl = opts.lifecycleUrl.replace(/\/+$/, '');
-    this.fetchImpl = opts.fetch ?? globalThis.fetch;
+    this.http = new AiosLifecycleHttpClient(opts);
     this.readinessAttempts = opts.readinessAttempts ?? DEFAULT_READY_ATTEMPTS;
     this.readinessDelayMs = opts.readinessDelayMs ?? DEFAULT_READY_DELAY_MS;
     if (!Number.isInteger(this.readinessAttempts) || this.readinessAttempts < 1) {
@@ -154,15 +146,13 @@ export class AiosE2bProvider implements SandboxProvider {
   }
 
   async create(spec: SandboxSpec): Promise<SandboxHandle> {
+    const template = this.assertTemplateAllowed(spec);
     if (spec.volumes?.length) throw new Error('AIOS Lifecycle mode does not support sandbox volumes');
-    if (spec.template !== CODE_INTERPRETER_TEMPLATE) {
-      throw new Error(`AIOS Lifecycle mode requires template=${CODE_INTERPRETER_TEMPLATE}`);
-    }
     const timeout = timeoutSeconds(spec.timeoutMs);
     const response = await this.request<SandboxResponse>('/sandboxes', {
       method: 'POST',
       body: {
-        ...(spec.template === undefined ? {} : { template: spec.template }),
+        template,
         ...(timeout === undefined ? {} : { timeout }),
         ...(spec.envs === undefined ? {} : { env: spec.envs }),
         ...(spec.metadata === undefined ? {} : { metadata: spec.metadata }),
@@ -182,6 +172,7 @@ export class AiosE2bProvider implements SandboxProvider {
   }
 
   async connect(sandboxId: string, spec: SandboxSpec): Promise<SandboxHandle> {
+    this.assertTemplateAllowed(spec);
     if (spec.volumes?.length) throw new Error('AIOS Lifecycle mode does not support sandbox volumes');
     const timeout = timeoutSeconds(spec.timeoutMs);
     await this.request<SandboxResponse>(`/sandboxes/${encodeURIComponent(sandboxId)}/connect`, {
@@ -195,16 +186,29 @@ export class AiosE2bProvider implements SandboxProvider {
 
   async command(sandboxId: string, command: string, timeoutMs?: number): Promise<CommandResponse> {
     const timeout = timeoutSeconds(timeoutMs);
-    const response = await this.fetchJson<CommandResponse>(
+    const response = await this.http.requestJson<CommandResponse>(
       `/sandboxes/${encodeURIComponent(sandboxId)}/commands`,
       { method: 'POST', body: { command, ...(timeout === undefined ? {} : { timeout }) } },
       [408],
+      { timeoutMs: (timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS) + COMMAND_TRANSPORT_GRACE_MS },
     );
     return response.status === 408 ? { ...response.body, timedOut: true } : response.body;
   }
 
-  async request<T = unknown>(path: string, init: { method: string; body?: unknown }): Promise<T> {
-    return (await this.fetchJson<T>(path, init)).body;
+  async request<T = unknown>(
+    path: string,
+    init: { method: string; body?: unknown },
+    requestOptions: { timeoutMs?: number; maxResponseBytes?: number } = {},
+  ): Promise<T> {
+    return (await this.http.requestJson<T>(path, init, [], requestOptions)).body;
+  }
+
+  private assertTemplateAllowed(spec: SandboxSpec): string {
+    const template = spec.template;
+    if (!template || !this.opts.allowedTemplateIds.has(template)) {
+      throw new Error('AIOS template is not present in the current AIOS template catalog');
+    }
+    return template;
   }
 
   private async waitUntilReady(handle: AiosE2bHandle): Promise<void> {
@@ -216,35 +220,11 @@ export class AiosE2bProvider implements SandboxProvider {
         lastError = new Error(`AIOS sandbox readiness probe exited with code ${result.exitCode}`);
       } catch (err) {
         lastError = err;
-        if (!(err instanceof LifecycleHttpError) || err.status !== 409) throw err;
+        if (!(err instanceof AiosLifecycleHttpError) || err.status !== 409) throw err;
       }
       if (attempt + 1 < this.readinessAttempts) await this.sleep(this.readinessDelayMs);
     }
     throw new Error(`AIOS sandbox did not become ready: ${String(lastError)}`);
   }
 
-  private async fetchJson<T>(
-    path: string,
-    init: { method: string; body?: unknown },
-    allowedStatuses: number[] = [],
-  ): Promise<{ body: T; status: number }> {
-    let response: Response;
-    try {
-      response = await this.fetchImpl(`${this.lifecycleUrl}${path}`, {
-        method: init.method,
-        headers: { 'Content-Type': 'application/json', 'X-API-KEY': this.apiKey },
-        redirect: 'error',
-        ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
-      });
-    } catch {
-      throw new Error('AIOS Lifecycle request failed');
-    }
-    if (!response.ok && !allowedStatuses.includes(response.status)) throw new LifecycleHttpError(response.status);
-    if (response.status === 204) return { body: undefined as T, status: response.status };
-    try {
-      return { body: await response.json() as T, status: response.status };
-    } catch {
-      throw new Error(`AIOS Lifecycle returned an invalid response (HTTP ${response.status})`);
-    }
-  }
 }
