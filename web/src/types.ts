@@ -244,6 +244,10 @@ export interface ChatMessage {
   /** 智能体导出的可下载文件（file_exported 事件）。 */
   files?: ExportedFile[];
   running?: boolean;
+  /** 本次助手响应开始时间，仅用于执行中实时计时。 */
+  startedAt?: number;
+  /** 本次助手响应最终执行耗时。 */
+  durationMs?: number;
   time: string;
   tools?: string[];
   attachments?: Attachment[];

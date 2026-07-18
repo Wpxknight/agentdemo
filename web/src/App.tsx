@@ -686,9 +686,11 @@ function ZoomableImage({ src, alt }: { src: string; alt?: string }) {
         ? createPortal(
             <div className="media-lightbox" role="dialog" aria-label={alt || '图片预览'} onClick={() => setOpen(false)}>
               <img src={src} alt={alt || ''} />
-              <button type="button" className="media-lightbox-close" aria-label="关闭预览">
-                <X />
-              </button>
+              <IconTooltip label="关闭预览">
+                <button type="button" className="media-lightbox-close" aria-label="关闭预览">
+                  <X />
+                </button>
+              </IconTooltip>
             </div>,
             document.body,
           )
@@ -889,6 +891,15 @@ function BrandLogo({ className }: { className?: string }) {
     <span className={cn('brand-logo', className)} aria-hidden="true">
       <img src={logoUrl} alt="" />
     </span>
+  );
+}
+
+function IconTooltip({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{children}</TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -1149,6 +1160,12 @@ export default function App() {
     }
   }, [api]);
 
+  const loadSandboxes = useCallback(async () => {
+    const body = await api.get<SandboxesBody>('/v1/sandboxes');
+    setSandboxes(body.sandboxes || []);
+    setSandboxProfiles(body.profiles || []);
+  }, [api]);
+
   useEffect(() => {
     if (!token || !sessionId) return;
     void loadContextUsage(sessionId);
@@ -1166,6 +1183,7 @@ export default function App() {
         await fetchSessionsPage(0);
         const toolsBody = await api.get<ToolsBody>('/v1/tools');
         setTools(toolsBody.tools || []);
+        await loadSandboxes().catch(() => {});
       }
       if (target === 'skills' || target === 'mcp') {
         const body = await api.get<ToolsBody>('/v1/tools');
@@ -1176,15 +1194,13 @@ export default function App() {
         setTasks(body.tasks || []);
       }
       if (target === 'sandbox') {
-        const body = await api.get<SandboxesBody>('/v1/sandboxes');
-        setSandboxes(body.sandboxes || []);
-        setSandboxProfiles(body.profiles || []);
+        await loadSandboxes();
       }
       if (target === 'settings') await loadLlmSettings().catch(() => {});
     } catch (err) {
       console.error(err);
     }
-  }, [api, fetchSessionsPage, loadLlmSettings, page, token]);
+  }, [api, fetchSessionsPage, loadLlmSettings, loadSandboxes, page, token]);
 
   useEffect(() => {
     if (!token && page !== 'login') {
@@ -1428,14 +1444,21 @@ export default function App() {
       return;
     }
     const assistantId = randomId();
-    const assistant: ChatMessage = { id: assistantId, role: 'assistant', text: '', time: new Date().toLocaleTimeString(), running: true };
+    const startedAt = Date.now();
+    const assistant: ChatMessage = {
+      id: assistantId,
+      role: 'assistant',
+      text: '',
+      time: new Date().toLocaleTimeString(),
+      running: true,
+      startedAt,
+    };
     const publishAssistant = () => {
       updateSessionMessages(activeSessionId, (current) => current.map((message) => (message.id === assistantId ? { ...assistant } : message)));
     };
     updateSessionMessages(requestSessionId, (current) => [...current, assistant]);
     setRunningAgentCount((current) => current + 1);
     setActiveRunSessionIds((current) => new Set(current).add(requestSessionId));
-    const startedAt = Date.now();
     setRunStartedAt((current) => ({ ...current, [requestSessionId]: startedAt }));
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -1626,6 +1649,7 @@ export default function App() {
       if (assistant.steps?.some((s) => s.status === 'running')) {
         assistant.steps = assistant.steps.map((s) => (s.status === 'running' ? { ...s, status: 'error' } : s));
       }
+      assistant.durationMs = Math.max(0, Date.now() - startedAt);
       Object.assign(assistant, { running: false, retrying: undefined });
       publishAssistant();
       setRunningAgentCount((current) => Math.max(0, current - 1));
@@ -1644,6 +1668,7 @@ export default function App() {
       await refreshSessions();
       await loadContextUsage(activeSessionId);
       await loadSessionTokenUsage(activeSessionId);
+      await loadSandboxes().catch(() => {});
     }
   }
 
@@ -1831,6 +1856,7 @@ export default function App() {
   const skillTools = tools.filter((tool) => (tool.category || toolCategory(tool.name)) === 'skill');
   const mcpTools = tools.filter((tool) => (tool.category || toolCategory(tool.name)) === 'mcp');
   const skillSuggestions = skillSuggestionsFor(composerValue, skillTools);
+  const currentSandbox = sandboxes.find((sandbox) => sandbox.sessionId === sessionId);
 
   if (activePage === 'chat') {
     return (
@@ -1862,6 +1888,7 @@ export default function App() {
           terminatingSession={terminatingSession}
           sandboxOutput={sandboxOutput}
           browserStreamUrl={browserStreamUrl}
+          currentSandbox={currentSandbox}
           composerRef={composerRef}
           fileInputRef={fileInputRef}
           onNavigate={navigate}
@@ -1981,15 +2008,17 @@ function SidebarAccountMenu({ token, me, onLogout }: { token: string; me?: MeBod
   const [open, setOpen] = useState(false);
   return (
     <div className="sidebar-account">
-      <button
-        className={cn('account-avatar-button', open && 'active')}
-        type="button"
-        aria-label="用户菜单"
-        aria-expanded={open}
-        onClick={() => setOpen((value) => !value)}
-      >
-        <img src={userAvatarUrl} alt="" />
-      </button>
+      <IconTooltip label="用户菜单">
+        <button
+          className={cn('account-avatar-button', open && 'active')}
+          type="button"
+          aria-label="用户菜单"
+          aria-expanded={open}
+          onClick={() => setOpen((value) => !value)}
+        >
+          <img src={userAvatarUrl} alt="" />
+        </button>
+      </IconTooltip>
       {open ? (
         <div className="account-popover" role="menu">
           <div className="account-popover-user">
@@ -2037,6 +2066,7 @@ function PrototypeChatShell(props: {
   terminatingSession: boolean;
   sandboxOutput: string;
   browserStreamUrl: string;
+  currentSandbox?: SandboxSummary;
   composerRef: React.RefObject<HTMLTextAreaElement | null>;
   fileInputRef: React.RefObject<HTMLInputElement | null>;
   onNavigate: (page: PageId) => void;
@@ -2122,6 +2152,7 @@ function PrototypeChatShell(props: {
           <PrototypeSandboxPanel
             sandboxOutput={props.sandboxOutput}
             browserStreamUrl={props.browserStreamUrl}
+            currentSandbox={props.currentSandbox}
             onRunSandbox={props.onRunSandbox}
             onOpenPreview={props.onOpenPreview}
             onRefreshPreview={props.onRefreshPreview}
@@ -2155,7 +2186,6 @@ function PrototypeSidebarNav({ page, token, me, onNavigate, onLogout }: {
               <button
                 type="button"
                 className={cn('prototype-nav-btn', item.id === page && 'active')}
-                title={item.label}
                 aria-label={item.label}
                 onClick={() => onNavigate(item.id)}
               >
@@ -2248,9 +2278,11 @@ function PrototypeSessionPanel({ sessions, total, page, pageCount, selectedSessi
           >
             {selectMode ? (checkedItems.length ? `删除 (${checkedItems.length})` : '取消') : '批量删除'}
           </button>
-          <button type="button" onClick={onToggle} aria-label="收起最近会话">
-            <ChevronLeft />
-          </button>
+          <IconTooltip label="收起最近会话">
+            <button type="button" onClick={onToggle} aria-label="收起最近会话">
+              <ChevronLeft />
+            </button>
+          </IconTooltip>
         </div>
       </div>
       <label className="prototype-session-search">
@@ -2505,9 +2537,11 @@ function ModalDialog({ title, status, icon, onClose, children }: {
             <h2>{title}</h2>
             {status ? <Badge variant="secondary">{status}</Badge> : null}
           </div>
-          <button type="button" className="modal-dialog-close" onClick={onClose} aria-label="关闭">
-            <X />
-          </button>
+          <IconTooltip label="关闭">
+            <button type="button" className="modal-dialog-close" onClick={onClose} aria-label="关闭">
+              <X />
+            </button>
+          </IconTooltip>
         </div>
         <div className="modal-dialog-body">{children}</div>
       </section>
@@ -2542,7 +2576,7 @@ function PrototypeMessages({ messages }: { messages: ChatMessage[] }) {
                   ) : null}
                   {message.running ? <RunningIndicator /> : null}
                 </div>
-                <time className="prototype-message-time">{message.time}</time>
+                <MessageMeta message={message} />
               </div>
             </article>
           );
@@ -2550,6 +2584,30 @@ function PrototypeMessages({ messages }: { messages: ChatMessage[] }) {
         <div ref={messageEndRef} className="prototype-message-end" aria-hidden="true" />
       </div>
     </ScrollArea>
+  );
+}
+
+function MessageMeta({ message }: { message: ChatMessage }) {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!message.running || !message.startedAt) return undefined;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [message.running, message.startedAt]);
+
+  const duration = message.running && message.startedAt
+    ? Math.max(0, now - message.startedAt)
+    : message.durationMs;
+
+  return (
+    <div className="prototype-message-meta">
+      <time className="prototype-message-time">{message.time}</time>
+      {message.role === 'assistant' && duration !== undefined ? (
+        <span className="prototype-message-duration">执行 {formatElapsedTime(duration)}</span>
+      ) : null}
+    </div>
   );
 }
 
@@ -2613,12 +2671,11 @@ function PrototypeComposer(props: {
         </div>
       ) : null}
       <div className="prototype-input-box">
-        <button type="button" onClick={props.onChooseAttachment} aria-label="添加附件">
-          <Paperclip />
-        </button>
-        <button type="button" aria-label="代码模式">
-          <Code2 />
-        </button>
+        <IconTooltip label="添加附件">
+          <button type="button" onClick={props.onChooseAttachment} aria-label="添加附件">
+            <Paperclip />
+          </button>
+        </IconTooltip>
         <textarea
           ref={props.composerRef}
           name="task"
@@ -2628,9 +2685,11 @@ function PrototypeComposer(props: {
           onChange={(event) => props.onComposerChange(event.target.value)}
           onKeyDown={props.onComposerKeydown}
         />
-        <button type="submit" className="send" aria-label="发送">
-          <Send />
-        </button>
+        <IconTooltip label="发送消息">
+          <button type="submit" className="send" aria-label="发送消息">
+            <Send />
+          </button>
+        </IconTooltip>
       </div>
     </form>
   );
@@ -2639,6 +2698,7 @@ function PrototypeComposer(props: {
 function PrototypeSandboxPanel(props: {
   sandboxOutput: string;
   browserStreamUrl: string;
+  currentSandbox?: SandboxSummary;
   onRunSandbox: (code: string, language: string) => void;
   onOpenPreview: () => void;
   onRefreshPreview: () => void;
@@ -2655,16 +2715,18 @@ function PrototypeSandboxPanel(props: {
     <aside className="prototype-sandbox-panel">
       <button className="prototype-resize-handle" type="button" aria-label="拖动调整沙箱宽度" onPointerDown={props.onStartResize} />
       <div className="prototype-sandbox-head">
-        <div>
+        <div className="prototype-sandbox-title-row">
           <h2>当前沙箱</h2>
-          <span>
-            <i />
-            sandbox-prod · ready
+          <span className="prototype-sandbox-identity">
+            <i className={cn('prototype-sandbox-indicator', props.currentSandbox ? 'ready' : 'muted')} />
+            {props.currentSandbox ? props.currentSandbox.id : '未绑定'}
           </span>
         </div>
-        <button type="button" onClick={props.onClose} aria-label="收起当前沙箱">
-          <ChevronRight />
-        </button>
+        <IconTooltip label="收起当前沙箱">
+          <button type="button" onClick={props.onClose} aria-label="收起当前沙箱">
+            <ChevronRight />
+          </button>
+        </IconTooltip>
       </div>
       <div className="prototype-tabs">
         {[
@@ -2835,13 +2897,17 @@ function ChatWorkbench(props: {
             <h1>AI 运维助手</h1>
             <p className="page-subtitle">查询集群、分析告警、执行变更和管理沙箱。</p>
           </div>
-          <div className="header-actions">
-            <Button variant="outline" size="icon" title="切换会话列表" onClick={props.onToggleHistory}>
-              <PanelLeftClose />
-            </Button>
-            <Button variant="outline" size="icon" title="切换浏览器预览" onClick={props.onTogglePreview}>
-              <PanelRightClose />
-            </Button>
+        <div className="header-actions">
+            <IconTooltip label="切换会话列表">
+              <Button variant="outline" size="icon" aria-label="切换会话列表" onClick={props.onToggleHistory}>
+                <PanelLeftClose />
+              </Button>
+            </IconTooltip>
+            <IconTooltip label="切换浏览器预览">
+              <Button variant="outline" size="icon" aria-label="切换浏览器预览" onClick={props.onTogglePreview}>
+                <PanelRightClose />
+              </Button>
+            </IconTooltip>
             <Button onClick={props.onNewSession}>
               <MessageSquare data-icon="inline-start" />
               新建会话
@@ -2884,9 +2950,11 @@ function SessionHistory({ sessions, onCollapse }: { sessions: SessionSummary[]; 
           <h2>最近会话</h2>
           <span>按更新时间排序</span>
         </div>
-        <Button variant="ghost" size="icon" onClick={onCollapse}>
-          <X />
-        </Button>
+        <IconTooltip label="收起最近会话">
+          <Button variant="ghost" size="icon" aria-label="收起最近会话" onClick={onCollapse}>
+            <X />
+          </Button>
+        </IconTooltip>
       </div>
       <ScrollArea className="session-scroll">
         <div className="session-list">
@@ -2937,7 +3005,12 @@ function Messages({ messages }: { messages: ChatMessage[] }) {
                   ) : null}
                   {message.running ? <RunningIndicator /> : null}
                 </div>
-                <time className="message-time">{message.time}</time>
+                <div className="message-meta">
+                  <time className="message-time">{message.time}</time>
+                  {message.role === 'assistant' && message.durationMs !== undefined ? (
+                    <span className="message-duration">执行 {formatElapsedTime(message.durationMs)}</span>
+                  ) : null}
+                </div>
               </div>
             </article>
           );
@@ -2958,9 +3031,11 @@ function AttachmentChips({ attachments, onRemove }: { attachments: Attachment[];
           <ZoomableImage src={file.data} alt={file.name} />
           <figcaption>{file.name}</figcaption>
           {onRemove ? (
-            <button className="attachment-image-remove" type="button" onClick={() => onRemove(file.id)} aria-label={`移除 ${file.name}`}>
-              <Trash2 />
-            </button>
+            <IconTooltip label={`移除 ${file.name}`}>
+              <button className="attachment-image-remove" type="button" onClick={() => onRemove(file.id)} aria-label={`移除 ${file.name}`}>
+                <Trash2 />
+              </button>
+            </IconTooltip>
           ) : null}
         </figure>
       ))}
@@ -2970,9 +3045,11 @@ function AttachmentChips({ attachments, onRemove }: { attachments: Attachment[];
           <span>{file.name}</span>
           <small>{file.type || 'file'} · {formatFileSize(file.size)}</small>
           {onRemove ? (
-            <button type="button" onClick={() => onRemove(file.id)} aria-label={`移除 ${file.name}`}>
-              <Trash2 />
-            </button>
+            <IconTooltip label={`移除 ${file.name}`}>
+              <button type="button" onClick={() => onRemove(file.id)} aria-label={`移除 ${file.name}`}>
+                <Trash2 />
+              </button>
+            </IconTooltip>
           ) : null}
         </span>
       ))}
@@ -3010,9 +3087,11 @@ function ComposerInput(props: {
           onKeyDown={props.onComposerKeydown}
         />
         <div className="composer-action-row">
-          <Button variant="outline" size="icon" type="button" title="添加附件" onClick={props.onChooseAttachment}>
-            <Paperclip />
-          </Button>
+          <IconTooltip label="添加附件">
+            <Button variant="outline" size="icon" type="button" aria-label="添加附件" onClick={props.onChooseAttachment}>
+              <Paperclip />
+            </Button>
+          </IconTooltip>
           <Button className="send-button" type="submit">
             <Send data-icon="inline-start" />
             发送
@@ -3040,11 +3119,13 @@ function BrowserPreviewPanel(props: {
       <div className="sandbox-head">
         <div>
           <h2>当前沙箱</h2>
-          <p><span className="ready-dot" />sandbox-prod · ready</p>
+          <p><span className="muted-dot" />未绑定</p>
         </div>
-        <Button variant="ghost" size="icon" onClick={props.onClose}>
-          <X />
-        </Button>
+        <IconTooltip label="收起当前沙箱">
+          <Button variant="ghost" size="icon" aria-label="收起当前沙箱" onClick={props.onClose}>
+            <X />
+          </Button>
+        </IconTooltip>
       </div>
       <Card className="sandbox-tool">
         <CardHeader>
@@ -4594,18 +4675,18 @@ function SandboxPage({ sandboxes, profiles }: { sandboxes: SandboxSummary[]; pro
                 {profiles.map((profile) => (
                   <button key={profile.id} type="button" className="sandbox-profile-item" onClick={() => setSelectedProfileId(profile.id)}>
                     <div className="sandbox-profile-head">
-                      <strong>{profile.name}</strong>
+                      <strong className="sandbox-profile-title">{profile.name}</strong>
                       {profile.envType === 'browser' ? <Badge variant="secondary">浏览器</Badge> : <Badge variant="outline">代码</Badge>}
-                      {profile.runtimeRole === 'sandbox-diag' ? <Badge className="badge-privileged" variant="outline"><strong>特权诊断</strong></Badge> : null}
+                      {profile.runtimeRole === 'sandbox-diag' ? <Badge className="badge-privileged" variant="outline">特权诊断</Badge> : null}
                     </div>
                     <div className="sandbox-profile-row">
-                      <span>环境类型</span><strong>{profile.envType === 'browser' ? '浏览器' : '代码'}</strong>
+                      <span>环境类型</span><span className="sandbox-profile-value">{profile.envType === 'browser' ? '浏览器' : '代码'}</span>
                     </div>
                     <div className="sandbox-profile-row">
-                      <span>Runtime Role</span><strong>{profile.runtimeRole}</strong>
+                      <span>Runtime Role</span><span className="sandbox-profile-value">{profile.runtimeRole}</span>
                     </div>
                     <div className="sandbox-profile-row">
-                      <span>Template ID</span><strong>{profile.template || profile.id}</strong>
+                      <span>Template ID</span><span className="sandbox-profile-value">{profile.template || profile.id}</span>
                     </div>
                   </button>
                 ))}
@@ -4640,17 +4721,17 @@ function SandboxPage({ sandboxes, profiles }: { sandboxes: SandboxSummary[]; pro
           <div className="detail-panel sandbox-profile-detail">
             <p>{selectedProfile.description || '暂无模板说明。'}</p>
             <div className="kv">
-              <span>Template ID</span><strong>{selectedProfile.template || selectedProfile.id}</strong>
-              <span>镜像</span><strong>{selectedProfile.image || '-'}</strong>
-              <span>环境类型</span><strong>{selectedProfile.envType === 'browser' ? '浏览器' : '代码'}</strong>
-              <span>Runtime Role</span><strong>{selectedProfile.runtimeRole}</strong>
-              <span>Domain</span><strong>{selectedProfile.domain || '-'}</strong>
-              <span>Namespace</span><strong>{selectedProfile.namespace || '-'}</strong>
-              <span>Service Account</span><strong>{selectedProfile.serviceAccount || '-'}</strong>
-              <span>桌面能力</span><strong>{selectedProfile.desktop ? '支持' : '不支持'}</strong>
-              <span>权限</span><strong>{selectedProfile.privileged ? '特权' : '普通'}</strong>
-              <span>能力</span><strong>{listSummary(selectedProfile.capabilities)}</strong>
-              <span>超时时间</span><strong>{selectedProfile.timeoutMs ? `${selectedProfile.timeoutMs} ms` : '-'}</strong>
+              <span>Template ID</span><span className="sandbox-profile-value">{selectedProfile.template || selectedProfile.id}</span>
+              <span>镜像</span><span className="sandbox-profile-value">{selectedProfile.image || '-'}</span>
+              <span>环境类型</span><span className="sandbox-profile-value">{selectedProfile.envType === 'browser' ? '浏览器' : '代码'}</span>
+              <span>Runtime Role</span><span className="sandbox-profile-value">{selectedProfile.runtimeRole}</span>
+              <span>Domain</span><span className="sandbox-profile-value">{selectedProfile.domain || '-'}</span>
+              <span>Namespace</span><span className="sandbox-profile-value">{selectedProfile.namespace || '-'}</span>
+              <span>Service Account</span><span className="sandbox-profile-value">{selectedProfile.serviceAccount || '-'}</span>
+              <span>桌面能力</span><span className="sandbox-profile-value">{selectedProfile.desktop ? '支持' : '不支持'}</span>
+              <span>权限</span><span className="sandbox-profile-value">{selectedProfile.privileged ? '特权' : '普通'}</span>
+              <span>能力</span><span className="sandbox-profile-value">{listSummary(selectedProfile.capabilities)}</span>
+              <span>超时时间</span><span className="sandbox-profile-value">{selectedProfile.timeoutMs ? `${selectedProfile.timeoutMs} ms` : '-'}</span>
             </div>
           </div>
         </ModalDialog>

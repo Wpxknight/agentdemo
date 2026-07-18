@@ -667,6 +667,88 @@ describe('frontend API wiring', () => {
     expect(css).not.toContain('.bubble time');
   });
 
+  it('shows live and final assistant execution duration beside the message time', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const types = await readFile('web/src/types.ts', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(types).toContain('startedAt?: number;');
+    expect(types).toContain('durationMs?: number;');
+    expect(app).toContain('function MessageMeta({ message }: { message: ChatMessage })');
+    expect(app).toContain('message.running && message.startedAt');
+    expect(app).toContain('message.durationMs');
+    expect(app).toContain("assistant.durationMs = Math.max(0, Date.now() - startedAt);");
+    expect(app).toContain('<MessageMeta message={message} />');
+    expect(css).toContain('.prototype-message-meta');
+    expect(css).toContain('.prototype-message-duration');
+  });
+
+  it('uses the AIOS light-primary surface for user message bubbles', async () => {
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(css).toMatch(/\.prototype-message\.user \.prototype-bubble\s*\{[\s\S]*?background:\s*rgba\(88, 130, 252, \.1\);/);
+    expect(css).toMatch(/\.message-user \.bubble\s*\{[\s\S]*?background:\s*rgba\(88, 130, 252, \.1\);/);
+  });
+
+  it('keeps sandbox template fields regular-weight while preserving bold card titles', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(app).toContain('className="sandbox-profile-title"');
+    expect(app).toContain('className="sandbox-profile-value"');
+    expect(app).not.toContain('<Badge className="badge-privileged" variant="outline"><strong>特权诊断</strong></Badge>');
+    expect(css).toMatch(/\.sandbox-profile-title\s*\{[\s\S]*?font-weight:\s*700;/);
+    expect(css).toMatch(/\.sandbox-profile-value,[\s\S]*?\.sandbox-profile-detail \.kv span\s*\{[\s\S]*?font-weight:\s*400;/);
+  });
+
+  it('lets the skill search wrapper exclusively own border and focus styling', async () => {
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(css).toMatch(/\.skill-search-box:focus-within\s*\{[\s\S]*?border-color:\s*hsl\(var\(--primary\)\);[\s\S]*?box-shadow:\s*0 0 0 2px var\(--focus-ring\);/);
+    expect(css).toMatch(/\.skill-search-box input,[\s\S]*?\.skill-search-box input:focus-visible\s*\{[\s\S]*?border:\s*0;[\s\S]*?outline:\s*0;[\s\S]*?box-shadow:\s*none;/);
+  });
+
+  it('removes the inactive chat code-mode placeholder button', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(app).not.toContain('aria-label="代码模式"');
+    expect(css).not.toContain('.prototype-input-box button[aria-label="代码模式"]');
+  });
+
+  it('lets the management search wrapper exclusively own MCP focus styling', async () => {
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(css).toMatch(/\.management-page \.search-box:focus-within\s*\{[\s\S]*?border-color:\s*hsl\(var\(--primary\)\);[\s\S]*?box-shadow:\s*0 0 0 2px var\(--focus-ring\);/);
+    expect(css).toMatch(/\.management-page \.search-box input,[\s\S]*?\.management-page \.search-box input:focus-visible\s*\{[\s\S]*?border:\s*0;[\s\S]*?outline:\s*0;[\s\S]*?box-shadow:\s*none;/);
+  });
+
+  it('shows the current session sandbox identity with ready or unbound status', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(app).toContain('const currentSandbox = sandboxes.find((sandbox) => sandbox.sessionId === sessionId);');
+    expect(app).toContain('currentSandbox={currentSandbox}');
+    expect(app).toContain("props.currentSandbox ? props.currentSandbox.id : '未绑定'");
+    expect(app).toContain("props.currentSandbox ? 'ready' : 'muted'");
+    expect(app).not.toContain('sandbox-prod · ready');
+    expect(css).toContain('.prototype-sandbox-identity');
+    expect(css).toContain('.prototype-sandbox-indicator.muted');
+  });
+
+  it('uses one blue tooltip system for navigation and icon-only controls', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const tooltip = await readFile('web/src/components/ui/tooltip.tsx', 'utf8');
+
+    expect(app).toContain('function IconTooltip({ label, children }');
+    expect(app).toContain('<IconTooltip label="添加附件">');
+    expect(app).toContain('<IconTooltip label="发送消息">');
+    expect(app).toContain('<IconTooltip label="收起当前沙箱">');
+    expect(app).toContain('<IconTooltip label="关闭">');
+    expect(app).not.toContain('className={cn(\'prototype-nav-btn\', item.id === page && \'active\')}\n                title={item.label}');
+    expect(tooltip).toContain('bg-primary text-primary-foreground');
+  });
+
   it('uses the refreshed AIOP logo for assistant identity and concise running copy', async () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
 
@@ -1084,5 +1166,24 @@ describe('kubernetes frontend deployment', () => {
     expect(deployment).toMatch(/name:\s+PORT\s*\n\s+value:\s+"8081"/);
     expect(deployment).toContain('containerPort: 8080');
     expect(deployment).toContain('containerPort: 8081');
+  });
+});
+
+describe('AIOS design-system first pass', () => {
+  it('applies one shared visual contract to navigation, management, chat, login, and mobile surfaces', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const css = await readFile('web/src/index.css', 'utf8');
+
+    expect(app).toContain('prototype-chat-page management-page');
+    expect(app).toContain('className="login-page"');
+    expect(css).toContain('/* AIOS first-pass global alignment */');
+    expect(css).toContain('--aios-control-height: 32px;');
+    expect(css).toContain('--aios-panel-radius: 10px;');
+    expect(css).toMatch(/\.prototype-nav-btn\.active\s*\{[\s\S]*?border-left:\s*2px solid hsl\(var\(--primary\)\);/);
+    expect(css).toMatch(/\.page-title h1,[\s\S]*?\.skills-page-header h1\s*\{[\s\S]*?color:\s*#606266;/);
+    expect(css).toMatch(/\.management-page :is\(\.list-card, \.schedule-list-panel, \.skills-workbench\)\s*\{[\s\S]*?border-radius:\s*var\(--aios-panel-radius\);/);
+    expect(css).toMatch(/\.prototype-input-box\s*\{[\s\S]*?border-radius:\s*4px;/);
+    expect(css).toMatch(/\.login-card\s*\{[\s\S]*?border-radius:\s*var\(--aios-panel-radius\);/);
+    expect(css).toMatch(/@media \(max-width: 760px\)[\s\S]*?\.management-main-content \.content-shell\s*\{[\s\S]*?padding:\s*16px;/);
   });
 });
