@@ -367,6 +367,19 @@ describe('frontend API wiring', () => {
     expect(css).toContain('.prototype-code-card summary');
   });
 
+  it('isolates terminal output by session and clears deleted session caches', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(app).toContain('SessionTerminalCache');
+    expect(app).toContain('const [terminalCache, setTerminalCache] = useState<SessionTerminalCache>({})');
+    expect(app).toContain('sessionTerminalOutput(terminalCache, sessionId)');
+    expect(app).toContain('appendTerminalOutput(activeSessionId, chunk)');
+    expect(app).toContain('replaceTerminalOutput(targetSessionId');
+    expect(app).toContain('removeSessionTerminals(current, deletedIds)');
+    expect(app).toContain('touchSessionTerminal(current, nextSessionId)');
+    expect(app).not.toContain("const [sandboxOutput, setSandboxOutput] = useState('')");
+  });
+
   it('supports paginated and deletable session history without blocking chat input during runs', async () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
     const css = await readFile('web/src/index.css', 'utf8');

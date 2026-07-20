@@ -48,6 +48,14 @@ import { NAV_ITEMS, defaultLlmConfig, fallbackTools } from './app-data';
 import { MermaidDiagram } from './components/mermaid-diagram';
 import { createApi, numericSessionId, randomId, readStorage, writeStorage } from './api';
 import { formatSandboxOutputChunk, parseSandboxOutput, sandboxOutputClassNames, sandboxOutputCommand, sandboxOutputLabels } from './sandbox-output';
+import {
+  appendSessionTerminal,
+  removeSessionTerminals,
+  sessionTerminalOutput,
+  setSessionTerminal,
+  touchSessionTerminal,
+  type SessionTerminalCache,
+} from './session-terminal';
 import type {
   AdminUser,
   AdminUsersBody,
@@ -931,7 +939,7 @@ export default function App() {
   const [historyOpen, setHistoryOpen] = useState(true);
   const [previewOpen, setPreviewOpen] = useState(true);
   const [previewWidth, setPreviewWidth] = useState(() => clampPreviewWidth(readStorage('aiop_sandbox_width') || 440));
-  const [sandboxOutput, setSandboxOutput] = useState('');
+  const [terminalCache, setTerminalCache] = useState<SessionTerminalCache>({});
   const [browserStreamUrl, setBrowserStreamUrl] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [toolTestOutput, setToolTestOutput] = useState('');
@@ -969,8 +977,17 @@ export default function App() {
   function activateSession(nextSessionId: string) {
     sessionIdRef.current = nextSessionId;
     setSessionId(nextSessionId);
+    setTerminalCache((current) => touchSessionTerminal(current, nextSessionId));
     writeStorage('aiop_session_id', nextSessionId);
   }
+
+  const replaceTerminalOutput = useCallback((targetSessionId: string, output: string) => {
+    setTerminalCache((current) => setSessionTerminal(current, targetSessionId, output));
+  }, []);
+
+  const appendTerminalOutput = useCallback((targetSessionId: string, chunk: string) => {
+    setTerminalCache((current) => appendSessionTerminal(current, targetSessionId, chunk));
+  }, []);
 
   function showSessionMessages(nextSessionId: string, nextMessages: ChatMessage[]) {
     activateSession(nextSessionId);
@@ -1047,7 +1064,7 @@ export default function App() {
         setActiveRunSessionIds(new Set());
         setAttachments([]);
         setComposerValue('');
-        setSandboxOutput('');
+        setTerminalCache({});
         setBrowserStreamUrl('');
       }
       writeStorage('aiop_user', userKey);
@@ -1353,6 +1370,7 @@ export default function App() {
     ));
     const deletedIds = targetIds.filter((_, index) => results[index].status === 'fulfilled');
     const failedCount = results.length - deletedIds.length;
+    setTerminalCache((current) => removeSessionTerminals(current, deletedIds));
     await refreshSessions();
     if (deletedIds.includes(sessionId)) await startNewSession();
     if (failedCount > 0) {
@@ -1465,15 +1483,14 @@ export default function App() {
     let buffer = '';
     // 沙箱执行过程汇入右侧面板终端：首个沙箱事件出现时才清空旧内容，
     // 避免无沙箱调用的对话误清手动运行的输出。
-    let terminalBuffer = '';
     let terminalStarted = false;
     const pushTerminal = (chunk: string) => {
       if (!terminalStarted) {
         terminalStarted = true;
-        terminalBuffer = '';
+        replaceTerminalOutput(activeSessionId, chunk);
+        return;
       }
-      terminalBuffer += chunk;
-      setSandboxOutput(terminalBuffer);
+      appendTerminalOutput(activeSessionId, chunk);
     };
     try {
       while (true) {
@@ -1488,6 +1505,11 @@ export default function App() {
             const previousSessionId = activeSessionId;
             activeSessionId = event.data.sessionId;
             if (previousSessionId !== activeSessionId) {
+              setTerminalCache((current) => {
+                const output = sessionTerminalOutput(current, previousSessionId);
+                const next = removeSessionTerminals(current, [previousSessionId]);
+                return output ? setSessionTerminal(next, activeSessionId, output) : next;
+              });
               setSessionMessageCache((current) => {
                 if (current[activeSessionId]) return current;
                 const previousMessages = current[previousSessionId]
@@ -1746,54 +1768,58 @@ export default function App() {
 
   async function runSandboxCode(code: string, language: string) {
     if (!code.trim()) return;
+    const targetSessionId = sessionId;
     const command = sandboxOutputCommand(language, code);
-    setSandboxOutput(`$ ${command}\n正在沙箱中运行代码...`);
+    replaceTerminalOutput(targetSessionId, `$ ${command}\n正在沙箱中运行代码...`);
     try {
-      const body = await api.post<ToolCallBody>('/v1/sandbox/run-code', { sessionId, code, language });
-      setSandboxOutput(`$ ${command}\n${formatToolResponse(body)}`);
+      const body = await api.post<ToolCallBody>('/v1/sandbox/run-code', { sessionId: targetSessionId, code, language });
+      replaceTerminalOutput(targetSessionId, `$ ${command}\n${formatToolResponse(body)}`);
     } catch (err) {
-      setSandboxOutput(`$ ${command}\n[error]\n运行失败：${formatError(err)}`);
+      replaceTerminalOutput(targetSessionId, `$ ${command}\n[error]\n运行失败：${formatError(err)}`);
     }
   }
 
   async function openBrowserStream() {
-    setSandboxOutput('$ browser stream\n正在获取浏览器预览...');
+    const targetSessionId = sessionId;
+    replaceTerminalOutput(targetSessionId, '$ browser stream\n正在获取浏览器预览...');
     try {
-      const body = await api.post<ToolCallBody>('/v1/browser/stream', { sessionId });
+      const body = await api.post<ToolCallBody>('/v1/browser/stream', { sessionId: targetSessionId });
       const text = formatToolResponse(body);
       const url = extractUrl(text);
       if (url) setBrowserStreamUrl(url);
-      setSandboxOutput(url ? `$ browser stream\n${text}\n已加载到右侧预览。` : `$ browser stream\n${text}`);
+      replaceTerminalOutput(targetSessionId, url ? `$ browser stream\n${text}\n已加载到右侧预览。` : `$ browser stream\n${text}`);
     } catch (err) {
-      setSandboxOutput(`$ browser stream\n[error]\n预览获取失败：${formatError(err)}`);
+      replaceTerminalOutput(targetSessionId, `$ browser stream\n[error]\n预览获取失败：${formatError(err)}`);
     }
   }
 
   async function captureBrowserScreenshot() {
-    setSandboxOutput('$ browser screenshot\n正在刷新浏览器截图...');
+    const targetSessionId = sessionId;
+    replaceTerminalOutput(targetSessionId, '$ browser screenshot\n正在刷新浏览器截图...');
     try {
-      const body = await api.post<ToolCallBody>('/v1/browser/screenshot', { sessionId });
-      setSandboxOutput(`$ browser screenshot\n${formatToolResponse(body)}`);
+      const body = await api.post<ToolCallBody>('/v1/browser/screenshot', { sessionId: targetSessionId });
+      replaceTerminalOutput(targetSessionId, `$ browser screenshot\n${formatToolResponse(body)}`);
     } catch (err) {
-      setSandboxOutput(`$ browser screenshot\n[error]\n截图失败：${formatError(err)}`);
+      replaceTerminalOutput(targetSessionId, `$ browser screenshot\n[error]\n截图失败：${formatError(err)}`);
     }
   }
 
   /** 把沙箱浏览器当前页面的真实 URL 在本地浏览器新标签页打开（可直接点击、输入）。 */
   async function openBrowserInNewTab() {
-    setSandboxOutput('$ browser url\n正在获取当前页面地址...');
+    const targetSessionId = sessionId;
+    replaceTerminalOutput(targetSessionId, '$ browser url\n正在获取当前页面地址...');
     try {
-      const body = await api.post<ToolCallBody>('/v1/browser/url', { sessionId });
+      const body = await api.post<ToolCallBody>('/v1/browser/url', { sessionId: targetSessionId });
       const text = formatToolResponse(body);
       const pageUrl = text.match(/https?:\/\/[^\s)]+/)?.[0];
       if (pageUrl) {
         window.open(pageUrl, '_blank', 'noopener');
-        setSandboxOutput(`$ browser url\n${text}\n已在新标签页打开。`);
+        replaceTerminalOutput(targetSessionId, `$ browser url\n${text}\n已在新标签页打开。`);
       } else {
-        setSandboxOutput(`$ browser url\n${text}`);
+        replaceTerminalOutput(targetSessionId, `$ browser url\n${text}`);
       }
     } catch (err) {
-      setSandboxOutput(`$ browser url\n[error]\n获取页面地址失败：${formatError(err)}`);
+      replaceTerminalOutput(targetSessionId, `$ browser url\n[error]\n获取页面地址失败：${formatError(err)}`);
     }
   }
 
@@ -1886,7 +1912,7 @@ export default function App() {
           settingsStatus={settingsStatus}
           runningAgentCount={runningAgentCount}
           terminatingSession={terminatingSession}
-          sandboxOutput={sandboxOutput}
+          sandboxOutput={sessionTerminalOutput(terminalCache, sessionId)}
           browserStreamUrl={browserStreamUrl}
           currentSandbox={currentSandbox}
           composerRef={composerRef}
