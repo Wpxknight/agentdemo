@@ -250,6 +250,9 @@ describe('MemoryStore', () => {
     // 消息内容 JSON 持久化并回读多模态内容块
     expect(source).toContain('contentBlocks: msg.contentBlocks');
     expect(source).toContain('contentBlocks: c.contentBlocks');
+    // AI 运行耗时复用 messages.content JSON，无需新增数据库列。
+    expect(source).toContain('durationMs: msg.durationMs');
+    expect(source).toContain("typeof c.durationMs === 'number'");
   });
 
   it('roundtrips user contentBlocks through the memory store', async () => {

@@ -1788,6 +1788,7 @@ async function runAgentSse(
       : '';
     const modelConfig = currentModelConfig(rt);
     const triggerTokens = compactionTriggerTokens(modelConfig);
+    const runStartedAt = Date.now();
     const result = await runAgent({
       model: rt.model,
       tools: rt.tools,
@@ -1886,6 +1887,9 @@ async function runAgentSse(
         sse(e.type, e);
       },
     });
+    const durationMs = Math.max(0, Date.now() - runStartedAt);
+    const finalAssistant = result.messages.findLast((message) => message.role === 'assistant');
+    if (finalAssistant) finalAssistant.durationMs = durationMs;
     if (result.compacted) {
       // 运行期间发生过摘要压缩：历史已被改写，整体替换落库（事务），并保持会话时间线更新。
       await rt.store.replaceMessages(ctx, sessionId, result.messages);

@@ -696,6 +696,15 @@ describe('frontend API wiring', () => {
     expect(css).toContain('.prototype-message-duration');
   });
 
+  it('restores historical assistant duration after merging persisted rounds', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const types = await readFile('web/src/types.ts', 'utf8');
+
+    expect(types).toMatch(/export interface SessionMessagesBody[\s\S]*?durationMs\?: number;/);
+    expect(app).toContain('prev.durationMs = message.durationMs ?? prev.durationMs');
+    expect(app).toContain('durationMs: message.durationMs');
+  });
+
   it('uses the AIOS light-primary surface for user message bubbles', async () => {
     const css = await readFile('web/src/index.css', 'utf8');
 

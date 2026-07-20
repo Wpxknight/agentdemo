@@ -104,6 +104,7 @@ function serializeMsgContent(msg: Msg): string {
   return JSON.stringify({
     text: msg.text,
     thinking: msg.thinking,
+    durationMs: msg.durationMs,
     toolCalls: msg.toolCalls,
     toolResults: msg.toolResults,
     contentBlocks: msg.contentBlocks,
@@ -296,6 +297,9 @@ export class MysqlStore implements Store {
         role: r.role as MsgRole,
         text: c.text,
         thinking: c.thinking,
+        durationMs: typeof c.durationMs === 'number' && Number.isFinite(c.durationMs) && c.durationMs >= 0
+          ? c.durationMs
+          : undefined,
         toolCalls: c.toolCalls,
         toolResults: c.toolResults,
         contentBlocks: c.contentBlocks,

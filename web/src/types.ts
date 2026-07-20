@@ -278,6 +278,7 @@ export interface SessionMessagesBody {
     role: Role | 'tool';
     text?: string;
     thinking?: string;
+    durationMs?: number;
   }>;
 }
 

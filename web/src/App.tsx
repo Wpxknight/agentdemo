@@ -406,6 +406,7 @@ function sessionMessagesToChatMessages(body: SessionMessagesBody): ChatMessage[]
       prev.text = [prev.text, text].filter((part) => part.trim()).join('\n\n');
       const mergedThinking = [prev.thinking || '', thinking].filter((part) => part.trim()).join('\n\n');
       prev.thinking = mergedThinking || undefined;
+      prev.durationMs = message.durationMs ?? prev.durationMs;
       continue;
     }
     messages.push({
@@ -413,6 +414,7 @@ function sessionMessagesToChatMessages(body: SessionMessagesBody): ChatMessage[]
       role: message.role as Role,
       text,
       thinking: thinking || undefined,
+      durationMs: message.durationMs,
       summary: message.role === 'user' && text.startsWith(CONTEXT_SUMMARY_PREFIX),
       time: '',
     });

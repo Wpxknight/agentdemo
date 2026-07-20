@@ -55,6 +55,8 @@ export interface Msg {
   role: Role;
   text?: string;
   thinking?: string; // role === 'assistant'，模型 reasoning/thinking 内容（展示用）
+  /** 一次 Agent 运行最终耗时（毫秒）；仅最后一条 assistant 消息持久化。 */
+  durationMs?: number;
   /** Anthropic 思考块原文 + 签名，用于多轮工具调用时原样回填（保持推理连续性 / 防 400）。 */
   thinkingBlocks?: ThinkingBlock[]; // role === 'assistant'
   toolCalls?: ToolCall[]; // role === 'assistant'

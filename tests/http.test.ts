@@ -254,6 +254,33 @@ describe('HTTP server', () => {
     expect(msgs.map((m) => m.role)).toContain('assistant');
   });
 
+  it('persists agent duration in successful assistant history', async () => {
+    const sessionId = 'duration-success';
+    const login = await fetch(`${base}/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tenantId: 'default', username: 'admin', password: 'pw' }),
+    });
+    const durationToken = (await login.json() as { token: string }).token;
+    const run = await fetch(`${base}/v1/agent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${durationToken}` },
+      body: JSON.stringify({ task: 'measure this run', sessionId }),
+    });
+    expect(run.status).toBe(200);
+    expect(await run.text()).toContain('event: done');
+
+    const history = await fetch(`${base}/v1/sessions/${sessionId}/messages`, {
+      headers: { authorization: `Bearer ${durationToken}` },
+    });
+    expect(history.status).toBe(200);
+    const body = await history.json() as { messages: Msg[] };
+    const assistant = body.messages.findLast((message) => message.role === 'assistant');
+    expect(assistant?.text).toBe('hello');
+    expect(assistant?.durationMs).toEqual(expect.any(Number));
+    expect(assistant!.durationMs).toBeGreaterThanOrEqual(0);
+  });
+
   it('uses numeric session ids when the client omits or sends a numeric sessionId', async () => {
     const generated = await fetch(`${base}/v1/agent`, {
       method: 'POST',
