@@ -494,12 +494,73 @@ describe('HTTP server', () => {
       expect(body).toContain('event: terminated');
       expect(body).not.toContain('未终止');
       expect(aborted).toBe(true);
-      await expect(localStore.listMessages(ctx, 'term-sess')).resolves.toEqual([
+      const messages = await localStore.listMessages(ctx, 'term-sess');
+      expect(messages.slice(0, 2)).toEqual([
         { role: 'user', text: '保留的问题' },
         { role: 'assistant', text: '保留的回答' },
       ] as Msg[]);
+      expect(messages.at(-2)).toMatchObject({ role: 'user', text: '长任务' });
+      expect(messages.at(-1)).toMatchObject({
+        role: 'assistant',
+        text: expect.stringContaining('开始执行'),
+        durationMs: expect.any(Number),
+      });
+      expect(messages.at(-1)?.text).toContain('已终止当前运行。');
     } finally {
       await new Promise<void>((resolve) => terminateServer.close(() => resolve()));
+    }
+  });
+
+  it('persists duration for a failed agent run with partial output', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'failed-run-secret' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    const failingModel: ChatModel = {
+      id: 'failing',
+      async *stream(): AsyncIterable<StreamEvent> {
+        yield { type: 'thinking_delta', text: '正在分析。' };
+        yield { type: 'text_delta', text: '部分回答。' };
+        throw Object.assign(new Error('upstream failed'), { status: 400 });
+      },
+    };
+    const rt = {
+      model: failingModel,
+      tools: new ToolRegistry(),
+      store: localStore,
+      policy: new AllowAllPolicy(),
+      policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth,
+      jwtSecret: 'failed-run-secret',
+      systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+    const failedServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => failedServer.listen(0, '127.0.0.1', resolve));
+    const failedBase = `http://127.0.0.1:${(failedServer.address() as AddressInfo).port}`;
+
+    try {
+      const run = await fetch(`${failedBase}/v1/agent`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${adminToken}` },
+        body: JSON.stringify({ task: '失败任务', sessionId: 'failed-sess' }),
+      });
+      expect(run.status).toBe(200);
+      expect(await run.text()).toContain('event: error');
+
+      const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+      const messages = await localStore.listMessages(ctx, 'failed-sess');
+      expect(messages.at(-2)).toMatchObject({ role: 'user', text: '失败任务' });
+      expect(messages.at(-1)).toMatchObject({
+        role: 'assistant',
+        text: expect.stringContaining('部分回答。'),
+        thinking: '正在分析。',
+        durationMs: expect.any(Number),
+      });
+      expect(messages.at(-1)?.text).toContain('运行失败：upstream failed');
+    } finally {
+      await new Promise<void>((resolve) => failedServer.close(() => resolve()));
     }
   });
 

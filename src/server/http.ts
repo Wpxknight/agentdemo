@@ -1776,6 +1776,10 @@ async function runAgentSse(
   addActiveRun(activeRuns, activeKey, activeRun);
   res.on('close', onClose);
   const toolCtx = { sessionId, tenantId: ctx.tenantId, userId: ctx.userId, role: ctx.role };
+  const runStartedAt = Date.now();
+  let streamedText = '';
+  let streamedThinking = '';
+  let agentReturned = false;
 
   try {
     // 续接历史：加载该会话既有消息作为上下文。
@@ -1788,7 +1792,6 @@ async function runAgentSse(
       : '';
     const modelConfig = currentModelConfig(rt);
     const triggerTokens = compactionTriggerTokens(modelConfig);
-    const runStartedAt = Date.now();
     const result = await runAgent({
       model: rt.model,
       tools: rt.tools,
@@ -1878,6 +1881,12 @@ async function runAgentSse(
       compactionWatermarkTokens: compactionWatermarks.get(activeKey),
       drainPendingMessages: activeRun.drain,
       onEvent: (e) => {
+        if (e.type === 'text_delta') streamedText += e.text;
+        else if (e.type === 'thinking_delta') streamedThinking += e.text;
+        else if (e.type === 'model_retry') {
+          if (e.discardTextChars > 0) streamedText = streamedText.slice(0, -e.discardTextChars);
+          if (e.discardThinkingChars > 0) streamedThinking = streamedThinking.slice(0, -e.discardThinkingChars);
+        }
         if (e.type === 'context_compacted') {
           // 摘要后仍超触发线：记跨请求水位，历史没涨够前的下一次运行不再白跑摘要。
           if (e.afterTokens > triggerTokens) compactionWatermarks.set(activeKey, e.afterTokens + COMPACTION_RETRY_GROWTH_TOKENS);
@@ -1887,6 +1896,7 @@ async function runAgentSse(
         sse(e.type, e);
       },
     });
+    agentReturned = true;
     const durationMs = Math.max(0, Date.now() - runStartedAt);
     const finalAssistant = result.messages.findLast((message) => message.role === 'assistant');
     if (finalAssistant) finalAssistant.durationMs = durationMs;
@@ -1906,6 +1916,30 @@ async function runAgentSse(
     });
     sse('done', { sessionId, steps: result.steps, text: result.text, usage: { ...result.usage, context, cost }, context, cost });
   } catch (err) {
+    if (!agentReturned) {
+      const durationMs = Math.max(0, Date.now() - runStartedAt);
+      const finalLine = abort.signal.aborted
+        ? '已终止当前运行。'
+        : `运行失败：${err instanceof Error ? err.message : '运行失败'}`;
+      const assistantText = [streamedText.trim(), finalLine].filter(Boolean).join('\n\n');
+      try {
+        await rt.store.appendMessages(ctx, sessionId, [
+          {
+            role: 'user',
+            text: parsedTask.task,
+            contentBlocks: taskBlocks.length ? taskBlocks : undefined,
+          },
+          {
+            role: 'assistant',
+            text: assistantText,
+            thinking: streamedThinking.trim() || undefined,
+            durationMs,
+          },
+        ]);
+      } catch (persistErr) {
+        log.warn({ err: persistErr, sessionId }, 'agent 失败记录落库失败');
+      }
+    }
     if (abort.signal.aborted) {
       sse('terminated', { sessionId, reason: abortReasonMessage(abort.signal.reason) });
     } else {
