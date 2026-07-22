@@ -55,12 +55,15 @@ export class LangGraphAgentKernel implements AgentKernel {
           ? Math.max(10, (options.maxSteps ?? 1) * 3 + 5)
           : 10_000,
       };
-    let input: unknown = initialAgentGraphState(messages, options.compactionWatermarkTokens);
+    let input: unknown = options.resumeFromCheckpoint
+      ? null
+      : initialAgentGraphState(messages, options.compactionWatermarkTokens);
     let state: Awaited<ReturnType<typeof graph.invoke>>;
     for (;;) {
       state = await graph.invoke(input as never, config);
       if (!isInterrupted(state)) break;
       if (!options.durableInteractions) throw new Error('LangGraph 运行被中断，但未配置 durable interaction bridge');
+      await options.runLifecycle?.waiting({ interactions: state.__interrupt__.length });
       const resolutions = await Promise.all(state.__interrupt__.map(async (entry) => {
         const value = entry.value as { interactionId?: unknown };
         if (typeof value?.interactionId !== 'string') throw new Error('LangGraph interrupt 缺少 interactionId');
@@ -69,6 +72,7 @@ export class LangGraphAgentKernel implements AgentKernel {
       input = new Command({
         resume: resolutions.length === 1 ? resolutions[0]![1] : Object.fromEntries(resolutions),
       });
+      await options.runLifecycle?.running({ resumedInteractions: resolutions.length });
     }
     return {
       messages: state.messages,

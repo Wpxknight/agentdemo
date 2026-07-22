@@ -53,6 +53,7 @@ export function createAgentGraph(options: RunAgentOptions, checkpointer?: BaseCh
       modelRetryDelayMs: options.modelRetryDelayMs,
       signal: options.signal,
       onEvent: options.onEvent,
+      guard: options.runGuard,
     });
     const steps = state.steps + 1;
     messages.push({
@@ -120,6 +121,7 @@ export function createAgentGraph(options: RunAgentOptions, checkpointer?: BaseCh
         : undefined,
       signal: options.signal,
       onEvent: options.onEvent,
+      guard: options.runGuard,
     });
     throwIfAborted(options.signal);
     return {
@@ -130,9 +132,9 @@ export function createAgentGraph(options: RunAgentOptions, checkpointer?: BaseCh
   };
 
   return new StateGraph(AgentGraphState)
-    .addNode('prepare', prepare)
-    .addNode('model', model)
-    .addNode('tools', tools)
+    .addNode('prepare', observedNode('prepare', prepare, options))
+    .addNode('model', observedNode('model', model, options))
+    .addNode('tools', observedNode('tools', tools, options))
     .addEdge(START, 'prepare')
     .addEdge('prepare', 'model')
     .addConditionalEdges('model', (state) => {
@@ -141,6 +143,27 @@ export function createAgentGraph(options: RunAgentOptions, checkpointer?: BaseCh
     })
     .addConditionalEdges('tools', (state) => state.continueModel ? 'model' : END)
     .compile({ checkpointer });
+}
+
+function observedNode(
+  name: string,
+  node: (state: AgentGraphStateValue) => Promise<Partial<AgentGraphStateValue>>,
+  options: RunAgentOptions,
+): (state: AgentGraphStateValue) => Promise<Partial<AgentGraphStateValue>> {
+  return async (state) => {
+    await options.runLifecycle?.nodeStarted(name);
+    try {
+      await options.runGuard?.();
+      const result = await node(state);
+      await options.runLifecycle?.nodeCompleted(name, {
+        ...(typeof result.steps === 'number' ? { steps: result.steps } : {}),
+      });
+      return result;
+    } catch (error) {
+      await options.runLifecycle?.nodeFailed(name, error);
+      throw error;
+    }
+  };
 }
 
 function addUsage(left: AgentGraphStateValue['usage'], right: AgentGraphStateValue['usage']): AgentGraphStateValue['usage'] {

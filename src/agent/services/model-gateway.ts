@@ -28,6 +28,7 @@ export interface RunModelTurnOptions {
   modelRetryDelayMs?: number;
   signal?: AbortSignal;
   onEvent?: (event: StreamEvent) => void;
+  guard?: () => Promise<void>;
 }
 
 /** 模型调用失败（网络异常 / 上游报错）的最大重试次数（不含首次尝试）。 */
@@ -46,6 +47,7 @@ export async function runModelTurn(options: RunModelTurnOptions): Promise<ModelT
     calls = [];
     thinkingBlocks = [];
     try {
+      await options.guard?.();
       const sendMessages = options.contextBudgetTokens
         ? compactMessages(options.messages, options.contextBudgetTokens, options.keepImages ?? 1)
         : options.messages;

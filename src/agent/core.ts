@@ -93,6 +93,8 @@ export interface RunAgentOptions {
   /** Run Center 生命周期观察器与多副本 fencing guard。 */
   runLifecycle?: AgentRunLifecycleObserver;
   runGuard?: () => Promise<void>;
+  /** 仅供经过安全校验的故障恢复：使用相同 runId 从最新 checkpoint 继续。 */
+  resumeFromCheckpoint?: boolean;
 }
 
 export interface RunAgentResult {

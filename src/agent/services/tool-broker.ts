@@ -22,6 +22,7 @@ export interface ToolBrokerOptions {
   requestPlanApprovalForCall?: (call: ToolCall, plan: ChangePlan) => Promise<boolean>;
   signal?: AbortSignal;
   onEvent?: (event: StreamEvent) => void;
+  guard?: () => Promise<void>;
 }
 
 /** 并发执行同一模型轮次的工具调用，同时保持回填结果与模型 call 顺序一致。 */
@@ -40,6 +41,7 @@ export function executeToolCalls(calls: ToolCall[], options: ToolBrokerOptions):
 
 /** 执行单个工具调用，固定 Policy → Approval → Hook → dispatch 顺序。 */
 export async function executeToolCall(call: ToolCall, options: ToolBrokerOptions): Promise<ToolResult> {
+  await options.guard?.();
   throwIfAborted(options.signal);
   const policyDecision = await options.policy.check(call, options.ctx);
   throwIfAborted(options.signal);
@@ -79,6 +81,7 @@ export async function executeToolCall(call: ToolCall, options: ToolBrokerOptions
         args: call.args,
       }
     : undefined;
+  await options.guard?.();
   if (ledgerIdentity) {
     const decision = await options.toolLedger!.begin(ledgerIdentity);
     if (decision.action === 'reuse') return decision.result;
@@ -99,6 +102,7 @@ export async function executeToolCall(call: ToolCall, options: ToolBrokerOptions
     ...(askUser ? { askUser } : {}),
     ...(requestPlanApproval ? { requestPlanApproval } : {}),
   };
+  await options.guard?.();
   const result = await options.tools.dispatch(call, callContext);
   if (ledgerIdentity) await options.toolLedger!.complete(ledgerIdentity, result);
   throwIfAborted(options.signal);
