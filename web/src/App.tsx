@@ -46,6 +46,7 @@ import {
 } from 'lucide-react';
 import { NAV_ITEMS, defaultLlmConfig, fallbackTools } from './app-data';
 import { MermaidDiagram } from './components/mermaid-diagram';
+import { RunCenterPage } from './components/run-center-page';
 import { createApi, numericSessionId, randomId, readStorage, writeStorage } from './api';
 import { formatSandboxOutputChunk, parseSandboxOutput, sandboxOutputClassNames, sandboxOutputCommand, sandboxOutputLabels } from './sandbox-output';
 import {
@@ -114,6 +115,7 @@ import { cn } from '@/lib/utils';
 
 const iconMap = {
   chat: MessageSquare,
+  runs: Activity,
   skills: Boxes,
   mcp: Link2,
   schedule: CalendarClock,
@@ -1979,6 +1981,7 @@ export default function App() {
                 onRequestConfirm={requestConfirmDialog}
               />
             )}
+            {activePage === 'runs' && <RunCenterPage api={api} />}
             {activePage === 'mcp' && <McpPage tools={mcpTools} api={api} output={toolTestOutput} onTest={testMcpTool} onRequestConfirm={requestConfirmDialog} onChanged={() => void loadPageData('mcp')} />}
             {activePage === 'schedule' && <SchedulePage tasks={tasks} api={api} onChanged={() => void loadPageData('schedule')} onRequestConfirm={requestConfirmDialog} />}
             {activePage === 'sandbox' && <SandboxPage sandboxes={sandboxes} profiles={sandboxProfiles} />}

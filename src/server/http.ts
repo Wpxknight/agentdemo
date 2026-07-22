@@ -42,12 +42,24 @@ import {
 import { SessionCommitter } from '../agent/services/session-committer.js';
 import { DurableToolLedger } from '../agent/tool-ledger/store.js';
 import { DurableInteractionService } from '../agent/interactions/store.js';
+import {
+  RunCenterConflictError,
+  RunCenterNotFoundError,
+  RunCenterService,
+} from '../agent/run-center.js';
+import type { AgentRunRecord, AgentRunStatus } from '../db/store.js';
 
 const log = logger.child({ mod: 'http' });
 
 type Req = http.IncomingMessage;
 type Res = http.ServerResponse;
-type ActiveAgentRun = { abort: AbortController; append: (message: Msg) => void; drain: () => Msg[] };
+type ActiveAgentRun = {
+  tenantId: string;
+  runId: string;
+  abort: AbortController;
+  append: (message: Msg) => void;
+  drain: () => Msg[];
+};
 type ActiveAgentRuns = Map<string, Set<ActiveAgentRun>>;
 /** 无效压缩水位（tenant+session → token 数）：摘要后仍超触发线时记录，历史没涨够前跳过重试。 */
 type CompactionWatermarks = Map<string, number>;
@@ -692,10 +704,20 @@ export function createHttpServer(rt: Runtime): http.Server {
   const interactions = new DurableInteractionService(rt.store);
   const activeRuns: ActiveAgentRuns = new Map();
   const compactionWatermarks: CompactionWatermarks = new Map();
+  const runCenter = new RunCenterService(rt.store, {
+    abortLocal: (ctx, runId) => abortActiveRunById(activeRuns, ctx.tenantId, runId),
+    recover: (ctx, run) => {
+      void recoverAgentRun(rt, interactions, activeRuns, compactionWatermarks, ctx, run).catch((err) => {
+        log.error({ err, runId: run.runId }, 'Agent Run checkpoint 恢复失败');
+      });
+    },
+  });
 
   return http.createServer((req, res) => {
-    handle(rt, secret, approvals, questions, interactions, activeRuns, compactionWatermarks, req, res).catch((err) => {
+    handle(rt, secret, approvals, questions, interactions, runCenter, activeRuns, compactionWatermarks, req, res).catch((err) => {
       if (err instanceof HttpError) return sendJson(res, err.status, { error: err.message });
+      if (err instanceof RunCenterNotFoundError) return sendJson(res, 404, { error: err.message });
+      if (err instanceof RunCenterConflictError) return sendJson(res, 409, { error: err.message });
       if (err instanceof AuthzError) return sendJson(res, 403, { error: err.message });
       log.error({ err }, '请求处理异常');
       if (!res.headersSent) sendJson(res, 500, { error: '内部错误' });
@@ -710,6 +732,7 @@ async function handle(
   approvals: InMemoryApprovalStore,
   questions: InMemoryQuestionStore,
   interactions: DurableInteractionService,
+  runCenter: RunCenterService,
   activeRuns: ActiveAgentRuns,
   compactionWatermarks: CompactionWatermarks,
   req: Req,
@@ -824,6 +847,45 @@ async function handle(
 
   // —— 以下均需认证 ——
   if (route === 'POST /v1/agent') return runAgentSse(rt, approvals, questions, interactions, activeRuns, compactionWatermarks, req, res);
+
+  if (route === 'GET /v1/agent/runs') {
+    const ctx = await requireAuth(rt, req);
+    const rawStatus = url.searchParams.get('status');
+    const statuses: AgentRunStatus[] = ['queued', 'running', 'waiting', 'succeeded', 'failed', 'cancelled', 'recovery_required'];
+    if (rawStatus && !statuses.includes(rawStatus as AgentRunStatus)) throw new HttpError(400, '无效的 Run 状态');
+    const limit = intParam(url.searchParams.get('limit'), 50, 1, 100);
+    const offset = intParam(url.searchParams.get('offset'), 0, 0, 1_000_000);
+    return sendJson(res, 200, await runCenter.list(ctx, {
+      ...(rawStatus ? { status: rawStatus as AgentRunStatus } : {}),
+      ...(url.searchParams.get('sessionId') ? { sessionId: url.searchParams.get('sessionId')! } : {}),
+      limit,
+      offset,
+    }));
+  }
+
+  const runDetailMatch = /^\/v1\/agent\/runs\/([^/]+)$/.exec(path);
+  if (method === 'GET' && runDetailMatch) {
+    const ctx = await requireAuth(rt, req);
+    const detail = await runCenter.detail(ctx, decodeURIComponent(runDetailMatch[1]!));
+    if (!detail) throw new RunCenterNotFoundError();
+    return sendJson(res, 200, detail);
+  }
+
+  const runCancelMatch = /^\/v1\/agent\/runs\/([^/]+)\/cancel$/.exec(path);
+  if (method === 'POST' && runCancelMatch) {
+    const ctx = await requireAuth(rt, req);
+    return sendJson(res, 200, {
+      ok: true,
+      ...await runCenter.cancel(ctx, decodeURIComponent(runCancelMatch[1]!)),
+    });
+  }
+
+  const runResumeMatch = /^\/v1\/agent\/runs\/([^/]+)\/resume$/.exec(path);
+  if (method === 'POST' && runResumeMatch) {
+    const ctx = await requireAuth(rt, req);
+    await runCenter.resume(ctx, decodeURIComponent(runResumeMatch[1]!));
+    return sendJson(res, 202, { ok: true });
+  }
 
   if (route === 'GET /v1/me') {
     const ctx = await requireAuth(rt, req);
@@ -1747,10 +1809,182 @@ function abortActiveRuns(activeRuns: ActiveAgentRuns, key: string): number {
   return aborted;
 }
 
+function abortActiveRunById(activeRuns: ActiveAgentRuns, tenantId: string, runId: string): number {
+  let aborted = 0;
+  for (const set of activeRuns.values()) {
+    for (const run of set) {
+      if (run.tenantId !== tenantId || run.runId !== runId || run.abort.signal.aborted) continue;
+      run.abort.abort(new Error(RUN_TERMINATED_MESSAGE));
+      aborted++;
+    }
+  }
+  return aborted;
+}
+
 function abortReasonMessage(reason: unknown): string {
   if (reason instanceof Error) return reason.message;
   if (typeof reason === 'string' && reason) return reason;
   return RUN_TERMINATED_MESSAGE;
+}
+
+async function recoverAgentRun(
+  rt: Runtime,
+  interactions: DurableInteractionService,
+  activeRuns: ActiveAgentRuns,
+  compactionWatermarks: CompactionWatermarks,
+  requester: RequestContext,
+  run: AgentRunRecord,
+): Promise<void> {
+  const owner = await rt.store.getUser(run.tenantId, run.userId).catch(() => undefined);
+  const ctx: RequestContext = {
+    tenantId: run.tenantId,
+    userId: run.userId,
+    role: owner?.role ?? (requester.userId === run.userId ? requester.role : 'user'),
+  };
+  const activeKey = activeRunKey(ctx, run.sessionId);
+  if (findActiveRun(activeRuns, activeKey)) {
+    const now = new Date();
+    await rt.store.updateAgentRun(run.tenantId, run.runId, {
+      status: 'recovery_required',
+      errorMessage: '同一会话已有运行中的任务',
+      updatedAt: now,
+    });
+    await rt.store.appendAgentRunEvent({
+      tenantId: run.tenantId,
+      runId: run.runId,
+      type: 'recovery',
+      status: 'blocked',
+      detail: { reason: 'session_busy' },
+      createdAt: now,
+    });
+    return;
+  }
+
+  const abort = new AbortController();
+  const pendingMessages: Msg[] = [];
+  const activeRun: ActiveAgentRun = {
+    tenantId: run.tenantId,
+    runId: run.runId,
+    abort,
+    append: (message) => pendingMessages.push(message),
+    drain: () => pendingMessages.splice(0),
+  };
+  addActiveRun(activeRuns, activeKey, activeRun);
+
+  try {
+    const prior = await rt.store.listMessages(ctx, run.sessionId);
+    const modelConfig = currentModelConfig(rt);
+    const triggerTokens = compactionTriggerTokens(modelConfig);
+    const userHomeNote = rt.sandboxSettings?.enabled && rt.userHome
+      ? await boundUserHomeNote(rt.store, ctx.tenantId, ctx.userId, rt.userHome)
+      : '';
+    const startedAt = Date.now();
+    const durableInteractions = {
+      create: async (input: { kind: 'approval' | 'question' | 'plan'; toolCallId: string; payload: unknown }) => {
+        const id = createHash('sha256')
+          .update(`${run.runId}\0${input.kind}\0${input.toolCallId}`)
+          .digest('hex');
+        const existing = await rt.store.getInteraction(ctx.tenantId, id);
+        if (existing) return { id };
+        const payload = asObject(input.payload);
+        const publicPayload = input.kind === 'plan'
+          ? {
+              ...payload,
+              questions: [{
+                question: `请审批变更方案：${planSummary(payload.plan)}`,
+                header: '变更审批',
+                options: [{ label: '批准' }, { label: '拒绝' }],
+              } satisfies QuestionSpec],
+            }
+          : payload;
+        await interactions.create({
+          id,
+          kind: input.kind,
+          tenantId: ctx.tenantId,
+          userId: ctx.userId,
+          sessionId: run.sessionId,
+          runId: run.runId,
+          toolCallId: input.toolCallId,
+          payload: { id, runId: run.runId, sessionId: run.sessionId, ...publicPayload },
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+        });
+        return { id };
+      },
+      wait: async (id: string) => {
+        const record = await interactions.wait(ctx.tenantId, id, abort.signal);
+        if (record.status !== 'resolved') return record.kind === 'question' ? null : false;
+        if (record.kind !== 'plan') return record.resolution;
+        const payload = record.payload as { plan?: { summary?: string }; questions?: QuestionSpec[] };
+        const answers = record.resolution as QuestionAnswers | undefined;
+        const question = payload.questions?.[0]?.question
+          ?? `请审批变更方案：${payload.plan?.summary ?? ''}`;
+        const approved = answers?.[question]?.includes('批准') ?? record.resolution === true;
+        if (approved) rt.planState?.approve(run.sessionId);
+        return approved;
+      },
+    };
+
+    const result = await resolveAgentRuntime(rt.agentRuntime).run({
+      runId: run.runId,
+      resumeFromCheckpoint: true,
+      model: rt.model,
+      tools: rt.tools,
+      policy: rt.policy,
+      filterToolDefs: (defs) => rt.permissionRules?.filterToolDefs(defs) ?? defs,
+      hooks: rt.hooks,
+      toolLedger: new DurableToolLedger(rt.store),
+      durableInteractions,
+      system: [
+        rt.skillRegistry ? rt.skillRegistry.summariesFor(ctx) : rt.systemExtra,
+        rt.sandboxSettings?.enabled ? SANDBOX_SERVICE_NOTE : '',
+        userHomeNote,
+      ].filter(Boolean).join('\n\n'),
+      ctx: { ...ctx, sessionId: run.sessionId },
+      signal: abort.signal,
+      contextBudgetTokens: contextBudgetTokens(modelConfig),
+      keepImages: keepImagesOf(modelConfig),
+      summarize: (stale) => summarizeMessages(rt.model, stale, abort.signal),
+      compactionTriggerTokens: triggerTokens,
+      compactionKeepRecent: COMPACTION_KEEP_RECENT,
+      compactionWatermarkTokens: compactionWatermarks.get(activeKey),
+      drainPendingMessages: activeRun.drain,
+      onEvent: (event) => {
+        if (event.type !== 'context_compacted') return;
+        if (event.afterTokens > triggerTokens) {
+          compactionWatermarks.set(activeKey, event.afterTokens + COMPACTION_RETRY_GROWTH_TOKENS);
+        } else {
+          compactionWatermarks.delete(activeKey);
+        }
+      },
+    });
+    await new SessionCommitter(rt.store).commitSuccess({
+      ctx,
+      sessionId: run.sessionId,
+      priorMessageCount: prior.length,
+      result,
+      durationMs: Math.max(0, Date.now() - startedAt),
+    });
+  } finally {
+    removeActiveRun(activeRuns, activeKey, activeRun);
+    for (const message of activeRun.drain()) {
+      await rt.store.appendMessage(ctx, run.sessionId, message).catch((err) => {
+        log.warn({ err, runId: run.runId }, '恢复运行残留消息落库失败');
+      });
+    }
+  }
+}
+
+function asObject(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : { value };
+}
+
+function planSummary(value: unknown): string {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && typeof (value as { summary?: unknown }).summary === 'string'
+    ? (value as { summary: string }).summary
+    : '';
 }
 
 /** POST /v1/agent：流式（SSE）运行一次 agent，自动续接会话历史并持久化。 */
@@ -1804,6 +2038,8 @@ async function runAgentSse(
   const pendingMessages: Msg[] = [];
   const activeKey = activeRunKey(ctx, sessionId);
   const activeRun: ActiveAgentRun = {
+    tenantId: ctx.tenantId,
+    runId,
     abort,
     append: (message) => pendingMessages.push(message),
     drain: () => pendingMessages.splice(0),

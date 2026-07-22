@@ -1,11 +1,11 @@
-export type PageId = 'chat' | 'skills' | 'mcp' | 'schedule' | 'sandbox' | 'users' | 'settings';
+export type PageId = 'chat' | 'runs' | 'skills' | 'mcp' | 'schedule' | 'sandbox' | 'users' | 'settings';
 
 export type Role = 'user' | 'assistant';
 
 export interface NavItem {
   id: PageId;
   label: string;
-  icon: 'chat' | 'skills' | 'mcp' | 'schedule' | 'sandbox' | 'users' | 'settings';
+  icon: 'chat' | 'runs' | 'skills' | 'mcp' | 'schedule' | 'sandbox' | 'users' | 'settings';
   /** 仅管理员可见的一级菜单（前端隐藏只是 UX，真正的防线是后端 RBAC）。 */
   adminOnly?: boolean;
 }
@@ -119,6 +119,58 @@ export interface TaskRun {
   detail?: string;
   steps?: number;
   createdAt?: string;
+}
+
+export type AgentRunStatus = 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'recovery_required';
+
+export interface AgentRunSummary {
+  tenantId: string;
+  userId: string;
+  sessionId: string;
+  runId: string;
+  kernel: 'legacy' | 'langgraph';
+  graphName: string;
+  graphVersion: string;
+  status: AgentRunStatus;
+  currentNode?: string;
+  stepCount: number;
+  usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number };
+  errorMessage?: string;
+  createdAt: string;
+  startedAt?: string;
+  updatedAt: string;
+  completedAt?: string;
+  cancelRequestedAt?: string;
+  leaseToken: number;
+  leaseExpiresAt?: string;
+  leaseActive: boolean;
+}
+
+export interface AgentRunEventBody {
+  id?: number;
+  type: string;
+  node?: string;
+  status?: string;
+  detail?: unknown;
+  createdAt: string;
+}
+
+export interface AgentRunListBody {
+  runs: AgentRunSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+}
+
+export interface AgentRunDetailBody {
+  run: AgentRunSummary;
+  events: AgentRunEventBody[];
+  interactions: Array<{ id: string; kind: string; status: string; createdAt: string; resolvedAt?: string }>;
+  tools: Array<{ toolCallId: string; toolName: string; status: string; startedAt: string; completedAt?: string }>;
+  canCancel: boolean;
+  canResume: boolean;
+  recoveryBlockedReason?: string;
 }
 
 export interface SandboxSummary {

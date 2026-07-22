@@ -2,6 +2,7 @@ import type { NavItem, PageMeta, RuntimeModelConfig, SandboxSummary, ScheduledTa
 
 export const NAV_ITEMS: NavItem[] = [
   { id: 'chat', label: '聊天', icon: 'chat' },
+  { id: 'runs', label: '运行中心', icon: 'runs' },
   { id: 'skills', label: '技能', icon: 'skills' },
   { id: 'mcp', label: 'MCP', icon: 'mcp' },
   { id: 'schedule', label: '定时任务', icon: 'schedule' },
@@ -12,6 +13,7 @@ export const NAV_ITEMS: NavItem[] = [
 
 export const PAGES: Record<string, PageMeta> = {
   chat: { title: 'AI 助手', hasSandboxWorkspace: true, hasSessionHistoryDrawer: true },
+  runs: { title: '运行中心', hasSandboxWorkspace: false },
   skills: { title: '技能', hasSandboxWorkspace: false },
   mcp: { title: 'MCP', hasSandboxWorkspace: false },
   schedule: { title: '定时任务', hasSandboxWorkspace: false },
