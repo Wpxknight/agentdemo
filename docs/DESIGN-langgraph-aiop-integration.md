@@ -195,7 +195,117 @@ AIoP 当前已经具备：
 
 这些能力不应因为引入 LangGraph 而被重复实现。
 
-### 3.2 当前执行链路
+### 3.2 当前 AIoP 模块架构与 LangGraph 替换范围
+
+下图按当前源码模块展示 AIoP 的主要运行链路，并标记 LangGraph 的适用边界：
+
+- **可替换**：现有模块的核心职责可迁移到 LangGraph；
+- **部分替换**：只迁移流程协调或等待/恢复机制，业务决策权仍留在 AIoP；
+- **保留**：属于 AIoP 平台控制面或能力适配层，不应交给 LangGraph；
+- **新增**：为 LangGraph 接入增加的适配与持久化模块。
+
+```mermaid
+flowchart TB
+  subgraph ENTRY[入口与传输层]
+    WEB[Web UI<br/>保留]
+    HTTP[src/server/http.ts<br/>HTTP / SSE<br/>部分替换]
+    CLI[src/index.ts<br/>CLI<br/>保留]
+    SCHED[src/scheduler/runner.ts<br/>Scheduler<br/>保留]
+  end
+
+  subgraph ROOT[装配与平台控制面]
+    RUNTIME[src/runtime.ts<br/>Runtime Composition Root<br/>保留]
+    AUTH[src/auth/*<br/>Auth / Tenant / RBAC<br/>保留]
+    STORE[src/db/*<br/>Session / Message / Run Store<br/>保留]
+    AUDIT[src/audit/*<br/>Audit / Usage / Cost<br/>保留]
+  end
+
+  subgraph CURRENT[当前 Agent 执行与协调]
+    ACTIVE[src/server/http.ts activeRuns<br/>Pending / Cancel / In-memory Wait<br/>部分替换]
+    CORE[src/agent/core.ts runAgent<br/>模型-工具循环 / 分支 / 步骤<br/>可替换]
+    COMPACT[core.ts Context Compaction<br/>轮次边界与压缩调度<br/>可替换]
+    APPROVAL[src/agent/approval.ts + question.ts<br/>审批 / 提问等待<br/>部分替换]
+    PARALLEL[core.ts Promise.all tool calls<br/>工具批次调度<br/>可替换]
+  end
+
+  subgraph CAP[模型、安全与能力层]
+    MODEL[src/model/*<br/>ChatModel / Provider Adapter<br/>保留]
+    REGISTRY[src/agent/tools.ts<br/>ToolRegistry<br/>保留]
+    POLICY[src/agent/policy.ts + rules.ts + hooks.ts<br/>Policy / Rules / Hook<br/>保留]
+    MCP[src/mcp/*<br/>MCP Manager<br/>保留]
+    SKILL[src/skill/* + skills/*<br/>Skill Registry<br/>保留]
+    SANDBOX[src/sandbox/* + src/tools/*<br/>Sandbox / Browser / kubectl<br/>保留]
+  end
+
+  subgraph LG[LangGraph 接入目标]
+    GRAPH[StateGraph Agent Kernel<br/>新增]
+    NODES[Model / Compact / Tool / Interaction Nodes<br/>新增]
+    INTERRUPT[Interrupt + Resume<br/>新增]
+    CHECKPOINT[MySQL Checkpointer<br/>新增]
+    STREAM[Custom / Updates Stream Adapter<br/>新增]
+  end
+
+  WEB --> HTTP
+  HTTP --> RUNTIME
+  CLI --> RUNTIME
+  SCHED --> RUNTIME
+  HTTP --> AUTH
+  RUNTIME --> ACTIVE
+  ACTIVE --> CORE
+  CORE --> COMPACT
+  CORE --> APPROVAL
+  CORE --> PARALLEL
+  CORE --> MODEL
+  PARALLEL --> POLICY
+  POLICY --> REGISTRY
+  REGISTRY --> MCP
+  REGISTRY --> SKILL
+  REGISTRY --> SANDBOX
+  ACTIVE --> STORE
+  CORE --> AUDIT
+
+  CORE -.流程控制迁移.-> GRAPH
+  COMPACT -.节点化.-> NODES
+  PARALLEL -.阶段与并行节点.-> NODES
+  APPROVAL -.等待与恢复迁移.-> INTERRUPT
+  ACTIVE -.运行内状态迁移.-> GRAPH
+  GRAPH --> CHECKPOINT
+  GRAPH --> STREAM
+  STREAM -.兼容现有 SSE.-> HTTP
+  CHECKPOINT -.复用 MySQL.-> STORE
+  NODES -.继续调用.-> MODEL
+  NODES -.必须经过.-> POLICY
+
+  classDef retain fill:#dbeafe,stroke:#2563eb,color:#172554;
+  classDef partial fill:#fef3c7,stroke:#d97706,color:#451a03;
+  classDef replace fill:#dcfce7,stroke:#16a34a,color:#052e16;
+  classDef added fill:#f3e8ff,stroke:#9333ea,color:#3b0764;
+
+  class WEB,CLI,SCHED,RUNTIME,AUTH,STORE,AUDIT,MODEL,REGISTRY,POLICY,MCP,SKILL,SANDBOX retain;
+  class HTTP,ACTIVE,APPROVAL partial;
+  class CORE,COMPACT,PARALLEL replace;
+  class GRAPH,NODES,INTERRUPT,CHECKPOINT,STREAM added;
+```
+
+#### 3.2.1 模块替换边界表
+
+| 当前模块/职责 | 替换程度 | LangGraph 承接内容 | AIoP 必须保留内容 |
+|---|---|---|---|
+| `src/agent/core.ts` 的 `runAgent()` | 高，可替换 | 循环、条件边、步骤推进、终止判断、节点状态 | `ChatModel`、消息协议、重试细节和工具安全入口 |
+| `runAgent()` 内上下文压缩调度 | 高，可替换 | 将压缩检查和摘要变成显式节点及 checkpoint 边界 | token 估算、摘要实现、图片治理策略 |
+| `Promise.all()` 工具批次调度 | 高，可替换 | 动态并行节点、super-step、pending writes、失败后局部恢复 | ToolExecutionPlanner、资源键、工具副作用分类和结果顺序 |
+| HTTP `activeRuns` 中的运行内状态 | 中，部分替换 | 单 run 图状态、暂停位置、恢复游标 | 跨副本 Lease/Fencing、durable inbox、cancel owner 路由 |
+| `approval.ts`、`question.ts` 的进程内等待 | 中，部分替换 | `interrupt()`、checkpoint、`Command({ resume })` | 审批权限、交互记录、过期、CAS、审计和可信决策读取 |
+| 模型流事件协调 | 中，部分替换 | `custom/updates` 流、节点级事件来源 | 现有 `StreamEvent`、RuntimeEvent、SSE 对外兼容协议 |
+| Session/Message 持久化 | 低，不替换 | 仅保存单 run checkpoint | 会话历史事实源、revision、最终事务提交和数据生命周期 |
+| `ChatModel` 与 Anthropic/OpenAI Adapter | 不替换 | 在 model node 中调用 | Provider 协议翻译、thinking、usage、重试和模型配置 |
+| ToolRegistry/MCP/Skill/Sandbox | 不替换 | 在 tool node 中经 Broker 调用 | 工具发现、生命周期、资源隔离、凭据和真实 dispatch |
+| Policy/Rules/Hook/Audit | 不替换 | 在节点执行路径中调用 | 所有授权、审批决策、安全底线和审计事实 |
+| Auth/Tenant/RBAC | 不替换 | 无 | 可信身份、多租户边界和权限判断 |
+
+图中的“可替换”不是删除对应业务能力，而是把其**流程状态机职责**迁移到 LangGraph；模型、工具、安全和存储实现继续作为 LangGraph 节点调用的 AIoP 能力。
+
+### 3.3 当前执行链路
 
 ```text
 HTTP / CLI / Scheduler
@@ -215,7 +325,7 @@ HTTP / CLI / Scheduler
 appendMessages() / replaceMessages()
 ```
 
-### 3.3 最适合 LangGraph 接管的部分
+### 3.4 最适合 LangGraph 接管的部分
 
 LangGraph 应接管：
 
@@ -238,7 +348,7 @@ LangGraph 不应接管：
 - 审计、计费和数据保留策略；
 - HTTP/SSE 对外协议。
 
-### 3.4 与现有 Agent Runtime 设计的关系
+### 3.5 与现有 Agent Runtime 设计的关系
 
 仓库已有 `docs/DESIGN-agent-runtime.md`，其 AgentRuntime、TurnCoordinator、Message Envelope、Runtime Event、Lease、Fencing、Tool Ledger 等设计仍然有效。
 
@@ -345,6 +455,29 @@ START → run_existing_agent → END
 - 图版本治理成为新运维要求。
 
 结论：**推荐路线。**
+
+### 4.4 替换部分模块到 LangGraph 的收益
+
+| 替换对象 | 当前问题 | LangGraph 提供的机制 | 主要好处 | 仍需 AIoP 补齐 |
+|---|---|---|---|---|
+| `runAgent()` 命令式循环 | 模型、工具、压缩、pending message 和终止逻辑集中在一个循环中，扩展分支容易互相影响 | State、Node、Conditional Edge、循环图 | 流程边界清楚；节点可独立测试；增加回退、分支和子流程时不必继续扩大单函数 | 节点内的模型与工具业务实现 |
+| 模型轮次和工具轮次的恢复 | 当前完整 `runAgent()` 返回前缺少细粒度稳定恢复点 | 每个 super-step checkpoint、StateSnapshot | 进程重启后从最近稳定节点恢复，减少整轮任务丢失和重复模型调用 | MySQL saver、图版本和恢复权限校验 |
+| 并行工具执行 | 当前同轮调用无条件 `Promise.all()`，无法表达串行屏障或同资源互斥 | 动态节点、并行 super-step、pending writes | 安全工具可并行；同批部分成功时保留成功结果；失败恢复不必重跑全部工具 | execution metadata、stage planner、资源键和副作用账本 |
+| 审批与提问等待 | 依赖进程内 Promise，Pod 重启或请求断开后等待状态丢失 | `interrupt()`、持久 checkpoint、`Command({ resume })` | 等待状态可跨进程恢复；审批和提问成为显式流程节点；更容易查询当前暂停位置 | durable interaction 表、RBAC、过期、CAS 和审计 |
+| 上下文压缩调度 | 压缩判断嵌在循环边界，后续引入不同压缩策略时耦合较高 | 独立 compact node、条件边、checkpoint | 压缩前后状态可观测；策略更容易灰度和测试；失败回退路径更明确 | 现有 token 预算、摘要模型和图片保留策略 |
+| 运行状态可观测性 | 当前事件以模型/工具流为主，缺少统一节点级生命周期 | `updates`、`custom`、`debug` stream | 可看到节点进入、状态更新和暂停点；更容易定位长任务卡点和失败阶段 | RuntimeEvent、指标、脱敏与 SSE 适配 |
+| 多流程复用 | 训练、推理、诊断、报告等流程若继续写条件分支，会重复编排代码 | Subgraph、共享节点、显式输入输出 State | 公共审批、模型、工具和恢复节点可复用；业务流程可独立演进 | 子图版本治理和业务边界定义 |
+| 测试与故障注入 | 大循环测试需要构造完整运行，难以稳定覆盖中间状态 | 节点单测、状态快照、指定 checkpoint 恢复 | 可针对单节点、单边和特定恢复点测试；故障注入定位更精确 | saver 合同测试和外部副作用模拟 |
+| 渐进式演进 | 直接替换 Agent 栈风险大 | 普通函数节点、可选 checkpointer、图注册表 | 可以复用 AIoP 模型和工具适配器，按入口/租户灰度；旧 kernel 可保留回退 | feature flag、差异测试和双版本维护窗口 |
+
+总体收益可以归纳为四类：
+
+1. **可维护性**：把大循环拆成有明确输入输出的节点和边；
+2. **可靠性**：通过 checkpoint、pending writes 和 interrupt 获得可恢复执行；
+3. **扩展性**：为子图、多流程和后续多 Agent 提供统一编排模型；
+4. **低迁移风险**：保留 AIoP 已成熟的模型、安全、工具、租户和存储能力，只替换最适合图运行时的部分。
+
+同时需要保持预期准确：LangGraph 不自动提供跨 Pod Lease、租户授权、工具 exactly-once 或外部副作用事务，这些仍由 AIoP AgentRuntime 和 Tool Ledger 负责。
 
 ---
 
