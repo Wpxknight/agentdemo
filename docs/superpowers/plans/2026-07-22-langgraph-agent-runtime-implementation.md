@@ -162,17 +162,17 @@ Co-authored-by: AIOS <noreply@bocloud.com>"
 - Create: `/home/opt/develop/aicoding/aiop/tests/model-gateway.test.ts`
 - Modify: `/home/opt/develop/aicoding/aiop/src/agent/core.ts`
 
-- [ ] **Step 1: 写提示拼装、流式累积、重试和 usage 的失败测试**
+- [x] **Step 1: 写提示拼装、流式累积、重试和 usage 的失败测试**
 
 测试必须断言交互规则、无人值守规则、自定义 system 拼接顺序、thinking signature、失败流丢弃字符数、失败尝试 usage 仍累计。
 
-- [ ] **Step 2: 运行定向测试确认新服务不存在**
+- [x] **Step 2: 运行定向测试确认新服务不存在**
 
 Run: `npm test -- tests/model-gateway.test.ts`
 
 Expected: FAIL，模块或导出不存在。
 
-- [ ] **Step 3: 移动现有逻辑到服务并保持返回结构**
+- [x] **Step 3: 移动现有逻辑到服务并保持返回结构**
 
 ```ts
 export interface ModelTurn {
@@ -186,13 +186,13 @@ export interface ModelTurn {
 
 `core.ts` 仅调用服务，不改变事件产生时机和重试上限。
 
-- [ ] **Step 4: 运行行为契约、类型检查和全量测试**
+- [x] **Step 4: 运行行为契约、类型检查和全量测试**
 
 Run: `npm test -- tests/model-gateway.test.ts tests/agent-behavior-v1.test.ts && npm run typecheck && npm test`
 
 Expected: 全部通过。
 
-- [ ] **Step 5: 提交服务提取**
+- [x] **Step 5: 提交服务提取**
 
 ```bash
 git add src/agent/core.ts src/agent/services/prompt.ts src/agent/services/model-gateway.ts tests/model-gateway.test.ts
