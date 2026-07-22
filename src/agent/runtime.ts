@@ -3,6 +3,7 @@ import type { AgentKernel, AgentKernelName } from './kernel.js';
 import { LegacyAgentKernel } from './legacy-kernel.js';
 import { LangGraphAgentKernel } from './langgraph/kernel.js';
 import { logger } from '../logger.js';
+import type { BaseCheckpointSaver } from '@langchain/langgraph-checkpoint';
 
 export interface AgentRuntimeOptions {
   kernel?: AgentKernel;
@@ -32,7 +33,10 @@ export function resolveAgentRuntime(runtime?: AgentRuntime): AgentRuntime {
   return runtime ?? defaultAgentRuntime;
 }
 
-export function createConfiguredAgentRuntime(env: NodeJS.ProcessEnv = process.env): AgentRuntime {
+export function createConfiguredAgentRuntime(
+  env: NodeJS.ProcessEnv = process.env,
+  options: { checkpointer?: BaseCheckpointSaver } = {},
+): AgentRuntime {
   const configured = env.AIOP_AGENT_KERNEL?.trim().toLowerCase();
   if (!configured || configured === 'legacy') return new AgentRuntime();
   if (configured !== 'langgraph') {
@@ -40,7 +44,7 @@ export function createConfiguredAgentRuntime(env: NodeJS.ProcessEnv = process.en
     return new AgentRuntime();
   }
   try {
-    return new AgentRuntime({ kernel: new LangGraphAgentKernel() });
+    return new AgentRuntime({ kernel: new LangGraphAgentKernel({ checkpointer: options.checkpointer }) });
   } catch (error) {
     logger.warn({ error: String(error) }, 'LangGraph Kernel 初始化失败，回退 Legacy Kernel');
     return new AgentRuntime();

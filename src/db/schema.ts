@@ -7,6 +7,7 @@ import type { ColumnType, Generated } from 'kysely';
 
 type JsonColumn = ColumnType<unknown, string, string>;
 type NullableJsonColumn = ColumnType<unknown, string | null, string | null>;
+type BinaryColumn = ColumnType<Uint8Array, Uint8Array | Buffer, Uint8Array | Buffer>;
 
 export interface MessagesTable {
   id: Generated<number>;
@@ -116,6 +117,35 @@ export interface SettingSecretsTable {
   updated_at: Generated<Date>;
 }
 
+export interface LangGraphCheckpointsTable {
+  tenant_id: string;
+  thread_id: string;
+  checkpoint_ns: string;
+  checkpoint_id: string;
+  parent_checkpoint_id: string | null;
+  checkpoint_type: string;
+  checkpoint_data: BinaryColumn;
+  metadata_type: string;
+  metadata_data: BinaryColumn;
+  run_id: string;
+  graph_name: string;
+  graph_version: string;
+  expires_at: Date | null;
+  created_at: Date;
+}
+
+export interface LangGraphCheckpointWritesTable {
+  tenant_id: string;
+  thread_id: string;
+  checkpoint_ns: string;
+  checkpoint_id: string;
+  task_id: string;
+  write_index: number;
+  channel: string;
+  value_type: string;
+  value_data: BinaryColumn;
+}
+
 export interface Database {
   sessions: SessionsTable;
   messages: MessagesTable;
@@ -127,4 +157,6 @@ export interface Database {
   user_credentials: UserCredentialsTable;
   tenant_settings: TenantSettingsTable;
   setting_secrets: SettingSecretsTable;
+  langgraph_checkpoints: LangGraphCheckpointsTable;
+  langgraph_checkpoint_writes: LangGraphCheckpointWritesTable;
 }

@@ -4,6 +4,7 @@ import { agentBehaviorV1 } from './agent-behavior-v1.test.js';
 import { ToolRegistry } from '../src/agent/tools.js';
 import { AllowAllPolicy } from '../src/agent/policy.js';
 import type { ChatModel } from '../src/model/types.js';
+import { MemoryCheckpointStore, MysqlCheckpointSaver } from '../src/agent/checkpoint/mysql.js';
 
 agentBehaviorV1('langgraph', () => new LangGraphAgentKernel());
 
@@ -65,5 +66,35 @@ describe('LangGraphAgentKernel', () => {
 
     expect(result.steps).toBe(3);
     expect(result.messages.filter((message) => message.role === 'tool')).toHaveLength(3);
+  });
+
+  it('persists graph super-step checkpoints under the run thread id', async () => {
+    const store = new MemoryCheckpointStore();
+    const saver = new MysqlCheckpointSaver(store);
+    const kernel = new LangGraphAgentKernel({ checkpointer: saver, threadIdFactory: () => 'tenant-a:run-checkpoint' });
+    const model: ChatModel = {
+      id: 'checkpointed',
+      async *stream() {
+        yield { type: 'text_delta', text: 'ok' };
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+
+    await kernel.run({
+      model,
+      tools: new ToolRegistry(),
+      policy: new AllowAllPolicy(),
+      ctx: { sessionId: 'checkpointed', tenantId: 'tenant-a' },
+      task: 'go',
+    });
+
+    const checkpoints = [];
+    for await (const tuple of saver.list({ configurable: { thread_id: 'tenant-a:run-checkpoint' } })) {
+      checkpoints.push(tuple);
+    }
+    expect(checkpoints.length).toBeGreaterThan(1);
+    const persisted = await store.listCheckpoints({ threadId: 'tenant-a:run-checkpoint' });
+    expect(persisted.every((checkpoint) => checkpoint.tenantId === 'tenant-a')).toBe(true);
+    expect(persisted.every((checkpoint) => checkpoint.graphVersion === 'v1')).toBe(true);
   });
 });

@@ -43,6 +43,8 @@ import { LogAuditSink } from './audit/sink.js';
 import type { AuditSink } from './audit/sink.js';
 import { readMysqlConfig } from './config/mysql.js';
 import { createStore } from './db/index.js';
+import { MysqlStore } from './db/mysql.js';
+import { MemoryCheckpointStore, MysqlCheckpointSaver } from './agent/checkpoint/mysql.js';
 import type { LlmSettings, SandboxSettings, Store } from './db/store.js';
 import {
   SandboxSettingsPersistence,
@@ -556,6 +558,9 @@ export async function buildRuntime(
   };
   modelConfig = await resolveRuntimeModelConfig(config, store, DEFAULT_TENANT);
   const model = createModel(modelConfig.id, modelConfig);
+  const checkpointSaver = store instanceof MysqlStore
+    ? store.createCheckpointSaver()
+    : new MysqlCheckpointSaver(new MemoryCheckpointStore());
 
   const publicSandboxState = (): SandboxSettingsState => {
     const catalog = sandboxController.catalogInfo();
@@ -658,7 +663,7 @@ export async function buildRuntime(
   };
 
   const runtime: Runtime = {
-    agentRuntime: createConfiguredAgentRuntime(),
+    agentRuntime: createConfiguredAgentRuntime(process.env, { checkpointer: checkpointSaver }),
     model,
     modelConfig,
     modelOptions,

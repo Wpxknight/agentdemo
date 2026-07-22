@@ -299,27 +299,27 @@ Co-authored-by: AIOS <noreply@bocloud.com>"
 - Create: `/home/opt/develop/aicoding/aiop/tests/mysql-checkpointer.test.ts`
 - Modify: `/home/opt/develop/aicoding/aiop/src/db/mysql.ts`
 
-- [ ] **Step 1: 写 saver 协议、隔离和删除失败测试**
+- [x] **Step 1: 写 saver 协议、隔离和删除失败测试**
 
 覆盖 `getTuple/list/put/putWrites/deleteThread`，主键包含 tenant、run/thread、checkpoint namespace 和 id；列表顺序与 LangGraph saver 协议一致。
 
-- [ ] **Step 2: 运行测试确认表和 saver 不存在**
+- [x] **Step 2: 运行测试确认表和 saver 不存在**
 
 Run: `npm test -- tests/mysql-checkpointer.test.ts`
 
 Expected: FAIL，表或 saver 不存在。
 
-- [ ] **Step 3: 实现 Kysely 表结构和 BaseCheckpointSaver**
+- [x] **Step 3: 实现 Kysely 表结构和 BaseCheckpointSaver**
 
 checkpoint payload 使用 LangGraph serializer；AIoP 额外列保存 `tenant_id/run_id/graph_name/graph_version/expires_at`，不把 session 消息写入 checkpoint。
 
-- [ ] **Step 4: 接入 checkpoint validation 和恢复测试**
+- [x] **Step 4: 接入 checkpoint validation 和恢复测试**
 
 Run: `npm install -D @langchain/langgraph-checkpoint-validation@1.0.4 && npm test -- tests/mysql-checkpointer.test.ts`
 
 Expected: 协议验证和崩溃后恢复测试通过。
 
-- [ ] **Step 5: 运行类型检查和全量测试后提交**
+- [x] **Step 5: 运行类型检查和全量测试后提交**
 
 Run: `npm run typecheck && npm test`
 

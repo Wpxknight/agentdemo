@@ -1,4 +1,5 @@
 import { END, START, StateGraph } from '@langchain/langgraph';
+import type { BaseCheckpointSaver } from '@langchain/langgraph-checkpoint';
 import type { Msg } from '../../model/types.js';
 import type { RunAgentOptions } from '../core.js';
 import { COMPACTION_RETRY_GROWTH_TOKENS } from '../core.js';
@@ -9,7 +10,7 @@ import { buildSystemPrompt } from '../services/prompt.js';
 import { executeToolCalls } from '../services/tool-broker.js';
 import { AgentGraphState, type AgentGraphStateValue } from './state.js';
 
-export function createAgentGraph(options: RunAgentOptions) {
+export function createAgentGraph(options: RunAgentOptions, checkpointer?: BaseCheckpointSaver) {
   const system = buildSystemPrompt(options.system, options.unattended);
   const maxSteps = options.maxSteps ?? Infinity;
 
@@ -107,7 +108,7 @@ export function createAgentGraph(options: RunAgentOptions) {
       return state.continueModel && state.steps < maxSteps ? 'model' : END;
     })
     .addConditionalEdges('tools', (state) => state.continueModel ? 'model' : END)
-    .compile();
+    .compile({ checkpointer });
 }
 
 function addUsage(left: AgentGraphStateValue['usage'], right: AgentGraphStateValue['usage']): AgentGraphStateValue['usage'] {
