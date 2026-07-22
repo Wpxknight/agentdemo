@@ -209,17 +209,17 @@ Co-authored-by: AIOS <noreply@bocloud.com>"
 - Create: `/home/opt/develop/aicoding/aiop/tests/tool-broker.test.ts`
 - Modify: `/home/opt/develop/aicoding/aiop/src/agent/core.ts`
 
-- [ ] **Step 1: 写压缩水位和工具安全顺序失败测试**
+- [x] **Step 1: 写压缩水位和工具安全顺序失败测试**
 
 工具测试必须覆盖 policy block、approval deny、hook deny、独立 `ToolContext`、stdout/stderr、askUser、plan approval、并行结果保持原 call 顺序。
 
-- [ ] **Step 2: 运行测试确认服务不存在**
+- [x] **Step 2: 运行测试确认服务不存在**
 
 Run: `npm test -- tests/tool-broker.test.ts`
 
 Expected: FAIL，模块或导出不存在。
 
-- [ ] **Step 3: 提取现有逻辑并保持接口**
+- [x] **Step 3: 提取现有逻辑并保持接口**
 
 ```ts
 export interface ToolBroker {
@@ -230,13 +230,13 @@ export interface ToolBroker {
 
 `executeBatch()` 可以并行完成，但返回数组顺序必须与模型产生的 `calls` 一致。
 
-- [ ] **Step 4: 运行行为契约、类型检查和全量测试**
+- [x] **Step 4: 运行行为契约、类型检查和全量测试**
 
 Run: `npm test -- tests/tool-broker.test.ts tests/context.test.ts tests/agent-behavior-v1.test.ts && npm run typecheck && npm test`
 
 Expected: 全部通过。
 
-- [ ] **Step 5: 提交服务提取**
+- [x] **Step 5: 提交服务提取**
 
 ```bash
 git add src/agent/core.ts src/agent/services/context-service.ts src/agent/services/tool-broker.ts tests/tool-broker.test.ts

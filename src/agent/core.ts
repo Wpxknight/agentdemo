@@ -1,5 +1,5 @@
-import type { ChatModel, Msg, StreamEvent, ToolCall, ToolContentBlock, ToolDef, ToolResult } from '../model/types.js';
-import { compactMessages, estimateTokens, isUserInputMsg, planCompaction, summaryMessage } from './context.js';
+import type { ChatModel, Msg, StreamEvent, ToolContentBlock, ToolDef } from '../model/types.js';
+import { estimateTokens } from './context.js';
 import type { PolicyMiddleware } from './policy.js';
 import type { ToolContext, ToolRegistry } from './tools.js';
 import type { ApprovalGate } from './approval.js';
@@ -8,6 +8,8 @@ import type { QuestionAnswers, QuestionSpec } from './question.js';
 import type { ChangePlan } from './plan.js';
 import { buildSystemPrompt } from './services/prompt.js';
 import { runModelTurn, type Usage } from './services/model-gateway.js';
+import { compactAtBoundary } from './services/context-service.js';
+import { executeToolCalls } from './services/tool-broker.js';
 
 export { CHAT_SYSTEM_GUARDRAILS, UNATTENDED_SYSTEM_GUARDRAILS } from './services/prompt.js';
 export { MAX_MODEL_RETRIES } from './services/model-gateway.js';
@@ -117,7 +119,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     }
     // 摘要压缩检查点：每个轮次边界都查（含首轮——新任务及附件体积一并计入触发判断），
     // 长 run 中途历史膨胀也能压缩，而不是只靠硬裁剪无摘要地丢弃。
-    if (await maybeCompact(messages, compactionWatermark, opts)) {
+    if (await compactAtBoundary(messages, compactionWatermark, {
+      summarize: opts.summarize,
+      triggerTokens: opts.compactionTriggerTokens,
+      keepRecent: opts.compactionKeepRecent,
+      keepImages: opts.keepImages,
+      signal: opts.signal,
+      onEvent: opts.onEvent,
+    })) {
       compacted = true;
       const afterTokens = estimateTokens(messages);
       // 摘要后仍高于触发线（最近几条本身就很大）：记水位，历史没涨够前不重复摘要。
@@ -162,14 +171,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     }
     throwIfAborted(opts.signal);
 
-    const results = await Promise.all(
-      calls.map(async (call) => {
-        const result = await runOneCall(call, opts);
-        // 工具完成即发事件，供前端实时标记该步完成/失败（并行调用各自完成各自上报）。
-        opts.onEvent?.({ type: 'tool_result', toolId: call.id, name: call.name, isError: Boolean(result.isError) });
-        return result;
-      }),
-    );
+    const results = await executeToolCalls(calls, {
+      tools: opts.tools,
+      policy: opts.policy,
+      ctx: opts.ctx,
+      approval: opts.approval,
+      hooks: opts.hooks,
+      askUser: opts.askUser,
+      requestPlanApproval: opts.requestPlanApproval,
+      signal: opts.signal,
+      onEvent: opts.onEvent,
+    });
     throwIfAborted(opts.signal);
 
     messages.push({ role: 'tool', toolResults: results });
@@ -178,90 +190,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
   return { messages, text: lastText, steps, usage, compacted };
 }
 
-/**
- * 轮次边界的摘要压缩：历史超过触发线（且超过无效压缩水位）时，把较早的消息摘要成一段并原地改写 messages。
- * 成功返回 true 并发 context_compacted 事件；摘要失败/为空返回 false，硬裁剪仍兜底。
- */
-async function maybeCompact(messages: Msg[], watermark: number, opts: RunAgentOptions): Promise<boolean> {
-  if (!opts.summarize || !opts.compactionTriggerTokens) return false;
-  const beforeTokens = estimateTokens(messages);
-  if (beforeTokens <= opts.compactionTriggerTokens || beforeTokens <= watermark) return false;
-  const { stale, recent } = planCompaction(messages, opts.compactionKeepRecent ?? 8);
-  if (!stale.length) return false;
-  try {
-    const summary = (await opts.summarize(stale)).trim();
-    throwIfAborted(opts.signal);
-    if (!summary) return false;
-    // 用户输入永不吞掉：摘要只替代 assistant/tool 轮次，用户消息按原顺序保留在摘要之前
-    // （历史上一轮的摘要消息除外——其内容已并入新摘要）。发送时仍受硬预算截断兜底。
-    const keptUserInputs = stale.filter(isUserInputMsg);
-    // 同步剥离 recent 里较旧的图片：残留大图会让历史始终高于触发线，每轮白跑一次摘要。
-    const next = compactMessages([...keptUserInputs, summaryMessage(summary), ...recent], 0, opts.keepImages ?? 1);
-    messages.splice(0, messages.length, ...next);
-    opts.onEvent?.({
-      type: 'context_compacted',
-      summarizedMessages: stale.length,
-      beforeTokens,
-      afterTokens: estimateTokens(messages),
-    });
-    return true;
-  } catch {
-    throwIfAborted(opts.signal);
-    return false; // 摘要失败不阻断本轮
-  }
-}
-
 async function drainPendingMessages(messages: Msg[], opts: RunAgentOptions): Promise<boolean> {
   const pending = await opts.drainPendingMessages?.();
   if (!pending?.length) return false;
   messages.push(...pending);
   return true;
-}
-
-/** 执行单个工具调用：Policy 校验 → 审批 → dispatch；返回回填给模型的 ToolResult。 */
-async function runOneCall(call: ToolCall, opts: RunAgentOptions): Promise<ToolResult> {
-  throwIfAborted(opts.signal);
-  const decision = await opts.policy.check(call, opts.ctx);
-  throwIfAborted(opts.signal);
-  if (decision.blocked) {
-    return { id: call.id, content: `blocked by policy: ${decision.reason ?? 'denied'}`, isError: true };
-  }
-  if (decision.needApproval) {
-    const approved = opts.approval
-      ? await opts.approval.request({ call, reason: decision.reason, ctx: opts.ctx })
-      : false;
-    if (!approved) {
-      return {
-        id: call.id,
-        content: `needs approval (denied): ${decision.reason ?? '该操作需要审批后才能执行'}`,
-        isError: true,
-      };
-    }
-  }
-  throwIfAborted(opts.signal);
-  // PreToolUse 钩子：策略与审批都放行后、真正 dispatch 前执行；被拒绝则把原因回给模型。
-  if (opts.hooks && !opts.hooks.empty) {
-    const decision = await opts.hooks.preTool(call, opts.ctx);
-    throwIfAborted(opts.signal);
-    if (decision.denied) {
-      return { id: call.id, content: `blocked by hook: ${decision.reason ?? 'denied'}`, isError: true };
-    }
-  }
-  // 为每个工具调用派生独立 ctx，注入按 call.id 归集的实时输出回调，
-  // 供沙箱 stdout/stderr 流式回传到前端（不污染共享 opts.ctx，避免并发串台）。
-  const callCtx: ToolContext = opts.onEvent
-    ? {
-        ...opts.ctx,
-        onOutput: ({ stream, text }) =>
-          opts.onEvent?.({ type: 'tool_output', toolId: call.id, stream, text }),
-        emitEvent: (e) => opts.onEvent?.(e),
-        ...(opts.askUser ? { askUser: opts.askUser } : {}),
-        ...(opts.requestPlanApproval ? { requestPlanApproval: opts.requestPlanApproval } : {}),
-      }
-    : opts.ctx;
-  const result = await opts.tools.dispatch(call, callCtx);
-  throwIfAborted(opts.signal);
-  return result;
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
