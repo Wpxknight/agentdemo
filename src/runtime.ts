@@ -663,7 +663,11 @@ export async function buildRuntime(
   };
 
   const runtime: Runtime = {
-    agentRuntime: createConfiguredAgentRuntime(process.env, { checkpointer: checkpointSaver, bindingStore: store }),
+    agentRuntime: createConfiguredAgentRuntime(process.env, {
+      checkpointer: checkpointSaver,
+      bindingStore: store,
+      runStore: store,
+    }),
     model,
     modelConfig,
     modelOptions,

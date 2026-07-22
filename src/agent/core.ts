@@ -11,6 +11,7 @@ import { buildSystemPrompt } from './services/prompt.js';
 import { runModelTurn, type Usage } from './services/model-gateway.js';
 import { compactAtBoundary } from './services/context-service.js';
 import { executeToolCalls } from './services/tool-broker.js';
+import type { AgentRunLifecycleObserver } from './run-coordinator.js';
 
 export { CHAT_SYSTEM_GUARDRAILS, UNATTENDED_SYSTEM_GUARDRAILS } from './services/prompt.js';
 export { MAX_MODEL_RETRIES } from './services/model-gateway.js';
@@ -89,6 +90,9 @@ export interface RunAgentOptions {
   unattended?: boolean;
   /** 当前运行的取消信号；由 HTTP 终止会话或客户端断开触发。 */
   signal?: AbortSignal;
+  /** Run Center 生命周期观察器与多副本 fencing guard。 */
+  runLifecycle?: AgentRunLifecycleObserver;
+  runGuard?: () => Promise<void>;
 }
 
 export interface RunAgentResult {

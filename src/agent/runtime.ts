@@ -5,7 +5,9 @@ import { LegacyAgentKernel } from './legacy-kernel.js';
 import { LangGraphAgentKernel } from './langgraph/kernel.js';
 import { DEFAULT_AGENT_GRAPH_NAME, DEFAULT_AGENT_GRAPH_VERSION } from './langgraph/registry.js';
 import { logger } from '../logger.js';
-import type { AgentRunBinding } from '../db/store.js';
+import type { AgentRunBinding, Store } from '../db/store.js';
+import { AgentRunCancelledError, AgentRunCoordinator } from './run-coordinator.js';
+import { reqContext } from './tools.js';
 
 export type { AgentRunBinding } from '../db/store.js';
 
@@ -22,6 +24,7 @@ export interface AgentRuntimeOptions {
   selector?: (options: RunAgentOptions) => BuiltinKernelName;
   configuredName?: AgentKernelName;
   bindingStore?: AgentRunBindingStore;
+  runCoordinator?: AgentRunCoordinator;
   graphName?: string;
   graphVersion?: string;
 }
@@ -35,6 +38,7 @@ export class AgentRuntime {
   private readonly bindingStore?: AgentRunBindingStore;
   private readonly graphName: string;
   private readonly graphVersion: string;
+  private readonly runCoordinator?: AgentRunCoordinator;
 
   constructor(options: AgentRuntimeOptions = {}) {
     const defaultKernel = options.kernel ?? options.kernels?.legacy ?? new LegacyAgentKernel();
@@ -47,6 +51,7 @@ export class AgentRuntime {
     this.bindingStore = options.bindingStore;
     this.graphName = options.graphName ?? DEFAULT_AGENT_GRAPH_NAME;
     this.graphVersion = options.graphVersion ?? DEFAULT_AGENT_GRAPH_VERSION;
+    this.runCoordinator = options.runCoordinator;
   }
 
   get kernelName(): AgentKernelName {
@@ -58,7 +63,23 @@ export class AgentRuntime {
     const selected = await this.selectLockedKernel(options);
     const kernel = this.kernels[selected];
     if (!kernel) throw new Error(`Agent Kernel 不可用：${selected}`);
-    return kernel.run(options);
+    if (!options.runId || !this.runCoordinator) return kernel.run(options);
+    const execution = await this.runCoordinator.start(reqContext(options.ctx), options.runId);
+    try {
+      const result = await kernel.run({
+        ...options,
+        runLifecycle: execution,
+        runGuard: () => execution.guard(),
+      });
+      await execution.succeed(result);
+      return result;
+    } catch (error) {
+      const lifecycleError = options.signal?.aborted
+        ? new AgentRunCancelledError(abortMessage(options.signal.reason))
+        : error;
+      await execution.fail(lifecycleError);
+      throw error;
+    }
   }
 
   private async selectLockedKernel(options: RunAgentOptions): Promise<BuiltinKernelName> {
@@ -109,6 +130,7 @@ export function createConfiguredAgentRuntime(
     checkpointer?: BaseCheckpointSaver;
     kernels?: Partial<Record<BuiltinKernelName, AgentKernel>>;
     bindingStore?: AgentRunBindingStore;
+    runStore?: Store;
   } = {},
 ): AgentRuntime {
   const legacy = options.kernels?.legacy ?? new LegacyAgentKernel();
@@ -138,7 +160,13 @@ export function createConfiguredAgentRuntime(
     selector,
     configuredName: effective,
     bindingStore: options.bindingStore,
+    runCoordinator: options.runStore ? new AgentRunCoordinator(options.runStore) : undefined,
   });
+}
+
+function abortMessage(reason: unknown): string {
+  if (reason instanceof Error) return reason.message;
+  return typeof reason === 'string' && reason ? reason : 'Agent run cancelled';
 }
 
 function rolloutSelector(env: NodeJS.ProcessEnv): (options: RunAgentOptions) => BuiltinKernelName {

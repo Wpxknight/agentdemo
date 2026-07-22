@@ -5,6 +5,7 @@ import type { RunAgentOptions, RunAgentResult } from '../src/agent/core.js';
 import { ToolRegistry } from '../src/agent/tools.js';
 import { AllowAllPolicy } from '../src/agent/policy.js';
 import type { AgentRunBinding, AgentRunBindingStore } from '../src/agent/runtime.js';
+import { MemoryStore } from '../src/db/memory.js';
 
 function runOptions(): RunAgentOptions {
   return {
@@ -110,5 +111,32 @@ describe('AgentRuntime', () => {
 
     expect(calls).toEqual(['langgraph', 'langgraph']);
     expect(bindings.get('run-locked')).toMatchObject({ kernel: 'langgraph', graphVersion: 'v1' });
+  });
+
+  it('persists coordinated lifecycle around a real kernel invocation', async () => {
+    const store = new MemoryStore();
+    const result: RunAgentResult = {
+      messages: [], text: 'ok', steps: 2,
+      usage: { inputTokens: 5, outputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      compacted: false,
+    };
+    const runtime = createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'langgraph' }, {
+      kernels: { langgraph: { name: 'langgraph', run: async (options) => {
+        await options.runLifecycle?.nodeStarted('model');
+        await options.runLifecycle?.nodeCompleted('model', { steps: 2 });
+        return result;
+      } } },
+      bindingStore: store,
+      runStore: store,
+    });
+    const options = {
+      ...runOptions(), runId: 'run-coordinated',
+      ctx: { tenantId: 'tenant-a', userId: 'user-a', role: 'user' as const, sessionId: 'session-a' },
+    };
+
+    await expect(runtime.run(options)).resolves.toBe(result);
+    expect(await store.getAgentRun(options.ctx, 'run-coordinated')).toMatchObject({
+      status: 'succeeded', stepCount: 2, usage: { inputTokens: 5, outputTokens: 2 },
+    });
   });
 });
