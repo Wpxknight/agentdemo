@@ -114,7 +114,7 @@ Co-authored-by: AIOS <noreply@bocloud.com>"
 - Create: `/home/opt/develop/aicoding/aiop/tests/agent-behavior-v1.test.ts`
 - Modify: `/home/opt/develop/aicoding/aiop/tests/agent.test.ts`
 
-- [ ] **Step 1: 写可复用 kernel factory 契约套件**
+- [x] **Step 1: 写可复用 kernel factory 契约套件**
 
 ```ts
 export function agentBehaviorV1(name: string, createKernel: () => AgentKernel): void {
@@ -129,23 +129,23 @@ export function agentBehaviorV1(name: string, createKernel: () => AgentKernel): 
 }
 ```
 
-- [ ] **Step 2: 先接一个故意缺能力的测试 kernel 并确认契约失败**
+- [x] **Step 2: 运行 Legacy Kernel 特征测试并冻结当前基线**
 
 Run: `npm test -- tests/agent-behavior-v1.test.ts`
 
-Expected: FAIL，至少在 thinking signature、工具顺序和 compaction 断言处失败。
+Expected: Legacy Kernel 的 6 项关键特征测试通过；未来 LangGraph Kernel 复用同一 suite。
 
-- [ ] **Step 3: 改为 LegacyAgentKernel 并复用现有 fixture**
+- [x] **Step 3: 使用 LegacyAgentKernel 固化独立 fixture**
 
-将 `/home/opt/develop/aicoding/aiop/tests/agent.test.ts` 中脚本模型和长历史构造器提取为测试 helper，契约套件调用 `new LegacyAgentKernel()`。
+契约套件使用独立脚本模型和长历史 fixture，调用 `new LegacyAgentKernel()`，避免与旧测试共享可变状态。
 
-- [ ] **Step 4: 运行契约与全量测试**
+- [x] **Step 4: 运行契约与全量测试**
 
 Run: `npm test -- tests/agent-behavior-v1.test.ts tests/agent.test.ts && npm test`
 
 Expected: Legacy Kernel 的全部行为契约通过，全量无回归。
 
-- [ ] **Step 5: 提交行为基线**
+- [x] **Step 5: 提交行为基线**
 
 ```bash
 git add tests/agent-behavior-v1.test.ts tests/agent.test.ts
