@@ -8,6 +8,7 @@ import type { PolicyMiddleware } from './agent/policy.js';
 import { PermissionRules } from './agent/rules.js';
 import { HookRunner } from './agent/hooks.js';
 import { PlanApprovalState } from './agent/plan.js';
+import { AgentRuntime } from './agent/runtime.js';
 import { SandboxManager, type SandboxManagerLike } from './sandbox/lifecycle.js';
 import {
   SandboxRuntimeController,
@@ -109,6 +110,8 @@ export interface SandboxSettingsUpdate {
 }
 
 export interface Runtime {
+  /** Agent 执行 facade；当前默认使用 Legacy Kernel，后续可切换 LangGraph Kernel。 */
+  agentRuntime: AgentRuntime;
   model: ChatModel;
   modelConfig?: RuntimeModelConfig;
   modelOptions?: RuntimeModelConfig[];
@@ -655,6 +658,7 @@ export async function buildRuntime(
   };
 
   const runtime: Runtime = {
+    agentRuntime: new AgentRuntime(),
     model,
     modelConfig,
     modelOptions,

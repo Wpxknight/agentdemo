@@ -5,7 +5,8 @@ import { resolve } from 'node:path';
 import { SignJWT, jwtVerify } from 'jose';
 import { logger } from '../logger.js';
 import type { Runtime, RuntimeModelConfig } from '../runtime.js';
-import { COMPACTION_RETRY_GROWTH_TOKENS, runAgent } from '../agent/core.js';
+import { COMPACTION_RETRY_GROWTH_TOKENS } from '../agent/core.js';
+import { resolveAgentRuntime } from '../agent/runtime.js';
 import {
   DEFAULT_CONTEXT_WINDOW_TOKENS,
   contextBudgetTokens as budgetForWindow,
@@ -1792,7 +1793,7 @@ async function runAgentSse(
       : '';
     const modelConfig = currentModelConfig(rt);
     const triggerTokens = compactionTriggerTokens(modelConfig);
-    const result = await runAgent({
+    const result = await resolveAgentRuntime(rt.agentRuntime).run({
       model: rt.model,
       tools: rt.tools,
       policy: rt.policy,

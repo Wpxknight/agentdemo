@@ -1,5 +1,5 @@
 import { logger } from '../logger.js';
-import { runAgent } from '../agent/core.js';
+import { resolveAgentRuntime } from '../agent/runtime.js';
 import { estimateCost } from '../model/cost.js';
 import { contextBudgetTokens } from '../agent/context.js';
 import { AutoDenyGate } from '../agent/approval.js';
@@ -47,7 +47,7 @@ async function runScheduledTask(
   const userHomeNote = rt.sandboxSettings?.enabled && rt.userHome
     ? await boundUserHomeNote(rt.store, t.tenantId, t.userId, rt.userHome)
     : '';
-  const result = await runAgent({
+  const result = await resolveAgentRuntime(rt.agentRuntime).run({
     model: rt.model,
     tools: rt.tools,
     policy: t.preApproved ? rt.policyPreApproved : rt.policy,

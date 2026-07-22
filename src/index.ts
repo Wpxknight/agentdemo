@@ -1,6 +1,5 @@
 import { logger } from './logger.js';
 import { loadConfig } from './config/load.js';
-import { runAgent } from './agent/core.js';
 import { buildRuntime } from './runtime.js';
 import { AutoApproveGate } from './agent/approval.js';
 import { createHttpServer } from './server/http.js';
@@ -56,7 +55,7 @@ async function runOnce(config: Config, task: string) {
   const { tenantId, userId, role } = rt.defaultContext;
   const sessionId = 'cli';
   const prior = await rt.store.listMessages(rt.defaultContext, sessionId);
-  const result = await runAgent({
+  const result = await rt.agentRuntime.run({
     model: rt.model,
     tools: rt.tools,
     policy: rt.policy,
