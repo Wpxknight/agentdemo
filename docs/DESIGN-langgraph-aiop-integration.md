@@ -1,9 +1,9 @@
 # LangGraph 与 AIoP 集成最佳方案
 
 > 状态：技术调研与集成设计稿
-> 日期：2026-07-21
+> 日期：2026-07-22
 > 目标仓库：`/home/opt/develop/aicoding/aiop`
-> 调研基线：AIoP `feature/langgraph-dev` / `751ac62`；`@langchain/langgraph` `1.4.8`
+> 调研基线：AIoP `feature/langgraph-dev` / `bddd3dc`；`@langchain/langgraph` `1.4.8`
 
 ---
 
@@ -34,7 +34,9 @@ AIoP 不应直接替换为 LangChain Agent，也不应把 LangSmith Agent Server
 - AIoP `messages` 表是跨 turn 会话历史的唯一事实源；
 - LangGraph checkpoint 是单次 run 的执行恢复数据，不替代会话消息库；
 - Run 成功提交后，checkpoint 按短期保留策略清理；等待审批、失败或需恢复的 run 保留；
-- LangGraph 不直接 dispatch 工具，所有工具仍经过 AIoP Tool Broker。
+- LangGraph 不直接 dispatch 工具，所有工具仍经过 AIoP Tool Broker；
+- 先用统一 `AgentKernel` 封装现有 `runAgent()`，再引入 LangGraph Kernel；
+- 以 `agent-behavior-v1` 功能契约保证 HTTP、CLI、Scheduler、SSE、消息和安全能力不丢失。
 
 ### 1.2 为什么这是最佳方案
 
@@ -65,6 +67,8 @@ LangGraph 正好擅长图编排、持久状态、interrupt、子图、流式更�
 | 多副本协调 | 继续实现 AIoP AgentRuntime/Lease/Fencing；不能只依赖 checkpointer |
 | 可观测性 | 默认 AIoP Audit/日志/指标；LangSmith 仅作为可选开发工具 |
 | 版本策略 | 固定小版本、记录 `graphVersion`、保留旧图直到在途 run 排空 |
+| 兼容策略 | `AgentRuntime + AgentKernel` 稳定接口；Legacy/LangGraph 双内核迁移 |
+| 功能保护 | 冻结 `agent-behavior-v1`，逐项通过功能矩阵后才能扩大灰度 |
 
 ---
 
@@ -479,6 +483,20 @@ START → run_existing_agent → END
 
 同时需要保持预期准确：LangGraph 不自动提供跨 Pod Lease、租户授权、工具 exactly-once 或外部副作用事务，这些仍由 AIoP AgentRuntime 和 Tool Ledger 负责。
 
+### 4.5 自研代码与维护量预估
+
+LangGraph 接入的目标不是让当前仓库立即大幅变小。由于需要新增封装层、MySQL Saver 和安全恢复，第一阶段代码量可能持平或增加。
+
+| 范围 | 预估 |
+|---|---:|
+| 当前可退出/收缩的 runAgent、HTTP 运行协调和进程内等待代码 | 约 500～800 行 |
+| 新增兼容封装、Graph Kernel、MySQL Saver 等 AIoP 代码 | 约 1,200～2,200 行 |
+| 当前仓库净变化 | 约持平到增加 500～1,000 行 |
+| 避免未来自研的图调度、checkpoint、interrupt、pending writes、subgraph 等代码 | 约 2,000～4,000 行 |
+| 避免重复建设的 Runtime 测试代码 | 约 2,000～5,000 行 |
+
+长期收益主要体现为 Agent Runtime 范围减少约 30%～45% 的自研基础设施和维护责任，而不是删除 AIoP 的企业控制面代码。
+
 ---
 
 ## 5. 推荐总体架构
@@ -491,46 +509,274 @@ flowchart TB
     SCH[Scheduler]
   end
 
-  subgraph Control[AIoP 控制面]
+  subgraph Facade[稳定运行入口]
     AR[AgentRuntime]
+    KH[AgentKernel 接口]
+  end
+
+  subgraph Control[AIoP 运行控制面]
     TC[TurnCoordinator]
     LEASE[Session Lease / Fencing]
-    RUNS[Run / Inbox / Interaction Store]
-    SESSION[Session / Message Store]
+    INBOX[Durable Inbox]
+    INTERACTION[Interaction Service]
+    COMMIT[Session Committer]
+    RUNS[Run Repository]
   end
 
-  subgraph Kernel[LangGraph 执行内核]
+  subgraph Kernel[可切换执行内核]
+    LEGACY[LegacyAgentKernel<br/>封装现有 runAgent]
+    LGK[LangGraphAgentKernel]
     REG[Graph Registry]
     GRAPH[AIoP Agent Graph]
-    CP[AIoP MySQL Checkpointer]
   end
 
-  subgraph Broker[AIoP 能力与安全面]
-    MODEL[ChatModel Adapters]
+  subgraph Adapter[兼容与封装层]
+    PROMPT[PromptService]
+    MESSAGE[MessageMapper]
+    CATALOG[ToolCatalogView]
+    MODEL[ModelGateway<br/>封装 ChatModel]
+    CONTEXT[ContextService<br/>封装压缩与预算]
     TOOL[Tool Broker]
-    POLICY[Policy / Approval / Hook]
+    EVENT[EventBridge<br/>StreamEvent / RuntimeEvent / SSE]
+    RESULT[ResultMapper<br/>保持 RunAgentResult 语义]
+  end
+
+  subgraph Capability[AIoP 能力与安全面]
+    PROVIDER[Anthropic / OpenAI Adapter]
+    POLICY[Policy / PermissionRules / Approval / Hook]
     LEDGER[Tool Execution Ledger]
     CAP[ToolRegistry / MCP / Skill / Sandbox]
+  end
+
+  subgraph Persistence[AIoP 持久化]
+    CP[AIoP MySQL Checkpointer]
+    SESSION[Session / Message Store]
+    AUDIT[Audit / Usage / Cost]
   end
 
   HTTP --> AR
   CLI --> AR
   SCH --> AR
   AR --> TC
-  TC --> LEASE
   AR --> RUNS
-  AR --> REG
+  AR --> KH
+  KH --> LEGACY
+  KH --> LGK
+  TC --> LEASE
+  TC --> INBOX
+  AR --> INTERACTION
+  AR --> COMMIT
+  LGK --> REG
   REG --> GRAPH
   GRAPH <--> CP
-  GRAPH --> MODEL
+  LEGACY --> MODEL
+  LEGACY --> PROMPT
+  LEGACY --> MESSAGE
+  LEGACY --> CATALOG
+  LEGACY --> CONTEXT
+  LEGACY --> TOOL
+  LEGACY --> EVENT
+  LEGACY --> RESULT
+  LGK --> MODEL
+  LGK --> PROMPT
+  LGK --> MESSAGE
+  LGK --> CATALOG
+  LGK --> CONTEXT
+  LGK --> TOOL
+  LGK --> EVENT
+  LGK --> RESULT
+  LGK --> INBOX
+  MODEL --> PROVIDER
+  PROMPT --> MODEL
+  MESSAGE --> MODEL
+  CATALOG --> POLICY
+  CATALOG --> CAP
   GRAPH --> TOOL
   TOOL --> POLICY
+  TOOL --> INTERACTION
   TOOL --> LEDGER
   TOOL --> CAP
-  AR --> SESSION
+  RESULT --> AR
+  EVENT --> HTTP
+  COMMIT --> SESSION
+  COMMIT --> AUDIT
+  EVENT --> AUDIT
 ```
 
-### 5.1 关键原则
+### 5.1 架构调整结论
+
+调整后的核心不是让所有入口直接调用 LangGraph，而是在 AIoP 内部建立稳定的运行边界：
+
+```text
+HTTP / CLI / Scheduler
+        ↓
+AgentRuntime
+        ↓
+AgentKernel
+   ├─ LegacyAgentKernel
+   └─ LangGraphAgentKernel
+        ↓
+PromptService / MessageMapper / ModelGateway / ContextService
+ToolCatalogView / ToolBroker / EventBridge / SessionCommitter
+        ↓
+AIoP 现有模型、工具、安全、存储和沙箱能力
+```
+
+这样设计有三个目的：
+
+1. 入口层不感知 LangGraph，避免 HTTP、CLI、Scheduler 分别迁移产生行为差异；
+2. 现有 `runAgent()` 先被封装为 Legacy Kernel，迁移期间始终有可验证、可回退的基线；
+3. LangGraph Node 调用封装后的 AIoP 服务，不复制模型重试、上下文压缩、工具权限和事件映射逻辑。
+
+### 5.2 稳定接口：AgentRuntime 与 AgentKernel
+
+#### AgentRuntime
+
+`AgentRuntime` 是产品运行入口，负责图外的服务端职责：
+
+```ts
+interface AgentRuntime {
+  start(input: AgentRunInput): Promise<AgentRunHandle>;
+  append(ctx: RequestContext, runId: string, input: MessageEnvelope): Promise<void>;
+  cancel(ctx: RequestContext, runId: string, reason?: string): Promise<void>;
+  resume(ctx: RequestContext, runId: string, resolution: InteractionResolution): Promise<void>;
+  getRun(ctx: RequestContext, runId: string): Promise<AgentRunView>;
+  wait(ctx: RequestContext, runId: string): Promise<AgentRunResult>;
+}
+```
+
+它统一处理：
+
+- 可信 `RequestContext`；
+- session/run/turn ID；
+- Lease、Fencing 和同 session 串行；
+- durable inbox；
+- graph/kernel 选择；
+- cancel/resume；
+- 最终消息、duration、usage、cost 和 audit 提交；
+- Runtime Event 发布。
+
+#### AgentKernel
+
+`AgentKernel` 只负责一次 run 内的模型—工具执行，不直接管理 HTTP、租户登录或最终产品事务：
+
+```ts
+interface AgentKernel {
+  readonly kind: 'legacy' | 'langgraph';
+  run(input: KernelRunInput, deps: KernelDependencies): Promise<KernelRunResult>;
+  resume?(input: KernelResumeInput, deps: KernelDependencies): Promise<KernelRunResult>;
+}
+```
+
+两个实现必须返回相同的规范化结果：
+
+- 完整 `messages`；
+- 最后一轮 assistant 文本；
+- steps；
+- usage；
+- compacted；
+- terminal outcome；
+- 待提交的 interaction/recovery 信息。
+
+### 5.3 双内核迁移与回退
+
+| Kernel | 用途 | 生命周期 |
+|---|---|---|
+| `LegacyAgentKernel` | 直接封装现有 `runAgent()`，建立统一接口和行为基线 | LangGraph 全量稳定前保留 |
+| `LangGraphAgentKernel` | 使用 StateGraph、Checkpointer、Interrupt 和 Node 执行 | 逐入口、逐租户灰度 |
+
+建议提供三种配置：
+
+```text
+agent.kernel = legacy
+agent.kernel = langgraph
+agent.kernel = tenant-rule
+```
+
+`tenant-rule` 根据租户、用户角色、入口类型、工具风险或 feature flag 选择内核。已经创建的 run 必须固定 kernel 和 graph version，不能在恢复过程中切换。
+
+生产环境不做会真实执行两次工具的 shadow run。差异验证仅允许：
+
+- Faux Model/Faux Tool 测试；
+- 录制的模型事件与工具结果回放；
+- 纯只读、显式允许重复的测试租户；
+- 对最终消息、事件和 usage 做离线比较。
+
+### 5.4 兼容封装层
+
+| 封装模块 | 封装现有能力 | 迁移价值 | 功能保留要求 |
+|---|---|---|---|
+| `PromptService` | 默认/无人值守规则、Goal Mode、Skill/Sandbox/Home 提示 | 所有入口和 Kernel 共用系统提示装配 | Prompt 内容、顺序和按用户可见性保持 |
+| `MessageMapper` | `Msg`、多模态块、Thinking Block、Graph State | 阻止 LangGraph/LangChain 类型扩散到 Provider 和 Store | 消息顺序、图片和 Thinking Signature 原样保持 |
+| `ToolCatalogView` | ToolRegistry defs、PermissionRules 过滤 | 统一模型可见工具集合 | 被 deny 工具不可见，dispatch 权限仍二次校验 |
+| `ModelGateway` | `ChatModel.stream()`、模型重试、usage 收集 | Legacy 和 LangGraph 共用同一模型行为 | 保留 thinking block/signature、断流回滚、408/429/5xx 重试 |
+| `ContextService` | `compactMessages()`、`maybeCompact()`、token 估算、图片治理 | 避免压缩逻辑复制到 Node | 保留用户输入、最近消息、图片数量、水位和失败兜底 |
+| `ToolBroker` | Policy、Approval、Hook、ToolRegistry dispatch、tool output | 确保任何 Kernel 都不能绕过安全链路 | 保留工具过滤、dry-run diff、ask_user、change-plan 和审计 |
+| `InteractionService` | Approval/Question/Plan 等待 | 将进程内 Promise 改为 durable interaction | 保留现有 API 语义、租户权限、批准/拒绝/回答结果 |
+| `EventBridge` | `StreamEvent`、SSE、RuntimeEvent | 内核事件与前端协议解耦 | 现有 SSE 名称和 payload 第一阶段不变 |
+| `SessionCommitter` | append/replace/touch、duration、usage、cost | 所有入口统一最终事务 | 保留 compaction replace 语义和失败消息落库 |
+| `ResultMapper` | `RunAgentResult` 和终态错误 | 让新内核兼容现有调用方和测试 | 字段、步骤、usage、compacted 含义不变 |
+| `AiopMySqlSaver` | LangGraph `BaseCheckpointSaver` | 将框架 checkpoint 接入 AIoP MySQL | 加密、租户 guard、namespace、pending writes、retention |
+
+封装不是简单转发。每个封装模块必须成为唯一实现点，Legacy Kernel 和 LangGraph Kernel 都只能通过它使用对应能力。
+
+迁移初期 `InteractionService` 可以使用现有 InMemoryApprovalStore/InMemoryQuestionStore 作为 backend adapter；Phase 4 再切换为 durable backend。上层 ToolBroker 和 API adapter 不更换接口，从而把“接口重构”和“持久化语义变化”拆成两步。
+
+### 5.5 Runtime Composition Root 调整
+
+现有 `src/runtime.ts` 继续作为 composition root，但增加 `agentRuntime`，并逐步减少入口层直接拼装 Agent 参数：
+
+```ts
+interface Runtime {
+  agentRuntime: AgentRuntime;
+
+  // 下列能力继续保留，供管理 API、直接工具 API 和内部服务使用
+  model: ChatModel;
+  tools: ToolRegistry;
+  policy: PolicyMiddleware;
+  hooks: HookRunner;
+  store: Store;
+  audit: AuditSink;
+  // sandbox / mcp / skill / auth / credentials ...
+}
+```
+
+调整后：
+
+- `POST /v1/agent` 只调用 `agentRuntime.start()`；
+- `/append`、`/terminate`、审批和提问接口调用 AgentRuntime/InteractionService；
+- CLI 和 Scheduler 不再自行加载历史、调用 `runAgent()`、提交消息；
+- 管理类 API、直接工具调试 API 仍可使用 `Runtime` 中的底层组件；
+- `Runtime.dispose()` 统一关闭 AgentRuntime、MCP、Sandbox 和数据库资源。
+
+### 5.6 依赖方向
+
+必须保持单向依赖：
+
+```text
+server / cli / scheduler
+        ↓
+agent-runtime
+        ↓
+agent-kernel interface
+        ↓
+legacy-kernel | langgraph-kernel
+        ↓
+model-gateway / context-service / tool-broker / event-bridge
+        ↓
+model / agent policy / tools / sandbox / mcp / skill / db
+```
+
+禁止：
+
+- LangGraph Node import `server/http.ts`；
+- Tool Handler import LangGraph 类型；
+- Model Adapter 感知 graph state；
+- Store 根据前端 SSE 类型决定事务；
+- Legacy Kernel 和 LangGraph Kernel 各自实现一份 Policy、Retry 或 Compaction；
+- HTTP 根据 kernel 类型拼装不同业务参数。
+
+### 5.7 关键原则
 
 1. **一个 run 一个权威状态机**：同一 run 不能同时由旧 `runAgent()` 和 LangGraph 执行。
 2. **Host owns authority**：图只能使用宿主注入的可信上下文，不能从 State 中的用户文本恢复身份。
@@ -730,6 +976,74 @@ execute_tool node
 ```
 
 任何 LangGraph tool node 都不能直接调用具体 handler。
+
+### 7.6 Node 与封装服务的关系
+
+LangGraph Node 应保持薄逻辑，只负责读取 State、调用领域服务并返回 State Update：
+
+| Node | 调用的封装服务 | 从现有代码迁移的逻辑 | Node 不应承担 |
+|---|---|---|---|
+| `load_and_validate` | `RunRepository`、`GraphRegistry` | run 状态、版本和 revision 校验 | 认证、查询参数解析 |
+| `drain_inbox` | `TurnCoordinator`、`InboxRepository` | `drainPendingMessages()` 语义 | 跨 Pod 路由实现 |
+| `compact_context` | `ContextService` | `maybeCompact()` 和 hard trim | 自己实现 token/图片算法 |
+| `call_model` | `ModelGateway` | system prompt、retry、thinking、usage、tool defs | 直接访问 Provider SDK |
+| `plan_tool_stages` | `ToolExecutionPlanner` | 当前 `Promise.all()` 的替代规划 | Policy 或 dispatch |
+| `execute_tool` | `ToolBroker` | `runOneCall()` 安全链路 | 直接调用 ToolRegistry/MCP/Sandbox |
+| `interaction` | `InteractionService` | Approval、Question、Plan 等待 | 信任 resume payload 中的身份和 args |
+| `finalize` | `ResultMapper` | `RunAgentResult` 组装 | 直接提交 Session 数据库 |
+
+采用薄 Node 后，Legacy Kernel 也可以逐步改用同一组服务。这样 LangGraph 不是新建第二套 Agent 实现，而是替换流程控制器。
+
+### 7.7 调整后的完整运行链路
+
+```mermaid
+sequenceDiagram
+  participant E as HTTP/CLI/Scheduler
+  participant AR as AgentRuntime
+  participant TC as TurnCoordinator
+  participant K as AgentKernel
+  participant G as LangGraph
+  participant S as AIoP Services
+  participant DB as Store/Checkpointer
+
+  E->>AR: start(verified context + input)
+  AR->>TC: acquire session lease / create run
+  TC->>DB: persist accepted input
+  AR->>K: run(kernel fixed on run)
+  K->>G: invoke(state, runtime context)
+  loop graph nodes
+    G->>S: ModelGateway / ContextService / ToolBroker
+    S-->>G: normalized update + events
+    G->>DB: checkpoint / pending writes
+  end
+  alt waiting interaction
+    G-->>AR: interrupt(interactionId)
+    AR-->>E: approval/question event
+  else terminal
+    G-->>K: KernelRunResult
+    K-->>AR: normalized result
+    AR->>DB: revision + fencing guarded commit
+    AR-->>E: done/error/cancelled
+  end
+```
+
+### 7.8 错误边界
+
+错误按归属处理，避免全部退化为 graph failure：
+
+| 错误类别 | 处理层 | 行为 |
+|---|---|---|
+| 模型网络错误、429、5xx | `ModelGateway` | 保持现有重试和 `model_retry` 事件 |
+| 确定性模型 4xx | `ModelGateway` | 快速失败，不无意义重试 |
+| 摘要失败 | `ContextService` | 保持现有非阻断语义，hard trim 兜底 |
+| Policy/Hook 拒绝 | `ToolBroker` | 返回 ToolResult 错误给模型，不视为 Runtime 崩溃 |
+| 等待审批/提问 | `InteractionService` + graph interrupt | run 进入 waiting 状态，不视为失败 |
+| 工具普通失败 | `ToolBroker` | 保存错误 ToolResult，允许模型决定后续 |
+| 工具副作用状态未知 | `ToolBroker`/Ledger | run 进入 `recovery_required`，禁止自动重放 |
+| Checkpoint 写失败 | `AgentRuntime` | 停止推进后续 Node；收敛已启动工具并保留证据 |
+| Lease/Fencing 丢失 | `TurnCoordinator` | 当前 owner 立即停止写入和提交 |
+| Session revision 冲突 | `SessionCommitter` | 禁止覆盖，进入显式冲突处理 |
+| SSE 断开 | `EventBridge` | 按 DisconnectPolicy 处理，不默认等同业务取消 |
 
 ---
 
@@ -1191,10 +1505,163 @@ leaseGeneration
 
 ---
 
-## 17. 测试策略
+## 17. 功能兼容与零丢失设计
 
-### 17.1 单元测试
+### 17.1 兼容性目标
 
+LangGraph 接入以“现有功能全部保留、对外协议默认不变”为硬约束。第一版定义 `agent-behavior-v1`，Legacy Kernel 和 LangGraph Kernel 都必须满足同一行为契约。
+
+允许的变化只有：
+
+- 内部模块边界调整；
+- 运行状态从进程内变为持久化；
+- 工具并发从无条件并行变为安全规划；
+- 错误和恢复状态更明确；
+- 新增 run/status/resume 等不破坏旧接口的 API。
+
+未经单独产品设计，不允许改变：
+
+- 现有请求字段；
+- 现有 SSE 事件名称和主要 payload；
+- Session/Message 展示语义；
+- Policy、审批和 Hook 顺序；
+- 模型上下文和工具结果顺序；
+- HTTP、CLI、Scheduler 的权限模型。
+
+### 17.2 `runAgent()` 功能保留矩阵
+
+| 当前功能 | 当前实现 | 调整后归属 | 必须保持的行为 |
+|---|---|---|---|
+| 历史消息续接 | `messages` 复制 | `AgentRuntime + SessionService` | 同一 session 历史顺序不变 |
+| 当前任务注入 | `task` 追加 user message | `AgentRuntime` 输入标准化 | 文本和附件组成同一 user message |
+| 图片附件 | `taskContentBlocks` | `MessageMapper` | mime/data 和消息位置不变 |
+| 默认系统规则 | `system` + `CHAT_SYSTEM_GUARDRAILS` | `PromptService` | 调用方系统提示及中文、Todo、审批、汇报规则保持 |
+| 无人值守规则 | `UNATTENDED_SYSTEM_GUARDRAILS` | `PromptService` | Scheduler 不等待在线用户，拒绝后继续汇报 |
+| Goal Mode 提示 | HTTP 拼接系统提示 | `PromptService` | 现有 goal mode 触发和提示保持 |
+| Skill 摘要可见性 | `skillRegistry.summariesFor(ctx)` | `PromptService` | 他人私有 Skill 不进入模型上下文 |
+| Sandbox 服务提示 | HTTP 拼接 | `PromptService` | 启用状态和用户 Home 提示保持 |
+| 步数限制 | `maxSteps` | Graph State + route guard | 缺省不限；无人值守调用方可显式限制 |
+| Pending Message | `drainPendingMessages()` | `TurnCoordinator + drain_inbox node` | 只在模型轮次边界注入；工具执行中不改变当前 batch |
+| 最终前再次检查 Pending | 无 tool call 后再 drain | `drain_final_pending node` | 有新消息则继续调用模型而不是提前结束 |
+| 上下文硬预算 | `compactMessages()` | `ContextService` | 只影响发给模型的请求，不无故丢失 canonical history |
+| 图片历史治理 | `keepImages` | `ContextService` | 保留最近指定数量图片，其余按原策略处理 |
+| 中途摘要 | `summarize` + `compactionTriggerTokens` + `maybeCompact()` | `ContextService + compact node` | 超阈值才摘要，摘要失败不阻断 |
+| 摘要保留窗口 | `compactionKeepRecent` | `ContextService` | 最近消息原样保留数量保持默认值和调用方覆盖能力 |
+| 压缩水位 | `compactionWatermarkTokens` | Run State/Checkpoint | 摘要后仍超限时避免每轮重复白跑摘要 |
+| 用户输入保留 | compaction 保留 user message | `ContextService` | 摘要不能吞掉用户原始输入 |
+| 模型流式输出 | `model.stream()` + `onEvent` | `ModelGateway + EventBridge` | 文本、Thinking、Tool Call 实时输出 |
+| Thinking Signature | `thinkingBlocks` | `ModelGateway/MessageMapper` | Anthropic 跨工具轮次原样回填，避免 400 |
+| Usage 累计 | 跨 attempt/turn 累计 | `ModelGateway + ResultMapper` | 失败重试消耗也计入真实 usage |
+| 模型重试 | `modelRetryDelayMs` + 最多 10 次指数退避 | `ModelGateway` | 无 status、408、429、5xx 重试；确定性 4xx 快速失败；测试可覆盖 delay |
+| 断流回滚 | `model_retry.discard*` | `ModelGateway + EventBridge` | 前端能回滚失败 attempt 的文本、Thinking 和 Tool Call |
+| 工具定义过滤 | `filterToolDefs()` | `ToolCatalogView` | 被无条件 deny 的工具不暴露给模型 |
+| Assistant 消息顺序 | 模型完成后先追加 assistant | `call_model node` | Tool Result 前必须存在对应 assistant tool call message |
+| Policy | `policy.check()` | `ToolBroker` | 先 Policy，blocked 以 ToolResult 返回 |
+| Approval | `ApprovalGate` | `ToolBroker + InteractionService` | needApproval 未批准不得 dispatch |
+| kubectl dry-run diff | HTTP ApprovalGate diff | `ApprovalPresenter/ToolBroker` | 审批信息仍可包含变更预览 |
+| PreToolUse Hook | `hooks.preTool()` | `ToolBroker` | Policy/Approval 后、dispatch 前执行 |
+| Tool dispatch | `tools.dispatch()` | `ToolBroker` | 仍由 AIoP ToolRegistry 执行，不绕过注册表 |
+| 工具实时 stdout/stderr | 每 call 注入 `onOutput` | `ToolBroker + EventBridge` | 按 toolCallId 隔离，禁止并发串台 |
+| 工具结构化事件 | `emitEvent` | `ToolBroker + EventBridge` | Todo、文件导出等事件继续转发 |
+| ask_user | `askUser` ToolContext callback | `InteractionService + interrupt` | 问题结构、答案数组和取消语义保持 |
+| change-plan | `requestPlanApproval` ToolContext callback | `InteractionService + interrupt + PlanApprovalGrant` | 批准后会话内生产变更批量放行语义保持，并可跨进程恢复 |
+| 工具并行 | `Promise.all()` | `ToolExecutionPlanner + graph tasks` | 安全工具保持并行；不安全工具改为正确串行 |
+| 工具结果顺序 | Promise.all 保持输入顺序 | `collect_stage_results` | 无论完成顺序如何，都按模型 tool call 原顺序回填 |
+| 取消 | `AbortSignal` 多边界检查 | `AgentRuntime + Kernel Context` | 模型、等待和工具可收到取消；未知副作用不伪装成安全取消 |
+| 最终返回 | `RunAgentResult` | `ResultMapper` | messages/text/steps/usage/compacted 字段含义不变 |
+
+### 17.3 HTTP/SSE 功能保留矩阵
+
+| 当前能力 | 调整后实现 | 兼容要求 |
+|---|---|---|
+| `POST /v1/agent` | `AgentRuntime.start()` + SSE adapter | 请求 body 和首个 `session` 事件保持 |
+| 同 session 冲突 409 | TurnCoordinator collision policy | 第一阶段 HTTP 行为保持 409 |
+| `/append` | durable inbox | 返回成功前必须确认消息已持久化 |
+| `/terminate` | AgentRuntime.cancel | 保持终止入口；返回状态比当前更精确 |
+| Approval 列表/批准/拒绝 | InteractionService API adapter | 旧 API 在迁移窗口保持可用 |
+| Question 列表/回答 | InteractionService API adapter | 旧 API 和回答结构保持可用 |
+| `text_delta` | EventBridge | 名称和文本增量保持 |
+| `thinking_delta`/`thinking_block` | EventBridge | 展示和签名持久化语义保持 |
+| `tool_call`/`tool_output`/`tool_result` | EventBridge | toolId、name、stream、isError 保持 |
+| `model_retry` | EventBridge | discard 字段保持 |
+| `usage` | EventBridge/SessionCommitter | token 字段保持，最终继续带 context/cost |
+| `context_compacted` | ContextService/EventBridge | before/after/summarizedMessages 保持 |
+| `todo_updated` | ToolBroker/EventBridge | 前端 Todo 渲染不受影响 |
+| `file_exported` | ToolBroker/EventBridge | 下载按钮数据保持 |
+| `stop` | EventBridge | 工具/模型主动停止原因继续透传 |
+| `done` | AgentRuntime | sessionId、steps、text、usage、context、cost 保持 |
+| `terminated` | AgentRuntime | 兼容现有事件；新增 recovery 状态不得误报 terminated |
+| `error` | AgentRuntime | 保持错误事件，内部错误码可扩展 |
+| 断连取消 | DisconnectPolicy | 第一阶段保持当前默认；后续改变需单独产品决策 |
+
+### 17.4 数据与审计功能保留矩阵
+
+| 当前行为 | 调整后归属 | 保留要求 |
+|---|---|---|
+| 未压缩时批量追加消息 | `SessionCommitter.append()` | 一次事务，不能留下不配对的 tool message |
+| 压缩后整体替换历史 | `SessionCommitter.replace()` | 保持摘要后的完整消息序列和 touchSession |
+| 最终 assistant duration | `SessionCommitter` | 只写最后一条 assistant，毫秒含义不变 |
+| 失败/终止时保存已流式文本 | `SessionCommitter.commitFailure()` | 用户输入、已输出文本、Thinking 和 duration 保持 |
+| Context Usage | `SessionCommitter` | used/max/estimated 口径保持 |
+| Cost | `UsageService` | 使用当前模型 pricing，cache token 口径保持 |
+| Usage Audit | `AuditService` | tenant/session/steps/context/cost 字段保持 |
+| Policy Audit | `ToolBroker` | allow/block/approve-required 等行为保持 |
+| Skill/Sandbox 凭据隔离 | 现有服务 | 不进入 graph state/checkpoint 明文 |
+| Session 删除 | Store + Checkpoint Retention | 同时清理或异步清理关联 run/checkpoint，不残留跨租户数据 |
+
+### 17.5 多入口功能保留
+
+| 入口 | 当前差异 | 调整后要求 |
+|---|---|---|
+| HTTP | 交互审批、SSE、append、terminate | 完整保留并支持 durable resume |
+| CLI | 默认身份、AutoApprove、终端输出 | 通过 AgentRuntime 运行，默认行为不变 |
+| Scheduler | unattended、AutoDeny/预批准、超时、TaskRun | 通过 AgentRuntime 运行，不等待用户；任务记录保持 |
+| 直接 Tool API | 可绕过 Agent Loop 调试指定工具 | 不迁移到 LangGraph，继续走现有 Auth/Policy 边界 |
+| 管理 API | LLM/Sandbox/MCP/Skill/User 设置 | 不受 Agent Kernel 切换影响 |
+
+### 17.6 功能保留实施方法
+
+迁移必须按以下顺序，禁止直接删除旧逻辑后重写：
+
+1. **冻结行为基线**：为当前 `runAgent()`、HTTP SSE、CLI、Scheduler 建立 `agent-behavior-v1` 契约测试。
+2. **只提取不改行为**：抽出 ModelGateway、ContextService、ToolBroker、EventBridge、SessionCommitter。
+3. **Legacy Kernel 适配**：让现有 `runAgent()` 通过新接口运行，所有旧测试必须继续通过。
+4. **LangGraph Kernel 实现**：节点只调用同一组封装服务。
+5. **双内核契约测试**：同一录制输入下比较消息序列、事件序列、Tool Result、usage 和终态。
+6. **按入口灰度**：Scheduler → CLI → 测试租户 HTTP → 普通租户 → 高风险工具租户。
+7. **保留回退窗口**：至少跨两个稳定发布版本保留 Legacy Kernel；无在途 legacy run 后再删除。
+
+每项功能的切换条件是：
+
+```text
+功能契约测试通过
++ 故障注入通过
++ 安全审查通过
++ 灰度指标无回归
+= 才允许扩大流量
+```
+
+### 17.7 回退原则
+
+- 新 run 可通过配置回退到 Legacy Kernel；
+- 已经开始或等待恢复的 LangGraph run 必须继续由原 graph version 处理；
+- 不能把 LangGraph checkpoint 临时转换成 Legacy `messages` 后自动重跑副作用工具；
+- 回退不删除 checkpoint、interaction 或 tool ledger；
+- 数据库 schema 先向后兼容，确认无回退需求后再清理旧字段；
+- 出现跨租户、重复副作用、消息错序或审批绕过时立即停止 LangGraph 新流量。
+
+---
+
+## 18. 测试策略
+
+### 18.1 单元测试
+
+- PromptService 默认/无人值守/Goal/Skill/Sandbox/Home 拼装；
+- MessageMapper 文本、图片、Thinking Signature round-trip；
+- ModelGateway retry、usage 和断流 discard；
+- ContextService 摘要、水位、用户输入和图片治理；
+- ToolBroker Policy→Approval→Hook→dispatch 顺序；
+- SessionCommitter append/replace/failure/duration/cost；
 - State reducer 和 schema migration；
 - conditional edge；
 - tool stage planner；
@@ -1204,7 +1671,7 @@ leaseGeneration
 - graph registry/version selection；
 - recovery classification。
 
-### 17.2 Saver 合同测试
+### 18.2 Saver 合同测试
 
 - 官方 validation suite；
 - put/get/list/delete；
@@ -1218,7 +1685,7 @@ leaseGeneration
 - key rotation；
 - retention cleanup。
 
-### 17.3 故障注入
+### 18.3 故障注入
 
 在以下位置 kill 进程：
 
@@ -1237,7 +1704,7 @@ leaseGeneration
 
 验收重点不是“都能自动继续”，而是：不会静默重复副作用、不会跨租户、不会丢失已确认结果、未知状态会明确进入人工恢复。
 
-### 17.4 兼容测试
+### 18.4 兼容测试
 
 - Anthropic thinking blocks 跨工具轮次保持；
 - OpenAI tool call/result 格式保持；
@@ -1245,9 +1712,10 @@ leaseGeneration
 - HTTP SSE 前端零破坏；
 - CLI/Scheduler 输出和审计一致；
 - ask_user/change_plan/approval 重启后可恢复；
-- 旧 `runAgent()` 与 LangGraph shadow 结果差异报告。
+- Legacy Kernel 与 LangGraph Kernel 对同一录制输入的消息、事件、usage 和终态差异报告；
+- 差异测试使用 Faux Tool 或录制回放，禁止生产副作用工具双执行。
 
-### 17.5 性能测试
+### 18.5 性能测试
 
 - 首 token 延迟；
 - 每 super-step MySQL 写放大；
@@ -1260,12 +1728,13 @@ leaseGeneration
 
 ---
 
-## 18. 分阶段落地计划
+## 19. 分阶段落地计划
 
-### Phase 0：技术 Spike（1～2 周）
+### Phase 0：行为基线与技术 Spike（1～2 周）
 
-目标：验证技术兼容，不改生产入口。
+目标：证明 LangGraph 兼容，并冻结现有功能行为。
 
+- 为 `runAgent()`、HTTP SSE、CLI、Scheduler 补齐 `agent-behavior-v1` 契约测试；
 - 引入固定版本依赖；
 - 用 MemorySaver 构建最小图；
 - 将现有 `runAgent()` 暂时包装为单 node；
@@ -1275,44 +1744,62 @@ leaseGeneration
 
 退出标准：
 
-- typecheck/test 通过；
-- 两类模型基本对话与工具调用通过；
-- 证明不需要迁移 LangChain model/tool。
+- 现有测试和行为契约全部通过；
+- 两类模型基本对话、Thinking、图片和工具调用通过；
+- 证明不需要迁移 LangChain model/tool；
+- 明确所有现有 SSE 和持久化口径。
 
-### Phase 1：MySQL Checkpointer（2～3 周）
+### Phase 1：封装服务与 Legacy Kernel（2～4 周）
+
+- 提取 PromptService、ModelGateway、ContextService、ToolBroker；
+- 提取 EventBridge、SessionCommitter、ResultMapper；
+- 定义 AgentRuntime/AgentKernel 接口；
+- 用 `LegacyAgentKernel` 封装现有 `runAgent()`；
+- HTTP、CLI、Scheduler 仍可先走 legacy，但通过统一 AgentRuntime 调用。
+
+退出标准：
+
+- 不改变 prompt、消息、事件、重试和工具安全行为；
+- 所有旧测试通过；
+- 三个入口使用相同运行契约；
+- 可通过配置稳定选择 legacy kernel。
+
+### Phase 2：MySQL Checkpointer 与 Run 基础设施（2～3 周）
 
 - 实现 saver schema、serde、加密；
 - 接入 validation suite；
 - 支持 checkpoint/pending writes/namespace；
 - 增加 retention worker；
-- 建立 run→thread 映射。
+- 建立 run→thread 映射；
+- 完成 RunRepository、基础状态和 graph version 固定。
 
 退出标准：
 
 - saver 合同测试通过；
 - 重启后可从稳定 node 恢复；
-- 跨租户读取测试全部拒绝。
+- 跨租户读取测试全部拒绝；
+- checkpoint 失败不会静默继续执行。
 
-### Phase 2：拆分模型循环（2～4 周）
+### Phase 3：LangGraph Kernel 与模型循环拆分（2～4 周）
 
-- 提取 `compact_context`；
-- 提取 `call_model`；
-- 提取 `plan_tool_stages`；
-- 提取 `execute_tool` 和 `collect`；
+- 实现 `load/inbox/compact/model/finalize` 节点；
+- 节点只调用 Phase 1 提取的封装服务；
 - 保持现有消息和 SSE 协议；
-- 与旧 `runAgent()` 做回归对照。
+- 通过录制回放与 Legacy Kernel 做差异测试；
+- 增加 tenant/entry feature flag。
 
 退出标准：
 
-- 核心 agent 测试迁移；
-- provider 行为一致；
-- 同轮工具结果顺序一致；
-- feature flag 可一键回退。
+- provider、Thinking、图片、usage 行为一致；
+- pending message 和 compaction 语义一致；
+- final/failed/cancelled 消息提交一致；
+- feature flag 可停止 LangGraph 新流量。
 
-### Phase 3：Durable Interaction（2～3 周）
+### Phase 4：Durable Interaction（2～3 周）
 
 - interaction 表和服务；
 - approval/question/change-plan 改为 interrupt；
+- 保留旧 API adapter；
 - resume API；
 - interaction expiry/CAS/audit；
 - 重启恢复。
@@ -1320,9 +1807,10 @@ leaseGeneration
 退出标准：
 
 - Pod 重启后仍可继续审批和提问；
-- 伪造/重复/跨租户回答被拒绝。
+- 伪造、重复、过期和跨租户回答被拒绝；
+- kubectl diff、PlanApprovalState 和原前端字段保持。
 
-### Phase 4：Tool Ledger 与安全并行（3～4 周）
+### Phase 5：Tool Ledger 与安全并行（3～4 周）
 
 - execution metadata；
 - stage planner；
@@ -1335,16 +1823,19 @@ leaseGeneration
 
 - 已完成并行工具不重跑；
 - 非幂等 unknown 工具不自动重放；
-- browser/sandbox/resource 工具顺序正确。
+- browser/sandbox/resource 工具顺序正确；
+- Tool Result 始终按模型调用顺序回填。
 
-### Phase 5：AgentRuntime 多入口迁移（3～5 周）
+### Phase 6：AgentRuntime 多入口迁移（3～5 周）
 
 顺序建议：
 
 1. Scheduler；
 2. CLI；
-3. HTTP 灰度租户；
-4. 全量 HTTP。
+3. 测试租户 HTTP；
+4. 普通租户 HTTP；
+5. 高风险工具租户；
+6. 全量 HTTP。
 
 同时接入：
 
@@ -1353,9 +1844,16 @@ leaseGeneration
 - lease/fencing；
 - final commit；
 - cancel/recovery；
-- status/resume API。
+- status/resume API；
+- 生产指标和自动回退闸门。
 
-### Phase 6：子图与高级能力（后续）
+退出标准：
+
+- 所有入口功能矩阵通过；
+- 无跨租户、消息错序、审批绕过和副作用重放；
+- Legacy Kernel 保留但不再承载默认新流量。
+
+### Phase 7：子图与高级能力（后续）
 
 在基础运行时稳定后再引入：
 
@@ -1371,21 +1869,36 @@ leaseGeneration
 
 ---
 
-## 19. 建议代码结构
+## 20. 建议代码结构与模块优化
 
 ```text
 src/
 ├── agent-runtime/
-│   ├── runtime.ts
-│   ├── coordinator.ts
-│   ├── run-store.ts
-│   ├── interaction.ts
-│   ├── events.ts
+│   ├── types.ts                  # AgentRuntime/Run/Envelope 公共契约
+│   ├── runtime.ts                # start/append/cancel/resume/wait
+│   ├── coordinator.ts            # session 串行、lease、fencing、inbox
+│   ├── kernel.ts                 # AgentKernel 接口
+│   ├── legacy-kernel.ts          # 现有 runAgent 兼容实现
+│   ├── session-committer.ts      # append/replace/duration/usage/cost
+│   ├── interaction-service.ts    # approval/question/change-plan
+│   ├── event-bridge.ts           # StreamEvent/RuntimeEvent/SSE
+│   ├── result-mapper.ts          # KernelResult → 兼容结果
+│   ├── run-repository.ts
 │   └── graph-registry.ts
+├── agent-services/
+│   ├── model-gateway.ts          # 模型流、重试、usage、tool defs
+│   ├── prompt-service.ts         # guardrails/skill/sandbox/home prompt
+│   ├── context-service.ts        # hard trim/summary/image/watermark
+│   ├── message-mapper.ts         # Msg/Graph State 映射
+│   ├── tool-catalog-view.ts      # 权限过滤和稳定工具定义
+│   ├── tool-broker.ts            # policy/approval/hook/dispatch
+│   ├── tool-planner.ts           # parallel/serial/resource stage
+│   ├── tool-ledger.ts            # started/completed/unknown
+│   └── usage-service.ts          # context/cost/audit 口径
 ├── langgraph/
 │   ├── state-v1.ts
 │   ├── graph-v1.ts
-│   ├── context.ts
+│   ├── kernel.ts                 # LangGraphAgentKernel
 │   ├── nodes/
 │   │   ├── load.ts
 │   │   ├── inbox.ts
@@ -1394,6 +1907,7 @@ src/
 │   │   ├── tool-plan.ts
 │   │   ├── tool-execute.ts
 │   │   ├── tool-collect.ts
+│   │   ├── interaction.ts
 │   │   └── finalize.ts
 │   └── checkpoint/
 │       ├── mysql-saver.ts
@@ -1401,19 +1915,158 @@ src/
 │       ├── schema.ts
 │       └── retention.ts
 ├── agent/
-│   ├── tool-broker.ts
-│   ├── tool-planner.ts
-│   ├── tool-ledger.ts
-│   └── ... existing policy/hooks/tools
+│   ├── core.ts                   # 迁移期保留；最终只留兼容 facade 或删除
+│   ├── context.ts                # 算法迁入 ContextService 后可保留纯函数
+│   └── ... existing policy/hooks/tools/approval/question
+├── runtime/
+│   ├── build-runtime.ts          # composition root
+│   ├── build-model-services.ts
+│   ├── build-tool-services.ts
+│   ├── build-sandbox-services.ts
+│   └── build-agent-runtime.ts
 └── server/
+    ├── http.ts                   # server bootstrap + route dispatch
+    ├── routes/
+    │   ├── agent.ts
+    │   ├── interactions.ts
+    │   ├── sessions.ts
+    │   ├── tools.ts
+    │   └── settings.ts
     └── runtime-sse-adapter.ts
 ```
 
-`src/agent/core.ts` 在迁移期保留，最终变成兼容 facade 或删除。不要让新图节点继续反向调用完整 `runAgent()`。
+### 20.1 `src/agent/core.ts` 优化
+
+当前 `core.ts` 同时包含：
+
+- 系统规则；
+- 模型重试；
+- 上下文调度；
+- Agent 循环；
+- 工具安全执行；
+- pending message；
+- 事件和 usage 聚合。
+
+建议先做无行为变化拆分：
+
+| 当前逻辑 | 目标模块 |
+|---|---|
+| `CHAT_SYSTEM_GUARDRAILS`、无人值守提示 | `PromptService` |
+| retry/backoff、stream 收集、usage | `ModelGateway` |
+| `maybeCompact()`、hard trim | `ContextService` |
+| `runOneCall()` | `ToolBroker` |
+| `Promise.all()` | `ToolExecutionPlanner`；Legacy Kernel 初期可保留原行为 |
+| 主 while 循环 | Legacy Kernel；随后由 LangGraph Kernel 替代 |
+
+提取过程中不得顺带修改 prompt、重试次数、事件顺序或错误文案，避免“重构 + 行为变化”无法定位回归。
+
+### 20.2 `src/runtime.ts` 优化
+
+`src/runtime.ts` 继续保留公开 `Runtime` 接口和 `buildRuntime()` 入口，但内部按领域 builder 拆分：
+
+- Model/Auth/Store 基础服务；
+- Tool/MCP/Skill；
+- Sandbox generation；
+- AgentRuntime；
+- dispose lifecycle。
+
+`buildRuntime()` 只做装配顺序和最终对象返回。这样减少 700+ 行 composition root 中的交叉状态，同时不会影响现有测试和启动入口。
+
+### 20.3 `src/server/http.ts` 优化
+
+HTTP 文件应变薄，但路由和响应协议不改变：
+
+- Agent SSE、append、terminate 移入 `routes/agent.ts`；
+- Approval/Question/Plan 移入 `routes/interactions.ts`；
+- Session 路由移入 `routes/sessions.ts`；
+- MCP/Skill/Tool/Sandbox 调试路由按领域拆分；
+- `http.ts` 只负责 server 初始化、认证前置和 route dispatch。
+
+Agent route 不再持有 `ActiveAgentRuns`、InMemoryApprovalStore、InMemoryQuestionStore 或 compaction watermark Map；这些状态迁入 AgentRuntime/InteractionService/Checkpoint。
+
+### 20.4 Store 接口优化
+
+现有 `Store` 对外兼容保留，但内部可以按能力拆成小接口：
+
+```ts
+type AgentRuntimeStore =
+  SessionStore &
+  RunStore &
+  InboxStore &
+  InteractionStore &
+  ToolLedgerStore &
+  AuditSink;
+```
+
+MemoryStore 和 MySqlStore 继续实现聚合 `Store`，现有调用方无需一次性修改。LangGraph Saver 使用专门的 checkpoint repository，不把框架内部 schema 暴露给普通 Session Store。
+
+### 20.5 Tool 模块优化
+
+`ToolRegistry` 保持工具注册和真实 dispatch，新增元数据但不改变已有 handler 的执行签名：
+
+```ts
+interface ToolHandler {
+  def: ToolDef;
+  execution?: ToolExecutionMetadata;
+  run(args: JsonValue, ctx: ToolContext): Promise<ToolResult>;
+}
+```
+
+兼容策略：
+
+- 已有工具不声明 `execution` 也能继续运行；
+- Legacy Kernel 在迁移初期可维持当前并行行为；
+- LangGraph Kernel 对未声明工具默认 serial；
+- 完成工具审计后逐个声明 parallel/resource；
+- MCP 动态工具默认 non-idempotent + serial，除非管理员配置覆盖。
+
+### 20.6 Model 和消息模块优化
+
+不迁移到 LangChain Message/Model，继续使用 AIoP provider-neutral 类型。新增纯映射层：
+
+- `MessageMapper`：Graph State 与 `Msg` 之间转换；
+- `ModelGateway`：唯一调用 `ChatModel.stream()`；
+- `ToolCatalogView`：按权限生成稳定工具定义列表；
+- `PromptService`：集中生成系统提示。
+
+这样可以避免 LangGraph 类型扩散到 Provider Adapter，同时确保 Anthropic Thinking Signature 和现有多模态格式不丢失。
+
+### 20.7 Interaction 模块优化
+
+现有 Approval/Question 类保留为 API 兼容 adapter，底层改用统一 `InteractionService`：
+
+```text
+approval_required
+question_required
+change_plan_required
+        ↓
+InteractionRecord(kind + schema + authorization + expiry)
+        ↓
+LangGraph interrupt / resume
+```
+
+三类交互共用持久化、CAS、过期、审计和恢复逻辑，但展示 payload 和答案 schema 分开定义，不能为了复用而丢失现有前端字段。
+
+现有 `PlanApprovalState` 的“按 session 批量放行直到会话结束”语义改由持久化 `PlanApprovalGrant` 实现。Grant 至少绑定 tenantId、userId、sessionId、planDigest 和创建时间；Session 删除或显式 clear 时同步失效。迁移后不得因为 Pod 重启而丢失已批准方案，也不得把一个用户的批准复用给同 sessionId 的其他租户或用户。
+
+### 20.8 删除条件
+
+以下旧代码只有满足条件后才能删除：
+
+| 旧模块 | 删除条件 |
+|---|---|
+| `runAgent()` 主循环 | 所有入口完成 LangGraph 灰度，且无 legacy run/rollback 需求 |
+| `ActiveAgentRuns` | append/cancel/lease 全部由 AgentRuntime 接管 |
+| InMemoryApprovalStore | 所有 interaction 已持久化且旧 API adapter 稳定 |
+| InMemoryQuestionStore | question/change-plan 恢复测试通过 |
+| HTTP 内 compaction watermark Map | watermark 已进入 run checkpoint 且兼容测试通过 |
+| CLI/Scheduler 直接 `runAgent()` 调用 | 两入口均通过 AgentRuntime 并通过原测试 |
+
+任何删除都必须发生在功能迁移之后，而不是为了减少代码量提前删除。
 
 ---
 
-## 20. 主要风险与缓解
+## 21. 主要风险与缓解
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
@@ -1426,11 +2079,15 @@ src/
 | 双重消息事实源 | 会话漂移 | session canonical、一个 run 一个 thread、终态事务提交 |
 | 过早引入多 Agent | 复杂度失控 | 首期只迁移单 Agent loop |
 | 迁移期间两套 kernel 行为不同 | 回归风险 | feature flag、shadow/differential tests、入口分期迁移 |
+| Legacy/LangGraph 各复制一套模型和工具逻辑 | 长期行为漂移 | ModelGateway、ContextService、ToolBroker 作为唯一实现点 |
+| 为抽象而抽象导致调用链过深 | 开发和排障成本上升 | 封装只围绕稳定职责；Node 保持薄逻辑；禁止无业务价值 adapter |
+| 过早删除旧模块 | 功能丢失且无法回退 | 按 §20.8 删除条件执行，至少保留两个稳定版本 |
+| 对外 SSE 或消息格式顺手重构 | 前端和历史数据回归 | 第一阶段协议冻结，协议升级独立立项 |
 | LangChain 生态依赖扩大 | 包体/升级风险 | 只引入 langgraph/core，不引入完整 langchain |
 
 ---
 
-## 21. 验收标准
+## 22. 验收标准
 
 生产切换前必须满足：
 
@@ -1438,9 +2095,14 @@ src/
 
 - HTTP、CLI、Scheduler 均可通过 AgentRuntime 运行同一 graph；
 - 现有 Anthropic/OpenAI、MCP、Skill、Sandbox、kubectl 能力保持；
-- SSE 前端无破坏；
+- `agent-behavior-v1` 在 Legacy/LangGraph 两个 Kernel 上全部通过；
+- 文本、Thinking Signature、图片、Goal Mode、Skill 可见性和用户 Home 提示保持；
+- SSE 事件名称、关键 payload、顺序约束和前端渲染无破坏；
+- Pending Message、context compaction、水位和 hard trim 语义保持；
+- Tool Policy、Approval、Hook、stdout/stderr、Todo、文件导出和结果顺序保持；
 - 审批、提问可跨进程重启恢复；
-- pending message 在稳定边界注入。
+- duration、usage、context、cost、失败消息和终止消息持久化口径保持；
+- 直接 Tool API、管理 API、Session API 不受 Kernel 切换影响。
 
 ### 安全
 
@@ -1456,7 +2118,9 @@ src/
 - 故障注入场景结果符合恢复规则；
 - 完成工具不会因兄弟节点失败而重复执行；
 - final commit 使用 revision + fencing；
-- 旧 graph version 在在途 run 排空前可用。
+- 旧 graph version 在在途 run 排空前可用；
+- LangGraph 新流量停止后，Legacy Kernel 可以继续承接新 run；
+- 已开始的 LangGraph run 不因回退而错误转换或重放工具。
 
 ### 运维
 
@@ -1468,7 +2132,7 @@ src/
 
 ---
 
-## 22. 明确不建议做的事
+## 23. 明确不建议做的事
 
 1. 不要把 LangSmith Agent Server 直接放到 AIoP Server 前面取代现有 HTTP/Auth/Store。
 2. 不要为了使用 LangGraph 全量迁移到 LangChain Model/Tool。
@@ -1483,19 +2147,19 @@ src/
 
 ---
 
-## 23. 最终推荐顺序
+## 24. 最终推荐顺序
 
 如果只能先做三件事，建议依次为：
 
-1. **完成 MySQL Checkpointer spike 和合同测试**，先确认最关键的基础设施可行性；
-2. **将 `runAgent()` 拆成 model/tool graph nodes，但保持现有 Tool Broker 和 SSE**；
-3. **实现 durable interaction + tool ledger**，再开始生产灰度。
+1. **冻结 `agent-behavior-v1` 并提取兼容封装层**，先保证现有功能有可验证基线；
+2. **用 Legacy Kernel 统一 HTTP/CLI/Scheduler，再完成 MySQL Checkpointer 和 LangGraph Kernel**；
+3. **实现 durable interaction + tool ledger**，通过差异测试后再开始生产灰度。
 
-这一顺序先验证不可替代的持久化基础，再获得编排收益，最后解决真正影响生产安全的审批和副作用恢复。
+这一顺序先建立“不丢功能”的兼容边界，再引入持久化图执行，最后解决真正影响生产安全的审批和副作用恢复。禁止直接从当前 `runAgent()` 跳到全量 LangGraph 生产实现。
 
 ---
 
-## 24. 参考资料
+## 25. 参考资料
 
 ### LangGraph 官方
 
@@ -1520,6 +2184,6 @@ src/
 
 ---
 
-## 25. 一句话结论
+## 26. 一句话结论
 
 > **把 LangGraph 用作 AIoP 单次 Agent Run 的可持久化图执行内核，而不是新的平台控制面；AIoP 继续掌握身份、租户、会话、工具安全、Lease、副作用恢复和最终数据提交。**
