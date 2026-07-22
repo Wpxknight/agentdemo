@@ -1,6 +1,8 @@
 import type { RunAgentOptions, RunAgentResult } from './core.js';
 import type { AgentKernel, AgentKernelName } from './kernel.js';
 import { LegacyAgentKernel } from './legacy-kernel.js';
+import { LangGraphAgentKernel } from './langgraph/kernel.js';
+import { logger } from '../logger.js';
 
 export interface AgentRuntimeOptions {
   kernel?: AgentKernel;
@@ -28,4 +30,19 @@ export const defaultAgentRuntime = new AgentRuntime();
 
 export function resolveAgentRuntime(runtime?: AgentRuntime): AgentRuntime {
   return runtime ?? defaultAgentRuntime;
+}
+
+export function createConfiguredAgentRuntime(env: NodeJS.ProcessEnv = process.env): AgentRuntime {
+  const configured = env.AIOP_AGENT_KERNEL?.trim().toLowerCase();
+  if (!configured || configured === 'legacy') return new AgentRuntime();
+  if (configured !== 'langgraph') {
+    logger.warn({ configured }, '未知 Agent Kernel，回退 Legacy Kernel');
+    return new AgentRuntime();
+  }
+  try {
+    return new AgentRuntime({ kernel: new LangGraphAgentKernel() });
+  } catch (error) {
+    logger.warn({ error: String(error) }, 'LangGraph Kernel 初始化失败，回退 Legacy Kernel');
+    return new AgentRuntime();
+  }
 }

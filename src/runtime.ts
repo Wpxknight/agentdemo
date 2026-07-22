@@ -8,7 +8,7 @@ import type { PolicyMiddleware } from './agent/policy.js';
 import { PermissionRules } from './agent/rules.js';
 import { HookRunner } from './agent/hooks.js';
 import { PlanApprovalState } from './agent/plan.js';
-import { AgentRuntime } from './agent/runtime.js';
+import { AgentRuntime, createConfiguredAgentRuntime } from './agent/runtime.js';
 import { SandboxManager, type SandboxManagerLike } from './sandbox/lifecycle.js';
 import {
   SandboxRuntimeController,
@@ -658,7 +658,7 @@ export async function buildRuntime(
   };
 
   const runtime: Runtime = {
-    agentRuntime: new AgentRuntime(),
+    agentRuntime: createConfiguredAgentRuntime(),
     model,
     modelConfig,
     modelOptions,

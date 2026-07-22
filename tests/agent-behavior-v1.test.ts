@@ -6,7 +6,7 @@ import { AllowAllPolicy } from '../src/agent/policy.js';
 import { HookRunner } from '../src/agent/hooks.js';
 import type { ChatModel, Msg, StreamEvent } from '../src/model/types.js';
 
-function agentBehaviorV1(name: string, createKernel: () => AgentKernel): void {
+export function agentBehaviorV1(name: string, createKernel: () => AgentKernel): void {
   describe(`agent-behavior-v1: ${name}`, () => {
     it('preserves Anthropic thinking blocks and signatures across a tool turn', async () => {
       const tools = new ToolRegistry();

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AgentRuntime } from '../src/agent/runtime.js';
+import { AgentRuntime, createConfiguredAgentRuntime } from '../src/agent/runtime.js';
 import type { AgentKernel } from '../src/agent/kernel.js';
 import type { RunAgentOptions, RunAgentResult } from '../src/agent/core.js';
 import { ToolRegistry } from '../src/agent/tools.js';
@@ -44,5 +44,11 @@ describe('AgentRuntime', () => {
 
   it('uses the legacy kernel by default', () => {
     expect(new AgentRuntime().kernelName).toBe('legacy');
+  });
+
+  it('selects LangGraph only when explicitly configured and otherwise falls back to legacy', () => {
+    expect(createConfiguredAgentRuntime({}).kernelName).toBe('legacy');
+    expect(createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'langgraph' }).kernelName).toBe('langgraph');
+    expect(createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'unknown' }).kernelName).toBe('legacy');
   });
 });

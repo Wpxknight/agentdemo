@@ -255,33 +255,33 @@ Co-authored-by: AIOS <noreply@bocloud.com>"
 - Create: `/home/opt/develop/aicoding/aiop/src/agent/langgraph/graph.ts`
 - Create: `/home/opt/develop/aicoding/aiop/tests/langgraph-kernel.test.ts`
 
-- [ ] **Step 1: 写单轮、工具循环和 maxSteps 的失败测试**
+- [x] **Step 1: 写单轮、工具循环和 maxSteps 的失败测试**
 
 LangGraph Kernel 必须通过同一 `agent-behavior-v1` 契约，并额外断言一个 AIoP run 使用唯一 `thread_id`。
 
-- [ ] **Step 2: 运行测试确认 LangGraph 内核不存在**
+- [x] **Step 2: 运行测试确认 LangGraph 内核不存在**
 
 Run: `npm test -- tests/langgraph-kernel.test.ts`
 
 Expected: FAIL，模块不存在。
 
-- [ ] **Step 3: 固定依赖并实现最小 StateGraph**
+- [x] **Step 3: 固定依赖并实现最小 StateGraph**
 
 Run: `npm install @langchain/langgraph@1.4.8`
 
 图只包含 `prepare → model → route → tools → model → finish`，节点调用 Tasks 3-4 的 AIoP 服务，不直接调用 LangChain model/tool adapter。
 
-- [ ] **Step 4: 保持 Legacy 为默认并增加显式内核选择**
+- [x] **Step 4: 保持 Legacy 为默认并增加显式内核选择**
 
 仅当 `AIOP_AGENT_KERNEL=langgraph` 时选择 LangGraph；值无效或初始化失败时记录原因并回退 Legacy。默认值仍为 `legacy`。
 
-- [ ] **Step 5: 运行双内核契约、类型检查和全量测试**
+- [x] **Step 5: 运行双内核契约、类型检查和全量测试**
 
 Run: `npm test -- tests/agent-behavior-v1.test.ts tests/langgraph-kernel.test.ts && npm run typecheck && npm test`
 
 Expected: Legacy 与 LangGraph 同时通过契约。
 
-- [ ] **Step 6: 提交最小 LangGraph 内核**
+- [x] **Step 6: 提交最小 LangGraph 内核**
 
 ```bash
 git add package.json package-lock.json src/agent/langgraph tests/langgraph-kernel.test.ts
