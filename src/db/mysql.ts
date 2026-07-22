@@ -18,6 +18,7 @@ import type {
   SessionSummary,
   SessionTouchInput,
   InteractionRecord,
+  AgentRunBinding,
   InteractionKind,
   InteractionStatus,
   ScheduledTask,
@@ -529,6 +530,35 @@ export class MysqlStore implements Store {
       updated_at: record.updatedAt,
     }).where('tenant_id', '=', record.tenantId).where('run_id', '=', record.runId)
       .where('tool_call_id', '=', record.toolCallId).execute();
+  }
+
+  async getAgentRunBinding(tenantId: string, runId: string): Promise<AgentRunBinding | undefined> {
+    const row = await this.db.selectFrom('agent_runs').selectAll()
+      .where('tenant_id', '=', tenantId).where('run_id', '=', runId).executeTakeFirst();
+    return row ? {
+      tenantId: row.tenant_id,
+      runId: row.run_id,
+      userId: row.user_id,
+      sessionId: row.session_id,
+      kernel: row.kernel as AgentRunBinding['kernel'],
+      graphName: row.graph_name,
+      graphVersion: row.graph_version,
+      createdAt: toDate(row.created_at),
+    } : undefined;
+  }
+
+  async putAgentRunBindingIfAbsent(binding: AgentRunBinding): Promise<boolean> {
+    const result = await this.db.insertInto('agent_runs').values({
+      tenant_id: binding.tenantId,
+      run_id: binding.runId,
+      user_id: binding.userId,
+      session_id: binding.sessionId,
+      kernel: binding.kernel,
+      graph_name: binding.graphName,
+      graph_version: binding.graphVersion,
+      created_at: binding.createdAt,
+    }).ignore().executeTakeFirst();
+    return Number(result.numInsertedOrUpdatedRows ?? 0) > 0;
   }
 
   async record(event: AuditEvent): Promise<void> {

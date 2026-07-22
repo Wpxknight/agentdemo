@@ -1834,7 +1834,7 @@ async function runAgentSse(
     const modelConfig = currentModelConfig(rt);
     const triggerTokens = compactionTriggerTokens(modelConfig);
     const agentRuntime = resolveAgentRuntime(rt.agentRuntime);
-    const durableInteractions = agentRuntime.kernelName === 'langgraph' ? {
+    const durableInteractions = {
       create: async (input: { kind: 'approval' | 'question' | 'plan'; toolCallId: string; payload: unknown }) => {
         const id = createHash('sha256')
           .update(`${runId}\0${input.kind}\0${input.toolCallId}`)
@@ -1913,7 +1913,7 @@ async function runAgentSse(
         });
         return approved;
       },
-    } : undefined;
+    };
     const result = await agentRuntime.run({
       runId,
       model: rt.model,

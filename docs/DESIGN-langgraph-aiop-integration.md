@@ -1,9 +1,30 @@
 # LangGraph 与 AIoP 集成最佳方案
 
-> 状态：技术调研与集成设计稿
+> 状态：核心集成已实现（Legacy 默认，可灰度启用 LangGraph）
 > 日期：2026-07-22
 > 目标仓库：`/home/opt/develop/aicoding/aiop`
 > 调研基线：AIoP `feature/langgraph-dev` / `bddd3dc`；`@langchain/langgraph` `1.4.8`
+
+---
+
+## 0. 2026-07-22 实施状态
+
+本仓库已完成本设计中“可切换执行内核”的核心交付：
+
+| 能力 | 实施状态 | 代码位置 |
+|---|---|---|
+| `AgentRuntime + AgentKernel` | 已完成；HTTP、CLI、Scheduler 统一入口 | `src/agent/runtime.ts` |
+| Legacy 行为基线 | 已完成；`agent-behavior-v1` 双内核共用 | `tests/agent-behavior-v1.test.ts` |
+| LangGraph StateGraph | 已完成；`prepare → model ↔ tools → END` | `src/agent/langgraph/` |
+| MySQL Checkpointer | 已完成；官方 validation 716 项通过 | `src/agent/checkpoint/`、migration `0011` |
+| Durable Interaction | 已完成；Approval/Question/Plan 持久化、CAS、过期和身份校验 | `src/agent/interactions/`、migration `0012` |
+| Interrupt / Resume | 已完成；现有 SSE 事件映射到 `interrupt()`，可信决策通过 `Command({ resume })` 恢复 | `src/agent/langgraph/graph.ts`、`src/agent/langgraph/kernel.ts` |
+| Tool Ledger | 已完成；completed 复用，started 未知转 `recovery_required` | `src/agent/tool-ledger/` |
+| SessionCommitter | 已完成；成功、压缩、失败、终止提交语义统一 | `src/agent/services/session-committer.ts` |
+| Run kernel/version 锁定 | 已完成；恢复不随环境变量漂移 | migration `0013`、`src/agent/runtime.ts` |
+| 灰度与安全回退 | 已完成；测试租户、内部用户、只读会话、全工具会话分层 | `src/agent/runtime.ts` |
+
+AIoP 控制面模块没有迁移给 LangGraph：认证/RBAC、Session/Message、Policy、Hook、Audit、Sandbox、MCP、Skill、凭据、Scheduler 和 HTTP/SSE 仍由 AIoP 掌握。
 
 ---
 
@@ -2156,6 +2177,82 @@ LangGraph interrupt / resume
 3. **实现 durable interaction + tool ledger**，通过差异测试后再开始生产灰度。
 
 这一顺序先建立“不丢功能”的兼容边界，再引入持久化图执行，最后解决真正影响生产安全的审批和副作用恢复。禁止直接从当前 `runAgent()` 跳到全量 LangGraph 生产实现。
+
+---
+
+## 24.1 运行配置、灰度与回滚手册
+
+### 内核配置
+
+| 环境变量 | 含义 |
+|---|---|
+| `AIOP_AGENT_KERNEL=legacy` | 新 run 使用 Legacy；默认值 |
+| `AIOP_AGENT_KERNEL=langgraph` | 新 run 全量使用 LangGraph |
+| `AIOP_AGENT_KERNEL=tenant-rule` | 新 run 按下列四层名单选择 |
+| `AIOP_LANGGRAPH_TEST_TENANTS` | 第一层：逗号分隔测试租户 ID |
+| `AIOP_LANGGRAPH_INTERNAL_USERS` | 第二层：逗号分隔内部用户 ID |
+| `AIOP_LANGGRAPH_READ_ONLY_SESSIONS` | 第三层：已由权限策略限制为只读工具的 session ID |
+| `AIOP_LANGGRAPH_FULL_SESSIONS` | 第四层：允许完整工具链的 session ID |
+
+`tenant-rule` 的判断顺序固定为测试租户 → 内部用户 → 只读会话 → 全工具会话；均未命中时使用 Legacy。“只读会话”名单只是灰度选择条件，运维侧仍必须通过 PermissionRules/Policy 实际限制写工具，不能把变量名当作安全边界。
+
+### Run 锁定与恢复
+
+- 每个带 `runId` 的新 run 会在 `agent_runs` 写入 `kernel/graph_name/graph_version`；
+- 相同 `runId` 恢复时先读取该绑定，忽略新的灰度选择结果；
+- tenant/user/session 不匹配时拒绝恢复；
+- 旧 graph version 未注册时显式失败，不允许偷偷切到 Legacy 或最新图；
+- SSE `session` 事件以及 Approval/Question/Plan payload 均带 `runId`；
+- Pod 重启后，客户端先完成原 interaction，再以相同 `sessionId` 和 `resumeInteractionId` 调用 `POST /v1/agent`，服务端从 interaction 读取可信 `runId`，通过 checkpoint + `Command({ resume })` 续跑。
+
+### 安全回滚
+
+1. 把 `AIOP_AGENT_KERNEL` 改为 `legacy` 并滚动重启；
+2. 新 run 立即由 Legacy 承接；
+3. 已绑定 LangGraph 的在途 run 仍按原 kernel/version 恢复，避免跨内核重放工具；
+4. 不删除 `agent_runs`、pending interaction、tool ledger 或未过期 checkpoint；
+5. 等待在途 LangGraph run 完成、终止或人工处置后，再执行过期数据清理。
+
+禁止在运行中捕获任意 LangGraph 错误后自动改用 Legacy 重跑同一 run；模型或工具可能已经产生输出/副作用，这种“自动回退”会制造重复执行。自动回退只用于初始化失败、未知配置和未开始的新流量。
+
+### Checkpoint 清理
+
+Checkpoint 默认保留 24 小时，由 `checkpoint_expires_at` 写入 `langgraph_checkpoints.expires_at`。清理任务应先删 writes、再删 checkpoint；仍有 pending interaction 或 tool status 为 `started/unknown/recovery_required` 的 run 不得自动清理。
+
+推荐清理条件：
+
+```sql
+DELETE w FROM langgraph_checkpoint_writes w
+JOIN langgraph_checkpoints c
+  ON c.tenant_id = w.tenant_id
+ AND c.thread_id = w.thread_id
+ AND c.checkpoint_ns = w.checkpoint_ns
+ AND c.checkpoint_id = w.checkpoint_id
+WHERE c.expires_at < NOW()
+  AND NOT EXISTS (
+    SELECT 1 FROM agent_interactions i
+    WHERE i.tenant_id = c.tenant_id AND i.run_id = c.run_id AND i.status = 'pending'
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM agent_tool_executions t
+    WHERE t.tenant_id = c.tenant_id AND t.run_id = c.run_id
+      AND t.status IN ('started', 'unknown', 'recovery_required')
+  );
+
+DELETE c FROM langgraph_checkpoints c
+WHERE c.expires_at < NOW()
+  AND NOT EXISTS (
+    SELECT 1 FROM agent_interactions i
+    WHERE i.tenant_id = c.tenant_id AND i.run_id = c.run_id AND i.status = 'pending'
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM agent_tool_executions t
+    WHERE t.tenant_id = c.tenant_id AND t.run_id = c.run_id
+      AND t.status IN ('started', 'unknown', 'recovery_required')
+  );
+```
+
+执行清理前应备份并先以 `SELECT` 验证命中范围；生产环境由独立定时任务分批执行，避免大事务和锁表。
 
 ---
 

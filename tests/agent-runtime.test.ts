@@ -4,6 +4,7 @@ import type { AgentKernel } from '../src/agent/kernel.js';
 import type { RunAgentOptions, RunAgentResult } from '../src/agent/core.js';
 import { ToolRegistry } from '../src/agent/tools.js';
 import { AllowAllPolicy } from '../src/agent/policy.js';
+import type { AgentRunBinding, AgentRunBindingStore } from '../src/agent/runtime.js';
 
 function runOptions(): RunAgentOptions {
   return {
@@ -50,5 +51,64 @@ describe('AgentRuntime', () => {
     expect(createConfiguredAgentRuntime({}).kernelName).toBe('legacy');
     expect(createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'langgraph' }).kernelName).toBe('langgraph');
     expect(createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'unknown' }).kernelName).toBe('legacy');
+  });
+
+  it('applies tenant-rule rollout stages in fixed precedence', async () => {
+    const calls: string[] = [];
+    const result: RunAgentResult = {
+      messages: [], text: '', steps: 0,
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      compacted: false,
+    };
+    const kernel = (name: 'legacy' | 'langgraph'): AgentKernel => ({
+      name,
+      run: async () => { calls.push(name); return result; },
+    });
+    const runtime = createConfiguredAgentRuntime({
+      AIOP_AGENT_KERNEL: 'tenant-rule',
+      AIOP_LANGGRAPH_TEST_TENANTS: 'tenant-test',
+      AIOP_LANGGRAPH_INTERNAL_USERS: 'user-internal',
+      AIOP_LANGGRAPH_READ_ONLY_SESSIONS: 'session-ro',
+      AIOP_LANGGRAPH_FULL_SESSIONS: 'session-full',
+    }, { kernels: { legacy: kernel('legacy'), langgraph: kernel('langgraph') } });
+
+    for (const ctx of [
+      { tenantId: 'tenant-test', userId: 'u', sessionId: 's' },
+      { tenantId: 'tenant-x', userId: 'user-internal', sessionId: 's' },
+      { tenantId: 'tenant-x', userId: 'u', sessionId: 'session-ro' },
+      { tenantId: 'tenant-x', userId: 'u', sessionId: 'session-full' },
+      { tenantId: 'tenant-x', userId: 'u', sessionId: 'other' },
+    ]) await runtime.run({ ...runOptions(), ctx });
+
+    expect(calls).toEqual(['langgraph', 'langgraph', 'langgraph', 'langgraph', 'legacy']);
+  });
+
+  it('locks kernel and graph version for a run across runtime reconfiguration', async () => {
+    const bindings = new Map<string, AgentRunBinding>();
+    const bindingStore: AgentRunBindingStore = {
+      getAgentRunBinding: async (_tenantId, runId) => bindings.get(runId),
+      putAgentRunBindingIfAbsent: async (binding) => {
+        if (bindings.has(binding.runId)) return false;
+        bindings.set(binding.runId, binding);
+        return true;
+      },
+    };
+    const calls: string[] = [];
+    const result: RunAgentResult = {
+      messages: [], text: '', steps: 0,
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      compacted: false,
+    };
+    const kernels = {
+      legacy: { name: 'legacy', run: async () => { calls.push('legacy'); return result; } } satisfies AgentKernel,
+      langgraph: { name: 'langgraph', run: async () => { calls.push('langgraph'); return result; } } satisfies AgentKernel,
+    };
+    const first = createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'langgraph' }, { kernels, bindingStore });
+    await first.run({ ...runOptions(), runId: 'run-locked', ctx: { tenantId: 'tenant-a', userId: 'user-a', sessionId: 's' } });
+    const reconfigured = createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'legacy' }, { kernels, bindingStore });
+    await reconfigured.run({ ...runOptions(), runId: 'run-locked', ctx: { tenantId: 'tenant-a', userId: 'user-a', sessionId: 's' } });
+
+    expect(calls).toEqual(['langgraph', 'langgraph']);
+    expect(bindings.get('run-locked')).toMatchObject({ kernel: 'langgraph', graphVersion: 'v1' });
   });
 });

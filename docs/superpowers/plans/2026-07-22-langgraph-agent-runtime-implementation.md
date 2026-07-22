@@ -383,25 +383,25 @@ Co-authored-by: AIOS <noreply@bocloud.com>"
 - Modify: `/home/opt/develop/aicoding/aiop/docs/DESIGN-langgraph-aiop-integration.md`
 - Modify: `/home/opt/develop/aicoding/aiop/src/agent/runtime.ts`
 
-- [ ] **Step 1: 写 Legacy/LangGraph 同输入 parity 测试**
+- [x] **Step 1: 写 Legacy/LangGraph 同输入 parity 测试**
 
 相同脚本模型和工具输入必须得到相同 messages、text、steps、usage、compacted 和事件序列；仅允许 `thread_id/checkpoint` 等内部元数据不同。
 
-- [ ] **Step 2: 加入租户/用户/会话级 feature flag 与自动回退**
+- [x] **Step 2: 加入租户/用户/会话级 feature flag 与自动回退**
 
 灰度顺序固定为测试租户 → 内部用户 → 只读工具会话 → 全工具会话；运行开始后锁定 kernel 和 graphVersion，不在同一个 run 中切换。
 
-- [ ] **Step 3: 执行完整验证矩阵**
+- [x] **Step 3: 执行完整验证矩阵**
 
 Run: `npm run typecheck && npm test`
 
 Expected: 类型检查退出码 0；全部测试通过。
 
-- [ ] **Step 4: 更新设计文档实施状态和回滚手册**
+- [x] **Step 4: 更新设计文档实施状态和回滚手册**
 
 文档必须记录环境变量、灰度规则、checkpoint 清理、失败恢复、禁用 LangGraph 后 Legacy 回退步骤，以及未迁移的控制面模块。
 
-- [ ] **Step 5: 提交最终验收结果**
+- [x] **Step 5: 提交最终验收结果**
 
 ```bash
 git add src/agent/runtime.ts tests/agent-kernel-parity.test.ts docs/DESIGN-langgraph-aiop-integration.md

@@ -110,6 +110,17 @@ export interface ToolExecutionRecord {
   updatedAt: Date;
 }
 
+export interface AgentRunBinding {
+  tenantId: string;
+  userId: string;
+  sessionId: string;
+  runId: string;
+  kernel: 'legacy' | 'langgraph';
+  graphName: string;
+  graphVersion: string;
+  createdAt: Date;
+}
+
 /** 审计查询过滤（租户由 ctx 强制限定）。 */
 export interface AuditFilter {
   sessionId?: string;
@@ -230,6 +241,8 @@ export interface Store extends AuditSink {
   putToolExecutionIfAbsent(record: ToolExecutionRecord): Promise<boolean>;
   getToolExecution(tenantId: string, runId: string, toolCallId: string): Promise<ToolExecutionRecord | undefined>;
   updateToolExecution(record: ToolExecutionRecord): Promise<void>;
+  getAgentRunBinding(tenantId: string, runId: string): Promise<AgentRunBinding | undefined>;
+  putAgentRunBindingIfAbsent(binding: AgentRunBinding): Promise<boolean>;
 
   // —— 审计 ——（record 来自 AuditSink；event.tenantId 标识归属）
   record(event: AuditEvent): Promise<void>;

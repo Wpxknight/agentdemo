@@ -177,6 +177,17 @@ export interface AgentToolExecutionsTable {
   updated_at: Date;
 }
 
+export interface AgentRunsTable {
+  tenant_id: string;
+  run_id: string;
+  user_id: string;
+  session_id: string;
+  kernel: string;
+  graph_name: string;
+  graph_version: string;
+  created_at: Date;
+}
+
 export interface Database {
   sessions: SessionsTable;
   messages: MessagesTable;
@@ -192,4 +203,5 @@ export interface Database {
   langgraph_checkpoint_writes: LangGraphCheckpointWritesTable;
   agent_interactions: AgentInteractionsTable;
   agent_tool_executions: AgentToolExecutionsTable;
+  agent_runs: AgentRunsTable;
 }

@@ -17,6 +17,7 @@ import type {
   SessionSummary,
   SessionTouchInput,
   InteractionRecord,
+  AgentRunBinding,
   ScheduledTask,
   ScheduledTaskInput,
   ScheduledTaskPatch,
@@ -70,6 +71,7 @@ export class MemoryStore implements Store {
   private mcpServers = new Map<string, Record<string, McpServerConfig>>();
   private interactions = new Map<string, InteractionRecord>();
   private toolExecutions = new Map<string, ToolExecutionRecord>();
+  private agentRunBindings = new Map<string, AgentRunBinding>();
   private taskSeq = 0;
   private runSeq = 0;
   private userSeq = 0;
@@ -272,6 +274,18 @@ export class MemoryStore implements Store {
       toolExecutionKey(record.tenantId, record.runId, record.toolCallId),
       cloneToolExecution(record),
     );
+  }
+
+  async getAgentRunBinding(tenantId: string, runId: string): Promise<AgentRunBinding | undefined> {
+    const binding = this.agentRunBindings.get(`${tenantId}/${runId}`);
+    return binding ? structuredClone(binding) : undefined;
+  }
+
+  async putAgentRunBindingIfAbsent(binding: AgentRunBinding): Promise<boolean> {
+    const key = `${binding.tenantId}/${binding.runId}`;
+    if (this.agentRunBindings.has(key)) return false;
+    this.agentRunBindings.set(key, structuredClone(binding));
+    return true;
   }
 
   async record(event: AuditEvent): Promise<void> {
@@ -547,6 +561,7 @@ export class MemoryStore implements Store {
     this.mcpServers.clear();
     this.interactions.clear();
     this.toolExecutions.clear();
+    this.agentRunBindings.clear();
   }
 }
 
