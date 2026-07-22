@@ -18,6 +18,11 @@ import type {
   SessionTouchInput,
   InteractionRecord,
   AgentRunBinding,
+  AgentRunEvent,
+  AgentRunFilter,
+  AgentRunLease,
+  AgentRunPatch,
+  AgentRunRecord,
   ScheduledTask,
   ScheduledTaskInput,
   ScheduledTaskPatch,
@@ -71,9 +76,11 @@ export class MemoryStore implements Store {
   private mcpServers = new Map<string, Record<string, McpServerConfig>>();
   private interactions = new Map<string, InteractionRecord>();
   private toolExecutions = new Map<string, ToolExecutionRecord>();
-  private agentRunBindings = new Map<string, AgentRunBinding>();
+  private agentRunBindings = new Map<string, AgentRunRecord>();
+  private agentRunEvents: AgentRunEvent[] = [];
   private taskSeq = 0;
   private runSeq = 0;
+  private agentRunEventSeq = 0;
   private userSeq = 0;
 
   // 会话/消息按 (tenant, user) 双重隔离：不同用户的同名 sessionId 互不可见、互不冲突。
@@ -284,8 +291,150 @@ export class MemoryStore implements Store {
   async putAgentRunBindingIfAbsent(binding: AgentRunBinding): Promise<boolean> {
     const key = `${binding.tenantId}/${binding.runId}`;
     if (this.agentRunBindings.has(key)) return false;
-    this.agentRunBindings.set(key, structuredClone(binding));
+    this.agentRunBindings.set(key, {
+      ...structuredClone(binding),
+      status: 'queued',
+      stepCount: 0,
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      updatedAt: new Date(binding.createdAt),
+      leaseToken: 0,
+    });
     return true;
+  }
+
+  async getAgentRun(ctx: RequestContext, runId: string): Promise<AgentRunRecord | undefined> {
+    const record = this.agentRunBindings.get(`${ctx.tenantId}/${runId}`);
+    return record && canReadAgentRun(ctx, record) ? structuredClone(record) : undefined;
+  }
+
+  async listAgentRuns(ctx: RequestContext, filter: AgentRunFilter = {}): Promise<AgentRunRecord[]> {
+    const limit = Math.max(0, filter.limit ?? 50);
+    const offset = Math.max(0, filter.offset ?? 0);
+    return [...this.agentRunBindings.values()]
+      .filter((record) => canReadAgentRun(ctx, record))
+      .filter((record) => !filter.status || record.status === filter.status)
+      .filter((record) => !filter.sessionId || record.sessionId === filter.sessionId)
+      .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime() || b.createdAt.getTime() - a.createdAt.getTime())
+      .slice(offset, offset + limit)
+      .map((record) => structuredClone(record));
+  }
+
+  async countAgentRuns(ctx: RequestContext, filter: AgentRunFilter = {}): Promise<number> {
+    return [...this.agentRunBindings.values()]
+      .filter((record) => canReadAgentRun(ctx, record))
+      .filter((record) => !filter.status || record.status === filter.status)
+      .filter((record) => !filter.sessionId || record.sessionId === filter.sessionId)
+      .length;
+  }
+
+  async updateAgentRun(tenantId: string, runId: string, patch: AgentRunPatch): Promise<boolean> {
+    const key = `${tenantId}/${runId}`;
+    const current = this.agentRunBindings.get(key);
+    if (!current) return false;
+    const next: AgentRunRecord = {
+      ...current,
+      ...(patch.status ? { status: patch.status } : {}),
+      ...(patch.currentNode !== undefined ? { currentNode: patch.currentNode ?? undefined } : {}),
+      ...(patch.stepCount !== undefined ? { stepCount: patch.stepCount } : {}),
+      ...(patch.usage ? { usage: structuredClone(patch.usage) } : {}),
+      ...(patch.errorMessage !== undefined ? { errorMessage: patch.errorMessage ?? undefined } : {}),
+      ...(patch.startedAt !== undefined ? { startedAt: patch.startedAt ?? undefined } : {}),
+      updatedAt: patch.updatedAt ?? new Date(),
+      ...(patch.completedAt !== undefined ? { completedAt: patch.completedAt ?? undefined } : {}),
+      ...(patch.cancelRequestedAt !== undefined ? { cancelRequestedAt: patch.cancelRequestedAt ?? undefined } : {}),
+    };
+    if (patch.clearLease) {
+      next.leaseOwner = undefined;
+      next.leaseExpiresAt = undefined;
+    }
+    this.agentRunBindings.set(key, next);
+    return true;
+  }
+
+  async appendAgentRunEvent(event: AgentRunEvent): Promise<void> {
+    this.agentRunEvents.push(structuredClone({ ...event, id: ++this.agentRunEventSeq }));
+  }
+
+  async listAgentRunEvents(ctx: RequestContext, runId: string): Promise<AgentRunEvent[]> {
+    if (!await this.getAgentRun(ctx, runId)) return [];
+    return this.agentRunEvents
+      .filter((event) => event.tenantId === ctx.tenantId && event.runId === runId)
+      .sort((a, b) => (a.id ?? 0) - (b.id ?? 0))
+      .map((event) => structuredClone(event));
+  }
+
+  async listAgentRunInteractions(ctx: RequestContext, runId: string): Promise<InteractionRecord[]> {
+    if (!await this.getAgentRun(ctx, runId)) return [];
+    return [...this.interactions.values()]
+      .filter((record) => record.tenantId === ctx.tenantId && record.runId === runId)
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+      .map(cloneInteraction);
+  }
+
+  async listAgentRunToolExecutions(ctx: RequestContext, runId: string): Promise<ToolExecutionRecord[]> {
+    if (!await this.getAgentRun(ctx, runId)) return [];
+    return [...this.toolExecutions.values()]
+      .filter((record) => record.tenantId === ctx.tenantId && record.runId === runId)
+      .sort((a, b) => a.startedAt.getTime() - b.startedAt.getTime())
+      .map(cloneToolExecution);
+  }
+
+  async acquireAgentRunLease(
+    tenantId: string, runId: string, ownerId: string, now: Date, ttlMs: number,
+  ): Promise<AgentRunLease | undefined> {
+    const key = `${tenantId}/${runId}`;
+    const current = this.agentRunBindings.get(key);
+    if (!current) return undefined;
+    if (current.leaseOwner && current.leaseExpiresAt && current.leaseExpiresAt.getTime() > now.getTime()) {
+      if (current.leaseOwner !== ownerId) return undefined;
+      current.leaseExpiresAt = new Date(now.getTime() + ttlMs);
+      current.updatedAt = new Date(now);
+      return { ownerId, token: current.leaseToken, expiresAt: new Date(current.leaseExpiresAt) };
+    }
+    current.leaseOwner = ownerId;
+    current.leaseToken += 1;
+    current.leaseExpiresAt = new Date(now.getTime() + ttlMs);
+    current.updatedAt = new Date(now);
+    return { ownerId, token: current.leaseToken, expiresAt: new Date(current.leaseExpiresAt) };
+  }
+
+  async renewAgentRunLease(
+    tenantId: string, runId: string, ownerId: string, token: number, now: Date, ttlMs: number,
+  ): Promise<boolean> {
+    const current = this.agentRunBindings.get(`${tenantId}/${runId}`);
+    if (!current || current.leaseOwner !== ownerId || current.leaseToken !== token) return false;
+    current.leaseExpiresAt = new Date(now.getTime() + ttlMs);
+    current.updatedAt = new Date(now);
+    return true;
+  }
+
+  async assertAgentRunLease(
+    tenantId: string, runId: string, ownerId: string, token: number, now = new Date(),
+  ): Promise<void> {
+    const current = this.agentRunBindings.get(`${tenantId}/${runId}`);
+    if (!current || current.leaseOwner !== ownerId || current.leaseToken !== token
+      || !current.leaseExpiresAt || current.leaseExpiresAt.getTime() <= now.getTime()) {
+      throw new Error('Agent run lease lost');
+    }
+  }
+
+  async releaseAgentRunLease(tenantId: string, runId: string, ownerId: string, token: number): Promise<boolean> {
+    const current = this.agentRunBindings.get(`${tenantId}/${runId}`);
+    if (!current || current.leaseOwner !== ownerId || current.leaseToken !== token) return false;
+    current.leaseOwner = undefined;
+    current.leaseExpiresAt = undefined;
+    current.updatedAt = new Date();
+    return true;
+  }
+
+  async requestAgentRunCancellation(ctx: RequestContext, runId: string, now = new Date()): Promise<boolean> {
+    const current = await this.getAgentRun(ctx, runId);
+    if (!current) return false;
+    return this.updateAgentRun(ctx.tenantId, runId, { cancelRequestedAt: now, updatedAt: now });
+  }
+
+  async isAgentRunCancellationRequested(tenantId: string, runId: string): Promise<boolean> {
+    return Boolean(this.agentRunBindings.get(`${tenantId}/${runId}`)?.cancelRequestedAt);
   }
 
   async record(event: AuditEvent): Promise<void> {
@@ -562,7 +711,14 @@ export class MemoryStore implements Store {
     this.interactions.clear();
     this.toolExecutions.clear();
     this.agentRunBindings.clear();
+    this.agentRunEvents = [];
+    this.agentRunEventSeq = 0;
   }
+}
+
+function canReadAgentRun(ctx: RequestContext, record: AgentRunRecord): boolean {
+  if (record.tenantId !== ctx.tenantId) return false;
+  return ctx.role === 'platform_admin' || ctx.role === 'tenant_admin' || record.userId === ctx.userId;
 }
 
 function cloneInteraction(record: InteractionRecord): InteractionRecord {

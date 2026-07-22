@@ -121,6 +121,74 @@ export interface AgentRunBinding {
   createdAt: Date;
 }
 
+export type AgentRunStatus =
+  | 'queued'
+  | 'running'
+  | 'waiting'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'recovery_required';
+
+export interface AgentRunUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+}
+
+export interface AgentRunRecord extends AgentRunBinding {
+  status: AgentRunStatus;
+  currentNode?: string;
+  stepCount: number;
+  usage: AgentRunUsage;
+  errorMessage?: string;
+  startedAt?: Date;
+  updatedAt: Date;
+  completedAt?: Date;
+  cancelRequestedAt?: Date;
+  leaseOwner?: string;
+  leaseToken: number;
+  leaseExpiresAt?: Date;
+}
+
+export interface AgentRunPatch {
+  status?: AgentRunStatus;
+  currentNode?: string | null;
+  stepCount?: number;
+  usage?: AgentRunUsage;
+  errorMessage?: string | null;
+  startedAt?: Date | null;
+  updatedAt?: Date;
+  completedAt?: Date | null;
+  cancelRequestedAt?: Date | null;
+  clearLease?: boolean;
+}
+
+export interface AgentRunFilter {
+  status?: AgentRunStatus;
+  sessionId?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface AgentRunEvent {
+  id?: number;
+  tenantId: string;
+  runId: string;
+  type: string;
+  node?: string;
+  status?: string;
+  detail?: unknown;
+  createdAt: Date;
+}
+
+export interface AgentRunLease {
+  ownerId: string;
+  token: number;
+  expiresAt: Date;
+}
+
 /** 审计查询过滤（租户由 ctx 强制限定）。 */
 export interface AuditFilter {
   sessionId?: string;
@@ -243,6 +311,24 @@ export interface Store extends AuditSink {
   updateToolExecution(record: ToolExecutionRecord): Promise<void>;
   getAgentRunBinding(tenantId: string, runId: string): Promise<AgentRunBinding | undefined>;
   putAgentRunBindingIfAbsent(binding: AgentRunBinding): Promise<boolean>;
+  getAgentRun(ctx: RequestContext, runId: string): Promise<AgentRunRecord | undefined>;
+  listAgentRuns(ctx: RequestContext, filter?: AgentRunFilter): Promise<AgentRunRecord[]>;
+  countAgentRuns(ctx: RequestContext, filter?: AgentRunFilter): Promise<number>;
+  updateAgentRun(tenantId: string, runId: string, patch: AgentRunPatch): Promise<boolean>;
+  appendAgentRunEvent(event: AgentRunEvent): Promise<void>;
+  listAgentRunEvents(ctx: RequestContext, runId: string): Promise<AgentRunEvent[]>;
+  listAgentRunInteractions(ctx: RequestContext, runId: string): Promise<InteractionRecord[]>;
+  listAgentRunToolExecutions(ctx: RequestContext, runId: string): Promise<ToolExecutionRecord[]>;
+  acquireAgentRunLease(
+    tenantId: string, runId: string, ownerId: string, now: Date, ttlMs: number,
+  ): Promise<AgentRunLease | undefined>;
+  renewAgentRunLease(
+    tenantId: string, runId: string, ownerId: string, token: number, now: Date, ttlMs: number,
+  ): Promise<boolean>;
+  assertAgentRunLease(tenantId: string, runId: string, ownerId: string, token: number, now?: Date): Promise<void>;
+  releaseAgentRunLease(tenantId: string, runId: string, ownerId: string, token: number): Promise<boolean>;
+  requestAgentRunCancellation(ctx: RequestContext, runId: string, now?: Date): Promise<boolean>;
+  isAgentRunCancellationRequested(tenantId: string, runId: string): Promise<boolean>;
 
   // —— 审计 ——（record 来自 AuditSink；event.tenantId 标识归属）
   record(event: AuditEvent): Promise<void>;

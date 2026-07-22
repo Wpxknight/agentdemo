@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { sql, type Kysely } from 'kysely';
+import { sql, type Kysely, type Selectable } from 'kysely';
 import type { Msg, Role as MsgRole } from '../model/types.js';
 import type { AuditEvent } from '../audit/sink.js';
 import type { RequestContext, Role, Tenant, User } from '../auth/types.js';
@@ -19,6 +19,11 @@ import type {
   SessionTouchInput,
   InteractionRecord,
   AgentRunBinding,
+  AgentRunEvent,
+  AgentRunFilter,
+  AgentRunLease,
+  AgentRunPatch,
+  AgentRunRecord,
   InteractionKind,
   InteractionStatus,
   ScheduledTask,
@@ -104,6 +109,40 @@ function summarize(text: string | undefined, max = 48): string {
 
 function toDate(value: Date | string): Date {
   return value instanceof Date ? value : new Date(String(value));
+}
+
+function toOptionalDate(value: Date | string | null): Date | undefined {
+  return value === null ? undefined : toDate(value);
+}
+
+function toAgentRun(row: Selectable<Database['agent_runs']>): AgentRunRecord {
+  return {
+    tenantId: row.tenant_id,
+    runId: row.run_id,
+    userId: row.user_id,
+    sessionId: row.session_id,
+    kernel: row.kernel as AgentRunBinding['kernel'],
+    graphName: row.graph_name,
+    graphVersion: row.graph_version,
+    status: row.status as AgentRunRecord['status'],
+    currentNode: row.current_node ?? undefined,
+    stepCount: row.step_count,
+    usage: {
+      inputTokens: row.input_tokens,
+      outputTokens: row.output_tokens,
+      cacheReadTokens: row.cache_read_tokens,
+      cacheCreationTokens: row.cache_creation_tokens,
+    },
+    errorMessage: row.error_message ?? undefined,
+    startedAt: toOptionalDate(row.started_at),
+    updatedAt: toDate(row.updated_at),
+    completedAt: toOptionalDate(row.completed_at),
+    cancelRequestedAt: toOptionalDate(row.cancel_requested_at),
+    leaseOwner: row.lease_owner ?? undefined,
+    leaseToken: Number(row.lease_token),
+    leaseExpiresAt: toOptionalDate(row.lease_expires_at),
+    createdAt: toDate(row.created_at),
+  };
 }
 
 /** Msg -> messages.content JSON（含多模态内容块，回读时原样还原）。 */
@@ -556,9 +595,186 @@ export class MysqlStore implements Store {
       kernel: binding.kernel,
       graph_name: binding.graphName,
       graph_version: binding.graphVersion,
+      status: 'queued',
+      current_node: null,
+      step_count: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+      error_message: null,
+      started_at: null,
+      updated_at: binding.createdAt,
+      completed_at: null,
+      cancel_requested_at: null,
+      lease_owner: null,
+      lease_token: 0,
+      lease_expires_at: null,
       created_at: binding.createdAt,
     }).ignore().executeTakeFirst();
     return Number(result.numInsertedOrUpdatedRows ?? 0) > 0;
+  }
+
+  async getAgentRun(ctx: RequestContext, runId: string): Promise<AgentRunRecord | undefined> {
+    let query = this.db.selectFrom('agent_runs').selectAll()
+      .where('tenant_id', '=', ctx.tenantId).where('run_id', '=', runId);
+    if (ctx.role === 'user') query = query.where('user_id', '=', ctx.userId);
+    const row = await query.executeTakeFirst();
+    return row ? toAgentRun(row) : undefined;
+  }
+
+  async listAgentRuns(ctx: RequestContext, filter: AgentRunFilter = {}): Promise<AgentRunRecord[]> {
+    let query = this.db.selectFrom('agent_runs').selectAll().where('tenant_id', '=', ctx.tenantId);
+    if (ctx.role === 'user') query = query.where('user_id', '=', ctx.userId);
+    if (filter.status) query = query.where('status', '=', filter.status);
+    if (filter.sessionId) query = query.where('session_id', '=', filter.sessionId);
+    query = query.orderBy('updated_at', 'desc').orderBy('created_at', 'desc')
+      .limit(Math.max(0, filter.limit ?? 50)).offset(Math.max(0, filter.offset ?? 0));
+    return (await query.execute()).map(toAgentRun);
+  }
+
+  async countAgentRuns(ctx: RequestContext, filter: AgentRunFilter = {}): Promise<number> {
+    let query = this.db.selectFrom('agent_runs').select(({ fn }) => fn.countAll<number>().as('count'))
+      .where('tenant_id', '=', ctx.tenantId);
+    if (ctx.role === 'user') query = query.where('user_id', '=', ctx.userId);
+    if (filter.status) query = query.where('status', '=', filter.status);
+    if (filter.sessionId) query = query.where('session_id', '=', filter.sessionId);
+    const row = await query.executeTakeFirstOrThrow();
+    return Number(row.count);
+  }
+
+  async updateAgentRun(tenantId: string, runId: string, patch: AgentRunPatch): Promise<boolean> {
+    const result = await this.db.updateTable('agent_runs').set({
+      status: patch.status,
+      current_node: patch.currentNode,
+      step_count: patch.stepCount,
+      input_tokens: patch.usage?.inputTokens,
+      output_tokens: patch.usage?.outputTokens,
+      cache_read_tokens: patch.usage?.cacheReadTokens,
+      cache_creation_tokens: patch.usage?.cacheCreationTokens,
+      error_message: patch.errorMessage,
+      started_at: patch.startedAt,
+      updated_at: patch.updatedAt ?? new Date(),
+      completed_at: patch.completedAt,
+      cancel_requested_at: patch.cancelRequestedAt,
+      ...(patch.clearLease ? { lease_owner: null, lease_expires_at: null } : {}),
+    }).where('tenant_id', '=', tenantId).where('run_id', '=', runId).executeTakeFirst();
+    return Number(result.numUpdatedRows ?? 0) > 0;
+  }
+
+  async appendAgentRunEvent(event: AgentRunEvent): Promise<void> {
+    await this.db.insertInto('agent_run_events').values({
+      tenant_id: event.tenantId,
+      run_id: event.runId,
+      event_type: event.type,
+      node_name: event.node ?? null,
+      status: event.status ?? null,
+      detail: event.detail === undefined ? null : JSON.stringify(event.detail),
+      created_at: event.createdAt,
+    }).execute();
+  }
+
+  async listAgentRunEvents(ctx: RequestContext, runId: string): Promise<AgentRunEvent[]> {
+    if (!await this.getAgentRun(ctx, runId)) return [];
+    const rows = await this.db.selectFrom('agent_run_events').selectAll()
+      .where('tenant_id', '=', ctx.tenantId).where('run_id', '=', runId).orderBy('id', 'asc').execute();
+    return rows.map((row) => ({
+      id: Number(row.id), tenantId: row.tenant_id, runId: row.run_id, type: row.event_type,
+      node: row.node_name ?? undefined, status: row.status ?? undefined,
+      detail: parseJson(row.detail), createdAt: toDate(row.created_at),
+    }));
+  }
+
+  async listAgentRunInteractions(ctx: RequestContext, runId: string): Promise<InteractionRecord[]> {
+    if (!await this.getAgentRun(ctx, runId)) return [];
+    const rows = await this.db.selectFrom('agent_interactions').selectAll()
+      .where('tenant_id', '=', ctx.tenantId).where('run_id', '=', runId).orderBy('created_at', 'asc').execute();
+    return rows.map((row) => ({
+      id: row.id, tenantId: row.tenant_id, userId: row.user_id, sessionId: row.session_id, runId: row.run_id,
+      kind: row.kind as InteractionKind, toolCallId: row.tool_call_id ?? undefined, payload: parseJson(row.payload),
+      status: row.status as InteractionStatus, resolution: row.resolution === null ? undefined : parseJson(row.resolution),
+      resolvedBy: row.resolved_by ?? undefined, expiresAt: toDate(row.expires_at), createdAt: toDate(row.created_at),
+      resolvedAt: row.resolved_at ? toDate(row.resolved_at) : undefined,
+    }));
+  }
+
+  async listAgentRunToolExecutions(ctx: RequestContext, runId: string): Promise<ToolExecutionRecord[]> {
+    if (!await this.getAgentRun(ctx, runId)) return [];
+    const rows = await this.db.selectFrom('agent_tool_executions').selectAll()
+      .where('tenant_id', '=', ctx.tenantId).where('run_id', '=', runId).orderBy('started_at', 'asc').execute();
+    return rows.map((row) => ({
+      tenantId: row.tenant_id, runId: row.run_id, sessionId: row.session_id,
+      toolCallId: row.tool_call_id, toolName: row.tool_name, argsDigest: row.args_digest,
+      status: row.status as ToolExecutionStatus,
+      result: row.result === null ? undefined : parseJson(row.result) as ToolExecutionRecord['result'],
+      startedAt: toDate(row.started_at), completedAt: row.completed_at ? toDate(row.completed_at) : undefined,
+      updatedAt: toDate(row.updated_at),
+    }));
+  }
+
+  async acquireAgentRunLease(
+    tenantId: string, runId: string, ownerId: string, now: Date, ttlMs: number,
+  ): Promise<AgentRunLease | undefined> {
+    return this.db.transaction().execute(async (transaction) => {
+      const row = await transaction.selectFrom('agent_runs').selectAll()
+        .where('tenant_id', '=', tenantId).where('run_id', '=', runId).forUpdate().executeTakeFirst();
+      if (!row) return undefined;
+      const expiresAt = row.lease_expires_at ? toDate(row.lease_expires_at) : undefined;
+      if (row.lease_owner && expiresAt && expiresAt.getTime() > now.getTime() && row.lease_owner !== ownerId) {
+        return undefined;
+      }
+      const token = row.lease_owner === ownerId && expiresAt && expiresAt.getTime() > now.getTime()
+        ? Number(row.lease_token)
+        : Number(row.lease_token) + 1;
+      const nextExpiry = new Date(now.getTime() + ttlMs);
+      await transaction.updateTable('agent_runs').set({
+        lease_owner: ownerId, lease_token: token, lease_expires_at: nextExpiry, updated_at: now,
+      }).where('tenant_id', '=', tenantId).where('run_id', '=', runId).execute();
+      return { ownerId, token, expiresAt: nextExpiry };
+    });
+  }
+
+  async renewAgentRunLease(
+    tenantId: string, runId: string, ownerId: string, token: number, now: Date, ttlMs: number,
+  ): Promise<boolean> {
+    const result = await this.db.updateTable('agent_runs').set({
+      lease_expires_at: new Date(now.getTime() + ttlMs), updated_at: now,
+    }).where('tenant_id', '=', tenantId).where('run_id', '=', runId)
+      .where('lease_owner', '=', ownerId).where('lease_token', '=', token).executeTakeFirst();
+    return Number(result.numUpdatedRows ?? 0) > 0;
+  }
+
+  async assertAgentRunLease(
+    tenantId: string, runId: string, ownerId: string, token: number, now = new Date(),
+  ): Promise<void> {
+    const row = await this.db.selectFrom('agent_runs').select(['lease_owner', 'lease_token', 'lease_expires_at'])
+      .where('tenant_id', '=', tenantId).where('run_id', '=', runId).executeTakeFirst();
+    if (!row || row.lease_owner !== ownerId || Number(row.lease_token) !== token
+      || !row.lease_expires_at || toDate(row.lease_expires_at).getTime() <= now.getTime()) {
+      throw new Error('Agent run lease lost');
+    }
+  }
+
+  async releaseAgentRunLease(tenantId: string, runId: string, ownerId: string, token: number): Promise<boolean> {
+    const result = await this.db.updateTable('agent_runs').set({
+      lease_owner: null, lease_expires_at: null, updated_at: new Date(),
+    }).where('tenant_id', '=', tenantId).where('run_id', '=', runId)
+      .where('lease_owner', '=', ownerId).where('lease_token', '=', token).executeTakeFirst();
+    return Number(result.numUpdatedRows ?? 0) > 0;
+  }
+
+  async requestAgentRunCancellation(ctx: RequestContext, runId: string, now = new Date()): Promise<boolean> {
+    let query = this.db.updateTable('agent_runs').set({ cancel_requested_at: now, updated_at: now })
+      .where('tenant_id', '=', ctx.tenantId).where('run_id', '=', runId);
+    if (ctx.role === 'user') query = query.where('user_id', '=', ctx.userId);
+    const result = await query.executeTakeFirst();
+    return Number(result.numUpdatedRows ?? 0) > 0;
+  }
+
+  async isAgentRunCancellationRequested(tenantId: string, runId: string): Promise<boolean> {
+    const row = await this.db.selectFrom('agent_runs').select('cancel_requested_at')
+      .where('tenant_id', '=', tenantId).where('run_id', '=', runId).executeTakeFirst();
+    return Boolean(row?.cancel_requested_at);
   }
 
   async record(event: AuditEvent): Promise<void> {

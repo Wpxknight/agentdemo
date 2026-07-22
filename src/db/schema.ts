@@ -185,6 +185,32 @@ export interface AgentRunsTable {
   kernel: string;
   graph_name: string;
   graph_version: string;
+  status: string;
+  current_node: string | null;
+  step_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  error_message: string | null;
+  started_at: Date | null;
+  updated_at: Date;
+  completed_at: Date | null;
+  cancel_requested_at: Date | null;
+  lease_owner: string | null;
+  lease_token: number;
+  lease_expires_at: Date | null;
+  created_at: Date;
+}
+
+export interface AgentRunEventsTable {
+  id: Generated<number>;
+  tenant_id: string;
+  run_id: string;
+  event_type: string;
+  node_name: string | null;
+  status: string | null;
+  detail: NullableJsonColumn;
   created_at: Date;
 }
 
@@ -204,4 +230,5 @@ export interface Database {
   agent_interactions: AgentInteractionsTable;
   agent_tool_executions: AgentToolExecutionsTable;
   agent_runs: AgentRunsTable;
+  agent_run_events: AgentRunEventsTable;
 }
