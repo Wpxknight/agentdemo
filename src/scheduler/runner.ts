@@ -8,6 +8,9 @@ import { SANDBOX_SERVICE_NOTE } from '../sandbox/notes.js';
 import type { Runtime } from '../runtime.js';
 import { DEFAULT_TASK_MAX_RUN_MS, type ScheduledTask } from '../db/store.js';
 import { Scheduler, type TaskRunner } from './ticker.js';
+import { randomUUID } from 'node:crypto';
+import { DurableToolLedger } from '../agent/tool-ledger/store.js';
+import { SessionCommitter } from '../agent/services/session-committer.js';
 
 type Env = Record<string, string | undefined>;
 
@@ -43,16 +46,20 @@ async function runScheduledTask(
   signal: AbortSignal,
 ): Promise<{ status: 'success'; detail: string; steps: number }> {
   const prior = await rt.store.listMessages(taskCtx, t.sessionId);
+  const runId = randomUUID();
+  const startedAt = Date.now();
   // 用户绑定了主目录：与交互链路一致，告知模型挂载点、交付物默认写入持久化目录。
   const userHomeNote = rt.sandboxSettings?.enabled && rt.userHome
     ? await boundUserHomeNote(rt.store, t.tenantId, t.userId, rt.userHome)
     : '';
   const result = await resolveAgentRuntime(rt.agentRuntime).run({
+    runId,
     model: rt.model,
     tools: rt.tools,
     policy: t.preApproved ? rt.policyPreApproved : rt.policy,
     filterToolDefs: (defs) => rt.permissionRules?.filterToolDefs(defs) ?? defs,
     hooks: rt.hooks,
+    toolLedger: new DurableToolLedger(rt.store),
     approval: new AutoDenyGate(), // 无人值守：未预批准的审批一律拒绝
     unattended: true, // 系统提示切换为“确认类操作跳过并汇报”，不对着空气等确认
     // 技能摘要按任务归属用户过滤（他人私有技能不可见），与交互链路同一套可见性规则。
@@ -69,7 +76,13 @@ async function runScheduledTask(
     keepImages: rt.modelConfig?.contextKeepImages,
     signal,
   });
-  await rt.store.appendMessages(taskCtx, t.sessionId, result.messages.slice(prior.length));
+  await new SessionCommitter(rt.store).commitSuccess({
+    ctx: taskCtx,
+    sessionId: t.sessionId,
+    priorMessageCount: prior.length,
+    result,
+    durationMs: Math.max(0, Date.now() - startedAt),
+  });
   await rt.audit.record({
     kind: 'usage',
     action: 'scheduled',

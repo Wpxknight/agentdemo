@@ -1,4 +1,4 @@
-import { END, START, StateGraph } from '@langchain/langgraph';
+import { END, START, StateGraph, interrupt } from '@langchain/langgraph';
 import type { BaseCheckpointSaver } from '@langchain/langgraph-checkpoint';
 import type { Msg } from '../../model/types.js';
 import type { RunAgentOptions } from '../core.js';
@@ -83,9 +83,41 @@ export function createAgentGraph(options: RunAgentOptions, checkpointer?: BaseCh
       policy: options.policy,
       ctx: options.ctx,
       approval: options.approval,
+      approvalForCall: options.durableInteractions
+        ? async (call, reason) => {
+            const interaction = await options.durableInteractions!.create({
+              kind: 'approval',
+              toolCallId: call.id,
+              payload: { call, reason },
+            });
+            return interrupt({ interactionId: interaction.id, kind: 'approval' });
+          }
+        : undefined,
       hooks: options.hooks,
+      toolLedger: options.toolLedger,
+      runId: options.runId,
       askUser: options.askUser,
+      askUserForCall: options.durableInteractions
+        ? async (call, questions) => {
+            const interaction = await options.durableInteractions!.create({
+              kind: 'question',
+              toolCallId: call.id,
+              payload: { questions },
+            });
+            return interrupt({ interactionId: interaction.id, kind: 'question' });
+          }
+        : undefined,
       requestPlanApproval: options.requestPlanApproval,
+      requestPlanApprovalForCall: options.durableInteractions
+        ? async (call, plan) => {
+            const interaction = await options.durableInteractions!.create({
+              kind: 'plan',
+              toolCallId: call.id,
+              payload: { plan },
+            });
+            return interrupt({ interactionId: interaction.id, kind: 'plan' });
+          }
+        : undefined,
       signal: options.signal,
       onEvent: options.onEvent,
     });

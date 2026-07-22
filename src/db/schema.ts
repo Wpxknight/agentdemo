@@ -146,6 +146,37 @@ export interface LangGraphCheckpointWritesTable {
   value_data: BinaryColumn;
 }
 
+export interface AgentInteractionsTable {
+  id: string;
+  tenant_id: string;
+  user_id: string;
+  session_id: string;
+  run_id: string;
+  kind: string;
+  tool_call_id: string | null;
+  payload: JsonColumn;
+  status: string;
+  resolution: NullableJsonColumn;
+  resolved_by: string | null;
+  expires_at: Date;
+  created_at: Date;
+  resolved_at: Date | null;
+}
+
+export interface AgentToolExecutionsTable {
+  tenant_id: string;
+  run_id: string;
+  session_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  args_digest: string;
+  status: string;
+  result: NullableJsonColumn;
+  started_at: Date;
+  completed_at: Date | null;
+  updated_at: Date;
+}
+
 export interface Database {
   sessions: SessionsTable;
   messages: MessagesTable;
@@ -159,4 +190,6 @@ export interface Database {
   setting_secrets: SettingSecretsTable;
   langgraph_checkpoints: LangGraphCheckpointsTable;
   langgraph_checkpoint_writes: LangGraphCheckpointWritesTable;
+  agent_interactions: AgentInteractionsTable;
+  agent_tool_executions: AgentToolExecutionsTable;
 }

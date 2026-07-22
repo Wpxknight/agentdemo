@@ -5,15 +5,21 @@ import type { ChangePlan } from '../plan.js';
 import type { PolicyMiddleware } from '../policy.js';
 import type { QuestionAnswers, QuestionSpec } from '../question.js';
 import type { ToolContext, ToolRegistry } from '../tools.js';
+import type { DurableToolLedger } from '../tool-ledger/store.js';
 
 export interface ToolBrokerOptions {
   tools: ToolRegistry;
   policy: PolicyMiddleware;
   ctx: ToolContext;
   approval?: ApprovalGate;
+  approvalForCall?: (call: ToolCall, reason?: string) => Promise<boolean>;
   hooks?: HookRunner;
+  toolLedger?: DurableToolLedger;
+  runId?: string;
   askUser?: (questions: QuestionSpec[]) => Promise<QuestionAnswers | null>;
+  askUserForCall?: (call: ToolCall, questions: QuestionSpec[]) => Promise<QuestionAnswers | null>;
   requestPlanApproval?: (plan: ChangePlan) => Promise<boolean>;
+  requestPlanApprovalForCall?: (call: ToolCall, plan: ChangePlan) => Promise<boolean>;
   signal?: AbortSignal;
   onEvent?: (event: StreamEvent) => void;
 }
@@ -41,9 +47,11 @@ export async function executeToolCall(call: ToolCall, options: ToolBrokerOptions
     return { id: call.id, content: `blocked by policy: ${policyDecision.reason ?? 'denied'}`, isError: true };
   }
   if (policyDecision.needApproval) {
-    const approved = options.approval
-      ? await options.approval.request({ call, reason: policyDecision.reason, ctx: options.ctx })
-      : false;
+    const approved = options.approvalForCall
+      ? await options.approvalForCall(call, policyDecision.reason)
+      : options.approval
+        ? await options.approval.request({ call, reason: policyDecision.reason, ctx: options.ctx })
+        : false;
     if (!approved) {
       return {
         id: call.id,
@@ -60,17 +68,39 @@ export async function executeToolCall(call: ToolCall, options: ToolBrokerOptions
       return { id: call.id, content: `blocked by hook: ${hookDecision.reason ?? 'denied'}`, isError: true };
     }
   }
-  const callContext: ToolContext = options.onEvent
+  const ledgerIdentity = options.toolLedger && options.runId
+    && call.name !== 'ask_user' && call.name !== 'submit_change_plan'
     ? {
-        ...options.ctx,
-        onOutput: ({ stream, text }) =>
-          options.onEvent?.({ type: 'tool_output', toolId: call.id, stream, text }),
-        emitEvent: (event) => options.onEvent?.(event),
-        ...(options.askUser ? { askUser: options.askUser } : {}),
-        ...(options.requestPlanApproval ? { requestPlanApproval: options.requestPlanApproval } : {}),
+        tenantId: options.ctx.tenantId ?? 'default',
+        runId: options.runId,
+        sessionId: options.ctx.sessionId,
+        toolCallId: call.id,
+        toolName: call.name,
+        args: call.args,
       }
-    : options.ctx;
+    : undefined;
+  if (ledgerIdentity) {
+    const decision = await options.toolLedger!.begin(ledgerIdentity);
+    if (decision.action === 'reuse') return decision.result;
+  }
+  const askUser = options.askUserForCall
+    ? (questions: QuestionSpec[]) => options.askUserForCall!(call, questions)
+    : options.askUser;
+  const requestPlanApproval = options.requestPlanApprovalForCall
+    ? (plan: ChangePlan) => options.requestPlanApprovalForCall!(call, plan)
+    : options.requestPlanApproval;
+  const callContext: ToolContext = {
+    ...options.ctx,
+    ...(options.onEvent ? {
+      onOutput: ({ stream, text }) =>
+        options.onEvent?.({ type: 'tool_output', toolId: call.id, stream, text }),
+      emitEvent: (event) => options.onEvent?.(event),
+    } : {}),
+    ...(askUser ? { askUser } : {}),
+    ...(requestPlanApproval ? { requestPlanApproval } : {}),
+  };
   const result = await options.tools.dispatch(call, callContext);
+  if (ledgerIdentity) await options.toolLedger!.complete(ledgerIdentity, result);
   throwIfAborted(options.signal);
   return result;
 }

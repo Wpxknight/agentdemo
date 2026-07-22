@@ -16,11 +16,13 @@ import type {
   SessionInput,
   SessionSummary,
   SessionTouchInput,
+  InteractionRecord,
   ScheduledTask,
   ScheduledTaskInput,
   ScheduledTaskPatch,
   Store,
   TaskRun,
+  ToolExecutionRecord,
   UserCredentialRecord,
   UserPatch,
   UserWithSecret,
@@ -66,6 +68,8 @@ export class MemoryStore implements Store {
   private schedulerSettings = new Map<string, SchedulerSettings>();
   private sandboxSettings = new Map<string, SandboxSettingsRecord>();
   private mcpServers = new Map<string, Record<string, McpServerConfig>>();
+  private interactions = new Map<string, InteractionRecord>();
+  private toolExecutions = new Map<string, ToolExecutionRecord>();
   private taskSeq = 0;
   private runSeq = 0;
   private userSeq = 0;
@@ -226,6 +230,48 @@ export class MemoryStore implements Store {
         return total + Math.max(0, inputTokens) + Math.max(0, outputTokens);
       }, 0);
     return { totalTokens };
+  }
+
+  async putInteraction(record: InteractionRecord): Promise<void> {
+    this.interactions.set(`${record.tenantId}/${record.id}`, cloneInteraction(record));
+  }
+
+  async getInteraction(tenantId: string, id: string): Promise<InteractionRecord | undefined> {
+    const record = this.interactions.get(`${tenantId}/${id}`);
+    return record ? cloneInteraction(record) : undefined;
+  }
+
+  async listPendingInteractions(ctx: RequestContext): Promise<InteractionRecord[]> {
+    return [...this.interactions.values()]
+      .filter((record) => record.tenantId === ctx.tenantId && record.status === 'pending')
+      .map(cloneInteraction);
+  }
+
+  async resolveInteraction(record: InteractionRecord): Promise<boolean> {
+    const key = `${record.tenantId}/${record.id}`;
+    const current = this.interactions.get(key);
+    if (!current || current.status !== 'pending') return false;
+    this.interactions.set(key, cloneInteraction(record));
+    return true;
+  }
+
+  async putToolExecutionIfAbsent(record: ToolExecutionRecord): Promise<boolean> {
+    const key = toolExecutionKey(record.tenantId, record.runId, record.toolCallId);
+    if (this.toolExecutions.has(key)) return false;
+    this.toolExecutions.set(key, cloneToolExecution(record));
+    return true;
+  }
+
+  async getToolExecution(tenantId: string, runId: string, toolCallId: string): Promise<ToolExecutionRecord | undefined> {
+    const record = this.toolExecutions.get(toolExecutionKey(tenantId, runId, toolCallId));
+    return record ? cloneToolExecution(record) : undefined;
+  }
+
+  async updateToolExecution(record: ToolExecutionRecord): Promise<void> {
+    this.toolExecutions.set(
+      toolExecutionKey(record.tenantId, record.runId, record.toolCallId),
+      cloneToolExecution(record),
+    );
   }
 
   async record(event: AuditEvent): Promise<void> {
@@ -499,5 +545,19 @@ export class MemoryStore implements Store {
     this.schedulerSettings.clear();
     this.sandboxSettings.clear();
     this.mcpServers.clear();
+    this.interactions.clear();
+    this.toolExecutions.clear();
   }
+}
+
+function cloneInteraction(record: InteractionRecord): InteractionRecord {
+  return structuredClone(record);
+}
+
+function toolExecutionKey(tenantId: string, runId: string, toolCallId: string): string {
+  return `${tenantId}/${runId}/${toolCallId}`;
+}
+
+function cloneToolExecution(record: ToolExecutionRecord): ToolExecutionRecord {
+  return structuredClone(record);
 }

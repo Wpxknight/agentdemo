@@ -343,31 +343,31 @@ Co-authored-by: AIOS <noreply@bocloud.com>"
 - Modify: `/home/opt/develop/aicoding/aiop/src/db/memory.ts`
 - Modify: `/home/opt/develop/aicoding/aiop/src/db/mysql.ts`
 
-- [ ] **Step 1: 写重启恢复、幂等和最终提交失败测试**
+- [x] **Step 1: 写重启恢复、幂等和最终提交失败测试**
 
 覆盖审批/提问持久化、恢复时身份校验、工具 `started/completed/unknown`、非幂等 unknown 转 `recovery_required`、成功/失败/终止消息格式与现有 HTTP 行为一致。
 
-- [ ] **Step 2: 运行测试确认持久记录不存在**
+- [x] **Step 2: 运行测试确认持久记录不存在**
 
 Run: `npm test -- tests/session-committer.test.ts tests/durable-interaction.test.ts`
 
 Expected: FAIL，store 方法不存在。
 
-- [ ] **Step 3: 实现记录模型和事务提交**
+- [x] **Step 3: 实现记录模型和事务提交**
 
 工具 idempotency key 使用 `tenantId + runId + toolCallId`；审批 resume 必须校验 tenant、session、run、user、状态和过期时间。
 
-- [ ] **Step 4: 将 LangGraph interrupt 映射到现有 HTTP 事件**
+- [x] **Step 4: 将 LangGraph interrupt 映射到现有 HTTP 事件**
 
 继续发送 `question_required/change_plan_required/approval_required`，恢复请求转为 `Command({ resume })`，前端协议不变。
 
-- [ ] **Step 5: 运行 HTTP、Scheduler、行为契约和全量测试**
+- [x] **Step 5: 运行 HTTP、Scheduler、行为契约和全量测试**
 
 Run: `npm test -- tests/http.test.ts tests/scheduler.test.ts tests/session-committer.test.ts tests/durable-interaction.test.ts tests/agent-behavior-v1.test.ts && npm run typecheck && npm test`
 
 Expected: 全部通过。
 
-- [ ] **Step 6: 提交持久交互和提交器**
+- [x] **Step 6: 提交持久交互和提交器**
 
 ```bash
 git add src/agent/services/session-committer.ts src/agent/interactions src/agent/tool-ledger src/server/http.ts src/db tests/session-committer.test.ts tests/durable-interaction.test.ts

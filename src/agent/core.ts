@@ -6,6 +6,7 @@ import type { ApprovalGate } from './approval.js';
 import type { HookRunner } from './hooks.js';
 import type { QuestionAnswers, QuestionSpec } from './question.js';
 import type { ChangePlan } from './plan.js';
+import type { DurableToolLedger } from './tool-ledger/store.js';
 import { buildSystemPrompt } from './services/prompt.js';
 import { runModelTurn, type Usage } from './services/model-gateway.js';
 import { compactAtBoundary } from './services/context-service.js';
@@ -16,6 +17,8 @@ export { MAX_MODEL_RETRIES } from './services/model-gateway.js';
 export type { Usage } from './services/model-gateway.js';
 
 export interface RunAgentOptions {
+  /** 单次运行稳定 ID；用于 checkpoint、durable interaction 与工具幂等账本。 */
+  runId?: string;
   model: ChatModel;
   tools: ToolRegistry;
   policy: PolicyMiddleware;
@@ -67,6 +70,17 @@ export interface RunAgentOptions {
   filterToolDefs?: (defs: ToolDef[]) => ToolDef[];
   /** PreToolUse 钩子：策略放行后、dispatch 前执行，可拒绝调用。 */
   hooks?: HookRunner;
+  /** AIoP 工具副作用账本；缺省保持原有直接执行语义。 */
+  toolLedger?: DurableToolLedger;
+  /** LangGraph 人机交互桥：create 必须按 run/kind/toolCallId 幂等，wait 返回可信持久化决策。 */
+  durableInteractions?: {
+    create(input: {
+      kind: 'approval' | 'question' | 'plan';
+      toolCallId: string;
+      payload: unknown;
+    }): Promise<{ id: string }>;
+    wait(id: string): Promise<unknown>;
+  };
   /** ask_user 工具的提问回调：暂停运行、推问题、等回答（HTTP 层实现交互式；缺省则工具不可用）。 */
   askUser?: (questions: QuestionSpec[]) => Promise<QuestionAnswers | null>;
   /** submit_change_plan 工具的审批回调：推送变更方案、等用户批准。 */
@@ -177,6 +191,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
       ctx: opts.ctx,
       approval: opts.approval,
       hooks: opts.hooks,
+      toolLedger: opts.toolLedger,
+      runId: opts.runId,
       askUser: opts.askUser,
       requestPlanApproval: opts.requestPlanApproval,
       signal: opts.signal,

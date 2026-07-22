@@ -116,9 +116,10 @@ export class InMemoryApprovalStore {
 export class InteractiveApprovalGate implements ApprovalGate {
   constructor(private readonly opts: {
     store: InMemoryApprovalStore;
-    emit: (pending: ApprovalPending) => void;
+    emit: (pending: ApprovalPending) => unknown | Promise<unknown>;
     diff?: (req: ApprovalRequest) => Promise<string | undefined>;
     signal?: AbortSignal;
+    onCancel?: (pending: ApprovalPending) => unknown | Promise<unknown>;
   }) {}
 
   async request(req: ApprovalRequest): Promise<boolean> {
@@ -142,10 +143,13 @@ export class InteractiveApprovalGate implements ApprovalGate {
       diff,
     });
 
-    const onAbort = () => this.opts.store.cancel(pending.id);
+    const onAbort = () => {
+      this.opts.store.cancel(pending.id);
+      void this.opts.onCancel?.(pending);
+    };
     this.opts.signal?.addEventListener('abort', onAbort, { once: true });
     try {
-      this.opts.emit(pending);
+      await this.opts.emit(pending);
       return await promise;
     } finally {
       this.opts.signal?.removeEventListener('abort', onAbort);

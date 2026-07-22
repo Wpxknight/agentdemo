@@ -17,11 +17,16 @@ import type {
   SessionInput,
   SessionSummary,
   SessionTouchInput,
+  InteractionRecord,
+  InteractionKind,
+  InteractionStatus,
   ScheduledTask,
   ScheduledTaskInput,
   ScheduledTaskPatch,
   Store,
   TaskRun,
+  ToolExecutionRecord,
+  ToolExecutionStatus,
   UserCredentialRecord,
   UserPatch,
   UserWithSecret,
@@ -419,6 +424,111 @@ export class MysqlStore implements Store {
       return total + Math.max(0, inputTokens) + Math.max(0, outputTokens);
     }, 0);
     return { totalTokens };
+  }
+
+  async putInteraction(record: InteractionRecord): Promise<void> {
+    await this.db.insertInto('agent_interactions').values({
+      id: record.id,
+      tenant_id: record.tenantId,
+      user_id: record.userId,
+      session_id: record.sessionId,
+      run_id: record.runId,
+      kind: record.kind,
+      tool_call_id: record.toolCallId ?? null,
+      payload: JSON.stringify(record.payload),
+      status: record.status,
+      resolution: record.resolution === undefined ? null : JSON.stringify(record.resolution),
+      resolved_by: record.resolvedBy ?? null,
+      expires_at: record.expiresAt,
+      created_at: record.createdAt,
+      resolved_at: record.resolvedAt ?? null,
+    }).execute();
+  }
+
+  async getInteraction(tenantId: string, id: string): Promise<InteractionRecord | undefined> {
+    const row = await this.db.selectFrom('agent_interactions').selectAll()
+      .where('tenant_id', '=', tenantId).where('id', '=', id).executeTakeFirst();
+    return row ? {
+      id: row.id,
+      tenantId: row.tenant_id,
+      userId: row.user_id,
+      sessionId: row.session_id,
+      runId: row.run_id,
+      kind: row.kind as InteractionKind,
+      toolCallId: row.tool_call_id ?? undefined,
+      payload: parseJson(row.payload),
+      status: row.status as InteractionStatus,
+      resolution: row.resolution === null ? undefined : parseJson(row.resolution),
+      resolvedBy: row.resolved_by ?? undefined,
+      expiresAt: toDate(row.expires_at),
+      createdAt: toDate(row.created_at),
+      resolvedAt: row.resolved_at ? toDate(row.resolved_at) : undefined,
+    } : undefined;
+  }
+
+  async listPendingInteractions(ctx: RequestContext): Promise<InteractionRecord[]> {
+    const rows = await this.db.selectFrom('agent_interactions').select('id')
+      .where('tenant_id', '=', ctx.tenantId).where('status', '=', 'pending')
+      .orderBy('created_at', 'asc').execute();
+    const records = await Promise.all(rows.map((row) => this.getInteraction(ctx.tenantId, row.id)));
+    return records.filter((record): record is InteractionRecord => Boolean(record));
+  }
+
+  async resolveInteraction(record: InteractionRecord): Promise<boolean> {
+    const result = await this.db.updateTable('agent_interactions').set({
+      status: record.status,
+      resolution: record.resolution === undefined ? null : JSON.stringify(record.resolution),
+      resolved_by: record.resolvedBy ?? null,
+      resolved_at: record.resolvedAt ?? new Date(),
+    }).where('tenant_id', '=', record.tenantId).where('id', '=', record.id)
+      .where('status', '=', 'pending').executeTakeFirst();
+    return Number(result.numUpdatedRows ?? 0) > 0;
+  }
+
+  async putToolExecutionIfAbsent(record: ToolExecutionRecord): Promise<boolean> {
+    const result = await this.db.insertInto('agent_tool_executions').values({
+      tenant_id: record.tenantId,
+      run_id: record.runId,
+      session_id: record.sessionId,
+      tool_call_id: record.toolCallId,
+      tool_name: record.toolName,
+      args_digest: record.argsDigest,
+      status: record.status,
+      result: record.result === undefined ? null : JSON.stringify(record.result),
+      started_at: record.startedAt,
+      completed_at: record.completedAt ?? null,
+      updated_at: record.updatedAt,
+    }).ignore().executeTakeFirst();
+    return Number(result.numInsertedOrUpdatedRows ?? 0) > 0;
+  }
+
+  async getToolExecution(tenantId: string, runId: string, toolCallId: string): Promise<ToolExecutionRecord | undefined> {
+    const row = await this.db.selectFrom('agent_tool_executions').selectAll()
+      .where('tenant_id', '=', tenantId).where('run_id', '=', runId)
+      .where('tool_call_id', '=', toolCallId).executeTakeFirst();
+    return row ? {
+      tenantId: row.tenant_id,
+      runId: row.run_id,
+      sessionId: row.session_id,
+      toolCallId: row.tool_call_id,
+      toolName: row.tool_name,
+      argsDigest: row.args_digest,
+      status: row.status as ToolExecutionStatus,
+      result: row.result === null ? undefined : parseJson(row.result) as ToolExecutionRecord['result'],
+      startedAt: toDate(row.started_at),
+      completedAt: row.completed_at ? toDate(row.completed_at) : undefined,
+      updatedAt: toDate(row.updated_at),
+    } : undefined;
+  }
+
+  async updateToolExecution(record: ToolExecutionRecord): Promise<void> {
+    await this.db.updateTable('agent_tool_executions').set({
+      status: record.status,
+      result: record.result === undefined ? null : JSON.stringify(record.result),
+      completed_at: record.completedAt ?? null,
+      updated_at: record.updatedAt,
+    }).where('tenant_id', '=', record.tenantId).where('run_id', '=', record.runId)
+      .where('tool_call_id', '=', record.toolCallId).execute();
   }
 
   async record(event: AuditEvent): Promise<void> {

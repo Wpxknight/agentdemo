@@ -5,6 +5,7 @@ import type { RunAgentOptions, RunAgentResult } from '../core.js';
 import { createAgentGraph } from './graph.js';
 import { initialAgentGraphState } from './state.js';
 import { DEFAULT_AGENT_GRAPH_NAME, DEFAULT_AGENT_GRAPH_VERSION } from './registry.js';
+import { Command, isInterrupted } from '@langchain/langgraph';
 
 export interface LangGraphAgentKernelOptions {
   threadIdFactory?: () => string;
@@ -39,11 +40,9 @@ export class LangGraphAgentKernel implements AgentKernel {
         contentBlocks: options.taskContentBlocks?.length ? options.taskContentBlocks : undefined,
       });
     }
-    const threadId = this.threadIdFactory();
+    const threadId = options.runId ?? this.threadIdFactory();
     const graph = createAgentGraph(options, this.checkpointer);
-    const state = await graph.invoke(
-      initialAgentGraphState(messages, options.compactionWatermarkTokens),
-      {
+    const config = {
         configurable: {
           thread_id: threadId,
           tenant_id: options.ctx.tenantId ?? 'default',
@@ -55,8 +54,22 @@ export class LangGraphAgentKernel implements AgentKernel {
         recursionLimit: Number.isFinite(options.maxSteps)
           ? Math.max(10, (options.maxSteps ?? 1) * 3 + 5)
           : 10_000,
-      },
-    );
+      };
+    let input: unknown = initialAgentGraphState(messages, options.compactionWatermarkTokens);
+    let state: Awaited<ReturnType<typeof graph.invoke>>;
+    for (;;) {
+      state = await graph.invoke(input as never, config);
+      if (!isInterrupted(state)) break;
+      if (!options.durableInteractions) throw new Error('LangGraph 运行被中断，但未配置 durable interaction bridge');
+      const resolutions = await Promise.all(state.__interrupt__.map(async (entry) => {
+        const value = entry.value as { interactionId?: unknown };
+        if (typeof value?.interactionId !== 'string') throw new Error('LangGraph interrupt 缺少 interactionId');
+        return [entry.id, await options.durableInteractions!.wait(value.interactionId)] as const;
+      }));
+      input = new Command({
+        resume: resolutions.length === 1 ? resolutions[0]![1] : Object.fromEntries(resolutions),
+      });
+    }
     return {
       messages: state.messages,
       text: state.text,

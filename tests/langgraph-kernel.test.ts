@@ -5,6 +5,7 @@ import { ToolRegistry } from '../src/agent/tools.js';
 import { AllowAllPolicy } from '../src/agent/policy.js';
 import type { ChatModel } from '../src/model/types.js';
 import { MemoryCheckpointStore, MysqlCheckpointSaver } from '../src/agent/checkpoint/mysql.js';
+import { buildAskUserTool } from '../src/tools/ask-user.js';
 
 agentBehaviorV1('langgraph', () => new LangGraphAgentKernel());
 
@@ -96,5 +97,152 @@ describe('LangGraphAgentKernel', () => {
     const persisted = await store.listCheckpoints({ threadId: 'tenant-a:run-checkpoint' });
     expect(persisted.every((checkpoint) => checkpoint.tenantId === 'tenant-a')).toBe(true);
     expect(persisted.every((checkpoint) => checkpoint.graphVersion === 'v1')).toBe(true);
+  });
+
+  it('maps durable interaction waits to LangGraph interrupt and Command resume', async () => {
+    const tools = new ToolRegistry();
+    tools.register(buildAskUserTool());
+    let turn = 0;
+    const model: ChatModel = {
+      id: 'interrupt-resume',
+      async *stream() {
+        turn += 1;
+        if (turn === 1) {
+          yield {
+            type: 'tool_call',
+            call: {
+              id: 'ask-1',
+              name: 'ask_user',
+              args: { questions: [{ question: 'Continue?', options: [{ label: 'Yes' }, { label: 'No' }] }] },
+            },
+          };
+          yield { type: 'stop', reason: 'tool_use' };
+          return;
+        }
+        yield { type: 'text_delta', text: 'continued' };
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+    const created: Array<{ id: string; kind: string; payload: unknown }> = [];
+    const kernel = new LangGraphAgentKernel({
+      checkpointer: new MysqlCheckpointSaver(new MemoryCheckpointStore()),
+    });
+
+    const result = await kernel.run({
+      runId: 'run-interrupt',
+      model,
+      tools,
+      policy: new AllowAllPolicy(),
+      ctx: { sessionId: 'session-a', tenantId: 'tenant-a', userId: 'user-a' },
+      task: 'go',
+      durableInteractions: {
+        async create(input) {
+          const record = { id: 'interaction-1', ...input };
+          if (!created.length) created.push(record);
+          return { id: record.id };
+        },
+        async wait(id) {
+          expect(id).toBe('interaction-1');
+          return { 'Continue?': ['Yes'] };
+        },
+      },
+    });
+
+    expect(created).toMatchObject([{ id: 'interaction-1', kind: 'question' }]);
+    expect(result.text).toBe('continued');
+    expect(result.messages.find((message) => message.role === 'tool')?.toolResults?.[0]?.content)
+      .toContain('Yes');
+  });
+
+  it('uses durable approval interrupts before dispatching a protected tool', async () => {
+    const tools = new ToolRegistry();
+    tools.register({
+      def: { name: 'change', description: 'change', inputSchema: { type: 'object' } },
+      run: async () => ({ id: '', content: 'changed' }),
+    });
+    let turn = 0;
+    const model: ChatModel = {
+      id: 'approval-interrupt',
+      async *stream() {
+        turn += 1;
+        if (turn === 1) {
+          yield { type: 'tool_call', call: { id: 'change-1', name: 'change', args: {} } };
+          yield { type: 'stop', reason: 'tool_use' };
+          return;
+        }
+        yield { type: 'text_delta', text: 'done' };
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+    const kinds: string[] = [];
+    const result = await new LangGraphAgentKernel({
+      checkpointer: new MysqlCheckpointSaver(new MemoryCheckpointStore()),
+    }).run({
+      runId: 'run-approval',
+      model,
+      tools,
+      policy: { check: async () => ({ blocked: false, needApproval: true, reason: 'prod' }) },
+      ctx: { sessionId: 'session-a', tenantId: 'tenant-a', userId: 'user-a' },
+      task: 'go',
+      durableInteractions: {
+        async create(input) {
+          kinds.push(input.kind);
+          return { id: 'approval-1' };
+        },
+        async wait() { return true; },
+      },
+    });
+
+    expect(kinds).toContain('approval');
+    expect(result.messages.find((message) => message.role === 'tool')?.toolResults?.[0]?.content).toBe('changed');
+  });
+
+  it('resumes an interrupted run from the persisted checkpoint after kernel restart', async () => {
+    const saver = new MysqlCheckpointSaver(new MemoryCheckpointStore());
+    const tools = new ToolRegistry();
+    tools.register(buildAskUserTool());
+    let turn = 0;
+    const model: ChatModel = {
+      id: 'restart-resume',
+      async *stream() {
+        turn += 1;
+        if (turn === 1) {
+          yield {
+            type: 'tool_call',
+            call: {
+              id: 'ask-restart',
+              name: 'ask_user',
+              args: { questions: [{ question: 'Resume?', options: [{ label: 'Yes' }, { label: 'No' }] }] },
+            },
+          };
+          yield { type: 'stop', reason: 'tool_use' };
+          return;
+        }
+        yield { type: 'text_delta', text: 'resumed' };
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+    const base = {
+      runId: 'run-restart', model, tools, policy: new AllowAllPolicy(),
+      ctx: { sessionId: 'session-a', tenantId: 'tenant-a', userId: 'user-a' }, task: 'go',
+    };
+    await expect(new LangGraphAgentKernel({ checkpointer: saver }).run({
+      ...base,
+      durableInteractions: {
+        create: async () => ({ id: 'interaction-restart' }),
+        wait: async () => { throw new Error('simulated process loss'); },
+      },
+    })).rejects.toThrow('simulated process loss');
+
+    const result = await new LangGraphAgentKernel({ checkpointer: saver }).run({
+      ...base,
+      durableInteractions: {
+        create: async () => ({ id: 'interaction-restart' }),
+        wait: async () => ({ 'Resume?': ['Yes'] }),
+      },
+    });
+
+    expect(result.text).toBe('resumed');
+    expect(turn).toBe(2);
   });
 });

@@ -2,6 +2,9 @@ import { logger } from './logger.js';
 import { loadConfig } from './config/load.js';
 import { buildRuntime } from './runtime.js';
 import { AutoApproveGate } from './agent/approval.js';
+import { randomUUID } from 'node:crypto';
+import { DurableToolLedger } from './agent/tool-ledger/store.js';
+import { SessionCommitter } from './agent/services/session-committer.js';
 import { createHttpServer } from './server/http.js';
 import { LocalAuthProvider } from './auth/local.js';
 import type { Config } from './config/schema.js';
@@ -55,11 +58,14 @@ async function runOnce(config: Config, task: string) {
   const { tenantId, userId, role } = rt.defaultContext;
   const sessionId = 'cli';
   const prior = await rt.store.listMessages(rt.defaultContext, sessionId);
+  const startedAt = Date.now();
   const result = await rt.agentRuntime.run({
+    runId: randomUUID(),
     model: rt.model,
     tools: rt.tools,
     policy: rt.policy,
     approval: new AutoApproveGate(),
+    toolLedger: new DurableToolLedger(rt.store),
     system: rt.systemExtra,
     ctx: { sessionId, tenantId, userId, role },
     messages: prior,
@@ -71,7 +77,13 @@ async function runOnce(config: Config, task: string) {
 
   process.stdout.write('\n');
   logger.info({ steps: result.steps, usage: result.usage }, 'done');
-  await rt.store.appendMessages(rt.defaultContext, sessionId, result.messages.slice(prior.length));
+  await new SessionCommitter(rt.store).commitSuccess({
+    ctx: rt.defaultContext,
+    sessionId,
+    priorMessageCount: prior.length,
+    result,
+    durationMs: Math.max(0, Date.now() - startedAt),
+  });
   await rt.audit.record({
     kind: 'usage', action: 'agent', tenantId: rt.defaultContext.tenantId, sessionId,
     detail: { ...result.usage, steps: result.steps },

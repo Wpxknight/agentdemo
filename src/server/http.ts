@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { SignJWT, jwtVerify } from 'jose';
@@ -39,6 +39,9 @@ import {
   parseSandboxSettings,
   type SandboxApiKeyUpdate,
 } from '../sandbox/settings.js';
+import { SessionCommitter } from '../agent/services/session-committer.js';
+import { DurableToolLedger } from '../agent/tool-ledger/store.js';
+import { DurableInteractionService } from '../agent/interactions/store.js';
 
 const log = logger.child({ mod: 'http' });
 
@@ -686,11 +689,12 @@ export function createHttpServer(rt: Runtime): http.Server {
   const secret = new TextEncoder().encode(rt.jwtSecret);
   const approvals = new InMemoryApprovalStore();
   const questions = new InMemoryQuestionStore();
+  const interactions = new DurableInteractionService(rt.store);
   const activeRuns: ActiveAgentRuns = new Map();
   const compactionWatermarks: CompactionWatermarks = new Map();
 
   return http.createServer((req, res) => {
-    handle(rt, secret, approvals, questions, activeRuns, compactionWatermarks, req, res).catch((err) => {
+    handle(rt, secret, approvals, questions, interactions, activeRuns, compactionWatermarks, req, res).catch((err) => {
       if (err instanceof HttpError) return sendJson(res, err.status, { error: err.message });
       if (err instanceof AuthzError) return sendJson(res, 403, { error: err.message });
       log.error({ err }, '请求处理异常');
@@ -705,6 +709,7 @@ async function handle(
   secret: Uint8Array,
   approvals: InMemoryApprovalStore,
   questions: InMemoryQuestionStore,
+  interactions: DurableInteractionService,
   activeRuns: ActiveAgentRuns,
   compactionWatermarks: CompactionWatermarks,
   req: Req,
@@ -818,7 +823,7 @@ async function handle(
   }
 
   // —— 以下均需认证 ——
-  if (route === 'POST /v1/agent') return runAgentSse(rt, approvals, questions, activeRuns, compactionWatermarks, req, res);
+  if (route === 'POST /v1/agent') return runAgentSse(rt, approvals, questions, interactions, activeRuns, compactionWatermarks, req, res);
 
   if (route === 'GET /v1/me') {
     const ctx = await requireAuth(rt, req);
@@ -1339,24 +1344,36 @@ async function handle(
   if (route === 'GET /v1/approvals') {
     const ctx = await requireAuth(rt, req);
     requirePermission(ctx, 'approve');
-    return sendJson(res, 200, { approvals: approvals.list(ctx.tenantId) });
+    const pending = (await interactions.listPending(ctx))
+      .filter((record) => record.kind === 'approval')
+      .map((record) => record.payload);
+    return sendJson(res, 200, { approvals: pending });
   }
   const approvalMatch = /^\/v1\/approvals\/([^/]+)\/(approve|deny)$/.exec(path);
   if (method === 'POST' && approvalMatch) {
     const ctx = await requireAuth(rt, req);
     requirePermission(ctx, 'approve');
     const id = decodeURIComponent(approvalMatch[1]!);
-    const ok = approvalMatch[2] === 'approve'
-      ? await approvals.approve(id, ctx.tenantId)
-      : await approvals.deny(id, ctx.tenantId);
-    if (!ok) throw new HttpError(404, '审批不存在或已处理');
+    const interaction = await rt.store.getInteraction(ctx.tenantId, id);
+    if (!interaction || interaction.kind !== 'approval') throw new HttpError(404, '审批不存在或已处理');
+    const approved = approvalMatch[2] === 'approve';
+    await interactions.resolve(ctx, id, {
+      sessionId: interaction.sessionId,
+      runId: interaction.runId,
+      value: approved,
+    }).catch((error) => { throw new HttpError(404, error instanceof Error ? error.message : '审批不存在或已处理'); });
+    if (approved) await approvals.approve(id, ctx.tenantId);
+    else await approvals.deny(id, ctx.tenantId);
     return sendJson(res, 200, { ok: true });
   }
 
   // —— ask_user 交互式提问 ——
   if (route === 'GET /v1/questions') {
     const ctx = await requireAuth(rt, req);
-    return sendJson(res, 200, { questions: questions.list(ctx.tenantId) });
+    const pending = (await interactions.listPending(ctx))
+      .filter((record) => record.kind === 'question' || record.kind === 'plan')
+      .map((record) => record.payload);
+    return sendJson(res, 200, { questions: pending });
   }
   const questionMatch = /^\/v1\/questions\/([^/]+)\/answer$/.exec(path);
   if (method === 'POST' && questionMatch) {
@@ -1371,8 +1388,16 @@ async function handle(
     for (const [q, v] of Object.entries(rawAnswers as Record<string, unknown>)) {
       answers[q] = Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
     }
-    const ok = questions.answer(id, ctx.tenantId, answers);
-    if (!ok) throw new HttpError(404, '问题不存在或已回答');
+    const interaction = await rt.store.getInteraction(ctx.tenantId, id);
+    if (!interaction || (interaction.kind !== 'question' && interaction.kind !== 'plan')) {
+      throw new HttpError(404, '问题不存在或已回答');
+    }
+    await interactions.resolve(ctx, id, {
+      sessionId: interaction.sessionId,
+      runId: interaction.runId,
+      value: answers,
+    }).catch((error) => { throw new HttpError(404, error instanceof Error ? error.message : '问题不存在或已回答'); });
+    questions.answer(id, ctx.tenantId, answers);
     return sendJson(res, 200, { ok: true });
   }
 
@@ -1733,6 +1758,7 @@ async function runAgentSse(
   rt: Runtime,
   approvals: InMemoryApprovalStore,
   questions: InMemoryQuestionStore,
+  interactions: DurableInteractionService,
   activeRuns: ActiveAgentRuns,
   compactionWatermarks: CompactionWatermarks,
   req: Req,
@@ -1744,6 +1770,18 @@ async function runAgentSse(
   const taskBlocks = attachmentImageBlocks(body);
   const parsedTask = parseGoalTask(userText);
   const sessionId = sessionIdFromBody(body);
+  const resumeInteractionId = str(body, 'resumeInteractionId') ?? str(body, 'resume_interaction_id');
+  let runId: string = randomUUID();
+  if (resumeInteractionId) {
+    const interaction = await rt.store.getInteraction(ctx.tenantId, resumeInteractionId);
+    if (!interaction
+      || interaction.userId !== ctx.userId
+      || interaction.sessionId !== sessionId
+      || interaction.status !== 'resolved') {
+      throw new HttpError(404, '可恢复交互不存在、未完成或与当前身份/会话不匹配');
+    }
+    runId = interaction.runId;
+  }
 
   // 同一会话互斥：并发运行会各自加载相同历史再各自落库，导致历史交错重复，
   // 且压缩落库（replaceMessages）会覆盖对方新写的消息。运行中追加消息请走 /append。
@@ -1761,7 +1799,7 @@ async function runAgentSse(
     if (closed || res.destroyed || res.writableEnded) return;
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
-  sse('session', { sessionId });
+  sse('session', { sessionId, runId });
   const abort = new AbortController();
   const pendingMessages: Msg[] = [];
   const activeKey = activeRunKey(ctx, sessionId);
@@ -1777,6 +1815,8 @@ async function runAgentSse(
   addActiveRun(activeRuns, activeKey, activeRun);
   res.on('close', onClose);
   const toolCtx = { sessionId, tenantId: ctx.tenantId, userId: ctx.userId, role: ctx.role };
+  const sessionCommitter = new SessionCommitter(rt.store);
+  const toolLedger = new DurableToolLedger(rt.store);
   const runStartedAt = Date.now();
   let streamedText = '';
   let streamedThinking = '';
@@ -1793,12 +1833,96 @@ async function runAgentSse(
       : '';
     const modelConfig = currentModelConfig(rt);
     const triggerTokens = compactionTriggerTokens(modelConfig);
-    const result = await resolveAgentRuntime(rt.agentRuntime).run({
+    const agentRuntime = resolveAgentRuntime(rt.agentRuntime);
+    const durableInteractions = agentRuntime.kernelName === 'langgraph' ? {
+      create: async (input: { kind: 'approval' | 'question' | 'plan'; toolCallId: string; payload: unknown }) => {
+        const id = createHash('sha256')
+          .update(`${runId}\0${input.kind}\0${input.toolCallId}`)
+          .digest('hex');
+        const existing = await rt.store.getInteraction(ctx.tenantId, id);
+        if (existing) return { id };
+        const createdAt = new Date().toISOString();
+        if (input.kind === 'approval') {
+          const request = input.payload as { call?: ToolCall; reason?: string };
+          let diff: string | undefined;
+          if (request.call?.name === 'kubectl') {
+            try {
+              const args = request.call.args && typeof request.call.args === 'object' && !Array.isArray(request.call.args)
+                ? { ...request.call.args, dryRun: true }
+                : request.call.args;
+              diff = (await rt.tools.dispatch({ ...request.call, id: `${request.call.id}:dry-run`, args }, toolCtx)).content;
+            } catch (error) {
+              diff = `[dry-run error]\n${error instanceof Error ? error.message : String(error)}`;
+            }
+          }
+          const pending = {
+            id, tenantId: ctx.tenantId, sessionId, userId: ctx.userId,
+            runId, call: request.call, reason: request.reason, diff, createdAt,
+          };
+          await interactions.create({
+            id, kind: 'approval', tenantId: ctx.tenantId, userId: ctx.userId,
+            sessionId, runId, toolCallId: input.toolCallId, payload: pending,
+            expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+          });
+          sse('approval_required', pending);
+          return { id };
+        }
+        if (input.kind === 'question') {
+          const questions = (input.payload as { questions?: QuestionSpec[] }).questions ?? [];
+          const pending = { id, tenantId: ctx.tenantId, sessionId, userId: ctx.userId, runId, questions, createdAt };
+          await interactions.create({
+            id, kind: 'question', tenantId: ctx.tenantId, userId: ctx.userId,
+            sessionId, runId, toolCallId: input.toolCallId, payload: pending,
+            expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+          });
+          sse('question_required', pending);
+          return { id };
+        }
+        const plan = (input.payload as { plan?: unknown }).plan;
+        const summary = plan && typeof plan === 'object' && !Array.isArray(plan)
+          && typeof (plan as { summary?: unknown }).summary === 'string'
+          ? (plan as { summary: string }).summary
+          : '';
+        const q: QuestionSpec = {
+          question: `请审批变更方案：${summary}`,
+          header: '变更审批',
+          options: [{ label: '批准' }, { label: '拒绝' }],
+        };
+        const pending = { id, tenantId: ctx.tenantId, sessionId, userId: ctx.userId, runId, questions: [q], createdAt, plan };
+        const durablePending = { ...pending, runId };
+        await interactions.create({
+          id, kind: 'plan', tenantId: ctx.tenantId, userId: ctx.userId,
+          sessionId, runId, toolCallId: input.toolCallId, payload: pending,
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+        });
+        sse('change_plan_required', pending);
+        return { id };
+      },
+      wait: async (id: string) => {
+        const record = await interactions.wait(ctx.tenantId, id, abort.signal);
+        if (record.status !== 'resolved') return record.kind === 'question' ? null : false;
+        if (record.kind !== 'plan') return record.resolution;
+        const payload = record.payload as { questions?: QuestionSpec[]; plan?: unknown };
+        const question = payload.questions?.[0]?.question ?? '';
+        const answers = record.resolution as QuestionAnswers | undefined;
+        const approved = answers?.[question]?.includes('批准') ?? false;
+        if (approved) rt.planState.approve(sessionId);
+        await rt.audit?.record({
+          kind: 'policy', action: approved ? 'plan-approved' : 'plan-rejected',
+          tenantId: ctx.tenantId, sessionId, detail: { plan: payload.plan },
+        });
+        return approved;
+      },
+    } : undefined;
+    const result = await agentRuntime.run({
+      runId,
       model: rt.model,
       tools: rt.tools,
       policy: rt.policy,
       filterToolDefs: (defs) => rt.permissionRules?.filterToolDefs(defs) ?? defs,
       hooks: rt.hooks,
+      toolLedger,
+      durableInteractions,
       askUser: async (qs: QuestionSpec[]): Promise<QuestionAnswers | null> => {
         if (abort.signal.aborted) return null;
         const { pending, promise } = questions.create({
@@ -1807,10 +1931,24 @@ async function runAgentSse(
           userId: ctx.userId ?? '',
           questions: qs,
         });
-        const onAbort = () => questions.cancel(pending.id);
+        const durablePending = { ...pending, runId };
+        await interactions.create({
+          id: pending.id,
+          kind: 'question',
+          tenantId: ctx.tenantId,
+          userId: ctx.userId,
+          sessionId,
+          runId,
+          payload: durablePending,
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+        });
+        const onAbort = () => {
+          questions.cancel(pending.id);
+          void interactions.cancel(ctx.tenantId, pending.id);
+        };
         abort.signal.addEventListener('abort', onAbort, { once: true });
         try {
-          sse('question_required', pending);
+          sse('question_required', durablePending);
           return await promise;
         } finally {
           abort.signal.removeEventListener('abort', onAbort);
@@ -1830,11 +1968,25 @@ async function runAgentSse(
           userId: ctx.userId ?? '',
           questions: [q],
         });
-        const onAbort = () => questions.cancel(pending.id);
+        const durablePending = { ...pending, plan, runId };
+        await interactions.create({
+          id: pending.id,
+          kind: 'plan',
+          tenantId: ctx.tenantId,
+          userId: ctx.userId,
+          sessionId,
+          runId,
+          payload: durablePending,
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+        });
+        const onAbort = () => {
+          questions.cancel(pending.id);
+          void interactions.cancel(ctx.tenantId, pending.id);
+        };
         abort.signal.addEventListener('abort', onAbort, { once: true });
         try {
           // 附上完整方案供前端渲染（question_required 事件里带 plan）。
-          sse('change_plan_required', { ...pending, plan });
+          sse('change_plan_required', durablePending);
           const answers = await promise;
           const approved = answers?.[q.question]?.includes('批准') ?? false;
           if (approved) rt.planState.approve(sessionId);
@@ -1849,7 +2001,21 @@ async function runAgentSse(
       },
       approval: new InteractiveApprovalGate({
         store: approvals,
-        emit: (pending) => sse('approval_required', pending),
+        emit: async (pending) => {
+          await interactions.create({
+            id: pending.id,
+            kind: 'approval',
+            tenantId: ctx.tenantId,
+            userId: ctx.userId,
+            sessionId,
+            runId,
+            toolCallId: pending.call.id,
+            payload: { ...pending, runId },
+            expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+          });
+          sse('approval_required', { ...pending, runId });
+        },
+        onCancel: async (pending) => { await interactions.cancel(ctx.tenantId, pending.id); },
         signal: abort.signal,
         diff: async ({ call, ctx: diffCtx }) => {
           if (call.name !== 'kubectl') return undefined;
@@ -1899,16 +2065,13 @@ async function runAgentSse(
     });
     agentReturned = true;
     const durationMs = Math.max(0, Date.now() - runStartedAt);
-    const finalAssistant = result.messages.findLast((message) => message.role === 'assistant');
-    if (finalAssistant) finalAssistant.durationMs = durationMs;
-    if (result.compacted) {
-      // 运行期间发生过摘要压缩：历史已被改写，整体替换落库（事务），并保持会话时间线更新。
-      await rt.store.replaceMessages(ctx, sessionId, result.messages);
-      await rt.store.touchSession(ctx, sessionId, { updatedAt: new Date() });
-    } else {
-      // 仅持久化本轮新增消息（task + 后续），一次事务批量落库，避免中途失败留下半截轮次。
-      await rt.store.appendMessages(ctx, sessionId, result.messages.slice(prior.length));
-    }
+    await sessionCommitter.commitSuccess({
+      ctx,
+      sessionId,
+      priorMessageCount: prior.length,
+      result,
+      durationMs,
+    });
     const context = await rt.store.getSessionContextUsage(ctx, sessionId, contextWindowTokens(modelConfig));
     const cost = estimateCost(result.usage, modelConfig.pricing);
     await rt.audit?.record({
@@ -1919,24 +2082,18 @@ async function runAgentSse(
   } catch (err) {
     if (!agentReturned) {
       const durationMs = Math.max(0, Date.now() - runStartedAt);
-      const finalLine = abort.signal.aborted
-        ? '已终止当前运行。'
-        : `运行失败：${err instanceof Error ? err.message : '运行失败'}`;
-      const assistantText = [streamedText.trim(), finalLine].filter(Boolean).join('\n\n');
       try {
-        await rt.store.appendMessages(ctx, sessionId, [
-          {
-            role: 'user',
-            text: parsedTask.task,
-            contentBlocks: taskBlocks.length ? taskBlocks : undefined,
-          },
-          {
-            role: 'assistant',
-            text: assistantText,
-            thinking: streamedThinking.trim() || undefined,
-            durationMs,
-          },
-        ]);
+        await sessionCommitter.commitFailure({
+          ctx,
+          sessionId,
+          task: parsedTask.task,
+          taskContentBlocks: taskBlocks,
+          streamedText,
+          streamedThinking,
+          durationMs,
+          error: err,
+          terminated: abort.signal.aborted,
+        });
       } catch (persistErr) {
         log.warn({ err: persistErr, sessionId }, 'agent 失败记录落库失败');
       }

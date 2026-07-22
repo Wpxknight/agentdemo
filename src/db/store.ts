@@ -2,6 +2,7 @@ import type { Msg } from '../model/types.js';
 import type { AuditEvent, AuditSink } from '../audit/sink.js';
 import type { AuthProviderKind, Role, RequestContext, Tenant, User, UserStatus } from '../auth/types.js';
 import type { McpServerConfig } from '../mcp/types.js';
+import type { ToolResult } from '../model/types.js';
 
 export interface LlmSettings {
   id: string;
@@ -71,6 +72,42 @@ export interface SessionContextUsage {
 
 export interface SessionTokenUsage {
   totalTokens: number;
+}
+
+export type InteractionKind = 'approval' | 'question' | 'plan';
+export type InteractionStatus = 'pending' | 'resolved' | 'cancelled' | 'expired';
+
+export interface InteractionRecord {
+  id: string;
+  tenantId: string;
+  userId: string;
+  sessionId: string;
+  runId: string;
+  kind: InteractionKind;
+  toolCallId?: string;
+  payload: unknown;
+  status: InteractionStatus;
+  resolution?: unknown;
+  resolvedBy?: string;
+  expiresAt: Date;
+  createdAt: Date;
+  resolvedAt?: Date;
+}
+
+export type ToolExecutionStatus = 'started' | 'completed' | 'unknown' | 'recovery_required';
+
+export interface ToolExecutionRecord {
+  tenantId: string;
+  runId: string;
+  sessionId: string;
+  toolCallId: string;
+  toolName: string;
+  argsDigest: string;
+  status: ToolExecutionStatus;
+  result?: ToolResult;
+  startedAt: Date;
+  completedAt?: Date;
+  updatedAt: Date;
 }
 
 /** 审计查询过滤（租户由 ctx 强制限定）。 */
@@ -184,6 +221,15 @@ export interface Store extends AuditSink {
   deleteSession(ctx: RequestContext, sessionId: string): Promise<boolean>;
   getSessionContextUsage(ctx: RequestContext, sessionId: string, maxTokens: number): Promise<SessionContextUsage>;
   getSessionTokenUsage(ctx: RequestContext, sessionId: string): Promise<SessionTokenUsage>;
+
+  // —— Agent durable interaction / tool ledger ——
+  putInteraction(record: InteractionRecord): Promise<void>;
+  getInteraction(tenantId: string, id: string): Promise<InteractionRecord | undefined>;
+  listPendingInteractions(ctx: RequestContext): Promise<InteractionRecord[]>;
+  resolveInteraction(record: InteractionRecord): Promise<boolean>;
+  putToolExecutionIfAbsent(record: ToolExecutionRecord): Promise<boolean>;
+  getToolExecution(tenantId: string, runId: string, toolCallId: string): Promise<ToolExecutionRecord | undefined>;
+  updateToolExecution(record: ToolExecutionRecord): Promise<void>;
 
   // —— 审计 ——（record 来自 AuditSink；event.tenantId 标识归属）
   record(event: AuditEvent): Promise<void>;
