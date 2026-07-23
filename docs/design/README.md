@@ -27,6 +27,12 @@
 - 多租户 Web 服务：[01 系统总览](./01-system-overview.md) → [06 认证与安全](./06-auth-security-tenancy.md) → [07 数据与持久化](./07-data-and-persistence.md) → [09 API 与 Web](./09-api-and-web.md) → [10 部署与可观测性](./10-deployment-observability.md)。
 - 定时任务：[01 系统总览](./01-system-overview.md) → [02 Agent Runtime](./02-agent-runtime.md) → [06 认证与安全](./06-auth-security-tenancy.md) → [07 数据与持久化](./07-data-and-persistence.md) → [08 调度器](./08-scheduler.md) → [10 部署与可观测性](./10-deployment-observability.md)。
 
+当前实现的三个重要边界：
+
+- Agent Run Lease 提供多副本 fencing，但没有过期 running Run 的自动接管扫描器。
+- Interaction 记录已持久化，但等待通知仍在进程内；跨副本解析需要粘性路由或后续通知机制。
+- 模型、Sandbox Controller 和 MCP Manager 是进程级单实例，主要读取 `default` 设置；表结构中的 tenant key 不代表运行态已按 tenant 隔离。
+
 ## 模块与源码映射
 
 | 设计域 | 主要实现与事实入口 | 对应文档 |
