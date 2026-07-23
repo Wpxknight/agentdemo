@@ -55,48 +55,48 @@
 
 ## 技术栈与开源组件
 
-版本范围取自根目录和 Web 目录的 `package.json`；Node.js 内建模块、仓库自研模块与外部依赖分开记录。`package.json` 和 `web/package.json` 是依赖版本的唯一真源，维护本矩阵时必须逐项与其核对。
+依赖版本以根目录的 `package.json` 和 Web 目录的 `web/package.json` 为唯一真源，本节不复制易过期的版本范围，只记录组件、包名、用途和运行边界。Node.js 内建模块、仓库自研模块与外部依赖分开记录。
 
 ### 后端运行与集成
 
-| 类别 | 技术或组件 | 仓库版本 | 实际用途 |
-| --- | --- | --- | --- |
-| 运行平台 | Node.js、TypeScript（`typescript`）、tsx（`tsx`） | Node.js `>=20`；TypeScript `^6.0.3`；tsx `^4.22.4` | ESM 后端、类型检查、开发与直接运行 TypeScript |
-| HTTP 与流式协议 | Node.js `http`、SSE | Node.js 内建 | `/healthz`、`/readyz`、认证、`/v1/**` JSON API 和 Agent 流式事件 |
-| 配置校验 | Zod（`zod`） | `^4.4.3` | 模型、Sandbox、MCP、集群、认证、权限、Hook 等配置 Schema |
-| 日志 | Pino（`pino`） | `^10.3.1` | 结构化运行日志 |
-| Agent 编排 | LangChain Core（`@langchain/core`）、LangGraph（`@langchain/langgraph`） | `^1.1.48`、`^1.4.8` | 模型/消息基础契约、LangGraph Kernel、Checkpoint 驱动的运行恢复 |
-| 模型 SDK | Anthropic SDK（`@anthropic-ai/sdk`）、OpenAI SDK（`openai`） | `^0.104.2`、`^6.43.0` | Anthropic/OpenAI 协议模型适配 |
-| 扩展协议 | Model Context Protocol SDK（`@modelcontextprotocol/sdk`） | `^1.29.0` | stdio、SSE、HTTP MCP Server 连接与工具投影 |
-| 认证与令牌 | JOSE（`jose`）、OpenID Client（`openid-client`） | `^6.2.3`、`^6.8.4` | JWT/JWKS、OIDC 登录与回调 |
-| 数据访问 | `mysql2`、Kysely（`kysely`） | `^3.22.5`、`^0.29.2` | MySQL 连接、事务和类型化 SQL；无 MySQL 时可使用仓库内 MemoryStore |
-| 调度 | `cron-parser` | `^5.5.0` | Cron 校验和下次执行时间计算，任务领取与记录由 Store 实现 |
-| 沙箱 | Alibaba OpenSandbox（`@alibaba-group/opensandbox`）、E2B Code Interpreter（`@e2b/code-interpreter`）、E2B Desktop（`@e2b/desktop`） | `^0.1.9`、`^2.6.0`、`^2.3.1` | OpenSandbox/E2B 代码执行与桌面浏览器能力；AIOS Lifecycle 复用 E2B Provider；另有仓库内 Local Provider |
+| 类别 | 技术、组件与包名 | 用途和运行边界 |
+| --- | --- | --- |
+| 运行平台 | Node.js、TypeScript（`typescript`）、tsx（`tsx`） | Node.js ESM 后端；TypeScript 负责类型检查，tsx 用于开发和直接运行 TypeScript |
+| HTTP 与流式协议 | Node.js `http`、SSE | Node.js 内建能力；承载 `/healthz`、`/readyz`、认证、`/v1/**` JSON API 和 Agent 流式事件 |
+| 配置校验 | Zod（`zod`） | 校验模型、Sandbox、MCP、集群、认证、权限、Hook 等配置 Schema；边界在进程启动和设置更新入口 |
+| 日志 | Pino（`pino`） | 输出结构化运行日志；审计事件由仓库内 AuditSink/Store 单独持久化 |
+| Agent 编排 | LangChain Core（`@langchain/core`）、LangGraph（`@langchain/langgraph`） | 提供模型/消息基础契约和 LangGraph Kernel；兼容 Legacy Kernel 仍由仓库内实现维护 |
+| 模型 SDK | Anthropic SDK（`@anthropic-ai/sdk`）、OpenAI SDK（`openai`） | 适配 Anthropic/OpenAI 协议；中立消息与模型调用边界由 `src/model/**` 封装 |
+| 扩展协议 | Model Context Protocol SDK（`@modelcontextprotocol/sdk`） | 连接 stdio、SSE、HTTP MCP Server 并投影工具；生命周期由 McpManager 管理 |
+| 认证与令牌 | JOSE（`jose`）、OpenID Client（`openid-client`） | 处理 JWT/JWKS 和 OIDC 登录回调；授权与租户边界由仓库内 RBAC 和 RequestContext 负责 |
+| 数据访问 | `mysql2`、Kysely（`kysely`） | 提供 MySQL 连接、事务和类型化 SQL；无 MySQL 时可使用仓库内 MemoryStore |
+| 调度 | `cron-parser` | 校验 Cron 并计算下次执行时间；任务领取、隔离和运行记录由 Store 实现 |
+| 沙箱 | Alibaba OpenSandbox（`@alibaba-group/opensandbox`）、E2B Code Interpreter（`@e2b/code-interpreter`）、E2B Desktop（`@e2b/desktop`） | 提供 OpenSandbox/E2B 代码执行和桌面能力；AIOS Lifecycle 复用 E2B Provider，另有仓库内 Local Provider |
 
 ### Web 运行栈
 
-| 类别 | 技术或组件 | 仓库版本 | 实际用途 |
-| --- | --- | --- | --- |
-| UI 框架 | React（`react`）、React DOM（`react-dom`） | `^19.2.0`、`^19.2.0` | 单页 Web 应用和交互状态 |
-| 无障碍基础组件 | Radix UI（`@radix-ui/react-label`、`@radix-ui/react-scroll-area`、`@radix-ui/react-select`、`@radix-ui/react-separator`、`@radix-ui/react-slot`、`@radix-ui/react-tabs`、`@radix-ui/react-tooltip`） | `^2.1.8`、`^1.2.10`、`^2.2.6`、`^1.1.8`、`^1.2.4`、`^1.1.13`、`^1.2.8` | 表单、选择、标签页、提示和布局原语 |
-| 样式组合 | `tailwindcss`、`tailwindcss-animate`、`tailwind-merge`、`class-variance-authority`、`clsx` | `^3.4.19`、`^1.0.7`、`^3.4.0`、`^0.7.1`、`^2.1.1` | 原子样式、动画、类名合并和组件变体 |
-| 图标 | Lucide React（`lucide-react`） | `^0.562.0` | Web 图标系统 |
-| Markdown 与代码 | React Markdown（`react-markdown`）、`remark-gfm`、`rehype-highlight`、`highlight.js` | `^10.1.0`、`^4.0.1`、`^7.0.2`、`^11.11.1` | 对话 Markdown、GFM 和代码高亮 |
-| 图表 | Mermaid（`mermaid`） | `^11.16.0` | 对话及设计内容中的 Mermaid 图渲染 |
-| 构建 | Vite（`vite`）、React Plugin（`@vitejs/plugin-react`）、TypeScript（`typescript`）、PostCSS（`postcss`）、Autoprefixer（`autoprefixer`） | `^7.2.4`、`^5.1.1`、`~5.9.3`、`^8.5.6`、`^10.4.23` | Web 开发服务器、类型构建、打包和 CSS 处理 |
+| 类别 | 技术、组件与包名 | 用途和运行边界 |
+| --- | --- | --- |
+| UI 框架 | React（`react`）、React DOM（`react-dom`） | 构建单页 Web 应用和交互状态；服务端业务状态仍以 HTTP API 和 Store 为准 |
+| 无障碍基础组件 | Radix UI（`@radix-ui/react-label`、`@radix-ui/react-scroll-area`、`@radix-ui/react-select`、`@radix-ui/react-separator`、`@radix-ui/react-slot`、`@radix-ui/react-tabs`、`@radix-ui/react-tooltip`） | 提供表单、选择、标签页、提示和布局原语；业务组合由 Web 组件负责 |
+| 样式组合 | `tailwindcss`、`tailwindcss-animate`、`tailwind-merge`、`class-variance-authority`、`clsx` | 提供原子样式、动画、类名合并和组件变体，不承载业务状态 |
+| 图标 | Lucide React（`lucide-react`） | 提供 Web 图标系统 |
+| Markdown 与代码 | React Markdown（`react-markdown`）、`remark-gfm`、`rehype-highlight`、`highlight.js` | 渲染对话 Markdown、GFM 和代码高亮；内容仍按 Web 渲染安全策略处理 |
+| 图表 | Mermaid（`mermaid`） | 渲染对话及设计内容中的 Mermaid 图 |
+| 构建 | Vite（`vite`）、React Plugin（`@vitejs/plugin-react`）、TypeScript（`typescript`）、PostCSS（`postcss`）、Autoprefixer（`autoprefixer`） | 提供 Web 开发服务器、类型构建、打包和 CSS 处理，仅在前端构建链路使用 |
 
 ### 测试与部署
 
-| 类别 | 技术或组件 | 仓库版本或入口 | 实际用途 |
-| --- | --- | --- | --- |
-| 单元与集成测试 | Vitest（`vitest`）、Node.js 类型定义（`@types/node`） | `^4.1.9`、`^25.9.3` | 后端与跨模块回归测试 |
-| Checkpoint 兼容验证 | LangGraph Checkpoint Validation（`@langchain/langgraph-checkpoint-validation`） | `^1.1.0` | MySQL Checkpoint Saver 协议验证 |
-| Web 类型定义 | `@types/node`、`@types/react`、`@types/react-dom` | `^24.10.1`、`^19.2.5`、`^19.2.3` | Web 构建期类型支持 |
-| 数据库 | MySQL | `deploy/dev-k8s/mysql.yaml` 或外部实例 | 会话、用户、设置、调度、审计、Checkpoint 与 durable run 持久化 |
-| 容器与编排 | Docker、Kubernetes、Nginx | `Dockerfile`、`web/Dockerfile`、`deploy/k8s/**` | 生产清单中每个 Pod 包含 Web/Nginx 8080 与 API 8081 两个容器，后端通过环境变量内嵌调度器 |
-| 沙箱工作负载 | OpenSandbox 镜像与 Kubernetes 资源 | `deploy/opensandbox/**` | 浏览器、网络诊断、ServiceAccount 与运行模板 |
+| 类别 | 技术、组件与入口 | 用途和运行边界 |
+| --- | --- | --- |
+| 单元与集成测试 | Vitest（`vitest`）、Node.js 类型定义（`@types/node`） | 执行后端与跨模块回归测试；测试边界位于 `tests/**` |
+| Checkpoint 兼容验证 | LangGraph Checkpoint Validation（`@langchain/langgraph-checkpoint-validation`） | 验证 MySQL Checkpoint Saver 协议，不替代业务级 Agent Run 恢复测试 |
+| Web 类型定义 | `@types/node`、`@types/react`、`@types/react-dom` | 提供 Web 构建期类型支持，不进入浏览器运行包 |
+| 数据库 | MySQL；`deploy/dev-k8s/mysql.yaml` 或外部实例 | 持久化会话、用户、设置、调度、审计、Checkpoint 与 Agent Run；生产环境依赖外部数据库运维边界 |
+| 容器与编排 | Docker、Kubernetes、Nginx；`Dockerfile`、`web/Dockerfile`、`deploy/k8s/**` | 生产 Pod 包含 Web/Nginx 8080 与 API 8081 两个容器，后端通过环境变量内嵌调度器 |
+| 沙箱工作负载 | OpenSandbox 镜像与 Kubernetes 资源；`deploy/opensandbox/**` | 提供浏览器、网络诊断、ServiceAccount 与运行模板；权限边界由模板和 Kubernetes RBAC 决定 |
 
-Web 的产品入口由 `web/src/app-data.ts` 明确为聊天、运行中心、技能、MCP、定时任务、沙箱环境、用户管理和设置；用户管理带管理员可见性限制。生产依赖与开发依赖的完整版本仍以两个 `package.json` 为准，本文用于说明它们在系统中的角色。
+Web 的产品入口由 `web/src/app-data.ts` 明确为聊天、运行中心、技能、MCP、定时任务、沙箱环境、用户管理和设置；用户管理带管理员可见性限制。生产依赖与开发依赖的组件集合和版本均以两个 `package.json` 为准，本文只说明它们在系统中的角色和边界。
 
 ## 事实来源与证据规则
 
@@ -116,14 +116,14 @@ Web 的产品入口由 `web/src/app-data.ts` 明确为聊天、运行中心、�
 - `src/server/http.ts` 定义健康检查、认证、Agent/SSE、Run Center、会话、工具、Skill、MCP、沙箱、设置、审批、问题、调度、审计和管理 API。
 - `src/db/store.ts` 定义租户过滤的会话、durable interaction、工具账本、Agent Run/lease、审计、调度、用户、凭据和设置契约。
 - `src/config/schema.ts` 定义 Anthropic/OpenAI 模型、三类 MCP transport、三种 Sandbox Provider、仅支持 E2B 的 AIOS Lifecycle 集成约束、Local/OIDC/AIOS 认证、RBAC 角色、权限规则、Hook、下载和集群配置。
-- `tests/**` 覆盖 Agent 行为与 Kernel parity、Run 协调和恢复、上下文、模型网关、工具策略、Skill/MCP、Sandbox、认证与 RBAC、Store/Checkpoint、调度、HTTP、下载、部署清单和 Web Run Center 等边界。
+- `tests/**` 覆盖 Agent 行为与 Kernel parity、Agent Run 协调和恢复、上下文、模型网关、工具策略、Skill/MCP、Sandbox、认证与 RBAC、Store/Checkpoint、调度、HTTP、下载、部署清单和 Web Run Center 等边界。
 
 无法由上述来源确认的内容不得写成现状。设想、替代方案和未落地能力只能进入[演进路线](./11-evolution-roadmap.md)，并明确标为建议而非实现。
 
 ## 维护规则
 
 - 影响模块职责、公共 API、持久化 Schema、配置字段、安全边界、部署拓扑或关键失败语义的代码变更，必须同步更新对应设计文档。
-- 新增、移除或升级依赖时，以 `package.json`、`web/package.json` 为版本真源逐项核对并同步技术栈矩阵，同时记录用途、封装位置、关键约束和替换影响。
+- 新增、移除或升级依赖时，以 `package.json`、`web/package.json` 为版本真源同步技术栈矩阵；CI/文档校验使用 `npm pkg get engines dependencies devDependencies` 和 `npm --prefix web pkg get dependencies devDependencies` 核对组件集合，不依赖文档内复制版本范围。
 - 新增数据库迁移时，更新数据设计中的迁移清单、实体关系、回滚/兼容说明，并调整本文的迁移范围。
 - 新增 Web 一级页面、HTTP API、运行模式或 Sandbox Provider 时，更新本文的导航/源码映射及对应专题文档。
 - 当前实现和演进建议必须分段表达；兼容代码、可选 Provider 和部署差异需注明启用条件。
