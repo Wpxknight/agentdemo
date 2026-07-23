@@ -12,7 +12,7 @@
 | 2 | [Agent Runtime](./02-agent-runtime.md) | Runtime 组装、Legacy/LangGraph Kernel、Run 协调、Checkpoint、恢复、取消、交互与工具账本 |
 | 3 | [模型与上下文](./03-model-and-context.md) | Anthropic/OpenAI 适配、消息契约、提示词、上下文压缩、图片保留、Token 与成本统计 |
 | 4 | [工具、Skill 与 MCP](./04-tools-skills-mcp.md) | 工具注册与 Broker、权限与审批、Hook、内置工具、Skill 生命周期、MCP 连接与热管理 |
-| 5 | [沙箱与运维能力](./05-sandbox-and-ops.md) | Local/E2B/OpenSandbox/AIOS Provider、运行代际、Profile、预热池、桌面浏览器、文件导出、kubectl |
+| 5 | [沙箱与运维能力](./05-sandbox-and-ops.md) | Local/E2B/OpenSandbox Provider、依附 E2B 兼容路径的 AIOS Lifecycle/模板目录集成、运行代际、Profile、预热池、桌面浏览器、文件导出、kubectl |
 | 6 | [认证、安全与多租户](./06-auth-security-tenancy.md) | Local/OIDC/AIOS 登录、JWT、RBAC、租户与用户隔离、凭据、SSRF、下载与嵌入安全 |
 | 7 | [数据与持久化](./07-data-and-persistence.md) | Store 契约、Memory/MySQL、0001–0014 迁移、会话、Run、Checkpoint、设置与审计数据 |
 | 8 | [调度器](./08-scheduler.md) | 内嵌/独立调度模式、Cron、到期任务领取、无人值守策略、运行记录与超时 |
@@ -63,7 +63,7 @@
 | 认证与令牌 | JOSE、openid-client | `^6.2.3`、`^6.8.4` | JWT/JWKS、OIDC 登录与回调 |
 | 数据访问 | MySQL 2、Kysely | `^3.22.5`、`^0.29.2` | MySQL 连接、事务和类型化 SQL；无 MySQL 时可使用仓库内 MemoryStore |
 | 调度 | cron-parser | `^5.5.0` | Cron 校验和下次执行时间计算，任务领取与记录由 Store 实现 |
-| 沙箱 | Alibaba OpenSandbox、E2B Code Interpreter、E2B Desktop | `^0.1.9`、`^2.6.0`、`^2.3.1` | OpenSandbox/E2B/AIOS 生命周期适配、代码执行与桌面浏览器能力；另有仓库内 Local Provider |
+| 沙箱 | Alibaba OpenSandbox、E2B Code Interpreter、E2B Desktop | `^0.1.9`、`^2.6.0`、`^2.3.1` | OpenSandbox/E2B 代码执行与桌面浏览器能力；AIOS Lifecycle 与模板目录通过 E2B Provider 的兼容路径接入；另有仓库内 Local Provider |
 
 ### Web 运行栈
 
@@ -107,7 +107,7 @@ Web 的产品入口由 `web/src/app-data.ts` 明确为聊天、运行中心、�
 - `src/index.ts` 定义 `serve`、`scheduler`、`seed-admin` 和 CLI 单次任务入口，以及 SIGINT/SIGTERM 关闭流程。
 - `src/server/http.ts` 定义健康检查、认证、Agent/SSE、Run Center、会话、工具、Skill、MCP、沙箱、设置、审批、问题、调度、审计和管理 API。
 - `src/db/store.ts` 定义租户过滤的会话、durable interaction、工具账本、Agent Run/lease、审计、调度、用户、凭据和设置契约。
-- `src/config/schema.ts` 定义 Anthropic/OpenAI 模型、三类 MCP transport、Local/E2B/OpenSandbox Provider 与 AIOS 生命周期约束、Local/OIDC/AIOS 认证、RBAC 角色、权限规则、Hook、下载和集群配置。
+- `src/config/schema.ts` 定义 Anthropic/OpenAI 模型、三类 MCP transport、Local/E2B/OpenSandbox Provider、仅可依附 E2B 的 AIOS Lifecycle/模板目录集成约束、Local/OIDC/AIOS 认证、RBAC 角色、权限规则、Hook、下载和集群配置。
 - `tests/**` 覆盖 Agent 行为与 Kernel parity、Run 协调和恢复、上下文、模型网关、工具策略、Skill/MCP、Sandbox、认证与 RBAC、Store/Checkpoint、调度、HTTP、下载、部署清单和 Web Run Center 等边界。
 
 无法由上述来源确认的内容不得写成现状。设想、替代方案和未落地能力只能进入[演进路线](./11-evolution-roadmap.md)，并明确标为建议而非实现。
