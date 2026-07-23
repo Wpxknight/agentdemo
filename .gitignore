@@ -6,6 +6,7 @@ dist/
 config.jsonc
 coverage/
 .DS_Store
+.idea/
 .codegraph/
 .aios-team.txt
 __pycache__/
