@@ -14,15 +14,15 @@
 - Clicking a chapter never changes course progress or `state.current`.
 - Invalid, unknown, or missing chapter resources retain 400/404 behavior.
 - Existing viewer accessibility, SSE refresh, mobile layout, previews, and copy controls remain intact.
-- Temporary runtime data remains under `dist`; skill source remains under `/home/lb/.codex/skills/teaching-code`.
+- Temporary runtime data remains under `dist`; skill source remains under `/home/lb/.codex/skills/code-teacher`.
 
 ---
 
 ### Task 1: Make every generated chapter readable
 
 **Files:**
-- Modify: `/home/lb/.codex/skills/teaching-code/tests/teaching-server.test.mjs`
-- Modify: `/home/lb/.codex/skills/teaching-code/scripts/teaching-server.mjs`
+- Modify: `/home/lb/.codex/skills/code-teacher/tests/teaching-server.test.mjs`
+- Modify: `/home/lb/.codex/skills/code-teacher/scripts/teaching-server.mjs`
 
 **Interfaces:**
 - Consumes: `GET /api/chapters/:id`, parsed chapters from `outline.md`.
@@ -34,7 +34,7 @@ Rename the test to `serves every outlined chapter and blocks traversal`, assert 
 
 - [x] **Step 2: Run the focused test and verify RED**
 
-Run: `node --test --test-name-pattern='serves every outlined chapter' /home/lb/.codex/skills/teaching-code/tests/teaching-server.test.mjs`
+Run: `node --test --test-name-pattern='serves every outlined chapter' /home/lb/.codex/skills/code-teacher/tests/teaching-server.test.mjs`
 
 Expected: FAIL because `/api/chapters/1.3` returns 403.
 
@@ -55,11 +55,11 @@ Expected: PASS.
 ### Task 2: Make every directory entry selectable and document the contract
 
 **Files:**
-- Modify: `/home/lb/.codex/skills/teaching-code/tests/teaching-server.test.mjs`
-- Modify: `/home/lb/.codex/skills/teaching-code/assets/teaching.js`
-- Modify: `/home/lb/.codex/skills/teaching-code/assets/teaching.css`
-- Modify: `/home/lb/.codex/skills/teaching-code/references/viewer-contract.md`
-- Modify: `/home/lb/.codex/skills/teaching-code/SKILL.md`
+- Modify: `/home/lb/.codex/skills/code-teacher/tests/teaching-server.test.mjs`
+- Modify: `/home/lb/.codex/skills/code-teacher/assets/teaching.js`
+- Modify: `/home/lb/.codex/skills/code-teacher/assets/teaching.css`
+- Modify: `/home/lb/.codex/skills/code-teacher/references/viewer-contract.md`
+- Modify: `/home/lb/.codex/skills/code-teacher/SKILL.md`
 - Modify: `/opt/develop/aicoding/aiop/dist/code-teaching-outline.md`
 - Modify: `/opt/develop/aicoding/aiop/dist/code-teaching/outline.md`
 
@@ -82,7 +82,7 @@ assert.match(skill, /browsing.*does not.*advance.*progress/is);
 
 - [x] **Step 2: Run the contract test and verify RED**
 
-Run: `node --test --test-name-pattern='all generated chapters selectable' /home/lb/.codex/skills/teaching-code/tests/teaching-server.test.mjs`
+Run: `node --test --test-name-pattern='all generated chapters selectable' /home/lb/.codex/skills/code-teacher/tests/teaching-server.test.mjs`
 
 Expected: FAIL because pending buttons are disabled and the skill promises access restrictions.
 
@@ -103,7 +103,7 @@ Expected: PASS.
 ### Task 3: Verify the complete skill and existing AIoP course
 
 **Files:**
-- Verify: `/home/lb/.codex/skills/teaching-code/tests/teaching-server.test.mjs`
+- Verify: `/home/lb/.codex/skills/code-teacher/tests/teaching-server.test.mjs`
 - Verify: `/opt/develop/aicoding/aiop/dist/code-teaching/chapters/*.md`
 
 **Interfaces:**
@@ -112,7 +112,7 @@ Expected: PASS.
 
 - [x] **Step 1: Run the complete skill test suite**
 
-Run: `node --test /home/lb/.codex/skills/teaching-code/tests/teaching-server.test.mjs`
+Run: `node --test /home/lb/.codex/skills/code-teacher/tests/teaching-server.test.mjs`
 
 Expected: all tests pass with zero failures.
 
@@ -122,7 +122,7 @@ Run:
 
 ```bash
 for lesson in dist/code-teaching/chapters/*.md; do
-  node /home/lb/.codex/skills/teaching-code/scripts/validate-lesson.mjs "$lesson"
+  node /home/lb/.codex/skills/code-teacher/scripts/validate-lesson.mjs "$lesson"
 done
 ```
 
