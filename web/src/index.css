@@ -4729,6 +4729,7 @@ textarea:focus-visible,
 .run-detail-metrics div:nth-last-child(-n+2) { border-bottom: 0; }
 .run-detail-metrics dt { color: #909399; font-size: 11px; }
 .run-detail-metrics dd { margin-top: 3px; overflow: hidden; color: #303133; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.run-detail-tabs [data-slot="tabs-list"] { width: 100%; justify-content: flex-start; overflow-x: auto; }
 .run-detail-tabs [data-slot="tabs-content"] { margin-top: 14px; }
 .run-timeline { position: relative; padding-left: 4px; }
 .run-timeline-item { display: grid; grid-template-columns: 14px 1fr; gap: 9px; min-height: 52px; }

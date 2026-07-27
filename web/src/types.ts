@@ -123,18 +123,50 @@ export interface TaskRun {
 
 export type AgentRunStatus = 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'recovery_required';
 
+export interface AgentRunUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  costUsd?: number;
+}
+
+export interface AgentRunAttemptSummary {
+  attemptId: string;
+  kernel: string;
+  kernelVersion: string;
+  status: string;
+  errorCode?: string;
+  startedAt: string;
+  completedAt?: string;
+}
+
+export interface AgentRunTurnSummary {
+  attemptId: string;
+  turnNo: number;
+  commitId: string;
+  transcriptVersion: number;
+  stopReason?: string;
+  usage: AgentRunUsage;
+  eventSequenceEnd: number;
+  committedAt: string;
+}
+
 export interface AgentRunSummary {
   tenantId: string;
   userId: string;
   sessionId: string;
   runId: string;
   kernel: 'pi' | 'legacy' | 'langgraph';
+  kernelVersion?: string;
+  runtimeVersion?: string;
   graphName: string;
   graphVersion: string;
   status: AgentRunStatus;
+  waitingReason?: 'approval' | 'question' | 'plan' | 'external';
   currentNode?: string;
   stepCount: number;
-  usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; costUsd?: number };
+  usage: AgentRunUsage;
   errorMessage?: string;
   createdAt: string;
   startedAt?: string;
@@ -144,6 +176,8 @@ export interface AgentRunSummary {
   leaseToken: number;
   leaseExpiresAt?: string;
   leaseActive: boolean;
+  attemptSummary?: { count: number; latest?: AgentRunAttemptSummary };
+  turnSummary?: { count: number; latest?: AgentRunTurnSummary };
 }
 
 export interface AgentRunEventBody {
@@ -168,6 +202,8 @@ export interface AgentRunDetailBody {
   events: AgentRunEventBody[];
   interactions: Array<{ id: string; kind: string; status: string; createdAt: string; resolvedAt?: string }>;
   tools: Array<{ toolCallId: string; toolName: string; status: string; startedAt: string; completedAt?: string }>;
+  attempts: AgentRunAttemptSummary[];
+  turns: AgentRunTurnSummary[];
   canCancel: boolean;
   canResume: boolean;
   recoveryBlockedReason?: string;

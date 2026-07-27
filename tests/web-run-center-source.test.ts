@@ -29,6 +29,24 @@ describe('Run Center web UI contract', () => {
     }
   });
 
+  it('renders durable Attempt and committed Turn summaries returned by the Run Center API', () => {
+    const types = source('web/src/types.ts');
+    const page = source('web/src/components/run-center-page.tsx');
+    for (const field of ['attemptSummary', 'turnSummary', 'attempts:', 'turns:']) {
+      expect(types).toContain(field);
+    }
+    for (const label of ['Attempts', 'Committed Turns', 'Attempt 数', 'Turn 数']) {
+      expect(page).toContain(label);
+    }
+    expect(page).toContain('detail.attempts.map');
+    expect(page).toContain('detail.turns.map');
+  });
+
+  it('keeps the expanded Run detail tabs usable in the narrow detail pane', () => {
+    const css = source('web/src/index.css');
+    expect(css).toMatch(/\.run-detail-tabs \[data-slot="tabs-list"\][^{]*\{[^}]*width:\s*100%[^}]*overflow-x:\s*auto/);
+  });
+
   it('polls non-terminal runs every five seconds', () => {
     const page = source('web/src/components/run-center-page.tsx');
     expect(page).toContain('NON_TERMINAL');

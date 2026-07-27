@@ -137,7 +137,7 @@ export function RunCenterPage({ api }: { api: RunCenterApi }) {
                     <TableCell><strong>{shortId(run.runId)}</strong><small>{run.sessionId}</small></TableCell>
                     <TableCell>{run.graphName}<small>{run.graphVersion} · {run.kernel}</small></TableCell>
                     <TableCell>{run.currentNode ?? '-'}</TableCell>
-                    <TableCell>{run.stepCount}</TableCell>
+                    <TableCell>{run.stepCount}<small>A {run.attemptSummary?.count ?? 0} · T {run.turnSummary?.count ?? 0}</small></TableCell>
                     <TableCell>{formatTokens(totalTokens(run))}</TableCell>
                     <TableCell>{formatDuration(run)}</TableCell>
                   </TableRow>
@@ -179,10 +179,13 @@ function RunDetail({ detail, busy, onCancel, onResume }: { detail: AgentRunDetai
       <div><dt>Graph</dt><dd>{run.graphName} / {run.graphVersion}</dd></div><div><dt>当前节点</dt><dd>{run.currentNode ?? '-'}</dd></div>
       <div><dt>步骤</dt><dd>{run.stepCount}</dd></div><div><dt>Token</dt><dd>{formatTokens(totalTokens(run))}</dd></div>
       <div><dt>耗时</dt><dd>{formatDuration(run)}</dd></div><div><dt>租约</dt><dd>{run.leaseActive ? '活动' : '已释放'}</dd></div>
+      <div><dt>Attempt 数</dt><dd>{detail.attempts.length}</dd></div><div><dt>Turn 数</dt><dd>{detail.turns.length}</dd></div>
     </dl>
     <Tabs defaultValue="timeline" className="run-detail-tabs">
-      <TabsList><TabsTrigger value="timeline">Timeline</TabsTrigger><TabsTrigger value="interactions">交互 ({detail.interactions.length})</TabsTrigger><TabsTrigger value="tools">工具执行 ({detail.tools.length})</TabsTrigger></TabsList>
+      <TabsList><TabsTrigger value="timeline">Timeline</TabsTrigger><TabsTrigger value="attempts">Attempts ({detail.attempts.length})</TabsTrigger><TabsTrigger value="turns">Committed Turns ({detail.turns.length})</TabsTrigger><TabsTrigger value="interactions">交互 ({detail.interactions.length})</TabsTrigger><TabsTrigger value="tools">工具执行 ({detail.tools.length})</TabsTrigger></TabsList>
       <TabsContent value="timeline"><div className="run-timeline">{detail.events.map((event, index) => <div className="run-timeline-item" key={event.id ?? `${event.createdAt}-${index}`}><span /><div><strong>{event.node ?? event.type}</strong><Badge variant="outline">{event.status ?? event.type}</Badge><small>{formatDateTime(event.createdAt)}</small></div></div>)}{!detail.events.length ? <p>暂无 Timeline 事件</p> : null}</div></TabsContent>
+      <TabsContent value="attempts"><CompactRows empty="暂无 Attempt" rows={detail.attempts.map((item) => [`${shortId(item.attemptId)} · ${item.kernel}@${item.kernelVersion}`, item.status, formatDateTime(item.startedAt)])} /></TabsContent>
+      <TabsContent value="turns"><CompactRows empty="暂无已提交 Turn" rows={detail.turns.map((item) => [`Turn ${item.turnNo} · ${shortId(item.commitId)}`, item.stopReason ?? '-', formatDateTime(item.committedAt)])} /></TabsContent>
       <TabsContent value="interactions"><CompactRows empty="暂无交互" rows={detail.interactions.map((item) => [item.kind, item.status, formatDateTime(item.createdAt)])} /></TabsContent>
       <TabsContent value="tools"><CompactRows empty="暂无工具执行" rows={detail.tools.map((item) => [item.toolName, item.status, formatDateTime(item.startedAt)])} /></TabsContent>
     </Tabs>

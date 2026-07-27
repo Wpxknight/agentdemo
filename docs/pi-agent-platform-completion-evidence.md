@@ -30,7 +30,7 @@ Pi Agent Platform 的仓库开发范围已覆盖 Durable Run/Attempt/Turn、Pi K
 | AIOP Durable Pi product Tool Runtime | `b6fe2db3` |
 | HTTP interaction auto-resume | `a2cd36ca` |
 
-最终交付审计、共享模型并发控制和本文档的收口由本分支后续提交记录。
+最终交付审计、共享模型并发控制、Run Center Attempt/Turn 展示和本文档的收口由本分支后续提交记录。
 
 ## 并发与配额
 
@@ -94,6 +94,12 @@ npx vitest run --reporter=verbose tests/durable-runtime.test.ts tests/memory-run
 
 公共包输出 `dist/index.js` 与 `dist/index.d.ts`，API snapshots 位于 `/home/opt/develop/aicoding/aiop/docs/public-api`。`verify:packages` 会构建全部包、检查 API diff、执行 `npm pack --dry-run` 和真实 pack，并在临时非 AIOP 项目安装/导入全部 tarball；tarball 中不得包含 `src/`，跨包依赖必须声明。
 
+## Run Center Web
+
+- 列表直接展示后端返回的 Attempt/Turn 数量摘要，详情指标展示完整数量。
+- 详情页提供 `Attempts` 与 `Committed Turns` 标签，展示 Attempt 状态、Kernel 版本、Turn 编号、Commit、stop reason 和持久化时间。
+- 标签栏在窄详情面板内横向滚动；源码合约、Web production build，以及 headless Chrome 桌面/窄屏渲染与实际标签点击均已验证。
+
 ## CI、部署与可复现镜像
 
 - `/home/opt/develop/aicoding/aiop/.gitlab-ci.yml` 使用 Node 24 执行 Node、Agent Platform、typecheck、全量测试、Web build、依赖审计和公共包门禁。
@@ -111,12 +117,12 @@ npx vitest run --reporter=verbose tests/durable-runtime.test.ts tests/memory-run
 | `make verify-node` | Node 24.13.0，满足 `>=22.19.0` |
 | `make test-agent-platform` | 12 files、83 tests 通过；随后包构建/API/tarball 门禁通过 |
 | `npm run typecheck` | 通过 |
-| `npm test` | 71 files；664 passed、1 skipped |
+| `npm test` | 71 files；666 passed、1 skipped |
 | `npm --prefix web run build` | TypeScript 与 Vite production build 通过；存在既有大 chunk warning |
 | `npm audit --audit-level=high` | 退出 0；0 high/critical，5 moderate，均为已记录的 Pi → Google GenAI → MCP SDK → Hono 链且当前无修复 |
 | `npm run verify:packages` | 全部公共包 build、API snapshot、pack、临时项目安装与动态 import 通过 |
 | `git diff --check` | 通过 |
-| `make image` | 退出 0；builder 内生成公共包 dist，镜像 `aiop:pi-agent-platform` 构建成功，容器公共包 import 输出 `workspace-ok`，容器 Node 24.13.0 通过基线 |
+| `make image` | 退出 0；builder 内生成公共包 dist，镜像 `aiop:pi-agent-platform` 构建成功，容器公共包 import 输出 `workspace-ok`，容器 Node 24.18.0 通过基线 |
 
 Docker 构建期间同样报告 5 个 moderate 漏洞以及待 allowScripts 复核的 `@google/genai`、`esbuild`、`protobufjs` 安装脚本；本次构建没有把这些警告误记为 high/critical 或伪造为已修复。
 
