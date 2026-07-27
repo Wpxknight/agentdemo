@@ -91,10 +91,10 @@
 - Replace: `/home/opt/develop/aicoding/aiop/packages/sandbox-e2b/src/index.ts`
 - Test: `/home/opt/develop/aicoding/aiop/tests/sandbox-platform-packages.test.ts`
 
-- [ ] Add failing SDK-factory tests for acquire, streaming execute, upload, download, timeout, release, tenant metadata, and path safety through each public package root.
-- [ ] Implement `OpenSandboxProvider` directly with `@alibaba-group/opensandbox`, injected connection settings, safe metadata, and byte file transfer.
-- [ ] Implement `E2BSandboxProvider` directly with `@e2b/code-interpreter`, injected API/domain/template settings, streamed commands, byte file transfer, and kill-on-release.
-- [ ] Keep credentials in constructor/factory inputs and never copy them into `SandboxHandle` or Runtime snapshots.
+- [x] Add failing SDK-factory tests for acquire, streaming execute, upload, download, timeout, release, tenant metadata, and path safety through each public package root.
+- [x] Implement `OpenSandboxProvider` directly with `@alibaba-group/opensandbox`, injected connection settings, safe metadata, and byte file transfer.
+- [x] Implement `E2BSandboxProvider` directly with `@e2b/code-interpreter`, injected API/domain/template settings, streamed commands, byte file transfer, and kill-on-release.
+- [x] Keep credentials in constructor/factory inputs and never copy them into `SandboxHandle` or Runtime snapshots.
 - [ ] Commit with the required AIOS co-author trailer.
 
 ### Task 6: Replay/dry-run semantics and rollout evidence
