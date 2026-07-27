@@ -14,35 +14,8 @@ export class PiAIOPAgentKernel implements AgentKernel {
   readonly name = 'pi' as const;
 
   async run(options: RunAgentOptions): Promise<RunAgentResult> {
-    const modelProvider: ModelProvider = {
-      stream: (input) => adaptModel(options, input.system, input.messages, input.tools, input.signal),
-    };
-    const toolRuntime: ToolRuntime = {
-      execute: async (call) => {
-        const toolResult = await executeToolCall({ id: call.id, name: call.name, args: call.arguments }, {
-          tools: options.tools,
-          policy: options.policy,
-          ctx: options.ctx,
-          approval: options.approval,
-          hooks: options.hooks,
-          toolLedger: options.toolLedger,
-          runId: options.runId,
-          askUser: options.askUser,
-          requestPlanApproval: options.requestPlanApproval,
-          signal: options.signal,
-          guard: options.runGuard,
-          onEvent: (event) => {
-            if (event.type !== 'tool_result') options.onEvent?.(event);
-          },
-        });
-        return {
-          kind: 'result',
-          result: { callId: call.id, content: toolResult.content, isError: toolResult.isError },
-        };
-      },
-    };
-    const kernel = new PiAgentKernel({ modelProvider, toolRuntime, systemPrompt: options.system });
-    const messages = toKernelMessages(options.messages ?? [], options.task, options.taskContentBlocks);
+    const kernel = createPiPlatformKernel(options);
+    const messages = toPiKernelMessages(options.messages ?? [], options.task, options.taskContentBlocks);
     const exit = await kernel.run({
       runId: options.runId ?? `compat:${options.ctx.sessionId}`,
       attemptId: `compat:${Date.now()}`,
@@ -54,15 +27,15 @@ export class PiAIOPAgentKernel implements AgentKernel {
       },
       messages,
       model: { provider: 'aiop', model: options.model.id, contextWindowTokens: options.contextBudgetTokens },
-      tools: options.tools.defs().map((tool) => ({ ...tool, capability: capability(tool) })),
+      tools: piToolDefinitions(options),
       limits: { maxTurns: options.maxSteps },
       signal: options.signal,
     }, {
-      emit: async (event) => emitCompatEvent(event, options.onEvent),
+      emit: async (event) => emitPiCompatEvent(event, options.onEvent),
       guard: options.runGuard ?? (async () => undefined),
       shouldStopAfterTurn: async () => false,
     });
-    const resultMessages = fromKernelMessages(exit.messages);
+    const resultMessages = fromPiKernelMessages(exit.messages);
     return {
       messages: resultMessages,
       text: lastAssistantText(exit.messages) ?? '',
@@ -71,6 +44,42 @@ export class PiAIOPAgentKernel implements AgentKernel {
       compacted: false,
     };
   }
+}
+
+export function createPiPlatformKernel(options: RunAgentOptions): PiAgentKernel {
+  const modelProvider: ModelProvider = {
+    stream: (input) => adaptModel(options, input.system, input.messages, input.tools, input.signal),
+  };
+  const toolRuntime: ToolRuntime = {
+    execute: async (call) => {
+      const toolResult = await executeToolCall({ id: call.id, name: call.name, args: call.arguments }, {
+        tools: options.tools,
+        policy: options.policy,
+        ctx: options.ctx,
+        approval: options.approval,
+        hooks: options.hooks,
+        toolLedger: options.toolLedger,
+        runId: options.runId,
+        askUser: options.askUser,
+        requestPlanApproval: options.requestPlanApproval,
+        signal: options.signal,
+        guard: options.runGuard,
+        onEvent: (event) => {
+          if (event.type !== 'tool_result') options.onEvent?.(event);
+        },
+      });
+      return {
+        kind: 'result',
+        result: { callId: call.id, content: toolResult.content, isError: toolResult.isError },
+      };
+    },
+  };
+  return new PiAgentKernel({ modelProvider, toolRuntime, systemPrompt: options.system });
+}
+
+export function piToolDefinitions(options: RunAgentOptions) {
+  const defs = options.filterToolDefs?.(options.tools.defs()) ?? options.tools.defs();
+  return defs.map((tool) => ({ ...tool, capability: capability(tool) }));
 }
 
 async function* adaptModel(
@@ -82,7 +91,7 @@ async function* adaptModel(
 ): AsyncIterable<import('@aiop/agent-contracts').ModelStreamEvent> {
   for await (const event of options.model.stream({
     system,
-    messages: fromKernelMessages(messages),
+    messages: fromPiKernelMessages(messages),
     tools: tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema })),
     signal,
   })) {
@@ -102,7 +111,7 @@ async function* adaptModel(
   }
 }
 
-function toKernelMessages(
+export function toPiKernelMessages(
   messages: readonly Msg[], task?: string, taskBlocks?: RunAgentOptions['taskContentBlocks'],
 ): KernelMessage[] {
   const output: KernelMessage[] = messages.flatMap((message): KernelMessage[] => {
@@ -132,7 +141,7 @@ function toKernelMessages(
   return output;
 }
 
-function fromKernelMessages(messages: readonly KernelMessage[]): Msg[] {
+export function fromPiKernelMessages(messages: readonly KernelMessage[]): Msg[] {
   return messages.map((message): Msg => {
     if (message.role === 'user') return {
       role: 'user',
@@ -155,7 +164,7 @@ function capability(tool: ToolDef): 'read' | 'non_idempotent_write' {
   return /^(get|list|read|search|fetch|describe|query)(_|$)/i.test(tool.name) ? 'read' : 'non_idempotent_write';
 }
 
-function emitCompatEvent(event: KernelEvent, sink?: (event: StreamEvent) => void): void {
+export function emitPiCompatEvent(event: KernelEvent, sink?: (event: StreamEvent) => void): void {
   if (!sink) return;
   if (event.type === 'text_delta' || event.type === 'thinking_delta') sink(event);
   else if (event.type === 'tool_call') sink({

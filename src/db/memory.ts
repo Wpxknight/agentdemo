@@ -35,6 +35,7 @@ import type {
 } from './store.js';
 import { DEFAULT_SESSION_TITLE } from './store.js';
 import { nextRunAt } from '../scheduler/cron.js';
+import { MemoryRuntimeStore } from '@aiop/agent-runtime-core';
 
 interface MsgRow {
   tenantId: string;
@@ -62,6 +63,11 @@ function summarize(text: string | undefined, max = 48): string {
 
 /** 内存 Store：未配置 MySQL 时的回落实现，亦用于测试。租户隔离同样强制生效。 */
 export class MemoryStore implements Store {
+  private readonly durableRuntimeStore = new MemoryRuntimeStore();
+
+  agentRuntimeStore() {
+    return this.durableRuntimeStore;
+  }
   private messages: MsgRow[] = [];
   private sessions = new Map<string, SessionRow>();
   private audit: AuditEvent[] = [];
@@ -360,6 +366,15 @@ export class MemoryStore implements Store {
 
   async listAgentRunEvents(ctx: RequestContext, runId: string): Promise<AgentRunEvent[]> {
     if (!await this.getAgentRun(ctx, runId)) return [];
+    const durable = await this.durableRuntimeStore.events.list({ tenantId: ctx.tenantId, runId });
+    if (durable.length) return durable.map((event) => ({
+      tenantId: event.tenantId,
+      runId: event.runId,
+      sequence: Number(event.sequence),
+      type: event.type,
+      detail: event.detail,
+      createdAt: event.createdAt,
+    }));
     return this.agentRunEvents
       .filter((event) => event.tenantId === ctx.tenantId && event.runId === runId)
       .sort((a, b) => (a.id ?? 0) - (b.id ?? 0))
@@ -368,12 +383,29 @@ export class MemoryStore implements Store {
 
   async listAgentRunAttempts(ctx: RequestContext, runId: string) {
     if (!await this.getAgentRun(ctx, runId)) return [];
-    return [];
+    return (await this.durableRuntimeStore.attempts.list({ tenantId: ctx.tenantId, runId })).map((attempt) => ({
+      attemptId: attempt.attemptId,
+      kernel: attempt.kernel,
+      kernelVersion: attempt.kernelVersion,
+      status: attempt.status,
+      errorCode: attempt.errorCode,
+      startedAt: attempt.startedAt,
+      completedAt: attempt.completedAt,
+    }));
   }
 
   async listAgentRunTurns(ctx: RequestContext, runId: string) {
     if (!await this.getAgentRun(ctx, runId)) return [];
-    return [];
+    return (await this.durableRuntimeStore.turns.listCommitted({ tenantId: ctx.tenantId, runId })).map((turn) => ({
+      attemptId: turn.attemptId,
+      turnNo: turn.turnNo,
+      commitId: turn.commitId,
+      transcriptVersion: Number(turn.transcriptVersion),
+      stopReason: turn.stopReason,
+      usage: turn.usage,
+      eventSequenceEnd: Number(turn.eventSequenceEnd),
+      committedAt: turn.committedAt,
+    }));
   }
 
   async listAgentRunInteractions(ctx: RequestContext, runId: string): Promise<InteractionRecord[]> {

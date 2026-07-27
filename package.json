@@ -18,7 +18,7 @@
     "test": "vitest run --exclude 'dist/**'",
     "test:watch": "vitest",
     "verify:node": "tsx scripts/verify-node.ts",
-    "test:agent-platform": "vitest run tests/pi-*.test.ts tests/*runtime-store*.test.ts tests/durable-runtime.test.ts"
+    "test:agent-platform": "vitest run tests/pi-*.test.ts tests/agent-runtime.test.ts tests/*runtime-store*.test.ts tests/durable-runtime.test.ts"
   },
   "dependencies": {
     "@alibaba-group/opensandbox": "^0.1.9",

@@ -171,6 +171,10 @@ export class MysqlRuntimeStore implements RuntimeStore {
         .orderBy('transcript_version', 'desc').executeTakeFirst();
       return row ? mapCommit(row) : undefined;
     },
+    listCommitted: async (identity: RunIdentity): Promise<TurnCommit[]> => (await this.db
+      .selectFrom('agent_turn_commits').selectAll()
+      .where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId)
+      .orderBy('transcript_version', 'asc').execute()).map(mapCommit),
     commit: async (input: CommitTurnInput): Promise<TurnCommit> => {
       if (!this.transactionalView) return this.transaction((tx) => tx.turns.commit(input));
       await this.assertCommitLease(input.snapshot, input.leaseOwner, input.leaseToken, input.commit.committedAt);

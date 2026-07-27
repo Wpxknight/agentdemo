@@ -1,6 +1,6 @@
 # AIoP 设计文档
 
-本目录是 AIoP 现行设计文档的统一入口。文档基线为 `feature/langgraph-dev` 分支在 2026-07-23 的实现；代码、数据库迁移、配置 Schema、测试和部署清单是事实依据，本文负责导航，不替代源码契约。
+本目录是 AIoP 设计文档入口。2026-07-27 起 Agent Runtime 现行基线以 [12 Pi 集成与 Agent Platform 模块化设计](./12-pi-integration-plan.md) 和实际代码为准；较早章节中的 LangGraph 执行描述仅保留为历史设计背景。
 
 研发首次接触项目时，建议先阅读 [AIoP 代码走读：从启动到一次 Agent Run](../guide/code-walkthrough.md)，再按本文进入对应领域设计。
 
@@ -11,7 +11,7 @@
 | 顺序 | 文档 | 主要内容 |
 | --- | --- | --- |
 | 1 | [系统总览](./01-system-overview.md) | 产品边界、参与者、运行形态、总体组件、请求与数据路径、技术栈全景 |
-| 2 | [Agent Runtime](./02-agent-runtime.md) | Runtime 组装、Legacy/LangGraph Kernel、Agent Run 协调、Checkpoint、恢复、取消、交互与工具账本 |
+| 2 | [Agent Runtime](./02-agent-runtime.md) | 历史 Runtime 设计；现行 Pi/Durable Runtime 以第 12 章为准 |
 | 3 | [模型与上下文](./03-model-and-context.md) | Anthropic/OpenAI 适配、消息契约、提示词、上下文压缩、图片保留、Token 与成本统计 |
 | 4 | [工具、Skill 与 MCP](./04-tools-skills-mcp.md) | 工具注册与 Broker、权限与审批、Hook、内置工具、Skill 生命周期、MCP 连接与热管理 |
 | 5 | [沙箱与运维能力](./05-sandbox-and-ops.md) | Local/E2B/OpenSandbox Provider、AIOS Lifecycle（E2B 兼容集成）、运行代际、Profile、预热池、桌面浏览器、文件导出、kubectl |
@@ -41,7 +41,7 @@
 | 设计域 | 主要实现与事实入口 | 对应文档 |
 | --- | --- | --- |
 | 进程入口与 Runtime 组装 | `src/index.ts`、`src/runtime.ts`、`src/config/schema.ts` | [01 系统总览](./01-system-overview.md)、[02 Agent Runtime](./02-agent-runtime.md)、[10 部署与可观测性](./10-deployment-observability.md) |
-| Agent Kernel 与 Agent Run | `src/agent/runtime.ts`、`src/agent/kernel.ts`、`src/agent/legacy-kernel.ts`、`src/agent/langgraph/kernel.ts`、`src/agent/run-coordinator.ts`、`src/agent/services/**`、`src/agent/tool-ledger/**` | [02 Agent Runtime](./02-agent-runtime.md) |
+| Agent Kernel 与 Agent Run | `packages/agent-runtime-core/**`、`packages/agent-kernel-pi/**`、`packages/agent-runtime-aiop/**`、`src/agent/runtime.ts`、`src/agent/pi/**` | [12 Pi 集成](./12-pi-integration-plan.md) |
 | 模型、消息与上下文 | `src/model/**`、`src/agent/context.ts`、`src/agent/services/context-service.ts`、`src/config/schema.ts` | [03 模型与上下文](./03-model-and-context.md) |
 | 工具、策略、Hook、Skill、MCP | `src/agent/tools.ts`、`src/agent/policy.ts`、`src/agent/rules.ts`、`src/agent/hooks.ts`、`src/tools/**`、`src/skill/**`、`src/mcp/**` | [04 工具/Skill/MCP](./04-tools-skills-mcp.md) |
 | 沙箱、桌面与运维工具 | `src/sandbox/**`、`src/tools/browser.ts`、`src/tools/export.ts`、`src/tools/kubectl.ts`、`deploy/opensandbox/**` | [05 沙箱与运维](./05-sandbox-and-ops.md) |
@@ -58,7 +58,7 @@
 
 - **Agent Runtime**：组装模型、Kernel、工具、策略、持久化和运行协调能力的顶层执行服务。
 - **Agent Run**：一次具有独立 `runId`、状态、事件、租约和恢复语义的持久化执行实例，不等同于会话。
-- **Kernel**：Agent Runtime 内可替换的执行内核；当前实现包括 Legacy Kernel 和 LangGraph Kernel。
+- **Kernel**：Agent Runtime 内可替换的执行内核；当前新运行使用 Legacy 或 Pi，历史 LangGraph Run 只读查询。
 - **Provider**：未加限定时指 Sandbox Provider，当前仅 `local`、`e2b`、`opensandbox`；AIOS Lifecycle 是 E2B 兼容集成，不是 Provider。
 - **Store**：业务持久化接口及其隔离契约，当前实现包括 MemoryStore 和 MysqlStore，不特指某一种数据库。
 
@@ -74,7 +74,7 @@
 | HTTP 与流式协议 | Node.js `http`、SSE | Node.js 内建能力；承载 `/healthz`、`/readyz`、认证、`/v1/**` JSON API 和 Agent 流式事件 |
 | 配置校验 | Zod（`zod`） | 校验模型、Sandbox、MCP、集群、认证、权限、Hook 等配置 Schema；边界在进程启动和设置更新入口 |
 | 日志 | Pino（`pino`） | 输出结构化运行日志；审计事件由仓库内 AuditSink/Store 单独持久化 |
-| Agent 编排 | LangChain Core（`@langchain/core`）、LangGraph（`@langchain/langgraph`） | 提供模型/消息基础契约和 LangGraph Kernel；兼容 Legacy Kernel 仍由仓库内实现维护 |
+| Agent 编排 | Pi Agent Core（`@earendil-works/pi-agent-core`）、Pi AI（`@earendil-works/pi-ai`） | 提供 Agent loop 与模型协议；AIOP 自研 Durable Runtime、Kernel Adapter 和安全控制面 |
 | 模型 SDK | Anthropic SDK（`@anthropic-ai/sdk`）、OpenAI SDK（`openai`） | 适配 Anthropic/OpenAI 协议；中立消息与模型调用边界由 `src/model/**` 封装 |
 | 扩展协议 | Model Context Protocol SDK（`@modelcontextprotocol/sdk`） | 连接 stdio、SSE、HTTP MCP Server 并投影工具；生命周期由 McpManager 管理 |
 | 认证与令牌 | JOSE（`jose`）、OpenID Client（`openid-client`） | 处理 JWT/JWKS 和 OIDC 登录回调；授权与租户边界由仓库内 RBAC 和 RequestContext 负责 |

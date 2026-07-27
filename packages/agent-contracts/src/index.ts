@@ -39,9 +39,11 @@ export interface RunLimits {
 }
 
 export interface StartRunInput {
+  runId?: string;
   identity: IdentityContext;
   sessionId: string;
   input: readonly AgentInputMessage[];
+  messages?: readonly KernelMessage[];
   kernel?: AgentKernelName;
   limits?: RunLimits;
   signal?: AbortSignal;

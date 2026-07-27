@@ -2,11 +2,11 @@
 
 AIoP 是一个面向智能运维与平台工程场景的 Agent 应用平台。它将模型、Agent Runtime、工具安全链、Skill、MCP、Sandbox、定时任务和多租户 Web 控制台组装为一套可扩展的运行系统。
 
-项目后端基于 Node.js、TypeScript 和 LangGraph，前端基于 React 与 Vite。系统既可以作为 HTTP/SSE 服务运行，也支持命令行单次任务和独立调度器模式。
+项目后端基于 Node.js、TypeScript 和 Pi Agent Core，前端基于 React 与 Vite。系统既可以作为 HTTP/SSE 服务运行，也支持命令行单次任务和独立调度器模式。
 
 ## 核心能力
 
-- 可切换的 Legacy Kernel 与 LangGraph Kernel，以及持久化 Agent Run、Checkpoint、恢复和取消机制。
+- 可切换的 Legacy/Pi Kernel，以及 Run、Attempt、Turn Snapshot/Commit、恢复和取消机制。
 - Anthropic 与 OpenAI 协议模型适配，支持自定义模型地址、上下文管理和 Token/成本统计。
 - 统一 Tool Broker，集中处理权限规则、审批、PreToolUse Hook、审计和工具执行账本。
 - 内置工具、Skill 和 MCP Server 扩展体系。
@@ -18,7 +18,7 @@ AIoP 是一个面向智能运维与平台工程场景的 Agent 应用平台。�
 
 ### 环境要求
 
-- Node.js 20 或更高版本
+- Node.js 22.19.0 或更高版本
 - npm
 - 可用的 Anthropic、OpenAI 或兼容模型服务
 - MySQL（可选；未配置时使用进程内 Memory Store）
@@ -97,7 +97,10 @@ curl http://127.0.0.1:8080/readyz
 | --- | --- |
 | `AIOP_CONFIG` | JSON/JSONC 配置文件路径，默认 `./config.jsonc` |
 | `HOST` / `PORT` | HTTP 服务监听地址和端口，默认 `0.0.0.0:8080` |
-| `AIOP_AGENT_KERNEL` | 选择 Agent Kernel，部署环境可用于切换 Legacy/LangGraph |
+| `AIOP_AGENT_KERNEL` | `legacy`、`pi` 或 `tenant-rule`；历史 LangGraph Run 仅可查询 |
+| `AIOP_PI_MODE` | `full`、`read-only`、`dry-run`、`replay` 或 `disabled`；`disabled` 立即回退 Legacy |
+| `AIOP_PI_TEST_TENANTS` / `AIOP_PI_INTERNAL_USERS` | `tenant-rule` 的 Pi tenant/user 灰度名单 |
+| `AIOP_PI_READ_ONLY_SESSIONS` / `AIOP_PI_FULL_SESSIONS` | `tenant-rule` 的只读/完整流量 session 名单 |
 | `AIOP_EMBED_SCHEDULER` | 是否在 HTTP 服务进程内启动调度器 |
 | `AIOP_JWT_SECRET` | JWT 签名密钥，生产环境必须使用强随机值 |
 | `AIOP_SETTINGS_SECRET` | 持久化敏感设置的加密密钥，不得与 JWT 密钥复用 |
@@ -122,7 +125,11 @@ web/           React Web 控制台
 tests/         单元、集成和行为回归测试
 deploy/        Kubernetes 与 OpenSandbox 部署资源
 docs/          设计文档和代码走读
+packages/      可组合 Agent Platform 公共包
+examples/      不依赖 AIOP HTTP/Auth/MySQL 的嵌入示例
 ```
+
+Pi Agent Platform 的迁移、灰度和回滚说明见 [`docs/pi-agent-platform-operations.md`](./docs/pi-agent-platform-operations.md)，独立嵌入示例见 [`examples/pi-agent-platform.ts`](./examples/pi-agent-platform.ts)。
 
 `src/runtime.ts` 是后端组件装配中心，`src/index.ts` 定义各进程入口，`src/server/http.ts` 是 HTTP/SSE 协议入口，`src/db/store.ts` 是持久化能力契约。
 

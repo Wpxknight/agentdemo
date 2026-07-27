@@ -1,5 +1,7 @@
 # Agent Runtime、Agent Loop 与 Agent Core 设计
 
+> 历史说明：本章保留退役前 Legacy/LangGraph 双 Kernel 设计。现行实现使用 Legacy/Pi，新运行不再加载 LangGraph；请以[第 12 章](./12-pi-integration-plan.md)和 `packages/agent-runtime-*` 为准。
+
 ## 1. 文档目标与所有权标记
 
 本文说明 AIoP 的 Agent 执行架构，重点回答四个问题：

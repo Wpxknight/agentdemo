@@ -112,7 +112,12 @@ export class PiAgentKernel implements AgentKernel {
       : stopReason === 'error' || stopReason === 'aborted' ? 'failed'
         : stopReason === 'toolUse' ? 'continue'
           : 'completed';
-    return { outcome, turnNo: input.turnNo, stopReason, usage, messages, waitingReason };
+    const error = outcome === 'failed' ? {
+      code: 'MODEL_PROVIDER_ERROR' as const,
+      message: lastAssistant?.errorMessage ?? 'Pi model turn failed',
+      retryable: false,
+    } : undefined;
+    return { outcome, turnNo: input.turnNo, stopReason, usage, messages, waitingReason, error };
   }
 
   private createTools(

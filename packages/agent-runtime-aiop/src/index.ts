@@ -94,11 +94,11 @@ export class RunCenterService {
     if (blockedReason) throw new RunCenterConflictError(blockedReason);
     const now = new Date();
     await this.store.updateAgentRun(ctx.tenantId, runId, {
-      status: 'queued', currentNode: null, errorMessage: null, completedAt: null,
+      currentNode: null, errorMessage: null, completedAt: null,
       cancelRequestedAt: null, updatedAt: now,
     });
     await this.store.appendAgentRunEvent({
-      tenantId: ctx.tenantId, runId, type: 'recovery', status: 'queued',
+      tenantId: ctx.tenantId, runId, type: 'recovery', status: 'requested',
       detail: { requestedBy: ctx.userId }, createdAt: now,
     });
     this.options.recover?.(ctx, run);

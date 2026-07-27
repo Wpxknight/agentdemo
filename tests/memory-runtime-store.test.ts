@@ -60,6 +60,19 @@ describe('MemoryRuntimeStore', () => {
     expect((await store.events.list(identity)).map((event) => event.sequence)).toEqual([1n, 2n]);
     expect((await store.runs.get(identity))?.status).toBe('succeeded');
     expect((await store.turns.getLastCommitted(identity))?.commitId).toBe('commit-a');
+
+    const secondTurn = snapshot(2);
+    await store.turns.createSnapshot(secondTurn);
+    await store.turns.commit({
+      leaseOwner: 'worker-a', leaseToken: 1n, snapshot: secondTurn,
+      commit: {
+        ...identity, attemptId: 'attempt-a', turnNo: 2, commitId: 'commit-b', transcriptVersion: 2n,
+        usage: { inputTokens: 4, outputTokens: 5, cacheReadTokens: 0, cacheCreationTokens: 0 },
+        messages: [], committedAt: new Date('2026-07-27T00:00:03.000Z'),
+      },
+      events: [], runStatus: 'succeeded',
+    });
+    expect((await store.turns.listCommitted(identity)).map((turn) => turn.commitId)).toEqual(['commit-a', 'commit-b']);
   });
 
   it('rolls back every repository when a transaction fails', async () => {

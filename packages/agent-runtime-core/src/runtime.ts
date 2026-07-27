@@ -32,6 +32,7 @@ export interface DurableAgentRuntimeOptions {
   policyVersion?: string;
   leaseTtlMs?: number;
   now?: () => Date;
+  observeEvent?: (event: KernelEvent) => void | Promise<void>;
 }
 
 export class DurableAgentRuntime {
@@ -64,9 +65,9 @@ export class DurableAgentRuntime {
 
   async run(input: StartRunInput): Promise<RunHandle> {
     const kernel = this.resolveKernel(input.kernel ?? this.options.defaultKernel);
-    const runId = randomUUID();
+    const runId = input.runId ?? randomUUID();
     const now = this.now();
-    const record: RunRecord = {
+    const created: RunRecord = {
       tenantId: input.identity.tenantId,
       runId,
       actorId: input.identity.actorId,
@@ -80,8 +81,14 @@ export class DurableAgentRuntime {
       createdAt: now,
       updatedAt: now,
     };
-    await this.options.store.runs.create(record);
-    const messages = input.input.map<KernelMessage>((message) => ({
+    const existing = await this.options.store.runs.get({ tenantId: input.identity.tenantId, runId });
+    if (existing && (existing.actorId !== input.identity.actorId || existing.sessionId !== input.sessionId
+      || existing.kernel !== kernel.descriptor.name || existing.kernelVersion !== kernel.descriptor.version)) {
+      throw new AgentPlatformError({ code: 'RUN_STATE_CONFLICT', message: 'Existing run binding does not match', retryable: false });
+    }
+    const record = existing ?? created;
+    if (!existing) await this.options.store.runs.create(record);
+    const messages = input.messages ?? input.input.map<KernelMessage>((message) => ({
       role: 'user',
       content: message.content ?? (message.text === undefined ? [] : [{ type: 'text', text: message.text }]),
     }));
@@ -107,7 +114,11 @@ export class DurableAgentRuntime {
         ...interaction, status: 'resolved', resolution: input.resolution.value, resolvedAt: this.now(),
       });
     }
-    return this.startHandle(record, kernel, input.identity, last.messages, true, input.signal);
+    const messages = (last.stopReason === 'error' || last.stopReason === 'aborted')
+      && last.messages.at(-1)?.role === 'assistant'
+      ? last.messages.slice(0, -1)
+      : last.messages;
+    return this.startHandle(record, kernel, input.identity, messages, true, input.signal);
   }
 
   async cancel(input: CancelRunInput): Promise<void> {
@@ -193,7 +204,10 @@ export class DurableAgentRuntime {
           continuation: currentContinuation,
           signal,
         }, {
-          emit: async (event) => { buffered.push(this.kernelEvent(identity, attemptId, turnNo, event)); },
+          emit: async (event) => {
+            buffered.push(this.kernelEvent(identity, attemptId, turnNo, event));
+            await this.options.observeEvent?.(event);
+          },
           guard: async () => this.guard(identity, lease.token, deadlineAt, signal),
           shouldStopAfterTurn: async () => true,
         });

@@ -661,6 +661,7 @@ export async function buildRuntime(
     agentRuntime: createConfiguredAgentRuntime(process.env, {
       bindingStore: store,
       runStore: store,
+      runtimeStore: store.agentRuntimeStore(),
     }),
     model,
     modelConfig,

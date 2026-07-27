@@ -1,5 +1,7 @@
 # AIoP 系统总览
 
+> 历史说明：本章的 LangGraph 执行细节记录旧基线。现行 Agent Platform 架构、Pi Kernel、Durable Runtime 和 LangGraph 退役状态以[第 12 章](./12-pi-integration-plan.md)及源码为准。
+
 ## 1. 定位与范围
 
 AIoP 是面向企业运维与研发场景的多租户 Web Agent 平台。它把大模型、工具、Skill、MCP、隔离沙箱、集群运维、定时任务和审计能力组装为统一运行时，并通过 HTTP/SSE、Web 页面、CLI 和调度器提供入口。

@@ -140,6 +140,10 @@ export class MemoryRuntimeStore implements RuntimeStore {
         .sort((a, b) => a.transcriptVersion > b.transcriptVersion ? -1 : a.transcriptVersion < b.transcriptVersion ? 1 : 0);
       return clone(commits[0]);
     },
+    listCommitted: async (identity: RunIdentity): Promise<TurnCommit[]> => [...this.state.commits.values()]
+      .filter((item) => item.tenantId === identity.tenantId && item.runId === identity.runId)
+      .sort((a, b) => a.transcriptVersion < b.transcriptVersion ? -1 : a.transcriptVersion > b.transcriptVersion ? 1 : 0)
+      .map(clone),
     commit: async (input: CommitTurnInput): Promise<TurnCommit> => {
       if (!this.transactionalView) return this.transaction((tx) => tx.turns.commit(input));
       await this.runs.assertLease(

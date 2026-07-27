@@ -142,6 +142,7 @@ export interface TurnRepository {
   createSnapshot(snapshot: TurnSnapshot): Promise<void>;
   getSnapshot(identity: RunIdentity & { attemptId: string; turnNo: number }): Promise<TurnSnapshot | undefined>;
   getLastCommitted(identity: RunIdentity): Promise<TurnCommit | undefined>;
+  listCommitted(identity: RunIdentity): Promise<TurnCommit[]>;
   commit(input: CommitTurnInput): Promise<TurnCommit>;
 }
 
