@@ -36,12 +36,12 @@
 - Test: `/home/opt/develop/aicoding/aiop/tests/mysql-runtime-store.test.ts`
 - Test: `/home/opt/develop/aicoding/aiop/tests/durable-interaction.test.ts`
 
-- [ ] Add failing contract tests proving every Interaction field round-trips and `list()` is tenant/run scoped and creation ordered.
-- [ ] Add a failing product Memory Store test proving `putInteraction` and `agentRuntimeStore().interactions.get/list` observe the same record and transaction rollback does not expose a pending Interaction.
-- [ ] Persist/map `user_id`, `session_id`, `tool_call_id`, `expires_at`, and `resolved_by` in the MySQL Runtime Adapter.
-- [ ] Replace the product Memory Store's separate Interaction map with delegation to the shared Memory Runtime repository while preserving product authorization behavior.
-- [ ] Run the three targeted Store/Interaction test files and typecheck.
-- [ ] Commit with the required AIOS co-author trailer.
+- [x] Add failing contract tests proving every Interaction field round-trips and `list()` is tenant/run scoped and creation ordered.
+- [x] Add a failing product Memory Store test proving `putInteraction` and `agentRuntimeStore().interactions.get/list` observe the same record and transaction rollback does not expose a pending Interaction.
+- [x] Persist/map `user_id`, `session_id`, `tool_call_id`, `expires_at`, and `resolved_by` in the MySQL Runtime Adapter.
+- [x] Replace the product Memory Store's separate Interaction map with delegation to the shared Memory Runtime repository while preserving product authorization behavior.
+- [x] Run the three targeted Store/Interaction test files and typecheck.
+- [x] Commit with the required AIOS co-author trailer.
 
 ### Task 3: Shared Tool Runtime concurrency and durable interaction tools
 

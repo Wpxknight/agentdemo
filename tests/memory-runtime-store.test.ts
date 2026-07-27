@@ -25,6 +25,39 @@ function snapshot(turnNo = 1): TurnSnapshot {
 }
 
 describe('MemoryRuntimeStore', () => {
+  it('round-trips complete run-scoped interactions in creation order', async () => {
+    const store = new MemoryRuntimeStore();
+    const later = {
+      ...identity, id: 'interaction-b', userId: 'user-a', sessionId: 'session-a',
+      attemptId: 'attempt-a', turnNo: 1, kind: 'question' as const, toolCallId: 'call-b',
+      status: 'pending' as const, payload: { question: 'continue?' },
+      expiresAt: new Date('2026-07-29T00:00:00.000Z'), createdAt: new Date('2026-07-27T00:00:02.000Z'),
+    };
+    const earlier = {
+      ...later, id: 'interaction-a', toolCallId: 'call-a', kind: 'approval' as const,
+      payload: { reason: 'production' }, createdAt: new Date('2026-07-27T00:00:01.000Z'),
+    };
+    await store.interactions.put(later);
+    await store.interactions.put(earlier);
+
+    await expect(store.interactions.get({ ...identity, interactionId: earlier.id })).resolves.toEqual(earlier);
+    await expect(store.interactions.list(identity)).resolves.toEqual([earlier, later]);
+    await expect(store.interactions.list({ tenantId: 'tenant-b', runId: identity.runId })).resolves.toEqual([]);
+  });
+
+  it('does not expose an interaction from a rolled-back transaction', async () => {
+    const store = new MemoryRuntimeStore();
+    await expect(store.transaction(async (tx) => {
+      await tx.interactions.put({
+        ...identity, id: 'interaction-rollback', userId: 'user-a', sessionId: 'session-a',
+        attemptId: 'attempt-a', turnNo: 1, kind: 'plan', toolCallId: 'call-a', status: 'pending',
+        payload: { plan: 'change' }, expiresAt: new Date('2026-07-29T00:00:00.000Z'), createdAt: new Date(),
+      });
+      throw new Error('rollback interaction');
+    })).rejects.toThrow('rollback interaction');
+    await expect(store.interactions.list(identity)).resolves.toEqual([]);
+  });
+
   it('keeps turn snapshots immutable', async () => {
     const store = new MemoryRuntimeStore();
     await store.runs.create(run());

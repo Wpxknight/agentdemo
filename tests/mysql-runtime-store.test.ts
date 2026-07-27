@@ -18,4 +18,14 @@ describe('MySQL runtime adapter contract', () => {
     expect(source).toContain("where('lease_owner', '=', ownerId)");
     expect(source).toContain("where('lease_token', '=', Number(token))");
   });
+
+  it('persists and maps every durable interaction identity and lifecycle field', async () => {
+    const source = await readFile(sourceUrl, 'utf8');
+    for (const field of [
+      'record.userId', 'record.sessionId', 'record.toolCallId', 'record.resolvedBy', 'record.expiresAt',
+      'row.user_id', 'row.session_id', 'row.tool_call_id', 'row.resolved_by', 'row.expires_at',
+    ]) expect(source).toContain(field);
+    expect(source).not.toContain("user_id: '', session_id: ''");
+    expect(source).not.toContain('tool_call_id: null');
+  });
 });

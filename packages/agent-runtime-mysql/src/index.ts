@@ -216,15 +216,18 @@ export class MysqlRuntimeStore implements RuntimeStore {
   readonly interactions = {
     put: async (record: InteractionRecord): Promise<void> => {
       await this.db.insertInto('agent_interactions').values({
-        id: record.id, tenant_id: record.tenantId, user_id: '', session_id: '', run_id: record.runId,
-        attempt_id: record.attemptId, turn_no: record.turnNo, kind: record.kind, tool_call_id: null,
+        id: record.id, tenant_id: record.tenantId, user_id: record.userId ?? '',
+        session_id: record.sessionId ?? '', run_id: record.runId,
+        attempt_id: record.attemptId, turn_no: record.turnNo, kind: record.kind,
+        tool_call_id: record.toolCallId ?? null,
         payload: json(record.payload), status: record.status,
-        resolution: record.resolution === undefined ? null : json(record.resolution), resolved_by: null,
-        expires_at: new Date('9999-12-31T23:59:59.999Z'), created_at: record.createdAt,
+        resolution: record.resolution === undefined ? null : json(record.resolution),
+        resolved_by: record.resolvedBy ?? null,
+        expires_at: record.expiresAt ?? new Date('9999-12-31T23:59:59.999Z'), created_at: record.createdAt,
         resolved_at: record.resolvedAt ?? null,
       }).onDuplicateKeyUpdate({
         status: record.status, resolution: record.resolution === undefined ? null : json(record.resolution),
-        resolved_at: record.resolvedAt ?? null,
+        resolved_by: record.resolvedBy ?? null, resolved_at: record.resolvedAt ?? null,
       }).execute();
     },
     get: async (identity: RunIdentity & { interactionId: string }): Promise<InteractionRecord | undefined> => {
@@ -232,10 +235,14 @@ export class MysqlRuntimeStore implements RuntimeStore {
         .where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId)
         .where('id', '=', identity.interactionId).executeTakeFirst();
       return row ? {
-        tenantId: row.tenant_id, runId: row.run_id, id: row.id, attemptId: row.attempt_id ?? '', turnNo: row.turn_no ?? 0,
-        kind: row.kind as InteractionRecord['kind'], status: row.status as InteractionRecord['status'],
+        tenantId: row.tenant_id, runId: row.run_id, id: row.id,
+        userId: row.user_id || undefined, sessionId: row.session_id || undefined,
+        attemptId: row.attempt_id ?? '', turnNo: row.turn_no ?? 0,
+        kind: row.kind as InteractionRecord['kind'], toolCallId: row.tool_call_id ?? undefined,
+        status: row.status as InteractionRecord['status'],
         payload: parse(row.payload) as InteractionRecord['payload'],
         resolution: row.resolution === null ? undefined : parse(row.resolution) as InteractionRecord['resolution'],
+        resolvedBy: row.resolved_by ?? undefined, expiresAt: row.expires_at,
         createdAt: row.created_at, resolvedAt: row.resolved_at ?? undefined,
       } : undefined;
     },

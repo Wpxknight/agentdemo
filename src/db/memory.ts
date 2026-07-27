@@ -36,6 +36,7 @@ import type {
 import { DEFAULT_SESSION_TITLE } from './store.js';
 import { nextRunAt } from '../scheduler/cron.js';
 import { MemoryRuntimeStore } from '@aiop/agent-runtime-core';
+import type { InteractionRecord as RuntimeInteractionRecord, JsonValue } from '@aiop/agent-runtime-core';
 
 interface MsgRow {
   tenantId: string;
@@ -63,7 +64,7 @@ function summarize(text: string | undefined, max = 48): string {
 
 /** 内存 Store：未配置 MySQL 时的回落实现，亦用于测试。租户隔离同样强制生效。 */
 export class MemoryStore implements Store {
-  private readonly durableRuntimeStore = new MemoryRuntimeStore();
+  private durableRuntimeStore = new MemoryRuntimeStore();
 
   agentRuntimeStore() {
     return this.durableRuntimeStore;
@@ -80,7 +81,6 @@ export class MemoryStore implements Store {
   private schedulerSettings = new Map<string, SchedulerSettings>();
   private sandboxSettings = new Map<string, SandboxSettingsRecord>();
   private mcpServers = new Map<string, Record<string, McpServerConfig>>();
-  private interactions = new Map<string, InteractionRecord>();
   private toolExecutions = new Map<string, ToolExecutionRecord>();
   private agentRunBindings = new Map<string, AgentRunRecord>();
   private agentRunEvents: AgentRunEvent[] = [];
@@ -248,26 +248,29 @@ export class MemoryStore implements Store {
   }
 
   async putInteraction(record: InteractionRecord): Promise<void> {
-    this.interactions.set(`${record.tenantId}/${record.id}`, cloneInteraction(record));
+    await this.durableRuntimeStore.interactions.put(toRuntimeInteraction(record));
   }
 
   async getInteraction(tenantId: string, id: string): Promise<InteractionRecord | undefined> {
-    const record = this.interactions.get(`${tenantId}/${id}`);
-    return record ? cloneInteraction(record) : undefined;
+    const record = await this.durableRuntimeStore.interactions.getById(tenantId, id);
+    return record ? fromRuntimeInteraction(record) : undefined;
   }
 
   async listPendingInteractions(ctx: RequestContext): Promise<InteractionRecord[]> {
-    return [...this.interactions.values()]
+    return (await this.durableRuntimeStore.interactions.listByTenant(ctx.tenantId))
       .filter((record) => record.tenantId === ctx.tenantId && record.status === 'pending')
-      .map(cloneInteraction);
+      .map(fromRuntimeInteraction);
   }
 
   async resolveInteraction(record: InteractionRecord): Promise<boolean> {
-    const key = `${record.tenantId}/${record.id}`;
-    const current = this.interactions.get(key);
-    if (!current || current.status !== 'pending') return false;
-    this.interactions.set(key, cloneInteraction(record));
-    return true;
+    return this.durableRuntimeStore.transaction(async (tx) => {
+      const current = await tx.interactions.get({
+        tenantId: record.tenantId, runId: record.runId, interactionId: record.id,
+      });
+      if (!current || current.status !== 'pending') return false;
+      await tx.interactions.put(toRuntimeInteraction(record));
+      return true;
+    });
   }
 
   async putToolExecutionIfAbsent(record: ToolExecutionRecord): Promise<boolean> {
@@ -415,10 +418,8 @@ export class MemoryStore implements Store {
 
   async listAgentRunInteractions(ctx: RequestContext, runId: string): Promise<InteractionRecord[]> {
     if (!await this.getAgentRun(ctx, runId)) return [];
-    return [...this.interactions.values()]
-      .filter((record) => record.tenantId === ctx.tenantId && record.runId === runId)
-      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
-      .map(cloneInteraction);
+    return (await this.durableRuntimeStore.interactions.list({ tenantId: ctx.tenantId, runId }))
+      .map(fromRuntimeInteraction);
   }
 
   async listAgentRunToolExecutions(ctx: RequestContext, runId: string): Promise<ToolExecutionRecord[]> {
@@ -758,7 +759,7 @@ export class MemoryStore implements Store {
     this.schedulerSettings.clear();
     this.sandboxSettings.clear();
     this.mcpServers.clear();
-    this.interactions.clear();
+    this.durableRuntimeStore = new MemoryRuntimeStore();
     this.toolExecutions.clear();
     this.agentRunBindings.clear();
     this.agentRunEvents = [];
@@ -771,8 +772,25 @@ function canReadAgentRun(ctx: RequestContext, record: AgentRunRecord): boolean {
   return ctx.role === 'platform_admin' || ctx.role === 'tenant_admin' || record.userId === ctx.userId;
 }
 
-function cloneInteraction(record: InteractionRecord): InteractionRecord {
-  return structuredClone(record);
+function toRuntimeInteraction(record: InteractionRecord): RuntimeInteractionRecord {
+  return {
+    ...structuredClone(record),
+    attemptId: record.attemptId ?? '',
+    turnNo: record.turnNo ?? 0,
+    payload: structuredClone(record.payload) as JsonValue,
+    resolution: record.resolution === undefined ? undefined : structuredClone(record.resolution) as JsonValue,
+  };
+}
+
+function fromRuntimeInteraction(record: RuntimeInteractionRecord): InteractionRecord {
+  return {
+    ...structuredClone(record),
+    userId: record.userId ?? '',
+    sessionId: record.sessionId ?? '',
+    attemptId: record.attemptId || undefined,
+    turnNo: record.turnNo || undefined,
+    expiresAt: record.expiresAt ?? new Date('9999-12-31T23:59:59.999Z'),
+  };
 }
 
 function toolExecutionKey(tenantId: string, runId: string, toolCallId: string): string {

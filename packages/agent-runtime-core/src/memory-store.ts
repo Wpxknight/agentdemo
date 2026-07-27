@@ -189,8 +189,17 @@ export class MemoryRuntimeStore implements RuntimeStore {
     get: async (
       identity: RunIdentity & { interactionId: string },
     ): Promise<InteractionRecord | undefined> => clone(this.state.interactions.get(interactionKey(identity))),
+    getById: async (tenantId: string, interactionId: string): Promise<InteractionRecord | undefined> => {
+      const record = [...this.state.interactions.values()]
+        .find((item) => item.tenantId === tenantId && item.id === interactionId);
+      return clone(record);
+    },
     list: async (identity: RunIdentity): Promise<InteractionRecord[]> => [...this.state.interactions.values()]
       .filter((record) => record.tenantId === identity.tenantId && record.runId === identity.runId)
+      .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime())
+      .map(clone),
+    listByTenant: async (tenantId: string): Promise<InteractionRecord[]> => [...this.state.interactions.values()]
+      .filter((record) => record.tenantId === tenantId)
       .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime())
       .map(clone),
   };
