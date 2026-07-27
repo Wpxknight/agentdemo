@@ -1,10 +1,7 @@
-import type { BaseCheckpointSaver } from '@langchain/langgraph-checkpoint';
 import type { RunAgentOptions, RunAgentResult } from './core.js';
 import type { AgentKernel, AgentKernelName } from './kernel.js';
 import { LegacyAgentKernel } from './legacy-kernel.js';
-import { LangGraphAgentKernel } from './langgraph/kernel.js';
 import { PiAIOPAgentKernel } from './pi/kernel.js';
-import { DEFAULT_AGENT_GRAPH_NAME, DEFAULT_AGENT_GRAPH_VERSION } from './langgraph/registry.js';
 import { logger } from '../logger.js';
 import type { AgentRunBinding, Store } from '../db/store.js';
 import { AgentRunCancelledError, AgentRunCoordinator } from './run-coordinator.js';
@@ -17,7 +14,7 @@ export interface AgentRunBindingStore {
   putAgentRunBindingIfAbsent(binding: AgentRunBinding): Promise<boolean>;
 }
 
-type BuiltinKernelName = 'pi' | 'legacy' | 'langgraph';
+type BuiltinKernelName = 'pi' | 'legacy';
 
 export interface AgentRuntimeOptions {
   kernel?: AgentKernel;
@@ -26,8 +23,6 @@ export interface AgentRuntimeOptions {
   configuredName?: AgentKernelName;
   bindingStore?: AgentRunBindingStore;
   runCoordinator?: AgentRunCoordinator;
-  graphName?: string;
-  graphVersion?: string;
 }
 
 /** 供 HTTP、CLI、Scheduler 共用的稳定 Agent 运行入口。 */
@@ -37,8 +32,6 @@ export class AgentRuntime {
   private readonly selector: (options: RunAgentOptions) => BuiltinKernelName;
   private readonly configuredName: AgentKernelName;
   private readonly bindingStore?: AgentRunBindingStore;
-  private readonly graphName: string;
-  private readonly graphVersion: string;
   private readonly runCoordinator?: AgentRunCoordinator;
 
   constructor(options: AgentRuntimeOptions = {}) {
@@ -53,8 +46,6 @@ export class AgentRuntime {
     this.selector = options.selector ?? (() => defaultBuiltinName);
     this.configuredName = options.configuredName ?? defaultKernel.name;
     this.bindingStore = options.bindingStore;
-    this.graphName = options.graphName ?? DEFAULT_AGENT_GRAPH_NAME;
-    this.graphVersion = options.graphVersion ?? DEFAULT_AGENT_GRAPH_VERSION;
     this.runCoordinator = options.runCoordinator;
   }
 
@@ -63,7 +54,7 @@ export class AgentRuntime {
   }
 
   async run(options: RunAgentOptions): Promise<RunAgentResult> {
-    if (!this.kernels.pi && !this.kernels.legacy && !this.kernels.langgraph) return this.kernel.run(options);
+    if (!this.kernels.pi && !this.kernels.legacy) return this.kernel.run(options);
     const selected = await this.selectLockedKernel(options);
     const kernel = this.kernels[selected];
     if (!kernel) throw new Error(`Agent Kernel 不可用：${selected}`);
@@ -99,8 +90,8 @@ export class AgentRuntime {
       sessionId: options.ctx.sessionId,
       runId: options.runId,
       kernel: selected,
-      graphName: this.graphName,
-      graphVersion: this.graphVersion,
+      graphName: '',
+      graphVersion: '',
       createdAt: new Date(),
     };
     if (await this.bindingStore.putAgentRunBindingIfAbsent(binding)) return selected;
@@ -113,11 +104,7 @@ export class AgentRuntime {
     if (binding.userId !== (options.ctx.userId ?? '') || binding.sessionId !== options.ctx.sessionId) {
       throw new Error('Agent run binding 与当前用户或会话不匹配');
     }
-    if (binding.kernel === 'langgraph'
-      && (binding.graphName !== this.graphName || binding.graphVersion !== this.graphVersion)) {
-      throw new Error(`Agent graph version 不可用：${binding.graphName}@${binding.graphVersion}`);
-    }
-    if (binding.kernel !== 'pi' && binding.kernel !== 'legacy' && binding.kernel !== 'langgraph') {
+    if (binding.kernel !== 'pi' && binding.kernel !== 'legacy') {
       throw new Error(`Agent Kernel 不可用：${binding.kernel}@${binding.kernelVersion ?? 'unknown'}`);
     }
     return binding.kernel;
@@ -134,7 +121,6 @@ export function resolveAgentRuntime(runtime?: AgentRuntime): AgentRuntime {
 export function createConfiguredAgentRuntime(
   env: NodeJS.ProcessEnv = process.env,
   options: {
-    checkpointer?: BaseCheckpointSaver;
     kernels?: Partial<Record<BuiltinKernelName, AgentKernel>>;
     bindingStore?: AgentRunBindingStore;
     runStore?: Store;
@@ -142,33 +128,23 @@ export function createConfiguredAgentRuntime(
 ): AgentRuntime {
   const legacy = options.kernels?.legacy ?? new LegacyAgentKernel();
   const pi = options.kernels?.pi ?? new PiAIOPAgentKernel();
-  let langgraph = options.kernels?.langgraph;
-  if (!langgraph) {
-    try {
-      langgraph = new LangGraphAgentKernel({ checkpointer: options.checkpointer });
-    } catch (error) {
-      logger.warn({ error: String(error) }, 'LangGraph Kernel 初始化失败');
-    }
-  }
-  const kernels = { pi, legacy, ...(langgraph ? { langgraph } : {}) };
+  const kernels = { pi, legacy };
   const configured = env.AIOP_AGENT_KERNEL?.trim().toLowerCase() || 'legacy';
-  if (configured !== 'pi' && configured !== 'legacy' && configured !== 'langgraph' && configured !== 'tenant-rule') {
+  if (configured !== 'pi' && configured !== 'legacy' && configured !== 'tenant-rule') {
     logger.warn({ configured }, '未知 Agent Kernel，回退 Legacy Kernel');
   }
-  const requested = configured === 'pi' || configured === 'langgraph' || configured === 'tenant-rule'
+  const requested = configured === 'pi' || configured === 'tenant-rule'
     ? configured
     : 'legacy';
-  const effective = requested === 'langgraph' && !langgraph ? 'legacy' : requested;
-  if (requested === 'langgraph' && !langgraph) logger.warn('LangGraph Kernel 不可用，回退 Legacy Kernel');
   const rollout = rolloutSelector(env);
-  const selector = effective === 'tenant-rule'
-    ? (runOptions: RunAgentOptions) => rollout(runOptions) === 'langgraph' && !langgraph ? 'legacy' : rollout(runOptions)
-    : () => effective as BuiltinKernelName;
+  const selector = requested === 'tenant-rule'
+    ? rollout
+    : () => requested as BuiltinKernelName;
   return new AgentRuntime({
-    kernel: effective === 'pi' ? pi : effective === 'langgraph' && langgraph ? langgraph : legacy,
+    kernel: requested === 'pi' ? pi : legacy,
     kernels,
     selector,
-    configuredName: effective,
+    configuredName: requested,
     bindingStore: options.bindingStore,
     runCoordinator: options.runStore ? new AgentRunCoordinator(options.runStore) : undefined,
   });
@@ -184,19 +160,11 @@ function rolloutSelector(env: NodeJS.ProcessEnv): (options: RunAgentOptions) => 
   const piInternalUsers = csv(env.AIOP_PI_INTERNAL_USERS);
   const piReadOnlySessions = csv(env.AIOP_PI_READ_ONLY_SESSIONS);
   const piFullSessions = csv(env.AIOP_PI_FULL_SESSIONS);
-  const testTenants = csv(env.AIOP_LANGGRAPH_TEST_TENANTS);
-  const internalUsers = csv(env.AIOP_LANGGRAPH_INTERNAL_USERS);
-  const readOnlySessions = csv(env.AIOP_LANGGRAPH_READ_ONLY_SESSIONS);
-  const fullSessions = csv(env.AIOP_LANGGRAPH_FULL_SESSIONS);
   return (options) => {
     if (options.ctx.tenantId && piTestTenants.has(options.ctx.tenantId)) return 'pi';
     if (options.ctx.userId && piInternalUsers.has(options.ctx.userId)) return 'pi';
     if (piReadOnlySessions.has(options.ctx.sessionId)) return 'pi';
     if (piFullSessions.has(options.ctx.sessionId)) return 'pi';
-    if (options.ctx.tenantId && testTenants.has(options.ctx.tenantId)) return 'langgraph';
-    if (options.ctx.userId && internalUsers.has(options.ctx.userId)) return 'langgraph';
-    if (readOnlySessions.has(options.ctx.sessionId)) return 'langgraph';
-    if (fullSessions.has(options.ctx.sessionId)) return 'langgraph';
     return 'legacy';
   };
 }
@@ -206,5 +174,5 @@ function csv(value: string | undefined): Set<string> {
 }
 
 function isBuiltinKernelName(name: AgentKernelName): name is BuiltinKernelName {
-  return name === 'pi' || name === 'legacy' || name === 'langgraph';
+  return name === 'pi' || name === 'legacy';
 }

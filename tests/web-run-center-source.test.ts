@@ -14,12 +14,12 @@ describe('Run Center web UI contract', () => {
     expect(source('web/src/App.tsx')).toContain("activePage === 'runs'");
   });
 
-  it('loads list and detail APIs and exposes cancel and checkpoint resume actions', () => {
+  it('loads list and detail APIs and exposes cancel and durable resume actions', () => {
     const page = source('web/src/components/run-center-page.tsx');
     expect(page).toContain('/v1/agent/runs?');
     expect(page).toContain('/cancel');
     expect(page).toContain('/resume');
-    expect(page).toContain('从 checkpoint 恢复');
+    expect(page).toContain('恢复运行');
   });
 
   it('shows filters, operational columns, timeline, interactions and tool ledger', () => {

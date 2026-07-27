@@ -128,7 +128,7 @@ export interface AgentRunSummary {
   userId: string;
   sessionId: string;
   runId: string;
-  kernel: 'legacy' | 'langgraph';
+  kernel: 'pi' | 'legacy' | 'langgraph';
   graphName: string;
   graphVersion: string;
   status: AgentRunStatus;

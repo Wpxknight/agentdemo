@@ -86,7 +86,7 @@ export function RunCenterPage({ api }: { api: RunCenterApi }) {
   async function runAction(action: 'cancel' | 'resume') {
     if (!detail) return;
     setBusyAction(action);
-    setMessage(action === 'cancel' ? '正在请求取消...' : '正在从 checkpoint 恢复...');
+    setMessage(action === 'cancel' ? '正在请求取消...' : '正在从最后已提交 Turn 恢复...');
     try {
       await api.post(`/v1/agent/runs/${encodeURIComponent(detail.run.runId)}${ACTION_PATH[action]}`);
       setMessage(action === 'cancel' ? '取消请求已持久化。' : '恢复请求已受理。');
@@ -103,7 +103,7 @@ export function RunCenterPage({ api }: { api: RunCenterApi }) {
       <div className="page-title run-center-heading">
         <div>
           <h1>运行中心</h1>
-          <p className="page-subtitle">查看 Agent Run 生命周期、LangGraph 节点时间线并执行安全恢复。</p>
+          <p className="page-subtitle">查看 Agent Run、Attempt、Turn 时间线并执行安全恢复。</p>
         </div>
         <Button variant="outline" type="button" aria-label="刷新运行记录" disabled={loading} onClick={() => void loadRuns()}>
           <RefreshCcw className={cn(loading && 'run-center-spin')} />刷新
@@ -169,7 +169,7 @@ function RunDetail({ detail, busy, onCancel, onResume }: { detail: AgentRunDetai
       <div><span>RUN</span><h2>{run.runId}</h2><RunStatus status={run.status} /></div>
       <div className="run-detail-actions">
         <Button variant="outline" disabled={busy || !detail.canCancel} onClick={onCancel}><Ban />取消</Button>
-        <Button disabled={busy || !detail.canResume} onClick={onResume}><RotateCcw />从 checkpoint 恢复</Button>
+        <Button disabled={busy || !detail.canResume} onClick={onResume}><RotateCcw />恢复运行</Button>
       </div>
     </header>
     {detail.recoveryBlockedReason ? <p className="run-recovery-warning">{detail.recoveryBlockedReason}</p> : null}

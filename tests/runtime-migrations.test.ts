@@ -33,6 +33,14 @@ describe('durable runtime migrations', () => {
     expect(source).toContain('unique key uq_agent_run_event_sequence');
   });
 
+  it('freezes historical LangGraph checkpoint tables after new traffic stops', async () => {
+    const source = await sql('0019_langgraph_checkpoints_read_only.sql');
+    expect(source).toContain('before insert on langgraph_checkpoints');
+    expect(source).toContain('before update on langgraph_checkpoints');
+    expect(source).toContain('before delete on langgraph_checkpoint_writes');
+    expect(source).toContain("signal sqlstate '45000'");
+  });
+
   it('registers the new tables and columns in the Kysely schema', async () => {
     const source = (await readFile(new URL('../schema.ts', migrations), 'utf8')).toLowerCase();
     for (const table of ['agentrunattemptstable', 'agentturnsnapshotstable', 'agentturncommitstable']) {

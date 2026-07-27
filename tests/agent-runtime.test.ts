@@ -48,10 +48,10 @@ describe('AgentRuntime', () => {
     expect(new AgentRuntime().kernelName).toBe('legacy');
   });
 
-  it('selects Pi or LangGraph only when explicitly configured and otherwise falls back to legacy', () => {
+  it('selects Pi only when explicitly configured and rejects new LangGraph traffic', () => {
     expect(createConfiguredAgentRuntime({}).kernelName).toBe('legacy');
     expect(createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'pi' }).kernelName).toBe('pi');
-    expect(createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'langgraph' }).kernelName).toBe('langgraph');
+    expect(createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'langgraph' }).kernelName).toBe('legacy');
     expect(createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'unknown' }).kernelName).toBe('legacy');
   });
 
@@ -85,37 +85,7 @@ describe('AgentRuntime', () => {
     expect(calls).toEqual(['pi', 'pi', 'pi', 'pi', 'legacy']);
   });
 
-  it('applies tenant-rule rollout stages in fixed precedence', async () => {
-    const calls: string[] = [];
-    const result: RunAgentResult = {
-      messages: [], text: '', steps: 0,
-      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
-      compacted: false,
-    };
-    const kernel = (name: 'legacy' | 'langgraph'): AgentKernel => ({
-      name,
-      run: async () => { calls.push(name); return result; },
-    });
-    const runtime = createConfiguredAgentRuntime({
-      AIOP_AGENT_KERNEL: 'tenant-rule',
-      AIOP_LANGGRAPH_TEST_TENANTS: 'tenant-test',
-      AIOP_LANGGRAPH_INTERNAL_USERS: 'user-internal',
-      AIOP_LANGGRAPH_READ_ONLY_SESSIONS: 'session-ro',
-      AIOP_LANGGRAPH_FULL_SESSIONS: 'session-full',
-    }, { kernels: { legacy: kernel('legacy'), langgraph: kernel('langgraph') } });
-
-    for (const ctx of [
-      { tenantId: 'tenant-test', userId: 'u', sessionId: 's' },
-      { tenantId: 'tenant-x', userId: 'user-internal', sessionId: 's' },
-      { tenantId: 'tenant-x', userId: 'u', sessionId: 'session-ro' },
-      { tenantId: 'tenant-x', userId: 'u', sessionId: 'session-full' },
-      { tenantId: 'tenant-x', userId: 'u', sessionId: 'other' },
-    ]) await runtime.run({ ...runOptions(), ctx });
-
-    expect(calls).toEqual(['langgraph', 'langgraph', 'langgraph', 'langgraph', 'legacy']);
-  });
-
-  it('locks kernel and graph version for a run across runtime reconfiguration', async () => {
+  it('locks the Pi kernel for a run across runtime reconfiguration', async () => {
     const bindings = new Map<string, AgentRunBinding>();
     const bindingStore: AgentRunBindingStore = {
       getAgentRunBinding: async (_tenantId, runId) => bindings.get(runId),
@@ -133,15 +103,15 @@ describe('AgentRuntime', () => {
     };
     const kernels = {
       legacy: { name: 'legacy', run: async () => { calls.push('legacy'); return result; } } satisfies AgentKernel,
-      langgraph: { name: 'langgraph', run: async () => { calls.push('langgraph'); return result; } } satisfies AgentKernel,
+      pi: { name: 'pi', run: async () => { calls.push('pi'); return result; } } satisfies AgentKernel,
     };
-    const first = createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'langgraph' }, { kernels, bindingStore });
+    const first = createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'pi' }, { kernels, bindingStore });
     await first.run({ ...runOptions(), runId: 'run-locked', ctx: { tenantId: 'tenant-a', userId: 'user-a', sessionId: 's' } });
     const reconfigured = createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'legacy' }, { kernels, bindingStore });
     await reconfigured.run({ ...runOptions(), runId: 'run-locked', ctx: { tenantId: 'tenant-a', userId: 'user-a', sessionId: 's' } });
 
-    expect(calls).toEqual(['langgraph', 'langgraph']);
-    expect(bindings.get('run-locked')).toMatchObject({ kernel: 'langgraph', graphVersion: 'v1' });
+    expect(calls).toEqual(['pi', 'pi']);
+    expect(bindings.get('run-locked')).toMatchObject({ kernel: 'pi' });
   });
 
   it('persists coordinated lifecycle around a real kernel invocation', async () => {
@@ -151,8 +121,8 @@ describe('AgentRuntime', () => {
       usage: { inputTokens: 5, outputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 0 },
       compacted: false,
     };
-    const runtime = createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'langgraph' }, {
-      kernels: { langgraph: { name: 'langgraph', run: async (options) => {
+    const runtime = createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'pi' }, {
+      kernels: { pi: { name: 'pi', run: async (options) => {
         await options.runLifecycle?.nodeStarted('model');
         await options.runLifecycle?.nodeCompleted('model', { steps: 2 });
         return result;

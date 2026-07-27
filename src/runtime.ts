@@ -44,7 +44,6 @@ import type { AuditSink } from './audit/sink.js';
 import { readMysqlConfig } from './config/mysql.js';
 import { createStore } from './db/index.js';
 import { MysqlStore } from './db/mysql.js';
-import { MemoryCheckpointStore, MysqlCheckpointSaver } from './agent/checkpoint/mysql.js';
 import type { LlmSettings, SandboxSettings, Store } from './db/store.js';
 import {
   SandboxSettingsPersistence,
@@ -112,7 +111,7 @@ export interface SandboxSettingsUpdate {
 }
 
 export interface Runtime {
-  /** Agent 执行 facade；当前默认使用 Legacy Kernel，后续可切换 LangGraph Kernel。 */
+  /** Agent 执行 facade；支持 Legacy 与 Pi Kernel，历史 LangGraph Run 仅供查询。 */
   agentRuntime: AgentRuntime;
   model: ChatModel;
   modelConfig?: RuntimeModelConfig;
@@ -558,10 +557,6 @@ export async function buildRuntime(
   };
   modelConfig = await resolveRuntimeModelConfig(config, store, DEFAULT_TENANT);
   const model = createModel(modelConfig.id, modelConfig);
-  const checkpointSaver = store instanceof MysqlStore
-    ? store.createCheckpointSaver()
-    : new MysqlCheckpointSaver(new MemoryCheckpointStore());
-
   const publicSandboxState = (): SandboxSettingsState => {
     const catalog = sandboxController.catalogInfo();
     return {
@@ -664,7 +659,6 @@ export async function buildRuntime(
 
   const runtime: Runtime = {
     agentRuntime: createConfiguredAgentRuntime(process.env, {
-      checkpointer: checkpointSaver,
       bindingStore: store,
       runStore: store,
     }),

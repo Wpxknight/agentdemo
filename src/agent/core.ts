@@ -18,7 +18,7 @@ export { MAX_MODEL_RETRIES } from './services/model-gateway.js';
 export type { Usage } from './services/model-gateway.js';
 
 export interface RunAgentOptions {
-  /** 单次运行稳定 ID；用于 checkpoint、durable interaction 与工具幂等账本。 */
+  /** 单次运行稳定 ID；用于 Turn Commit、durable interaction 与工具幂等账本。 */
   runId?: string;
   model: ChatModel;
   tools: ToolRegistry;
@@ -73,7 +73,7 @@ export interface RunAgentOptions {
   hooks?: HookRunner;
   /** AIoP 工具副作用账本；缺省保持原有直接执行语义。 */
   toolLedger?: DurableToolLedger;
-  /** LangGraph 人机交互桥：create 必须按 run/kind/toolCallId 幂等，wait 返回可信持久化决策。 */
+  /** Durable 人机交互桥：create 必须按 run/kind/toolCallId 幂等，wait 返回可信持久化决策。 */
   durableInteractions?: {
     create(input: {
       kind: 'approval' | 'question' | 'plan';
@@ -93,7 +93,7 @@ export interface RunAgentOptions {
   /** Run Center 生命周期观察器与多副本 fencing guard。 */
   runLifecycle?: AgentRunLifecycleObserver;
   runGuard?: () => Promise<void>;
-  /** 仅供经过安全校验的故障恢复：使用相同 runId 从最新 checkpoint 继续。 */
+  /** 仅供经过安全校验的故障恢复：使用相同 runId 从最后已提交 Turn 继续。 */
   resumeFromCheckpoint?: boolean;
 }
 

@@ -44,7 +44,6 @@ import type { McpServerConfig } from '../mcp/types.js';
 import { nextRunAt } from '../scheduler/cron.js';
 import { estimateTokens } from '../agent/context.js';
 import { parseStoredSandboxSettings } from '../sandbox/settings.js';
-import { KyselyCheckpointStore, MysqlCheckpointSaver } from '../agent/checkpoint/mysql.js';
 
 interface TaskRow {
   id: number;
@@ -215,10 +214,6 @@ function parseSchedulerSettings(value: unknown): SchedulerSettings | undefined {
 /** 基于 Kysely + mysql2 的持久化实现（租户由 ctx 强制过滤）。 */
 export class MysqlStore implements Store {
   constructor(private readonly db: Kysely<Database>) {}
-
-  createCheckpointSaver(): MysqlCheckpointSaver {
-    return new MysqlCheckpointSaver(new KyselyCheckpointStore(this.db));
-  }
 
   async createSession(ctx: RequestContext, input: SessionInput): Promise<SessionSummary> {
     const title = summarize(input.title ?? input.sessionId);

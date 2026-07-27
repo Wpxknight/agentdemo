@@ -73,7 +73,7 @@ export class ToolRegistry {
       const result = await handler.run(call.args, ctx);
       return { ...result, id: call.id };
     } catch (err) {
-      // LangGraph interrupt/drain 等控制流异常必须穿透工具边界，不能被降级为普通 ToolResult。
+      // Runtime interrupt/drain 等控制流异常必须穿透工具边界，不能被降级为普通 ToolResult。
       if (err && typeof err === 'object' && (err as { is_bubble_up?: unknown }).is_bubble_up === true) throw err;
       return {
         id: call.id,

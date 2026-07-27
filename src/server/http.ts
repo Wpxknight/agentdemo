@@ -708,7 +708,7 @@ export function createHttpServer(rt: Runtime): http.Server {
     abortLocal: (ctx, runId) => abortActiveRunById(activeRuns, ctx.tenantId, runId),
     recover: (ctx, run) => {
       void recoverAgentRun(rt, interactions, activeRuns, compactionWatermarks, ctx, run).catch((err) => {
-        log.error({ err, runId: run.runId }, 'Agent Run checkpoint 恢复失败');
+        log.error({ err, runId: run.runId }, 'Agent Run durable 恢复失败');
       });
     },
   });
