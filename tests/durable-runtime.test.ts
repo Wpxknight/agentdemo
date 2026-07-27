@@ -332,6 +332,33 @@ describe('DurableAgentRuntime', () => {
     });
   });
 
+  it('rejects a second cross-process resume after the persisted maxAttempts budget is exhausted', async () => {
+    const store = new MemoryRuntimeStore();
+    const waitingKernel: AgentKernel = {
+      descriptor: { name: 'pi', version: '0.82.1', protocolVersion: '1' },
+      run: async () => ({ ...completed('waiting'), outcome: 'waiting', waitingReason: 'external' }),
+    };
+    const firstRuntime = new DurableAgentRuntime({ store, kernels: [waitingKernel], defaultKernel: 'pi' });
+    const first = await firstRuntime.run({
+      identity, sessionId: 'session-attempt-budget', input: [], limits: { maxAttempts: 2 },
+    });
+    expect((await first.result()).status).toBe('waiting');
+
+    const resumedKernel: AgentKernel = { ...waitingKernel, run: vi.fn(waitingKernel.run) };
+    const firstResumeRuntime = new DurableAgentRuntime({ store, kernels: [resumedKernel], defaultKernel: 'pi' });
+    const firstResume = await firstResumeRuntime.resume({ identity, runId: first.runId });
+    expect((await firstResume.result()).status).toBe('waiting');
+    expect(resumedKernel.run).toHaveBeenCalledOnce();
+
+    const exhaustedKernel: AgentKernel = { ...waitingKernel, run: vi.fn(waitingKernel.run) };
+    const secondResumeRuntime = new DurableAgentRuntime({ store, kernels: [exhaustedKernel], defaultKernel: 'pi' });
+    await expect(secondResumeRuntime.resume({ identity, runId: first.runId })).rejects.toMatchObject({
+      code: 'RUN_LIMIT_EXCEEDED', message: 'Run maxAttempts exceeded: 2',
+    });
+    expect(exhaustedKernel.run).not.toHaveBeenCalled();
+    expect(await store.attempts.list({ tenantId: identity.tenantId, runId: first.runId })).toHaveLength(2);
+  });
+
   it.each([
     ['maxInputTokens', { maxInputTokens: 2 }, { ...usage, inputTokens: 3 }, 'Run maxInputTokens exceeded: 3 > 2'],
     ['maxOutputTokens', { maxOutputTokens: 1 }, usage, 'Run maxOutputTokens exceeded: 2 > 1'],

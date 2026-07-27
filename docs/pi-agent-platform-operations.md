@@ -14,9 +14,11 @@ AIoP 新运行支持 `legacy` 与 `pi`。历史 `kernel=langgraph` 记录继续�
 ## 并发与容量
 
 - `AIOP_PI_MAX_CONCURRENT_MODEL_CALLS` 控制每个 tenant/provider/model/route 的并发模型流数量，默认 `4`，必须是正整数。
+- `AIOP_PI_MAX_CONCURRENT_TOOLS_PER_TENANT`、`AIOP_PI_MAX_CONCURRENT_TOOLS_PER_TOOL`、`AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE` 分别控制进程内 tenant、工具和资源 FIFO 并发，默认 `8`、`4`、`1`，必须是正整数。
 - 相同 tenant/model 的请求按 FIFO 排队；不同 tenant 或 model 使用独立队列。
 - 模型许可只覆盖实际 `ModelProvider.stream()` 消费期，进入工具执行后立即释放，不会用模型配额锁住外部工具。
 - provider 异常、Run 取消和排队期间取消都会释放或移除许可。该控制器在进程内跨所有新建 Durable Runtime 实例共享；多副本部署仍应叠加 provider 网关或分布式全局配额。
+- `RunLimits.maxAttempts` 与其他 Run 预算一起保存在现有 TurnSnapshot `limits_json`；达到上限后，跨进程恢复会在获取新 Attempt 前返回 `RUN_LIMIT_EXCEEDED`，无需新增迁移。
 
 ## 数据迁移
 

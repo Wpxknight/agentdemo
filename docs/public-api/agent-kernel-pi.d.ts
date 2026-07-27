@@ -25,6 +25,7 @@ export declare class PiAgentKernel implements AgentKernel {
     run(input: KernelRunInput, control: KernelControl): Promise<KernelExit>;
     private compactContext;
     private createTools;
+    private resolveInteraction;
     private createStreamFn;
     private pumpModel;
     private forwardEvent;

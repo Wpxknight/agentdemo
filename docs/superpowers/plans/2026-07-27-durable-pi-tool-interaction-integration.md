@@ -115,10 +115,10 @@
 - Modify: `/home/opt/develop/aicoding/aiop/docs/design/12-pi-integration-plan.md`
 - Test: `/home/opt/develop/aicoding/aiop/tests/durable-runtime.test.ts`
 
-- [ ] Add a failing `maxAttempts` test proving the second cross-process resume is rejected after the persisted Attempt budget is exhausted.
-- [ ] Add `RunLimits.maxAttempts`, persist it in the existing `limits_json`, and enforce it before acquiring a new Attempt; do not create production-only evidence or checkpoint cleanup migrations.
-- [ ] Re-run BR-01～BR-07, interfaces, migrations, non-functional requirements, stage acceptance conditions, and minimum-test-coverage evidence matrix.
-- [ ] Update public API snapshots only after reviewing every changed declaration.
-- [ ] Run `make verify-node`, `make test-agent-platform`, `npm run typecheck`, `npm test`, `npm --prefix web run build`, `npm audit --audit-level=high`, `npm run verify:packages`, `make image`, and `git diff --check`.
-- [ ] Update evidence with fresh file/test counts and keep stages 7 production metrics, 8 retention window, and 10 backup/audit/drop work explicitly external.
-- [ ] Commit with the required AIOS co-author trailer and confirm the worktree is clean.
+- [x] Add a failing `maxAttempts` test proving the second cross-process resume is rejected after the persisted Attempt budget is exhausted.
+- [x] Add `RunLimits.maxAttempts`, persist it in the existing `limits_json`, and enforce it before acquiring a new Attempt; do not create production-only evidence or checkpoint cleanup migrations.
+- [x] Re-run BR-01～BR-07, interfaces, migrations, non-functional requirements, stage acceptance conditions, and minimum-test-coverage evidence matrix.
+- [x] Update public API snapshots only after reviewing every changed declaration.
+- [x] Run `make verify-node`, `make test-agent-platform`, `npm run typecheck`, `npm test`, `npm --prefix web run build`, `npm audit --audit-level=high`, `npm run verify:packages`, `make image`, and `git diff --check`.
+- [x] Update evidence with fresh file/test counts and keep stages 7 production metrics, 8 retention window, and 10 backup/audit/drop work explicitly external.
+- [x] Commit with the required AIOS co-author trailer and confirm the worktree is clean.

@@ -167,6 +167,7 @@ export declare class MysqlRuntimeStore implements RuntimeStore {
         get: (identity: RunIdentity & {
             interactionId: string;
         }) => Promise<InteractionRecord | undefined>;
+        list: (identity: RunIdentity) => Promise<InteractionRecord[]>;
     };
     readonly toolLedger: {
         putIfAbsent: (record: ToolLedgerRecord) => Promise<boolean>;

@@ -31,6 +31,7 @@ export type AgentContentBlock =
   | { type: 'image'; mimeType: string; data: string };
 
 export interface RunLimits {
+  maxAttempts?: number;
   maxTurns?: number;
   maxToolCalls?: number;
   maxInputTokens?: number;

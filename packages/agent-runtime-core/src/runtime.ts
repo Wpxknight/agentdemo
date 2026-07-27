@@ -133,6 +133,7 @@ export class DurableAgentRuntime {
         });
       }
     }
+    await this.assertAttemptBudget(identity, snapshot.limits);
     let interactionResolution: ResolvedInteraction | undefined;
     if (input.resolution) {
       const interaction = await this.options.store.interactions.get({ ...identity, interactionId: input.resolution.interactionId });
@@ -225,6 +226,7 @@ export class DurableAgentRuntime {
     const controller = new AbortController();
     this.active.set(runKey(identity), controller);
     const signal = externalSignal ? AbortSignal.any([controller.signal, externalSignal]) : controller.signal;
+    await this.assertAttemptBudget(identity, limits);
     const attemptId = randomUUID();
     const correlationId = identityContext.correlationId ?? record.runId;
     const runStartedAt = this.now();
@@ -471,6 +473,17 @@ export class DurableAgentRuntime {
 
   private async release(identity: RunIdentity, _commit: TurnCommit): Promise<void> {
     await this.options.store.runs.update(identity, { leaseOwner: undefined, leaseExpiresAt: undefined, updatedAt: this.now() });
+  }
+
+  private async assertAttemptBudget(identity: RunIdentity, limits?: RunLimits): Promise<void> {
+    if (limits?.maxAttempts === undefined) return;
+    if (!Number.isInteger(limits.maxAttempts) || limits.maxAttempts < 1) {
+      throw limitExceeded(`Run maxAttempts must be a positive integer: ${limits.maxAttempts}`);
+    }
+    const attempts = await this.options.store.attempts.list(identity);
+    if (attempts.length >= limits.maxAttempts) {
+      throw limitExceeded(`Run maxAttempts exceeded: ${limits.maxAttempts}`);
+    }
   }
 
   private kernelEvent(

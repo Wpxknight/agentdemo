@@ -22,6 +22,13 @@ Pi Agent Platform 的仓库开发范围已覆盖 Durable Run/Attempt/Turn、Pi K
 | Replay/dry-run semantics | `c26cf613` |
 | Publishable packages and API gates | `b3faeaa2` |
 | Durable observability and fault evidence | `f6ec268e` |
+| Delivery/runtime audit、CI、Docker、Run Center summary | `1bb8ffc2` |
+| Trusted Interaction resolution contract | `e3dbfe2c` |
+| Unified Memory/MySQL Interaction repositories | `4a12c21d` |
+| Durable Tool Runtime interactions and shared concurrency | `b0543a96` |
+| Pi Kernel interaction resume | `93fc9ad5` |
+| AIOP Durable Pi product Tool Runtime | `b6fe2db3` |
+| HTTP interaction auto-resume | `a2cd36ca` |
 
 最终交付审计、共享模型并发控制和本文档的收口由本分支后续提交记录。
 
@@ -31,6 +38,22 @@ Pi Agent Platform 的仓库开发范围已覆盖 Durable Run/Attempt/Turn、Pi K
 - `FifoModelConcurrencyController` 按可信 tenant 与绑定后的 provider/model/route 限制模型流并发；AIOP 长生命周期 Runtime 持有一个共享实例，覆盖其创建的全部 Durable Pi Runtime。
 - 模型许可只覆盖 `ModelProvider.stream()` 的消费期，工具阶段不持有模型许可。
 - `AIOP_PI_MAX_CONCURRENT_MODEL_CALLS` 默认 `4`；相同 tenant/model FIFO 排队，不同 tenant/model 相互独立；provider 失败和排队取消均有回归测试。
+- AIOP 同一长生命周期 Runtime 还共享 `ToolConcurrencyController`；tenant/tool/resource 默认上限分别为 `8/4/1`，环境变量必须是正整数。
+- `RunLimits.maxAttempts` 复用现有 TurnSnapshot `limits_json` 持久化，恢复前按已持久化 Attempt 数量拒绝超限，不修改历史迁移。
+- approval/question/plan 都通过持久化 Interaction 跨进程等待与恢复；可信 resolution 在模型再次调用前消费，并替换原 `waiting:<interactionId>` 工具结果。
+- HTTP Interaction resolve 在完成身份、会话、Run、toolCall 与冲突校验后异步触发恢复；重复同值 resolve 幂等，冲突值拒绝，pending Interaction 不能由显式 resume 绕过。
+
+## BR-01～BR-07 最终审计
+
+| 要求 | 仓库证据 |
+| --- | --- |
+| BR-01 工具不能直连基础设施/凭据 | Durable Pi 只注入 `/home/opt/develop/aicoding/aiop/src/agent/pi/tool-runtime.ts`，由产品 Registry、Policy、Hook 与 Provider 执行 |
+| BR-02 长度截断不执行工具 | `/home/opt/develop/aicoding/aiop/tests/pi-contract.test.ts` 的 length-truncated 工具阻断用例 |
+| BR-03 只读受限并行、写/资源默认串行 | `/home/opt/develop/aicoding/aiop/packages/tool-runtime/src/index.ts` FIFO semaphore 与 failure/cancel release 用例 |
+| BR-04 tenant/tool/resource 并发限制 | 共享 `ToolConcurrencyController` 跨 fresh Engine 测试及 AIOP 三项正整数环境变量 |
+| BR-05 stable idempotency/correlation | approval fresh Runtime 恢复复用原 idempotency key；durable event 保留 correlation identity |
+| BR-06 未知非幂等结果禁止重放 | `recovery_required` Ledger 与 Pi/Runtime 故障测试 |
+| BR-07 可信 IdentityContext | Runtime 从 Store/调用方传递 tenant/actor/roles/session，Interaction resolve 校验 tenant/user/session/run/toolCall |
 
 ## Durable observability
 
@@ -60,6 +83,7 @@ npx vitest run --reporter=verbose tests/durable-runtime.test.ts tests/memory-run
 | transaction rollback | `rolls back every repository when a transaction fails` |
 | resume | last committed Turn resume、AIOP Run Center recovery |
 | approval/question/plan | 三类 interaction 均由新 Runtime Attempt 恢复并解析 |
+| HTTP auto-resume | resolve 返回后异步创建新 Attempt；重复同值幂等、冲突值拒绝、session busy 与失败事件脱敏 |
 | duplicate write | completed idempotent call reuse |
 | unknown side effect | non-idempotent unknown write 转 `recovery_required` |
 | commit boundary | 外部成功保持 provisional，最终 Ledger fact 随 Turn commit 提交 |
@@ -85,14 +109,14 @@ npx vitest run --reporter=verbose tests/durable-runtime.test.ts tests/memory-run
 | 命令 | 结果 |
 | --- | --- |
 | `make verify-node` | Node 24.13.0，满足 `>=22.19.0` |
-| `make test-agent-platform` | 12 files、65 tests 通过；随后包构建/API/tarball 门禁通过 |
+| `make test-agent-platform` | 12 files、83 tests 通过；随后包构建/API/tarball 门禁通过 |
 | `npm run typecheck` | 通过 |
-| `npm test` | 71 files；632 passed、1 skipped |
+| `npm test` | 71 files；664 passed、1 skipped |
 | `npm --prefix web run build` | TypeScript 与 Vite production build 通过；存在既有大 chunk warning |
 | `npm audit --audit-level=high` | 退出 0；0 high/critical，5 moderate，均为已记录的 Pi → Google GenAI → MCP SDK → Hono 链且当前无修复 |
 | `npm run verify:packages` | 全部公共包 build、API snapshot、pack、临时项目安装与动态 import 通过 |
 | `git diff --check` | 通过 |
-| `make image` | 退出 0；builder 内生成公共包 dist，镜像 `aiop:pi-agent-platform` 构建成功，容器公共包 import 输出 `workspace-ok`，容器 Node 24.18.0 通过基线 |
+| `make image` | 退出 0；builder 内生成公共包 dist，镜像 `aiop:pi-agent-platform` 构建成功，容器公共包 import 输出 `workspace-ok`，容器 Node 24.13.0 通过基线 |
 
 Docker 构建期间同样报告 5 个 moderate 漏洞以及待 allowScripts 复核的 `@google/genai`、`esbuild`、`protobufjs` 安装脚本；本次构建没有把这些警告误记为 high/critical 或伪造为已修复。
 

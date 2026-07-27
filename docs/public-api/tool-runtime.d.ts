@@ -5,6 +5,7 @@ export interface RegisteredTool {
     description: string;
     inputSchema: Record<string, unknown>;
     capability: ToolCapability;
+    interactionKind?: 'question' | 'plan';
     execute(call: ToolCall, context: ToolExecutionContext & {
         idempotencyKey: string;
     }): Promise<Omit<ToolResult, 'callId'>>;
@@ -53,6 +54,7 @@ export interface ToolRuntimeEngineOptions {
     audit?: ToolAudit;
     outputLimiter?: ToolOutputLimiter;
     concurrency?: ConcurrencyLimits;
+    concurrencyController?: ToolConcurrencyController;
     onLedger?: () => void;
     onLock?: () => void;
     now?: () => Date;
@@ -69,6 +71,11 @@ export declare class ToolRuntimeEngine implements ToolRuntime {
     private readonly now;
     constructor(options: ToolRuntimeEngineOptions);
     execute(call: ToolCall, context: ToolExecutionContext): Promise<ToolExecutionOutcome>;
+    private executeInteractionTool;
+    private trustedApproval;
+    private completeWithoutExecution;
+    private completedOutcome;
+    private ledgerMismatch;
     private pendingApproval;
 }
 export interface PiToolOutputLimiterOptions {
@@ -82,4 +89,17 @@ export declare class PiToolOutputLimiter implements ToolOutputLimiter {
     private readonly options;
     constructor(options: PiToolOutputLimiterOptions);
     limit(result: ToolResult, _tool?: RegisteredTool): Promise<ToolResult>;
+}
+export declare class ToolConcurrencyController {
+    private readonly limits;
+    private readonly tenant;
+    private readonly tool;
+    private readonly resource;
+    constructor(limits?: ConcurrencyLimits);
+    run<T>(input: {
+        tenantId: string;
+        toolName: string;
+        resourceKey?: string;
+        signal?: AbortSignal;
+    }, work: () => Promise<T>): Promise<T>;
 }

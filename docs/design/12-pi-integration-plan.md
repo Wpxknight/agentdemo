@@ -513,6 +513,16 @@ interface StartRunInput {
   signal?: AbortSignal;
 }
 
+interface RunLimits {
+  maxAttempts?: number;
+  maxTurns?: number;
+  maxToolCalls?: number;
+  maxInputTokens?: number;
+  maxOutputTokens?: number;
+  maxCostUsd?: number;
+  deadlineAt?: Date;
+}
+
 interface ResumeRunInput {
   identity: IdentityContext;
   runId: string;
@@ -642,7 +652,7 @@ Runtime 公共包不提供 HTTP。`@aiop/agent-runtime-aiop` 继续兼容现有�
 | --- | --- | --- |
 | `RUN_NOT_FOUND` | Run 不存在或调用方不可见 | 否 |
 | `RUN_STATE_CONFLICT` | 当前状态不允许取消或恢复 | 条件满足后重试 |
-| `RUN_LIMIT_EXCEEDED` | Turn、token、费用、deadline 或 durable event 超出 Run 限制 | 否 |
+| `RUN_LIMIT_EXCEEDED` | Attempt、Turn、token、费用、工具调用、deadline 或 durable event 超出 Run 限制 | 否 |
 | `LEASE_LOST` | Worker 丢失 lease/fencing 权限 | 当前 Attempt 否 |
 | `TURN_COMMIT_FAILED` | Turn 事务提交失败 | 恢复器检查后决定 |
 | `TOOL_RESULT_UNKNOWN` | 外部副作用结果不确定 | 禁止自动重试 |
@@ -782,6 +792,7 @@ make rollback-staging
 - 事务提交前后 Worker 崩溃；
 - lease loss、deadline、取消和 shutdown；
 - approval/question/plan 跨进程恢复；
+- `maxAttempts` 随 TurnSnapshot 跨进程恢复并在创建新 Attempt 前拒绝超限；
 - Tool Ledger 幂等复用和非幂等写保护；
 - 多 tenant、身份、Policy 和资源 ACL；
 - Sandbox、MCP 和 Scheduler Provider 合约；
