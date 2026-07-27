@@ -19,7 +19,7 @@ AIOP 引入 Pi 的目的，是复用成熟的通用 Agent loop，统一“模型
 5. 首期不采用 `AgentHarness`。它虽然是公开 export，但包含 Session、filesystem、工具和本地运行假设，超出可复用 Runtime 的最小边界。
 6. AIOP 自研并持有 Run、Attempt、Turn、Lease、恢复、审批、Tool Ledger、幂等、策略和审计等 durable 能力。
 7. Agent Platform SDK 采用“核心契约 + 可选适配包”，不要求复用团队使用 AIOP 的数据库、认证、HTTP 或具体运维工具。
-8. LangGraph 不再用于新增通用 ReAct loop；存量确定性 DAG 暂时保留，后续迁往显式 workflow 服务或 Temporal。
+8. LangGraph 进入废弃流程，不再承载新增功能。Pi 和 Durable Runtime 完成替代、存量 Run 收敛后，删除 LangGraph Kernel、Checkpoint Saver、依赖和专用数据表。
 
 ## 2. 当前态、目标态与范围
 
@@ -71,7 +71,7 @@ Agent Platform SDK
 - Run、Attempt、Turn、Snapshot、Commit Barrier、取消和 lease guard；
 - Tool Runtime、Sandbox、Scheduler、MCP、Skill 的独立模块边界；
 - 只读工具 POC、写工具审批/resume、幂等与恢复验证；
-- LangGraph 通用 Agent loop 的渐进式替换和回滚。
+- LangGraph 的冻结、停流、存量恢复、代码删除和数据清理。
 
 ### 2.4 非目标
 
@@ -79,7 +79,7 @@ Agent Platform SDK
 - 要求复用团队使用 AIOP MySQL Schema、RBAC、Sandbox 或 MCP 配置；
 - 引入 Pi coding-agent CLI、TUI、JSONL Session、`AgentSessionRuntime` 或本地 workspace/cwd；
 - 使用 Pi 内置 bash/read/edit/write 工具直接访问生产环境；
-- 一次性删除 Legacy Kernel 或 LangGraph Kernel；
+- 在 Pi 和 Durable Runtime 尚未覆盖恢复能力前立即删除 Legacy Kernel 或 LangGraph Kernel；
 - 在本方案中同时完成 LiteLLM、Langfuse 和 Temporal 的生产部署。
 
 ## 3. Agent Platform SDK 包设计
@@ -553,21 +553,66 @@ Cron 到期
 
 多副本 Scheduler 通过 Store Adapter 实现 claim、租约和重试。MySQL Adapter 使用 `SKIP LOCKED`；其他团队可以实现自己的数据库或消息队列 Adapter。
 
-## 11. LangGraph 收敛策略
+## 11. LangGraph 废弃与移除计划
 
-| 场景 | 目标执行层 |
-| --- | --- |
-| 通用 Chat、ReAct、模型主导的诊断和工具调用 | PiAgentKernel |
-| 存量固定、确定性业务 DAG | LangGraphKernel，暂时保留 |
-| 长任务、跨副本等待、定时、重试和补偿 | Durable Runtime；后续迁往 Temporal 或 workflow 服务 |
-| Legacy 兼容场景 | LegacyKernel，逐步缩小 |
+### 11.1 废弃决策
 
-规则：
+当前 LangGraph 只实现 `prepare → model ↔ tools` 通用 ReAct 图，没有发现独立的确定性业务 DAG。它当前不可直接删除，是因为仍提供两项过渡能力：
 
-- 新功能不得以 LangGraph 实现通用“模型 → 工具 → 模型”循环；
-- 已创建 Run 固定 Kernel binding，不能中途切换；
-- 先迁移只读 Agent，再迁移经过审批的写工具，最后迁移存量 LangGraph ReAct 图；
-- 确定性 DAG 迁移完成后，再评估移除 LangGraph 依赖。
+- LangGraph Checkpoint 和 pending writes；
+- `interrupt()` / `Command(resume)` 驱动的 approval、question 和 plan 恢复。
+
+这些能力将由 Runtime Core 的 Run/Attempt/Turn、commit marker、Interaction 和恢复器接管。LangGraph 的最终状态是完全移除，不作为 Agent Platform SDK 的长期可选 Kernel。
+
+### 11.2 三阶段废弃流程
+
+| 阶段 | 行为 | 允许事项 | 禁止事项 |
+| --- | --- | --- | --- |
+| A：冻结 | 标记 deprecated，默认 Kernel 保持现状 | 修复安全、数据损坏和迁移阻塞问题 | 新增 LangGraph 节点、图、功能或业务依赖 |
+| B：停流 | Pi 达到灰度门槛后停止创建新 LangGraph Run | 恢复、取消和完成存量 LangGraph Run | 新 Run 绑定 `langgraph`、扩大 LangGraph 灰度 |
+| C：移除 | 存量 Run 收敛并经过回滚窗口后删除实现 | 只读保留历史 Run/Event/Audit | 加载 LangGraph Kernel、写入 LangGraph checkpoint |
+
+任何阶段都不得将已创建 Run 中途切换到另一 Kernel。迁移只影响新 Run binding。
+
+### 11.3 进入移除阶段的退出门槛
+
+删除 LangGraph 代码前必须同时满足：
+
+1. Pi 通过模型、工具、context、usage、取消和事件 parity 测试；
+2. Durable Runtime 支持所有 Kernel 的崩溃恢复，运行中心不再限制“仅 LangGraph Run 支持恢复”；
+3. approval、question 和 plan 均支持跨进程、跨副本 resume；
+4. Pi 写工具通过审批、Tool Ledger、幂等和非幂等恢复测试；
+5. 新 LangGraph Run 数量连续一个 checkpoint 保留周期为 0；
+6. `running`、`waiting`、`failed` 和 `recovery_required` 的 LangGraph Run 均已完成、取消或完成人工处置；
+7. Pi 灰度指标满足第 13.3 节要求，并完成一次生产回滚演练；
+8. 已生成 LangGraph 存量 Run、checkpoint、interaction 和 ledger 的清理审计报告。
+
+### 11.4 代码与依赖清理
+
+进入移除阶段后按以下顺序执行：
+
+1. 删除 LangGraph rollout 配置、环境变量选项和新 Run 选择逻辑；
+2. 删除 `LangGraphAgentKernel`、StateGraph、state、registry 和专用 Adapter；
+3. 删除 LangGraph Checkpoint Saver 及其 validation、parity 和 recovery 测试；
+4. 从 Kernel 类型、Run binding 和管理接口中移除新的 `langgraph` 写入能力；
+5. 删除 `@langchain/langgraph`、checkpoint validation 及仅由它们使用的 `@langchain/core` 依赖；
+6. 更新 HTTP、CLI、Scheduler、运行中心和设计文档中的 LangGraph 分支；
+7. 运行公共 npm API diff，确保 Agent Platform SDK 不暴露 LangGraph 类型。
+
+历史 Run 读取模型可以继续识别 `kernel=langgraph`，但只能用于展示和审计，不能再次执行。
+
+### 11.5 数据清理与回滚窗口
+
+LangGraph 停流后，`langgraph_checkpoints` 和 `langgraph_checkpoint_writes` 先转为只读，至少保留“当前 checkpoint 保留周期 + 一个应用发布回滚窗口”。
+
+回滚规则：
+
+- 阶段 A/B 可以停止新 Pi Run，并恢复到仍包含 LangGraph Kernel 的版本；
+- 阶段 C 删除代码后，只能回滚到与保留表结构兼容的历史构建；
+- 删除 LangGraph 数据表后，不再支持普通应用回滚；恢复旧 LangGraph 只能通过数据库备份和旧版本构建执行灾难恢复；
+- 删除表必须使用独立的向前迁移，禁止修改或重写历史迁移 `0011_langgraph_checkpoints.sql`。
+
+确认不再需要回滚后，新增迁移删除 LangGraph checkpoint 表，并清理 `agent_runs` 中只服务于 LangGraph 的 graph name/version 写入逻辑。历史审计数据继续保留。
 
 ## 12. 实施阶段
 
@@ -581,7 +626,9 @@ Cron 到期
 | 5：只读 POC | 日志、指标、资源查询、知识检索、只读 MCP | Tool Runtime 强制转发，受限并行和取消通过 |
 | 6：写工具闭环 | Approval、Ledger、幂等、resume、resource lock | 跨副本审批、崩溃恢复和非幂等保护通过 |
 | 7：模块抽取 | Sandbox、MCP、Skill、Scheduler、MySQL Adapter 独立包 | 至少一个非 AIOP fixture 完成嵌入式集成测试 |
-| 8：迁移收敛 | dry-run shadow、灰度、迁移通用 Agent、收缩 LangGraph | SLO 和安全指标达标，可关闭 Pi 新流量 |
+| 8：LangGraph 停流 | dry-run shadow、Pi 灰度、停止新 LangGraph binding | SLO 和安全指标达标，新 LangGraph Run 连续一个保留周期为 0 |
+| 9：LangGraph 移除 | 存量收敛、回滚演练、删除代码/依赖、只读保留 checkpoint 表 | 生产只运行 Pi/Legacy，公共 SDK 不暴露 LangGraph 类型 |
+| 10：数据清理 | 回滚窗口结束后删除 LangGraph checkpoint 表和专用字段写入 | 备份验证通过，历史 Run/Event/Audit 仍可查询 |
 
 镜像构建和测试环境部署必须通过 Makefile 入口，例如：
 
@@ -612,6 +659,8 @@ Tool Ledger 幂等、崩溃恢复、非幂等写保护
 context 截断、脱敏、摘要可追溯与预算限制
 Scheduler 多副本 claim 和 Run 关联
 Sandbox Provider 合约、配额、取消和回收
+LangGraph 停流、存量识别、移除后历史 Run 只读展示
+移除 LangGraph 依赖后的 typecheck、测试和包 API diff
 ```
 
 Pi 版本升级必须断言 tool result source order、事件顺序、abort、queue、截断 tool call、公开 export 和字段兼容性。
@@ -640,11 +689,12 @@ Shadow 不得重复执行任何外部写操作。
 
 ### 13.4 回滚
 
-1. 停止新 Run 绑定 `pi`，新请求回到既有 Kernel；
+1. LangGraph 移除前，停止新 Run 绑定 `pi`，新请求可回到 Legacy 或仍可用的 LangGraph Kernel；
 2. 已运行的 Pi Run 不得切换 Kernel，只能继续、取消或进入 `recovery_required`；
 3. 未完成工具依据 Ledger 和幂等 capability 保守处理；
 4. 保留 snapshot、commit、event、trace 和 ledger 用于复盘；
-5. 数据库迁移只向前追加，旧版本必须能够忽略新表和可选字段。
+5. LangGraph 代码移除后，应用回滚不得假设 LangGraph Kernel 仍然存在；
+6. 数据库迁移只向前追加，旧版本必须能够忽略新表和可选字段。
 
 ## 14. 发布、版本和复用治理
 
