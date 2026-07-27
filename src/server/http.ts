@@ -707,9 +707,7 @@ export function createHttpServer(rt: Runtime): http.Server {
   const runCenter = new RunCenterService(rt.store, {
     abortLocal: (ctx, runId) => abortActiveRunById(activeRuns, ctx.tenantId, runId),
     recover: (ctx, run) => {
-      void recoverAgentRun(rt, interactions, activeRuns, compactionWatermarks, ctx, run).catch((err) => {
-        log.error({ err, runId: run.runId }, 'Agent Run durable 恢复失败');
-      });
+      scheduleAgentRecovery(rt, interactions, activeRuns, compactionWatermarks, ctx, run);
     },
   });
 
@@ -1437,14 +1435,18 @@ async function handle(
     const id = decodeURIComponent(approvalMatch[1]!);
     const interaction = await rt.store.getInteraction(ctx.tenantId, id);
     if (!interaction || interaction.kind !== 'approval') throw new HttpError(404, '审批不存在或已处理');
+    const wasPending = interaction.status === 'pending';
     const approved = approvalMatch[2] === 'approve';
-    await interactions.resolve(ctx, id, {
+    const resolved = await interactions.resolve(ctx, id, {
       sessionId: interaction.sessionId,
       runId: interaction.runId,
       value: approved,
-    }).catch((error) => { throw new HttpError(404, error instanceof Error ? error.message : '审批不存在或已处理'); });
+    }).catch((error) => { throw interactionResolveHttpError(error, '审批不存在或已处理'); });
     if (approved) await approvals.approve(id, ctx.tenantId);
     else await approvals.deny(id, ctx.tenantId);
+    await scheduleResolvedInteractionRecovery(
+      rt, interactions, activeRuns, compactionWatermarks, ctx, resolved, approved, wasPending,
+    );
     return sendJson(res, 200, { ok: true });
   }
 
@@ -1473,12 +1475,16 @@ async function handle(
     if (!interaction || (interaction.kind !== 'question' && interaction.kind !== 'plan')) {
       throw new HttpError(404, '问题不存在或已回答');
     }
-    await interactions.resolve(ctx, id, {
+    const wasPending = interaction.status === 'pending';
+    const resolved = await interactions.resolve(ctx, id, {
       sessionId: interaction.sessionId,
       runId: interaction.runId,
       value: answers,
-    }).catch((error) => { throw new HttpError(404, error instanceof Error ? error.message : '问题不存在或已回答'); });
+    }).catch((error) => { throw interactionResolveHttpError(error, '问题不存在或已回答'); });
     questions.answer(id, ctx.tenantId, answers);
+    await scheduleResolvedInteractionRecovery(
+      rt, interactions, activeRuns, compactionWatermarks, ctx, resolved, answers, wasPending,
+    );
     return sendJson(res, 200, { ok: true });
   }
 
@@ -1846,6 +1852,79 @@ function abortReasonMessage(reason: unknown): string {
   return RUN_TERMINATED_MESSAGE;
 }
 
+function scheduleAgentRecovery(
+  rt: Runtime,
+  interactions: DurableInteractionService,
+  activeRuns: ActiveAgentRuns,
+  compactionWatermarks: CompactionWatermarks,
+  requester: RequestContext,
+  run: AgentRunRecord,
+  interactionResolution?: { interactionId: string; value: JsonValue },
+): void {
+  void recoverAgentRun(
+    rt, interactions, activeRuns, compactionWatermarks, requester, run, interactionResolution,
+  ).catch(async (error) => {
+    const now = new Date();
+    log.error({
+      errorType: error instanceof Error ? error.name : 'Error', runId: run.runId,
+    }, 'Agent Run durable 恢复失败');
+    await Promise.allSettled([
+      rt.store.updateAgentRun(run.tenantId, run.runId, {
+        status: 'recovery_required',
+        errorMessage: '交互恢复失败，可从 Run Center 重试',
+        updatedAt: now,
+      }),
+      rt.store.appendAgentRunEvent({
+        tenantId: run.tenantId, runId: run.runId, type: 'recovery', status: 'failed',
+        detail: {
+          reason: 'runtime_error',
+          interactionId: interactionResolution?.interactionId ?? null,
+          errorType: error instanceof Error ? error.name : 'Error',
+        },
+        createdAt: now,
+      }),
+    ]);
+  });
+}
+
+async function scheduleResolvedInteractionRecovery(
+  rt: Runtime,
+  interactions: DurableInteractionService,
+  activeRuns: ActiveAgentRuns,
+  compactionWatermarks: CompactionWatermarks,
+  requester: RequestContext,
+  interaction: Awaited<ReturnType<DurableInteractionService['resolve']>>,
+  value: JsonValue,
+  newlyResolved: boolean,
+): Promise<void> {
+  const run = await rt.store.getAgentRun(requester, interaction.runId);
+  if (!run || run.kernel !== 'pi') return;
+  if (!newlyResolved && run.status !== 'recovery_required') return;
+  await rt.store.appendAgentRunEvent({
+    tenantId: run.tenantId, runId: run.runId, type: 'recovery', status: 'requested',
+    detail: {
+      reason: 'interaction_resolved',
+      kind: interaction.kind,
+      interactionId: interaction.id,
+      requestedBy: requester.userId,
+    },
+    createdAt: new Date(),
+  });
+  scheduleAgentRecovery(rt, interactions, activeRuns, compactionWatermarks, requester, run, {
+    interactionId: interaction.id,
+    value,
+  });
+}
+
+function interactionResolveHttpError(error: unknown, fallback: string): HttpError {
+  const message = error instanceof Error ? error.message : fallback;
+  if (message.includes('冲突') || message.includes('已处理') || message.includes('已过期')) {
+    return new HttpError(409, message);
+  }
+  if (message.includes('无权')) return new HttpError(403, message);
+  return new HttpError(404, message);
+}
+
 async function recoverAgentRun(
   rt: Runtime,
   interactions: DurableInteractionService,
@@ -1853,6 +1932,7 @@ async function recoverAgentRun(
   compactionWatermarks: CompactionWatermarks,
   requester: RequestContext,
   run: AgentRunRecord,
+  interactionResolution?: { interactionId: string; value: JsonValue },
 ): Promise<void> {
   const owner = await rt.store.getUser(run.tenantId, run.userId).catch(() => undefined);
   const ctx: RequestContext = {
@@ -1861,7 +1941,13 @@ async function recoverAgentRun(
     role: owner?.role ?? (requester.userId === run.userId ? requester.role : 'user'),
   };
   const activeKey = activeRunKey(ctx, run.sessionId);
-  if (findActiveRun(activeRuns, activeKey)) {
+  const active = findActiveRun(activeRuns, activeKey);
+  if (active?.runId === run.runId) {
+    await waitForActiveRunRelease(activeRuns, activeKey, run.runId);
+  }
+  const remainingActive = findActiveRun(activeRuns, activeKey);
+  if (remainingActive?.runId === run.runId) return;
+  if (remainingActive) {
     const now = new Date();
     await rt.store.updateAgentRun(run.tenantId, run.runId, {
       status: 'recovery_required',
@@ -1946,6 +2032,7 @@ async function recoverAgentRun(
     const result = await resolveAgentRuntime(rt.agentRuntime).run({
       runId: run.runId,
       resumeFromCheckpoint: true,
+      interactionResolution,
       model: rt.model,
       tools: rt.tools,
       policy: rt.policy,
@@ -1990,6 +2077,19 @@ async function recoverAgentRun(
         log.warn({ err, runId: run.runId }, '恢复运行残留消息落库失败');
       });
     }
+  }
+}
+
+async function waitForActiveRunRelease(
+  activeRuns: ActiveAgentRuns,
+  activeKey: string,
+  runId: string,
+): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const active = findActiveRun(activeRuns, activeKey);
+    if (!active || active.runId !== runId) return;
+    await new Promise<void>((resolveWait) => setTimeout(resolveWait, 10));
   }
 }
 

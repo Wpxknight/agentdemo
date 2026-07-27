@@ -181,7 +181,7 @@ export class RunCenterService {
       this.store.listAgentRunAttempts(ctx, runId),
       this.store.listAgentRunTurns(ctx, runId),
     ]);
-    const blockedReason = recoveryBlockedReason(run, tools);
+    const blockedReason = recoveryBlockedReason(run, tools, interactions);
     return {
       run: publicRun(run),
       events: events.map(publicEvent),
@@ -214,8 +214,11 @@ export class RunCenterService {
     const run = await this.store.getAgentRun(ctx, runId);
     if (!run) throw new RunCenterNotFoundError();
     if (!RESUMABLE.has(run.status)) throw new RunCenterConflictError(`当前状态不可恢复：${run.status}`);
-    const tools = await this.store.listAgentRunToolExecutions(ctx, runId);
-    const blockedReason = recoveryBlockedReason(run, tools);
+    const [tools, interactions] = await Promise.all([
+      this.store.listAgentRunToolExecutions(ctx, runId),
+      this.store.listAgentRunInteractions(ctx, runId),
+    ]);
+    const blockedReason = recoveryBlockedReason(run, tools, interactions);
     if (blockedReason) throw new RunCenterConflictError(blockedReason);
     const now = new Date();
     await this.store.updateAgentRun(ctx.tenantId, runId, {
@@ -233,6 +236,7 @@ export class RunCenterService {
 function recoveryBlockedReason(
   run: AgentRunRecord,
   tools: ToolExecutionRecord[],
+  interactions: InteractionRecord[] = [],
 ): string | undefined {
   if (run.kernel === 'langgraph') return '历史 LangGraph Run 仅供查询，不能恢复执行';
   if (run.leaseOwner && run.leaseExpiresAt && run.leaseExpiresAt.getTime() > Date.now()) {
@@ -240,6 +244,8 @@ function recoveryBlockedReason(
   }
   const unsafe = tools.find((tool) => tool.status === 'started' || tool.status === 'unknown' || tool.status === 'recovery_required');
   if (unsafe) return `工具 ${unsafe.toolName} 的执行结果不确定，需要人工确认后恢复`;
+  const pending = interactions.find((interaction) => interaction.status === 'pending');
+  if (pending) return `运行仍有 pending Interaction（${pending.kind}:${pending.id}），必须先提交可信 resolution`;
   return undefined;
 }
 

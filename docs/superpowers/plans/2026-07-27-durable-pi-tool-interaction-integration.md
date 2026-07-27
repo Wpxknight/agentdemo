@@ -95,13 +95,13 @@
 - Test: `/home/opt/develop/aicoding/aiop/tests/http-agent-runs.test.ts`
 - Test: `/home/opt/develop/aicoding/aiop/tests/http.test.ts`
 
-- [ ] Add failing HTTP tests proving approve/deny/question/plan resolve invokes recovery with `{interactionId,value}`, returns after scheduling, and a new Attempt is created without a separate `/resume` call.
-- [ ] Add failing tests for duplicate matching resolve, conflicting resolve, cross-user/cross-tenant access, expired Interaction, and session-busy recovery protection.
-- [ ] Extend recovery orchestration and `RunAgentOptions` to carry the resolution into `DurableAgentRuntime.resume()`.
-- [ ] Keep explicit Run Center resume for failed/recovery-required Runs; reject bypass of a pending Interaction without resolution.
-- [ ] Record recovery requested/failed events without persisting sensitive answer content in control-event detail.
-- [ ] Run both HTTP test files plus the fault matrix.
-- [ ] Commit with the required AIOS co-author trailer.
+- [x] Add failing HTTP tests proving approve/deny/question/plan resolve invokes recovery with `{interactionId,value}`, returns after scheduling, and a new Attempt is created without a separate `/resume` call.
+- [x] Add failing tests for duplicate matching resolve, conflicting resolve, cross-user/cross-tenant access, expired Interaction, and session-busy recovery protection.
+- [x] Extend recovery orchestration and `RunAgentOptions` to carry the resolution into `DurableAgentRuntime.resume()`.
+- [x] Keep explicit Run Center resume for failed/recovery-required Runs; reject bypass of a pending Interaction without resolution.
+- [x] Record recovery requested/failed events without persisting sensitive answer content in control-event detail.
+- [x] Run both HTTP test files plus the fault matrix.
+- [x] Commit with the required AIOS co-author trailer.
 
 ### Task 7: Remaining design limit audit and delivery evidence
 

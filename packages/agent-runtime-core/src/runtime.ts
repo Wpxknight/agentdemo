@@ -122,6 +122,17 @@ export class DurableAgentRuntime {
     if (!snapshot) {
       throw new AgentPlatformError({ code: 'TURN_COMMIT_FAILED', message: 'Committed turn snapshot is missing', retryable: false });
     }
+    if (!input.resolution) {
+      const pending = (await this.options.store.interactions.list(identity))
+        .find((interaction) => interaction.status === 'pending');
+      if (pending) {
+        throw new AgentPlatformError({
+          code: 'RUN_STATE_CONFLICT',
+          message: `Pending Interaction ${pending.id} requires a trusted resolution`,
+          retryable: false,
+        });
+      }
+    }
     let interactionResolution: ResolvedInteraction | undefined;
     if (input.resolution) {
       const interaction = await this.options.store.interactions.get({ ...identity, interactionId: input.resolution.interactionId });

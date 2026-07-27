@@ -69,8 +69,11 @@ describe('DurableInteractionService', () => {
       value: { 'Continue?': ['Yes'] },
     })).resolves.toMatchObject({ status: 'resolved' });
     await expect(restarted.resolve(owner, pending.id, {
+      sessionId: 'session-a', runId: 'run-a', value: { 'Continue?': ['Yes'] },
+    })).resolves.toMatchObject({ status: 'resolved' });
+    await expect(restarted.resolve(owner, pending.id, {
       sessionId: 'session-a', runId: 'run-a', value: {},
-    })).rejects.toThrow('已处理');
+    })).rejects.toThrow('冲突');
   });
 
   it('rejects cross-tenant, cross-user, mismatched run, and expired resolution', async () => {

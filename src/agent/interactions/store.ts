@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import type { RequestContext } from '../../auth/types.js';
 import { can } from '../../auth/rbac.js';
 import type { InteractionKind, InteractionRecord, Store } from '../../db/store.js';
@@ -54,8 +55,7 @@ export class DurableInteractionService {
   ): Promise<InteractionRecord> {
     const current = await this.store.getInteraction(ctx.tenantId, id);
     if (!current) throw new Error('交互不存在');
-    if (current.status !== 'pending') throw new Error('交互已处理');
-    if (current.expiresAt.getTime() <= Date.now()) {
+    if (current.status === 'pending' && current.expiresAt.getTime() <= Date.now()) {
       const expired = { ...current, status: 'expired' as const, resolvedAt: new Date() };
       await this.store.resolveInteraction(expired);
       throw new Error('交互已过期');
@@ -66,6 +66,11 @@ export class DurableInteractionService {
     if (current.sessionId !== resolution.sessionId || current.runId !== resolution.runId) {
       throw new Error('交互所属会话或运行不匹配');
     }
+    if (current.status === 'resolved') {
+      if (isDeepStrictEqual(current.resolution, resolution.value)) return current;
+      throw new Error('交互决议冲突');
+    }
+    if (current.status !== 'pending') throw new Error('交互已处理');
     const resolved: InteractionRecord = {
       ...current,
       status: 'resolved',

@@ -104,6 +104,8 @@ describe('DurableAgentRuntime', () => {
         },
       };
       const resumedRuntime = new DurableAgentRuntime({ store, kernels: [resumedKernel], defaultKernel: 'pi' });
+      await expect(resumedRuntime.resume({ identity, runId: first.runId }))
+        .rejects.toMatchObject({ code: 'RUN_STATE_CONFLICT' });
       const resumed = await resumedRuntime.resume({
         identity,
         runId: first.runId,

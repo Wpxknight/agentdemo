@@ -160,6 +160,150 @@ describe('Agent Run Center HTTP API', () => {
     })));
   });
 
+  it.each([
+    ['approve', true],
+    ['deny', false],
+  ] as const)('automatically recovers a resolved approval (%s) once with a trusted resolution', async (action, value) => {
+    run.mockClear();
+    const id = `approval-auto-${action}`;
+    await store.updateAgentRun('default', 'run-user', { status: 'waiting', waitingReason: 'approval' });
+    await store.putInteraction({
+      id, tenantId: 'default', userId, sessionId: 'session-user', runId: 'run-user',
+      kind: 'approval', toolCallId: `call-${action}`, payload: { id }, status: 'pending',
+      expiresAt: new Date(Date.now() + 60_000), createdAt: new Date(),
+    });
+
+    const first = await fetch(`${base}/v1/approvals/${id}/${action}`, {
+      method: 'POST', headers: auth(adminToken), body: '{}',
+    });
+    expect(first.status).toBe(200);
+    await vi.waitFor(() => expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'run-user', resumeFromCheckpoint: true,
+      interactionResolution: { interactionId: id, value },
+    })));
+    const calls = run.mock.calls.length;
+
+    const duplicate = await fetch(`${base}/v1/approvals/${id}/${action}`, {
+      method: 'POST', headers: auth(adminToken), body: '{}',
+    });
+    expect(duplicate.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(run).toHaveBeenCalledTimes(calls);
+
+    const conflict = await fetch(`${base}/v1/approvals/${id}/${action === 'approve' ? 'deny' : 'approve'}`, {
+      method: 'POST', headers: auth(adminToken), body: '{}',
+    });
+    expect(conflict.status).toBe(409);
+    const events = await store.listAgentRunEvents({ tenantId: 'default', userId, role: 'user' }, 'run-user');
+    const requested = events.findLast((event) => event.type === 'recovery' && event.status === 'requested');
+    expect(requested?.detail).toMatchObject({ reason: 'interaction_resolved', kind: 'approval' });
+    expect(requested?.detail).not.toHaveProperty('value');
+  });
+
+  it.each(['question', 'plan'] as const)('automatically recovers a resolved %s without exposing answers in events', async (kind) => {
+    run.mockClear();
+    const id = `${kind}-auto`;
+    const answers = { 'Continue?': [kind === 'plan' ? '批准' : 'Yes'] };
+    await store.updateAgentRun('default', 'run-user', { status: 'waiting', waitingReason: kind });
+    await store.putInteraction({
+      id, tenantId: 'default', userId, sessionId: 'session-user', runId: 'run-user',
+      kind, toolCallId: `call-${kind}`, payload: { id, questions: [] }, status: 'pending',
+      expiresAt: new Date(Date.now() + 60_000), createdAt: new Date(),
+    });
+    const response = await fetch(`${base}/v1/questions/${id}/answer`, {
+      method: 'POST', headers: auth(userToken), body: JSON.stringify({ answers }),
+    });
+    expect(response.status).toBe(200);
+    await vi.waitFor(() => expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'run-user', resumeFromCheckpoint: true,
+      interactionResolution: { interactionId: id, value: answers },
+    })));
+    const events = await store.listAgentRunEvents({ tenantId: 'default', userId, role: 'user' }, 'run-user');
+    const requested = events.findLast((event) => event.type === 'recovery' && event.status === 'requested');
+    expect(requested?.detail).toMatchObject({ reason: 'interaction_resolved', kind });
+    expect(JSON.stringify(requested?.detail)).not.toContain('Continue?');
+  });
+
+  it('records a sanitized recovery failure after a successful interaction resolve', async () => {
+    run.mockClear();
+    run.mockRejectedValueOnce(new Error('sensitive model failure detail'));
+    const id = 'approval-recovery-failure';
+    await store.updateAgentRun('default', 'run-user', { status: 'waiting', waitingReason: 'approval' });
+    await store.putInteraction({
+      id, tenantId: 'default', userId, sessionId: 'session-user', runId: 'run-user',
+      kind: 'approval', toolCallId: 'call-failure', payload: {}, status: 'pending',
+      expiresAt: new Date(Date.now() + 60_000), createdAt: new Date(),
+    });
+    const response = await fetch(`${base}/v1/approvals/${id}/approve`, {
+      method: 'POST', headers: auth(adminToken), body: '{}',
+    });
+    expect(response.status).toBe(200);
+    await vi.waitFor(async () => {
+      const record = await store.getAgentRun({ tenantId: 'default', userId, role: 'user' }, 'run-user');
+      expect(record?.status).toBe('recovery_required');
+    });
+    const events = await store.listAgentRunEvents({ tenantId: 'default', userId, role: 'user' }, 'run-user');
+    const failed = events.findLast((event) => event.type === 'recovery' && event.status === 'failed');
+    expect(failed?.detail).toMatchObject({
+      reason: 'runtime_error', interactionId: id, errorType: 'Error',
+    });
+    expect(JSON.stringify(failed?.detail)).not.toContain('sensitive model failure detail');
+  });
+
+  it('keeps session-busy protection when interaction recovery races another active run', async () => {
+    run.mockClear();
+    run.mockImplementationOnce(async (options) => new Promise<RunAgentResult>((_resolve, reject) => {
+      options.signal?.addEventListener('abort', () => reject(options.signal?.reason), { once: true });
+    }));
+    const activeResponse = await fetch(`${base}/v1/agent`, {
+      method: 'POST', headers: auth(userToken),
+      body: JSON.stringify({ task: 'hold session', sessionId: 'session-user' }),
+    });
+    expect(activeResponse.status).toBe(200);
+    await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
+
+    const id = 'approval-session-busy';
+    await store.updateAgentRun('default', 'run-user', { status: 'waiting', waitingReason: 'approval' });
+    await store.putInteraction({
+      id, tenantId: 'default', userId, sessionId: 'session-user', runId: 'run-user',
+      kind: 'approval', toolCallId: 'call-busy', payload: {}, status: 'pending',
+      expiresAt: new Date(Date.now() + 60_000), createdAt: new Date(),
+    });
+    const resolved = await fetch(`${base}/v1/approvals/${id}/approve`, {
+      method: 'POST', headers: auth(adminToken), body: '{}',
+    });
+    expect(resolved.status).toBe(200);
+    await vi.waitFor(async () => {
+      const record = await store.getAgentRun({ tenantId: 'default', userId, role: 'user' }, 'run-user');
+      expect(record).toMatchObject({ status: 'recovery_required', errorMessage: '同一会话已有运行中的任务' });
+    });
+    const events = await store.listAgentRunEvents({ tenantId: 'default', userId, role: 'user' }, 'run-user');
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'recovery', status: 'blocked', detail: { reason: 'session_busy' },
+    }));
+
+    await fetch(`${base}/v1/sessions/session-user/terminate`, {
+      method: 'POST', headers: auth(userToken), body: '{}',
+    });
+    await activeResponse.body?.cancel().catch(() => undefined);
+  });
+
+  it('rejects explicit resume while a durable interaction is still pending', async () => {
+    run.mockClear();
+    await store.updateAgentRun('default', 'run-user', { status: 'failed', waitingReason: 'approval' });
+    await store.putInteraction({
+      id: 'approval-pending-resume', tenantId: 'default', userId, sessionId: 'session-user', runId: 'run-user',
+      kind: 'approval', toolCallId: 'call-pending', payload: {}, status: 'pending',
+      expiresAt: new Date(Date.now() + 60_000), createdAt: new Date(),
+    });
+    const response = await fetch(`${base}/v1/agent/runs/run-user/resume`, {
+      method: 'POST', headers: auth(userToken), body: '{}',
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: expect.stringContaining('pending Interaction') });
+    expect(run).not.toHaveBeenCalled();
+  });
+
   it('keeps historical LangGraph runs query-only and rejects recovery', async () => {
     await store.updateAgentRun('default', 'run-admin', { status: 'failed', updatedAt: new Date() });
     const detail = await fetch(`${base}/v1/agent/runs/run-admin`, { headers: auth(adminToken) });
