@@ -8,6 +8,7 @@ import type {
   JsonValue,
   KernelMessage,
   ModelBinding,
+  RunLimits,
   ToolCapability,
   ToolResult,
   WaitingReason,
@@ -59,6 +60,7 @@ export interface TurnSnapshot extends RunIdentity {
   skillSetVersion?: string;
   toolSetVersion: string;
   policyVersion: string;
+  limits?: RunLimits;
   deadlineAt?: Date;
   messages: readonly KernelMessage[];
   createdAt: Date;

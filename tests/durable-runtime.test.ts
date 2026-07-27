@@ -115,4 +115,127 @@ describe('DurableAgentRuntime', () => {
     expect((await handle.result()).status).toBe('cancelled');
     expect((await store.runs.get({ tenantId: 'tenant-a', runId: handle.runId }))?.status).toBe('cancelled');
   });
+
+  it('commits the boundary turn and fails when the durable max-turn budget is exhausted', async () => {
+    const store = new MemoryRuntimeStore();
+    const kernel: AgentKernel = {
+      descriptor: { name: 'pi', version: '0.82.1', protocolVersion: '1' },
+      run: vi.fn(async (input) => ({
+        outcome: 'continue' as const, turnNo: input.turnNo, usage,
+        messages: [...input.messages, { role: 'assistant', content: [{ type: 'text', text: 'more' }] }],
+      })),
+    };
+    const runtime = new DurableAgentRuntime({ store, kernels: [kernel], defaultKernel: 'pi' });
+    const handle = await runtime.run({
+      identity, sessionId: 'session-a', input: [{ role: 'user', text: 'loop' }], limits: { maxTurns: 1 },
+    });
+
+    await expect(handle.result()).resolves.toMatchObject({
+      status: 'failed', error: { code: 'RUN_LIMIT_EXCEEDED', message: 'Run maxTurns exceeded: 1' },
+    });
+    expect(kernel.run).toHaveBeenCalledOnce();
+    expect(await store.turns.listCommitted({ tenantId: 'tenant-a', runId: handle.runId })).toHaveLength(1);
+  });
+
+  it.each([
+    ['maxInputTokens', { maxInputTokens: 2 }, { ...usage, inputTokens: 3 }, 'Run maxInputTokens exceeded: 3 > 2'],
+    ['maxOutputTokens', { maxOutputTokens: 1 }, usage, 'Run maxOutputTokens exceeded: 2 > 1'],
+    ['maxCostUsd', { maxCostUsd: 0.01 }, { ...usage, costUsd: 0.02 }, 'Run maxCostUsd exceeded: 0.02 > 0.01'],
+  ] as const)('fails with a committed turn when %s is exceeded', async (_name, limits, turnUsage, message) => {
+    const store = new MemoryRuntimeStore();
+    const kernel: AgentKernel = {
+      descriptor: { name: 'pi', version: '0.82.1', protocolVersion: '1' },
+      run: async () => ({ ...completed(), usage: turnUsage }),
+    };
+    const runtime = new DurableAgentRuntime({ store, kernels: [kernel], defaultKernel: 'pi' });
+    const handle = await runtime.run({ identity, sessionId: 'session-a', input: [], limits });
+
+    await expect(handle.result()).resolves.toMatchObject({
+      status: 'failed', error: { code: 'RUN_LIMIT_EXCEEDED', message },
+    });
+    expect(await store.turns.listCommitted({ tenantId: 'tenant-a', runId: handle.runId })).toHaveLength(1);
+  });
+
+  it('persists the deadline and enforces it after a cross-process resume', async () => {
+    const store = new MemoryRuntimeStore();
+    let now = new Date('2026-07-27T00:00:00.000Z');
+    const deadlineAt = new Date('2026-07-27T00:00:10.000Z');
+    const firstKernel: AgentKernel = {
+      descriptor: { name: 'pi', version: '0.82.1', protocolVersion: '1' },
+      run: async () => ({ ...completed('waiting'), outcome: 'waiting', waitingReason: 'question' }),
+    };
+    const firstRuntime = new DurableAgentRuntime({ store, kernels: [firstKernel], defaultKernel: 'pi', now: () => now });
+    const first = await firstRuntime.run({
+      identity, sessionId: 'session-a', input: [{ role: 'user', text: 'hello' }], limits: { deadlineAt },
+    });
+    expect((await first.result()).status).toBe('waiting');
+
+    now = new Date('2026-07-27T00:00:11.000Z');
+    const resumedKernel = { ...firstKernel, run: vi.fn(firstKernel.run) };
+    const resumedRuntime = new DurableAgentRuntime({ store, kernels: [resumedKernel], defaultKernel: 'pi', now: () => now });
+    const resumed = await resumedRuntime.resume({ identity, runId: first.runId });
+    await expect(resumed.result()).resolves.toMatchObject({
+      status: 'failed', error: { code: 'RUN_LIMIT_EXCEEDED', message: 'Run deadline exceeded' },
+    });
+    expect(resumedKernel.run).not.toHaveBeenCalled();
+  });
+
+  it('aborts and awaits all active runs during shutdown', async () => {
+    const store = new MemoryRuntimeStore();
+    const kernel: AgentKernel = {
+      descriptor: { name: 'pi', version: '0.82.1', protocolVersion: '1' },
+      run: (input) => new Promise((_resolve, reject) => {
+        input.signal?.addEventListener('abort', () => reject(input.signal?.reason), { once: true });
+      }),
+    };
+    const runtime = new DurableAgentRuntime({ store, kernels: [kernel], defaultKernel: 'pi' });
+    const first = await runtime.run({ identity, sessionId: 'session-a', input: [] });
+    const second = await runtime.run({ identity, sessionId: 'session-b', input: [] });
+
+    await runtime.shutdown('worker shutdown');
+    await expect(Promise.all([first.result(), second.result()])).resolves.toEqual([
+      expect.objectContaining({ status: 'cancelled' }), expect.objectContaining({ status: 'cancelled' }),
+    ]);
+  });
+
+  it('keeps streaming deltas live-only and bounds durable control events per turn', async () => {
+    const store = new MemoryRuntimeStore();
+    const observed: string[] = [];
+    const kernel: AgentKernel = {
+      descriptor: { name: 'pi', version: '0.82.1', protocolVersion: '1' },
+      run: async (_input, control) => {
+        await control.emit({ type: 'text_delta', text: 'secret-text' });
+        await control.emit({ type: 'thinking_delta', text: 'secret-thinking' });
+        await control.emit({ type: 'usage', usage });
+        return completed();
+      },
+    };
+    const runtime = new DurableAgentRuntime({
+      store, kernels: [kernel], defaultKernel: 'pi', observeEvent: (event) => { observed.push(event.type); },
+    });
+    const handle = await runtime.run({ identity, sessionId: 'session-a', input: [] });
+    expect((await handle.result()).status).toBe('succeeded');
+    const events = await store.events.list({ tenantId: 'tenant-a', runId: handle.runId });
+    expect(observed).toEqual(['text_delta', 'thinking_delta', 'usage']);
+    expect(events.map((event) => event.type)).not.toContain('text_delta');
+    expect(events.map((event) => event.type)).not.toContain('thinking_delta');
+    expect(JSON.stringify(events.map((event) => event.detail))).not.toContain('secret-text');
+    expect(JSON.stringify(events.map((event) => event.detail))).not.toContain('secret-thinking');
+
+    const overflowingKernel: AgentKernel = {
+      ...kernel,
+      run: async (_input, control) => {
+        await control.emit({ type: 'usage', usage });
+        await control.emit({ type: 'usage', usage });
+        return completed();
+      },
+    };
+    const bounded = new DurableAgentRuntime({
+      store: new MemoryRuntimeStore(), kernels: [overflowingKernel], defaultKernel: 'pi', maxDurableEventsPerTurn: 1,
+    });
+    const overflow = await bounded.run({ identity, sessionId: 'session-c', input: [] });
+    await expect(overflow.result()).resolves.toMatchObject({
+      status: 'failed', error: { code: 'RUN_LIMIT_EXCEEDED', message: 'Durable event limit exceeded: 1' },
+    });
+  });
 });

@@ -486,6 +486,9 @@ MySQL Adapter 按以下顺序执行：
 | `0015_agent_attempts_and_turns.sql` | attempts、snapshots、commits 及 `agent_runs` 扩展 |
 | `0016_agent_tool_ledger_v2.sql` | Tool Ledger 字段和唯一键 |
 | `0017_agent_run_event_sequence.sql` | event sequence 与历史回填 |
+| `0018_scheduler_agent_run_links.sql` | Scheduler task 与 Agent Run 的独立关联 |
+| `0019_langgraph_checkpoints_read_only.sql` | 停止新 LangGraph 流量后冻结 checkpoint 表 |
+| `0020_agent_run_limits.sql` | TurnSnapshot 持久化 Run 预算，跨进程恢复继续执行相同限制 |
 | LangGraph 清理迁移 | 回滚窗口结束后删除 checkpoint 表；编号在实施时顺延 |
 
 旧版本必须能忽略新表和可选字段。历史事件 sequence 回填完成并验证唯一性后，再设为强约束。
@@ -639,6 +642,7 @@ Runtime 公共包不提供 HTTP。`@aiop/agent-runtime-aiop` 继续兼容现有�
 | --- | --- | --- |
 | `RUN_NOT_FOUND` | Run 不存在或调用方不可见 | 否 |
 | `RUN_STATE_CONFLICT` | 当前状态不允许取消或恢复 | 条件满足后重试 |
+| `RUN_LIMIT_EXCEEDED` | Turn、token、费用、deadline 或 durable event 超出 Run 限制 | 否 |
 | `LEASE_LOST` | Worker 丢失 lease/fencing 权限 | 当前 Attempt 否 |
 | `TURN_COMMIT_FAILED` | Turn 事务提交失败 | 恢复器检查后决定 |
 | `TOOL_RESULT_UNKNOWN` | 外部副作用结果不确定 | 禁止自动重试 |

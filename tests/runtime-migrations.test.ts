@@ -41,6 +41,12 @@ describe('durable runtime migrations', () => {
     expect(source).toContain("signal sqlstate '45000'");
   });
 
+  it('persists restart-safe run limits with every turn snapshot', async () => {
+    const source = await sql('0020_agent_run_limits.sql');
+    expect(source).toContain('alter table agent_turn_snapshots');
+    expect(source).toContain('add column limits_json json');
+  });
+
   it('registers the new tables and columns in the Kysely schema', async () => {
     const source = (await readFile(new URL('../schema.ts', migrations), 'utf8')).toLowerCase();
     for (const table of ['agentrunattemptstable', 'agentturnsnapshotstable', 'agentturncommitstable']) {
@@ -50,5 +56,6 @@ describe('durable runtime migrations', () => {
     expect(source).toContain('agent_turn_snapshots:');
     expect(source).toContain('agent_turn_commits:');
     expect(source).toContain('sequence: number');
+    expect(source).toContain('limits_json: nullablejsoncolumn');
   });
 });

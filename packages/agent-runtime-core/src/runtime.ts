@@ -10,6 +10,7 @@ import {
   type KernelMessage,
   type ModelBinding,
   type ResumeRunInput,
+  type RunLimits,
   type RunHandle,
   type StartRunInput,
   type ToolDefinition,
@@ -31,6 +32,7 @@ export interface DurableAgentRuntimeOptions {
   toolSetVersion?: string;
   policyVersion?: string;
   leaseTtlMs?: number;
+  maxDurableEventsPerTurn?: number;
   now?: () => Date;
   observeEvent?: (event: KernelEvent) => void | Promise<void>;
 }
@@ -47,7 +49,9 @@ export class DurableAgentRuntime {
   private readonly toolSetVersion: string;
   private readonly policyVersion: string;
   private readonly leaseTtlMs: number;
+  private readonly maxDurableEventsPerTurn: number;
   private readonly now: () => Date;
+  private readonly executions = new Map<string, Promise<AgentRunResult>>();
 
   constructor(private readonly options: DurableAgentRuntimeOptions) {
     for (const kernel of options.kernels) this.kernels.set(kernel.descriptor.name, kernel);
@@ -60,6 +64,7 @@ export class DurableAgentRuntime {
     this.toolSetVersion = options.toolSetVersion ?? 'default';
     this.policyVersion = options.policyVersion ?? 'default';
     this.leaseTtlMs = options.leaseTtlMs ?? 30_000;
+    this.maxDurableEventsPerTurn = options.maxDurableEventsPerTurn ?? 256;
     this.now = options.now ?? (() => new Date());
   }
 
@@ -92,7 +97,7 @@ export class DurableAgentRuntime {
       role: 'user',
       content: message.content ?? (message.text === undefined ? [] : [{ type: 'text', text: message.text }]),
     }));
-    return this.startHandle(record, kernel, input.identity, messages, false, input.signal, input.limits?.deadlineAt);
+    return this.startHandle(record, kernel, input.identity, messages, false, input.signal, input.limits);
   }
 
   async resume(input: ResumeRunInput): Promise<RunHandle> {
@@ -105,6 +110,12 @@ export class DurableAgentRuntime {
     const kernel = this.resolveKernel(record.kernel, record.kernelVersion);
     const last = await this.options.store.turns.getLastCommitted(identity);
     if (!last) throw new AgentPlatformError({ code: 'TURN_COMMIT_FAILED', message: 'No committed turn to resume', retryable: false });
+    const snapshot = await this.options.store.turns.getSnapshot({
+      ...identity, attemptId: last.attemptId, turnNo: last.turnNo,
+    });
+    if (!snapshot) {
+      throw new AgentPlatformError({ code: 'TURN_COMMIT_FAILED', message: 'Committed turn snapshot is missing', retryable: false });
+    }
     if (input.resolution) {
       const interaction = await this.options.store.interactions.get({ ...identity, interactionId: input.resolution.interactionId });
       if (!interaction || interaction.status !== 'pending') {
@@ -118,7 +129,7 @@ export class DurableAgentRuntime {
       && last.messages.at(-1)?.role === 'assistant'
       ? last.messages.slice(0, -1)
       : last.messages;
-    return this.startHandle(record, kernel, input.identity, messages, true, input.signal);
+    return this.startHandle(record, kernel, input.identity, messages, true, input.signal, snapshot.limits);
   }
 
   async cancel(input: CancelRunInput): Promise<void> {
@@ -134,6 +145,11 @@ export class DurableAgentRuntime {
     if (record.status !== 'running') await this.options.store.runs.update(identity, { status: 'cancelled', updatedAt: now });
   }
 
+  async shutdown(reason = 'Agent runtime shutdown'): Promise<void> {
+    for (const controller of this.active.values()) controller.abort(new Error(reason));
+    await Promise.allSettled([...this.executions.values()]);
+  }
+
   private startHandle(
     record: RunRecord,
     kernel: AgentKernel,
@@ -141,13 +157,18 @@ export class DurableAgentRuntime {
     messages: readonly KernelMessage[],
     continuation: boolean,
     externalSignal?: AbortSignal,
-    deadlineAt?: Date,
+    limits?: RunLimits,
   ): RunHandle {
     const identity = { tenantId: record.tenantId, runId: record.runId };
+    const key = runKey(identity);
     let settled = false;
     const resultPromise = this.execute(
-      record, kernel, identityContext, messages, continuation, externalSignal, deadlineAt,
-    ).finally(() => { settled = true; });
+      record, kernel, identityContext, messages, continuation, externalSignal, limits,
+    ).finally(() => {
+      settled = true;
+      this.executions.delete(key);
+    });
+    this.executions.set(key, resultPromise);
     return {
       runId: record.runId,
       status: record.status,
@@ -163,7 +184,7 @@ export class DurableAgentRuntime {
     messages: readonly KernelMessage[],
     continuation: boolean,
     externalSignal?: AbortSignal,
-    deadlineAt?: Date,
+    limits?: RunLimits,
   ): Promise<AgentRunResult> {
     const identity = { tenantId: record.tenantId, runId: record.runId };
     const controller = new AbortController();
@@ -178,7 +199,7 @@ export class DurableAgentRuntime {
     let currentContinuation = continuation;
     let aggregateUsage = { ...record.usage };
     let snapshot = this.snapshot({
-      identity, attemptId, turnNo, identityContext, messages: currentMessages, previous, deadlineAt,
+      identity, attemptId, turnNo, identityContext, messages: currentMessages, previous, limits,
     });
     await this.options.store.transaction(async (tx) => {
       await tx.runs.update(identity, { status: 'running', waitingReason: undefined, updatedAt: this.now() });
@@ -192,7 +213,10 @@ export class DurableAgentRuntime {
     try {
       while (true) {
         const buffered: Omit<AgentRunEvent, 'sequence'>[] = [];
-        await this.guard(identity, lease.token, deadlineAt, signal);
+        await this.guard(identity, lease.token, limits?.deadlineAt, signal);
+        if (limits?.maxTurns !== undefined && turnNo > limits.maxTurns) {
+          throw limitExceeded(`Run maxTurns exceeded: ${limits.maxTurns}`);
+        }
         const exit = await kernel.run({
           ...identity,
           attemptId,
@@ -205,18 +229,25 @@ export class DurableAgentRuntime {
           signal,
         }, {
           emit: async (event) => {
-            buffered.push(this.kernelEvent(identity, attemptId, turnNo, event));
             await this.options.observeEvent?.(event);
+            const durable = this.kernelEvent(identity, attemptId, turnNo, event);
+            if (!durable) return;
+            if (buffered.length >= this.maxDurableEventsPerTurn) {
+              throw limitExceeded(`Durable event limit exceeded: ${this.maxDurableEventsPerTurn}`);
+            }
+            buffered.push(durable);
           },
-          guard: async () => this.guard(identity, lease.token, deadlineAt, signal),
+          guard: async () => this.guard(identity, lease.token, limits?.deadlineAt, signal),
           shouldStopAfterTurn: async () => true,
         });
-        await this.guard(identity, lease.token, deadlineAt, signal);
+        await this.guard(identity, lease.token, limits?.deadlineAt, signal);
         aggregateUsage = addUsage(aggregateUsage, exit.usage);
-        const status = exit.outcome === 'continue' ? 'running'
-          : exit.outcome === 'completed' ? 'succeeded'
-            : exit.outcome === 'waiting' ? 'waiting'
-              : exit.outcome === 'recovery_required' ? 'recovery_required' : 'failed';
+        const limitError = runLimitError(limits, aggregateUsage, turnNo, exit.outcome);
+        const outcome = limitError ? 'failed' : exit.outcome;
+        const status = outcome === 'continue' ? 'running'
+          : outcome === 'completed' ? 'succeeded'
+            : outcome === 'waiting' ? 'waiting'
+              : outcome === 'recovery_required' ? 'recovery_required' : 'failed';
         const committedAt = this.now();
         const commit = await this.options.store.turns.commit({
           leaseOwner: this.workerId,
@@ -229,18 +260,18 @@ export class DurableAgentRuntime {
           },
           events: [...buffered, {
             ...identity, attemptId, turnNo, type: 'turn_committed',
-            detail: { outcome: exit.outcome, stopReason: exit.stopReason ?? null }, createdAt: committedAt,
+            detail: { outcome, stopReason: exit.stopReason ?? null }, createdAt: committedAt,
           }],
           runStatus: status,
           waitingReason: exit.waitingReason,
         });
-        if (exit.outcome === 'continue') {
+        if (outcome === 'continue') {
           previous = commit;
           turnNo++;
           currentMessages = exit.messages;
           currentContinuation = true;
           snapshot = this.snapshot({
-            identity, attemptId, turnNo, identityContext, messages: currentMessages, previous, deadlineAt,
+            identity, attemptId, turnNo, identityContext, messages: currentMessages, previous, limits,
           });
           await this.options.store.turns.createSnapshot(snapshot);
           continue;
@@ -251,7 +282,13 @@ export class DurableAgentRuntime {
           completedAt: committedAt,
         });
         await this.release(identity, commit);
-        return { runId: record.runId, status: finalStatus, text: lastText(exit.messages), usage: aggregateUsage, error: exit.error };
+        return {
+          runId: record.runId,
+          status: finalStatus,
+          text: lastText(exit.messages),
+          usage: aggregateUsage,
+          error: limitError ? errorData(limitError) : exit.error,
+        };
       }
     } catch (error) {
       const now = this.now();
@@ -274,7 +311,11 @@ export class DurableAgentRuntime {
         runId: record.runId,
         status,
         usage: aggregateUsage,
-        error: { code: status === 'recovery_required' ? 'TOOL_RESULT_UNKNOWN' : 'MODEL_PROVIDER_ERROR', message: safeMessage(error), retryable: false },
+        error: error instanceof AgentPlatformError ? errorData(error) : {
+          code: status === 'recovery_required' ? 'TOOL_RESULT_UNKNOWN' : 'MODEL_PROVIDER_ERROR',
+          message: safeMessage(error),
+          retryable: false,
+        },
       };
     } finally {
       this.active.delete(runKey(identity));
@@ -288,7 +329,7 @@ export class DurableAgentRuntime {
     identityContext: StartRunInput['identity'];
     messages: readonly KernelMessage[];
     previous?: TurnCommit;
-    deadlineAt?: Date;
+    limits?: RunLimits;
   }): TurnSnapshot {
     return {
       ...input.identity,
@@ -302,7 +343,8 @@ export class DurableAgentRuntime {
       skillSetVersion: this.skillSetVersion,
       toolSetVersion: this.toolSetVersion,
       policyVersion: this.policyVersion,
-      deadlineAt: input.deadlineAt,
+      limits: input.limits,
+      deadlineAt: input.limits?.deadlineAt,
       messages: input.messages,
       createdAt: this.now(),
     };
@@ -310,7 +352,7 @@ export class DurableAgentRuntime {
 
   private async guard(identity: RunIdentity, token: bigint, deadlineAt: Date | undefined, signal: AbortSignal): Promise<void> {
     if (signal.aborted) throw signal.reason;
-    if (deadlineAt && deadlineAt <= this.now()) throw new Error('Run deadline exceeded');
+    if (deadlineAt && deadlineAt <= this.now()) throw limitExceeded('Run deadline exceeded');
     await this.options.store.runs.assertLease(identity, this.workerId, token, this.now());
     const run = await this.options.store.runs.get(identity);
     if (run?.cancelRequestedAt) throw new Error('Agent run cancelled');
@@ -322,10 +364,26 @@ export class DurableAgentRuntime {
 
   private kernelEvent(
     identity: RunIdentity, attemptId: string, turnNo: number, event: KernelEvent,
-  ): Omit<AgentRunEvent, 'sequence'> {
+  ): Omit<AgentRunEvent, 'sequence'> | undefined {
+    if (event.type === 'text_delta' || event.type === 'thinking_delta') return undefined;
+    const detail = event.type === 'tool_call' ? {
+      type: event.type,
+      call: { id: event.call.id, logicalCallId: event.call.logicalCallId, name: event.call.name },
+    } : event.type === 'tool_result' ? {
+      type: event.type,
+      result: { callId: event.result.callId, isError: Boolean(event.result.isError) },
+    } : event.type === 'turn_end' ? {
+      type: event.type,
+      result: {
+        turnNo: event.result.turnNo,
+        stopReason: event.result.stopReason,
+        usage: event.result.usage,
+        waitingReason: event.result.waitingReason,
+      },
+    } : event;
     return {
       ...identity, attemptId, turnNo, type: event.type,
-      detail: JSON.parse(JSON.stringify(event)) as AgentRunEvent['detail'], createdAt: this.now(),
+      detail: JSON.parse(JSON.stringify(detail)) as AgentRunEvent['detail'], createdAt: this.now(),
     };
   }
 
@@ -359,6 +417,36 @@ function runKey(identity: RunIdentity): string {
 
 function notFound(): AgentPlatformError {
   return new AgentPlatformError({ code: 'RUN_NOT_FOUND', message: 'Run not found', retryable: false });
+}
+
+function limitExceeded(message: string): AgentPlatformError {
+  return new AgentPlatformError({ code: 'RUN_LIMIT_EXCEEDED', message, retryable: false });
+}
+
+function runLimitError(
+  limits: RunLimits | undefined,
+  usage: AgentRunResult['usage'],
+  turnNo: number,
+  outcome: string,
+): AgentPlatformError | undefined {
+  if (!limits) return undefined;
+  if (limits.maxTurns !== undefined && outcome === 'continue' && turnNo >= limits.maxTurns) {
+    return limitExceeded(`Run maxTurns exceeded: ${limits.maxTurns}`);
+  }
+  if (limits.maxInputTokens !== undefined && usage.inputTokens > limits.maxInputTokens) {
+    return limitExceeded(`Run maxInputTokens exceeded: ${usage.inputTokens} > ${limits.maxInputTokens}`);
+  }
+  if (limits.maxOutputTokens !== undefined && usage.outputTokens > limits.maxOutputTokens) {
+    return limitExceeded(`Run maxOutputTokens exceeded: ${usage.outputTokens} > ${limits.maxOutputTokens}`);
+  }
+  if (limits.maxCostUsd !== undefined && (usage.costUsd ?? 0) > limits.maxCostUsd) {
+    return limitExceeded(`Run maxCostUsd exceeded: ${usage.costUsd ?? 0} > ${limits.maxCostUsd}`);
+  }
+  return undefined;
+}
+
+function errorData(error: AgentPlatformError) {
+  return { code: error.code, message: error.message, retryable: error.retryable };
 }
 
 function lastText(messages: readonly KernelMessage[]): string | undefined {

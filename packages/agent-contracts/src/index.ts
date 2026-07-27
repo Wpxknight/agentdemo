@@ -275,6 +275,7 @@ export interface AgentRunEvent {
 export type AgentPlatformErrorCode =
   | 'RUN_NOT_FOUND'
   | 'RUN_STATE_CONFLICT'
+  | 'RUN_LIMIT_EXCEEDED'
   | 'LEASE_LOST'
   | 'TURN_COMMIT_FAILED'
   | 'TOOL_RESULT_UNKNOWN'

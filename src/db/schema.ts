@@ -263,6 +263,7 @@ export interface AgentTurnSnapshotsTable {
   skill_set_version: string | null;
   tool_set_version: string;
   policy_version: string;
+  limits_json: NullableJsonColumn;
   messages_json: JsonColumn;
   deadline_at: Date | null;
   created_at: Date;

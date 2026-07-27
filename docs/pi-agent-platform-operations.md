@@ -13,7 +13,7 @@ AIoP 新运行支持 `legacy` 与 `pi`。历史 `kernel=langgraph` 记录继续�
 
 ## 数据迁移
 
-迁移 `0015`～`0018` 增加 Attempt、Turn Snapshot/Commit、Ledger v2、事件 sequence 与 Scheduler 关联。迁移 `0019` 把历史 LangGraph checkpoint 表冻结为只读。回滚窗口结束前不要删除这些表；最终删除必须先完成备份恢复验证和审计保留确认。
+迁移 `0015`～`0018` 增加 Attempt、Turn Snapshot/Commit、Ledger v2、事件 sequence 与 Scheduler 关联，迁移 `0020` 持久化跨进程恢复所需的 Run limits。迁移 `0019` 把历史 LangGraph checkpoint 表冻结为只读。回滚窗口结束前不要删除这些表；最终删除必须先完成备份恢复验证和审计保留确认。
 
 ## 验证
 

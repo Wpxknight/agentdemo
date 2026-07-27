@@ -15,6 +15,7 @@ import type {
 import type { ColumnType, Generated, Kysely, Transaction } from 'kysely';
 
 type JsonColumn = ColumnType<unknown, string, string>;
+type NullableJsonColumn = ColumnType<unknown, string | null, string | null>;
 
 export interface RuntimeMysqlDatabase {
   agent_runs: {
@@ -35,7 +36,8 @@ export interface RuntimeMysqlDatabase {
     tenant_id: string; run_id: string; attempt_id: string; turn_no: number; session_version: number;
     parent_commit_id: string | null; identity_json: JsonColumn; model_binding_json: JsonColumn;
     prompt_version: string; skill_set_version: string | null; tool_set_version: string;
-    policy_version: string; messages_json: JsonColumn; deadline_at: Date | null; created_at: Date;
+    policy_version: string; limits_json: NullableJsonColumn; messages_json: JsonColumn;
+    deadline_at: Date | null; created_at: Date;
   };
   agent_turn_commits: {
     tenant_id: string; run_id: string; attempt_id: string; turn_no: number; commit_id: string;
@@ -156,6 +158,7 @@ export class MysqlRuntimeStore implements RuntimeStore {
         identity_json: json(snapshot.identity), model_binding_json: json(snapshot.modelBinding),
         prompt_version: snapshot.promptVersion, skill_set_version: snapshot.skillSetVersion ?? null,
         tool_set_version: snapshot.toolSetVersion, policy_version: snapshot.policyVersion,
+        limits_json: snapshot.limits ? json(withoutDeadline(snapshot.limits)) : null,
         messages_json: json(snapshot.messages), deadline_at: snapshot.deadlineAt ?? null, created_at: snapshot.createdAt,
       }).execute();
     },
@@ -322,12 +325,19 @@ function mapAttempt(row: any): AttemptRecord {
     startedAt: row.started_at, completedAt: row.completed_at ?? undefined };
 }
 function mapSnapshot(row: any): TurnSnapshot {
+  const limits = row.limits_json === null ? undefined : parse(row.limits_json) as NonNullable<TurnSnapshot['limits']>;
   return { tenantId: row.tenant_id, runId: row.run_id, attemptId: row.attempt_id, turnNo: row.turn_no,
     sessionVersion: BigInt(row.session_version), parentCommitId: row.parent_commit_id ?? undefined,
     identity: parse(row.identity_json), modelBinding: parse(row.model_binding_json), promptVersion: row.prompt_version,
     skillSetVersion: row.skill_set_version ?? undefined, toolSetVersion: row.tool_set_version,
+    limits: limits || row.deadline_at ? { ...limits, deadlineAt: row.deadline_at ?? undefined } : undefined,
     policyVersion: row.policy_version, messages: parse(row.messages_json), deadlineAt: row.deadline_at ?? undefined,
     createdAt: row.created_at } as TurnSnapshot;
+}
+
+function withoutDeadline(limits: NonNullable<TurnSnapshot['limits']>) {
+  const { deadlineAt: _deadlineAt, ...rest } = limits;
+  return rest;
 }
 function mapCommit(row: any): TurnCommit {
   return { tenantId: row.tenant_id, runId: row.run_id, attemptId: row.attempt_id, turnNo: row.turn_no,
