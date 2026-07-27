@@ -49,7 +49,7 @@
 - [x] Emit a durable compaction control event containing token counts and summary version, without persisting sensitive source text.
 - [x] Verify usage accounting includes compaction model usage and survives resume.
 - [x] Run Pi context, AIOP runtime, and full typecheck tests.
-- [ ] Commit with the required AIOS co-author trailer.
+- [x] Commit with the required AIOS co-author trailer.
 
 ### Task 3: Transactional interaction and ledger completion facts
 
@@ -124,11 +124,11 @@
 - Modify: `/home/opt/develop/aicoding/aiop/Makefile`
 - Test: `/home/opt/develop/aicoding/aiop/tests/agent-platform-packages.test.ts`
 
-- [ ] Add failing tests that reject TypeScript-source exports, undeclared cross-package imports, AIOP product types in neutral packages, and Pi deep imports.
-- [ ] Build declarations and JavaScript for every public package into `dist/`, with package exports pointing to runtime JavaScript and types.
-- [ ] Add an API snapshot/diff command that fails on unreviewed breaking changes.
-- [ ] Run `npm pack --dry-run` for every preview package and import each tarball from a temporary non-AIOP project.
-- [ ] Add these checks to `make test-agent-platform`.
+- [x] Add failing tests that reject TypeScript-source exports, undeclared cross-package imports, AIOP product types in neutral packages, and Pi deep imports.
+- [x] Build declarations and JavaScript for every public package into `dist/`, with package exports pointing to runtime JavaScript and types.
+- [x] Add an API snapshot/diff command that fails on unreviewed breaking changes.
+- [x] Run `npm pack --dry-run` for every preview package and import each tarball from a temporary non-AIOP project.
+- [x] Add these checks to `make test-agent-platform`.
 - [ ] Commit with the required AIOS co-author trailer.
 
 ### Task 8: Observability, failure injection, and completion evidence

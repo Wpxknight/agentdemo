@@ -18,7 +18,11 @@
     "test": "vitest run --exclude 'dist/**'",
     "test:watch": "vitest",
     "verify:node": "tsx scripts/verify-node.ts",
-    "test:agent-platform": "vitest run tests/pi-*.test.ts tests/agent-runtime.test.ts tests/*runtime-store*.test.ts tests/durable-runtime.test.ts"
+    "build:packages": "tsx scripts/build-packages.ts",
+    "check:public-api": "tsx scripts/check-public-api.ts",
+    "verify:package-tarballs": "tsx scripts/verify-package-tarballs.ts",
+    "verify:packages": "npm run build:packages && npm run check:public-api && npm run verify:package-tarballs",
+    "test:agent-platform": "vitest run tests/pi-*.test.ts tests/agent-runtime.test.ts tests/*runtime-store*.test.ts tests/durable-runtime.test.ts && npm run verify:packages"
   },
   "dependencies": {
     "@alibaba-group/opensandbox": "^0.1.9",

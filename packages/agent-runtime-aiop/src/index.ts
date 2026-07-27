@@ -1,13 +1,95 @@
-import type { RequestContext } from '../../../src/auth/types.js';
-import type {
-  AgentRunEvent,
-  AgentRunFilter,
-  AgentRunRecord,
-  AgentRunStatus,
-  InteractionRecord,
-  Store,
-  ToolExecutionRecord,
-} from '../../../src/db/store.js';
+export interface RequestContext {
+  tenantId: string;
+  userId: string;
+  role: 'platform_admin' | 'tenant_admin' | 'user';
+}
+
+export type AgentRunStatus = 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'recovery_required';
+
+export interface AgentRunFilter {
+  status?: AgentRunStatus;
+  sessionId?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface AgentRunRecord {
+  tenantId: string;
+  userId: string;
+  sessionId: string;
+  runId: string;
+  kernel: 'pi' | 'legacy' | 'langgraph';
+  kernelVersion?: string;
+  runtimeVersion?: string;
+  graphName: string;
+  graphVersion: string;
+  createdAt: Date;
+  status: AgentRunStatus;
+  waitingReason?: 'approval' | 'question' | 'plan' | 'external';
+  currentNode?: string;
+  stepCount: number;
+  usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number };
+  errorMessage?: string;
+  startedAt?: Date;
+  updatedAt: Date;
+  completedAt?: Date;
+  cancelRequestedAt?: Date;
+  leaseOwner?: string;
+  leaseToken: number;
+  leaseExpiresAt?: Date;
+}
+
+export interface AgentRunEvent {
+  sequence?: number;
+  type: string;
+  status?: string;
+  id?: number;
+  tenantId: string;
+  runId: string;
+  node?: string;
+  detail?: unknown;
+  createdAt: Date;
+}
+
+export interface InteractionRecord {
+  id: string;
+  kind: string;
+  status: string;
+  toolCallId?: string;
+  createdAt: Date;
+  resolvedAt?: Date;
+  expiresAt?: Date;
+}
+
+export interface ToolExecutionRecord {
+  toolCallId: string;
+  toolName: string;
+  status: string;
+  startedAt: Date;
+  completedAt?: Date;
+  updatedAt: Date;
+}
+
+export interface RunCenterStore {
+  listAgentRuns(ctx: RequestContext, filter: AgentRunFilter): Promise<AgentRunRecord[]>;
+  countAgentRuns(ctx: RequestContext, filter: AgentRunFilter): Promise<number>;
+  getAgentRun(ctx: RequestContext, runId: string): Promise<AgentRunRecord | undefined>;
+  listAgentRunEvents(ctx: RequestContext, runId: string): Promise<AgentRunEvent[]>;
+  listAgentRunInteractions(ctx: RequestContext, runId: string): Promise<InteractionRecord[]>;
+  listAgentRunToolExecutions(ctx: RequestContext, runId: string): Promise<ToolExecutionRecord[]>;
+  listAgentRunAttempts(ctx: RequestContext, runId: string): Promise<unknown[]>;
+  listAgentRunTurns(ctx: RequestContext, runId: string): Promise<unknown[]>;
+  requestAgentRunCancellation(ctx: RequestContext, runId: string): Promise<boolean>;
+  updateAgentRun(tenantId: string, runId: string, patch: {
+    status?: AgentRunStatus;
+    currentNode?: string | null;
+    errorMessage?: string | null;
+    completedAt?: Date | null;
+    cancelRequestedAt?: Date | null;
+    updatedAt?: Date;
+  }): Promise<boolean>;
+  appendAgentRunEvent(event: AgentRunEvent): Promise<unknown>;
+}
 
 const CANCELLABLE = new Set<AgentRunStatus>(['queued', 'running', 'waiting']);
 const RESUMABLE = new Set<AgentRunStatus>(['failed', 'recovery_required']);
@@ -32,7 +114,7 @@ export interface RunCenterOptions {
 }
 
 export class RunCenterService {
-  constructor(private readonly store: Store, private readonly options: RunCenterOptions = {}) {}
+  constructor(private readonly store: RunCenterStore, private readonly options: RunCenterOptions = {}) {}
 
   async list(ctx: RequestContext, filter: AgentRunFilter = {}) {
     const [runs, total] = await Promise.all([
@@ -107,7 +189,7 @@ export class RunCenterService {
 
 function recoveryBlockedReason(
   run: AgentRunRecord,
-  tools: Awaited<ReturnType<Store['listAgentRunToolExecutions']>>,
+  tools: ToolExecutionRecord[],
 ): string | undefined {
   if (run.leaseOwner && run.leaseExpiresAt && run.leaseExpiresAt.getTime() > Date.now()) {
     return '运行仍被执行实例持有，请等待租约释放或过期后再恢复';

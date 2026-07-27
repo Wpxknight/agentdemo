@@ -17,15 +17,34 @@ describe('agent platform package boundaries', () => {
   });
 
   it('exports package-root public APIs', async () => {
-    expect((await manifest('agent-contracts')).exports).toEqual({ '.': './src/index.ts' });
-    expect((await manifest('agent-runtime-core')).exports).toEqual({ '.': './src/index.ts' });
-    expect((await manifest('agent-runtime-aiop')).exports).toEqual({ '.': './src/index.ts' });
+    for (const name of ['agent-contracts', 'agent-runtime-core', 'agent-runtime-aiop']) {
+      expect((await manifest(name)).exports).toEqual({
+        '.': { types: './dist/index.d.ts', import: './dist/index.js' },
+      });
+    }
   });
 
   it('keeps product and LangGraph types outside public contracts', async () => {
     const contracts = await readFile(new URL('packages/agent-contracts/src/index.ts', root), 'utf8');
     for (const forbidden of ['RequestContext', "../db/store", 'langgraph', '@langchain']) {
       expect(contracts.toLowerCase()).not.toContain(forbidden.toLowerCase());
+    }
+  });
+
+  it('keeps every public package free of product imports and undeclared workspace dependencies', async () => {
+    const names = [
+      'agent-contracts', 'agent-kernel-pi', 'agent-runtime-aiop', 'agent-runtime-core', 'agent-runtime-mysql',
+      'mcp-runtime', 'sandbox-core', 'sandbox-e2b', 'sandbox-local', 'sandbox-opensandbox',
+      'scheduler-core', 'scheduler-mysql', 'skill-runtime', 'tool-runtime',
+    ];
+    for (const name of names) {
+      const pkg = await manifest(name) as { dependencies?: Record<string, string> };
+      const source = await readFile(new URL(`packages/${name}/src/index.ts`, root), 'utf8');
+      expect(source).not.toMatch(/from ['"]\.\.\/\.\.\/\.\.\/src\//);
+      for (const match of source.matchAll(/from ['"](@aiop\/[^'"]+)['"]/g)) {
+        expect(pkg.dependencies, `${name} must declare ${match[1]}`).toHaveProperty(match[1]!);
+      }
+      expect(source).not.toMatch(/@earendil-works\/pi-(agent-core|ai)\//);
     }
   });
 });
