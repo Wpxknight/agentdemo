@@ -79,13 +79,13 @@
 - Modify: `/home/opt/develop/aicoding/aiop/src/agent/core.ts`
 - Test: `/home/opt/develop/aicoding/aiop/tests/agent-runtime.test.ts`
 
-- [ ] Add a failing product-path test proving a policy-gated write creates pending Interaction/Ledger facts in the Runtime Store and does not call the product handler.
-- [ ] Add a failing fresh-Runtime resume test proving approval executes the original `ToolRegistry` handler once with a stable idempotency key and cumulative usage/transcript survives.
-- [ ] Adapt product Tool definitions, Policy decisions, Hook decisions, ToolContext output events, question/plan payloads, and Runtime Store Ledger into `ToolRuntimeEngine`.
-- [ ] Keep old `executeToolCall` only for Legacy/non-durable compatibility; Durable Pi must receive the new adapter explicitly.
-- [ ] Hold one shared `ToolConcurrencyController` on `AgentRuntime`; parse positive integer tenant/tool/resource limits from `AIOP_PI_MAX_CONCURRENT_TOOLS_PER_TENANT`, `AIOP_PI_MAX_CONCURRENT_TOOLS_PER_TOOL`, and `AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE`.
-- [ ] Run Agent Runtime, Tool Runtime, Pi contract, and typecheck tests.
-- [ ] Commit with the required AIOS co-author trailer.
+- [x] Add a failing product-path test proving a policy-gated write creates pending Interaction/Ledger facts in the Runtime Store and does not call the product handler.
+- [x] Add a failing fresh-Runtime resume test proving approval executes the original `ToolRegistry` handler once with a stable idempotency key and cumulative usage/transcript survives.
+- [x] Adapt product Tool definitions, Policy decisions, Hook decisions, ToolContext output events, question/plan payloads, and Runtime Store Ledger into `ToolRuntimeEngine`.
+- [x] Keep old `executeToolCall` only for Legacy/non-durable compatibility; Durable Pi must receive the new adapter explicitly.
+- [x] Hold one shared `ToolConcurrencyController` on `AgentRuntime`; parse positive integer tenant/tool/resource limits from `AIOP_PI_MAX_CONCURRENT_TOOLS_PER_TENANT`, `AIOP_PI_MAX_CONCURRENT_TOOLS_PER_TOOL`, and `AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE`.
+- [x] Run Agent Runtime, Tool Runtime, Pi contract, and typecheck tests.
+- [x] Commit with the required AIOS co-author trailer.
 
 ### Task 6: HTTP resolve automatically starts a fresh Attempt
 

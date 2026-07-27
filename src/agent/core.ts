@@ -1,4 +1,4 @@
-import type { ChatModel, Msg, StreamEvent, ToolContentBlock, ToolDef } from '../model/types.js';
+import type { ChatModel, JsonValue, Msg, StreamEvent, ToolContentBlock, ToolDef } from '../model/types.js';
 import { estimateTokens } from './context.js';
 import type { PolicyMiddleware } from './policy.js';
 import type { ToolContext, ToolRegistry } from './tools.js';
@@ -77,7 +77,7 @@ export interface RunAgentOptions {
   hooks?: HookRunner;
   /** AIoP 工具副作用账本；缺省保持原有直接执行语义。 */
   toolLedger?: DurableToolLedger;
-  /** Durable 人机交互桥：create 必须按 run/kind/toolCallId 幂等，wait 返回可信持久化决策。 */
+  /** Durable 人机交互桥：Runtime 原子提交创建事实，wait 用于恢复时归一化可信持久化决策。 */
   durableInteractions?: {
     create(input: {
       kind: 'approval' | 'question' | 'plan';
@@ -99,6 +99,8 @@ export interface RunAgentOptions {
   runGuard?: () => Promise<void>;
   /** 仅供经过安全校验的故障恢复：使用相同 runId 从最后已提交 Turn 继续。 */
   resumeFromCheckpoint?: boolean;
+  /** Store 校验后的 durable Interaction resolution；仅在恢复新 Attempt 时传入。 */
+  interactionResolution?: { interactionId: string; value: JsonValue };
 }
 
 export interface RunAgentResult {

@@ -19,6 +19,8 @@ import { logger } from '../logger.js';
 import type { AgentRunBinding, Store } from '../db/store.js';
 import { AgentRunCancelledError, AgentRunCoordinator } from './run-coordinator.js';
 import { reqContext } from './tools.js';
+import { ToolConcurrencyController } from '@aiop/tool-runtime';
+import { createAIOPToolRuntime } from './pi/tool-runtime.js';
 
 export type { AgentRunBinding } from '../db/store.js';
 
@@ -40,6 +42,7 @@ export interface AgentRuntimeOptions {
   runtimeStore?: RuntimeStore;
   runStore?: Store;
   modelConcurrency?: ModelConcurrencyController;
+  toolConcurrency?: ToolConcurrencyController;
 }
 
 /** 供 HTTP、CLI、Scheduler 共用的稳定 Agent 运行入口。 */
@@ -54,6 +57,7 @@ export class AgentRuntime {
   private readonly runtimeStore?: RuntimeStore;
   private readonly runStore?: Store;
   private readonly modelConcurrency: ModelConcurrencyController;
+  private readonly toolConcurrency: ToolConcurrencyController;
 
   constructor(options: AgentRuntimeOptions = {}) {
     const defaultKernel = options.kernel ?? options.kernels?.legacy ?? new LegacyAgentKernel();
@@ -72,6 +76,7 @@ export class AgentRuntime {
     this.runtimeStore = options.runtimeStore;
     this.runStore = options.runStore;
     this.modelConcurrency = options.modelConcurrency ?? new FifoModelConcurrencyController();
+    this.toolConcurrency = options.toolConcurrency ?? new ToolConcurrencyController();
   }
 
   get kernelName(): AgentKernelName {
@@ -115,7 +120,10 @@ export class AgentRuntime {
   }
 
   private async runDurablePi(options: RunAgentOptions): Promise<RunAgentResult> {
-    const kernel = createPiPlatformKernel(options, this.modelConcurrency);
+    const toolRuntime = createAIOPToolRuntime(
+      options, this.runtimeStore!.toolLedger, this.toolConcurrency,
+    );
+    const kernel = createPiPlatformKernel(options, this.modelConcurrency, toolRuntime);
     let compacted = false;
     const runtime = new DurableAgentRuntime({
       store: this.runtimeStore!,
@@ -138,7 +146,10 @@ export class AgentRuntime {
       roles: [options.ctx.role ?? 'user'],
     };
     const handle = options.resumeFromCheckpoint
-      ? await runtime.resume({ identity, runId: options.runId!, signal: options.signal })
+      ? await runtime.resume({
+          identity, runId: options.runId!, signal: options.signal,
+          resolution: options.interactionResolution,
+        })
       : await runtime.run({
           runId: options.runId,
           identity,
@@ -310,6 +321,17 @@ export function createConfiguredAgentRuntime(
   const modelConcurrency = new FifoModelConcurrencyController({
     maxConcurrentPerTenantModel: modelConcurrencyLimit(env.AIOP_PI_MAX_CONCURRENT_MODEL_CALLS),
   });
+  const toolConcurrency = new ToolConcurrencyController({
+    maxConcurrentPerTenant: toolConcurrencyLimit(
+      env.AIOP_PI_MAX_CONCURRENT_TOOLS_PER_TENANT, 'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_TENANT', 8,
+    ),
+    maxConcurrentPerTool: toolConcurrencyLimit(
+      env.AIOP_PI_MAX_CONCURRENT_TOOLS_PER_TOOL, 'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_TOOL', 4,
+    ),
+    maxConcurrentPerResource: toolConcurrencyLimit(
+      env.AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE, 'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE', 1,
+    ),
+  });
   const legacy = options.kernels?.legacy ?? new LegacyAgentKernel();
   const pi = options.kernels?.pi ?? new PiAIOPAgentKernel(modelConcurrency);
   const kernels = { pi, legacy };
@@ -336,7 +358,15 @@ export function createConfiguredAgentRuntime(
     runtimeStore: options.runtimeStore,
     runStore: options.runStore,
     modelConcurrency,
+    toolConcurrency,
   });
+}
+
+function toolConcurrencyLimit(value: string | undefined, name: string, fallback: number): number {
+  if (value === undefined || value.trim() === '') return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) throw new Error(`${name} must be a positive integer: ${value}`);
+  return parsed;
 }
 
 function modelConcurrencyLimit(value: string | undefined): number {

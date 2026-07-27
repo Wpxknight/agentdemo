@@ -7,6 +7,14 @@ import { AllowAllPolicy } from '../src/agent/policy.js';
 import type { AgentRunBinding, AgentRunBindingStore } from '../src/agent/runtime.js';
 import { MemoryStore } from '../src/db/memory.js';
 import { MemoryRuntimeStore } from '@aiop/agent-runtime-core';
+import type { JsonValue } from '../src/model/types.js';
+
+const productInteractionCases: Array<[string, 'question' | 'plan', JsonValue]> = [
+  ['ask_user', 'question', { questions: [{ question: 'Continue?', options: [{ label: 'Yes' }, { label: 'No' }] }] }],
+  ['submit_change_plan', 'plan', {
+    summary: 'roll out', changes: [{ action: 'apply', target: 'prod' }], impact: 'api', rollback: 'revert',
+  }],
+];
 
 function runOptions(): RunAgentOptions {
   return {
@@ -208,6 +216,153 @@ describe('AgentRuntime', () => {
     expect(result.text).toBe('done');
     expect(await runtimeStore.attempts.list({ tenantId: 'tenant-a', runId: 'run-durable-aiop' })).toHaveLength(1);
     expect((await runtimeStore.turns.getLastCommitted({ tenantId: 'tenant-a', runId: 'run-durable-aiop' }))?.turnNo).toBe(2);
+  });
+
+  it('commits policy-gated product tools as pending Runtime facts without executing the handler', async () => {
+    const runtimeStore = new MemoryRuntimeStore();
+    const execute = vi.fn(async () => ({ id: '', content: 'must not execute' }));
+    const tools = new ToolRegistry().register({
+      def: { name: 'write_config', description: 'write', inputSchema: { type: 'object' } },
+      run: execute,
+    });
+    const runtime = createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'pi' }, { runtimeStore });
+    let turn = 0;
+    const result = await runtime.run({
+      ...runOptions(), runId: 'run-product-approval', tools,
+      policy: { check: async () => ({ blocked: false, needApproval: true, reason: 'production' }) },
+      model: {
+        id: 'fake',
+        async *stream() {
+          turn++;
+          if (turn === 1) {
+            yield { type: 'tool_call', call: { id: 'call-write', name: 'write_config', args: { value: 7 } } } as const;
+            yield { type: 'stop', reason: 'tool_use' } as const;
+          } else {
+            yield { type: 'text_delta', text: 'continued' } as const;
+            yield { type: 'stop', reason: 'end_turn' } as const;
+          }
+        },
+      },
+      ctx: { tenantId: 'tenant-a', userId: 'user-a', role: 'user', sessionId: 'session-a' },
+    });
+
+    expect(result.text).toBe('');
+    expect(execute).not.toHaveBeenCalled();
+    await expect(runtimeStore.interactions.list({ tenantId: 'tenant-a', runId: 'run-product-approval' }))
+      .resolves.toEqual([expect.objectContaining({
+        kind: 'approval', status: 'pending', userId: 'user-a', sessionId: 'session-a',
+        toolCallId: 'call-write', payload: expect.objectContaining({ reason: 'production' }),
+      })]);
+    await expect(runtimeStore.toolLedger.get({
+      tenantId: 'tenant-a', runId: 'run-product-approval', logicalCallId: 'call-write',
+    })).resolves.toMatchObject({ status: 'pending_approval', toolName: 'write_config' });
+  });
+
+  it('uses a fresh Durable Pi runtime to approve and execute the original product handler once', async () => {
+    const runtimeStore = new MemoryRuntimeStore();
+    const idempotencyKeys: string[] = [];
+    const tools = new ToolRegistry().register({
+      def: { name: 'write_config', description: 'write', inputSchema: { type: 'object' } },
+      run: async (_args, ctx) => {
+        idempotencyKeys.push(String(ctx.idempotencyKey));
+        return { id: '', content: 'product write completed' };
+      },
+    });
+    let modelAttempt = 0;
+    const model = {
+      id: 'fake',
+      async *stream(input: Parameters<RunAgentOptions['model']['stream']>[0]) {
+        modelAttempt++;
+        if (modelAttempt === 1) {
+          yield { type: 'tool_call', call: { id: 'call-write', name: 'write_config', args: { value: 7 } } } as const;
+          yield { type: 'usage', inputTokens: 3, outputTokens: 2 } as const;
+          yield { type: 'stop', reason: 'tool_use' } as const;
+          return;
+        }
+        expect(input.messages.some((message) => message.toolResults?.some((item) =>
+          item.id === 'call-write' && item.content === 'product write completed'))).toBe(true);
+        yield { type: 'text_delta', text: 'resumed done' } as const;
+        yield { type: 'usage', inputTokens: 4, outputTokens: 1 } as const;
+        yield { type: 'stop', reason: 'end_turn' } as const;
+      },
+    };
+    const options = {
+      ...runOptions(), runId: 'run-product-resume', tools, model,
+      policy: { check: async () => ({ blocked: false, needApproval: true, reason: 'production' }) },
+      ctx: { tenantId: 'tenant-a', userId: 'user-a', role: 'user' as const, sessionId: 'session-a' },
+    };
+    const firstRuntime = createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'pi' }, { runtimeStore });
+    await firstRuntime.run(options);
+    const interaction = (await runtimeStore.interactions.list({
+      tenantId: 'tenant-a', runId: 'run-product-resume',
+    }))[0]!;
+    const stableKey = (await runtimeStore.toolLedger.get({
+      tenantId: 'tenant-a', runId: 'run-product-resume', logicalCallId: 'call-write',
+    }))!.idempotencyKey;
+
+    const freshRuntime = createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'pi' }, { runtimeStore });
+    const result = await freshRuntime.run({
+      ...options,
+      resumeFromCheckpoint: true,
+      interactionResolution: { interactionId: interaction.id, value: true },
+    });
+
+    expect(result).toMatchObject({
+      text: 'resumed done',
+      usage: { inputTokens: 7, outputTokens: 3, cacheReadTokens: 0, cacheCreationTokens: 0 },
+    });
+    expect(idempotencyKeys).toEqual([stableKey]);
+    await expect(runtimeStore.toolLedger.get({
+      tenantId: 'tenant-a', runId: 'run-product-resume', logicalCallId: 'call-write',
+    })).resolves.toMatchObject({ status: 'completed', result: { content: 'product write completed' } });
+    expect(await runtimeStore.attempts.list({ tenantId: 'tenant-a', runId: 'run-product-resume' })).toHaveLength(2);
+  });
+
+  it.each(productInteractionCases)('commits %s as a product-shaped durable %s interaction without invoking its handler', async (
+    toolName, kind, args,
+  ) => {
+    const runtimeStore = new MemoryRuntimeStore();
+    const handler = vi.fn(async () => ({ id: '', content: 'must not execute' }));
+    const tools = new ToolRegistry().register({
+      def: { name: toolName, description: kind, inputSchema: { type: 'object' } }, run: handler,
+    });
+    const runtime = createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'pi' }, { runtimeStore });
+    await runtime.run({
+      ...runOptions(), runId: `run-product-${kind}`, tools,
+      model: {
+        id: 'fake',
+        async *stream() {
+          yield { type: 'tool_call', call: { id: `call-${kind}`, name: toolName, args } } as const;
+          yield { type: 'stop', reason: 'tool_use' } as const;
+        },
+      },
+      ctx: { tenantId: 'tenant-a', userId: 'user-a', role: 'user', sessionId: 'session-a' },
+    });
+
+    const interaction = (await runtimeStore.interactions.list({
+      tenantId: 'tenant-a', runId: `run-product-${kind}`,
+    }))[0]!;
+    expect(interaction).toMatchObject({
+      kind, status: 'pending', toolCallId: `call-${kind}`, expiresAt: expect.any(Date),
+      payload: expect.objectContaining({
+        id: interaction.id, tenantId: 'tenant-a', userId: 'user-a', sessionId: 'session-a',
+        runId: `run-product-${kind}`,
+      }),
+    });
+    if (kind === 'question') expect(interaction.payload).toMatchObject({
+      questions: (args as { questions: JsonValue }).questions,
+    });
+    else expect(interaction.payload).toMatchObject({ plan: args, questions: expect.any(Array) });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_TENANT',
+    'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_TOOL',
+    'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE',
+  ])('rejects an invalid positive-integer %s limit', (name) => {
+    expect(() => createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'pi', [name]: '0' }))
+      .toThrow(`${name} must be a positive integer`);
   });
 
   it('shares the configured tenant/model ceiling across Durable Pi runtime instances', async () => {

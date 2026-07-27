@@ -59,11 +59,12 @@ export class PiAIOPAgentKernel implements AgentKernel {
 export function createPiPlatformKernel(
   options: RunAgentOptions,
   modelConcurrency?: ModelConcurrencyController,
+  durableToolRuntime?: ToolRuntime,
 ): PiAgentKernel {
   const modelProvider: ModelProvider = {
     stream: (input) => adaptModel(options, input.system, input.messages, input.tools, input.signal),
   };
-  const toolRuntime: ToolRuntime = {
+  const toolRuntime: ToolRuntime = durableToolRuntime ?? {
     execute: async (call) => {
       const toolResult = await executeToolCall({ id: call.id, name: call.name, args: call.arguments }, {
         tools: options.tools,
