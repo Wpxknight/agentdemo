@@ -109,7 +109,9 @@ export class PiAgentKernel implements AgentKernel {
     lastAssistant ??= [...allMessages].reverse().find((message): message is AssistantMessage => message.role === 'assistant');
     const stopReason = lastAssistant?.stopReason;
     const outcome = waitingReason ? 'waiting'
-      : stopReason === 'error' || stopReason === 'aborted' ? 'failed' : 'completed';
+      : stopReason === 'error' || stopReason === 'aborted' ? 'failed'
+        : stopReason === 'toolUse' ? 'continue'
+          : 'completed';
     return { outcome, turnNo: input.turnNo, stopReason, usage, messages, waitingReason };
   }
 

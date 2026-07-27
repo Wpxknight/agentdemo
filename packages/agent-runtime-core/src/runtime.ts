@@ -161,24 +161,14 @@ export class DurableAgentRuntime {
     const attemptId = randomUUID();
     const lease = await this.options.store.runs.acquireLease(identity, this.workerId, this.now(), this.leaseTtlMs);
     if (!lease) throw new AgentPlatformError({ code: 'LEASE_LOST', message: 'Run is owned by another worker', retryable: false });
-    const previous = await this.options.store.turns.getLastCommitted(identity);
-    const turnNo = (previous?.turnNo ?? 0) + 1;
-    const snapshot: TurnSnapshot = {
-      ...identity,
-      attemptId,
-      turnNo,
-      sessionVersion: previous?.transcriptVersion ?? 0n,
-      parentCommitId: previous?.commitId,
-      identity: identityContext,
-      modelBinding: this.modelBinding,
-      promptVersion: this.promptVersion,
-      skillSetVersion: this.skillSetVersion,
-      toolSetVersion: this.toolSetVersion,
-      policyVersion: this.policyVersion,
-      deadlineAt,
-      messages,
-      createdAt: this.now(),
-    };
+    let previous = await this.options.store.turns.getLastCommitted(identity);
+    let turnNo = (previous?.turnNo ?? 0) + 1;
+    let currentMessages = messages;
+    let currentContinuation = continuation;
+    let aggregateUsage = { ...record.usage };
+    let snapshot = this.snapshot({
+      identity, attemptId, turnNo, identityContext, messages: currentMessages, previous, deadlineAt,
+    });
     await this.options.store.transaction(async (tx) => {
       await tx.runs.update(identity, { status: 'running', waitingReason: undefined, updatedAt: this.now() });
       await tx.attempts.create({
@@ -188,51 +178,67 @@ export class DurableAgentRuntime {
       });
       await tx.turns.createSnapshot(snapshot);
     });
-    const buffered: Omit<AgentRunEvent, 'sequence'>[] = [];
     try {
-      await this.guard(identity, lease.token, deadlineAt, signal);
-      const exit = await kernel.run({
-        ...identity,
-        attemptId,
-        turnNo,
-        identity: identityContext,
-        messages,
-        model: this.modelBinding,
-        tools: this.tools,
-        continuation,
-        signal,
-      }, {
-        emit: async (event) => { buffered.push(this.kernelEvent(identity, attemptId, turnNo, event)); },
-        guard: async () => this.guard(identity, lease.token, deadlineAt, signal),
-        shouldStopAfterTurn: async (turn) => Boolean(turn.waitingReason),
-      });
-      await this.guard(identity, lease.token, deadlineAt, signal);
-      const status = exit.outcome === 'completed' ? 'succeeded'
-        : exit.outcome === 'waiting' ? 'waiting'
-          : exit.outcome === 'recovery_required' ? 'recovery_required' : 'failed';
-      const committedAt = this.now();
-      const commit = await this.options.store.turns.commit({
-        leaseOwner: this.workerId,
-        leaseToken: lease.token,
-        snapshot,
-        commit: {
-          ...identity, attemptId, turnNo, commitId: randomUUID(),
-          transcriptVersion: (previous?.transcriptVersion ?? 0n) + 1n,
-          stopReason: exit.stopReason, usage: exit.usage, messages: exit.messages, committedAt,
-        },
-        events: [...buffered, {
-          ...identity, attemptId, turnNo, type: 'turn_committed',
-          detail: { outcome: exit.outcome, stopReason: exit.stopReason ?? null }, createdAt: committedAt,
-        }],
-        runStatus: status,
-        waitingReason: exit.waitingReason,
-      });
-      await this.options.store.attempts.update({ ...identity, attemptId }, {
-        status: status === 'failed' || status === 'recovery_required' ? 'failed' : 'succeeded',
-        completedAt: committedAt,
-      });
-      await this.release(identity, commit);
-      return { runId: record.runId, status, text: lastText(exit.messages), usage: exit.usage, error: exit.error };
+      while (true) {
+        const buffered: Omit<AgentRunEvent, 'sequence'>[] = [];
+        await this.guard(identity, lease.token, deadlineAt, signal);
+        const exit = await kernel.run({
+          ...identity,
+          attemptId,
+          turnNo,
+          identity: identityContext,
+          messages: currentMessages,
+          model: this.modelBinding,
+          tools: this.tools,
+          continuation: currentContinuation,
+          signal,
+        }, {
+          emit: async (event) => { buffered.push(this.kernelEvent(identity, attemptId, turnNo, event)); },
+          guard: async () => this.guard(identity, lease.token, deadlineAt, signal),
+          shouldStopAfterTurn: async () => true,
+        });
+        await this.guard(identity, lease.token, deadlineAt, signal);
+        aggregateUsage = addUsage(aggregateUsage, exit.usage);
+        const status = exit.outcome === 'continue' ? 'running'
+          : exit.outcome === 'completed' ? 'succeeded'
+            : exit.outcome === 'waiting' ? 'waiting'
+              : exit.outcome === 'recovery_required' ? 'recovery_required' : 'failed';
+        const committedAt = this.now();
+        const commit = await this.options.store.turns.commit({
+          leaseOwner: this.workerId,
+          leaseToken: lease.token,
+          snapshot,
+          commit: {
+            ...identity, attemptId, turnNo, commitId: randomUUID(),
+            transcriptVersion: (previous?.transcriptVersion ?? 0n) + 1n,
+            stopReason: exit.stopReason, usage: aggregateUsage, messages: exit.messages, committedAt,
+          },
+          events: [...buffered, {
+            ...identity, attemptId, turnNo, type: 'turn_committed',
+            detail: { outcome: exit.outcome, stopReason: exit.stopReason ?? null }, createdAt: committedAt,
+          }],
+          runStatus: status,
+          waitingReason: exit.waitingReason,
+        });
+        if (exit.outcome === 'continue') {
+          previous = commit;
+          turnNo++;
+          currentMessages = exit.messages;
+          currentContinuation = true;
+          snapshot = this.snapshot({
+            identity, attemptId, turnNo, identityContext, messages: currentMessages, previous, deadlineAt,
+          });
+          await this.options.store.turns.createSnapshot(snapshot);
+          continue;
+        }
+        const finalStatus = status as AgentRunResult['status'];
+        await this.options.store.attempts.update({ ...identity, attemptId }, {
+          status: finalStatus === 'failed' || finalStatus === 'recovery_required' ? 'failed' : 'succeeded',
+          completedAt: committedAt,
+        });
+        await this.release(identity, commit);
+        return { runId: record.runId, status: finalStatus, text: lastText(exit.messages), usage: aggregateUsage, error: exit.error };
+      }
     } catch (error) {
       const now = this.now();
       const cancelled = signal.aborted;
@@ -253,12 +259,39 @@ export class DurableAgentRuntime {
       return {
         runId: record.runId,
         status,
-        usage: { ...ZERO_USAGE },
+        usage: aggregateUsage,
         error: { code: status === 'recovery_required' ? 'TOOL_RESULT_UNKNOWN' : 'MODEL_PROVIDER_ERROR', message: safeMessage(error), retryable: false },
       };
     } finally {
       this.active.delete(runKey(identity));
     }
+  }
+
+  private snapshot(input: {
+    identity: RunIdentity;
+    attemptId: string;
+    turnNo: number;
+    identityContext: StartRunInput['identity'];
+    messages: readonly KernelMessage[];
+    previous?: TurnCommit;
+    deadlineAt?: Date;
+  }): TurnSnapshot {
+    return {
+      ...input.identity,
+      attemptId: input.attemptId,
+      turnNo: input.turnNo,
+      sessionVersion: input.previous?.transcriptVersion ?? 0n,
+      parentCommitId: input.previous?.commitId,
+      identity: input.identityContext,
+      modelBinding: this.modelBinding,
+      promptVersion: this.promptVersion,
+      skillSetVersion: this.skillSetVersion,
+      toolSetVersion: this.toolSetVersion,
+      policyVersion: this.policyVersion,
+      deadlineAt: input.deadlineAt,
+      messages: input.messages,
+      createdAt: this.now(),
+    };
   }
 
   private async guard(identity: RunIdentity, token: bigint, deadlineAt: Date | undefined, signal: AbortSignal): Promise<void> {
@@ -326,4 +359,16 @@ function safeMessage(error: unknown): string {
 
 function errorCode(error: unknown): string {
   return error instanceof AgentPlatformError ? error.code : 'MODEL_PROVIDER_ERROR';
+}
+
+function addUsage(left: AgentRunResult['usage'], right: AgentRunResult['usage']): AgentRunResult['usage'] {
+  return {
+    inputTokens: left.inputTokens + right.inputTokens,
+    outputTokens: left.outputTokens + right.outputTokens,
+    cacheReadTokens: left.cacheReadTokens + right.cacheReadTokens,
+    cacheCreationTokens: left.cacheCreationTokens + right.cacheCreationTokens,
+    costUsd: left.costUsd === undefined && right.costUsd === undefined
+      ? undefined
+      : (left.costUsd ?? 0) + (right.costUsd ?? 0),
+  };
 }

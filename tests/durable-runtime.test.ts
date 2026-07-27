@@ -60,6 +60,47 @@ describe('DurableAgentRuntime', () => {
     expect(await store.attempts.list({ tenantId: 'tenant-a', runId: first.runId })).toHaveLength(2);
   });
 
+  it('commits every model turn before continuing within the same attempt', async () => {
+    const store = new MemoryRuntimeStore();
+    const inputs: Array<{ turnNo: number; continuation: boolean }> = [];
+    const kernel: AgentKernel = {
+      descriptor: { name: 'pi', version: '0.82.1', protocolVersion: '1' },
+      run: async (input) => {
+        inputs.push({ turnNo: input.turnNo, continuation: Boolean(input.continuation) });
+        if (input.turnNo === 1) {
+          return {
+            outcome: 'continue', turnNo: 1, usage,
+            messages: [
+              ...input.messages,
+              { role: 'assistant', content: [], toolCalls: [{ id: 'call-1', logicalCallId: 'logical-1', name: 'lookup', arguments: {} }] },
+              { role: 'tool', results: [{ callId: 'call-1', content: 'value=7' }] },
+            ],
+          };
+        }
+        return {
+          ...completed('done'), turnNo: 2,
+          messages: [...input.messages, { role: 'assistant', content: [{ type: 'text', text: 'done' }] }],
+        };
+      },
+    };
+    const runtime = new DurableAgentRuntime({ store, kernels: [kernel], defaultKernel: 'pi' });
+    const handle = await runtime.run({ identity, sessionId: 'session-a', input: [{ role: 'user', text: 'hello' }] });
+
+    await expect(handle.result()).resolves.toMatchObject({
+      status: 'succeeded',
+      usage: { inputTokens: 2, outputTokens: 4 },
+    });
+    expect(inputs).toEqual([
+      { turnNo: 1, continuation: false },
+      { turnNo: 2, continuation: true },
+    ]);
+    const attempt = (await store.attempts.list({ tenantId: 'tenant-a', runId: handle.runId }))[0]!;
+    expect(await store.turns.getSnapshot({ tenantId: 'tenant-a', runId: handle.runId, attemptId: attempt.attemptId, turnNo: 1 })).toBeTruthy();
+    expect(await store.turns.getSnapshot({ tenantId: 'tenant-a', runId: handle.runId, attemptId: attempt.attemptId, turnNo: 2 })).toBeTruthy();
+    expect((await store.turns.getLastCommitted({ tenantId: 'tenant-a', runId: handle.runId }))?.transcriptVersion).toBe(2n);
+    expect((await store.events.list({ tenantId: 'tenant-a', runId: handle.runId })).filter((event) => event.type === 'turn_committed')).toHaveLength(2);
+  });
+
   it('durably cancels and aborts an active kernel', async () => {
     const store = new MemoryRuntimeStore();
     const kernel: AgentKernel = {
