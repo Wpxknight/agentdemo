@@ -198,6 +198,8 @@ export class DurableAgentRuntime {
     let currentMessages = messages;
     let currentContinuation = continuation;
     let aggregateUsage = { ...record.usage };
+    let toolCalls = (await this.options.store.events.list(identity))
+      .filter((event) => event.type === 'tool_call').length;
     let snapshot = this.snapshot({
       identity, attemptId, turnNo, identityContext, messages: currentMessages, previous, limits,
     });
@@ -230,6 +232,12 @@ export class DurableAgentRuntime {
         }, {
           emit: async (event) => {
             await this.options.observeEvent?.(event);
+            if (event.type === 'tool_call') {
+              toolCalls++;
+              if (limits?.maxToolCalls !== undefined && toolCalls > limits.maxToolCalls) {
+                throw limitExceeded(`Run maxToolCalls exceeded: ${limits.maxToolCalls}`);
+              }
+            }
             const durable = this.kernelEvent(identity, attemptId, turnNo, event);
             if (!durable) return;
             if (buffered.length >= this.maxDurableEventsPerTurn) {

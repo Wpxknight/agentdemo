@@ -127,6 +127,110 @@ describe('ToolRuntimeEngine', () => {
     expect(provisional?.result).toBeUndefined();
   });
 
+  it.each([
+    ['tenant', { maxConcurrentPerTenant: 1, maxConcurrentPerTool: 2, maxConcurrentPerResource: 2 },
+      [{ name: 'write-a', resourceKey: 'r-a' }, { name: 'write-b', resourceKey: 'r-b' }]],
+    ['tool', { maxConcurrentPerTenant: 2, maxConcurrentPerTool: 1, maxConcurrentPerResource: 2 },
+      [{ name: 'write-a', resourceKey: 'r-a' }, { name: 'write-a', resourceKey: 'r-b' }]],
+    ['resource', { maxConcurrentPerTenant: 2, maxConcurrentPerTool: 2, maxConcurrentPerResource: 1 },
+      [{ name: 'write-a', resourceKey: 'shared' }, { name: 'write-b', resourceKey: 'shared' }]],
+  ] as const)('enforces the trusted %s concurrency ceiling in FIFO order', async (_kind, concurrency, calls) => {
+    const started: string[] = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const runtime = new ToolRuntimeEngine({
+      ledger: new MemoryRuntimeStore().toolLedger,
+      concurrency,
+      definitions: ['write-a', 'write-b'].map((name) => ({
+        name, description: name, inputSchema: { type: 'object' }, capability: 'retryable_write' as const,
+        execute: async (call: { id: string }) => {
+          started.push(call.id);
+          if (call.id === 'call-1') await firstGate;
+          return { content: call.id };
+        },
+      })),
+      policy: { check: async (call) => ({
+        allowed: true,
+        resourceKey: call.id === 'call-1' ? calls[0].resourceKey : calls[1].resourceKey,
+      }) },
+    });
+    const first = runtime.execute({
+      id: 'call-1', logicalCallId: 'logical-1', name: calls[0].name, arguments: {},
+    }, { ...context, runId: 'run-1' });
+    await vi.waitFor(() => expect(started).toEqual(['call-1']));
+    const second = runtime.execute({
+      id: 'call-2', logicalCallId: 'logical-2', name: calls[1].name, arguments: {},
+    }, { ...context, runId: 'run-2' });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(started).toEqual(['call-1']);
+
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(started).toEqual(['call-1', 'call-2']);
+  });
+
+  it('releases concurrency permits after tool failure', async () => {
+    const started: string[] = [];
+    const runtime = new ToolRuntimeEngine({
+      ledger: new MemoryRuntimeStore().toolLedger,
+      concurrency: { maxConcurrentPerTenant: 1 },
+      definitions: [{
+        name: 'write', description: 'write', inputSchema: { type: 'object' }, capability: 'retryable_write',
+        execute: async (call) => {
+          started.push(call.id);
+          if (call.id === 'call-1') throw new Error('boom');
+          return { content: 'ok' };
+        },
+      }],
+    });
+
+    const outcomes = await Promise.all([
+      runtime.execute({ id: 'call-1', logicalCallId: 'logical-1', name: 'write', arguments: {} }, { ...context, runId: 'run-1' }),
+      runtime.execute({ id: 'call-2', logicalCallId: 'logical-2', name: 'write', arguments: {} }, { ...context, runId: 'run-2' }),
+    ]);
+    expect(started).toEqual(['call-1', 'call-2']);
+    expect(outcomes[1]).toMatchObject({ kind: 'result', result: { content: 'ok' } });
+  });
+
+  it('removes a cancelled FIFO waiter and releases permits for the next tool', async () => {
+    const started: string[] = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const runtime = new ToolRuntimeEngine({
+      ledger: new MemoryRuntimeStore().toolLedger,
+      concurrency: { maxConcurrentPerTenant: 1 },
+      definitions: [{
+        name: 'write', description: 'write', inputSchema: { type: 'object' }, capability: 'retryable_write',
+        execute: async (call) => {
+          started.push(call.id);
+          if (call.id === 'call-1') await firstGate;
+          return { content: call.id };
+        },
+      }],
+    });
+    const cancelled = new AbortController();
+    const first = runtime.execute(
+      { id: 'call-1', logicalCallId: 'logical-1', name: 'write', arguments: {} },
+      { ...context, runId: 'run-1' },
+    );
+    await vi.waitFor(() => expect(started).toEqual(['call-1']));
+    const second = runtime.execute(
+      { id: 'call-2', logicalCallId: 'logical-2', name: 'write', arguments: {} },
+      { ...context, runId: 'run-2', signal: cancelled.signal },
+    );
+    const third = runtime.execute(
+      { id: 'call-3', logicalCallId: 'logical-3', name: 'write', arguments: {} },
+      { ...context, runId: 'run-3' },
+    );
+    cancelled.abort(new Error('cancel queued tool'));
+    releaseFirst();
+    const outcomes = await Promise.all([first, second, third]);
+
+    expect(started).toEqual(['call-1', 'call-3']);
+    expect(outcomes[1]).toMatchObject({ kind: 'result', result: { isError: true, content: 'cancel queued tool' } });
+    expect(outcomes[2]).toMatchObject({ kind: 'result', result: { content: 'call-3' } });
+  });
+
   it('uses Pi truncation and stores the original output only when configured', async () => {
     const save = vi.fn(async () => 'blob://tool-output/a');
     const limiter = new PiToolOutputLimiter({ direction: 'head', maxLines: 2, maxBytes: 100, saveOriginal: save });

@@ -209,6 +209,40 @@ describe('DurableAgentRuntime', () => {
     expect(await store.turns.listCommitted({ tenantId: 'tenant-a', runId: handle.runId })).toHaveLength(1);
   });
 
+  it('enforces maxToolCalls from durable events across a resumed attempt', async () => {
+    const store = new MemoryRuntimeStore();
+    const firstKernel: AgentKernel = {
+      descriptor: { name: 'pi', version: '0.82.1', protocolVersion: '1' },
+      run: async (_input, control) => {
+        await control.emit({
+          type: 'tool_call', call: { id: 'call-1', logicalCallId: 'logical-1', name: 'lookup', arguments: {} },
+        });
+        return { ...completed('waiting'), outcome: 'waiting', waitingReason: 'question' };
+      },
+    };
+    const firstRuntime = new DurableAgentRuntime({ store, kernels: [firstKernel], defaultKernel: 'pi' });
+    const first = await firstRuntime.run({
+      identity, sessionId: 'session-a', input: [], limits: { maxToolCalls: 1 },
+    });
+    expect((await first.result()).status).toBe('waiting');
+
+    const resumedKernel: AgentKernel = {
+      ...firstKernel,
+      run: async (_input, control) => {
+        await control.emit({
+          type: 'tool_call', call: { id: 'call-2', logicalCallId: 'logical-2', name: 'lookup', arguments: {} },
+        });
+        return completed();
+      },
+    };
+    const resumedRuntime = new DurableAgentRuntime({ store, kernels: [resumedKernel], defaultKernel: 'pi' });
+    const resumed = await resumedRuntime.resume({ identity, runId: first.runId });
+    await expect(resumed.result()).resolves.toMatchObject({
+      status: 'failed',
+      error: { code: 'RUN_LIMIT_EXCEEDED', message: 'Run maxToolCalls exceeded: 1' },
+    });
+  });
+
   it.each([
     ['maxInputTokens', { maxInputTokens: 2 }, { ...usage, inputTokens: 3 }, 'Run maxInputTokens exceeded: 3 > 2'],
     ['maxOutputTokens', { maxOutputTokens: 1 }, usage, 'Run maxOutputTokens exceeded: 2 > 1'],

@@ -78,10 +78,10 @@
 - Test: `/home/opt/develop/aicoding/aiop/tests/tool-runtime-platform.test.ts`
 - Test: `/home/opt/develop/aicoding/aiop/tests/durable-runtime.test.ts`
 
-- [ ] Add failing tests for tenant, tool, and resource concurrency ceilings and FIFO release after success, failure, and cancellation.
-- [ ] Add explicit `ConcurrencyLimits` configuration with bounded semaphores keyed by trusted identity plus tool/resource.
-- [ ] Count tool calls per Run and fail safely when the configured maximum is reached.
-- [ ] Ensure locks and permits are always released in `finally` and never derive keys from model-supplied identity fields.
+- [x] Add failing tests for tenant, tool, and resource concurrency ceilings and FIFO release after success, failure, and cancellation.
+- [x] Add explicit `ConcurrencyLimits` configuration with bounded semaphores keyed by trusted identity plus tool/resource.
+- [x] Count tool calls per Run and fail safely when the configured maximum is reached.
+- [x] Ensure locks and permits are always released in `finally` and never derive keys from model-supplied identity fields.
 - [ ] Commit with the required AIOS co-author trailer.
 
 ### Task 5: Real standalone OpenSandbox and E2B providers

@@ -66,14 +66,21 @@ export interface ToolRuntimeEngineOptions {
   hooks?: ToolHooks;
   audit?: ToolAudit;
   outputLimiter?: ToolOutputLimiter;
+  concurrency?: ConcurrencyLimits;
   onLedger?: () => void;
   onLock?: () => void;
   now?: () => Date;
 }
 
+export interface ConcurrencyLimits {
+  maxConcurrentPerTenant?: number;
+  maxConcurrentPerTool?: number;
+  maxConcurrentPerResource?: number;
+}
+
 export class ToolRuntimeEngine implements ToolRuntime {
   private readonly definitions = new Map<string, RegisteredTool>();
-  private readonly locks = new ResourceLocks();
+  private readonly concurrency: ConcurrencyController;
   private readonly now: () => Date;
 
   constructor(private readonly options: ToolRuntimeEngineOptions) {
@@ -82,6 +89,7 @@ export class ToolRuntimeEngine implements ToolRuntime {
       this.definitions.set(definition.name, definition);
     }
     this.now = options.now ?? (() => new Date());
+    this.concurrency = new ConcurrencyController(options.concurrency);
   }
 
   async execute(call: ToolCall, context: ToolExecutionContext): Promise<ToolExecutionOutcome> {
@@ -172,9 +180,12 @@ export class ToolRuntimeEngine implements ToolRuntime {
     };
     let outcome: ToolExecutionOutcome;
     try {
-      outcome = tool.capability === 'read'
-        ? await execute()
-        : await this.locks.run(policy.resourceKey ?? call.name, execute);
+      outcome = await this.concurrency.run({
+        tenantId: context.identity.tenantId,
+        toolName: tool.name,
+        resourceKey: policy.resourceKey ?? (tool.capability === 'read' ? undefined : call.name),
+        signal: context.signal,
+      }, execute);
     } catch (error) {
       if (tool.capability === 'non_idempotent_write') {
         const recovery = { ...record, status: 'recovery_required' as const, updatedAt: this.now() };
@@ -231,22 +242,122 @@ export class PiToolOutputLimiter implements ToolOutputLimiter {
   }
 }
 
-class ResourceLocks {
-  private tails = new Map<string, Promise<void>>();
+class ConcurrencyController {
+  private readonly tenant = new SemaphorePool();
+  private readonly tool = new SemaphorePool();
+  private readonly resource = new SemaphorePool();
 
-  async run<T>(key: string, work: () => Promise<T>): Promise<T> {
-    const previous = this.tails.get(key) ?? Promise.resolve();
-    let release!: () => void;
-    const current = new Promise<void>((resolve) => { release = resolve; });
-    this.tails.set(key, current);
-    await previous;
+  constructor(private readonly limits: ConcurrencyLimits = {}) {}
+
+  async run<T>(
+    input: { tenantId: string; toolName: string; resourceKey?: string; signal?: AbortSignal },
+    work: () => Promise<T>,
+  ): Promise<T> {
+    const releases: Array<() => void> = [];
     try {
+      if (this.limits.maxConcurrentPerTenant !== undefined) {
+        releases.push(await this.tenant.acquire(
+          `tenant:${input.tenantId}`, positiveLimit(this.limits.maxConcurrentPerTenant), input.signal,
+        ));
+      }
+      if (this.limits.maxConcurrentPerTool !== undefined) {
+        releases.push(await this.tool.acquire(
+          `tool:${input.tenantId}:${input.toolName}`, positiveLimit(this.limits.maxConcurrentPerTool), input.signal,
+        ));
+      }
+      const resourceLimit = this.limits.maxConcurrentPerResource ?? (input.resourceKey ? 1 : undefined);
+      if (resourceLimit !== undefined && input.resourceKey) {
+        releases.push(await this.resource.acquire(
+          `resource:${input.tenantId}:${input.resourceKey}`, positiveLimit(resourceLimit), input.signal,
+        ));
+      }
       return await work();
     } finally {
-      release();
-      if (this.tails.get(key) === current) this.tails.delete(key);
+      for (const release of releases.reverse()) release();
     }
   }
+}
+
+class SemaphorePool {
+  private readonly semaphores = new Map<string, FifoSemaphore>();
+
+  async acquire(key: string, limit: number, signal?: AbortSignal): Promise<() => void> {
+    const semaphore = this.semaphores.get(key) ?? new FifoSemaphore(limit);
+    if (semaphore.limit !== limit) throw new Error(`Concurrency limit changed for ${key}`);
+    this.semaphores.set(key, semaphore);
+    const release = await semaphore.acquire(signal);
+    return () => {
+      release();
+      if (semaphore.idle) this.semaphores.delete(key);
+    };
+  }
+}
+
+class FifoSemaphore {
+  private active = 0;
+  private readonly queue: Array<{
+    resolve: (release: () => void) => void;
+    reject: (error: unknown) => void;
+    signal?: AbortSignal;
+    onAbort?: () => void;
+  }> = [];
+
+  constructor(readonly limit: number) {}
+
+  get idle(): boolean {
+    return this.active === 0 && this.queue.length === 0;
+  }
+
+  acquire(signal?: AbortSignal): Promise<() => void> {
+    if (signal?.aborted) return Promise.reject(abortError(signal));
+    if (this.active < this.limit) {
+      this.active++;
+      return Promise.resolve(this.releaseOnce());
+    }
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve, reject, signal, onAbort: undefined as (() => void) | undefined };
+      waiter.onAbort = () => {
+        const index = this.queue.indexOf(waiter);
+        if (index >= 0) this.queue.splice(index, 1);
+        reject(abortError(signal));
+      };
+      signal?.addEventListener('abort', waiter.onAbort, { once: true });
+      this.queue.push(waiter);
+    });
+  }
+
+  private releaseOnce(): () => void {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.active--;
+      this.drain();
+    };
+  }
+
+  private drain(): void {
+    while (this.active < this.limit && this.queue.length > 0) {
+      const waiter = this.queue.shift()!;
+      waiter.signal?.removeEventListener('abort', waiter.onAbort!);
+      if (waiter.signal?.aborted) {
+        waiter.reject(abortError(waiter.signal));
+        continue;
+      }
+      this.active++;
+      waiter.resolve(this.releaseOnce());
+    }
+  }
+}
+
+function positiveLimit(value: number): number {
+  if (!Number.isInteger(value) || value < 1) throw new Error(`Concurrency limit must be a positive integer: ${value}`);
+  return value;
+}
+
+function abortError(signal?: AbortSignal): Error {
+  if (signal?.reason instanceof Error) return signal.reason;
+  return new Error(typeof signal?.reason === 'string' && signal.reason ? signal.reason : 'Tool execution aborted');
 }
 
 function result(callId: string, content: string, isError = false): ToolExecutionOutcome {

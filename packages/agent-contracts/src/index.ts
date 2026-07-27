@@ -32,6 +32,7 @@ export type AgentContentBlock =
 
 export interface RunLimits {
   maxTurns?: number;
+  maxToolCalls?: number;
   maxInputTokens?: number;
   maxOutputTokens?: number;
   maxCostUsd?: number;
