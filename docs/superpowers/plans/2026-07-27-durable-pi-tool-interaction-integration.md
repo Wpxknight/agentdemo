@@ -63,12 +63,12 @@
 - Modify: `/home/opt/develop/aicoding/aiop/packages/agent-kernel-pi/src/index.ts`
 - Test: `/home/opt/develop/aicoding/aiop/tests/pi-contract.test.ts`
 
-- [ ] Add a failing test where a first Kernel returns `waiting`, a fresh Kernel receives an approval resolution, re-executes the original call before the model stream, replaces `waiting:<id>`, and commits the real ToolResult.
-- [ ] Add failing question/plan tests proving the model receives the resolved value and the tool handler is not executed.
-- [ ] Locate the original assistant ToolCall by trusted `toolCallId`; reject missing or mismatched calls as `RUN_STATE_CONFLICT` rather than asking the model to recreate the write.
-- [ ] Merge ledger/interaction updates produced during resolution execution into the same `KernelExit` facts used by Turn commit.
-- [ ] Run Pi contract and Durable Runtime tests.
-- [ ] Commit with the required AIOS co-author trailer.
+- [x] Add a failing test where a first Kernel returns `waiting`, a fresh Kernel receives an approval resolution, re-executes the original call before the model stream, replaces `waiting:<id>`, and commits the real ToolResult.
+- [x] Add failing question/plan tests proving the model receives the resolved value and the tool handler is not executed.
+- [x] Locate the original assistant ToolCall by trusted `toolCallId`; reject missing or mismatched calls as `RUN_STATE_CONFLICT` rather than asking the model to recreate the write.
+- [x] Merge ledger/interaction updates produced during resolution execution into the same `KernelExit` facts used by Turn commit.
+- [x] Run Pi contract and Durable Runtime tests.
+- [x] Commit with the required AIOS co-author trailer.
 
 ### Task 5: AIOP public Tool Runtime adapter
 

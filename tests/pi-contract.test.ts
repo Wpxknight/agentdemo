@@ -22,6 +22,7 @@ import {
 } from '@aiop/agent-runtime-core';
 import { FifoModelConcurrencyController } from '../packages/agent-runtime-core/src/model-concurrency.js';
 import { PiAgentKernel, PiContextManager } from '../packages/agent-kernel-pi/src/index.js';
+import { ToolRuntimeEngine } from '../packages/tool-runtime/src/index.js';
 
 const usage = { inputTokens: 3, outputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 0 };
 
@@ -208,6 +209,154 @@ describe('Pi public contract', () => {
     expect(second.outcome).toBe('completed');
     expect(second.messages.at(-1)).toMatchObject({ role: 'assistant' });
     expect(request).toBe(2);
+  });
+
+  it('resolves the original waiting tool call before streaming the model and merges its durable facts', async () => {
+    const order: string[] = [];
+    const now = new Date('2026-07-27T00:00:00.000Z');
+    const toolRuntime: ToolRuntime = {
+      execute: vi.fn(async (call, executionContext) => {
+        order.push('tool');
+        expect(call).toEqual({
+          id: 'call-approval', logicalCallId: 'logical-approval', name: 'write', arguments: { value: 7 },
+        });
+        expect(executionContext.interactionResolution).toEqual({
+          interactionId: 'approval-a', kind: 'approval', toolCallId: 'call-approval', value: true,
+        });
+        return {
+          kind: 'result' as const,
+          result: { callId: call.id, content: 'write completed' },
+          ledgerUpdates: [{
+            tenantId: 'tenant-a', runId: 'run-resolve', attemptId: 'attempt-b', turnNo: 2,
+            logicalCallId: call.logicalCallId, toolCallId: call.id, toolName: call.name,
+            argsDigest: 'args', capability: 'retryable_write' as const, idempotencyKey: 'stable-key',
+            status: 'completed' as const, result: { callId: call.id, content: 'write completed' },
+            createdAt: now, updatedAt: now,
+          }],
+          interactionUpdates: [{
+            tenantId: 'tenant-a', runId: 'run-resolve', id: 'approval-a', userId: 'user-a',
+            sessionId: 'session-a', attemptId: 'attempt-b', turnNo: 2, kind: 'approval' as const,
+            toolCallId: call.id, status: 'resolved' as const, payload: {}, resolution: true,
+            createdAt: now, resolvedAt: now,
+          }],
+        };
+      }),
+    };
+    const kernel = new PiAgentKernel({
+      toolRuntime,
+      modelProvider: {
+        async *stream(request) {
+          order.push('model');
+          expect(request.messages).toEqual(expect.arrayContaining([
+            expect.objectContaining({ role: 'tool', results: [expect.objectContaining({
+              callId: 'call-approval', content: 'write completed',
+            })] }),
+          ]));
+          expect(JSON.stringify(request.messages)).not.toContain('waiting:approval-a');
+          yield { type: 'text_delta', text: 'continued after write' };
+          yield { type: 'stop', reason: 'stop' };
+        },
+      },
+    });
+    const exit = await kernel.run({
+      runId: 'run-resolve', attemptId: 'attempt-b', turnNo: 2, sessionId: 'session-a', continuation: true,
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'write' }] },
+        { role: 'assistant', content: [], toolCalls: [{
+          id: 'call-approval', logicalCallId: 'logical-approval', name: 'write', arguments: { value: 7 },
+        }] },
+        { role: 'tool', results: [{ callId: 'call-approval', content: 'waiting:approval-a' }] },
+      ],
+      model: { provider: 'fake', model: 'fake-1' },
+      tools: [{ name: 'write', description: 'write', inputSchema: { type: 'object' }, capability: 'retryable_write' }],
+      interactionResolution: {
+        interactionId: 'approval-a', kind: 'approval', toolCallId: 'call-approval', value: true,
+      },
+    }, { emit: async () => undefined, guard: async () => undefined, shouldStopAfterTurn: async () => false });
+
+    expect(order).toEqual(['tool', 'model']);
+    expect(exit).toMatchObject({
+      outcome: 'completed',
+      ledgerUpdates: [expect.objectContaining({ status: 'completed', idempotencyKey: 'stable-key' })],
+      interactionUpdates: [expect.objectContaining({ id: 'approval-a', status: 'resolved' })],
+    });
+  });
+
+  it.each(['question', 'plan'] as const)('feeds a resolved %s value to the model without executing the handler', async (kind) => {
+    const handler = vi.fn(async () => ({ content: 'must not execute' }));
+    const store = new MemoryRuntimeStore();
+    const definition = {
+      name: `${kind}-tool`, description: kind, inputSchema: { type: 'object' }, capability: 'read' as const,
+      interactionKind: kind, execute: handler,
+    };
+    const call = {
+      id: `call-${kind}`, logicalCallId: `logical-${kind}`, name: definition.name, arguments: { prompt: kind },
+    } as const;
+    const initial = await new ToolRuntimeEngine({ ledger: store.toolLedger, definitions: [definition] })
+      .execute(call, {
+        identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+        runId: `run-${kind}`, attemptId: 'attempt-a', turnNo: 1, sessionId: 'session-a',
+      });
+    if (initial.kind !== 'waiting') throw new Error('expected interaction wait');
+    await store.toolLedger.putIfAbsent(initial.ledgerUpdates![0]!);
+    const value = kind === 'question' ? { answer: ['yes'] } : true;
+    const expected = `${kind} resolved: ${kind === 'question' ? '{"answer":["yes"]}' : 'true'}`;
+    const kernel = new PiAgentKernel({
+      toolRuntime: new ToolRuntimeEngine({ ledger: store.toolLedger, definitions: [definition] }),
+      modelProvider: {
+        async *stream(request) {
+          expect(request.messages).toEqual(expect.arrayContaining([
+            expect.objectContaining({ role: 'tool', results: [expect.objectContaining({ content: expected })] }),
+          ]));
+          yield { type: 'text_delta', text: `continued ${kind}` };
+          yield { type: 'stop', reason: 'stop' };
+        },
+      },
+    });
+    const exit = await kernel.run({
+      runId: `run-${kind}`, attemptId: 'attempt-b', turnNo: 2, sessionId: 'session-a', continuation: true,
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+      messages: [
+        { role: 'assistant', content: [], toolCalls: [call] },
+        { role: 'tool', results: [{ callId: call.id, content: `waiting:${initial.interactionId}` }] },
+      ],
+      model: { provider: 'fake', model: 'fake-1' }, tools: [{
+        name: definition.name, description: kind, inputSchema: { type: 'object' }, capability: 'read',
+      }],
+      interactionResolution: {
+        interactionId: initial.interactionId, kind, toolCallId: call.id, value,
+      },
+    }, { emit: async () => undefined, guard: async () => undefined, shouldStopAfterTurn: async () => false });
+
+    expect(exit.outcome).toBe('completed');
+    expect(exit.ledgerUpdates).toEqual([expect.objectContaining({ status: 'completed' })]);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['missing original call', [{ role: 'tool' as const, results: [{ callId: 'call-a', content: 'waiting:approval-a' }] }]],
+    ['mismatched waiting result', [
+      { role: 'assistant' as const, content: [], toolCalls: [{
+        id: 'call-a', logicalCallId: 'logical-a', name: 'write', arguments: {},
+      }] },
+      { role: 'tool' as const, results: [{ callId: 'call-a', content: 'waiting:approval-other' }] },
+    ]],
+  ])('rejects a %s as a run-state conflict', async (_case, messages) => {
+    const toolRuntime: ToolRuntime = { execute: vi.fn() };
+    const modelProvider: ModelProvider = { async *stream() { throw new Error('model must not run'); } };
+    const kernel = new PiAgentKernel({ modelProvider, toolRuntime });
+    await expect(kernel.run({
+      runId: 'run-conflict', attemptId: 'attempt-b', turnNo: 2, continuation: true,
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] }, messages,
+      model: { provider: 'fake', model: 'fake-1' },
+      tools: [{ name: 'write', description: 'write', inputSchema: { type: 'object' }, capability: 'retryable_write' }],
+      interactionResolution: {
+        interactionId: 'approval-a', kind: 'approval', toolCallId: 'call-a', value: true,
+      },
+    }, { emit: async () => undefined, guard: async () => undefined, shouldStopAfterTurn: async () => false }))
+      .rejects.toMatchObject({ code: 'RUN_STATE_CONFLICT' });
+    expect(toolRuntime.execute).not.toHaveBeenCalled();
   });
 
   it('adds Pi compaction model usage to the kernel turn usage', async () => {

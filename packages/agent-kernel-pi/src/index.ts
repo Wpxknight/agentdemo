@@ -23,6 +23,7 @@ import {
   type UserMessage,
 } from '@earendil-works/pi-ai';
 import {
+  AgentPlatformError,
   type AgentContentBlock,
   type AgentKernel,
   type AgentRunUsage,
@@ -79,18 +80,40 @@ export class PiAgentKernel implements AgentKernel {
     const interactionUpdates: DurableInteractionUpdate[] = [];
     let lastAssistant: AssistantMessage | undefined;
     const usage: AgentRunUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
-    const runMessages = await this.compactContext(input, control, usage);
+    let runMessages = input.messages;
+    if (input.interactionResolution) {
+      const resolved = await this.resolveInteraction(
+        input, runMessages, control, ledgerUpdates, interactionUpdates,
+      );
+      runMessages = resolved.messages;
+      recoveryRequired = resolved.recoveryRequired;
+      if (recoveryRequired) {
+        return {
+          outcome: 'recovery_required', turnNo: input.turnNo, usage, messages: runMessages,
+          error: {
+            code: 'TOOL_RESULT_UNKNOWN', message: recoveryRequired.message, retryable: false,
+          },
+          ledgerUpdates: ledgerUpdates.length ? ledgerUpdates : undefined,
+          interactionUpdates: interactionUpdates.length ? interactionUpdates : undefined,
+        };
+      }
+    }
+    if (!input.interactionResolution) {
+      runMessages = await this.compactContext({ ...input, messages: runMessages }, control, usage);
+    }
     const tools = this.createTools(
       input,
+      logicalCalls,
       () => waitingReason,
       (reason) => { waitingReason = reason; },
       (recovery) => { recoveryRequired = recovery; },
       ledgerUpdates,
       interactionUpdates,
     );
+    const initialPiMessages = toPiMessages(runMessages, logicalCalls);
     const context: AgentContext = {
       systemPrompt: this.options.systemPrompt ?? '',
-      messages: input.continuation ? toPiMessages(runMessages) : [],
+      messages: input.continuation ? initialPiMessages : [],
       tools,
     };
     const config: AgentLoopConfig = {
@@ -112,7 +135,7 @@ export class PiAgentKernel implements AgentKernel {
           turnNo: input.turnNo,
           stopReason: message.stopReason,
           usage: { ...usage },
-          messages: fromPiMessages(input.continuation ? [...toPiMessages(runMessages), ...newMessages] : newMessages),
+          messages: fromPiMessages(input.continuation ? [...initialPiMessages, ...newMessages] : newMessages, logicalCalls),
           waitingReason,
         };
         return message.stopReason === 'length' || Boolean(waitingReason) || await control.shouldStopAfterTurn(turn);
@@ -121,12 +144,12 @@ export class PiAgentKernel implements AgentKernel {
     const streamFn = this.createStreamFn(input, logicalCalls);
     const stream = input.continuation
       ? agentLoopContinue(context, config, input.signal, streamFn)
-      : agentLoop(toPiMessages(runMessages), context, config, input.signal, streamFn);
+      : agentLoop(initialPiMessages, context, config, input.signal, streamFn);
     let returned: AgentMessage[] = [];
     for await (const event of stream) await this.forwardEvent(event, input, logicalCalls, control);
     returned = await stream.result();
-    const allMessages = input.continuation ? [...toPiMessages(runMessages), ...returned] : returned;
-    const messages = fromPiMessages(allMessages);
+    const allMessages = input.continuation ? [...initialPiMessages, ...returned] : returned;
+    const messages = fromPiMessages(allMessages, logicalCalls);
     lastAssistant ??= [...allMessages].reverse().find((message): message is AssistantMessage => message.role === 'assistant');
     const stopReason = lastAssistant?.stopReason;
     const outcome = recoveryRequired ? 'recovery_required'
@@ -195,6 +218,7 @@ export class PiAgentKernel implements AgentKernel {
 
   private createTools(
     input: KernelRunInput,
+    logicalCalls: Map<string, string>,
     waiting: () => WaitingReason | undefined,
     setWaiting: (reason: WaitingReason) => void,
     setRecovery: (recovery: { correlationId?: string; message: string }) => void,
@@ -211,7 +235,7 @@ export class PiAgentKernel implements AgentKernel {
         if (waiting()) throw new Error('turn is already waiting');
         const outcome = await this.options.toolRuntime.execute({
           id: toolCallId,
-          logicalCallId: toolCallId,
+          logicalCallId: logicalCalls.get(toolCallId) ?? toolCallId,
           name: definition.name,
           arguments: toJsonValue(params),
         }, {
@@ -219,6 +243,7 @@ export class PiAgentKernel implements AgentKernel {
           runId: input.runId,
           attemptId: input.attemptId,
           turnNo: input.turnNo,
+          sessionId: input.sessionId,
           signal,
         });
         if (outcome.ledgerUpdates) ledgerUpdates.push(...outcome.ledgerUpdates);
@@ -245,6 +270,60 @@ export class PiAgentKernel implements AgentKernel {
         };
       },
     }));
+  }
+
+  private async resolveInteraction(
+    input: KernelRunInput,
+    messages: readonly KernelMessage[],
+    control: KernelControl,
+    ledgerUpdates: DurableToolLedgerUpdate[],
+    interactionUpdates: DurableInteractionUpdate[],
+  ): Promise<{
+    messages: readonly KernelMessage[];
+    recoveryRequired?: { correlationId?: string; message: string };
+  }> {
+    const resolution = input.interactionResolution!;
+    const calls = messages.flatMap((message) => message.role === 'assistant'
+      ? (message.toolCalls ?? []).filter((call) => call.id === resolution.toolCallId)
+      : []);
+    if (calls.length !== 1) throw runStateConflict('Resolved interaction original tool call is missing or ambiguous');
+    const call = calls[0]!;
+    if (!input.tools.some((definition) => definition.name === call.name)) {
+      throw runStateConflict('Resolved interaction tool definition is missing');
+    }
+    const waitingContent = `waiting:${resolution.interactionId}`;
+    const waitingResults = messages.flatMap((message) => message.role === 'tool'
+      ? message.results.filter((toolResult) => toolResult.callId === call.id)
+      : []);
+    if (waitingResults.length !== 1 || waitingResults[0]!.content !== waitingContent) {
+      throw runStateConflict('Resolved interaction does not match the committed waiting result');
+    }
+
+    await control.emit({ type: 'tool_call', call });
+    const outcome = await this.options.toolRuntime.execute(call, {
+      identity: input.identity, runId: input.runId, attemptId: input.attemptId, turnNo: input.turnNo,
+      sessionId: input.sessionId, interactionResolution: resolution, signal: input.signal,
+    });
+    if (outcome.ledgerUpdates) ledgerUpdates.push(...outcome.ledgerUpdates);
+    if (outcome.interactionUpdates) interactionUpdates.push(...outcome.interactionUpdates);
+    if (outcome.kind === 'waiting') {
+      throw runStateConflict('Resolved interaction returned to waiting');
+    }
+    if (outcome.kind === 'recovery_required') {
+      const replacement = { callId: call.id, content: 'recovery_required', isError: true };
+      await control.emit({ type: 'tool_result', result: replacement });
+      await control.guard();
+      return {
+        messages: replaceWaitingResult(messages, call.id, waitingContent, replacement),
+        recoveryRequired: { correlationId: outcome.correlationId, message: outcome.message },
+      };
+    }
+    if (outcome.result.callId !== call.id) {
+      throw runStateConflict('Resolved interaction returned a result for a different tool call');
+    }
+    await control.emit({ type: 'tool_result', result: outcome.result });
+    await control.guard();
+    return { messages: replaceWaitingResult(messages, call.id, waitingContent, outcome.result) };
   }
 
   private createStreamFn(input: KernelRunInput, logicalCalls: Map<string, string>): StreamFn {
@@ -368,7 +447,7 @@ export class PiAgentKernel implements AgentKernel {
           turnNo: input.turnNo,
           stopReason: event.message.stopReason,
           usage: turnUsage,
-          messages: fromPiMessages([event.message, ...event.toolResults]),
+          messages: fromPiMessages([event.message, ...event.toolResults], logicalCalls),
         },
       });
     }
@@ -391,7 +470,7 @@ function toPiModel(input: KernelRunInput): Model<any> {
   } as Model<any>;
 }
 
-function toPiMessages(messages: readonly KernelMessage[]): AgentMessage[] {
+function toPiMessages(messages: readonly KernelMessage[], logicalCalls?: Map<string, string>): AgentMessage[] {
   const names = new Map<string, string>();
   const result: AgentMessage[] = [];
   for (const message of messages) {
@@ -404,6 +483,7 @@ function toPiMessages(messages: readonly KernelMessage[]): AgentMessage[] {
           : []),
         ...(message.toolCalls ?? []).map((call) => {
           names.set(call.id, call.name);
+          logicalCalls?.set(call.id, call.logicalCallId);
           return { type: 'toolCall' as const, id: call.id, name: call.name, arguments: objectArguments(call.arguments) };
         }),
       ];
@@ -423,7 +503,7 @@ function toPiMessages(messages: readonly KernelMessage[]): AgentMessage[] {
   return result;
 }
 
-function fromPiMessages(messages: readonly AgentMessage[]): KernelMessage[] {
+function fromPiMessages(messages: readonly AgentMessage[], logicalCalls?: ReadonlyMap<string, string>): KernelMessage[] {
   const output: KernelMessage[] = [];
   for (const message of messages) {
     if (message.role === 'user') {
@@ -435,7 +515,8 @@ function fromPiMessages(messages: readonly AgentMessage[]): KernelMessage[] {
           ? [{ type: 'text', text: block.text }]
           : []),
         toolCalls: message.content.flatMap((block): ToolCall[] => block.type === 'toolCall' ? [{
-          id: block.id, logicalCallId: block.id, name: block.name, arguments: toJsonValue(block.arguments),
+          id: block.id, logicalCallId: logicalCalls?.get(block.id) ?? block.id,
+          name: block.name, arguments: toJsonValue(block.arguments),
         }] : []),
       });
     } else if (message.role === 'toolResult') {
@@ -515,4 +596,25 @@ function piResultText(result: unknown): string {
   if (!result || typeof result !== 'object') return String(result ?? '');
   const content = (result as { content?: ToolResultMessage['content'] }).content;
   return content ? piContentText(content) : JSON.stringify(result);
+}
+
+function replaceWaitingResult(
+  messages: readonly KernelMessage[],
+  callId: string,
+  waitingContent: string,
+  replacement: { callId: string; content: string; isError?: boolean },
+): KernelMessage[] {
+  return messages.map((message): KernelMessage => {
+    if (message.role !== 'tool') return message;
+    return {
+      role: 'tool',
+      results: message.results.map((toolResult) => toolResult.callId === callId && toolResult.content === waitingContent
+        ? replacement
+        : toolResult),
+    };
+  });
+}
+
+function runStateConflict(message: string): AgentPlatformError {
+  return new AgentPlatformError({ code: 'RUN_STATE_CONFLICT', message, retryable: false });
 }
