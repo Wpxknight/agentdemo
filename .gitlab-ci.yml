@@ -1,0 +1,43 @@
+stages:
+  - verify
+  - image
+
+variables:
+  npm_config_cache: "$CI_PROJECT_DIR/.npm"
+
+cache:
+  key:
+    files:
+      - package-lock.json
+      - web/package-lock.json
+  paths:
+    - .npm/
+
+agent-platform:
+  stage: verify
+  image: node:24-slim
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends make && rm -rf /var/lib/apt/lists/*
+    - npm ci
+    - npm --prefix web ci
+  script:
+    - make verify-node
+    - make test-agent-platform
+    - npm run typecheck
+    - npm test
+    - npm --prefix web run build
+    - npm audit --audit-level=high
+
+agent-platform-image:
+  stage: image
+  image: docker:27-cli
+  services:
+    - name: docker:27-dind
+      command: ["--tls=false"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - apk add --no-cache make
+  script:
+    - make image

@@ -28,7 +28,13 @@ export interface AgentRunRecord {
   waitingReason?: 'approval' | 'question' | 'plan' | 'external';
   currentNode?: string;
   stepCount: number;
-  usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number };
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+    costUsd?: number;
+  };
   errorMessage?: string;
   startedAt?: Date;
   updatedAt: Date;
@@ -46,6 +52,11 @@ export interface AgentRunEvent {
   id?: number;
   tenantId: string;
   runId: string;
+  attemptId?: string;
+  turnNo?: number;
+  kernel?: 'pi' | 'legacy' | 'langgraph';
+  kernelVersion?: string;
+  correlationId?: string;
   node?: string;
   detail?: unknown;
   createdAt: Date;
@@ -70,6 +81,27 @@ export interface ToolExecutionRecord {
   updatedAt: Date;
 }
 
+export interface AgentRunAttemptSummary {
+  attemptId: string;
+  kernel: string;
+  kernelVersion: string;
+  status: string;
+  errorCode?: string;
+  startedAt: Date;
+  completedAt?: Date;
+}
+
+export interface AgentRunTurnSummary {
+  attemptId: string;
+  turnNo: number;
+  commitId: string;
+  transcriptVersion: number;
+  stopReason?: string;
+  usage: AgentRunRecord['usage'];
+  eventSequenceEnd: number;
+  committedAt: Date;
+}
+
 export interface RunCenterStore {
   listAgentRuns(ctx: RequestContext, filter: AgentRunFilter): Promise<AgentRunRecord[]>;
   countAgentRuns(ctx: RequestContext, filter: AgentRunFilter): Promise<number>;
@@ -77,8 +109,8 @@ export interface RunCenterStore {
   listAgentRunEvents(ctx: RequestContext, runId: string): Promise<AgentRunEvent[]>;
   listAgentRunInteractions(ctx: RequestContext, runId: string): Promise<InteractionRecord[]>;
   listAgentRunToolExecutions(ctx: RequestContext, runId: string): Promise<ToolExecutionRecord[]>;
-  listAgentRunAttempts(ctx: RequestContext, runId: string): Promise<unknown[]>;
-  listAgentRunTurns(ctx: RequestContext, runId: string): Promise<unknown[]>;
+  listAgentRunAttempts(ctx: RequestContext, runId: string): Promise<AgentRunAttemptSummary[]>;
+  listAgentRunTurns(ctx: RequestContext, runId: string): Promise<AgentRunTurnSummary[]>;
   requestAgentRunCancellation(ctx: RequestContext, runId: string): Promise<boolean>;
   updateAgentRun(tenantId: string, runId: string, patch: {
     status?: AgentRunStatus;
@@ -121,8 +153,19 @@ export class RunCenterService {
       this.store.listAgentRuns(ctx, filter),
       this.store.countAgentRuns(ctx, filter),
     ]);
+    const summarized = await Promise.all(runs.map(async (run) => {
+      const [attempts, turns] = await Promise.all([
+        this.store.listAgentRunAttempts(ctx, run.runId),
+        this.store.listAgentRunTurns(ctx, run.runId),
+      ]);
+      return {
+        ...publicRun(run),
+        attemptSummary: { count: attempts.length, latest: attempts.at(-1) },
+        turnSummary: { count: turns.length, latest: turns.at(-1) },
+      };
+    }));
     return {
-      runs: runs.map(publicRun), total,
+      runs: summarized, total,
       limit: filter.limit ?? 50, offset: filter.offset ?? 0,
       hasMore: (filter.offset ?? 0) + runs.length < total,
     };
@@ -191,6 +234,7 @@ function recoveryBlockedReason(
   run: AgentRunRecord,
   tools: ToolExecutionRecord[],
 ): string | undefined {
+  if (run.kernel === 'langgraph') return '历史 LangGraph Run 仅供查询，不能恢复执行';
   if (run.leaseOwner && run.leaseExpiresAt && run.leaseExpiresAt.getTime() > Date.now()) {
     return '运行仍被执行实例持有，请等待租约释放或过期后再恢复';
   }

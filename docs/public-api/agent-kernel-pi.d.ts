@@ -1,8 +1,9 @@
-import { type AgentKernel, type KernelControl, type KernelExit, type KernelRunInput, type ModelProvider, type ToolRuntime } from '@aiop/agent-contracts';
+import { type AgentKernel, type KernelControl, type KernelExit, type KernelRunInput, type ModelConcurrencyController, type ModelProvider, type ToolRuntime } from '@aiop/agent-contracts';
 import type { ContextManager } from './context-manager.js';
 export * from './context-manager.js';
 export interface PiAgentKernelOptions {
     modelProvider: ModelProvider;
+    modelConcurrency?: ModelConcurrencyController;
     toolRuntime: ToolRuntime;
     systemPrompt?: string;
     protocolVersion?: string;

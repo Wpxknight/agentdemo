@@ -702,6 +702,11 @@ export class MysqlStore implements Store {
         tenant_id: event.tenantId,
         run_id: event.runId,
         sequence: event.sequence ?? Number(last?.sequence ?? 0) + 1,
+        attempt_id: event.attemptId ?? null,
+        turn_no: event.turnNo ?? null,
+        kernel: event.kernel ?? null,
+        kernel_version: event.kernelVersion ?? null,
+        correlation_id: event.correlationId ?? null,
         event_type: event.type,
         node_name: event.node ?? null,
         status: event.status ?? null,
@@ -717,6 +722,9 @@ export class MysqlStore implements Store {
       .where('tenant_id', '=', ctx.tenantId).where('run_id', '=', runId).orderBy('id', 'asc').execute();
     return rows.map((row) => ({
       id: Number(row.id), tenantId: row.tenant_id, runId: row.run_id, sequence: Number(row.sequence), type: row.event_type,
+      attemptId: row.attempt_id ?? undefined, turnNo: row.turn_no ?? undefined,
+      kernel: row.kernel === 'pi' || row.kernel === 'legacy' || row.kernel === 'langgraph' ? row.kernel : undefined,
+      kernelVersion: row.kernel_version ?? undefined, correlationId: row.correlation_id ?? undefined,
       node: row.node_name ?? undefined, status: row.status ?? undefined,
       detail: parseJson(row.detail), createdAt: toDate(row.created_at),
     }));

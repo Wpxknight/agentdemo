@@ -30,6 +30,7 @@ export interface AgentRunRecord {
         outputTokens: number;
         cacheReadTokens: number;
         cacheCreationTokens: number;
+        costUsd?: number;
     };
     errorMessage?: string;
     startedAt?: Date;
@@ -47,6 +48,11 @@ export interface AgentRunEvent {
     id?: number;
     tenantId: string;
     runId: string;
+    attemptId?: string;
+    turnNo?: number;
+    kernel?: 'pi' | 'legacy' | 'langgraph';
+    kernelVersion?: string;
+    correlationId?: string;
     node?: string;
     detail?: unknown;
     createdAt: Date;
@@ -68,6 +74,25 @@ export interface ToolExecutionRecord {
     completedAt?: Date;
     updatedAt: Date;
 }
+export interface AgentRunAttemptSummary {
+    attemptId: string;
+    kernel: string;
+    kernelVersion: string;
+    status: string;
+    errorCode?: string;
+    startedAt: Date;
+    completedAt?: Date;
+}
+export interface AgentRunTurnSummary {
+    attemptId: string;
+    turnNo: number;
+    commitId: string;
+    transcriptVersion: number;
+    stopReason?: string;
+    usage: AgentRunRecord['usage'];
+    eventSequenceEnd: number;
+    committedAt: Date;
+}
 export interface RunCenterStore {
     listAgentRuns(ctx: RequestContext, filter: AgentRunFilter): Promise<AgentRunRecord[]>;
     countAgentRuns(ctx: RequestContext, filter: AgentRunFilter): Promise<number>;
@@ -75,8 +100,8 @@ export interface RunCenterStore {
     listAgentRunEvents(ctx: RequestContext, runId: string): Promise<AgentRunEvent[]>;
     listAgentRunInteractions(ctx: RequestContext, runId: string): Promise<InteractionRecord[]>;
     listAgentRunToolExecutions(ctx: RequestContext, runId: string): Promise<ToolExecutionRecord[]>;
-    listAgentRunAttempts(ctx: RequestContext, runId: string): Promise<unknown[]>;
-    listAgentRunTurns(ctx: RequestContext, runId: string): Promise<unknown[]>;
+    listAgentRunAttempts(ctx: RequestContext, runId: string): Promise<AgentRunAttemptSummary[]>;
+    listAgentRunTurns(ctx: RequestContext, runId: string): Promise<AgentRunTurnSummary[]>;
     requestAgentRunCancellation(ctx: RequestContext, runId: string): Promise<boolean>;
     updateAgentRun(tenantId: string, runId: string, patch: {
         status?: AgentRunStatus;
@@ -103,9 +128,45 @@ export declare class RunCenterService {
     private readonly options;
     constructor(store: RunCenterStore, options?: RunCenterOptions);
     list(ctx: RequestContext, filter?: AgentRunFilter): Promise<{
-        runs: (Omit<AgentRunRecord, "leaseOwner"> & {
+        runs: {
+            attemptSummary: {
+                count: number;
+                latest: AgentRunAttemptSummary | undefined;
+            };
+            turnSummary: {
+                count: number;
+                latest: AgentRunTurnSummary | undefined;
+            };
+            usage: {
+                inputTokens: number;
+                outputTokens: number;
+                cacheReadTokens: number;
+                cacheCreationTokens: number;
+                costUsd?: number;
+            };
+            tenantId: string;
+            userId: string;
+            sessionId: string;
+            runId: string;
+            kernel: "pi" | "legacy" | "langgraph";
+            kernelVersion?: string | undefined;
+            runtimeVersion?: string | undefined;
+            graphName: string;
+            graphVersion: string;
+            createdAt: Date;
+            status: AgentRunStatus;
+            waitingReason?: "approval" | "question" | "plan" | "external" | undefined;
+            currentNode?: string | undefined;
+            stepCount: number;
+            errorMessage?: string | undefined;
+            startedAt?: Date | undefined;
+            updatedAt: Date;
+            completedAt?: Date | undefined;
+            cancelRequestedAt?: Date | undefined;
+            leaseToken: number;
+            leaseExpiresAt?: Date | undefined;
             leaseActive: boolean;
-        })[];
+        }[];
         total: number;
         limit: number;
         offset: number;
@@ -133,8 +194,8 @@ export declare class RunCenterService {
             completedAt: Date | undefined;
             updatedAt: Date;
         }[];
-        attempts: unknown[];
-        turns: unknown[];
+        attempts: AgentRunAttemptSummary[];
+        turns: AgentRunTurnSummary[];
         canCancel: boolean;
         canResume: boolean;
         recoveryBlockedReason: string | undefined;

@@ -148,3 +148,39 @@
 - [x] Record stages 8 and 10 as externally pending until a real checkpoint retention period, backup restore, audit query, and production rollout evidence exist; do not claim or simulate them in code.
 - [x] Run `make verify-node`, `make test-agent-platform`, `npm run typecheck`, `npm test`, `npm --prefix web run build`, `make image`, audit/deep-import checks, package tarball checks, and `git diff --check`.
 - [x] Commit with the required AIOS co-author trailer.
+
+### Task 9: Completion audit for CI and delivery reproducibility
+
+**Files:**
+- Create: `/home/opt/develop/aicoding/aiop/.gitlab-ci.yml`
+- Modify: `/home/opt/develop/aicoding/aiop/Dockerfile`
+- Modify: `/home/opt/develop/aicoding/aiop/.dockerignore`
+- Modify: `/home/opt/develop/aicoding/aiop/deploy/dev-k8s/aiop-deployment.yaml`
+- Test: `/home/opt/develop/aicoding/aiop/tests/pi-delivery-baseline.test.ts`
+
+- [x] Add failing tests proving GitLab CI runs Node, package, typecheck, full test, Web, audit, and image gates.
+- [x] Remove the remaining executable LangGraph setting from the development deployment and select Pi full mode.
+- [x] Build public package dist inside the Docker builder and exclude host-generated package dist from the build context.
+- [x] Verify the clean-context image imports a public package and satisfies the Node baseline.
+- [x] Run the final repository verification.
+- [x] Commit with the required AIOS co-author trailer.
+
+### Task 10: Shared tenant/model concurrency completion
+
+**Files:**
+- Modify: `/home/opt/develop/aicoding/aiop/packages/agent-contracts/src/index.ts`
+- Create: `/home/opt/develop/aicoding/aiop/packages/agent-runtime-core/src/model-concurrency.ts`
+- Modify: `/home/opt/develop/aicoding/aiop/packages/agent-runtime-core/src/index.ts`
+- Modify: `/home/opt/develop/aicoding/aiop/packages/agent-kernel-pi/src/index.ts`
+- Modify: `/home/opt/develop/aicoding/aiop/src/agent/pi/kernel.ts`
+- Modify: `/home/opt/develop/aicoding/aiop/src/agent/runtime.ts`
+- Test: `/home/opt/develop/aicoding/aiop/tests/pi-contract.test.ts`
+- Test: `/home/opt/develop/aicoding/aiop/tests/agent-runtime.test.ts`
+
+- [x] Add failing tests proving same-tenant/model FIFO behavior across fresh Pi Kernels and fresh Durable Runtime instances.
+- [x] Add failing tests proving provider failure and queued cancellation release permits without starting cancelled model calls.
+- [x] Acquire only around `ModelProvider.stream()` consumption so tool execution never holds a model permit.
+- [x] Keep the controller on the long-lived AIOP Runtime and inject it into every newly-created Durable Pi Kernel.
+- [x] Key permits from trusted tenant identity plus bound provider/model/route, with independent queues for other models and tenants.
+- [x] Add `AIOP_PI_MAX_CONCURRENT_MODEL_CALLS` with a bounded default of 4 and reject invalid values.
+- [x] Review and update the public API snapshots.

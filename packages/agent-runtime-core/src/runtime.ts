@@ -205,7 +205,7 @@ export class DurableAgentRuntime {
     let turnNo = (previous?.turnNo ?? 0) + 1;
     let currentMessages = messages;
     let currentContinuation = continuation;
-    let aggregateUsage = { ...record.usage };
+    let aggregateUsage = { ...(previous?.usage ?? record.usage) };
     let toolCalls = (await this.options.store.events.list(identity))
       .filter((event) => event.type === 'tool_call').length;
     let snapshot = this.snapshot({
@@ -591,6 +591,10 @@ function addUsage(left: AgentRunResult['usage'], right: AgentRunResult['usage'])
     cacheCreationTokens: left.cacheCreationTokens + right.cacheCreationTokens,
     costUsd: left.costUsd === undefined && right.costUsd === undefined
       ? undefined
-      : (left.costUsd ?? 0) + (right.costUsd ?? 0),
+      : roundCost((left.costUsd ?? 0) + (right.costUsd ?? 0)),
   };
+}
+
+function roundCost(value: number): number {
+  return Math.round(value * 1_000_000_000_000) / 1_000_000_000_000;
 }

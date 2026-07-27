@@ -1,5 +1,7 @@
 # Pi Agent Platform Implementation Plan
 
+> **状态说明（2026-07-27）：** 本文件是初始实施草案，未维护的 checkbox 不再代表当前完成状态。实际收口与证据以 `/home/opt/develop/aicoding/aiop/docs/superpowers/plans/2026-07-27-pi-integration-completion.md` 和 `/home/opt/develop/aicoding/aiop/docs/pi-agent-platform-completion-evidence.md` 为准。LangGraph checkpoint 最终清表仍受阶段 10 的真实保留周期、备份恢复、历史审计查询和生产审批门禁约束；证据不齐时不得创建清表迁移。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 按 `docs/design/12-pi-integration-plan.md` 完成 Durable Runtime、Pi Kernel、模块化包、AIOP 兼容适配和 LangGraph 退役所需的全部代码与验证工作。

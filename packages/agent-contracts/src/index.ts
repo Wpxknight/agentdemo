@@ -176,6 +176,16 @@ export interface ModelProvider {
   stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent>;
 }
 
+export interface ModelConcurrencyInput {
+  identity: IdentityContext;
+  model: ModelBinding;
+  signal?: AbortSignal;
+}
+
+export interface ModelConcurrencyController {
+  acquire(input: ModelConcurrencyInput): Promise<() => void>;
+}
+
 export interface ModelStreamInput {
   model: ModelBinding;
   system: string;

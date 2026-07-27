@@ -9,8 +9,12 @@ import {
   piToolDefinitions,
   toPiKernelMessages,
 } from './pi/kernel.js';
-import { DurableAgentRuntime, type RuntimeStore } from '@aiop/agent-runtime-core';
-import { AgentPlatformError } from '@aiop/agent-contracts';
+import {
+  DurableAgentRuntime,
+  FifoModelConcurrencyController,
+  type RuntimeStore,
+} from '@aiop/agent-runtime-core';
+import { AgentPlatformError, type ModelConcurrencyController } from '@aiop/agent-contracts';
 import { logger } from '../logger.js';
 import type { AgentRunBinding, Store } from '../db/store.js';
 import { AgentRunCancelledError, AgentRunCoordinator } from './run-coordinator.js';
@@ -35,6 +39,7 @@ export interface AgentRuntimeOptions {
   runCoordinator?: AgentRunCoordinator;
   runtimeStore?: RuntimeStore;
   runStore?: Store;
+  modelConcurrency?: ModelConcurrencyController;
 }
 
 /** 供 HTTP、CLI、Scheduler 共用的稳定 Agent 运行入口。 */
@@ -48,6 +53,7 @@ export class AgentRuntime {
   private readonly runCoordinator?: AgentRunCoordinator;
   private readonly runtimeStore?: RuntimeStore;
   private readonly runStore?: Store;
+  private readonly modelConcurrency: ModelConcurrencyController;
 
   constructor(options: AgentRuntimeOptions = {}) {
     const defaultKernel = options.kernel ?? options.kernels?.legacy ?? new LegacyAgentKernel();
@@ -65,6 +71,7 @@ export class AgentRuntime {
     this.runCoordinator = options.runCoordinator;
     this.runtimeStore = options.runtimeStore;
     this.runStore = options.runStore;
+    this.modelConcurrency = options.modelConcurrency ?? new FifoModelConcurrencyController();
   }
 
   get kernelName(): AgentKernelName {
@@ -108,7 +115,7 @@ export class AgentRuntime {
   }
 
   private async runDurablePi(options: RunAgentOptions): Promise<RunAgentResult> {
-    const kernel = createPiPlatformKernel(options);
+    const kernel = createPiPlatformKernel(options, this.modelConcurrency);
     let compacted = false;
     const runtime = new DurableAgentRuntime({
       store: this.runtimeStore!,
@@ -300,8 +307,11 @@ export function createConfiguredAgentRuntime(
     runtimeStore?: RuntimeStore;
   } = {},
 ): AgentRuntime {
+  const modelConcurrency = new FifoModelConcurrencyController({
+    maxConcurrentPerTenantModel: modelConcurrencyLimit(env.AIOP_PI_MAX_CONCURRENT_MODEL_CALLS),
+  });
   const legacy = options.kernels?.legacy ?? new LegacyAgentKernel();
-  const pi = options.kernels?.pi ?? new PiAIOPAgentKernel();
+  const pi = options.kernels?.pi ?? new PiAIOPAgentKernel(modelConcurrency);
   const kernels = { pi, legacy };
   const configured = env.AIOP_AGENT_KERNEL?.trim().toLowerCase() || 'legacy';
   const piMode = resolvePiMode(env.AIOP_PI_MODE);
@@ -325,7 +335,17 @@ export function createConfiguredAgentRuntime(
     runCoordinator: options.runStore ? new AgentRunCoordinator(options.runStore) : undefined,
     runtimeStore: options.runtimeStore,
     runStore: options.runStore,
+    modelConcurrency,
   });
+}
+
+function modelConcurrencyLimit(value: string | undefined): number {
+  if (value === undefined || value.trim() === '') return 4;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`AIOP_PI_MAX_CONCURRENT_MODEL_CALLS must be a positive integer: ${value}`);
+  }
+  return parsed;
 }
 
 function abortMessage(reason: unknown): string {

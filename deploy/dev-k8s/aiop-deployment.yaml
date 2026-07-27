@@ -47,9 +47,11 @@ spec:
               value: "8081"
             - name: AIOP_EMBED_SCHEDULER
               value: "true"
-            # 测试环境的新 run 全量使用 LangGraph Kernel。
+            # 测试环境的新 Run 全量使用 Pi；历史 LangGraph Run 仅保留查询。
             - name: AIOP_AGENT_KERNEL
-              value: langgraph
+              value: pi
+            - name: AIOP_PI_MODE
+              value: full
           envFrom:
             - secretRef: { name: aiop-dev-secrets }
           volumeMounts:

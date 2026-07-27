@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { AgentPlatformError, type AgentKernel, type RuntimeObservation } from '@aiop/agent-contracts';
 import { DurableAgentRuntime } from '../packages/agent-runtime-core/src/runtime.js';
 import { MemoryRuntimeStore } from '../packages/agent-runtime-core/src/memory-store.js';
+import { MemoryStore } from '../src/db/memory.js';
 
 const identity = {
   tenantId: 'tenant-observe',
@@ -164,5 +165,25 @@ describe('Pi durable observability', () => {
     });
     const events = await store.events.list({ tenantId: identity.tenantId, runId: handle.runId });
     expect(JSON.stringify(events.map((event) => event.detail))).not.toContain('private-model-prompt');
+  });
+
+  it('preserves durable event identity through the AIOP Run Center store adapter', async () => {
+    const store = new MemoryStore();
+    const createdAt = new Date('2026-07-27T00:00:00.000Z');
+    await store.putAgentRunBindingIfAbsent({
+      tenantId: 'tenant-observe', userId: 'user-observe', sessionId: 'session-observe', runId: 'run-observe',
+      kernel: 'pi', kernelVersion: '0.82.1', graphName: '', graphVersion: '', createdAt,
+    });
+    await store.agentRuntimeStore().events.append({
+      tenantId: 'tenant-observe', runId: 'run-observe', attemptId: 'attempt-observe', turnNo: 2,
+      kernel: 'pi', kernelVersion: '0.82.1', correlationId: 'corr-observe',
+      type: 'turn_committed', createdAt,
+    });
+
+    await expect(store.listAgentRunEvents({
+      tenantId: 'tenant-observe', userId: 'user-observe', role: 'user',
+    }, 'run-observe')).resolves.toEqual([expect.objectContaining({
+      attemptId: 'attempt-observe', turnNo: 2, kernel: 'pi', kernelVersion: '0.82.1', correlationId: 'corr-observe',
+    })]);
   });
 });

@@ -1,0 +1,48 @@
+import { readFile } from 'node:fs/promises';
+import { describe, expect, it } from 'vitest';
+
+const root = new URL('../', import.meta.url);
+
+describe('Pi delivery baseline', () => {
+  it('runs the Node, package, full test, web, audit, and image gates in GitLab CI', async () => {
+    const source = await readFile(new URL('.gitlab-ci.yml', root), 'utf8');
+
+    expect(source).toContain('node:24-slim');
+    expect(source).toContain('apt-get install -y --no-install-recommends make');
+    expect(source).toContain('apk add --no-cache make');
+    for (const command of [
+      'make verify-node',
+      'make test-agent-platform',
+      'npm run typecheck',
+      'npm test',
+      'npm --prefix web ci',
+      'npm --prefix web run build',
+      'npm audit --audit-level=high',
+      'make image',
+    ]) expect(source).toContain(command);
+    expect(source).toContain('docker:27-dind');
+  });
+
+  it('deploys new development runs on Pi without a LangGraph kernel fallback', async () => {
+    const source = await readFile(new URL('deploy/dev-k8s/aiop-deployment.yaml', root), 'utf8');
+
+    expect(source).toContain('name: AIOP_AGENT_KERNEL');
+    expect(source).toMatch(/name: AIOP_AGENT_KERNEL\s+value: pi/);
+    expect(source).toContain('name: AIOP_PI_MODE');
+    expect(source).toMatch(/name: AIOP_PI_MODE\s+value: full/);
+    expect(source).not.toMatch(/value:\s*langgraph/i);
+  });
+
+  it('builds public package dist inside the image instead of copying host artifacts', async () => {
+    const [dockerfile, dockerignore] = await Promise.all([
+      readFile(new URL('Dockerfile', root), 'utf8'),
+      readFile(new URL('.dockerignore', root), 'utf8'),
+    ]);
+
+    expect(dockerfile).toContain('COPY tsconfig.packages.json ./');
+    expect(dockerfile).toContain('COPY scripts/build-packages.ts ./scripts/build-packages.ts');
+    expect(dockerfile).toContain('RUN npm run build:packages');
+    expect(dockerfile).toContain('COPY --from=deps /app/packages ./packages');
+    expect(dockerignore).toContain('packages/*/dist');
+  });
+});

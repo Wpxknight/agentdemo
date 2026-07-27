@@ -134,7 +134,7 @@ export interface AgentRunSummary {
   status: AgentRunStatus;
   currentNode?: string;
   stepCount: number;
-  usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number };
+  usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; costUsd?: number };
   errorMessage?: string;
   createdAt: string;
   startedAt?: string;

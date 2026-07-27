@@ -1,10 +1,12 @@
 import type {
   KernelEvent,
   KernelMessage,
+  ModelConcurrencyController,
   ModelProvider,
   ToolRuntime,
 } from '@aiop/agent-contracts';
 import { PiAgentKernel, PiContextManager } from '@aiop/agent-kernel-pi';
+import { FifoModelConcurrencyController } from '@aiop/agent-runtime-core';
 import type { Msg, StreamEvent, ToolDef } from '../../model/types.js';
 import type { AgentKernel } from '../kernel.js';
 import type { RunAgentOptions, RunAgentResult } from '../core.js';
@@ -13,8 +15,12 @@ import { executeToolCall } from '../services/tool-broker.js';
 export class PiAIOPAgentKernel implements AgentKernel {
   readonly name = 'pi' as const;
 
+  constructor(
+    private readonly modelConcurrency: ModelConcurrencyController = new FifoModelConcurrencyController(),
+  ) {}
+
   async run(options: RunAgentOptions): Promise<RunAgentResult> {
-    const kernel = createPiPlatformKernel(options);
+    const kernel = createPiPlatformKernel(options, this.modelConcurrency);
     let compacted = false;
     const messages = toPiKernelMessages(options.messages ?? [], options.task, options.taskContentBlocks);
     const exit = await kernel.run({
@@ -50,7 +56,10 @@ export class PiAIOPAgentKernel implements AgentKernel {
   }
 }
 
-export function createPiPlatformKernel(options: RunAgentOptions): PiAgentKernel {
+export function createPiPlatformKernel(
+  options: RunAgentOptions,
+  modelConcurrency?: ModelConcurrencyController,
+): PiAgentKernel {
   const modelProvider: ModelProvider = {
     stream: (input) => adaptModel(options, input.system, input.messages, input.tools, input.signal),
   };
@@ -88,7 +97,7 @@ export function createPiPlatformKernel(options: RunAgentOptions): PiAgentKernel 
     keepRecentMessages: options.compactionKeepRecent ?? 8,
     watermarkTokens: options.compactionWatermarkTokens,
   } : undefined;
-  return new PiAgentKernel({ modelProvider, toolRuntime, systemPrompt: options.system, context });
+  return new PiAgentKernel({ modelProvider, modelConcurrency, toolRuntime, systemPrompt: options.system, context });
 }
 
 export function piToolDefinitions(options: RunAgentOptions) {

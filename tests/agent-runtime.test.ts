@@ -210,6 +210,44 @@ describe('AgentRuntime', () => {
     expect((await runtimeStore.turns.getLastCommitted({ tenantId: 'tenant-a', runId: 'run-durable-aiop' }))?.turnNo).toBe(2);
   });
 
+  it('shares the configured tenant/model ceiling across Durable Pi runtime instances', async () => {
+    const runtimeStore = new MemoryRuntimeStore();
+    const runtime = createConfiguredAgentRuntime({
+      AIOP_AGENT_KERNEL: 'pi',
+      AIOP_PI_MAX_CONCURRENT_MODEL_CALLS: '1',
+    }, { runtimeStore });
+    const started: string[] = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const options = (runId: string, modelId: string): RunAgentOptions => ({
+      ...runOptions(), runId,
+      model: {
+        id: modelId,
+        async *stream() {
+          started.push(runId);
+          if (runId === 'run-model-1') await firstGate;
+          yield { type: 'text_delta', text: runId } as const;
+          yield { type: 'stop', reason: 'end_turn' } as const;
+        },
+      },
+      ctx: { tenantId: 'tenant-a', userId: 'user-a', role: 'user', sessionId: runId },
+    });
+
+    const first = runtime.run(options('run-model-1', 'shared-model'));
+    await vi.waitFor(() => expect(started).toEqual(['run-model-1']));
+    const queued = runtime.run(options('run-model-2', 'shared-model'));
+    const otherModel = runtime.run(options('run-model-3', 'other-model'));
+    await expect(otherModel).resolves.toMatchObject({ text: 'run-model-3' });
+    expect(started).toEqual(['run-model-1', 'run-model-3']);
+
+    releaseFirst();
+    await expect(Promise.all([first, queued])).resolves.toEqual([
+      expect.objectContaining({ text: 'run-model-1' }),
+      expect.objectContaining({ text: 'run-model-2' }),
+    ]);
+    expect(started).toEqual(['run-model-1', 'run-model-3', 'run-model-2']);
+  });
+
   it('compacts an oversized transcript before the Durable Pi model call and commits the compacted context', async () => {
     const runtimeStore = new MemoryRuntimeStore();
     const modelMessages: string[][] = [];

@@ -148,6 +148,7 @@ export interface AgentRunUsage {
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
+  costUsd?: number;
 }
 
 export interface AgentRunRecord extends AgentRunBinding {
@@ -193,6 +194,11 @@ export interface AgentRunEvent {
   runId: string;
   sequence?: number;
   type: string;
+  attemptId?: string;
+  turnNo?: number;
+  kernel?: 'pi' | 'legacy' | 'langgraph';
+  kernelVersion?: string;
+  correlationId?: string;
   node?: string;
   status?: string;
   detail?: unknown;

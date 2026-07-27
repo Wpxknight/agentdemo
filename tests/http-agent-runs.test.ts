@@ -160,6 +160,23 @@ describe('Agent Run Center HTTP API', () => {
     })));
   });
 
+  it('keeps historical LangGraph runs query-only and rejects recovery', async () => {
+    await store.updateAgentRun('default', 'run-admin', { status: 'failed', updatedAt: new Date() });
+    const detail = await fetch(`${base}/v1/agent/runs/run-admin`, { headers: auth(adminToken) });
+    expect(detail.status).toBe(200);
+    await expect(detail.json()).resolves.toMatchObject({
+      run: { runId: 'run-admin', kernel: 'langgraph' },
+      canResume: false,
+      recoveryBlockedReason: expect.stringContaining('仅供查询'),
+    });
+
+    const response = await fetch(`${base}/v1/agent/runs/run-admin/resume`, {
+      method: 'POST', headers: auth(adminToken), body: '{}',
+    });
+    expect(response.status).toBe(409);
+    expect(run).not.toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-admin' }));
+  });
+
   it('replays durable SSE events strictly after Last-Event-ID', async () => {
     await store.appendAgentRunEvent({
       tenantId: 'default', runId: 'run-user', type: 'turn_committed', status: 'succeeded', createdAt: new Date(),

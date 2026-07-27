@@ -16,7 +16,11 @@ import {
   truncateTail,
 } from '@earendil-works/pi-agent-core';
 import type { ModelProvider, ToolRuntime } from '@aiop/agent-contracts';
-import { DurableAgentRuntime, MemoryRuntimeStore } from '@aiop/agent-runtime-core';
+import {
+  DurableAgentRuntime,
+  MemoryRuntimeStore,
+} from '@aiop/agent-runtime-core';
+import { FifoModelConcurrencyController } from '../packages/agent-runtime-core/src/model-concurrency.js';
 import { PiAgentKernel, PiContextManager } from '../packages/agent-kernel-pi/src/index.js';
 
 const usage = { inputTokens: 3, outputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 0 };
@@ -34,6 +38,91 @@ describe('Pi public contract', () => {
     const source = await readFile(new URL('../packages/agent-kernel-pi/src/index.ts', import.meta.url), 'utf8');
     expect(source).not.toMatch(/pi-agent-core\//);
     expect(source).not.toMatch(/pi-ai\//);
+  });
+
+  it('shares a FIFO tenant/model concurrency ceiling across fresh Pi kernels', async () => {
+    const controller = new FifoModelConcurrencyController({ maxConcurrentPerTenantModel: 1 });
+    const started: string[] = [];
+    const releases = new Map<string, () => void>();
+    const kernel = (runId: string) => new PiAgentKernel({
+      modelProvider: {
+        async *stream() {
+          started.push(runId);
+          await new Promise<void>((resolve) => releases.set(runId, resolve));
+          yield { type: 'text_delta', text: runId };
+          yield { type: 'stop', reason: 'stop' };
+        },
+      },
+      toolRuntime: { execute: async () => { throw new Error('not used'); } },
+      modelConcurrency: controller,
+    });
+    const run = (runId: string) => kernel(runId).run({
+      runId, attemptId: `attempt-${runId}`, turnNo: 1,
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+      messages: [{ role: 'user', content: [{ type: 'text', text: runId }] }],
+      model: { provider: 'fake', model: 'shared-model' },
+      tools: [],
+    }, { emit: async () => undefined, guard: async () => undefined, shouldStopAfterTurn: async () => false });
+
+    const first = run('run-1');
+    await vi.waitFor(() => expect(started).toEqual(['run-1']));
+    const second = run('run-2');
+    const third = run('run-3');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(started).toEqual(['run-1']);
+
+    releases.get('run-1')!();
+    await vi.waitFor(() => expect(started).toEqual(['run-1', 'run-2']));
+    releases.get('run-2')!();
+    await vi.waitFor(() => expect(started).toEqual(['run-1', 'run-2', 'run-3']));
+    releases.get('run-3')!();
+
+    await expect(Promise.all([first, second, third])).resolves.toEqual([
+      expect.objectContaining({ outcome: 'completed' }),
+      expect.objectContaining({ outcome: 'completed' }),
+      expect.objectContaining({ outcome: 'completed' }),
+    ]);
+  });
+
+  it('releases model permits after provider failure and removes cancelled FIFO waiters', async () => {
+    const controller = new FifoModelConcurrencyController({ maxConcurrentPerTenantModel: 1 });
+    const started: string[] = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const kernel = (runId: string) => new PiAgentKernel({
+      modelProvider: {
+        async *stream() {
+          started.push(runId);
+          if (runId === 'run-failing') {
+            await firstGate;
+            throw new Error('provider failed');
+          }
+          yield { type: 'text_delta', text: runId };
+          yield { type: 'stop', reason: 'stop' };
+        },
+      },
+      toolRuntime: { execute: async () => { throw new Error('not used'); } },
+      modelConcurrency: controller,
+    });
+    const run = (runId: string, signal?: AbortSignal) => kernel(runId).run({
+      runId, attemptId: `attempt-${runId}`, turnNo: 1,
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+      messages: [{ role: 'user', content: [{ type: 'text', text: runId }] }],
+      model: { provider: 'fake', model: 'shared-model' }, tools: [], signal,
+    }, { emit: async () => undefined, guard: async () => undefined, shouldStopAfterTurn: async () => false });
+
+    const failing = run('run-failing');
+    await vi.waitFor(() => expect(started).toEqual(['run-failing']));
+    const cancelledController = new AbortController();
+    const cancelled = run('run-cancelled', cancelledController.signal);
+    const succeeding = run('run-succeeding');
+    cancelledController.abort(new Error('cancel queued model call'));
+    releaseFirst();
+
+    await expect(failing).resolves.toMatchObject({ outcome: 'failed' });
+    await expect(cancelled).resolves.toMatchObject({ outcome: 'failed', stopReason: 'aborted' });
+    await expect(succeeding).resolves.toMatchObject({ outcome: 'completed' });
+    expect(started).toEqual(['run-failing', 'run-succeeding']);
   });
 
   it('runs model-tool-model through Pi while preserving awaited event order', async () => {

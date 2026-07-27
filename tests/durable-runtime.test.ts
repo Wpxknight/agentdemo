@@ -286,6 +286,38 @@ describe('DurableAgentRuntime', () => {
     expect(resumedKernel.run).not.toHaveBeenCalled();
   });
 
+  it('restores cumulative cost from the last Turn commit when the Run projection has no cost column', async () => {
+    const store = new MemoryRuntimeStore();
+    const firstKernel: AgentKernel = {
+      descriptor: { name: 'pi', version: '0.82.1', protocolVersion: '1' },
+      run: async () => ({
+        ...completed('waiting'), outcome: 'waiting', waitingReason: 'question',
+        usage: { ...usage, costUsd: 0.008 },
+      }),
+    };
+    const firstRuntime = new DurableAgentRuntime({ store, kernels: [firstKernel], defaultKernel: 'pi' });
+    const first = await firstRuntime.run({
+      identity, sessionId: 'session-cost', input: [], limits: { maxCostUsd: 0.01 },
+    });
+    expect((await first.result()).status).toBe('waiting');
+
+    const runIdentity = { tenantId: identity.tenantId, runId: first.runId };
+    const projected = await store.runs.get(runIdentity);
+    await store.runs.update(runIdentity, { usage: { ...projected!.usage, costUsd: undefined } });
+    const resumedKernel: AgentKernel = {
+      ...firstKernel,
+      run: async () => ({ ...completed(), usage: { ...usage, costUsd: 0.005 } }),
+    };
+    const resumedRuntime = new DurableAgentRuntime({ store, kernels: [resumedKernel], defaultKernel: 'pi' });
+    const resumed = await resumedRuntime.resume({ identity, runId: first.runId });
+
+    await expect(resumed.result()).resolves.toMatchObject({
+      status: 'failed',
+      usage: { costUsd: 0.013 },
+      error: { code: 'RUN_LIMIT_EXCEEDED', message: 'Run maxCostUsd exceeded: 0.013 > 0.01' },
+    });
+  });
+
   it('aborts and awaits all active runs during shutdown', async () => {
     const store = new MemoryRuntimeStore();
     const kernel: AgentKernel = {

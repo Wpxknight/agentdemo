@@ -33,6 +33,7 @@ import {
   type KernelExit,
   type KernelMessage,
   type KernelRunInput,
+  type ModelConcurrencyController,
   type ModelProvider,
   type ToolCall,
   type ToolDefinition,
@@ -50,6 +51,7 @@ const EMPTY_PI_USAGE: Usage = {
 
 export interface PiAgentKernelOptions {
   modelProvider: ModelProvider;
+  modelConcurrency?: ModelConcurrencyController;
   toolRuntime: ToolRuntime;
   systemPrompt?: string;
   protocolVersion?: string;
@@ -267,7 +269,13 @@ export class PiAgentKernel implements AgentKernel {
       usage, stopReason: 'stop', timestamp: Date.now(),
     });
     stream.push({ type: 'start', partial: partial() });
+    let releaseModel: () => void = () => undefined;
     try {
+      releaseModel = await this.options.modelConcurrency?.acquire({
+        identity: input.identity,
+        model: input.model,
+        signal: input.signal,
+      }) ?? releaseModel;
       let reason = 'stop';
       for await (const event of this.options.modelProvider.stream({
         model: input.model,
@@ -317,6 +325,8 @@ export class PiAgentKernel implements AgentKernel {
       };
       const reason = input.signal?.aborted ? 'aborted' as const : 'error' as const;
       stream.push({ type: 'error', reason, error: failed });
+    } finally {
+      releaseModel();
     }
   }
 
