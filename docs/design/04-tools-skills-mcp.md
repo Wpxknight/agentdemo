@@ -1,13 +1,28 @@
 # 工具、Skill 与 MCP 设计
 
+## 0. 开源与自研边界
+
+| 能力 | 所有权 | 说明 |
+| --- | --- | --- |
+| MCP 协议与 Client SDK | **开源引用** | `@modelcontextprotocol/sdk` 提供协议与 transport 能力 |
+| `McpManager`、连接热管理和工具映射 | **混合封装** | 基于 MCP SDK，把远程工具映射为 AIoP `ToolHandler` |
+| LangGraph `interrupt()` / `Command` | **开源引用** | 提供暂停与恢复原语 |
+| Tool Registry、Tool Broker、Rules、Policy、Approval、Hook、Ledger | **自研** | 定义工具可见性、执行顺序、安全边界和副作用恢复 |
+| Built-in 与 Skill 工具 | **自研** | AIoP 定义工具契约、参数、权限语义和执行逻辑 |
+| Sandbox/MCP 工具适配 | **混合封装** | 基于外部 SDK 或协议映射为 AIoP `ToolHandler` |
+
+Legacy 和 LangGraph 两种 Kernel 都调用同一个自研 Tool Broker。LangGraph 图不能直接绕过 Policy、Approval、Hook、Ledger 或 Registry dispatch。
+
 ## 1. 总体结构
 
 AIoP 将内置工具、Sandbox 工具、Skill 工具和 MCP 工具统一为 `ToolHandler`，由 `ToolRegistry` 提供定义列表和 dispatch。
 
 ~~~mermaid
 flowchart LR
+  Legacy[Legacy Loop 自研]
+  LangGraph[AIoP LangGraph Graph 自研]
   Model[Model ToolCall]
-  Broker[Tool Broker]
+  Broker[Tool Broker 自研]
   Rules[Permission Rules]
   Policy[Ops Policy]
   Approval[Approval or Interaction]
@@ -19,7 +34,10 @@ flowchart LR
   MCP[MCP Tools]
   Sandbox[Sandbox Tools]
 
-  Model --> Broker
+  Model --> Legacy
+  Model --> LangGraph
+  Legacy --> Broker
+  LangGraph --> Broker
   Broker --> Rules --> Policy --> Approval --> Hook --> Ledger --> Registry
   Registry --> Builtin
   Registry --> Skill
@@ -43,6 +61,8 @@ flowchart LR
 8. 发出 tool output 和 tool result 事件。
 
 CLI 虽复用 Tool Broker、Policy、Approval 和 Tool Ledger，但 `runOnce()` 当前没有传入 Permission Rules 的工具定义过滤或配置化 Hook，因此不具备与 HTTP/Scheduler 完全相同的调用链。
+
+LangGraph 路径中，`tools` 节点负责把 state 中的 ToolCall 交给 `executeToolCalls()`。节点只负责图状态转换和 durable interaction 的 interrupt 映射；真正的策略判断与副作用执行仍在 Tool Broker。
 
 ## 3. 权限规则与运维策略
 
@@ -76,13 +96,15 @@ flowchart TD
 
 ## 4. Approval、Question 与 Plan
 
-交互分为内存兼容路径和 durable interaction 路径。LangGraph Kernel 使用持久记录与 interrupt：
+交互分为内存兼容路径和 durable interaction 路径。LangGraph Kernel 使用 AIoP 持久记录与开源 interrupt 原语：
 
 - approval：批准一次工具调用。
 - question：`ask_user` 请求结构化回答。
 - plan：`submit_change_plan` 请求批准变更计划。
 
 会话内 `PlanApprovalState` 可让后续同会话生产变更免于逐条审批；它不跨会话扩权。
+
+这里属于混合边界：LangGraph 提供 `interrupt()` / `Command(resume)`，AIoP 自研 Interaction 的创建、Store 记录、tenant/user/session/run 授权、等待和解析。
 
 ## 5. Hook
 

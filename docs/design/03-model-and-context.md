@@ -1,5 +1,20 @@
 # 模型与上下文设计
 
+## 0. 开源与自研边界
+
+模型调用链不是由 LangGraph 或模型 SDK 整体提供。所有权如下：
+
+| 能力 | 所有权 | 实现位置 |
+| --- | --- | --- |
+| Anthropic/OpenAI 客户端与 LangChain 基础类型 | **开源引用** | `@anthropic-ai/sdk`、`openai`、`@langchain/core` |
+| `Msg`、`ToolCall`、`ToolResult`、`StreamEvent`、`ChatModel` | **自研** | `src/model/types.ts` |
+| Anthropic/OpenAI Adapter | **混合封装** | 基于开源 SDK 实现 AIoP 中立消息与事件映射，位于 `src/model/**` |
+| Model Gateway | **自研** | `src/agent/services/model-gateway.ts` |
+| Prompt、token 估算、硬裁剪、摘要压缩 | **自研** | `src/agent/services/prompt.ts`、`src/agent/context.ts`、`context-service.ts` |
+| LangGraph `model` 节点 | **自研** | 使用开源图 API 注册，但节点状态转换与服务调用由 AIoP 定义 |
+
+Legacy Agent Loop 和 LangGraph Kernel 共用同一个 Model Gateway 与 Context Service。切换 Kernel 不会切换模型协议、重试、usage 或上下文治理语义。
+
 ## 1. 中立模型契约
 
 Agent 核心不直接使用 Anthropic 或 OpenAI 的 wire format，而使用 `src/model/types.ts` 定义的中立结构。
@@ -15,10 +30,10 @@ Agent 核心不直接使用 Anthropic 或 OpenAI 的 wire format，而使用 `sr
 
 ~~~mermaid
 flowchart LR
-  Agent[Agent Core]
+  Agent[自研 Agent Core Services]
   Neutral[Neutral Contracts]
-  Anthropic[Anthropic Adapter]
-  OpenAI[OpenAI Adapter]
+  Anthropic[Anthropic Adapter 混合封装]
+  OpenAI[OpenAI Adapter 混合封装]
   AAPI[Anthropic compatible API]
   OAPI[OpenAI compatible API]
 
@@ -27,7 +42,7 @@ flowchart LR
   Neutral --> OpenAI --> OAPI
 ~~~
 
-Adapter 负责消息转换、工具 Schema 映射、流式事件转换、usage 归一化，并保留 Anthropic thinking block 及 signature。
+Adapter 负责消息转换、工具 Schema 映射、流式事件转换、usage 归一化，并保留 Anthropic thinking block 及 signature。底层 SDK 是开源引用，转换规则和中立契约由 AIoP 自研。
 
 ## 2. 模型配置与选择
 
@@ -45,10 +60,10 @@ Adapter 负责消息转换、工具 Schema 映射、流式事件转换、usage �
 
 ~~~mermaid
 sequenceDiagram
-  participant G as Kernel
-  participant C as Context
-  participant M as Model Gateway
-  participant A as Adapter
+  participant G as Legacy or LangGraph Kernel
+  participant C as Context 自研
+  participant M as Model Gateway 自研
+  participant A as Adapter 混合封装
   participant P as Provider
 
   G->>C: compact at boundary
@@ -64,6 +79,8 @@ sequenceDiagram
 ~~~
 
 `runModelTurn()` 为一次完整尝试收集文本、思考、工具调用和 usage。可重试错误会整轮重放，前端通过 `model_retry` 回滚失败尝试的展示。
+
+LangGraph 只负责何时调度 `model` 节点；节点内部的上下文压缩、工具定义过滤、模型流消费、重试和 usage 聚合仍由 AIoP 自研代码执行。
 
 ## 5. 上下文预算
 

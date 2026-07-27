@@ -293,9 +293,19 @@ sequenceDiagram
 
 入口在 [src/agent/runtime.ts](../../src/agent/runtime.ts)。
 
+先统一所有权标记：
+
+| 标记 | 含义 | 本节示例 |
+| --- | --- | --- |
+| **开源引用** | 外部项目直接提供的协议或运行机制 | LangGraph `StateGraph`、Checkpoint、`interrupt()`、`Command` |
+| **自研** | AIoP 定义并维护的业务契约和实现 | `AgentRuntime`、Legacy Loop、Tool Broker、Run Coordinator |
+| **混合封装** | 基于开源扩展点实现 AIoP 特有适配 | `LangGraphAgentKernel`、MySQL Checkpoint Saver |
+
+不要把 `Agent Runtime` 和 LangGraph 画等号：LangGraph 只在一个 Kernel 内部提供图执行机制。
+
 ### 9.1 AgentRuntime
 
-`AgentRuntime.run()` 做三件事：
+`AgentRuntime` 是**自研**稳定入口。`AgentRuntime.run()` 做三件事：
 
 1. 选择 Kernel。
 2. 用 Agent Run binding 锁定 Kernel 和 graph version。
@@ -305,7 +315,9 @@ sequenceDiagram
 
 ### 9.2 Legacy Kernel
 
-[src/agent/legacy-kernel.ts](../../src/agent/legacy-kernel.ts) 很薄，只是调用 [src/agent/core.ts](../../src/agent/core.ts) 的 `runAgent()`。
+[src/agent/legacy-kernel.ts](../../src/agent/legacy-kernel.ts) 是很薄的**自研**适配器，只调用 [src/agent/core.ts](../../src/agent/core.ts) 的 `runAgent()`。
+
+仓库里没有 `AgentCore` 类。`core.ts` 一方面定义两个 Kernel 共用的 `RunAgentOptions` / `RunAgentResult`，另一方面实现 Legacy 路径的自研 Agent Loop。共享逻辑已拆到 `src/agent/services/**`。
 
 `runAgent()` 的核心循环：
 
@@ -319,7 +331,7 @@ sequenceDiagram
 
 ### 9.3 LangGraph Kernel
 
-[src/agent/langgraph/graph.ts](../../src/agent/langgraph/graph.ts) 将相同语义拆为三个节点：
+[src/agent/langgraph/graph.ts](../../src/agent/langgraph/graph.ts) 使用开源 LangGraph 机制，将相同的自研业务语义拆为三个节点：
 
 ~~~mermaid
 flowchart LR
@@ -330,12 +342,13 @@ flowchart LR
   Model -->|complete| End([END])
 ~~~
 
-- `prepare`：准备消息。
-- `model`：压缩上下文并调用模型。
-- `tools`：执行工具调用。
-- `observedNode`：写节点时间线并执行 Run guard。
+- `StateGraph`、`Annotation`、条件边、Checkpoint、interrupt/Command：**开源引用**。
+- `prepare`：**自研节点**，准备消息并检查取消。
+- `model`：**自研节点**，调用共享 Context Service 和 Model Gateway。
+- `tools`：**自研节点**，调用共享 Tool Broker。
+- `observedNode`：**自研封装**，写节点时间线并执行 Run guard。
 
-[src/agent/langgraph/kernel.ts](../../src/agent/langgraph/kernel.ts) 负责 thread id、Checkpoint 配置、interrupt 和 Command resume。
+[src/agent/langgraph/kernel.ts](../../src/agent/langgraph/kernel.ts) 是**混合封装**，负责 thread id、Checkpoint metadata、graph invoke、interrupt 检测和 Command resume。
 
 ### 9.4 Agent Run 与恢复
 
@@ -358,6 +371,24 @@ Checkpoint、Lease、Interaction 和 Tool Ledger 不是一回事：
 | Tool Ledger | 外部副作用结果复用与不确定性 |
 
 当前没有自动扫描器接管 Lease 已过期的 running Run。Interaction waiter 也是进程内状态，跨副本解析需要粘性路由或后续通知机制。
+
+另一个当前差异是：LangGraph 路径会在节点、模型和工具边界调用 `runGuard`；Legacy `runAgent()` 目前没有继续传递该 guard，主要依赖 AbortSignal，因此多副本 fencing 与 Store 取消检查并不完全等价。
+
+### 9.5 Agent Core 共享能力与修改入口
+
+| 想修改的行为 | 所有权 | 首选文件 |
+| --- | --- | --- |
+| Kernel 选择、灰度、binding、graph version | **自研** | `src/agent/runtime.ts` |
+| Legacy model → tools 循环 | **自研** | `src/agent/core.ts` |
+| LangGraph 状态、节点和路由 | **自研** | `src/agent/langgraph/state.ts`、`graph.ts` |
+| LangGraph thread、invoke、interrupt/resume | **混合封装** | `src/agent/langgraph/kernel.ts` |
+| 模型流、重试和 usage | **自研** | `src/agent/services/model-gateway.ts` |
+| Prompt 与上下文压缩 | **自研** | `src/agent/services/prompt.ts`、`context-service.ts`、`context.ts` |
+| 工具安全链 | **自研** | `src/agent/services/tool-broker.ts`、`policy.ts`、`rules.ts`、`hooks.ts` |
+| Run lease、取消和节点事件 | **自研** | `src/agent/run-coordinator.ts` |
+| LangGraph Saver 协议实现 | **混合封装** | `src/agent/checkpoint/mysql.ts` |
+
+详细设计见[Agent Runtime、Agent Loop 与 Agent Core 设计](../design/02-agent-runtime.md)。
 
 ## 10. 第五条主线：模型和上下文
 
@@ -542,7 +573,8 @@ Run Center 已拆到 [web/src/components/run-center-page.tsx](../../web/src/comp
 | 新增 Sandbox Provider | `src/sandbox/types.ts`、Provider | Runtime 装配、Profile、合同测试、设置 UI |
 | 新增 API | `src/server/http.ts` | `web/src/api.ts`、types、HTTP 测试 |
 | 新增页面 | `web/src/app-data.ts`、`App.tsx` | CSS、API、frontend 测试 |
-| 修改 Agent 图 | `src/agent/langgraph/graph.ts` | graph version、Checkpoint 兼容、Kernel parity |
+| 修改 Legacy Agent Loop | `src/agent/core.ts` | 共享 options/result、Agent 行为测试、Kernel parity |
+| 修改 Agent 图 | `src/agent/langgraph/graph.ts`、`state.ts` | graph version、Checkpoint 兼容、Kernel parity |
 | 修改会话数据 | `src/db/store.ts` | Memory/MySQL、迁移、HTTP 测试 |
 | 修改调度行为 | `src/scheduler/` | Store claim、Schedule API 和测试 |
 | 修改认证/RBAC | `src/auth/` | HTTP 权限、租户隔离、安全测试 |

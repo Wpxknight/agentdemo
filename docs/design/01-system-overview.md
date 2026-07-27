@@ -136,6 +136,27 @@ flowchart TB
 
 该文件是组装边界，不应成为具体领域规则的归属地。
 
+### 4.2 Agent 执行面的所有权边界
+
+Agent 执行面采用“自研 Runtime + 可替换 Kernel + 共享自研服务”。本文统一使用三个标记：
+
+- **开源引用**：直接使用外部项目提供的协议或运行机制。
+- **自研**：AIoP 定义并维护的业务契约与实现。
+- **混合封装**：基于开源扩展点实现 AIoP 特有适配。
+
+| 组件 | 所有权 | 当前职责 |
+| --- | --- | --- |
+| `AgentRuntime` / `AgentKernel` 契约 | **自研** | 稳定入口、Kernel 选择、binding、graph version 和 Run 生命周期 |
+| Legacy `runAgent()` Loop | **自研** | TypeScript `while` 循环实现 model → tools → model |
+| LangGraph `StateGraph`、Checkpoint、interrupt/Command | **开源引用** | 图调度、图状态持久化原语和暂停恢复原语 |
+| `LangGraphAgentKernel` | **混合封装** | 把 AIoP 运行契约映射为 LangGraph thread、invoke、Checkpoint 和 resume |
+| AIoP Agent Graph | **自研** | 使用 LangGraph API 声明状态、节点和路由，但业务定义由 AIoP 维护 |
+| Prompt、Context、Model Gateway、Tool Broker | **自研** | 两种 Kernel 共用的 Agent Core 服务 |
+| MySQL Checkpoint Saver | **混合封装** | 实现 LangGraph Saver 协议并扩展 tenant/run/version/TTL |
+| Run Coordinator、Interaction、Tool Ledger、Store | **自研** | 多副本所有权、人机交互、副作用恢复和业务持久化 |
+
+LangGraph 只位于 Kernel 内部。它不提供完整 AIoP Agent Runtime，也不替代 Tool Broker、Agent Run、Session、审计或多租户 Store。详细边界见[Agent Runtime、Agent Loop 与 Agent Core 设计](./02-agent-runtime.md)。
+
 ## 5. 主要数据与请求路径
 
 ~~~mermaid
@@ -179,9 +200,9 @@ sequenceDiagram
 | 运行时 | Node.js、TypeScript、`tsx` | 服务、CLI、调度与开发运行 | ESM 与 Node API 使用广，替换运行时影响全仓 |
 | 配置 | `zod` | 配置解析与跨字段校验 | 集中在 `src/config/schema.ts` |
 | 模型 | `@anthropic-ai/sdk`、`openai` | 两种模型协议与流式响应 | 经 `ChatModel` 中立接口隔离 |
-| Agent | `@langchain/core`、`@langchain/langgraph` | LangGraph Kernel、StateGraph、interrupt | Legacy Kernel 保留回退路径 |
+| Agent | `@langchain/core`、`@langchain/langgraph` | **开源引用**：基础类型、StateGraph、Checkpoint、interrupt/Command | `AgentRuntime`、AIoP Graph 和共享 Core 服务仍为自研；Legacy Kernel 保留回退路径 |
 | 持久化 | `mysql2`、`kysely` | MySQL 连接与类型化查询 | 经 `Store` 隔离；生产迁移依赖 SQL |
-| Checkpoint | LangGraph checkpoint API | 图状态保存和恢复 | 自定义 MySQL Saver；不能替代 Agent Run Lease |
+| Checkpoint | LangGraph checkpoint API | **开源引用**：图状态保存和恢复协议 | **混合封装**：自研 MySQL Saver；不能替代 Agent Run Lease |
 | MCP | `@modelcontextprotocol/sdk` | stdio/SSE/HTTP MCP 接入 | 经 `McpManager` 映射为 Tool Handler |
 | Sandbox | `@alibaba-group/opensandbox` | OpenSandbox 生命周期 | 经 `SandboxProvider` 封装 |
 | Sandbox | `@e2b/code-interpreter`、`@e2b/desktop` | 代码与桌面沙箱 | 经 Provider 与 Desktop Provider 封装 |
@@ -197,12 +218,12 @@ sequenceDiagram
 
 ## 7. 核心设计原则
 
-- 稳定入口：HTTP、CLI、Scheduler 统一调用 `AgentRuntime`。
+- 稳定入口：HTTP、CLI、Scheduler 统一调用自研 `AgentRuntime`。
 - 权威上下文：租户、用户和角色由认证与服务端上下文提供。
 - 端口隔离：模型、Store、Sandbox、Desktop、Audit 通过接口隔离实现。
 - 分层恢复：Checkpoint 恢复图状态，Tool Ledger 处理副作用不确定性，Lease 处理并发所有权。
 - 默认安全：危险命令硬拦截、生产变更审批、租户隔离、敏感设置加密。
-- 渐进替换：Legacy/LangGraph Kernel、Memory/MySQL Store、多种 Sandbox Provider 可以按配置切换。
+- 渐进替换：自研 Legacy Kernel 与混合封装 LangGraph Kernel、Memory/MySQL Store、多种 Sandbox Provider 可以按配置切换。
 - 可降级：外部 MCP 单点连接失败不阻断其他 Server；MySQL 未配置可用 Memory Store 开发运行。
 
 ## 8. 源码依据
