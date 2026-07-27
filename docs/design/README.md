@@ -21,7 +21,7 @@
 | 9 | [HTTP API 与 Web](./09-api-and-web.md) | Node HTTP 路由、JSON/SSE、会话与 Agent API、管理 API、React 页面和前端状态 |
 | 10 | [部署与可观测性](./10-deployment-observability.md) | CLI/Server/Scheduler 进程、Kubernetes 拓扑、配置与密钥、健康检查、日志、审计和故障域 |
 | 11 | [演进路线](./11-evolution-roadmap.md) | 已知限制、技术债、兼容边界及有证据支撑的后续演进方向 |
-| 12 | [Pi 集成与 Agent Platform 模块化方案](./12-pi-integration-plan.md) | PiAgentKernel、可复用 Runtime、Tool/Sandbox/Scheduler 模块边界、持久化恢复、迁移与发布治理 |
+| 12 | [Pi 集成与 Agent Platform 模块化设计](./12-pi-integration-plan.md) | PiAgentKernel、模块边界、数据与 Interface、持久化恢复、开源组件、工时估算及 LangGraph 退场 |
 
 推荐的专题阅读路径：
 
