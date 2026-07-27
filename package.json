@@ -3,8 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -13,13 +16,17 @@
     "scheduler": "tsx src/index.ts scheduler",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --exclude 'dist/**'",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "verify:node": "tsx scripts/verify-node.ts",
+    "test:agent-platform": "vitest run tests/pi-*.test.ts tests/*runtime-store*.test.ts tests/durable-runtime.test.ts"
   },
   "dependencies": {
     "@alibaba-group/opensandbox": "^0.1.9",
     "@anthropic-ai/sdk": "^0.104.2",
     "@e2b/code-interpreter": "^2.6.0",
     "@e2b/desktop": "^2.3.1",
+    "@earendil-works/pi-agent-core": "0.82.1",
+    "@earendil-works/pi-ai": "0.82.1",
     "@langchain/core": "^1.1.48",
     "@langchain/langgraph": "^1.4.8",
     "@modelcontextprotocol/sdk": "^1.29.0",

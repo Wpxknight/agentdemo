@@ -83,6 +83,8 @@ export interface InteractionRecord {
   userId: string;
   sessionId: string;
   runId: string;
+  attemptId?: string;
+  turnNo?: number;
   kind: InteractionKind;
   toolCallId?: string;
   payload: unknown;
@@ -99,8 +101,16 @@ export type ToolExecutionStatus = 'started' | 'completed' | 'unknown' | 'recover
 export interface ToolExecutionRecord {
   tenantId: string;
   runId: string;
+  attemptId?: string;
+  turnNo?: number;
   sessionId: string;
   toolCallId: string;
+  logicalCallId?: string;
+  idempotencyKey?: string;
+  capability?: 'read' | 'retryable_write' | 'non_idempotent_write';
+  externalCorrelationId?: string;
+  resultDigest?: string;
+  approvedInteractionId?: string;
   toolName: string;
   argsDigest: string;
   status: ToolExecutionStatus;
@@ -115,7 +125,9 @@ export interface AgentRunBinding {
   userId: string;
   sessionId: string;
   runId: string;
-  kernel: 'legacy' | 'langgraph';
+  kernel: 'pi' | 'legacy' | 'langgraph';
+  kernelVersion?: string;
+  runtimeVersion?: string;
   graphName: string;
   graphVersion: string;
   createdAt: Date;
@@ -139,6 +151,7 @@ export interface AgentRunUsage {
 
 export interface AgentRunRecord extends AgentRunBinding {
   status: AgentRunStatus;
+  waitingReason?: 'approval' | 'question' | 'plan' | 'external';
   currentNode?: string;
   stepCount: number;
   usage: AgentRunUsage;
@@ -154,6 +167,7 @@ export interface AgentRunRecord extends AgentRunBinding {
 
 export interface AgentRunPatch {
   status?: AgentRunStatus;
+  waitingReason?: AgentRunRecord['waitingReason'] | null;
   currentNode?: string | null;
   stepCount?: number;
   usage?: AgentRunUsage;
@@ -176,6 +190,7 @@ export interface AgentRunEvent {
   id?: number;
   tenantId: string;
   runId: string;
+  sequence?: number;
   type: string;
   node?: string;
   status?: string;

@@ -352,7 +352,10 @@ export class MemoryStore implements Store {
   }
 
   async appendAgentRunEvent(event: AgentRunEvent): Promise<void> {
-    this.agentRunEvents.push(structuredClone({ ...event, id: ++this.agentRunEventSeq }));
+    const sequence = event.sequence ?? this.agentRunEvents
+      .filter((item) => item.tenantId === event.tenantId && item.runId === event.runId)
+      .reduce((max, item) => Math.max(max, item.sequence ?? 0), 0) + 1;
+    this.agentRunEvents.push(structuredClone({ ...event, id: ++this.agentRunEventSeq, sequence }));
   }
 
   async listAgentRunEvents(ctx: RequestContext, runId: string): Promise<AgentRunEvent[]> {

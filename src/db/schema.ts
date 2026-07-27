@@ -152,6 +152,8 @@ export interface AgentInteractionsTable {
   user_id: string;
   session_id: string;
   run_id: string;
+  attempt_id: string | null;
+  turn_no: number | null;
   kind: string;
   tool_call_id: string | null;
   payload: JsonColumn;
@@ -166,8 +168,16 @@ export interface AgentInteractionsTable {
 export interface AgentToolExecutionsTable {
   tenant_id: string;
   run_id: string;
+  attempt_id: string | null;
+  turn_no: number | null;
   session_id: string;
   tool_call_id: string;
+  logical_call_id: string;
+  idempotency_key: string;
+  capability: string;
+  external_correlation_id: string | null;
+  result_digest: string | null;
+  approved_interaction_id: string | null;
   tool_name: string;
   args_digest: string;
   status: string;
@@ -183,9 +193,12 @@ export interface AgentRunsTable {
   user_id: string;
   session_id: string;
   kernel: string;
+  kernel_version: string;
   graph_name: string;
   graph_version: string;
+  runtime_version: string;
   status: string;
+  waiting_reason: string | null;
   current_node: string | null;
   step_count: number;
   input_tokens: number;
@@ -207,11 +220,59 @@ export interface AgentRunEventsTable {
   id: Generated<number>;
   tenant_id: string;
   run_id: string;
+  sequence: number;
   event_type: string;
   node_name: string | null;
   status: string | null;
   detail: NullableJsonColumn;
   created_at: Date;
+}
+
+export interface AgentRunAttemptsTable {
+  tenant_id: string;
+  run_id: string;
+  attempt_id: string;
+  worker_id: string;
+  lease_token: number;
+  kernel: string;
+  kernel_version: string;
+  status: string;
+  error_code: string | null;
+  error_message: string | null;
+  started_at: Date;
+  completed_at: Date | null;
+}
+
+export interface AgentTurnSnapshotsTable {
+  tenant_id: string;
+  run_id: string;
+  attempt_id: string;
+  turn_no: number;
+  session_version: number;
+  parent_commit_id: string | null;
+  identity_json: JsonColumn;
+  model_binding_json: JsonColumn;
+  prompt_version: string;
+  skill_set_version: string | null;
+  tool_set_version: string;
+  policy_version: string;
+  messages_json: JsonColumn;
+  deadline_at: Date | null;
+  created_at: Date;
+}
+
+export interface AgentTurnCommitsTable {
+  tenant_id: string;
+  run_id: string;
+  attempt_id: string;
+  turn_no: number;
+  commit_id: string;
+  transcript_version: number;
+  stop_reason: string | null;
+  usage_json: JsonColumn;
+  messages_json: JsonColumn;
+  event_sequence_end: number;
+  committed_at: Date;
 }
 
 export interface Database {
@@ -231,4 +292,7 @@ export interface Database {
   agent_tool_executions: AgentToolExecutionsTable;
   agent_runs: AgentRunsTable;
   agent_run_events: AgentRunEventsTable;
+  agent_run_attempts: AgentRunAttemptsTable;
+  agent_turn_snapshots: AgentTurnSnapshotsTable;
+  agent_turn_commits: AgentTurnCommitsTable;
 }

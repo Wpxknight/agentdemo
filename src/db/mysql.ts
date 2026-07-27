@@ -122,9 +122,12 @@ function toAgentRun(row: Selectable<Database['agent_runs']>): AgentRunRecord {
     userId: row.user_id,
     sessionId: row.session_id,
     kernel: row.kernel as AgentRunBinding['kernel'],
+    kernelVersion: row.kernel_version,
+    runtimeVersion: row.runtime_version,
     graphName: row.graph_name,
     graphVersion: row.graph_version,
     status: row.status as AgentRunRecord['status'],
+    waitingReason: row.waiting_reason as AgentRunRecord['waitingReason'] ?? undefined,
     currentNode: row.current_node ?? undefined,
     stepCount: row.step_count,
     usage: {
@@ -473,6 +476,8 @@ export class MysqlStore implements Store {
       user_id: record.userId,
       session_id: record.sessionId,
       run_id: record.runId,
+      attempt_id: record.attemptId ?? null,
+      turn_no: record.turnNo ?? null,
       kind: record.kind,
       tool_call_id: record.toolCallId ?? null,
       payload: JSON.stringify(record.payload),
@@ -529,8 +534,16 @@ export class MysqlStore implements Store {
     const result = await this.db.insertInto('agent_tool_executions').values({
       tenant_id: record.tenantId,
       run_id: record.runId,
+      attempt_id: record.attemptId ?? null,
+      turn_no: record.turnNo ?? null,
       session_id: record.sessionId,
       tool_call_id: record.toolCallId,
+      logical_call_id: record.logicalCallId ?? record.toolCallId,
+      idempotency_key: record.idempotencyKey ?? `${record.tenantId}:${record.runId}:${record.toolCallId}`,
+      capability: record.capability ?? 'non_idempotent_write',
+      external_correlation_id: record.externalCorrelationId ?? null,
+      result_digest: record.resultDigest ?? null,
+      approved_interaction_id: record.approvedInteractionId ?? null,
       tool_name: record.toolName,
       args_digest: record.argsDigest,
       status: record.status,
@@ -549,8 +562,16 @@ export class MysqlStore implements Store {
     return row ? {
       tenantId: row.tenant_id,
       runId: row.run_id,
+      attemptId: row.attempt_id ?? undefined,
+      turnNo: row.turn_no ?? undefined,
       sessionId: row.session_id,
       toolCallId: row.tool_call_id,
+      logicalCallId: row.logical_call_id,
+      idempotencyKey: row.idempotency_key,
+      capability: row.capability as ToolExecutionRecord['capability'],
+      externalCorrelationId: row.external_correlation_id ?? undefined,
+      resultDigest: row.result_digest ?? undefined,
+      approvedInteractionId: row.approved_interaction_id ?? undefined,
       toolName: row.tool_name,
       argsDigest: row.args_digest,
       status: row.status as ToolExecutionStatus,
@@ -580,6 +601,8 @@ export class MysqlStore implements Store {
       userId: row.user_id,
       sessionId: row.session_id,
       kernel: row.kernel as AgentRunBinding['kernel'],
+      kernelVersion: row.kernel_version,
+      runtimeVersion: row.runtime_version,
       graphName: row.graph_name,
       graphVersion: row.graph_version,
       createdAt: toDate(row.created_at),
@@ -593,9 +616,12 @@ export class MysqlStore implements Store {
       user_id: binding.userId,
       session_id: binding.sessionId,
       kernel: binding.kernel,
+      kernel_version: binding.kernelVersion ?? `${binding.kernel}-v1`,
       graph_name: binding.graphName,
       graph_version: binding.graphVersion,
+      runtime_version: binding.runtimeVersion ?? 'compat-v1',
       status: 'queued',
+      waiting_reason: null,
       current_node: null,
       step_count: 0,
       input_tokens: 0,
@@ -646,6 +672,7 @@ export class MysqlStore implements Store {
   async updateAgentRun(tenantId: string, runId: string, patch: AgentRunPatch): Promise<boolean> {
     const result = await this.db.updateTable('agent_runs').set({
       status: patch.status,
+      waiting_reason: patch.waitingReason,
       current_node: patch.currentNode,
       step_count: patch.stepCount,
       input_tokens: patch.usage?.inputTokens,
@@ -663,15 +690,24 @@ export class MysqlStore implements Store {
   }
 
   async appendAgentRunEvent(event: AgentRunEvent): Promise<void> {
-    await this.db.insertInto('agent_run_events').values({
-      tenant_id: event.tenantId,
-      run_id: event.runId,
-      event_type: event.type,
-      node_name: event.node ?? null,
-      status: event.status ?? null,
-      detail: event.detail === undefined ? null : JSON.stringify(event.detail),
-      created_at: event.createdAt,
-    }).execute();
+    await this.db.transaction().execute(async (transaction) => {
+      await transaction.selectFrom('agent_runs').select('lease_token')
+        .where('tenant_id', '=', event.tenantId).where('run_id', '=', event.runId)
+        .forUpdate().executeTakeFirstOrThrow();
+      const last = await transaction.selectFrom('agent_run_events')
+        .select(({ fn }) => fn.max<number>('sequence').as('sequence'))
+        .where('tenant_id', '=', event.tenantId).where('run_id', '=', event.runId).executeTakeFirst();
+      await transaction.insertInto('agent_run_events').values({
+        tenant_id: event.tenantId,
+        run_id: event.runId,
+        sequence: event.sequence ?? Number(last?.sequence ?? 0) + 1,
+        event_type: event.type,
+        node_name: event.node ?? null,
+        status: event.status ?? null,
+        detail: event.detail === undefined ? null : JSON.stringify(event.detail),
+        created_at: event.createdAt,
+      }).execute();
+    });
   }
 
   async listAgentRunEvents(ctx: RequestContext, runId: string): Promise<AgentRunEvent[]> {
@@ -679,7 +715,7 @@ export class MysqlStore implements Store {
     const rows = await this.db.selectFrom('agent_run_events').selectAll()
       .where('tenant_id', '=', ctx.tenantId).where('run_id', '=', runId).orderBy('id', 'asc').execute();
     return rows.map((row) => ({
-      id: Number(row.id), tenantId: row.tenant_id, runId: row.run_id, type: row.event_type,
+      id: Number(row.id), tenantId: row.tenant_id, runId: row.run_id, sequence: Number(row.sequence), type: row.event_type,
       node: row.node_name ?? undefined, status: row.status ?? undefined,
       detail: parseJson(row.detail), createdAt: toDate(row.created_at),
     }));
@@ -704,7 +740,12 @@ export class MysqlStore implements Store {
       .where('tenant_id', '=', ctx.tenantId).where('run_id', '=', runId).orderBy('started_at', 'asc').execute();
     return rows.map((row) => ({
       tenantId: row.tenant_id, runId: row.run_id, sessionId: row.session_id,
-      toolCallId: row.tool_call_id, toolName: row.tool_name, argsDigest: row.args_digest,
+      attemptId: row.attempt_id ?? undefined, turnNo: row.turn_no ?? undefined,
+      toolCallId: row.tool_call_id, logicalCallId: row.logical_call_id, idempotencyKey: row.idempotency_key,
+      capability: row.capability as ToolExecutionRecord['capability'],
+      externalCorrelationId: row.external_correlation_id ?? undefined, resultDigest: row.result_digest ?? undefined,
+      approvedInteractionId: row.approved_interaction_id ?? undefined,
+      toolName: row.tool_name, argsDigest: row.args_digest,
       status: row.status as ToolExecutionStatus,
       result: row.result === null ? undefined : parseJson(row.result) as ToolExecutionRecord['result'],
       startedAt: toDate(row.started_at), completedAt: row.completed_at ? toDate(row.completed_at) : undefined,

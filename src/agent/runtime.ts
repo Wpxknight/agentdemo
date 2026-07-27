@@ -113,6 +113,9 @@ export class AgentRuntime {
       && (binding.graphName !== this.graphName || binding.graphVersion !== this.graphVersion)) {
       throw new Error(`Agent graph version 不可用：${binding.graphName}@${binding.graphVersion}`);
     }
+    if (binding.kernel !== 'legacy' && binding.kernel !== 'langgraph') {
+      throw new Error(`Agent Kernel 不可用：${binding.kernel}@${binding.kernelVersion ?? 'unknown'}`);
+    }
     return binding.kernel;
   }
 }
