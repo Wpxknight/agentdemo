@@ -863,6 +863,25 @@ async function handle(
     }));
   }
 
+  const runEventsMatch = /^\/v1\/agent\/runs\/([^/]+)\/events$/.exec(path);
+  if (method === 'GET' && runEventsMatch) {
+    const ctx = await requireAuth(rt, req);
+    const header = Array.isArray(req.headers['last-event-id'])
+      ? req.headers['last-event-id'][0]
+      : req.headers['last-event-id'];
+    const after = intParam(url.searchParams.get('after') ?? header ?? null, 0, 0, Number.MAX_SAFE_INTEGER);
+    const events = await runCenter.events(ctx, decodeURIComponent(runEventsMatch[1]!), after);
+    if (!events) throw new RunCenterNotFoundError();
+    res.statusCode = 200;
+    res.setHeader('content-type', 'text/event-stream; charset=utf-8');
+    res.setHeader('cache-control', 'no-cache');
+    for (const event of events) {
+      res.write(`id: ${event.sequence ?? 0}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    }
+    res.end();
+    return;
+  }
+
   const runDetailMatch = /^\/v1\/agent\/runs\/([^/]+)$/.exec(path);
   if (method === 'GET' && runDetailMatch) {
     const ctx = await requireAuth(rt, req);

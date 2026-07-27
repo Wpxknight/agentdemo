@@ -42,7 +42,7 @@ beforeAll(async () => {
   const createdAt = new Date('2026-07-22T00:00:00.000Z');
   await store.putAgentRunBindingIfAbsent({
     tenantId: 'default', userId: user.id, sessionId: 'session-user', runId: 'run-user',
-    kernel: 'langgraph', graphName: 'aiop-agent', graphVersion: 'v1', createdAt,
+    kernel: 'pi', kernelVersion: '0.82.1', graphName: '', graphVersion: '', createdAt,
   });
   await store.updateAgentRun('default', 'run-user', {
     status: 'failed', errorMessage: 'upstream failed', completedAt: createdAt, updatedAt: createdAt,
@@ -102,10 +102,11 @@ describe('Agent Run Center HTTP API', () => {
     const response = await fetch(`${base}/v1/agent/runs/run-user`, { headers: auth(userToken) });
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
-      run: { runId: 'run-user', status: 'failed', graphVersion: 'v1' },
+      run: { runId: 'run-user', status: 'failed', kernel: 'pi', kernelVersion: '0.82.1' },
       events: [{ node: 'model', status: 'failed' }],
       interactions: [{ id: 'interaction-secret', kind: 'approval', status: 'resolved' }],
-      tools: [{ toolCallId: 'tool-secret', toolName: 'kubectl', status: 'completed' }], canResume: true,
+      tools: [{ toolCallId: 'tool-secret', toolName: 'kubectl', status: 'completed' }],
+      attempts: [], turns: [], canResume: true,
     });
     const raw = JSON.stringify(await (await fetch(`${base}/v1/agent/runs/run-user`, { headers: auth(userToken) })).json());
     expect(raw).not.toContain('must-not-leak');
@@ -126,7 +127,7 @@ describe('Agent Run Center HTTP API', () => {
     expect(denied.status).toBe(404);
   });
 
-  it('accepts safe checkpoint recovery and invokes the runtime with the locked run id', async () => {
+  it('accepts safe kernel-independent recovery and invokes the runtime with the locked run id', async () => {
     await store.updateAgentRun('default', 'run-user', { cancelRequestedAt: null, status: 'failed' });
     const response = await fetch(`${base}/v1/agent/runs/run-user/resume`, {
       method: 'POST', headers: auth(userToken), body: '{}',
@@ -136,5 +137,20 @@ describe('Agent Run Center HTTP API', () => {
       runId: 'run-user', resumeFromCheckpoint: true,
       ctx: expect.objectContaining({ tenantId: 'default', userId: expect.any(String), sessionId: 'session-user' }),
     })));
+  });
+
+  it('replays durable SSE events strictly after Last-Event-ID', async () => {
+    await store.appendAgentRunEvent({
+      tenantId: 'default', runId: 'run-user', type: 'turn_committed', status: 'succeeded', createdAt: new Date(),
+    });
+    const response = await fetch(`${base}/v1/agent/runs/run-user/events`, {
+      headers: { ...auth(userToken), 'last-event-id': '1' },
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('text/event-stream');
+    const body = await response.text();
+    expect(body).not.toContain('id: 1\n');
+    expect(body).toContain('id: 2\n');
+    expect(body).toContain('"sequence":2');
   });
 });

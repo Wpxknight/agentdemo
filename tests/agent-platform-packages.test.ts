@@ -13,11 +13,13 @@ describe('agent platform package boundaries', () => {
     expect(rootManifest.workspaces).toContain('packages/*');
     expect((await manifest('agent-contracts')).name).toBe('@aiop/agent-contracts');
     expect((await manifest('agent-runtime-core')).name).toBe('@aiop/agent-runtime-core');
+    expect((await manifest('agent-runtime-aiop')).name).toBe('@aiop/agent-runtime-aiop');
   });
 
   it('exports package-root public APIs', async () => {
     expect((await manifest('agent-contracts')).exports).toEqual({ '.': './src/index.ts' });
     expect((await manifest('agent-runtime-core')).exports).toEqual({ '.': './src/index.ts' });
+    expect((await manifest('agent-runtime-aiop')).exports).toEqual({ '.': './src/index.ts' });
   });
 
   it('keeps product and LangGraph types outside public contracts', async () => {

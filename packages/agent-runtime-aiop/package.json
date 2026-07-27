@@ -1,0 +1,12 @@
+{
+  "name": "@aiop/agent-runtime-aiop",
+  "version": "0.1.0-preview.1",
+  "type": "module",
+  "sideEffects": false,
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@aiop/agent-contracts": "0.1.0-preview.1",
+    "@aiop/agent-runtime-core": "0.1.0-preview.1"
+  },
+  "engines": { "node": ">=22.19.0" }
+}

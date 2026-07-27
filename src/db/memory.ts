@@ -366,6 +366,16 @@ export class MemoryStore implements Store {
       .map((event) => structuredClone(event));
   }
 
+  async listAgentRunAttempts(ctx: RequestContext, runId: string) {
+    if (!await this.getAgentRun(ctx, runId)) return [];
+    return [];
+  }
+
+  async listAgentRunTurns(ctx: RequestContext, runId: string) {
+    if (!await this.getAgentRun(ctx, runId)) return [];
+    return [];
+  }
+
   async listAgentRunInteractions(ctx: RequestContext, runId: string): Promise<InteractionRecord[]> {
     if (!await this.getAgentRun(ctx, runId)) return [];
     return [...this.interactions.values()]

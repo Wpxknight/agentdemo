@@ -24,6 +24,7 @@ import type {
   AgentRunLease,
   AgentRunPatch,
   AgentRunRecord,
+  AgentRunUsage,
   InteractionKind,
   InteractionStatus,
   ScheduledTask,
@@ -718,6 +719,37 @@ export class MysqlStore implements Store {
       id: Number(row.id), tenantId: row.tenant_id, runId: row.run_id, sequence: Number(row.sequence), type: row.event_type,
       node: row.node_name ?? undefined, status: row.status ?? undefined,
       detail: parseJson(row.detail), createdAt: toDate(row.created_at),
+    }));
+  }
+
+  async listAgentRunAttempts(ctx: RequestContext, runId: string) {
+    if (!await this.getAgentRun(ctx, runId)) return [];
+    const rows = await this.db.selectFrom('agent_run_attempts').selectAll()
+      .where('tenant_id', '=', ctx.tenantId).where('run_id', '=', runId).orderBy('started_at', 'asc').execute();
+    return rows.map((row) => ({
+      attemptId: row.attempt_id,
+      kernel: row.kernel,
+      kernelVersion: row.kernel_version,
+      status: row.status,
+      errorCode: row.error_code ?? undefined,
+      startedAt: toDate(row.started_at),
+      completedAt: row.completed_at ? toDate(row.completed_at) : undefined,
+    }));
+  }
+
+  async listAgentRunTurns(ctx: RequestContext, runId: string) {
+    if (!await this.getAgentRun(ctx, runId)) return [];
+    const rows = await this.db.selectFrom('agent_turn_commits').selectAll()
+      .where('tenant_id', '=', ctx.tenantId).where('run_id', '=', runId).orderBy('turn_no', 'asc').execute();
+    return rows.map((row) => ({
+      attemptId: row.attempt_id,
+      turnNo: row.turn_no,
+      commitId: row.commit_id,
+      transcriptVersion: row.transcript_version,
+      stopReason: row.stop_reason ?? undefined,
+      usage: parseJson(row.usage_json) as AgentRunUsage,
+      eventSequenceEnd: row.event_sequence_end,
+      committedAt: toDate(row.committed_at),
     }));
   }
 

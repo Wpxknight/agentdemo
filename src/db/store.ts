@@ -198,6 +198,27 @@ export interface AgentRunEvent {
   createdAt: Date;
 }
 
+export interface AgentRunAttemptSummary {
+  attemptId: string;
+  kernel: string;
+  kernelVersion: string;
+  status: string;
+  errorCode?: string;
+  startedAt: Date;
+  completedAt?: Date;
+}
+
+export interface AgentRunTurnSummary {
+  attemptId: string;
+  turnNo: number;
+  commitId: string;
+  transcriptVersion: number;
+  stopReason?: string;
+  usage: AgentRunUsage;
+  eventSequenceEnd: number;
+  committedAt: Date;
+}
+
 export interface AgentRunLease {
   ownerId: string;
   token: number;
@@ -332,6 +353,8 @@ export interface Store extends AuditSink {
   updateAgentRun(tenantId: string, runId: string, patch: AgentRunPatch): Promise<boolean>;
   appendAgentRunEvent(event: AgentRunEvent): Promise<void>;
   listAgentRunEvents(ctx: RequestContext, runId: string): Promise<AgentRunEvent[]>;
+  listAgentRunAttempts(ctx: RequestContext, runId: string): Promise<AgentRunAttemptSummary[]>;
+  listAgentRunTurns(ctx: RequestContext, runId: string): Promise<AgentRunTurnSummary[]>;
   listAgentRunInteractions(ctx: RequestContext, runId: string): Promise<InteractionRecord[]>;
   listAgentRunToolExecutions(ctx: RequestContext, runId: string): Promise<ToolExecutionRecord[]>;
   acquireAgentRunLease(
