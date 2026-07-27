@@ -16,6 +16,7 @@ export interface RegisteredTool {
   description: string;
   inputSchema: Record<string, unknown>;
   capability: ToolCapability;
+  interactionKind?: 'question' | 'plan';
   execute(call: ToolCall, context: ToolExecutionContext & { idempotencyKey: string }): Promise<Omit<ToolResult, 'callId'>>;
 }
 
@@ -67,6 +68,7 @@ export interface ToolRuntimeEngineOptions {
   audit?: ToolAudit;
   outputLimiter?: ToolOutputLimiter;
   concurrency?: ConcurrencyLimits;
+  concurrencyController?: ToolConcurrencyController;
   onLedger?: () => void;
   onLock?: () => void;
   now?: () => Date;
@@ -80,7 +82,7 @@ export interface ConcurrencyLimits {
 
 export class ToolRuntimeEngine implements ToolRuntime {
   private readonly definitions = new Map<string, RegisteredTool>();
-  private readonly concurrency: ConcurrencyController;
+  private readonly concurrency: ToolConcurrencyController;
   private readonly now: () => Date;
 
   constructor(private readonly options: ToolRuntimeEngineOptions) {
@@ -89,7 +91,7 @@ export class ToolRuntimeEngine implements ToolRuntime {
       this.definitions.set(definition.name, definition);
     }
     this.now = options.now ?? (() => new Date());
-    this.concurrency = new ConcurrencyController(options.concurrency);
+    this.concurrency = options.concurrencyController ?? new ToolConcurrencyController(options.concurrency);
   }
 
   async execute(call: ToolCall, context: ToolExecutionContext): Promise<ToolExecutionOutcome> {
@@ -101,9 +103,14 @@ export class ToolRuntimeEngine implements ToolRuntime {
     const policy = await this.options.policy?.check(call, context, tool) ?? { allowed: true };
     if (!policy.allowed) return result(call.id, `blocked by policy: ${policy.reason ?? 'denied'}`, true);
 
-    const approval = this.options.approval
+    if (tool.interactionKind) return this.executeInteractionTool(call, context, tool, tool.interactionKind, policy);
+
+    const trustedApproval = this.trustedApproval(call, context);
+    if (trustedApproval?.kind === 'invalid') return trustedApproval.outcome;
+
+    const approval = trustedApproval?.decision ?? (this.options.approval
       ? await this.options.approval.request(call, context, policy)
-      : { approved: !policy.needsApproval };
+      : { approved: !policy.needsApproval });
     if (!approval.approved) {
       if (approval.pending && approval.interactionId) {
         const pending = this.pendingApproval(call, context, tool, approval.interactionId);
@@ -111,9 +118,12 @@ export class ToolRuntimeEngine implements ToolRuntime {
           tenantId: context.identity.tenantId,
           runId: context.runId,
           id: approval.interactionId,
+          userId: context.identity.actorId,
+          sessionId: context.sessionId,
           attemptId: context.attemptId,
           turnNo: context.turnNo,
           kind: 'approval' as const,
+          toolCallId: call.id,
           status: 'pending' as const,
           payload: approval.payload ?? { toolName: call.name, reason: policy.reason ?? null },
           createdAt: this.now(),
@@ -122,6 +132,11 @@ export class ToolRuntimeEngine implements ToolRuntime {
           kind: 'waiting', reason: 'approval', interactionId: approval.interactionId,
           ledgerUpdates: [pending], interactionUpdates: [interaction],
         };
+      }
+      if (trustedApproval?.decision.interactionId) {
+        return this.completeWithoutExecution(
+          call, context, tool, trustedApproval.decision.interactionId, 'approval denied', true,
+        );
       }
       return result(call.id, `needs approval: ${policy.reason ?? 'denied'}`, true);
     }
@@ -140,10 +155,10 @@ export class ToolRuntimeEngine implements ToolRuntime {
         return { kind: 'recovery_required', message: 'logical tool call identity changed across attempts' };
       }
       if (existing.status === 'completed' && existing.result) return { kind: 'result', result: existing.result };
-      if (existing.status === 'pending_approval') {
+      if (existing.status === 'pending_approval' && !trustedApproval?.decision.approved) {
         return { kind: 'waiting', reason: 'approval', interactionId: existing.approvedInteractionId ?? 'pending' };
       }
-      if (existing.capability === 'non_idempotent_write') {
+      if (existing.status !== 'pending_approval' && existing.capability === 'non_idempotent_write') {
         const recovery = { ...existing, status: 'recovery_required' as const, updatedAt: this.now() };
         return {
           kind: 'recovery_required',
@@ -198,13 +213,118 @@ export class ToolRuntimeEngine implements ToolRuntime {
     return outcome;
   }
 
+  private async executeInteractionTool(
+    call: ToolCall,
+    context: ToolExecutionContext,
+    tool: RegisteredTool,
+    interactionKind: 'question' | 'plan',
+    _policy: PolicyDecision,
+  ): Promise<ToolExecutionOutcome> {
+    this.options.onLedger?.();
+    const existing = await this.options.ledger.get({
+      tenantId: context.identity.tenantId, runId: context.runId, logicalCallId: call.logicalCallId,
+    });
+    const mismatch = this.ledgerMismatch(existing, call);
+    if (mismatch) return mismatch;
+    if (existing?.status === 'completed' && existing.result) return { kind: 'result', result: existing.result };
+
+    const resolution = context.interactionResolution;
+    if (!resolution) {
+      const interactionId = existing?.approvedInteractionId
+        ?? digest(`${context.identity.tenantId}:${context.runId}:${call.logicalCallId}:${interactionKind}`);
+      const pending = existing ?? this.pendingApproval(call, context, tool, interactionId, false);
+      return {
+        kind: 'waiting', reason: interactionKind, interactionId,
+        ledgerUpdates: existing ? undefined : [pending],
+        interactionUpdates: existing ? undefined : [{
+          tenantId: context.identity.tenantId, runId: context.runId, id: interactionId,
+          userId: context.identity.actorId, sessionId: context.sessionId,
+          attemptId: context.attemptId, turnNo: context.turnNo, kind: interactionKind,
+          toolCallId: call.id, status: 'pending', payload: call.arguments, createdAt: this.now(),
+        }],
+      };
+    }
+    if (resolution.kind !== interactionKind || resolution.toolCallId !== call.id
+      || !existing || existing.status !== 'pending_approval'
+      || existing.approvedInteractionId !== resolution.interactionId) {
+      return { kind: 'recovery_required', message: 'interaction resolution does not match the pending tool call' };
+    }
+    const content = `${interactionKind} resolved: ${stable(resolution.value)}`;
+    const outcome = this.completedOutcome(call, context, existing, content);
+    await this.options.audit?.record({ call, context, capability: tool.capability, outcome });
+    return outcome;
+  }
+
+  private trustedApproval(
+    call: ToolCall,
+    context: ToolExecutionContext,
+  ): { kind: 'valid'; decision: ApprovalDecision } | { kind: 'invalid'; outcome: ToolExecutionOutcome } | undefined {
+    const resolution = context.interactionResolution;
+    if (!resolution) return undefined;
+    if (resolution.kind !== 'approval' || resolution.toolCallId !== call.id || typeof resolution.value !== 'boolean') {
+      return {
+        kind: 'invalid',
+        outcome: { kind: 'recovery_required', message: 'approval resolution does not match the pending tool call' },
+      };
+    }
+    return {
+      kind: 'valid',
+      decision: { approved: resolution.value, interactionId: resolution.interactionId },
+    };
+  }
+
+  private async completeWithoutExecution(
+    call: ToolCall,
+    context: ToolExecutionContext,
+    tool: RegisteredTool,
+    interactionId: string,
+    content: string,
+    isError: boolean,
+  ): Promise<ToolExecutionOutcome> {
+    this.options.onLedger?.();
+    const existing = await this.options.ledger.get({
+      tenantId: context.identity.tenantId, runId: context.runId, logicalCallId: call.logicalCallId,
+    });
+    const mismatch = this.ledgerMismatch(existing, call);
+    if (mismatch) return mismatch;
+    if (!existing || existing.status !== 'pending_approval' || existing.approvedInteractionId !== interactionId) {
+      return { kind: 'recovery_required', message: 'approval resolution does not match the pending tool call' };
+    }
+    const outcome = this.completedOutcome(call, context, existing, content, isError);
+    await this.options.audit?.record({ call, context, capability: tool.capability, outcome });
+    return outcome;
+  }
+
+  private completedOutcome(
+    call: ToolCall,
+    context: ToolExecutionContext,
+    existing: ToolLedgerRecord,
+    content: string,
+    isError = false,
+  ): ToolExecutionOutcome {
+    const toolResult: ToolResult = { callId: call.id, content, isError };
+    const completed: ToolLedgerRecord = {
+      ...existing, attemptId: context.attemptId, turnNo: context.turnNo, toolCallId: call.id,
+      status: 'completed', result: toolResult, resultDigest: digest(content), updatedAt: this.now(),
+    };
+    return { kind: 'result', result: toolResult, ledgerUpdates: [completed] };
+  }
+
+  private ledgerMismatch(existing: ToolLedgerRecord | undefined, call: ToolCall): ToolExecutionOutcome | undefined {
+    if (existing && (existing.toolName !== call.name || existing.argsDigest !== digest(call.arguments))) {
+      return { kind: 'recovery_required', message: 'logical tool call identity changed across attempts' };
+    }
+    return undefined;
+  }
+
   private pendingApproval(
     call: ToolCall,
     context: ToolExecutionContext,
     tool: RegisteredTool,
     interactionId: string,
+    notify = true,
   ): ToolLedgerRecord {
-    this.options.onLedger?.();
+    if (notify) this.options.onLedger?.();
     const now = this.now();
     return {
       tenantId: context.identity.tenantId, runId: context.runId, attemptId: context.attemptId,
@@ -242,7 +362,7 @@ export class PiToolOutputLimiter implements ToolOutputLimiter {
   }
 }
 
-class ConcurrencyController {
+export class ToolConcurrencyController {
   private readonly tenant = new SemaphorePool();
   private readonly tool = new SemaphorePool();
   private readonly resource = new SemaphorePool();

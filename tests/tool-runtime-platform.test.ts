@@ -1,11 +1,21 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { JsonValue } from '@aiop/agent-contracts';
 import { MemoryRuntimeStore } from '../packages/agent-runtime-core/src/memory-store.js';
-import { PiToolOutputLimiter, ToolRuntimeEngine } from '../packages/tool-runtime/src/index.js';
+import {
+  PiToolOutputLimiter,
+  ToolConcurrencyController,
+  ToolRuntimeEngine,
+} from '../packages/tool-runtime/src/index.js';
 
 const context = {
   identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
   runId: 'run-a', attemptId: 'attempt-a', turnNo: 1,
 } as const;
+
+const interactionCases: Array<['question' | 'plan', JsonValue, string]> = [
+  ['question', { answer: ['yes'] }, 'question resolved: {"answer":["yes"]}'],
+  ['plan', true, 'plan resolved: true'],
+];
 
 describe('ToolRuntimeEngine', () => {
   it('executes the fixed production safety pipeline in order', async () => {
@@ -167,6 +177,152 @@ describe('ToolRuntimeEngine', () => {
     releaseFirst();
     await Promise.all([first, second]);
     expect(started).toEqual(['call-1', 'call-2']);
+  });
+
+  it.each([
+    ['tenant', { maxConcurrentPerTenant: 1, maxConcurrentPerTool: 2, maxConcurrentPerResource: 2 }, 'write-a', 'write-b', 'r-a', 'r-b'],
+    ['tool', { maxConcurrentPerTenant: 2, maxConcurrentPerTool: 1, maxConcurrentPerResource: 2 }, 'write-a', 'write-a', 'r-a', 'r-b'],
+    ['resource', { maxConcurrentPerTenant: 2, maxConcurrentPerTool: 2, maxConcurrentPerResource: 1 }, 'write-a', 'write-b', 'shared', 'shared'],
+  ] as const)('shares the trusted %s FIFO ceiling across fresh runtime instances', async (
+    _kind, limits, firstTool, secondTool, firstResource, secondResource,
+  ) => {
+    const started: string[] = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const controller = new ToolConcurrencyController(limits);
+    const definitions = ['write-a', 'write-b'].map((name) => ({
+      name, description: name, inputSchema: { type: 'object' }, capability: 'retryable_write' as const,
+      execute: async (call: { id: string }) => {
+        started.push(call.id);
+        if (call.id === 'call-1') await firstGate;
+        return { content: call.id };
+      },
+    }));
+    const createRuntime = (resourceKey: string) => new ToolRuntimeEngine({
+      ledger: new MemoryRuntimeStore().toolLedger,
+      concurrencyController: controller,
+      definitions,
+      policy: { check: async () => ({ allowed: true, resourceKey }) },
+    });
+    const first = createRuntime(firstResource).execute({
+      id: 'call-1', logicalCallId: 'logical-1', name: firstTool, arguments: {},
+    }, { ...context, runId: 'run-1' });
+    await vi.waitFor(() => expect(started).toEqual(['call-1']));
+    const second = createRuntime(secondResource).execute({
+      id: 'call-2', logicalCallId: 'logical-2', name: secondTool, arguments: {},
+    }, { ...context, runId: 'run-2' });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(started).toEqual(['call-1']);
+
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(started).toEqual(['call-1', 'call-2']);
+  });
+
+  it.each(interactionCases)('durably waits for and deterministically resolves a %s tool without executing it', async (
+    interactionKind, value, expectedContent,
+  ) => {
+    const execute = vi.fn(async () => ({ content: 'must not execute' }));
+    const store = new MemoryRuntimeStore();
+    const definition = {
+      name: `${interactionKind}-tool`, description: interactionKind, inputSchema: { type: 'object' },
+      capability: 'read' as const, interactionKind, execute,
+    };
+    const call = {
+      id: `call-${interactionKind}`, logicalCallId: `logical-${interactionKind}`,
+      name: definition.name, arguments: { prompt: 'continue?' },
+    } as const;
+    const waiting = await new ToolRuntimeEngine({ ledger: store.toolLedger, definitions: [definition] })
+      .execute(call, { ...context, sessionId: 'session-a' });
+    expect(waiting).toMatchObject({
+      kind: 'waiting', reason: interactionKind,
+      ledgerUpdates: [expect.objectContaining({ status: 'pending_approval' })],
+      interactionUpdates: [expect.objectContaining({
+        userId: 'user-a', sessionId: 'session-a', kind: interactionKind,
+        toolCallId: call.id, payload: call.arguments, status: 'pending',
+      })],
+    });
+    if (waiting.kind !== 'waiting') throw new Error('expected durable interaction wait');
+    await store.toolLedger.putIfAbsent(waiting.ledgerUpdates![0]!);
+
+    const resolved = await new ToolRuntimeEngine({ ledger: store.toolLedger, definitions: [definition] })
+      .execute(call, {
+        ...context, attemptId: 'attempt-b', sessionId: 'session-a',
+        interactionResolution: {
+          interactionId: waiting.interactionId!, kind: interactionKind, toolCallId: call.id, value,
+        },
+      });
+    expect(resolved).toMatchObject({
+      kind: 'result', result: { callId: call.id, content: expectedContent },
+      ledgerUpdates: [expect.objectContaining({
+        status: 'completed', result: expect.objectContaining({ content: expectedContent }),
+      })],
+    });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('resumes approved calls with the original idempotency key and finalizes denied calls without execution', async () => {
+    const store = new MemoryRuntimeStore();
+    const execute = vi.fn(async (_call, executionContext: { idempotencyKey: string }) => ({
+      content: executionContext.idempotencyKey,
+    }));
+    const definition = {
+      name: 'write', description: 'write', inputSchema: { type: 'object' },
+      capability: 'retryable_write' as const, execute,
+    };
+    const createPending = async (suffix: string) => {
+      const call = {
+        id: `call-${suffix}`, logicalCallId: `logical-${suffix}`, name: 'write', arguments: { suffix },
+      } as const;
+      const waiting = await new ToolRuntimeEngine({
+        ledger: store.toolLedger, definitions: [definition],
+        policy: { check: async () => ({ allowed: true, needsApproval: true }) },
+        approval: { request: async () => ({
+          approved: false, pending: true, interactionId: `approval-${suffix}`,
+        }) },
+      }).execute(call, context);
+      if (waiting.kind !== 'waiting') throw new Error('expected durable approval wait');
+      await store.toolLedger.putIfAbsent(waiting.ledgerUpdates![0]!);
+      return { call, waiting };
+    };
+
+    const approved = await createPending('approved');
+    const approvalRequest = vi.fn();
+    const approvedOutcome = await new ToolRuntimeEngine({
+      ledger: store.toolLedger, definitions: [definition],
+      policy: { check: async () => ({ allowed: true, needsApproval: true }) },
+      approval: { request: approvalRequest },
+    }).execute(approved.call, {
+      ...context, attemptId: 'attempt-b', interactionResolution: {
+        interactionId: approved.waiting.interactionId!, kind: 'approval',
+        toolCallId: approved.call.id, value: true,
+      },
+    });
+    const originalKey = approved.waiting.ledgerUpdates![0]!.idempotencyKey;
+    expect(approvedOutcome).toMatchObject({
+      kind: 'result', result: { content: originalKey },
+      ledgerUpdates: [expect.objectContaining({ status: 'completed', idempotencyKey: originalKey })],
+    });
+    expect(approvalRequest).not.toHaveBeenCalled();
+    expect(execute).toHaveBeenCalledOnce();
+
+    const denied = await createPending('denied');
+    const deniedOutcome = await new ToolRuntimeEngine({
+      ledger: store.toolLedger, definitions: [definition],
+      policy: { check: async () => ({ allowed: true, needsApproval: true }) },
+    }).execute(denied.call, {
+      ...context, attemptId: 'attempt-c', interactionResolution: {
+        interactionId: denied.waiting.interactionId!, kind: 'approval',
+        toolCallId: denied.call.id, value: false,
+      },
+    });
+    expect(deniedOutcome).toMatchObject({
+      kind: 'result', result: { callId: denied.call.id, isError: true, content: 'approval denied' },
+      ledgerUpdates: [expect.objectContaining({
+        status: 'completed', result: expect.objectContaining({ content: 'approval denied' }),
+      })],
+    });
+    expect(execute).toHaveBeenCalledOnce();
   });
 
   it('releases concurrency permits after tool failure', async () => {

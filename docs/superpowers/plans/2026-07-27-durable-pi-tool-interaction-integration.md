@@ -49,13 +49,13 @@
 - Modify: `/home/opt/develop/aicoding/aiop/packages/tool-runtime/src/index.ts`
 - Test: `/home/opt/develop/aicoding/aiop/tests/tool-runtime-platform.test.ts`
 
-- [ ] Add a failing test proving two fresh `ToolRuntimeEngine` instances sharing one controller enforce tenant/tool/resource FIFO ceilings.
-- [ ] Add failing tests proving `interactionKind: question|plan` returns a pending durable Interaction without executing the handler, then returns a deterministic ToolResult when given the matching trusted resolution.
-- [ ] Add failing tests proving approval=true resumes the same logical call with the same idempotency key, approval=false never executes it, and both finalize the pending Ledger fact safely.
-- [ ] Export `ToolConcurrencyController`; allow `ToolRuntimeEngineOptions` to inject it while retaining bounded defaults.
-- [ ] Add interaction metadata to `RegisteredTool` and implement initial waiting/resolved execution paths without weakening Policy → Approval → Hook → Ledger → Lock → Execute → Audit ordering.
-- [ ] Run `npx vitest run tests/tool-runtime-platform.test.ts` and typecheck.
-- [ ] Commit with the required AIOS co-author trailer.
+- [x] Add a failing test proving two fresh `ToolRuntimeEngine` instances sharing one controller enforce tenant/tool/resource FIFO ceilings.
+- [x] Add failing tests proving `interactionKind: question|plan` returns a pending durable Interaction without executing the handler, then returns a deterministic ToolResult when given the matching trusted resolution.
+- [x] Add failing tests proving approval=true resumes the same logical call with the same idempotency key, approval=false never executes it, and both finalize the pending Ledger fact safely.
+- [x] Export `ToolConcurrencyController`; allow `ToolRuntimeEngineOptions` to inject it while retaining bounded defaults.
+- [x] Add interaction metadata to `RegisteredTool` and implement initial waiting/resolved execution paths without weakening Policy → Approval → Hook → Ledger → Lock → Execute → Audit ordering.
+- [x] Run `npx vitest run tests/tool-runtime-platform.test.ts` and typecheck.
+- [x] Commit with the required AIOS co-author trailer.
 
 ### Task 4: Pi Kernel resume execution
 
