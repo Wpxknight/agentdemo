@@ -20,6 +20,10 @@ export type { Usage } from './services/model-gateway.js';
 export interface RunAgentOptions {
   /** 单次运行稳定 ID；用于 Turn Commit、durable interaction 与工具幂等账本。 */
   runId?: string;
+  /** Pi rollout execution mode, injected by the configured runtime. */
+  rolloutMode?: 'read-only' | 'dry-run' | 'replay' | 'full';
+  /** Source/control Run used for replay or rollout comparison. */
+  comparisonRunId?: string;
   model: ChatModel;
   tools: ToolRegistry;
   policy: PolicyMiddleware;
@@ -105,6 +109,12 @@ export interface RunAgentResult {
   usage: Usage;
   /** 运行期间发生过摘要压缩：messages 已被改写，调用方应整体替换持久化而非增量追加。 */
   compacted: boolean;
+  rollout?: {
+    mode: 'dry-run' | 'replay';
+    sourceRunId?: string;
+    sourceUsage?: Usage;
+    usageDelta?: Usage;
+  };
 }
 
 /** 无效压缩后需再涨多少 token 才重试摘要（吸收估算抖动，避免每轮白跑摘要调用）。 */

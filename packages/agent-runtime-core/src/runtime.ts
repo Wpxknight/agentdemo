@@ -268,7 +268,13 @@ export class DurableAgentRuntime {
           },
           events: [...buffered, {
             ...identity, attemptId, turnNo, type: 'turn_committed',
-            detail: { outcome, stopReason: exit.stopReason ?? null }, createdAt: committedAt,
+            detail: {
+              outcome,
+              stopReason: exit.stopReason ?? null,
+              rolloutMode: this.modelBinding.rolloutMode ?? null,
+              comparisonRunId: this.modelBinding.comparisonRunId ?? null,
+            },
+            createdAt: committedAt,
           }],
           runStatus: status,
           waitingReason: exit.waitingReason,

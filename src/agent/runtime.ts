@@ -73,10 +73,20 @@ export class AgentRuntime {
 
   async run(options: RunAgentOptions): Promise<RunAgentResult> {
     if (!this.kernels.pi && !this.kernels.legacy) return this.kernel.run(options);
+    const candidate = this.selector(options);
+    const candidateOptions = this.prepareOptions(candidate, options);
+    if (candidate === 'pi' && candidateOptions.rolloutMode === 'replay') {
+      if (!this.runtimeStore) {
+        throw new AgentPlatformError({
+          code: 'RUN_STATE_CONFLICT', message: 'Replay requires a Durable Runtime Store', retryable: false,
+        });
+      }
+      return this.replayDurablePi(candidateOptions);
+    }
     const selected = await this.selectLockedKernel(options);
     const kernel = this.kernels[selected];
     if (!kernel) throw new Error(`Agent Kernel 不可用：${selected}`);
-    const prepared = this.prepareOptions(selected, options);
+    const prepared = selected === candidate ? candidateOptions : this.prepareOptions(selected, options);
     if (selected === 'pi' && this.runtimeStore && prepared.runId) return this.runDurablePi(prepared);
     if (!prepared.runId || !this.runCoordinator) return kernel.run(prepared);
     const execution = await this.runCoordinator.start(reqContext(prepared.ctx), prepared.runId);
@@ -106,6 +116,8 @@ export class AgentRuntime {
       defaultKernel: 'pi',
       modelBinding: {
         provider: 'aiop', model: options.model.id, contextWindowTokens: options.contextBudgetTokens,
+        rolloutMode: options.rolloutMode,
+        comparisonRunId: options.comparisonRunId,
       },
       tools: piToolDefinitions(options),
       observeEvent: (event) => {
@@ -134,6 +146,25 @@ export class AgentRuntime {
       tenantId: identity.tenantId, runId: options.runId!,
     });
     const messages = fromPiKernelMessages(committed?.messages ?? []);
+    const rollout = await this.rolloutComparison(options, result.usage);
+    if (rollout && options.rolloutMode === 'dry-run' && committed) {
+      await this.runtimeStore!.events.append({
+        tenantId: identity.tenantId,
+        runId: options.runId!,
+        attemptId: committed.attemptId,
+        turnNo: committed.turnNo,
+        type: 'rollout_comparison',
+        detail: {
+          mode: rollout.mode,
+          sourceRunId: rollout.sourceRunId ?? null,
+          outcome: result.status,
+          usage: usageDetail(result.usage),
+          sourceUsage: rollout.sourceUsage ? usageDetail(rollout.sourceUsage) : null,
+          usageDelta: rollout.usageDelta ? usageDetail(rollout.usageDelta) : null,
+        },
+        createdAt: new Date(),
+      });
+    }
     const now = new Date();
     await this.runStore?.updateAgentRun(identity.tenantId, options.runId!, {
       status: result.status,
@@ -160,6 +191,57 @@ export class AgentRuntime {
       steps: committed?.turnNo ?? 0,
       usage: result.usage,
       compacted,
+      rollout,
+    };
+  }
+
+  private async replayDurablePi(options: RunAgentOptions): Promise<RunAgentResult> {
+    const sourceRunId = options.comparisonRunId ?? options.runId;
+    if (!sourceRunId) {
+      throw new AgentPlatformError({
+        code: 'RUN_STATE_CONFLICT', message: 'Replay requires comparisonRunId or runId', retryable: false,
+      });
+    }
+    const tenantId = options.ctx.tenantId ?? 'default';
+    const source = await this.runtimeStore!.runs.get({ tenantId, runId: sourceRunId });
+    if (!source || source.actorId !== (options.ctx.userId ?? '') || source.sessionId !== options.ctx.sessionId) {
+      throw new AgentPlatformError({ code: 'RUN_NOT_FOUND', message: 'Replay source run not found', retryable: false });
+    }
+    const committed = await this.runtimeStore!.turns.getLastCommitted({ tenantId, runId: sourceRunId });
+    if (!committed) {
+      throw new AgentPlatformError({ code: 'RUN_NOT_FOUND', message: 'Replay source has no committed transcript', retryable: false });
+    }
+    const messages = fromPiKernelMessages(committed.messages);
+    return {
+      messages,
+      text: lastReplayText(committed.messages),
+      steps: committed.turnNo,
+      usage: committed.usage,
+      compacted: false,
+      rollout: {
+        mode: 'replay',
+        sourceRunId,
+        sourceUsage: committed.usage,
+        usageDelta: zeroUsageDelta(),
+      },
+    };
+  }
+
+  private async rolloutComparison(
+    options: RunAgentOptions,
+    usage: RunAgentResult['usage'],
+  ): Promise<RunAgentResult['rollout']> {
+    if (options.rolloutMode !== 'dry-run') return undefined;
+    const sourceRunId = options.comparisonRunId;
+    if (!sourceRunId) return { mode: 'dry-run' };
+    const source = await this.runtimeStore!.turns.getLastCommitted({
+      tenantId: options.ctx.tenantId ?? 'default', runId: sourceRunId,
+    });
+    return {
+      mode: 'dry-run',
+      sourceRunId,
+      sourceUsage: source?.usage,
+      usageDelta: source ? subtractUsage(usage, source.usage) : undefined,
     };
   }
 
@@ -284,20 +366,56 @@ function piOptionGate(env: NodeJS.ProcessEnv, mode: PiMode) {
   const readOnlySessions = csv(env.AIOP_PI_READ_ONLY_SESSIONS);
   return (kernel: BuiltinKernelName, options: RunAgentOptions): RunAgentOptions => {
     if (kernel !== 'pi') return options;
+    const prepared = {
+      ...options,
+      rolloutMode: (mode === 'disabled' ? 'full' : mode) as NonNullable<RunAgentOptions['rolloutMode']>,
+      comparisonRunId: options.comparisonRunId ?? (env.AIOP_PI_COMPARISON_RUN_ID?.trim() || undefined),
+    };
     const restriction = mode === 'dry-run' || mode === 'replay'
       ? 'none'
       : mode === 'read-only' || readOnlySessions.has(options.ctx.sessionId)
         ? 'read-only'
         : 'full';
-    if (restriction === 'full') return options;
+    if (restriction === 'full') return prepared;
     const existing = options.filterToolDefs;
     return {
-      ...options,
+      ...prepared,
       filterToolDefs: (defs) => {
         const visible = existing?.(defs) ?? defs;
         return restriction === 'none' ? [] : visible.filter((tool) => isReadTool(tool.name));
       },
     };
+  };
+}
+
+function lastReplayText(messages: readonly import('@aiop/agent-contracts').KernelMessage[]): string {
+  const assistant = [...messages].reverse().find((message) => message.role === 'assistant');
+  if (!assistant || assistant.role !== 'assistant') return '';
+  return assistant.content.flatMap((block) => block.type === 'text' ? [block.text] : []).join('');
+}
+
+function subtractUsage(
+  current: RunAgentResult['usage'],
+  source: RunAgentResult['usage'],
+): RunAgentResult['usage'] {
+  return {
+    inputTokens: current.inputTokens - source.inputTokens,
+    outputTokens: current.outputTokens - source.outputTokens,
+    cacheReadTokens: current.cacheReadTokens - source.cacheReadTokens,
+    cacheCreationTokens: current.cacheCreationTokens - source.cacheCreationTokens,
+  };
+}
+
+function zeroUsageDelta(): RunAgentResult['usage'] {
+  return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
+}
+
+function usageDetail(usage: RunAgentResult['usage']) {
+  return {
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    cacheReadTokens: usage.cacheReadTokens,
+    cacheCreationTokens: usage.cacheCreationTokens,
   };
 }
 

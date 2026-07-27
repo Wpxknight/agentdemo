@@ -127,6 +127,27 @@ describe('Agent Run Center HTTP API', () => {
     expect(denied.status).toBe(404);
   });
 
+  it('exposes sanitized rollout comparison outcomes in Run Center details', async () => {
+    await store.appendAgentRunEvent({
+      tenantId: 'default', runId: 'run-user', type: 'rollout_comparison', status: 'succeeded',
+      detail: {
+        mode: 'dry-run', sourceRunId: 'run-control', outcome: 'succeeded',
+        usage: { inputTokens: 10, outputTokens: 2 },
+        sourceUsage: { inputTokens: 8, outputTokens: 3 },
+        usageDelta: { inputTokens: 2, outputTokens: -1 },
+      },
+      createdAt: new Date(),
+    });
+    const response = await fetch(`${base}/v1/agent/runs/run-user`, { headers: auth(userToken) });
+    const detail = await response.json() as { events: Array<{ type: string; detail?: unknown }> };
+
+    expect(detail.events).toContainEqual(expect.objectContaining({
+      type: 'rollout_comparison',
+      detail: expect.objectContaining({ mode: 'dry-run', sourceRunId: 'run-control', outcome: 'succeeded' }),
+    }));
+    expect(JSON.stringify(detail.events)).not.toContain('secret output');
+  });
+
   it('accepts safe kernel-independent recovery and invokes the runtime with the locked run id', async () => {
     await store.updateAgentRun('default', 'run-user', { cancelRequestedAt: null, status: 'failed' });
     const response = await fetch(`${base}/v1/agent/runs/run-user/resume`, {

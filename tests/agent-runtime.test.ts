@@ -311,6 +311,98 @@ describe('AgentRuntime', () => {
     expect(await runtimeStore.attempts.list({ tenantId: 'tenant-a', runId: 'run-durable-resume' })).toHaveLength(2);
     expect((await runtimeStore.turns.getLastCommitted({ tenantId: 'tenant-a', runId: 'run-durable-resume' }))?.turnNo).toBe(2);
   });
+
+  it('replays a committed Pi transcript without invoking model/tools or mutating the source Run', async () => {
+    const runtimeStore = new MemoryRuntimeStore();
+    const sourceRuntime = createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'pi' }, { runtimeStore });
+    await sourceRuntime.run({
+      ...runOptions(),
+      runId: 'run-replay-source',
+      model: {
+        id: 'fake',
+        async *stream() {
+          yield { type: 'text_delta', text: 'source answer' } as const;
+          yield { type: 'usage', inputTokens: 9, outputTokens: 3 } as const;
+          yield { type: 'stop', reason: 'end_turn' } as const;
+        },
+      },
+      ctx: { tenantId: 'tenant-a', userId: 'user-a', role: 'user', sessionId: 'session-a' },
+    });
+    const attemptsBefore = await runtimeStore.attempts.list({ tenantId: 'tenant-a', runId: 'run-replay-source' });
+    const turnsBefore = await runtimeStore.turns.listCommitted({ tenantId: 'tenant-a', runId: 'run-replay-source' });
+    const model = vi.fn(async function* () { yield { type: 'text_delta', text: 'must not run' } as const; });
+    const tool = vi.fn(async () => ({ id: 'write-1', content: 'must not run' }));
+    const tools = new ToolRegistry();
+    tools.register({ def: { name: 'write', description: 'write', inputSchema: { type: 'object' } }, run: tool });
+    const replayRuntime = createConfiguredAgentRuntime({
+      AIOP_AGENT_KERNEL: 'pi', AIOP_PI_MODE: 'replay',
+    }, { runtimeStore });
+
+    const replayed = await replayRuntime.run({
+      ...runOptions(),
+      runId: 'run-replay-source',
+      comparisonRunId: 'run-replay-source',
+      model: { id: 'fake', stream: model },
+      tools,
+      ctx: { tenantId: 'tenant-a', userId: 'user-a', role: 'user', sessionId: 'session-a' },
+    });
+
+    expect(replayed).toMatchObject({
+      text: 'source answer',
+      usage: { inputTokens: 9, outputTokens: 3 },
+      rollout: {
+        mode: 'replay', sourceRunId: 'run-replay-source',
+        usageDelta: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      },
+    });
+    expect(model).not.toHaveBeenCalled();
+    expect(tool).not.toHaveBeenCalled();
+    expect(await runtimeStore.attempts.list({ tenantId: 'tenant-a', runId: 'run-replay-source' })).toEqual(attemptsBefore);
+    expect(await runtimeStore.turns.listCommitted({ tenantId: 'tenant-a', runId: 'run-replay-source' })).toEqual(turnsBefore);
+  });
+
+  it('persists dry-run rollout metadata while exposing no tools to the model', async () => {
+    const runtimeStore = new MemoryRuntimeStore();
+    const visibleTools: string[][] = [];
+    const tools = new ToolRegistry();
+    const execute = vi.fn(async () => ({ id: 'write-1', content: 'must not run' }));
+    tools.register({ def: { name: 'write', description: 'write', inputSchema: { type: 'object' } }, run: execute });
+    const runtime = createConfiguredAgentRuntime({
+      AIOP_AGENT_KERNEL: 'pi', AIOP_PI_MODE: 'dry-run',
+    }, { runtimeStore });
+    await runtime.run({
+      ...runOptions(),
+      runId: 'run-dry-mode',
+      comparisonRunId: 'run-control',
+      tools,
+      model: {
+        id: 'fake',
+        async *stream(input) {
+          visibleTools.push(input.tools.map((tool) => tool.name));
+          yield { type: 'text_delta', text: 'dry result' } as const;
+          yield { type: 'stop', reason: 'end_turn' } as const;
+        },
+      },
+      ctx: { tenantId: 'tenant-a', userId: 'user-a', role: 'user', sessionId: 'session-a' },
+    });
+    const attempt = (await runtimeStore.attempts.list({ tenantId: 'tenant-a', runId: 'run-dry-mode' }))[0]!;
+    const snapshot = await runtimeStore.turns.getSnapshot({
+      tenantId: 'tenant-a', runId: 'run-dry-mode', attemptId: attempt.attemptId, turnNo: 1,
+    });
+
+    expect(visibleTools).toEqual([[]]);
+    expect(execute).not.toHaveBeenCalled();
+    expect(snapshot?.modelBinding).toMatchObject({ rolloutMode: 'dry-run', comparisonRunId: 'run-control' });
+    const events = await runtimeStore.events.list({ tenantId: 'tenant-a', runId: 'run-dry-mode' });
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'rollout_comparison',
+      detail: expect.objectContaining({ mode: 'dry-run', sourceRunId: 'run-control', outcome: 'succeeded' }),
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'turn_committed',
+      detail: expect.objectContaining({ rolloutMode: 'dry-run', comparisonRunId: 'run-control' }),
+    }));
+  });
 });
 
 function fromCommittedText(messages: readonly import('@aiop/agent-contracts').KernelMessage[]): string[] {

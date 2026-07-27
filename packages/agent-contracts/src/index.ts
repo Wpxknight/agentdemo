@@ -168,6 +168,8 @@ export interface ModelBinding {
   route?: string;
   thinking?: string;
   contextWindowTokens?: number;
+  rolloutMode?: 'read-only' | 'dry-run' | 'replay' | 'full';
+  comparisonRunId?: string;
 }
 
 export interface ModelProvider {

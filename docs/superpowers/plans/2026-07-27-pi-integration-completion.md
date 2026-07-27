@@ -108,10 +108,10 @@
 - Test: `/home/opt/develop/aicoding/aiop/tests/agent-runtime.test.ts`
 - Test: `/home/opt/develop/aicoding/aiop/tests/http-agent-runs.test.ts`
 
-- [ ] Add failing tests proving dry-run executes no tools, replay reads a committed transcript without executing model/tools, and neither mode mutates the source Run.
-- [ ] Persist rollout mode and comparison correlation in the new Run snapshot/event metadata.
-- [ ] Expose sanitized replay/dry-run outcome and usage comparison in Run Center details.
-- [ ] Keep `disabled` as an immediate new-Run fallback while preserving existing Kernel binding.
+- [x] Add failing tests proving dry-run executes no tools, replay reads a committed transcript without executing model/tools, and neither mode mutates the source Run.
+- [x] Persist rollout mode and comparison correlation in the new Run snapshot/event metadata.
+- [x] Expose sanitized replay/dry-run outcome and usage comparison in Run Center details.
+- [x] Keep `disabled` as an immediate new-Run fallback while preserving existing Kernel binding.
 - [ ] Commit with the required AIOS co-author trailer.
 
 ### Task 7: Publishable package and public API gates
