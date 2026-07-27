@@ -12,6 +12,7 @@ import {
   type ResumeRunInput,
   type RunLimits,
   type RunHandle,
+  type RuntimeObservation,
   type StartRunInput,
   type ToolDefinition,
 } from '@aiop/agent-contracts';
@@ -35,6 +36,7 @@ export interface DurableAgentRuntimeOptions {
   maxDurableEventsPerTurn?: number;
   now?: () => Date;
   observeEvent?: (event: KernelEvent) => void | Promise<void>;
+  observe?: (observation: RuntimeObservation) => void | Promise<void>;
 }
 
 export class DurableAgentRuntime {
@@ -97,7 +99,9 @@ export class DurableAgentRuntime {
       role: 'user',
       content: message.content ?? (message.text === undefined ? [] : [{ type: 'text', text: message.text }]),
     }));
-    return this.startHandle(record, kernel, input.identity, messages, false, input.signal, input.limits);
+    return this.startHandle(record, kernel, {
+      ...input.identity, correlationId: input.identity.correlationId ?? runId,
+    }, messages, false, input.signal, input.limits);
   }
 
   async resume(input: ResumeRunInput): Promise<RunHandle> {
@@ -129,7 +133,9 @@ export class DurableAgentRuntime {
       && last.messages.at(-1)?.role === 'assistant'
       ? last.messages.slice(0, -1)
       : last.messages;
-    return this.startHandle(record, kernel, input.identity, messages, true, input.signal, snapshot.limits);
+    return this.startHandle(record, kernel, {
+      ...input.identity, correlationId: input.identity.correlationId ?? snapshot.identity.correlationId ?? input.runId,
+    }, messages, true, input.signal, snapshot.limits);
   }
 
   async cancel(input: CancelRunInput): Promise<void> {
@@ -191,6 +197,8 @@ export class DurableAgentRuntime {
     this.active.set(runKey(identity), controller);
     const signal = externalSignal ? AbortSignal.any([controller.signal, externalSignal]) : controller.signal;
     const attemptId = randomUUID();
+    const correlationId = identityContext.correlationId ?? record.runId;
+    const runStartedAt = this.now();
     const lease = await this.options.store.runs.acquireLease(identity, this.workerId, this.now(), this.leaseTtlMs);
     if (!lease) throw new AgentPlatformError({ code: 'LEASE_LOST', message: 'Run is owned by another worker', retryable: false });
     let previous = await this.options.store.turns.getLastCommitted(identity);
@@ -212,9 +220,19 @@ export class DurableAgentRuntime {
       });
       await tx.turns.createSnapshot(snapshot);
     });
+    await this.observe(record, attemptId, turnNo, correlationId, 'run_started', {
+      kind: 'counter', name: 'runtime.runs.started', value: 1,
+    });
+    await this.observe(record, attemptId, turnNo, correlationId, 'attempt_started', {
+      kind: 'counter', name: 'runtime.attempts.started', value: 1,
+    });
     try {
       while (true) {
+        const turnStartedAt = this.now();
         const buffered: Omit<AgentRunEvent, 'sequence'>[] = [];
+        await this.observe(record, attemptId, turnNo, correlationId, 'turn_started', {
+          kind: 'counter', name: 'runtime.turns.started', value: 1,
+        });
         await this.guard(identity, lease.token, limits?.deadlineAt, signal);
         if (limits?.maxTurns !== undefined && turnNo > limits.maxTurns) {
           throw limitExceeded(`Run maxTurns exceeded: ${limits.maxTurns}`);
@@ -238,7 +256,15 @@ export class DurableAgentRuntime {
                 throw limitExceeded(`Run maxToolCalls exceeded: ${limits.maxToolCalls}`);
               }
             }
-            const durable = this.kernelEvent(identity, attemptId, turnNo, event);
+            if (event.type === 'tool_call' || event.type === 'tool_result' || event.type === 'context_compacted') {
+              await this.observe(record, attemptId, turnNo, correlationId, event.type, {
+                kind: 'counter',
+                name: event.type === 'tool_call' ? 'runtime.tool_calls' : event.type === 'tool_result'
+                  ? 'runtime.tool_results' : 'runtime.compactions',
+                value: 1,
+              });
+            }
+            const durable = this.kernelEvent(record, attemptId, turnNo, correlationId, event);
             if (!durable) return;
             if (buffered.length >= this.maxDurableEventsPerTurn) {
               throw limitExceeded(`Durable event limit exceeded: ${this.maxDurableEventsPerTurn}`);
@@ -267,7 +293,8 @@ export class DurableAgentRuntime {
             stopReason: exit.stopReason, usage: aggregateUsage, messages: exit.messages, committedAt,
           },
           events: [...buffered, {
-            ...identity, attemptId, turnNo, type: 'turn_committed',
+            ...identity, attemptId, turnNo, kernel: record.kernel, kernelVersion: record.kernelVersion,
+            correlationId, type: 'turn_committed',
             detail: {
               outcome,
               stopReason: exit.stopReason ?? null,
@@ -281,6 +308,9 @@ export class DurableAgentRuntime {
           ledgerUpdates: exit.ledgerUpdates,
           interactionUpdates: exit.interactionUpdates,
         });
+        await this.observe(record, attemptId, turnNo, correlationId, 'turn_committed', {
+          kind: 'timer', name: 'runtime.turn.duration', value: elapsedMs(turnStartedAt, committedAt), unit: 'ms',
+        }, status);
         if (outcome === 'continue') {
           previous = commit;
           turnNo++;
@@ -293,11 +323,28 @@ export class DurableAgentRuntime {
           continue;
         }
         const finalStatus = status as AgentRunResult['status'];
+        if (finalStatus === 'waiting') {
+          await this.observe(record, attemptId, turnNo, correlationId, 'waiting', {
+            kind: 'counter', name: 'runtime.waiting', value: 1,
+          }, finalStatus, { reason: exit.waitingReason ?? 'external' });
+        }
+        if (finalStatus === 'recovery_required') {
+          await this.observe(record, attemptId, turnNo, correlationId, 'recovery_required', {
+            kind: 'counter', name: 'runtime.recovery_required', value: 1,
+          }, finalStatus);
+        }
         await this.options.store.attempts.update({ ...identity, attemptId }, {
           status: finalStatus === 'failed' || finalStatus === 'recovery_required' ? 'failed' : 'succeeded',
           completedAt: committedAt,
         });
         await this.release(identity, commit);
+        const finishedAt = this.now();
+        await this.observe(record, attemptId, turnNo, correlationId, 'attempt_finished', {
+          kind: 'timer', name: 'runtime.attempt.duration', value: elapsedMs(runStartedAt, finishedAt), unit: 'ms',
+        }, finalStatus);
+        await this.observe(record, attemptId, turnNo, correlationId, 'run_finished', {
+          kind: 'timer', name: 'runtime.run.duration', value: elapsedMs(runStartedAt, finishedAt), unit: 'ms',
+        }, finalStatus);
         return {
           runId: record.runId,
           status: finalStatus,
@@ -311,6 +358,11 @@ export class DurableAgentRuntime {
       const cancelled = signal.aborted;
       const status = cancelled ? 'cancelled' : error instanceof AgentPlatformError && error.code === 'TOOL_RESULT_UNKNOWN'
         ? 'recovery_required' : 'failed';
+      if (errorCode(error) === 'LEASE_LOST') {
+        await this.observe(record, attemptId, turnNo, correlationId, 'lease_lost', {
+          kind: 'counter', name: 'runtime.lease_lost', value: 1,
+        }, status);
+      }
       await this.options.store.transaction(async (tx) => {
         await tx.attempts.update({ ...identity, attemptId }, {
           status: cancelled ? 'cancelled' : 'failed', errorCode: errorCode(error), errorMessage: safeMessage(error), completedAt: now,
@@ -319,10 +371,22 @@ export class DurableAgentRuntime {
           status, waitingReason: undefined, leaseOwner: undefined, leaseExpiresAt: undefined, updatedAt: now,
         });
         await tx.events.append({
-          ...identity, attemptId, turnNo, type: 'run_failed',
+          ...identity, attemptId, turnNo, kernel: record.kernel, kernelVersion: record.kernelVersion,
+          correlationId, type: 'run_failed',
           detail: { code: errorCode(error), message: safeMessage(error) }, createdAt: now,
         });
       });
+      if (status === 'recovery_required') {
+        await this.observe(record, attemptId, turnNo, correlationId, 'recovery_required', {
+          kind: 'counter', name: 'runtime.recovery_required', value: 1,
+        }, status);
+      }
+      await this.observe(record, attemptId, turnNo, correlationId, 'attempt_finished', {
+        kind: 'timer', name: 'runtime.attempt.duration', value: elapsedMs(runStartedAt, now), unit: 'ms',
+      }, status);
+      await this.observe(record, attemptId, turnNo, correlationId, 'run_finished', {
+        kind: 'timer', name: 'runtime.run.duration', value: elapsedMs(runStartedAt, now), unit: 'ms',
+      }, status);
       return {
         runId: record.runId,
         status,
@@ -379,7 +443,7 @@ export class DurableAgentRuntime {
   }
 
   private kernelEvent(
-    identity: RunIdentity, attemptId: string, turnNo: number, event: KernelEvent,
+    record: RunRecord, attemptId: string, turnNo: number, correlationId: string, event: KernelEvent,
   ): Omit<AgentRunEvent, 'sequence'> | undefined {
     if (event.type === 'text_delta' || event.type === 'thinking_delta') return undefined;
     const detail = event.type === 'tool_call' ? {
@@ -398,7 +462,8 @@ export class DurableAgentRuntime {
       },
     } : event;
     return {
-      ...identity, attemptId, turnNo, type: event.type,
+      tenantId: record.tenantId, runId: record.runId, attemptId, turnNo,
+      kernel: record.kernel, kernelVersion: record.kernelVersion, correlationId, type: event.type,
       detail: JSON.parse(JSON.stringify(detail)) as AgentRunEvent['detail'], createdAt: this.now(),
     };
   }
@@ -407,6 +472,16 @@ export class DurableAgentRuntime {
     let sequence = 0n;
     while (true) {
       const events = await this.options.store.events.list(identity, sequence);
+      if (events.length > 0) {
+        const first = events[0]!;
+        await this.emitObservation({
+          type: 'sse_replay', tenantId: first.tenantId, runId: first.runId,
+          attemptId: first.attemptId, turnNo: first.turnNo, kernel: first.kernel,
+          kernelVersion: first.kernelVersion, correlationId: first.correlationId,
+          metric: { kind: 'counter', name: 'runtime.sse_replay.events', value: events.length },
+          occurredAt: this.now(),
+        });
+      }
       for (const event of events) {
         sequence = event.sequence;
         yield event;
@@ -424,6 +499,31 @@ export class DurableAgentRuntime {
       });
     }
     return kernel;
+  }
+
+  private async observe(
+    record: RunRecord,
+    attemptId: string,
+    turnNo: number,
+    correlationId: string,
+    type: RuntimeObservation['type'],
+    metric: RuntimeObservation['metric'],
+    status?: RuntimeObservation['status'],
+    detail?: RuntimeObservation['detail'],
+  ): Promise<void> {
+    await this.emitObservation({
+      type, tenantId: record.tenantId, runId: record.runId, attemptId, turnNo,
+      kernel: record.kernel, kernelVersion: record.kernelVersion, correlationId,
+      metric, status, detail, occurredAt: this.now(),
+    });
+  }
+
+  private async emitObservation(observation: RuntimeObservation): Promise<void> {
+    try {
+      await this.options.observe?.(observation);
+    } catch {
+      // Observability must never change durable runtime semantics.
+    }
   }
 }
 
@@ -465,6 +565,10 @@ function errorData(error: AgentPlatformError) {
   return { code: error.code, message: error.message, retryable: error.retryable };
 }
 
+function elapsedMs(start: Date, end: Date): number {
+  return Math.max(0, end.getTime() - start.getTime());
+}
+
 function lastText(messages: readonly KernelMessage[]): string | undefined {
   const assistant = [...messages].reverse().find((message) => message.role === 'assistant');
   if (!assistant || assistant.role !== 'assistant') return undefined;
@@ -472,7 +576,7 @@ function lastText(messages: readonly KernelMessage[]): string | undefined {
 }
 
 function safeMessage(error: unknown): string {
-  return (error instanceof Error ? error.message : String(error)).slice(0, 1_024);
+  return error instanceof AgentPlatformError ? error.message.slice(0, 1_024) : 'Agent execution failed';
 }
 
 function errorCode(error: unknown): string {

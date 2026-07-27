@@ -59,6 +59,8 @@ export interface RuntimeMysqlDatabase {
   };
   agent_run_events: {
     id: Generated<number>; tenant_id: string; run_id: string; sequence: number; event_type: string;
+    attempt_id: string | null; turn_no: number | null; kernel: string | null;
+    kernel_version: string | null; correlation_id: string | null;
     node_name: string | null; status: string | null; detail: ColumnType<unknown, string | null, string | null>;
     created_at: Date;
   };
@@ -274,6 +276,8 @@ export class MysqlRuntimeStore implements RuntimeStore {
       const sequence = BigInt(Number(last?.sequence ?? 0) + 1);
       await this.db.insertInto('agent_run_events').values({
         tenant_id: event.tenantId, run_id: event.runId, sequence: Number(sequence), event_type: event.type,
+        attempt_id: event.attemptId, turn_no: event.turnNo, kernel: event.kernel,
+        kernel_version: event.kernelVersion, correlation_id: event.correlationId,
         node_name: null, status: null, detail: event.detail === undefined ? null : json(event.detail), created_at: event.createdAt,
       }).execute();
       return { ...event, sequence };
@@ -282,6 +286,9 @@ export class MysqlRuntimeStore implements RuntimeStore {
       .selectAll().where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId)
       .where('sequence', '>', Number(after)).orderBy('sequence', 'asc').execute()).map((row) => ({
         tenantId: row.tenant_id, runId: row.run_id, sequence: BigInt(row.sequence), type: row.event_type,
+        attemptId: row.attempt_id ?? 'legacy', turnNo: row.turn_no ?? 0,
+        kernel: row.kernel ?? 'legacy', kernelVersion: row.kernel_version ?? 'unknown',
+        correlationId: row.correlation_id ?? `${row.tenant_id}:${row.run_id}:${row.sequence}`,
         detail: row.detail === null ? undefined : parse(row.detail) as AgentRunEvent['detail'], createdAt: row.created_at,
       })),
   };

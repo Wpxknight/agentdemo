@@ -13,7 +13,19 @@ AIoP 新运行支持 `legacy` 与 `pi`。历史 `kernel=langgraph` 记录继续�
 
 ## 数据迁移
 
-迁移 `0015`～`0018` 增加 Attempt、Turn Snapshot/Commit、Ledger v2、事件 sequence 与 Scheduler 关联，迁移 `0020` 持久化跨进程恢复所需的 Run limits。迁移 `0019` 把历史 LangGraph checkpoint 表冻结为只读。回滚窗口结束前不要删除这些表；最终删除必须先完成备份恢复验证和审计保留确认。
+迁移 `0015`～`0018` 增加 Attempt、Turn Snapshot/Commit、Ledger v2、事件 sequence 与 Scheduler 关联，迁移 `0020` 持久化跨进程恢复所需的 Run limits，迁移 `0021` 为 durable event 增加 Attempt、Turn、Kernel 与 correlation 身份列。迁移 `0019` 把历史 LangGraph checkpoint 表冻结为只读。回滚窗口结束前不要删除这些表；最终删除必须先完成真实备份恢复验证和审计保留确认。
+
+## 可观测性
+
+每条 Durable Runtime 事件都携带 `tenantId`、`runId`、`attemptId`、`turnNo`、`kernel`、`kernelVersion` 和 `correlationId`。控制事件只保存工具名称/调用标识、结果状态、usage、停止原因和 compaction 计数，不保存模型 text/thinking、工具参数或工具结果正文。
+
+`DurableAgentRuntime` 的结构化 observer 输出以下 counter/timer：
+
+- Run、Attempt 和 Turn 的开始计数与完成耗时；
+- lease loss、compaction、tool call/result、waiting、`recovery_required` 计数；
+- SSE durable event 断点补发量。
+
+Observer 失败不会改变 Run 的 durable 语义。接入 metrics/logging 后端时，应以完整身份字段作为标签/日志字段，并控制 tenant/run/correlation 等高基数字段的指标使用方式。
 
 ## 验证
 
@@ -22,9 +34,29 @@ make verify-node
 make test-agent-platform
 npm run typecheck
 npm test
+npm --prefix web run build
 ```
 
 Run 事件可通过 `GET /v1/agent/runs/{runId}/events` 获取 SSE；使用 `Last-Event-ID` 或 `?after=<sequence>` 断点补发。
+
+故障矩阵可用以下命令复验：
+
+```bash
+npx vitest run --reporter=verbose tests/durable-runtime.test.ts tests/memory-runtime-store.test.ts tests/mysql-runtime-store.test.ts tests/tool-runtime-platform.test.ts tests/http-agent-runs.test.ts tests/pi-observability.test.ts
+```
+
+矩阵覆盖取消、deadline、shutdown、stale fencing、事务回滚、跨进程 resume、approval/question/plan、重复写复用、未知外部副作用保护和 SSE 断点补发。
+
+## 生产外部待办
+
+以下事项不能由仓库测试替代，目前均不得标记完成：
+
+- 阶段 7 的真实生产灰度阈值、持续窗口和安全事件统计；
+- 阶段 8 的真实 checkpoint 保留周期以及该周期内无新 LangGraph Run 的证据；
+- 阶段 10 前的真实备份恢复演练和历史审计查询；
+- 生产回滚窗口结束后的 checkpoint 清表审批、执行与验证。
+
+在以上证据齐备前，不得创建或执行删除 `langgraph_checkpoints`、`langgraph_checkpoint_writes` 的迁移。
 
 ## 独立嵌入
 

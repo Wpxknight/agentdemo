@@ -47,6 +47,13 @@ describe('durable runtime migrations', () => {
     expect(source).toContain('add column limits_json json');
   });
 
+  it('persists complete durable event identity for observability', async () => {
+    const source = await sql('0021_agent_run_event_identity.sql');
+    for (const column of ['attempt_id', 'turn_no', 'kernel', 'kernel_version', 'correlation_id']) {
+      expect(source).toContain(`add column ${column}`);
+    }
+  });
+
   it('registers the new tables and columns in the Kysely schema', async () => {
     const source = (await readFile(new URL('../schema.ts', migrations), 'utf8')).toLowerCase();
     for (const table of ['agentrunattemptstable', 'agentturnsnapshotstable', 'agentturncommitstable']) {
@@ -57,5 +64,6 @@ describe('durable runtime migrations', () => {
     expect(source).toContain('agent_turn_commits:');
     expect(source).toContain('sequence: number');
     expect(source).toContain('limits_json: nullablejsoncolumn');
+    expect(source).toContain('correlation_id: string | null');
   });
 });

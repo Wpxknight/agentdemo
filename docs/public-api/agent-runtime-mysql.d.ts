@@ -122,6 +122,11 @@ export interface RuntimeMysqlDatabase {
         run_id: string;
         sequence: number;
         event_type: string;
+        attempt_id: string | null;
+        turn_no: number | null;
+        kernel: string | null;
+        kernel_version: string | null;
+        correlation_id: string | null;
         node_name: string | null;
         status: string | null;
         detail: ColumnType<unknown, string | null, string | null>;

@@ -153,6 +153,9 @@ export class AgentRuntime {
         runId: options.runId!,
         attemptId: committed.attemptId,
         turnNo: committed.turnNo,
+        kernel: 'pi',
+        kernelVersion: '0.82.1',
+        correlationId: options.runId!,
         type: 'rollout_comparison',
         detail: {
           mode: rollout.mode,

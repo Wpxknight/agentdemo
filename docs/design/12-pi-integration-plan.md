@@ -1,8 +1,8 @@
 # Pi 集成与 Agent Platform 模块化设计
 
-> 状态：拟实施。
+> 状态：仓库开发实现完成，生产迁移与窗口验证待完成。
 >
-> 本文描述目标架构和迁移方案，不表示相关代码已经完成。当前实现以 `src/**`、`src/db/migrations/**`、`package.json` 和测试为事实依据。
+> 2026-07-27 已完成阶段 0～6 的仓库实现、阶段 7 的 replay/dry-run 与灰度控制代码，以及阶段 9 的 LangGraph 运行时代码和依赖删除。真实生产灰度指标、阶段 8 的 checkpoint 保留周期、阶段 10 的备份恢复/审计查询/清表窗口仍待外部执行。当前事实以 `src/**`、`packages/**`、`src/db/migrations/**`、`package.json`、测试和[完成证据](../pi-agent-platform-completion-evidence.md)为准。
 >
 > 关联文档：[Agent Runtime](./02-agent-runtime.md)、[模型与上下文](./03-model-and-context.md)、[工具、Skill 与 MCP](./04-tools-skills-mcp.md)、[数据与持久化](./07-data-and-persistence.md)、[调度器](./08-scheduler.md)、[HTTP API 与 Web](./09-api-and-web.md)、[部署与可观测性](./10-deployment-observability.md)。
 
@@ -737,6 +737,16 @@ Pi 每次升级都要执行公开 export、事件顺序、abort、tool result �
 | 8 | 停止新 LangGraph Run，收敛存量 | 连续一个 checkpoint 保留周期没有新 Run |
 | 9 | 删除 LangGraph 代码、依赖和配置 | 生产只运行 Pi/Legacy，历史 Run 可查询 |
 | 10 | 回滚窗口结束后清理 checkpoint 表 | 备份验证通过，审计数据仍可查询 |
+
+### 8.1.1 2026-07-27 实施状态
+
+| 阶段 | 仓库状态 | 外部状态 |
+| --- | --- | --- |
+| 0～6 | 已实现并通过仓库验证 | 部署环境与真实流量验证按发布流程执行 |
+| 7 | replay、dry-run、只读/写流量控制与 usage comparison 已实现 | 真实灰度阈值、生产指标和安全事件窗口未执行 |
+| 8 | 已禁止创建/恢复新的 LangGraph Run，checkpoint 表保持只读 | 必须等待一个真实 checkpoint 保留周期并确认没有新 Run；当前待完成 |
+| 9 | LangGraph 运行时代码、依赖和配置已从当前构建删除，历史 Run 保持查询 | 生产只运行 Pi/Legacy 的发布证据未在仓库内伪造 |
+| 10 | 未创建清表迁移，也未删除 checkpoint 表 | 必须先完成真实备份恢复、审计查询和回滚窗口；当前待完成 |
 
 ### 8.2 开发顺序建议
 

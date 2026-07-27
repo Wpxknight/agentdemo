@@ -228,6 +228,11 @@ export interface AgentRunEventsTable {
   tenant_id: string;
   run_id: string;
   sequence: number;
+  attempt_id: string | null;
+  turn_no: number | null;
+  kernel: string | null;
+  kernel_version: string | null;
+  correlation_id: string | null;
   event_type: string;
   node_name: string | null;
   status: string | null;

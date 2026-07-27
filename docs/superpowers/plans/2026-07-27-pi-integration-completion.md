@@ -68,7 +68,7 @@
 - [x] Keep the pre-side-effect `started` Ledger write synchronous, then include confirmed Ledger/Interaction updates in `turns.commit()` so transcript, usage, events, and final facts share one transaction.
 - [x] Prevent any remaining write tool in the same Turn after one call enters waiting.
 - [x] Verify completed idempotent calls reuse one result and unknown non-idempotent writes always become `recovery_required`.
-- [ ] Commit with the required AIOS co-author trailer.
+- [x] Commit with the required AIOS co-author trailer.
 
 ### Task 4: Tenant/tool/resource concurrency and execution quotas
 
@@ -82,7 +82,7 @@
 - [x] Add explicit `ConcurrencyLimits` configuration with bounded semaphores keyed by trusted identity plus tool/resource.
 - [x] Count tool calls per Run and fail safely when the configured maximum is reached.
 - [x] Ensure locks and permits are always released in `finally` and never derive keys from model-supplied identity fields.
-- [ ] Commit with the required AIOS co-author trailer.
+- [x] Commit with the required AIOS co-author trailer.
 
 ### Task 5: Real standalone OpenSandbox and E2B providers
 
@@ -95,7 +95,7 @@
 - [x] Implement `OpenSandboxProvider` directly with `@alibaba-group/opensandbox`, injected connection settings, safe metadata, and byte file transfer.
 - [x] Implement `E2BSandboxProvider` directly with `@e2b/code-interpreter`, injected API/domain/template settings, streamed commands, byte file transfer, and kill-on-release.
 - [x] Keep credentials in constructor/factory inputs and never copy them into `SandboxHandle` or Runtime snapshots.
-- [ ] Commit with the required AIOS co-author trailer.
+- [x] Commit with the required AIOS co-author trailer.
 
 ### Task 6: Replay/dry-run semantics and rollout evidence
 
@@ -112,7 +112,7 @@
 - [x] Persist rollout mode and comparison correlation in the new Run snapshot/event metadata.
 - [x] Expose sanitized replay/dry-run outcome and usage comparison in Run Center details.
 - [x] Keep `disabled` as an immediate new-Run fallback while preserving existing Kernel binding.
-- [ ] Commit with the required AIOS co-author trailer.
+- [x] Commit with the required AIOS co-author trailer.
 
 ### Task 7: Publishable package and public API gates
 
@@ -129,7 +129,7 @@
 - [x] Add an API snapshot/diff command that fails on unreviewed breaking changes.
 - [x] Run `npm pack --dry-run` for every preview package and import each tarball from a temporary non-AIOP project.
 - [x] Add these checks to `make test-agent-platform`.
-- [ ] Commit with the required AIOS co-author trailer.
+- [x] Commit with the required AIOS co-author trailer.
 
 ### Task 8: Observability, failure injection, and completion evidence
 
@@ -141,10 +141,10 @@
 - Create: `/home/opt/develop/aicoding/aiop/docs/pi-agent-platform-completion-evidence.md`
 - Test: `/home/opt/develop/aicoding/aiop/tests/pi-observability.test.ts`
 
-- [ ] Add failing tests that every durable event includes tenant/run/attempt/turn/kernel/kernelVersion/correlation identifiers and that sensitive model/tool content is absent from control events.
-- [ ] Add structured Runtime observer hooks for Run, Attempt, Turn, lease loss, compaction, tool, waiting, recovery, and SSE replay counters/timers.
-- [ ] Execute the complete fault matrix for cancellation, deadline, shutdown, stale fencing, transaction rollback, resume, approval/question/plan, duplicate write, and unknown side effect.
-- [ ] Update the design status from “拟实施” only for repository-development stages proven by command output.
-- [ ] Record stages 8 and 10 as externally pending until a real checkpoint retention period, backup restore, audit query, and production rollout evidence exist; do not claim or simulate them in code.
-- [ ] Run `make verify-node`, `make test-agent-platform`, `npm run typecheck`, `npm test`, `npm --prefix web run build`, `make image`, audit/deep-import checks, package tarball checks, and `git diff --check`.
-- [ ] Commit with the required AIOS co-author trailer.
+- [x] Add failing tests that every durable event includes tenant/run/attempt/turn/kernel/kernelVersion/correlation identifiers and that sensitive model/tool content is absent from control events.
+- [x] Add structured Runtime observer hooks for Run, Attempt, Turn, lease loss, compaction, tool, waiting, recovery, and SSE replay counters/timers.
+- [x] Execute the complete fault matrix for cancellation, deadline, shutdown, stale fencing, transaction rollback, resume, approval/question/plan, duplicate write, and unknown side effect.
+- [x] Update the design status from “拟实施” only for repository-development stages proven by command output.
+- [x] Record stages 8 and 10 as externally pending until a real checkpoint retention period, backup restore, audit query, and production rollout evidence exist; do not claim or simulate them in code.
+- [x] Run `make verify-node`, `make test-agent-platform`, `npm run typecheck`, `npm test`, `npm --prefix web run build`, `make image`, audit/deep-import checks, package tarball checks, and `git diff --check`.
+- [x] Commit with the required AIOS co-author trailer.

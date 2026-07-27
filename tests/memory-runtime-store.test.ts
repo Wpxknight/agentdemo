@@ -51,8 +51,14 @@ describe('MemoryRuntimeStore', () => {
         messages: [], committedAt: new Date('2026-07-27T00:00:02.000Z'),
       },
       events: [
-        { ...identity, type: 'turn', detail: { phase: 'started' }, createdAt: new Date('2026-07-27T00:00:01.000Z') },
-        { ...identity, type: 'turn', detail: { phase: 'committed' }, createdAt: new Date('2026-07-27T00:00:02.000Z') },
+        {
+          ...identity, attemptId: 'attempt-a', turnNo: 1, kernel: 'pi', kernelVersion: '0.82.1', correlationId: 'corr-a',
+          type: 'turn', detail: { phase: 'started' }, createdAt: new Date('2026-07-27T00:00:01.000Z'),
+        },
+        {
+          ...identity, attemptId: 'attempt-a', turnNo: 1, kernel: 'pi', kernelVersion: '0.82.1', correlationId: 'corr-a',
+          type: 'turn', detail: { phase: 'committed' }, createdAt: new Date('2026-07-27T00:00:02.000Z'),
+        },
       ],
       runStatus: 'succeeded',
     });
