@@ -212,6 +212,8 @@ export class DurableAgentRuntime {
           : exit.outcome === 'recovery_required' ? 'recovery_required' : 'failed';
       const committedAt = this.now();
       const commit = await this.options.store.turns.commit({
+        leaseOwner: this.workerId,
+        leaseToken: lease.token,
         snapshot,
         commit: {
           ...identity, attemptId, turnNo, commitId: randomUUID(),

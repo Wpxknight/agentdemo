@@ -1,0 +1,16 @@
+{
+  "name": "@aiop/skill-runtime",
+  "version": "0.1.0-preview.1",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@aiop/agent-contracts": "0.1.0-preview.1",
+    "@earendil-works/pi-agent-core": "0.82.1"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

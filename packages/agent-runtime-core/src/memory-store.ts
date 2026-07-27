@@ -142,6 +142,12 @@ export class MemoryRuntimeStore implements RuntimeStore {
     },
     commit: async (input: CommitTurnInput): Promise<TurnCommit> => {
       if (!this.transactionalView) return this.transaction((tx) => tx.turns.commit(input));
+      await this.runs.assertLease(
+        input.snapshot,
+        input.leaseOwner,
+        input.leaseToken,
+        input.commit.committedAt,
+      );
       const key = turnKey(input.snapshot);
       const snapshot = this.state.snapshots.get(key);
       if (!snapshot || !isDeepStrictEqual(snapshot, input.snapshot)) {

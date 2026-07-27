@@ -77,6 +77,8 @@ export interface TurnCommit extends RunIdentity {
 }
 
 export interface CommitTurnInput {
+  leaseOwner: string;
+  leaseToken: bigint;
   snapshot: TurnSnapshot;
   commit: Omit<TurnCommit, 'eventSequenceEnd'>;
   events: readonly Omit<AgentRunEvent, 'sequence'>[];
@@ -104,6 +106,7 @@ export interface ToolLedgerRecord extends RunIdentity {
   logicalCallId: string;
   toolCallId: string;
   toolName: string;
+  argsDigest: string;
   capability: ToolCapability;
   idempotencyKey: string;
   status: 'pending_approval' | 'started' | 'completed' | 'unknown' | 'recovery_required';

@@ -39,6 +39,8 @@ import {
   type WaitingReason,
 } from '@aiop/agent-contracts';
 
+export * from './context-manager.js';
+
 const EMPTY_PI_USAGE: Usage = {
   input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
