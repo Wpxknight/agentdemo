@@ -147,6 +147,13 @@ export interface KernelExit extends KernelTurnResult {
 export type KernelEvent =
   | { type: 'text_delta'; text: string }
   | { type: 'thinking_delta'; text: string }
+  | {
+      type: 'context_compacted';
+      tokensBefore: number;
+      tokensAfter: number;
+      summarizedMessages: number;
+      version: number;
+    }
   | { type: 'tool_call'; call: ToolCall }
   | { type: 'tool_result'; result: ToolResult }
   | { type: 'usage'; usage: AgentRunUsage }

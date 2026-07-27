@@ -38,6 +38,7 @@ import {
   type ToolRuntime,
   type WaitingReason,
 } from '@aiop/agent-contracts';
+import type { CompactionPolicy, ContextManager } from './context-manager.js';
 
 export * from './context-manager.js';
 
@@ -51,6 +52,12 @@ export interface PiAgentKernelOptions {
   toolRuntime: ToolRuntime;
   systemPrompt?: string;
   protocolVersion?: string;
+  context?: {
+    manager: ContextManager;
+    triggerTokens: number;
+    keepRecentMessages: number;
+    watermarkTokens?: number;
+  };
 }
 
 export class PiAgentKernel implements AgentKernel {
@@ -66,10 +73,11 @@ export class PiAgentKernel implements AgentKernel {
     let waitingReason: WaitingReason | undefined;
     let lastAssistant: AssistantMessage | undefined;
     const usage: AgentRunUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
+    const runMessages = await this.compactContext(input, control, usage);
     const tools = this.createTools(input, () => waitingReason, (reason) => { waitingReason = reason; });
     const context: AgentContext = {
       systemPrompt: this.options.systemPrompt ?? '',
-      messages: input.continuation ? toPiMessages(input.messages) : [],
+      messages: input.continuation ? toPiMessages(runMessages) : [],
       tools,
     };
     const config: AgentLoopConfig = {
@@ -91,7 +99,7 @@ export class PiAgentKernel implements AgentKernel {
           turnNo: input.turnNo,
           stopReason: message.stopReason,
           usage: { ...usage },
-          messages: fromPiMessages(input.continuation ? [...toPiMessages(input.messages), ...newMessages] : newMessages),
+          messages: fromPiMessages(input.continuation ? [...toPiMessages(runMessages), ...newMessages] : newMessages),
           waitingReason,
         };
         return message.stopReason === 'length' || Boolean(waitingReason) || await control.shouldStopAfterTurn(turn);
@@ -100,11 +108,11 @@ export class PiAgentKernel implements AgentKernel {
     const streamFn = this.createStreamFn(input, logicalCalls);
     const stream = input.continuation
       ? agentLoopContinue(context, config, input.signal, streamFn)
-      : agentLoop(toPiMessages(input.messages), context, config, input.signal, streamFn);
+      : agentLoop(toPiMessages(runMessages), context, config, input.signal, streamFn);
     let returned: AgentMessage[] = [];
     for await (const event of stream) await this.forwardEvent(event, input, logicalCalls, control);
     returned = await stream.result();
-    const allMessages = input.continuation ? [...toPiMessages(input.messages), ...returned] : returned;
+    const allMessages = input.continuation ? [...toPiMessages(runMessages), ...returned] : returned;
     const messages = fromPiMessages(allMessages);
     lastAssistant ??= [...allMessages].reverse().find((message): message is AssistantMessage => message.role === 'assistant');
     const stopReason = lastAssistant?.stopReason;
@@ -118,6 +126,49 @@ export class PiAgentKernel implements AgentKernel {
       retryable: false,
     } : undefined;
     return { outcome, turnNo: input.turnNo, stopReason, usage, messages, waitingReason, error };
+  }
+
+  private async compactContext(
+    input: KernelRunInput,
+    control: KernelControl,
+    usage: AgentRunUsage,
+  ): Promise<readonly KernelMessage[]> {
+    const context = this.options.context;
+    if (!context || input.messages.length === 0) return input.messages;
+    const inspected = await context.manager.inspect(input.messages);
+    if (inspected.tokens <= (context.watermarkTokens ?? 0)) return input.messages;
+    const recent = input.messages.slice(-Math.max(1, context.keepRecentMessages));
+    const recentUsage = await context.manager.inspect(recent);
+    const reserveTokens = Math.max(256, Math.ceil(context.triggerTokens * 0.15));
+    const policy: CompactionPolicy = {
+      contextWindowTokens: context.triggerTokens + reserveTokens,
+      reserveTokens,
+      keepRecentTokens: Math.max(1, recentUsage.tokens),
+    };
+    if (!context.manager.shouldCompact(inspected, policy)) return input.messages;
+    const prepared = context.manager.prepare(input.messages, policy);
+    if (!prepared || prepared.summarizedMessages === 0) return input.messages;
+    try {
+      const compacted = await context.manager.compact({ prepared, signal: input.signal });
+      if (!compacted.summary.trim()) return input.messages;
+      if (compacted.usage) addUsage(usage, toPiUsage(compacted.usage));
+      const messages: KernelMessage[] = [{
+        role: 'user',
+        content: [{ type: 'text', text: `Context summary:\n${compacted.summary.trim()}` }],
+      }, ...compacted.retainedMessages];
+      const after = await context.manager.inspect(messages);
+      await control.emit({
+        type: 'context_compacted',
+        tokensBefore: compacted.tokensBefore,
+        tokensAfter: after.tokens,
+        summarizedMessages: prepared.summarizedMessages,
+        version: 1,
+      });
+      return messages;
+    } catch {
+      await control.guard();
+      return input.messages;
+    }
   }
 
   private createTools(
@@ -382,6 +433,9 @@ function addUsage(target: AgentRunUsage, usage: Usage): void {
   target.outputTokens += usage.output;
   target.cacheReadTokens += usage.cacheRead;
   target.cacheCreationTokens += usage.cacheWrite;
+  if (target.costUsd !== undefined || usage.cost.total !== 0) {
+    target.costUsd = (target.costUsd ?? 0) + usage.cost.total;
+  }
 }
 
 function toPiUsage(usage: AgentRunUsage): Usage {

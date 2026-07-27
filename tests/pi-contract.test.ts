@@ -16,7 +16,8 @@ import {
   truncateTail,
 } from '@earendil-works/pi-agent-core';
 import type { ModelProvider, ToolRuntime } from '@aiop/agent-contracts';
-import { PiAgentKernel } from '../packages/agent-kernel-pi/src/index.js';
+import { DurableAgentRuntime, MemoryRuntimeStore } from '@aiop/agent-runtime-core';
+import { PiAgentKernel, PiContextManager } from '../packages/agent-kernel-pi/src/index.js';
 
 const usage = { inputTokens: 3, outputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 0 };
 
@@ -118,6 +119,113 @@ describe('Pi public contract', () => {
     expect(second.outcome).toBe('completed');
     expect(second.messages.at(-1)).toMatchObject({ role: 'assistant' });
     expect(request).toBe(2);
+  });
+
+  it('adds Pi compaction model usage to the kernel turn usage', async () => {
+    const manager = new PiContextManager({
+      complete: async () => ({
+        text: 'compact summary',
+        usage: {
+          inputTokens: 13,
+          outputTokens: 5,
+          cacheReadTokens: 2,
+          cacheCreationTokens: 1,
+          costUsd: 0.03,
+        },
+      }),
+    });
+    const kernel = new PiAgentKernel({
+      modelProvider: {
+        async *stream() {
+          yield { type: 'text_delta', text: 'answer' };
+          yield { type: 'usage', usage: {
+            inputTokens: 7, outputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 0, costUsd: 0.01,
+          } };
+          yield { type: 'stop', reason: 'stop' };
+        },
+      },
+      toolRuntime: { execute: async () => { throw new Error('not used'); } },
+      context: { manager, triggerTokens: 80, keepRecentMessages: 1 },
+    });
+    const exit = await kernel.run({
+      runId: 'run-compaction-usage', attemptId: 'attempt-compaction-usage', turnNo: 1,
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+      messages: Array.from({ length: 6 }, (_, index) => ({
+        role: 'user' as const,
+        content: [{ type: 'text' as const, text: `old-${index} ${'x'.repeat(100)}` }],
+      })),
+      model: { provider: 'fake', model: 'fake-1' },
+      tools: [],
+    }, { emit: async () => undefined, guard: async () => undefined, shouldStopAfterTurn: async () => true });
+
+    expect(exit.usage).toEqual({
+      inputTokens: 20,
+      outputTokens: 7,
+      cacheReadTokens: 2,
+      cacheCreationTokens: 1,
+      costUsd: 0.04,
+    });
+  });
+
+  it('preserves committed compaction usage when a fresh Durable Runtime resumes the run', async () => {
+    const store = new MemoryRuntimeStore();
+    const identity = { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] };
+    const context = {
+      manager: new PiContextManager({
+        complete: async () => ({
+          text: 'resume summary',
+          usage: {
+            inputTokens: 13, outputTokens: 5, cacheReadTokens: 2, cacheCreationTokens: 1, costUsd: 0.03,
+          },
+        }),
+      }),
+      triggerTokens: 80,
+      keepRecentMessages: 1,
+    };
+    const firstKernel = new PiAgentKernel({
+      modelProvider: { async *stream() { throw new Error('first attempt failed'); } },
+      toolRuntime: { execute: async () => { throw new Error('not used'); } },
+      context,
+    });
+    const firstRuntime = new DurableAgentRuntime({
+      store, kernels: [firstKernel], defaultKernel: 'pi', modelBinding: { provider: 'fake', model: 'fake-1' },
+    });
+    const first = await firstRuntime.run({
+      runId: 'run-resume-compaction-usage', identity, sessionId: 'session-a', input: [],
+      messages: Array.from({ length: 6 }, (_, index) => ({
+        role: 'user' as const,
+        content: [{ type: 'text' as const, text: `old-${index} ${'x'.repeat(100)}` }],
+      })),
+    });
+    await expect(first.result()).resolves.toMatchObject({
+      status: 'failed',
+      usage: { inputTokens: 13, outputTokens: 5, cacheReadTokens: 2, cacheCreationTokens: 1, costUsd: 0.03 },
+    });
+
+    const resumedKernel = new PiAgentKernel({
+      modelProvider: {
+        async *stream() {
+          yield { type: 'text_delta', text: 'recovered' };
+          yield { type: 'usage', usage: {
+            inputTokens: 7, outputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 0, costUsd: 0.01,
+          } };
+          yield { type: 'stop', reason: 'stop' };
+        },
+      },
+      toolRuntime: { execute: async () => { throw new Error('not used'); } },
+      context,
+    });
+    const resumedRuntime = new DurableAgentRuntime({
+      store, kernels: [resumedKernel], defaultKernel: 'pi', modelBinding: { provider: 'fake', model: 'fake-1' },
+    });
+    const resumed = await resumedRuntime.resume({ identity, runId: 'run-resume-compaction-usage' });
+
+    await expect(resumed.result()).resolves.toMatchObject({
+      status: 'succeeded',
+      usage: { inputTokens: 20, outputTokens: 7, cacheReadTokens: 2, cacheCreationTokens: 1, costUsd: 0.04 },
+    });
+    expect(await store.attempts.list({ tenantId: identity.tenantId, runId: 'run-resume-compaction-usage' }))
+      .toHaveLength(2);
   });
 
   it('never executes tool calls from a length-truncated assistant response', async () => {

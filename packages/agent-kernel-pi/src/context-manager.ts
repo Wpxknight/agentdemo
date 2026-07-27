@@ -8,7 +8,16 @@ import {
   type CompactionPreparation,
   type SessionTreeEntry,
 } from '@earendil-works/pi-agent-core';
-import type { Model, Models, Usage } from '@earendil-works/pi-ai';
+import {
+  createAssistantMessageEventStream,
+  createModels,
+  createProvider,
+  type AssistantMessage,
+  type Context,
+  type Model,
+  type SimpleStreamOptions,
+  type Usage,
+} from '@earendil-works/pi-ai';
 import type { AgentRunUsage, KernelMessage } from '@aiop/agent-contracts';
 
 export interface ContextUsage {
@@ -26,6 +35,7 @@ export interface CompactionPolicy {
 
 export interface PreparedCompaction {
   tokensBefore: number;
+  summarizedMessages: number;
   retainedMessages: KernelMessage[];
   handle: unknown;
 }
@@ -37,7 +47,38 @@ export interface CompactedContext {
   retainedMessages: KernelMessage[];
 }
 
-export class PiContextManager {
+export interface ContextCompletionInput {
+  system: string;
+  messages: readonly KernelMessage[];
+  sourceMessages: readonly KernelMessage[];
+  maxTokens?: number;
+  signal?: AbortSignal;
+}
+
+export interface ContextCompletionResult {
+  text: string;
+  usage?: AgentRunUsage;
+}
+
+export interface PiContextManagerOptions {
+  complete(input: ContextCompletionInput): Promise<ContextCompletionResult>;
+}
+
+export interface ContextManager {
+  inspect(messages: readonly KernelMessage[]): Promise<ContextUsage>;
+  shouldCompact(usage: ContextUsage, policy: CompactionPolicy): boolean;
+  contextTokens(usage: AgentRunUsage): number;
+  prepare(messages: readonly KernelMessage[], policy: CompactionPolicy): PreparedCompaction | undefined;
+  compact(input: {
+    prepared: PreparedCompaction;
+    instructions?: string;
+    signal?: AbortSignal;
+  }): Promise<CompactedContext>;
+}
+
+export class PiContextManager implements ContextManager {
+  constructor(private readonly options?: PiContextManagerOptions) {}
+
   async inspect(messages: readonly KernelMessage[]): Promise<ContextUsage> {
     const estimate = estimateContextTokens(toPiMessages(messages));
     return { tokens: estimate.tokens, usageTokens: estimate.usageTokens, trailingTokens: estimate.trailingTokens };
@@ -69,6 +110,7 @@ export class PiContextManager {
     if (!prepared.value) return undefined;
     return {
       tokensBefore: prepared.value.tokensBefore,
+      summarizedMessages: prepared.value.messagesToSummarize.length + prepared.value.turnPrefixMessages.length,
       retainedMessages: fromPiMessages(prepared.value.retainedTail),
       handle: prepared.value,
     };
@@ -76,15 +118,16 @@ export class PiContextManager {
 
   async compact(input: {
     prepared: PreparedCompaction;
-    models: unknown;
-    model: unknown;
     instructions?: string;
     signal?: AbortSignal;
   }): Promise<CompactedContext> {
+    if (!this.options) throw new Error('Pi context completion is not configured');
+    const preparation = input.prepared.handle as CompactionPreparation;
+    const { models, model } = createCompactionModels(this.options, preparation);
     const result = await compact(
-      input.prepared.handle as CompactionPreparation,
-      input.models as Models,
-      input.model as Model<any>,
+      preparation,
+      models,
+      model,
       input.instructions,
       input.signal,
     );
@@ -96,6 +139,77 @@ export class PiContextManager {
       retainedMessages: fromPiMessages(result.value.retainedTail ?? []),
     };
   }
+}
+
+function createCompactionModels(options: PiContextManagerOptions, preparation: CompactionPreparation) {
+  const model: Model<'aiop-context'> = {
+    id: 'aiop-context',
+    name: 'AIOP Context Summarizer',
+    api: 'aiop-context',
+    provider: 'aiop',
+    baseUrl: 'injected://aiop-context',
+    reasoning: false,
+    input: ['text', 'image'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: Math.max(preparation.tokensBefore, preparation.settings.reserveTokens),
+    maxTokens: preparation.settings.reserveTokens,
+  };
+  const sourceMessages = fromPiMessages([
+    ...preparation.messagesToSummarize,
+    ...preparation.turnPrefixMessages,
+  ]);
+  const stream = (_model: Model<'aiop-context'>, context: Context, streamOptions?: SimpleStreamOptions) => {
+    const output = createAssistantMessageEventStream();
+    void (async () => {
+      const empty = (): AssistantMessage => ({
+        role: 'assistant',
+        content: [],
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        usage: emptyUsage(),
+        stopReason: 'stop',
+        timestamp: Date.now(),
+      });
+      output.push({ type: 'start', partial: empty() });
+      try {
+        const result = await options.complete({
+          system: context.systemPrompt ?? '',
+          messages: fromPiMessages(context.messages),
+          sourceMessages,
+          maxTokens: streamOptions?.maxTokens,
+          signal: streamOptions?.signal,
+        });
+        const message: AssistantMessage = {
+          ...empty(),
+          content: [{ type: 'text', text: result.text }],
+          usage: toPiUsage(result.usage ?? zeroUsage()),
+        };
+        output.push({ type: 'done', reason: 'stop', message });
+      } catch (error) {
+        const message: AssistantMessage = {
+          ...empty(),
+          stopReason: streamOptions?.signal?.aborted ? 'aborted' : 'error',
+          errorMessage: error instanceof Error ? error.message : String(error),
+        };
+        output.push({ type: 'error', reason: message.stopReason === 'aborted' ? 'aborted' : 'error', error: message });
+      }
+    })();
+    return output;
+  };
+  const provider = createProvider({
+    id: 'aiop',
+    auth: { apiKey: { name: 'Injected AIOP model', resolve: async () => ({ auth: { apiKey: 'injected' } }) } },
+    models: [model],
+    api: { stream, streamSimple: stream },
+  });
+  const models = createModels();
+  models.setProvider(provider);
+  return { models, model };
+}
+
+function zeroUsage(): AgentRunUsage {
+  return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
 }
 
 function toPiMessages(messages: readonly KernelMessage[]): AgentMessage[] {

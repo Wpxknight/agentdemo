@@ -210,6 +210,61 @@ describe('AgentRuntime', () => {
     expect((await runtimeStore.turns.getLastCommitted({ tenantId: 'tenant-a', runId: 'run-durable-aiop' }))?.turnNo).toBe(2);
   });
 
+  it('compacts an oversized transcript before the Durable Pi model call and commits the compacted context', async () => {
+    const runtimeStore = new MemoryRuntimeStore();
+    const modelMessages: string[][] = [];
+    const events: unknown[] = [];
+    const staleMessages = Array.from({ length: 8 }, (_, index) => ({
+      role: 'user' as const,
+      text: `old-${index} ${'x'.repeat(120)}`,
+    }));
+    const runtime = createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'pi' }, { runtimeStore });
+
+    const result = await runtime.run({
+      ...runOptions(),
+      runId: 'run-durable-compaction',
+      messages: staleMessages,
+      task: 'latest request',
+      contextBudgetTokens: 400,
+      compactionTriggerTokens: 120,
+      compactionKeepRecent: 2,
+      summarize: async (stale) => `durable summary of ${stale.length} messages`,
+      onEvent: (event) => events.push(event),
+      model: {
+        id: 'fake',
+        async *stream(input) {
+          modelMessages.push(input.messages.map((message) => message.text ?? ''));
+          yield { type: 'text_delta', text: 'compacted answer' } as const;
+          yield { type: 'usage', inputTokens: 7, outputTokens: 2 } as const;
+          yield { type: 'stop', reason: 'end_turn' } as const;
+        },
+      },
+      ctx: { tenantId: 'tenant-a', userId: 'user-a', role: 'user', sessionId: 'session-a' },
+    });
+
+    expect(modelMessages).toHaveLength(1);
+    expect(modelMessages[0].some((text) => text.includes('durable summary'))).toBe(true);
+    expect(modelMessages[0]).not.toContain(staleMessages[0].text);
+    expect(result.compacted).toBe(true);
+    const committed = await runtimeStore.turns.getLastCommitted({
+      tenantId: 'tenant-a', runId: 'run-durable-compaction',
+    });
+    expect(fromCommittedText(committed?.messages ?? []).some((text) => text.includes('durable summary'))).toBe(true);
+    const durableEvents = await runtimeStore.events.list({ tenantId: 'tenant-a', runId: 'run-durable-compaction' });
+    expect(durableEvents).toContainEqual(expect.objectContaining({
+      type: 'context_compacted',
+      detail: expect.objectContaining({
+        type: 'context_compacted',
+        tokensBefore: expect.any(Number),
+        tokensAfter: expect.any(Number),
+        summarizedMessages: expect.any(Number),
+        version: 1,
+      }),
+    }));
+    expect(JSON.stringify(durableEvents.map((event) => event.detail))).not.toContain(staleMessages[0].text);
+    expect(events).toContainEqual(expect.objectContaining({ type: 'context_compacted' }));
+  });
+
   it('preserves the AIOP failure contract when Durable Runtime records a failed Pi run', async () => {
     const runtimeStore = new MemoryRuntimeStore();
     const runtime = createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'pi' }, { runtimeStore });
@@ -257,3 +312,9 @@ describe('AgentRuntime', () => {
     expect((await runtimeStore.turns.getLastCommitted({ tenantId: 'tenant-a', runId: 'run-durable-resume' }))?.turnNo).toBe(2);
   });
 });
+
+function fromCommittedText(messages: readonly import('@aiop/agent-contracts').KernelMessage[]): string[] {
+  return messages.flatMap((message) => message.role === 'user' || message.role === 'assistant'
+    ? message.content.flatMap((block) => block.type === 'text' ? [block.text] : [])
+    : message.results.map((result) => result.content));
+}

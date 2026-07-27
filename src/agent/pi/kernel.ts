@@ -4,7 +4,7 @@ import type {
   ModelProvider,
   ToolRuntime,
 } from '@aiop/agent-contracts';
-import { PiAgentKernel } from '@aiop/agent-kernel-pi';
+import { PiAgentKernel, PiContextManager } from '@aiop/agent-kernel-pi';
 import type { Msg, StreamEvent, ToolDef } from '../../model/types.js';
 import type { AgentKernel } from '../kernel.js';
 import type { RunAgentOptions, RunAgentResult } from '../core.js';
@@ -15,6 +15,7 @@ export class PiAIOPAgentKernel implements AgentKernel {
 
   async run(options: RunAgentOptions): Promise<RunAgentResult> {
     const kernel = createPiPlatformKernel(options);
+    let compacted = false;
     const messages = toPiKernelMessages(options.messages ?? [], options.task, options.taskContentBlocks);
     const exit = await kernel.run({
       runId: options.runId ?? `compat:${options.ctx.sessionId}`,
@@ -31,7 +32,10 @@ export class PiAIOPAgentKernel implements AgentKernel {
       limits: { maxTurns: options.maxSteps },
       signal: options.signal,
     }, {
-      emit: async (event) => emitPiCompatEvent(event, options.onEvent),
+      emit: async (event) => {
+        if (event.type === 'context_compacted') compacted = true;
+        emitPiCompatEvent(event, options.onEvent);
+      },
       guard: options.runGuard ?? (async () => undefined),
       shouldStopAfterTurn: async () => false,
     });
@@ -41,7 +45,7 @@ export class PiAIOPAgentKernel implements AgentKernel {
       text: lastAssistantText(exit.messages) ?? '',
       steps: exit.messages.filter((message) => message.role === 'assistant').length,
       usage: exit.usage,
-      compacted: false,
+      compacted,
     };
   }
 }
@@ -74,7 +78,17 @@ export function createPiPlatformKernel(options: RunAgentOptions): PiAgentKernel 
       };
     },
   };
-  return new PiAgentKernel({ modelProvider, toolRuntime, systemPrompt: options.system });
+  const context = options.summarize && options.compactionTriggerTokens ? {
+    manager: new PiContextManager({
+      complete: async ({ sourceMessages }) => ({
+        text: await options.summarize!(fromPiKernelMessages(sourceMessages)),
+      }),
+    }),
+    triggerTokens: options.compactionTriggerTokens,
+    keepRecentMessages: options.compactionKeepRecent ?? 8,
+    watermarkTokens: options.compactionWatermarkTokens,
+  } : undefined;
+  return new PiAgentKernel({ modelProvider, toolRuntime, systemPrompt: options.system, context });
 }
 
 export function piToolDefinitions(options: RunAgentOptions) {
@@ -167,6 +181,12 @@ function capability(tool: ToolDef): 'read' | 'non_idempotent_write' {
 export function emitPiCompatEvent(event: KernelEvent, sink?: (event: StreamEvent) => void): void {
   if (!sink) return;
   if (event.type === 'text_delta' || event.type === 'thinking_delta') sink(event);
+  else if (event.type === 'context_compacted') sink({
+    type: 'context_compacted',
+    summarizedMessages: event.summarizedMessages,
+    beforeTokens: event.tokensBefore,
+    afterTokens: event.tokensAfter,
+  });
   else if (event.type === 'tool_call') sink({
     type: 'tool_call', call: { id: event.call.id, name: event.call.name, args: event.call.arguments },
   });

@@ -99,6 +99,7 @@ export class AgentRuntime {
 
   private async runDurablePi(options: RunAgentOptions): Promise<RunAgentResult> {
     const kernel = createPiPlatformKernel(options);
+    let compacted = false;
     const runtime = new DurableAgentRuntime({
       store: this.runtimeStore!,
       kernels: [kernel],
@@ -107,7 +108,10 @@ export class AgentRuntime {
         provider: 'aiop', model: options.model.id, contextWindowTokens: options.contextBudgetTokens,
       },
       tools: piToolDefinitions(options),
-      observeEvent: (event) => emitPiCompatEvent(event, options.onEvent),
+      observeEvent: (event) => {
+        if (event.type === 'context_compacted') compacted = true;
+        emitPiCompatEvent(event, options.onEvent);
+      },
     });
     const identity = {
       tenantId: options.ctx.tenantId ?? 'default',
@@ -155,7 +159,7 @@ export class AgentRuntime {
       text: result.text ?? '',
       steps: committed?.turnNo ?? 0,
       usage: result.usage,
-      compacted: false,
+      compacted,
     };
   }
 

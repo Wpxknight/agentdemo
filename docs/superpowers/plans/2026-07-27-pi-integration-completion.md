@@ -43,12 +43,12 @@
 - Test: `/home/opt/develop/aicoding/aiop/tests/pi-context-manager.test.ts`
 - Test: `/home/opt/develop/aicoding/aiop/tests/agent-runtime.test.ts`
 
-- [ ] Add a failing product-path test where an oversized committed transcript is compacted before the next model call and the compacted messages are committed.
-- [ ] Add neutral `ContextManager` hooks to Pi Kernel options; use Pi package-root `estimateContextTokens`, `prepareCompaction`, and `compact` only.
-- [ ] Adapt the existing AIOP summarizer/model credentials without exposing Pi types to Runtime Core.
-- [ ] Emit a durable compaction control event containing token counts and summary version, without persisting sensitive source text.
-- [ ] Verify usage accounting includes compaction model usage and survives resume.
-- [ ] Run Pi context, AIOP runtime, and full typecheck tests.
+- [x] Add a failing product-path test where an oversized committed transcript is compacted before the next model call and the compacted messages are committed.
+- [x] Add neutral `ContextManager` hooks to Pi Kernel options; use Pi package-root `estimateContextTokens`, `prepareCompaction`, and `compact` only.
+- [x] Adapt the existing AIOP summarizer/model credentials without exposing Pi types to Runtime Core.
+- [x] Emit a durable compaction control event containing token counts and summary version, without persisting sensitive source text.
+- [x] Verify usage accounting includes compaction model usage and survives resume.
+- [x] Run Pi context, AIOP runtime, and full typecheck tests.
 - [ ] Commit with the required AIOS co-author trailer.
 
 ### Task 3: Transactional interaction and ledger completion facts
