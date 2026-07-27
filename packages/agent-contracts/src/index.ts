@@ -142,6 +142,8 @@ export interface KernelTurnResult {
 export interface KernelExit extends KernelTurnResult {
   outcome: 'continue' | 'waiting' | 'completed' | 'failed' | 'recovery_required';
   error?: AgentPlatformErrorData;
+  ledgerUpdates?: readonly DurableToolLedgerUpdate[];
+  interactionUpdates?: readonly DurableInteractionUpdate[];
 }
 
 export type KernelEvent =
@@ -216,6 +218,45 @@ export interface ToolRuntime {
   execute(call: ToolCall, context: ToolExecutionContext): Promise<ToolExecutionOutcome>;
 }
 
+export interface DurableInteractionUpdate {
+  tenantId: string;
+  runId: string;
+  id: string;
+  attemptId: string;
+  turnNo: number;
+  kind: 'approval' | 'question' | 'plan';
+  status: 'pending' | 'resolved' | 'cancelled' | 'expired';
+  payload: JsonValue;
+  resolution?: JsonValue;
+  createdAt: Date;
+  resolvedAt?: Date;
+}
+
+export interface DurableToolLedgerUpdate {
+  tenantId: string;
+  runId: string;
+  attemptId: string;
+  turnNo: number;
+  logicalCallId: string;
+  toolCallId: string;
+  toolName: string;
+  argsDigest: string;
+  capability: ToolCapability;
+  idempotencyKey: string;
+  status: 'pending_approval' | 'started' | 'completed' | 'unknown' | 'recovery_required';
+  externalCorrelationId?: string;
+  resultDigest?: string;
+  approvedInteractionId?: string;
+  result?: ToolResult;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface DurableExecutionFacts {
+  ledgerUpdates?: readonly DurableToolLedgerUpdate[];
+  interactionUpdates?: readonly DurableInteractionUpdate[];
+}
+
 export interface AcquireSandboxInput {
   identity: IdentityContext;
   profile: string;
@@ -263,10 +304,11 @@ export interface SandboxProvider {
   release(handle: SandboxHandle): Promise<void>;
 }
 
-export type ToolExecutionOutcome =
+export type ToolExecutionOutcome = (
   | { kind: 'result'; result: ToolResult }
   | { kind: 'waiting'; reason: WaitingReason; interactionId: string }
-  | { kind: 'recovery_required'; correlationId?: string; message: string };
+  | { kind: 'recovery_required'; correlationId?: string; message: string }
+) & DurableExecutionFacts;
 
 export interface AgentRunEvent {
   tenantId: string;

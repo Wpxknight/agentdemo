@@ -34,6 +34,7 @@ export interface ApprovalDecision {
   approved: boolean;
   pending?: boolean;
   interactionId?: string;
+  payload?: JsonValue;
 }
 
 export interface ToolApproval {
@@ -97,8 +98,22 @@ export class ToolRuntimeEngine implements ToolRuntime {
       : { approved: !policy.needsApproval };
     if (!approval.approved) {
       if (approval.pending && approval.interactionId) {
-        await this.putPendingApproval(call, context, tool, approval.interactionId);
-        return { kind: 'waiting', reason: 'approval', interactionId: approval.interactionId };
+        const pending = this.pendingApproval(call, context, tool, approval.interactionId);
+        const interaction = {
+          tenantId: context.identity.tenantId,
+          runId: context.runId,
+          id: approval.interactionId,
+          attemptId: context.attemptId,
+          turnNo: context.turnNo,
+          kind: 'approval' as const,
+          status: 'pending' as const,
+          payload: approval.payload ?? { toolName: call.name, reason: policy.reason ?? null },
+          createdAt: this.now(),
+        };
+        return {
+          kind: 'waiting', reason: 'approval', interactionId: approval.interactionId,
+          ledgerUpdates: [pending], interactionUpdates: [interaction],
+        };
       }
       return result(call.id, `needs approval: ${policy.reason ?? 'denied'}`, true);
     }
@@ -121,11 +136,12 @@ export class ToolRuntimeEngine implements ToolRuntime {
         return { kind: 'waiting', reason: 'approval', interactionId: existing.approvedInteractionId ?? 'pending' };
       }
       if (existing.capability === 'non_idempotent_write') {
-        await this.options.ledger.update({ ...existing, status: 'recovery_required', updatedAt: this.now() });
+        const recovery = { ...existing, status: 'recovery_required' as const, updatedAt: this.now() };
         return {
           kind: 'recovery_required',
           correlationId: existing.externalCorrelationId,
           message: 'non-idempotent tool result is unknown and cannot be replayed automatically',
+          ledgerUpdates: [recovery],
         };
       }
     }
@@ -152,8 +168,7 @@ export class ToolRuntimeEngine implements ToolRuntime {
       const completed: ToolLedgerRecord = {
         ...record, status: 'completed', result: limited, resultDigest: digest(limited.content), updatedAt: this.now(),
       };
-      await this.options.ledger.update(completed);
-      return { kind: 'result', result: limited };
+      return { kind: 'result', result: limited, ledgerUpdates: [completed] };
     };
     let outcome: ToolExecutionOutcome;
     try {
@@ -162,8 +177,8 @@ export class ToolRuntimeEngine implements ToolRuntime {
         : await this.locks.run(policy.resourceKey ?? call.name, execute);
     } catch (error) {
       if (tool.capability === 'non_idempotent_write') {
-        await this.options.ledger.update({ ...record, status: 'recovery_required', updatedAt: this.now() });
-        outcome = { kind: 'recovery_required', message: safeMessage(error) };
+        const recovery = { ...record, status: 'recovery_required' as const, updatedAt: this.now() };
+        outcome = { kind: 'recovery_required', message: safeMessage(error), ledgerUpdates: [recovery] };
       } else {
         outcome = result(call.id, safeMessage(error), true);
       }
@@ -172,21 +187,21 @@ export class ToolRuntimeEngine implements ToolRuntime {
     return outcome;
   }
 
-  private async putPendingApproval(
+  private pendingApproval(
     call: ToolCall,
     context: ToolExecutionContext,
     tool: RegisteredTool,
     interactionId: string,
-  ): Promise<void> {
+  ): ToolLedgerRecord {
     this.options.onLedger?.();
     const now = this.now();
-    await this.options.ledger.putIfAbsent({
+    return {
       tenantId: context.identity.tenantId, runId: context.runId, attemptId: context.attemptId,
       turnNo: context.turnNo, logicalCallId: call.logicalCallId, toolCallId: call.id,
       toolName: call.name, argsDigest: digest(call.arguments), capability: tool.capability,
       idempotencyKey: `${context.identity.tenantId}:${context.runId}:${call.logicalCallId}`,
       approvedInteractionId: interactionId, status: 'pending_approval', createdAt: now, updatedAt: now,
-    });
+    };
   }
 }
 

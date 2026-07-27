@@ -62,12 +62,12 @@
 - Test: `/home/opt/develop/aicoding/aiop/tests/durable-runtime.test.ts`
 - Test: `/home/opt/develop/aicoding/aiop/tests/tool-runtime-platform.test.ts`
 
-- [ ] Add failing tests for approval, question, and plan waits that restart with a fresh Runtime instance and create a new Attempt after resolution.
-- [ ] Add failing crash tests for: before Ledger begin, after external success/before Turn commit, and after Turn commit/before response delivery.
-- [ ] Represent pending interaction and final Ledger records as neutral `KernelExit` durable facts.
-- [ ] Keep the pre-side-effect `started` Ledger write synchronous, then include confirmed Ledger/Interaction updates in `turns.commit()` so transcript, usage, events, and final facts share one transaction.
-- [ ] Prevent any remaining write tool in the same Turn after one call enters waiting.
-- [ ] Verify completed idempotent calls reuse one result and unknown non-idempotent writes always become `recovery_required`.
+- [x] Add failing tests for approval, question, and plan waits that restart with a fresh Runtime instance and create a new Attempt after resolution.
+- [x] Add failing crash tests for: before Ledger begin, after external success/before Turn commit, and after Turn commit/before response delivery.
+- [x] Represent pending interaction and final Ledger records as neutral `KernelExit` durable facts.
+- [x] Keep the pre-side-effect `started` Ledger write synchronous, then include confirmed Ledger/Interaction updates in `turns.commit()` so transcript, usage, events, and final facts share one transaction.
+- [x] Prevent any remaining write tool in the same Turn after one call enters waiting.
+- [x] Verify completed idempotent calls reuse one result and unknown non-idempotent writes always become `recovery_required`.
 - [ ] Commit with the required AIOS co-author trailer.
 
 ### Task 4: Tenant/tool/resource concurrency and execution quotas

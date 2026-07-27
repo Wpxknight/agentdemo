@@ -23,10 +23,11 @@ import {
   type UserMessage,
 } from '@earendil-works/pi-ai';
 import {
-  AgentPlatformError,
   type AgentContentBlock,
   type AgentKernel,
   type AgentRunUsage,
+  type DurableInteractionUpdate,
+  type DurableToolLedgerUpdate,
   type JsonValue,
   type KernelControl,
   type KernelExit,
@@ -71,10 +72,20 @@ export class PiAgentKernel implements AgentKernel {
     await control.guard();
     const logicalCalls = new Map<string, string>();
     let waitingReason: WaitingReason | undefined;
+    let recoveryRequired: { correlationId?: string; message: string } | undefined;
+    const ledgerUpdates: DurableToolLedgerUpdate[] = [];
+    const interactionUpdates: DurableInteractionUpdate[] = [];
     let lastAssistant: AssistantMessage | undefined;
     const usage: AgentRunUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
     const runMessages = await this.compactContext(input, control, usage);
-    const tools = this.createTools(input, () => waitingReason, (reason) => { waitingReason = reason; });
+    const tools = this.createTools(
+      input,
+      () => waitingReason,
+      (reason) => { waitingReason = reason; },
+      (recovery) => { recoveryRequired = recovery; },
+      ledgerUpdates,
+      interactionUpdates,
+    );
     const context: AgentContext = {
       systemPrompt: this.options.systemPrompt ?? '',
       messages: input.continuation ? toPiMessages(runMessages) : [],
@@ -116,16 +127,25 @@ export class PiAgentKernel implements AgentKernel {
     const messages = fromPiMessages(allMessages);
     lastAssistant ??= [...allMessages].reverse().find((message): message is AssistantMessage => message.role === 'assistant');
     const stopReason = lastAssistant?.stopReason;
-    const outcome = waitingReason ? 'waiting'
+    const outcome = recoveryRequired ? 'recovery_required'
+      : waitingReason ? 'waiting'
       : stopReason === 'error' || stopReason === 'aborted' ? 'failed'
         : stopReason === 'toolUse' ? 'continue'
           : 'completed';
-    const error = outcome === 'failed' ? {
+    const error = outcome === 'recovery_required' ? {
+      code: 'TOOL_RESULT_UNKNOWN' as const,
+      message: recoveryRequired?.message ?? 'Tool result requires recovery',
+      retryable: false,
+    } : outcome === 'failed' ? {
       code: 'MODEL_PROVIDER_ERROR' as const,
       message: lastAssistant?.errorMessage ?? 'Pi model turn failed',
       retryable: false,
     } : undefined;
-    return { outcome, turnNo: input.turnNo, stopReason, usage, messages, waitingReason, error };
+    return {
+      outcome, turnNo: input.turnNo, stopReason, usage, messages, waitingReason, error,
+      ledgerUpdates: ledgerUpdates.length ? ledgerUpdates : undefined,
+      interactionUpdates: interactionUpdates.length ? interactionUpdates : undefined,
+    };
   }
 
   private async compactContext(
@@ -175,6 +195,9 @@ export class PiAgentKernel implements AgentKernel {
     input: KernelRunInput,
     waiting: () => WaitingReason | undefined,
     setWaiting: (reason: WaitingReason) => void,
+    setRecovery: (recovery: { correlationId?: string; message: string }) => void,
+    ledgerUpdates: DurableToolLedgerUpdate[],
+    interactionUpdates: DurableInteractionUpdate[],
   ): AgentTool[] {
     return input.tools.map((definition) => ({
       name: definition.name,
@@ -196,8 +219,15 @@ export class PiAgentKernel implements AgentKernel {
           turnNo: input.turnNo,
           signal,
         });
+        if (outcome.ledgerUpdates) ledgerUpdates.push(...outcome.ledgerUpdates);
+        if (outcome.interactionUpdates) interactionUpdates.push(...outcome.interactionUpdates);
         if (outcome.kind === 'recovery_required') {
-          throw new AgentPlatformError({ code: 'TOOL_RESULT_UNKNOWN', message: outcome.message, retryable: false });
+          setRecovery({ correlationId: outcome.correlationId, message: outcome.message });
+          return {
+            content: [{ type: 'text', text: 'recovery_required' }],
+            details: outcome,
+            terminate: true,
+          };
         }
         if (outcome.kind === 'waiting') {
           setWaiting(outcome.reason);

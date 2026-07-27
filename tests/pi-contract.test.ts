@@ -246,4 +246,79 @@ describe('Pi public contract', () => {
     }, { emit: async () => undefined, guard: async () => undefined, shouldStopAfterTurn: async () => false });
     expect(toolRuntime.execute).not.toHaveBeenCalled();
   });
+
+  it('stops the remaining write tools in a Turn after the first call enters waiting', async () => {
+    const modelProvider: ModelProvider = {
+      async *stream() {
+        yield { type: 'tool_call', call: {
+          id: 'call-wait', logicalCallId: 'logical-wait', name: 'write', arguments: { order: 1 },
+        } };
+        yield { type: 'tool_call', call: {
+          id: 'call-blocked', logicalCallId: 'logical-blocked', name: 'write', arguments: { order: 2 },
+        } };
+        yield { type: 'stop', reason: 'toolUse' };
+      },
+    };
+    const execute = vi.fn(async (call) => ({
+      kind: 'waiting' as const,
+      reason: 'approval' as const,
+      interactionId: 'approval-a',
+      ledgerUpdates: [{
+        tenantId: 'tenant-a', runId: 'run-wait', attemptId: 'attempt-wait', turnNo: 1,
+        logicalCallId: call.logicalCallId, toolCallId: call.id, toolName: call.name,
+        argsDigest: 'args', capability: 'non_idempotent_write' as const, idempotencyKey: 'key',
+        status: 'pending_approval' as const, createdAt: new Date(), updatedAt: new Date(),
+      }],
+    }));
+    const kernel = new PiAgentKernel({ modelProvider, toolRuntime: { execute } });
+    const exit = await kernel.run({
+      runId: 'run-wait', attemptId: 'attempt-wait', turnNo: 1,
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'write twice' }] }],
+      model: { provider: 'fake', model: 'fake-1' },
+      tools: [{ name: 'write', description: 'write', inputSchema: { type: 'object' }, capability: 'non_idempotent_write' }],
+    }, { emit: async () => undefined, guard: async () => undefined, shouldStopAfterTurn: async () => false });
+
+    expect(exit.outcome).toBe('waiting');
+    expect(execute).toHaveBeenCalledOnce();
+    expect(exit.ledgerUpdates).toHaveLength(1);
+  });
+
+  it('returns recovery_required with its final ledger fact instead of converting it to a model failure', async () => {
+    const now = new Date();
+    const kernel = new PiAgentKernel({
+      modelProvider: {
+        async *stream() {
+          yield { type: 'tool_call', call: {
+            id: 'call-a', logicalCallId: 'logical-a', name: 'create', arguments: {},
+          } };
+          yield { type: 'stop', reason: 'toolUse' };
+        },
+      },
+      toolRuntime: {
+        execute: async () => ({
+          kind: 'recovery_required', message: 'external result unknown',
+          ledgerUpdates: [{
+            tenantId: 'tenant-a', runId: 'run-recovery', attemptId: 'attempt-recovery', turnNo: 1,
+            logicalCallId: 'logical-a', toolCallId: 'call-a', toolName: 'create', argsDigest: 'args',
+            capability: 'non_idempotent_write', idempotencyKey: 'key', status: 'recovery_required',
+            createdAt: now, updatedAt: now,
+          }],
+        }),
+      },
+    });
+    const exit = await kernel.run({
+      runId: 'run-recovery', attemptId: 'attempt-recovery', turnNo: 1,
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'create' }] }],
+      model: { provider: 'fake', model: 'fake-1' },
+      tools: [{ name: 'create', description: 'create', inputSchema: { type: 'object' }, capability: 'non_idempotent_write' }],
+    }, { emit: async () => undefined, guard: async () => undefined, shouldStopAfterTurn: async () => false });
+
+    expect(exit).toMatchObject({
+      outcome: 'recovery_required',
+      error: { code: 'TOOL_RESULT_UNKNOWN', message: 'external result unknown' },
+      ledgerUpdates: [expect.objectContaining({ status: 'recovery_required' })],
+    });
+  });
 });

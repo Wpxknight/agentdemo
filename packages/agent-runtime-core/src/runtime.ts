@@ -264,6 +264,8 @@ export class DurableAgentRuntime {
           }],
           runStatus: status,
           waitingReason: exit.waitingReason,
+          ledgerUpdates: exit.ledgerUpdates,
+          interactionUpdates: exit.interactionUpdates,
         });
         if (outcome === 'continue') {
           previous = commit;

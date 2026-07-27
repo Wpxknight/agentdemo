@@ -4,13 +4,12 @@ import type {
   AgentRunStatus,
   AgentRunUsage,
   AttemptStatus,
+  DurableInteractionUpdate,
+  DurableToolLedgerUpdate,
   IdentityContext,
-  JsonValue,
   KernelMessage,
   ModelBinding,
   RunLimits,
-  ToolCapability,
-  ToolResult,
   WaitingReason,
 } from '@aiop/agent-contracts';
 
@@ -90,35 +89,9 @@ export interface CommitTurnInput {
   interactionUpdates?: readonly InteractionRecord[];
 }
 
-export interface InteractionRecord extends RunIdentity {
-  id: string;
-  attemptId: string;
-  turnNo: number;
-  kind: 'approval' | 'question' | 'plan';
-  status: 'pending' | 'resolved' | 'cancelled' | 'expired';
-  payload: JsonValue;
-  resolution?: JsonValue;
-  createdAt: Date;
-  resolvedAt?: Date;
-}
+export type InteractionRecord = DurableInteractionUpdate;
 
-export interface ToolLedgerRecord extends RunIdentity {
-  attemptId: string;
-  turnNo: number;
-  logicalCallId: string;
-  toolCallId: string;
-  toolName: string;
-  argsDigest: string;
-  capability: ToolCapability;
-  idempotencyKey: string;
-  status: 'pending_approval' | 'started' | 'completed' | 'unknown' | 'recovery_required';
-  externalCorrelationId?: string;
-  resultDigest?: string;
-  approvedInteractionId?: string;
-  result?: ToolResult;
-  createdAt: Date;
-  updatedAt: Date;
-}
+export type ToolLedgerRecord = DurableToolLedgerUpdate;
 
 export interface LeaseRecord {
   ownerId: string;

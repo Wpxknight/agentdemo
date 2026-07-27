@@ -31,16 +31,43 @@ describe('ToolRuntimeEngine', () => {
     expect(order).toEqual(['policy', 'approval', 'hook', 'ledger', 'lock', 'execute', 'audit']);
   });
 
+  it('never starts an external tool when the synchronous started-ledger write fails', async () => {
+    const execute = vi.fn(async () => ({ content: 'should not run' }));
+    const runtime = new ToolRuntimeEngine({
+      ledger: {
+        get: async () => undefined,
+        putIfAbsent: async () => { throw new Error('ledger unavailable'); },
+        update: async () => undefined,
+      },
+      definitions: [{
+        name: 'write', description: 'write', inputSchema: { type: 'object' }, capability: 'retryable_write', execute,
+      }],
+    });
+
+    await expect(runtime.execute({
+      id: 'call-a', logicalCallId: 'logical-a', name: 'write', arguments: {},
+    }, context)).rejects.toThrow('ledger unavailable');
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it('returns a durable wait before executing a tool that needs approval', async () => {
     const execute = vi.fn();
     const runtime = new ToolRuntimeEngine({
       ledger: new MemoryRuntimeStore().toolLedger,
       definitions: [{ name: 'write', description: 'write', inputSchema: { type: 'object' }, capability: 'retryable_write', execute }],
       policy: { check: async () => ({ allowed: true, needsApproval: true }) },
-      approval: { request: async () => ({ approved: false, pending: true, interactionId: 'approval-a' }) },
+      approval: { request: async () => ({
+        approved: false, pending: true, interactionId: 'approval-a', payload: { reason: 'production write' },
+      }) },
     });
     await expect(runtime.execute({ id: 'call-a', logicalCallId: 'logical-a', name: 'write', arguments: {} }, context))
-      .resolves.toEqual({ kind: 'waiting', reason: 'approval', interactionId: 'approval-a' });
+      .resolves.toMatchObject({
+        kind: 'waiting', reason: 'approval', interactionId: 'approval-a',
+        ledgerUpdates: [expect.objectContaining({ status: 'pending_approval' })],
+        interactionUpdates: [expect.objectContaining({
+          id: 'approval-a', kind: 'approval', status: 'pending', payload: { reason: 'production write' },
+        })],
+      });
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -54,8 +81,14 @@ describe('ToolRuntimeEngine', () => {
     });
     const call = { id: 'call-a', logicalCallId: 'logical-a', name: 'create', arguments: {} } as const;
     const first = await runtime.execute(call, context);
-    const reused = await runtime.execute(call, { ...context, attemptId: 'attempt-b' });
-    expect(first).toEqual(reused);
+    await store.toolLedger.update(first.ledgerUpdates![0]!);
+    const freshRuntime = new ToolRuntimeEngine({
+      ledger: store.toolLedger,
+      definitions: [{ name: 'create', description: 'create', inputSchema: { type: 'object' }, capability: 'non_idempotent_write', execute }],
+      policy: { check: async () => ({ allowed: true }) },
+    });
+    const reused = await freshRuntime.execute(call, { ...context, attemptId: 'attempt-b' });
+    expect(reused).toMatchObject({ kind: 'result', result: { content: 'created' } });
     expect(execute).toHaveBeenCalledOnce();
 
     await store.toolLedger.putIfAbsent({
@@ -69,6 +102,29 @@ describe('ToolRuntimeEngine', () => {
     }, { ...context, attemptId: 'attempt-b' });
     expect(unknown.kind).toBe('recovery_required');
     expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it('keeps external success provisional until the caller commits the returned final ledger fact', async () => {
+    const execute = vi.fn(async () => ({ content: 'created' }));
+    const store = new MemoryRuntimeStore();
+    const runtime = new ToolRuntimeEngine({
+      ledger: store.toolLedger,
+      definitions: [{
+        name: 'create', description: 'create', inputSchema: { type: 'object' }, capability: 'non_idempotent_write', execute,
+      }],
+    });
+    const call = { id: 'call-a', logicalCallId: 'logical-a', name: 'create', arguments: {} } as const;
+
+    const outcome = await runtime.execute(call, context);
+
+    expect(outcome).toMatchObject({ kind: 'result', result: { content: 'created' } });
+    expect(outcome.ledgerUpdates).toHaveLength(1);
+    expect(outcome.ledgerUpdates![0]).toMatchObject({ status: 'completed', result: { content: 'created' } });
+    const provisional = await store.toolLedger.get({
+      tenantId: context.identity.tenantId, runId: context.runId, logicalCallId: call.logicalCallId,
+    });
+    expect(provisional).toMatchObject({ status: 'started' });
+    expect(provisional?.result).toBeUndefined();
   });
 
   it('uses Pi truncation and stores the original output only when configured', async () => {

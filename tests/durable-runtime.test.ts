@@ -60,6 +60,78 @@ describe('DurableAgentRuntime', () => {
     expect(await store.attempts.list({ tenantId: 'tenant-a', runId: first.runId })).toHaveLength(2);
   });
 
+  it.each(['approval', 'question', 'plan'] as const)(
+    'commits a pending %s interaction and resolves it from a fresh Runtime attempt',
+    async (kind) => {
+      const store = new MemoryRuntimeStore();
+      const interactionId = `${kind}-interaction`;
+      const firstKernel: AgentKernel = {
+        descriptor: { name: 'pi', version: '0.82.1', protocolVersion: '1' },
+        run: async (input) => ({
+          ...completed('waiting'),
+          outcome: 'waiting',
+          waitingReason: kind,
+          interactionUpdates: [{
+            tenantId: input.identity.tenantId,
+            runId: input.runId,
+            id: interactionId,
+            attemptId: input.attemptId,
+            turnNo: input.turnNo,
+            kind,
+            status: 'pending',
+            payload: { prompt: `${kind} required` },
+            createdAt: new Date('2026-07-27T00:00:00.000Z'),
+          }],
+        }),
+      };
+      const firstRuntime = new DurableAgentRuntime({ store, kernels: [firstKernel], defaultKernel: 'pi' });
+      const first = await firstRuntime.run({ identity, sessionId: 'session-a', input: [{ role: 'user', text: 'hello' }] });
+      expect((await first.result()).status).toBe('waiting');
+      await expect(store.interactions.get({
+        tenantId: identity.tenantId, runId: first.runId, interactionId,
+      })).resolves.toMatchObject({ kind, status: 'pending' });
+
+      const resumedKernel: AgentKernel = {
+        ...firstKernel,
+        run: async () => completed('resumed'),
+      };
+      const resumedRuntime = new DurableAgentRuntime({ store, kernels: [resumedKernel], defaultKernel: 'pi' });
+      const resumed = await resumedRuntime.resume({
+        identity,
+        runId: first.runId,
+        resolution: { interactionId, value: { approved: true } },
+      });
+      expect((await resumed.result()).status).toBe('succeeded');
+      await expect(store.interactions.get({
+        tenantId: identity.tenantId, runId: first.runId, interactionId,
+      })).resolves.toMatchObject({ status: 'resolved', resolution: { approved: true } });
+      expect(await store.attempts.list({ tenantId: identity.tenantId, runId: first.runId })).toHaveLength(2);
+    },
+  );
+
+  it('commits transcript, usage, interaction, and final ledger facts in one Turn commit', async () => {
+    const store = new MemoryRuntimeStore();
+    const now = new Date('2026-07-27T00:00:00.000Z');
+    const kernel: AgentKernel = {
+      descriptor: { name: 'pi', version: '0.82.1', protocolVersion: '1' },
+      run: async (input) => ({
+        ...completed('tool completed'),
+        ledgerUpdates: [{
+          tenantId: input.identity.tenantId, runId: input.runId, attemptId: input.attemptId, turnNo: input.turnNo,
+          logicalCallId: 'logical-a', toolCallId: 'call-a', toolName: 'write', argsDigest: 'args',
+          capability: 'retryable_write', idempotencyKey: 'key-a', status: 'completed',
+          result: { callId: 'call-a', content: 'created' }, resultDigest: 'result', createdAt: now, updatedAt: now,
+        }],
+      }),
+    };
+    const runtime = new DurableAgentRuntime({ store, kernels: [kernel], defaultKernel: 'pi' });
+    const handle = await runtime.run({ identity, sessionId: 'session-a', input: [] });
+    expect((await handle.result()).status).toBe('succeeded');
+    await expect(store.toolLedger.get({
+      tenantId: identity.tenantId, runId: handle.runId, logicalCallId: 'logical-a',
+    })).resolves.toMatchObject({ status: 'completed', result: { content: 'created' } });
+  });
+
   it('commits every model turn before continuing within the same attempt', async () => {
     const store = new MemoryRuntimeStore();
     const inputs: Array<{ turnNo: number; continuation: boolean }> = [];
