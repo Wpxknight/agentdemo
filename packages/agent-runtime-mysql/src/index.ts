@@ -239,6 +239,21 @@ export class MysqlRuntimeStore implements RuntimeStore {
         createdAt: row.created_at, resolvedAt: row.resolved_at ?? undefined,
       } : undefined;
     },
+    list: async (identity: RunIdentity): Promise<InteractionRecord[]> => {
+      const rows = await this.db.selectFrom('agent_interactions').selectAll()
+        .where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId)
+        .orderBy('created_at', 'asc').execute();
+      return rows.map((row) => ({
+        tenantId: row.tenant_id, runId: row.run_id, id: row.id,
+        userId: row.user_id || undefined, sessionId: row.session_id || undefined,
+        attemptId: row.attempt_id ?? '', turnNo: row.turn_no ?? 0,
+        kind: row.kind as InteractionRecord['kind'], toolCallId: row.tool_call_id ?? undefined,
+        status: row.status as InteractionRecord['status'], payload: parse(row.payload) as InteractionRecord['payload'],
+        resolution: row.resolution === null ? undefined : parse(row.resolution) as InteractionRecord['resolution'],
+        resolvedBy: row.resolved_by ?? undefined, expiresAt: row.expires_at,
+        createdAt: row.created_at, resolvedAt: row.resolved_at ?? undefined,
+      }));
+    },
   };
 
   readonly toolLedger = {

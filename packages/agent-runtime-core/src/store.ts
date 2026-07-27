@@ -124,6 +124,7 @@ export interface TurnRepository {
 export interface InteractionRepository {
   put(record: InteractionRecord): Promise<void>;
   get(identity: RunIdentity & { interactionId: string }): Promise<InteractionRecord | undefined>;
+  list(identity: RunIdentity): Promise<InteractionRecord[]>;
 }
 
 export interface ToolLedgerRepository {

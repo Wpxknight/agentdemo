@@ -107,12 +107,14 @@ export interface KernelRunInput {
   runId: string;
   attemptId: string;
   turnNo: number;
+  sessionId?: string;
   identity: IdentityContext;
   messages: readonly KernelMessage[];
   model: ModelBinding;
   tools: readonly ToolDefinition[];
   limits?: RunLimits;
   continuation?: boolean;
+  interactionResolution?: ResolvedInteraction;
   signal?: AbortSignal;
 }
 
@@ -224,7 +226,16 @@ export interface ToolExecutionContext {
   runId: string;
   attemptId: string;
   turnNo: number;
+  sessionId?: string;
+  interactionResolution?: ResolvedInteraction;
   signal?: AbortSignal;
+}
+
+export interface ResolvedInteraction {
+  interactionId: string;
+  kind: 'approval' | 'question' | 'plan';
+  toolCallId: string;
+  value: JsonValue;
 }
 
 export interface ToolRuntime {
@@ -235,12 +246,17 @@ export interface DurableInteractionUpdate {
   tenantId: string;
   runId: string;
   id: string;
+  userId?: string;
+  sessionId?: string;
   attemptId: string;
   turnNo: number;
   kind: 'approval' | 'question' | 'plan';
+  toolCallId?: string;
   status: 'pending' | 'resolved' | 'cancelled' | 'expired';
   payload: JsonValue;
   resolution?: JsonValue;
+  resolvedBy?: string;
+  expiresAt?: Date;
   createdAt: Date;
   resolvedAt?: Date;
 }

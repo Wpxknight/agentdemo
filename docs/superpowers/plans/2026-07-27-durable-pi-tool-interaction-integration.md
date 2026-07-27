@@ -18,12 +18,12 @@
 - Modify: `/home/opt/develop/aicoding/aiop/packages/agent-runtime-core/src/runtime.ts`
 - Test: `/home/opt/develop/aicoding/aiop/tests/durable-runtime.test.ts`
 
-- [ ] Add a failing test where a waiting interaction has `toolCallId`, `userId`, `sessionId`, and `expiresAt`, `resume()` receives a resolution, and the fresh Kernel receives the resolved interaction in `KernelRunInput.interactionResolution`.
-- [ ] Add a failing test where the Interaction was already resolved by the product Store; matching resolution resumes, conflicting resolution fails with `RUN_STATE_CONFLICT`, and the original TurnCommit remains unchanged.
-- [ ] Extend `DurableInteractionUpdate`, `KernelRunInput`, and `ToolExecutionContext` with the exact trusted fields from the spec; add `InteractionRepository.list(run)`.
-- [ ] Pass `record.sessionId` and the validated resolution through `startHandle()` and `execute()` into every Kernel invocation of the new Attempt.
-- [ ] Run `npx vitest run tests/durable-runtime.test.ts tests/memory-runtime-store.test.ts` and confirm the new tests pass.
-- [ ] Commit with the required AIOS co-author trailer.
+- [x] Add a failing test where a waiting interaction has `toolCallId`, `userId`, `sessionId`, and `expiresAt`, `resume()` receives a resolution, and the fresh Kernel receives the resolved interaction in `KernelRunInput.interactionResolution`.
+- [x] Add a failing test where the Interaction was already resolved by the product Store; matching resolution resumes, conflicting resolution fails with `RUN_STATE_CONFLICT`, and the original TurnCommit remains unchanged.
+- [x] Extend `DurableInteractionUpdate`, `KernelRunInput`, and `ToolExecutionContext` with the exact trusted fields from the spec; add `InteractionRepository.list(run)`.
+- [x] Pass `record.sessionId` and the validated resolution through `startHandle()` and `execute()` into every Kernel invocation of the new Attempt.
+- [x] Run `npx vitest run tests/durable-runtime.test.ts tests/memory-runtime-store.test.ts` and confirm the new tests pass.
+- [x] Commit with the required AIOS co-author trailer.
 
 ### Task 2: Complete Memory/MySQL Interaction repositories
 

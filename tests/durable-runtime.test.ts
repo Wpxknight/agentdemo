@@ -65,6 +65,7 @@ describe('DurableAgentRuntime', () => {
     async (kind) => {
       const store = new MemoryRuntimeStore();
       const interactionId = `${kind}-interaction`;
+      const resumedInputs: Parameters<AgentKernel['run']>[0][] = [];
       const firstKernel: AgentKernel = {
         descriptor: { name: 'pi', version: '0.82.1', protocolVersion: '1' },
         run: async (input) => ({
@@ -75,11 +76,15 @@ describe('DurableAgentRuntime', () => {
             tenantId: input.identity.tenantId,
             runId: input.runId,
             id: interactionId,
+            userId: input.identity.actorId,
+            sessionId: input.sessionId,
             attemptId: input.attemptId,
             turnNo: input.turnNo,
             kind,
+            toolCallId: `${kind}-call`,
             status: 'pending',
             payload: { prompt: `${kind} required` },
+            expiresAt: new Date('2026-07-28T00:00:00.000Z'),
             createdAt: new Date('2026-07-27T00:00:00.000Z'),
           }],
         }),
@@ -93,7 +98,10 @@ describe('DurableAgentRuntime', () => {
 
       const resumedKernel: AgentKernel = {
         ...firstKernel,
-        run: async () => completed('resumed'),
+        run: async (input) => {
+          resumedInputs.push(input);
+          return completed('resumed');
+        },
       };
       const resumedRuntime = new DurableAgentRuntime({ store, kernels: [resumedKernel], defaultKernel: 'pi' });
       const resumed = await resumedRuntime.resume({
@@ -105,9 +113,88 @@ describe('DurableAgentRuntime', () => {
       await expect(store.interactions.get({
         tenantId: identity.tenantId, runId: first.runId, interactionId,
       })).resolves.toMatchObject({ status: 'resolved', resolution: { approved: true } });
+      expect(resumedInputs[0]).toMatchObject({
+        sessionId: 'session-a',
+        interactionResolution: {
+          interactionId,
+          kind,
+          toolCallId: `${kind}-call`,
+          value: { approved: true },
+        },
+      });
       expect(await store.attempts.list({ tenantId: identity.tenantId, runId: first.runId })).toHaveLength(2);
     },
   );
+
+  it('resumes an interaction already resolved by the product store when the value matches', async () => {
+    const store = new MemoryRuntimeStore();
+    const firstKernel: AgentKernel = {
+      descriptor: { name: 'pi', version: '0.82.1', protocolVersion: '1' },
+      run: async (input) => ({
+        ...completed('waiting'), outcome: 'waiting', waitingReason: 'approval',
+        interactionUpdates: [{
+          tenantId: input.identity.tenantId, runId: input.runId, id: 'approval-resolved',
+          userId: input.identity.actorId, sessionId: input.sessionId, attemptId: input.attemptId,
+          turnNo: input.turnNo, kind: 'approval', toolCallId: 'call-resolved', status: 'pending',
+          payload: { reason: 'production write' }, expiresAt: new Date('2026-07-28T00:00:00.000Z'),
+          createdAt: new Date('2026-07-27T00:00:00.000Z'),
+        }],
+      }),
+    };
+    const firstRuntime = new DurableAgentRuntime({ store, kernels: [firstKernel], defaultKernel: 'pi' });
+    const first = await firstRuntime.run({ identity, sessionId: 'session-a', input: [] });
+    await first.result();
+    const interaction = await store.interactions.get({
+      tenantId: identity.tenantId, runId: first.runId, interactionId: 'approval-resolved',
+    });
+    await store.interactions.put({
+      ...interaction!, status: 'resolved', resolution: true, resolvedBy: 'approver-a',
+      resolvedAt: new Date('2026-07-27T01:00:00.000Z'),
+    });
+    const originalCommit = await store.turns.getLastCommitted({ tenantId: identity.tenantId, runId: first.runId });
+    const resumedKernel: AgentKernel = { ...firstKernel, run: vi.fn(async () => completed('resumed')) };
+    const resumedRuntime = new DurableAgentRuntime({ store, kernels: [resumedKernel], defaultKernel: 'pi' });
+
+    const resumed = await resumedRuntime.resume({
+      identity, runId: first.runId, resolution: { interactionId: 'approval-resolved', value: true },
+    });
+
+    await expect(resumed.result()).resolves.toMatchObject({ status: 'succeeded' });
+    expect(resumedKernel.run).toHaveBeenCalledWith(expect.objectContaining({
+      interactionResolution: expect.objectContaining({
+        interactionId: 'approval-resolved', kind: 'approval', toolCallId: 'call-resolved', value: true,
+      }),
+    }), expect.anything());
+    expect((await store.turns.listCommitted({ tenantId: identity.tenantId, runId: first.runId }))[0])
+      .toEqual(originalCommit);
+  });
+
+  it('rejects a conflicting value for an interaction already resolved by the product store', async () => {
+    const store = new MemoryRuntimeStore();
+    const firstKernel: AgentKernel = {
+      descriptor: { name: 'pi', version: '0.82.1', protocolVersion: '1' },
+      run: async (input) => ({
+        ...completed('waiting'), outcome: 'waiting', waitingReason: 'approval',
+        interactionUpdates: [{
+          tenantId: input.identity.tenantId, runId: input.runId, id: 'approval-conflict',
+          userId: input.identity.actorId, sessionId: input.sessionId, attemptId: input.attemptId,
+          turnNo: input.turnNo, kind: 'approval', toolCallId: 'call-conflict', status: 'pending', payload: {},
+          expiresAt: new Date('2026-07-28T00:00:00.000Z'), createdAt: new Date('2026-07-27T00:00:00.000Z'),
+        }],
+      }),
+    };
+    const runtime = new DurableAgentRuntime({ store, kernels: [firstKernel], defaultKernel: 'pi' });
+    const first = await runtime.run({ identity, sessionId: 'session-a', input: [] });
+    await first.result();
+    const interaction = await store.interactions.get({
+      tenantId: identity.tenantId, runId: first.runId, interactionId: 'approval-conflict',
+    });
+    await store.interactions.put({ ...interaction!, status: 'resolved', resolution: true, resolvedAt: new Date() });
+
+    await expect(runtime.resume({
+      identity, runId: first.runId, resolution: { interactionId: 'approval-conflict', value: false },
+    })).rejects.toMatchObject({ code: 'RUN_STATE_CONFLICT' });
+  });
 
   it('commits transcript, usage, interaction, and final ledger facts in one Turn commit', async () => {
     const store = new MemoryRuntimeStore();

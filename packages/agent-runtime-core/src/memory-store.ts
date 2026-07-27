@@ -189,6 +189,10 @@ export class MemoryRuntimeStore implements RuntimeStore {
     get: async (
       identity: RunIdentity & { interactionId: string },
     ): Promise<InteractionRecord | undefined> => clone(this.state.interactions.get(interactionKey(identity))),
+    list: async (identity: RunIdentity): Promise<InteractionRecord[]> => [...this.state.interactions.values()]
+      .filter((record) => record.tenantId === identity.tenantId && record.runId === identity.runId)
+      .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime())
+      .map(clone),
   };
 
   readonly toolLedger = {

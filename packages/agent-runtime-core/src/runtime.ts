@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import {
   AgentPlatformError,
   type AgentKernel,
@@ -10,6 +11,7 @@ import {
   type KernelMessage,
   type ModelBinding,
   type ResumeRunInput,
+  type ResolvedInteraction,
   type RunLimits,
   type RunHandle,
   type RuntimeObservation,
@@ -120,14 +122,28 @@ export class DurableAgentRuntime {
     if (!snapshot) {
       throw new AgentPlatformError({ code: 'TURN_COMMIT_FAILED', message: 'Committed turn snapshot is missing', retryable: false });
     }
+    let interactionResolution: ResolvedInteraction | undefined;
     if (input.resolution) {
       const interaction = await this.options.store.interactions.get({ ...identity, interactionId: input.resolution.interactionId });
-      if (!interaction || interaction.status !== 'pending') {
-        throw new AgentPlatformError({ code: 'RUN_STATE_CONFLICT', message: 'Interaction is not pending', retryable: false });
+      if (!interaction) {
+        throw new AgentPlatformError({ code: 'RUN_STATE_CONFLICT', message: 'Interaction does not exist', retryable: false });
       }
-      await this.options.store.interactions.put({
-        ...interaction, status: 'resolved', resolution: input.resolution.value, resolvedAt: this.now(),
-      });
+      if (!interaction.toolCallId) {
+        throw new AgentPlatformError({ code: 'RUN_STATE_CONFLICT', message: 'Interaction tool call is missing', retryable: false });
+      }
+      if (interaction.status === 'pending') {
+        await this.options.store.interactions.put({
+          ...interaction, status: 'resolved', resolution: input.resolution.value, resolvedAt: this.now(),
+        });
+      } else if (interaction.status !== 'resolved' || !isDeepStrictEqual(interaction.resolution, input.resolution.value)) {
+        throw new AgentPlatformError({ code: 'RUN_STATE_CONFLICT', message: 'Interaction resolution conflicts', retryable: false });
+      }
+      interactionResolution = {
+        interactionId: interaction.id,
+        kind: interaction.kind,
+        toolCallId: interaction.toolCallId,
+        value: input.resolution.value,
+      };
     }
     const messages = (last.stopReason === 'error' || last.stopReason === 'aborted')
       && last.messages.at(-1)?.role === 'assistant'
@@ -135,7 +151,7 @@ export class DurableAgentRuntime {
       : last.messages;
     return this.startHandle(record, kernel, {
       ...input.identity, correlationId: input.identity.correlationId ?? snapshot.identity.correlationId ?? input.runId,
-    }, messages, true, input.signal, snapshot.limits);
+    }, messages, true, input.signal, snapshot.limits, interactionResolution);
   }
 
   async cancel(input: CancelRunInput): Promise<void> {
@@ -164,12 +180,13 @@ export class DurableAgentRuntime {
     continuation: boolean,
     externalSignal?: AbortSignal,
     limits?: RunLimits,
+    interactionResolution?: ResolvedInteraction,
   ): RunHandle {
     const identity = { tenantId: record.tenantId, runId: record.runId };
     const key = runKey(identity);
     let settled = false;
     const resultPromise = this.execute(
-      record, kernel, identityContext, messages, continuation, externalSignal, limits,
+      record, kernel, identityContext, messages, continuation, externalSignal, limits, interactionResolution,
     ).finally(() => {
       settled = true;
       this.executions.delete(key);
@@ -191,6 +208,7 @@ export class DurableAgentRuntime {
     continuation: boolean,
     externalSignal?: AbortSignal,
     limits?: RunLimits,
+    interactionResolution?: ResolvedInteraction,
   ): Promise<AgentRunResult> {
     const identity = { tenantId: record.tenantId, runId: record.runId };
     const controller = new AbortController();
@@ -241,11 +259,13 @@ export class DurableAgentRuntime {
           ...identity,
           attemptId,
           turnNo,
+          sessionId: record.sessionId,
           identity: identityContext,
           messages: currentMessages,
           model: this.modelBinding,
           tools: this.tools,
           continuation: currentContinuation,
+          interactionResolution,
           signal,
         }, {
           emit: async (event) => {
