@@ -48,10 +48,41 @@ describe('AgentRuntime', () => {
     expect(new AgentRuntime().kernelName).toBe('legacy');
   });
 
-  it('selects LangGraph only when explicitly configured and otherwise falls back to legacy', () => {
+  it('selects Pi or LangGraph only when explicitly configured and otherwise falls back to legacy', () => {
     expect(createConfiguredAgentRuntime({}).kernelName).toBe('legacy');
+    expect(createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'pi' }).kernelName).toBe('pi');
     expect(createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'langgraph' }).kernelName).toBe('langgraph');
     expect(createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'unknown' }).kernelName).toBe('legacy');
+  });
+
+  it('routes tenant-rule Pi rollout lists before legacy fallback', async () => {
+    const calls: string[] = [];
+    const result: RunAgentResult = {
+      messages: [], text: '', steps: 0,
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      compacted: false,
+    };
+    const kernel = (name: 'pi' | 'legacy'): AgentKernel => ({
+      name,
+      run: async () => { calls.push(name); return result; },
+    });
+    const runtime = createConfiguredAgentRuntime({
+      AIOP_AGENT_KERNEL: 'tenant-rule',
+      AIOP_PI_TEST_TENANTS: 'tenant-pi',
+      AIOP_PI_INTERNAL_USERS: 'user-pi',
+      AIOP_PI_READ_ONLY_SESSIONS: 'session-pi-ro',
+      AIOP_PI_FULL_SESSIONS: 'session-pi-full',
+    }, { kernels: { legacy: kernel('legacy'), pi: kernel('pi') } });
+
+    for (const ctx of [
+      { tenantId: 'tenant-pi', userId: 'u', sessionId: 's' },
+      { tenantId: 'tenant-x', userId: 'user-pi', sessionId: 's' },
+      { tenantId: 'tenant-x', userId: 'u', sessionId: 'session-pi-ro' },
+      { tenantId: 'tenant-x', userId: 'u', sessionId: 'session-pi-full' },
+      { tenantId: 'tenant-x', userId: 'u', sessionId: 'other' },
+    ]) await runtime.run({ ...runOptions(), ctx });
+
+    expect(calls).toEqual(['pi', 'pi', 'pi', 'pi', 'legacy']);
   });
 
   it('applies tenant-rule rollout stages in fixed precedence', async () => {

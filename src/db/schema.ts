@@ -68,6 +68,13 @@ export interface TaskRunsTable {
   created_at: Generated<Date>;
 }
 
+export interface TaskAgentRunsTable {
+  tenant_id: string;
+  task_id: number;
+  run_id: string;
+  created_at: Date;
+}
+
 export interface TenantsTable {
   id: string;
   name: string;
@@ -281,6 +288,7 @@ export interface Database {
   audit_events: AuditEventsTable;
   scheduled_tasks: ScheduledTasksTable;
   task_runs: TaskRunsTable;
+  task_agent_runs: TaskAgentRunsTable;
   tenants: TenantsTable;
   users: UsersTable;
   user_credentials: UserCredentialsTable;

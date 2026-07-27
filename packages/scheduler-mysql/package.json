@@ -1,0 +1,13 @@
+{
+  "name": "@aiop/scheduler-mysql",
+  "version": "0.1.0-preview.1",
+  "type": "module",
+  "sideEffects": false,
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@aiop/scheduler-core": "0.1.0-preview.1",
+    "cron-parser": "5.5.0",
+    "kysely": "0.29.2"
+  },
+  "engines": { "node": ">=22.19.0" }
+}

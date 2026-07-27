@@ -1,7 +1,7 @@
 import type { RunAgentOptions, RunAgentResult } from './core.js';
 
 /** 可观测、可配置的 Agent 执行内核名称。 */
-export type AgentKernelName = 'legacy' | 'langgraph' | (string & {});
+export type AgentKernelName = 'pi' | 'legacy' | 'langgraph' | (string & {});
 
 /**
  * AIoP Agent 执行内核稳定边界。

@@ -1,0 +1,13 @@
+{
+  "name": "@aiop/sandbox-opensandbox",
+  "version": "0.1.0-preview.1",
+  "type": "module",
+  "sideEffects": false,
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@aiop/agent-contracts": "0.1.0-preview.1",
+    "@aiop/sandbox-core": "0.1.0-preview.1",
+    "@alibaba-group/opensandbox": "0.1.9"
+  },
+  "engines": { "node": ">=22.19.0" }
+}

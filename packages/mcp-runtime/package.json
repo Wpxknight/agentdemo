@@ -1,0 +1,12 @@
+{
+  "name": "@aiop/mcp-runtime",
+  "version": "0.1.0-preview.1",
+  "type": "module",
+  "sideEffects": false,
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@aiop/agent-contracts": "0.1.0-preview.1",
+    "@modelcontextprotocol/sdk": "1.29.0"
+  },
+  "engines": { "node": ">=22.19.0" }
+}

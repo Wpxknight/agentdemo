@@ -1,0 +1,13 @@
+{
+  "name": "@aiop/sandbox-e2b",
+  "version": "0.1.0-preview.1",
+  "type": "module",
+  "sideEffects": false,
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@aiop/agent-contracts": "0.1.0-preview.1",
+    "@aiop/sandbox-core": "0.1.0-preview.1",
+    "@e2b/code-interpreter": "2.6.0"
+  },
+  "engines": { "node": ">=22.19.0" }
+}

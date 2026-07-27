@@ -3,6 +3,7 @@ import type { RunAgentOptions, RunAgentResult } from './core.js';
 import type { AgentKernel, AgentKernelName } from './kernel.js';
 import { LegacyAgentKernel } from './legacy-kernel.js';
 import { LangGraphAgentKernel } from './langgraph/kernel.js';
+import { PiAIOPAgentKernel } from './pi/kernel.js';
 import { DEFAULT_AGENT_GRAPH_NAME, DEFAULT_AGENT_GRAPH_VERSION } from './langgraph/registry.js';
 import { logger } from '../logger.js';
 import type { AgentRunBinding, Store } from '../db/store.js';
@@ -16,7 +17,7 @@ export interface AgentRunBindingStore {
   putAgentRunBindingIfAbsent(binding: AgentRunBinding): Promise<boolean>;
 }
 
-type BuiltinKernelName = 'legacy' | 'langgraph';
+type BuiltinKernelName = 'pi' | 'legacy' | 'langgraph';
 
 export interface AgentRuntimeOptions {
   kernel?: AgentKernel;
@@ -42,11 +43,14 @@ export class AgentRuntime {
 
   constructor(options: AgentRuntimeOptions = {}) {
     const defaultKernel = options.kernel ?? options.kernels?.legacy ?? new LegacyAgentKernel();
+    const defaultBuiltinName: BuiltinKernelName = isBuiltinKernelName(defaultKernel.name)
+      ? defaultKernel.name
+      : 'legacy';
     this.kernel = defaultKernel;
-    this.kernels = options.kernels ?? (defaultKernel.name === 'legacy' || defaultKernel.name === 'langgraph'
-      ? { [defaultKernel.name]: defaultKernel }
+    this.kernels = options.kernels ?? (isBuiltinKernelName(defaultKernel.name)
+      ? { [defaultBuiltinName]: defaultKernel }
       : {});
-    this.selector = options.selector ?? (() => defaultKernel.name === 'langgraph' ? 'langgraph' : 'legacy');
+    this.selector = options.selector ?? (() => defaultBuiltinName);
     this.configuredName = options.configuredName ?? defaultKernel.name;
     this.bindingStore = options.bindingStore;
     this.graphName = options.graphName ?? DEFAULT_AGENT_GRAPH_NAME;
@@ -59,7 +63,7 @@ export class AgentRuntime {
   }
 
   async run(options: RunAgentOptions): Promise<RunAgentResult> {
-    if (!this.kernels.legacy && !this.kernels.langgraph) return this.kernel.run(options);
+    if (!this.kernels.pi && !this.kernels.legacy && !this.kernels.langgraph) return this.kernel.run(options);
     const selected = await this.selectLockedKernel(options);
     const kernel = this.kernels[selected];
     if (!kernel) throw new Error(`Agent Kernel 不可用：${selected}`);
@@ -113,7 +117,7 @@ export class AgentRuntime {
       && (binding.graphName !== this.graphName || binding.graphVersion !== this.graphVersion)) {
       throw new Error(`Agent graph version 不可用：${binding.graphName}@${binding.graphVersion}`);
     }
-    if (binding.kernel !== 'legacy' && binding.kernel !== 'langgraph') {
+    if (binding.kernel !== 'pi' && binding.kernel !== 'legacy' && binding.kernel !== 'langgraph') {
       throw new Error(`Agent Kernel 不可用：${binding.kernel}@${binding.kernelVersion ?? 'unknown'}`);
     }
     return binding.kernel;
@@ -137,6 +141,7 @@ export function createConfiguredAgentRuntime(
   } = {},
 ): AgentRuntime {
   const legacy = options.kernels?.legacy ?? new LegacyAgentKernel();
+  const pi = options.kernels?.pi ?? new PiAIOPAgentKernel();
   let langgraph = options.kernels?.langgraph;
   if (!langgraph) {
     try {
@@ -145,12 +150,14 @@ export function createConfiguredAgentRuntime(
       logger.warn({ error: String(error) }, 'LangGraph Kernel 初始化失败');
     }
   }
-  const kernels = { legacy, ...(langgraph ? { langgraph } : {}) };
+  const kernels = { pi, legacy, ...(langgraph ? { langgraph } : {}) };
   const configured = env.AIOP_AGENT_KERNEL?.trim().toLowerCase() || 'legacy';
-  if (configured !== 'legacy' && configured !== 'langgraph' && configured !== 'tenant-rule') {
+  if (configured !== 'pi' && configured !== 'legacy' && configured !== 'langgraph' && configured !== 'tenant-rule') {
     logger.warn({ configured }, '未知 Agent Kernel，回退 Legacy Kernel');
   }
-  const requested = configured === 'langgraph' || configured === 'tenant-rule' ? configured : 'legacy';
+  const requested = configured === 'pi' || configured === 'langgraph' || configured === 'tenant-rule'
+    ? configured
+    : 'legacy';
   const effective = requested === 'langgraph' && !langgraph ? 'legacy' : requested;
   if (requested === 'langgraph' && !langgraph) logger.warn('LangGraph Kernel 不可用，回退 Legacy Kernel');
   const rollout = rolloutSelector(env);
@@ -158,7 +165,7 @@ export function createConfiguredAgentRuntime(
     ? (runOptions: RunAgentOptions) => rollout(runOptions) === 'langgraph' && !langgraph ? 'legacy' : rollout(runOptions)
     : () => effective as BuiltinKernelName;
   return new AgentRuntime({
-    kernel: effective === 'langgraph' && langgraph ? langgraph : legacy,
+    kernel: effective === 'pi' ? pi : effective === 'langgraph' && langgraph ? langgraph : legacy,
     kernels,
     selector,
     configuredName: effective,
@@ -173,11 +180,19 @@ function abortMessage(reason: unknown): string {
 }
 
 function rolloutSelector(env: NodeJS.ProcessEnv): (options: RunAgentOptions) => BuiltinKernelName {
+  const piTestTenants = csv(env.AIOP_PI_TEST_TENANTS);
+  const piInternalUsers = csv(env.AIOP_PI_INTERNAL_USERS);
+  const piReadOnlySessions = csv(env.AIOP_PI_READ_ONLY_SESSIONS);
+  const piFullSessions = csv(env.AIOP_PI_FULL_SESSIONS);
   const testTenants = csv(env.AIOP_LANGGRAPH_TEST_TENANTS);
   const internalUsers = csv(env.AIOP_LANGGRAPH_INTERNAL_USERS);
   const readOnlySessions = csv(env.AIOP_LANGGRAPH_READ_ONLY_SESSIONS);
   const fullSessions = csv(env.AIOP_LANGGRAPH_FULL_SESSIONS);
   return (options) => {
+    if (options.ctx.tenantId && piTestTenants.has(options.ctx.tenantId)) return 'pi';
+    if (options.ctx.userId && piInternalUsers.has(options.ctx.userId)) return 'pi';
+    if (piReadOnlySessions.has(options.ctx.sessionId)) return 'pi';
+    if (piFullSessions.has(options.ctx.sessionId)) return 'pi';
     if (options.ctx.tenantId && testTenants.has(options.ctx.tenantId)) return 'langgraph';
     if (options.ctx.userId && internalUsers.has(options.ctx.userId)) return 'langgraph';
     if (readOnlySessions.has(options.ctx.sessionId)) return 'langgraph';
@@ -188,4 +203,8 @@ function rolloutSelector(env: NodeJS.ProcessEnv): (options: RunAgentOptions) => 
 
 function csv(value: string | undefined): Set<string> {
   return new Set((value ?? '').split(',').map((item) => item.trim()).filter(Boolean));
+}
+
+function isBuiltinKernelName(name: AgentKernelName): name is BuiltinKernelName {
+  return name === 'pi' || name === 'legacy' || name === 'langgraph';
 }

@@ -38,9 +38,12 @@ describe('MemoryRuntimeStore', () => {
   it('commits messages, events and run state atomically with per-run sequence', async () => {
     const store = new MemoryRuntimeStore();
     await store.runs.create(run());
+    await store.runs.acquireLease(identity, 'worker-a', new Date('2026-07-27T00:00:00Z'), 10_000);
     const turn = snapshot();
     await store.turns.createSnapshot(turn);
     const committed = await store.turns.commit({
+      leaseOwner: 'worker-a',
+      leaseToken: 1n,
       snapshot: turn,
       commit: {
         ...identity, attemptId: 'attempt-a', turnNo: 1, commitId: 'commit-a', transcriptVersion: 1n,
@@ -79,5 +82,23 @@ describe('MemoryRuntimeStore', () => {
     expect(second?.token).toBe(2n);
     await expect(store.runs.assertLease(identity, 'worker-a', 1n, new Date('2026-07-27T00:00:00.012Z')))
       .rejects.toThrow('LEASE_LOST');
+  });
+
+  it('rejects a turn commit made with a stale fencing token', async () => {
+    const store = new MemoryRuntimeStore();
+    await store.runs.create(run());
+    await store.runs.acquireLease(identity, 'worker-a', new Date('2026-07-27T00:00:00Z'), 10);
+    await store.runs.acquireLease(identity, 'worker-b', new Date('2026-07-27T00:00:00.011Z'), 10_000);
+    const turn = snapshot();
+    await store.turns.createSnapshot(turn);
+    await expect(store.turns.commit({
+      leaseOwner: 'worker-a', leaseToken: 1n, snapshot: turn,
+      commit: {
+        ...identity, attemptId: 'attempt-a', turnNo: 1, commitId: 'stale', transcriptVersion: 1n,
+        usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+        messages: [], committedAt: new Date('2026-07-27T00:00:01Z'),
+      },
+      events: [], runStatus: 'succeeded',
+    })).rejects.toThrow('LEASE_LOST');
   });
 });
