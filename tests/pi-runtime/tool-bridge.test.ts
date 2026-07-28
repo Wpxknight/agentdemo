@@ -99,6 +99,54 @@ describe('Pi governed tool bridge', () => {
     });
   });
 
+  it.each(['initial', 'setTools'] as const)('preserves governed failures through the real Harness for %s tools', async (installation) => {
+    const tools = bridgeGovernedTools([{
+      definition: { name: 'lookup', description: 'Lookup', capability: 'read', inputSchema: { type: 'object' } },
+      logicalCallId: () => 'logical-denied-1',
+      execute: async () => ({ callId: 'call-1', content: 'denied', isError: true, digest: 'digest-1' }),
+    }]);
+    const repository = new InMemorySessionRepo();
+    const factory = new PiAgentSessionFactory({
+      repository, models: toolModels({ secret: 'do-not-persist', tokenCount: 7 }), model,
+      ...(installation === 'initial' ? { tools } : {}),
+    });
+    const session = await factory.create({ id: `governed-error-${installation}`,
+      initialMessage: { role: 'user', text: 'start' }, events: events() });
+    if (installation === 'setTools') await session.setTools(tools);
+
+    const projected = await collect(session.continue());
+    const completed = projected.find((event) => event.type === 'tool_execution_end');
+    expect(completed?.detail).toMatchObject({
+      isError: true,
+      details: {
+        version: 1, kind: 'governed_tool_error',
+        call: { id: 'call-1', logicalCallId: 'logical-denied-1', name: 'lookup',
+          arguments: { secret: '[REDACTED]', tokenCount: 7 } },
+        result: { callId: 'call-1', content: 'denied', isError: true, digest: 'digest-1' },
+      },
+    });
+    expect(JSON.stringify(await session.entries())).toContain('logical-denied-1');
+    expect(JSON.stringify(await session.entries())).toContain('digest-1');
+    await session.close();
+  });
+
+  it('keeps a real Harness run alive when tool details are an unreadable Proxy', async () => {
+    const unreadable = new Proxy({}, { get: () => { throw new Error('details getter failed'); } });
+    const session = await new PiAgentSessionFactory({
+      repository: new InMemorySessionRepo(), models: toolModels({}), model,
+      tools: [{
+        name: 'lookup', label: 'lookup', description: 'Lookup', parameters: { type: 'object' } as never,
+        execute: async () => ({ content: [{ type: 'text', text: 'ok' }], details: unreadable }),
+      }],
+    }).create({ id: 'unreadable-details', initialMessage: { role: 'user', text: 'start' }, events: events() });
+
+    const projected = await collect(session.continue());
+    expect(projected.find((event) => event.type === 'tool_execution_end')?.detail)
+      .toEqual({ kind: 'unserializable' });
+    expect(projected.some((event) => event.type === 'agent_end')).toBe(true);
+    await session.close();
+  });
+
   it('passes Pi cancellation and a caller-resolved logical id to governed execution', async () => {
     let started!: () => void;
     const didStart = new Promise<void>((resolve) => { started = resolve; });

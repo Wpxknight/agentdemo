@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { EventCodec, toDurableJsonValue } from '../../packages/pi-runtime/src/index.js';
+import { EventCodec } from '../../packages/pi-runtime/src/index.js';
+import { toDurableJsonValue } from '../../packages/pi-runtime/src/pi/event-codec.js';
 
 describe('Pi EventCodec', () => {
   it('projects a Harness tool event into a durable control event', () => {
@@ -68,6 +69,44 @@ describe('Pi EventCodec', () => {
     expect(toDurableJsonValue({ authorization: 'secret', apiKey: 'secret' })).toEqual({
       apiKey: '[REDACTED]', authorization: '[REDACTED]',
     });
+  });
+
+  it('redacts only explicit credential keys while retaining token accounting', () => {
+    expect(toDurableJsonValue({
+      authorization: 'Bearer secret', proxy_authorization: 'proxy secret', setCookie: 'session=secret',
+      api_key: 'api secret', accessToken: 'access secret', refresh_token: 'refresh secret',
+      authToken: 'auth secret', bearer_token: 'bearer secret', clientSecret: 'client secret',
+      token: 'token secret', password: 'password secret', credential: 'credential secret',
+      totalTokens: 101, tokensBefore: 89, tokensAfter: 55, maxTokens: 512, tokenCount: 34,
+    })).toEqual({
+      accessToken: '[REDACTED]', api_key: '[REDACTED]', authToken: '[REDACTED]',
+      authorization: '[REDACTED]', bearer_token: '[REDACTED]', clientSecret: '[REDACTED]',
+      credential: '[REDACTED]', maxTokens: 512, password: '[REDACTED]',
+      proxy_authorization: '[REDACTED]', refresh_token: '[REDACTED]', setCookie: '[REDACTED]',
+      token: '[REDACTED]', tokenCount: 34, tokensAfter: 55, tokensBefore: 89, totalTokens: 101,
+    });
+
+    const codec = new EventCodec({ tenantId: 't', runId: 'r', attemptId: 'a', turnNo: 1,
+      correlationId: 'c', sequence: () => 1n });
+    expect(codec.fromPi({ type: 'message_end', message: {
+      role: 'assistant', content: [], stopReason: 'stop', timestamp: 1,
+      usage: { input: 40, output: 10, cacheRead: 2, cacheWrite: 1, totalTokens: 53 },
+    } } as never).detail).toMatchObject({ message: { usage: { totalTokens: 53 } } });
+    expect(codec.fromPi({ type: 'session_before_compact', branchEntries: [], preparation: {
+      tokensBefore: 987, messagesToSummarize: [], retainedTail: [], firstKeptEntryId: undefined,
+    }, signal: new AbortController().signal } as never).detail).toMatchObject({ tokensBefore: 987 });
+  });
+
+  it('turns throwing keys, getters, and proxies into stable unserializable detail', () => {
+    const keysThrow = new Proxy({}, { ownKeys: () => { throw new Error('ownKeys failed'); } });
+    const getterThrow = Object.defineProperty({}, 'value', {
+      enumerable: true, get: () => { throw new Error('getter failed'); },
+    });
+
+    expect(toDurableJsonValue(keysThrow)).toEqual({ kind: 'unserializable' });
+    expect(toDurableJsonValue(getterThrow)).toEqual({ kind: 'unserializable' });
+    expect(() => JSON.stringify(toDurableJsonValue({ nested: keysThrow }))).not.toThrow();
+    expect(toDurableJsonValue({ nested: keysThrow })).toEqual({ nested: { kind: 'unserializable' } });
   });
 
   it('allowlists provider fields and enforces a strict durable detail bound', () => {

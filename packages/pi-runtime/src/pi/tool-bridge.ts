@@ -1,6 +1,11 @@
 import type { JsonValue, ToolCall, ToolDefinition, ToolResult } from '@aiop/control-contracts';
 import type { TSchema } from '@earendil-works/pi-ai';
 import type { AgentHarnessTool } from '@earendil-works/pi-agent-core';
+import {
+  associateGovernedTool,
+  createGovernedToolFailureTracker,
+  recordGovernedToolFailure,
+} from './governed-tool-state.js';
 
 export interface GovernedTool {
   definition: ToolDefinition;
@@ -34,9 +39,10 @@ export class GovernedToolExecutionError extends Error {
 export function bridgeGovernedTools(
   tools: readonly GovernedTool[], options: GovernedToolBridgeOptions = {},
 ): AgentHarnessTool<undefined>[] {
+  const tracker = createGovernedToolFailureTracker();
   return tools.map((governed) => {
     const { definition, execute } = governed;
-    return ({
+    const tool: AgentHarnessTool<undefined> = {
     name: definition.name,
     label: definition.name,
     description: definition.description,
@@ -58,17 +64,25 @@ export function bridgeGovernedTools(
       try {
         result = await execute(call, context);
       } catch (error) {
-        if (error instanceof GovernedToolExecutionError) throw error;
-        throw new GovernedToolExecutionError('Governed tool execution failed', call, {
+        const governedError = error instanceof GovernedToolExecutionError ? error
+          : new GovernedToolExecutionError('Governed tool execution failed', call, {
           callId: toolCallId, content: error instanceof Error ? error.message : String(error), isError: true,
         }, error);
+        recordGovernedToolFailure(tracker, toolCallId, governedError);
+        throw governedError;
       }
-      if (result.isError) throw new GovernedToolExecutionError(result.content, call, result);
+      if (result.isError) {
+        const error = new GovernedToolExecutionError(result.content, call, result);
+        recordGovernedToolFailure(tracker, toolCallId, error);
+        throw error;
+      }
       return {
         content: [{ type: 'text', text: result.content }],
         details: result,
       };
     },
-    });
+    };
+    associateGovernedTool(tool, tracker);
+    return tool;
   });
 }

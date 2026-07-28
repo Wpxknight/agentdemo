@@ -9,6 +9,8 @@ import {
 } from '@earendil-works/pi-ai';
 import { InMemorySessionRepo } from '@earendil-works/pi-agent-core';
 import {
+  EventCodec,
+  PiAgentSession,
   PiAgentSessionFactory,
   bridgeGovernedTools,
   compactPiCompaction,
@@ -247,6 +249,56 @@ describe('PiAgentSessionFactory', () => {
     controlled.release();
     await expect(collected).rejects.toThrow('signal cancelled');
     await session.close();
+  });
+
+  it.each(['close', 'return'] as const)('cleans an active run when %s cancellation rejects', async (action) => {
+    const listeners = new Set<(event: never) => void>();
+    let releaseRun!: () => void;
+    const runGate = new Promise<void>((resolve) => { releaseRun = resolve; });
+    let abortCalls = 0;
+    let unsubscribeCalls = 0;
+    const harness = {
+      subscribe(listener: (event: never) => void) {
+        listeners.add(listener);
+        return () => { unsubscribeCalls++; listeners.delete(listener); };
+      },
+      prompt: async () => {
+        for (const listener of listeners) listener({ type: 'agent_start' } as never);
+        await runGate;
+      },
+      abort: async () => {
+        abortCalls++;
+        for (const listener of listeners) listener({
+          type: 'abort', clearedSteer: [], clearedFollowUp: [],
+        } as never);
+      },
+      waitForIdle: async () => {},
+      getTools: () => [],
+      on: () => () => {},
+    };
+    let sequence = 0;
+    const session = new PiAgentSession(
+      { getMetadata: async () => ({ id: 'cleanup', createdAt: new Date(0).toISOString() }),
+        getEntries: async () => [] } as never,
+      harness as never,
+      { role: 'user', text: 'start' },
+      new EventCodec({ ...eventContext(`cleanup-${action}`), sequence: () => {
+        if (++sequence === 2) throw new Error('subscriber failed');
+        return BigInt(sequence);
+      } }),
+    );
+    const iterator = session.continue()[Symbol.asyncIterator]();
+    await iterator.next();
+
+    const operation = action === 'close' ? session.close() : iterator.return!();
+    const observed = operation.then(() => undefined, (error: unknown) => error);
+    if (action === 'return') releaseRun();
+    await expect(observed).resolves.toMatchObject({ message: 'subscriber failed' });
+    expect(unsubscribeCalls).toBe(1);
+    expect(listeners.size).toBe(0);
+    if (action === 'close') releaseRun();
+    expect(abortCalls).toBe(1);
+    await expect(iterator.next()).resolves.toMatchObject({ done: true });
   });
 });
 

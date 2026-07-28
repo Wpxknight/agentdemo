@@ -2,7 +2,8 @@
 export * from './pi/agent.js';
 export * from './pi/compatibility.js';
 export * from './pi/compaction.js';
-export * from './pi/event-codec.js';
+export { EventCodec } from './pi/event-codec.js';
+export type { EventCodecOptions } from './pi/event-codec.js';
 export * from './pi/message-codec.js';
 export * from './pi/models.js';
 export * from './pi/session.js';
@@ -57,6 +58,7 @@ export declare class PiAgentSession<TMetadata extends SessionMetadata = SessionM
     private closePromise?;
     private pendingMessage?;
     private activeRun?;
+    private removeGovernedToolHook;
     constructor(session: Session<TMetadata>, harness: AgentHarness, initialMessage: AgentInputMessage, eventCodec: EventCodec);
     continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent>;
     private iterate;
@@ -68,6 +70,7 @@ export declare class PiAgentSession<TMetadata extends SessionMetadata = SessionM
     metadata(): Promise<TMetadata>;
     entries(): Promise<SessionTreeEntry[]>;
     close(): Promise<void>;
+    private installGovernedToolHook;
     private ensureOpen;
 }
 export {};
@@ -151,7 +154,30 @@ export declare class EventCodec {
     fromPi(event: AgentHarnessEvent): AgentRunEvent;
 }
 export declare function toDurableJsonValue(value: unknown): JsonValue;
-export declare const PI_HARNESS_EVENT_TYPES: readonly ["agent_start", "agent_end", "turn_start", "turn_end", "message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_end", "tool_call", "tool_result", "queue_update", "save_point", "abort", "settled", "before_agent_start", "context", "before_provider_request", "before_provider_payload", "after_provider_response", "session_before_compact", "session_compact", "session_before_tree", "session_tree", "retry_scheduled", "retry_attempt_start", "retry_finished", "model_update", "thinking_level_update", "resources_update", "tools_update"];
+
+// file: pi/governed-tool-state.d.ts
+import type { ToolCall, ToolResult } from '@aiop/control-contracts';
+import type { AgentHarnessEvent, AgentHarnessTool } from '@earendil-works/pi-agent-core';
+export interface GovernedToolFailure {
+    call: ToolCall;
+    result: ToolResult;
+}
+interface GovernedToolFailureTracker {
+    failures: Map<string, GovernedToolFailure>;
+}
+export declare function createGovernedToolFailureTracker(): GovernedToolFailureTracker;
+export declare function associateGovernedTool(tool: AgentHarnessTool<undefined>, tracker: GovernedToolFailureTracker): void;
+export declare function recordGovernedToolFailure(tracker: GovernedToolFailureTracker, toolCallId: string, failure: GovernedToolFailure): void;
+export declare function governedToolResultHook(tools: readonly AgentHarnessTool<undefined>[]): {
+    patch(event: Extract<AgentHarnessEvent, {
+        type: 'tool_result';
+    }>): {
+        details: unknown;
+        isError: true;
+    } | undefined;
+    clear(): void;
+};
+export {};
 
 // file: pi/message-codec.d.ts
 import type { AgentMessage } from '@earendil-works/pi-agent-core';

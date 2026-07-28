@@ -12,6 +12,7 @@ import {
 } from '@earendil-works/pi-agent-core';
 import type { ImageContent, Model, Models } from '@earendil-works/pi-ai';
 import { EventCodec, type EventCodecOptions } from './event-codec.js';
+import { governedToolResultHook } from './governed-tool-state.js';
 
 export interface PiAgentSessionFactoryOptions<
   TMetadata extends SessionMetadata,
@@ -78,6 +79,7 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
   private closePromise?: Promise<void>;
   private pendingMessage?: AgentInputMessage;
   private activeRun?: { cancel(): Promise<void>; finalize(cancelRunning?: boolean): Promise<void> };
+  private removeGovernedToolHook = () => {};
 
   constructor(
     private readonly session: Session<TMetadata>,
@@ -86,6 +88,7 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     private readonly eventCodec: EventCodec,
   ) {
     this.pendingMessage = initialMessage;
+    this.installGovernedToolHook(harness.getTools());
   }
 
   continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent> {
@@ -112,21 +115,31 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     });
     let cancelPromise: Promise<void> | undefined;
     const cancel = () => cancelPromise ??= (async () => {
-      await this.harness.abort();
-      await this.harness.waitForIdle();
+      const errors: unknown[] = [];
+      try { await this.harness.abort(); } catch (error) { errors.push(error); }
+      try { await this.harness.waitForIdle(); } catch (error) { errors.push(error); }
+      throwCollected(errors, 'Pi agent cancellation failed');
     })();
     let removeSignalListener = () => {};
     let finalizePromise: Promise<void> | undefined;
     const active = {
       cancel,
       finalize: (cancelRunning = true) => finalizePromise ??= (async () => {
-        if (cancelRunning && !finished) await cancel();
-        removeSignalListener();
-        unsubscribe();
-        forceDone = true;
-        events.length = 0;
-        if (this.activeRun === active) this.activeRun = undefined;
-        wake?.();
+        const errors: unknown[] = [];
+        try {
+          if (cancelRunning && !finished) await cancel();
+        } catch (error) {
+          errors.push(error);
+        } finally {
+          try { removeSignalListener(); } catch (error) { errors.push(error); }
+          try { unsubscribe(); } catch (error) { errors.push(error); }
+          forceDone = true;
+          events.length = 0;
+          if (this.activeRun === active) this.activeRun = undefined;
+          wake?.();
+          wake = undefined;
+        }
+        throwCollected(errors, 'Pi agent finalization failed');
       })(),
     };
     this.activeRun = active;
@@ -151,7 +164,10 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
       }
       if (failure) throw failure;
     } finally {
-      try { await active.finalize(!finished); } catch (error) { failure ??= error; }
+      try { await active.finalize(!finished); } catch (error) {
+        if (failure) throw new AggregateError([failure, error], 'Pi agent run and finalization failed');
+        throw error;
+      }
       if (!finished) await run;
     }
   }
@@ -173,9 +189,10 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     else if (!this.closed) await this.harness.abort();
   }
 
-  setTools(tools: AgentHarnessTool<undefined>[]): Promise<void> {
+  async setTools(tools: AgentHarnessTool<undefined>[]): Promise<void> {
     this.ensureOpen();
-    return this.harness.setTools(tools, tools.map((tool) => tool.name));
+    await this.harness.setTools(tools, tools.map((tool) => tool.name));
+    this.installGovernedToolHook(tools);
   }
 
   tools(): AgentHarnessTool<undefined>[] {
@@ -193,20 +210,42 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
   async close(): Promise<void> {
     this.closed = true;
     return this.closePromise ??= (async () => {
+      const errors: unknown[] = [];
       const active = this.activeRun;
-      if (active) {
-        await active.cancel();
-        await active.finalize(false);
-      } else {
-        await this.harness.abort();
-        await this.harness.waitForIdle();
+      try {
+        if (active) {
+          try { await active.cancel(); } catch (error) { errors.push(error); }
+          try { await active.finalize(false); } catch (error) { errors.push(error); }
+        } else {
+          try { await this.harness.abort(); } catch (error) { errors.push(error); }
+          try { await this.harness.waitForIdle(); } catch (error) { errors.push(error); }
+        }
+      } finally {
+        try { this.removeGovernedToolHook(); } catch (error) { errors.push(error); }
       }
+      throwCollected(errors, 'Pi agent close failed');
     })();
+  }
+
+  private installGovernedToolHook(tools: readonly AgentHarnessTool<undefined>[]): void {
+    this.removeGovernedToolHook();
+    const governed = governedToolResultHook(tools);
+    const removeHook = this.harness.on('tool_result', (event) => governed.patch(event));
+    this.removeGovernedToolHook = () => {
+      governed.clear();
+      removeHook();
+      this.removeGovernedToolHook = () => {};
+    };
   }
 
   private ensureOpen(): void {
     if (this.closed) throw new Error('Pi agent session is closed');
   }
+}
+
+function throwCollected(errors: readonly unknown[], message: string): void {
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, message);
 }
 
 function abortReason(signal: AbortSignal): unknown {

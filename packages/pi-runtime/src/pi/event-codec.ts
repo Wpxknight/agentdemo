@@ -17,7 +17,11 @@ const MAX_ARRAY = 32;
 const MAX_KEYS = 32;
 const MAX_DEPTH = 5;
 const MAX_DETAIL_BYTES = 8192;
-const SENSITIVE_KEY = /authorization|cookie|api[-_]?key|token|secret|password|credential/i;
+const SENSITIVE_KEYS = new Set([
+  'authorization', 'proxyauthorization', 'cookie', 'setcookie', 'apikey', 'accesstoken', 'refreshtoken',
+  'token', 'authtoken', 'bearertoken', 'secret', 'clientsecret', 'password', 'credential', 'credentials', 'privatekey',
+]);
+const UNSERIALIZABLE = { kind: 'unserializable' } as const;
 
 export class EventCodec {
   private readonly now: () => Date;
@@ -27,15 +31,21 @@ export class EventCodec {
   }
 
   fromPi(event: AgentHarnessEvent): AgentRunEvent {
-    const known = KNOWN_EVENTS.has(event.type);
-    const detail = toDurableJsonValue(known ? projectKnown(event) : {
-      version: 1, kind: 'pi_harness_event', originalType: limited(event.type, MAX_NAME), keys: safeKeys(event),
-    });
+    const eventType = safeEventType(event);
+    const known = KNOWN_EVENTS.has(eventType);
+    let detail: JsonValue;
+    try {
+      detail = toDurableJsonValue(known ? projectKnown(event) : {
+        version: 1, kind: 'pi_harness_event', originalType: limited(eventType, MAX_NAME), keys: safeKeys(event),
+      });
+    } catch {
+      detail = UNSERIALIZABLE;
+    }
     return {
       tenantId: this.options.tenantId, runId: this.options.runId, attemptId: this.options.attemptId,
       turnNo: this.options.turnNo, kernel: 'pi', kernelVersion: '0.82.1',
       correlationId: this.options.correlationId, sequence: this.options.sequence(),
-      type: known ? event.type : 'pi_extension', detail, createdAt: this.now(),
+      type: known ? eventType : 'pi_extension', detail, createdAt: this.now(),
     };
   }
 }
@@ -59,7 +69,7 @@ function projectKnown(event: AgentHarnessEvent): Record<string, unknown> {
     };
     case 'tool_execution_end': return {
       version: 1, toolCallId: limited(event.toolCallId, MAX_NAME), toolName: limited(event.toolName, MAX_NAME),
-      isError: event.isError, result: valueShape(event.result),
+      isError: event.isError, result: valueShape(event.result), details: governedErrorDetails(event.result),
     };
     case 'tool_call': return {
       version: 1, toolCallId: limited(event.toolCallId, MAX_NAME), toolName: limited(event.toolName, MAX_NAME),
@@ -190,24 +200,41 @@ function valueShape(value: unknown): Record<string, unknown> {
   return { type: valueType(value), keys: objectKeys(value), estimatedBytes: estimateBytes(value) };
 }
 
-function objectKeys(value: unknown): string[] {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? Object.keys(value).filter((key) => !SENSITIVE_KEY.test(key)).sort().slice(0, MAX_KEYS).map((key) => limited(key, MAX_NAME)) : [];
+function objectKeys(value: unknown): string[] | typeof UNSERIALIZABLE {
+  try {
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? Object.keys(value).filter((key) => !isSensitiveKey(key)).sort().slice(0, MAX_KEYS).map((key) => limited(key, MAX_NAME)) : [];
+  } catch {
+    return UNSERIALIZABLE;
+  }
 }
 
-function safeKeys(event: unknown): string[] {
-  return objectKeys(event).filter((key) => key !== 'type');
+function safeKeys(event: unknown): string[] | typeof UNSERIALIZABLE {
+  const keys = objectKeys(event);
+  return Array.isArray(keys) ? keys.filter((key) => key !== 'type') : keys;
 }
 
 export function toDurableJsonValue(value: unknown): JsonValue {
-  const sanitized = sanitize(value, 0, new WeakSet<object>());
-  const json = JSON.stringify(sanitized);
-  return Buffer.byteLength(json) <= MAX_DETAIL_BYTES ? sanitized : {
-    version: 1, kind: 'truncated_detail', truncated: true, originalBytes: Buffer.byteLength(json),
-  };
+  try {
+    const sanitized = sanitize(value, 0, new WeakSet<object>());
+    const json = JSON.stringify(sanitized);
+    return Buffer.byteLength(json) <= MAX_DETAIL_BYTES ? sanitized : {
+      version: 1, kind: 'truncated_detail', truncated: true, originalBytes: Buffer.byteLength(json),
+    };
+  } catch {
+    return UNSERIALIZABLE;
+  }
 }
 
 function sanitize(value: unknown, depth: number, path: WeakSet<object>): JsonValue {
+  try {
+    return sanitizeUnsafe(value, depth, path);
+  } catch {
+    return UNSERIALIZABLE;
+  }
+}
+
+function sanitizeUnsafe(value: unknown, depth: number, path: WeakSet<object>): JsonValue {
   if (depth > MAX_DEPTH) return { kind: 'truncated_depth' };
   if (value === null || typeof value === 'boolean') return value;
   if (typeof value === 'string') return limited(value, MAX_STRING);
@@ -223,7 +250,7 @@ function sanitize(value: unknown, depth: number, path: WeakSet<object>): JsonVal
     if (Array.isArray(value)) return value.slice(0, MAX_ARRAY).map((item) => sanitize(item, depth + 1, path));
     const output: Record<string, JsonValue> = {};
     for (const key of Object.keys(value as object).sort().slice(0, MAX_KEYS)) {
-      if (SENSITIVE_KEY.test(key)) { output[key] = '[REDACTED]'; continue; }
+      if (isSensitiveKey(key)) { output[key] = '[REDACTED]'; continue; }
       const item = (value as Record<string, unknown>)[key];
       if (typeof item === 'undefined' || typeof item === 'function' || typeof item === 'symbol') continue;
       output[key] = sanitize(item, depth + 1, path);
@@ -235,12 +262,36 @@ function sanitize(value: unknown, depth: number, path: WeakSet<object>): JsonVal
 }
 
 function estimateBytes(value: unknown, depth = 0): number {
-  if (depth > 3 || value == null) return 0;
-  if (typeof value === 'string') return Buffer.byteLength(value);
-  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value).length;
-  if (Array.isArray(value)) return value.slice(0, MAX_ARRAY).reduce((sum, item) => sum + estimateBytes(item, depth + 1), 0);
-  if (typeof value === 'object') return Object.keys(value).slice(0, MAX_KEYS).reduce((sum, key) => sum + key.length + estimateBytes((value as Record<string, unknown>)[key], depth + 1), 0);
-  return 0;
+  try {
+    if (depth > 3 || value == null) return 0;
+    if (typeof value === 'string') return Buffer.byteLength(value);
+    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value).length;
+    if (Array.isArray(value)) return value.slice(0, MAX_ARRAY).reduce((sum, item) => sum + estimateBytes(item, depth + 1), 0);
+    if (typeof value === 'object') return Object.keys(value).slice(0, MAX_KEYS).reduce((sum, key) => sum + key.length + estimateBytes((value as Record<string, unknown>)[key], depth + 1), 0);
+    return 0;
+  } catch {
+    return 0;
+  }
+}
+
+function governedErrorDetails(result: unknown): unknown {
+  if (!result || typeof result !== 'object') return undefined;
+  const details = (result as { details?: unknown }).details;
+  if (!details || typeof details !== 'object') return undefined;
+  return (details as { kind?: unknown }).kind === 'governed_tool_error' ? details : undefined;
+}
+
+function isSensitiveKey(key: string): boolean {
+  return SENSITIVE_KEYS.has(key.replace(/[^a-z0-9]/gi, '').toLowerCase());
+}
+
+function safeEventType(event: unknown): string {
+  try {
+    return event && typeof event === 'object' && typeof (event as { type?: unknown }).type === 'string'
+      ? (event as { type: string }).type : 'unserializable';
+  } catch {
+    return 'unserializable';
+  }
 }
 
 function limited(value: string, max: number): string { return value.length <= max ? value : `${value.slice(0, max)}…[truncated:${value.length}]`; }
@@ -249,7 +300,7 @@ function stringValue(value: unknown): string | undefined { return typeof value =
 function numberValue(value: unknown): number | undefined { return typeof value === 'number' && Number.isFinite(value) ? value : undefined; }
 function valueType(value: unknown): string { return value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value; }
 
-export const PI_HARNESS_EVENT_TYPES = [
+const PI_HARNESS_EVENT_TYPES = [
   'agent_start', 'agent_end', 'turn_start', 'turn_end', 'message_start', 'message_update', 'message_end',
   'tool_execution_start', 'tool_execution_update', 'tool_execution_end', 'tool_call', 'tool_result',
   'queue_update', 'save_point', 'abort', 'settled', 'before_agent_start', 'context',
