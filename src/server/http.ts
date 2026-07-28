@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile, rm } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { SignJWT, jwtVerify } from 'jose';
 import { logger } from '../logger.js';
 import type { Runtime, RuntimeModelConfig } from '../runtime.js';
@@ -1046,21 +1046,30 @@ async function handle(
     if (!filename || !data) throw new HttpError(400, 'filename/data 必填');
     if (!/\.zip$/i.test(filename)) throw new HttpError(400, '仅支持导入 zip 技能包');
 
-    const imported = await importSkillZip({
-      rootDir: rt.skillRegistry.uploadRootFor(ctx),
-      filename,
-      data: decodeSkillImportData(data),
-    });
+    const registryRoot = resolve(rt.skillRegistry.rootDir());
+    const stagingRoot = join(dirname(registryRoot), `.${basename(registryRoot)}-imports`, randomUUID());
+    const uploadRoot = rt.skillRegistry.uploadRootFor(ctx);
+    let imported: Awaited<ReturnType<typeof importSkillZip>>;
+    try {
+      imported = await importSkillZip({
+        rootDir: stagingRoot,
+        filename,
+        data: decodeSkillImportData(data),
+      });
+    } catch (error) {
+      await rm(stagingRoot, { recursive: true, force: true });
+      throw error;
+    }
+    const destinationDir = join(uploadRoot, basename(imported.skillDir));
     let product: SkillProductRecord;
     try {
-      product = await rt.skillRegistry.installUploadedProduct(imported.skillDir, ctx);
-      await rt.skillRegistry.scan();
-      const persisted = rt.skillRegistry.list().find((item) => resolve(item.dir) === resolve(imported.skillDir));
-      if (!persisted) throw new Error('导入后未发现有效技能产品记录');
+      product = await rt.skillRegistry.installUploadedProduct(imported.skillDir, ctx, { destinationDir });
     } catch (error) {
       await rm(imported.skillDir, { recursive: true, force: true });
       await rt.skillRegistry.scan();
-      throw error;
+      throw skillHttpError(error);
+    } finally {
+      await rm(stagingRoot, { recursive: true, force: true });
     }
     rt.systemExtra = rt.skillRegistry.summaries();
     await rt.audit?.record({
@@ -1884,6 +1893,10 @@ function skillHttpError(err: unknown): HttpError {
     return new HttpError(403, message);
   }
   if (message.includes('已审核') || message.includes('不唯一')) return new HttpError(409, message);
+  if (message.includes('名称冲突')) return new HttpError(409, message);
+  if (message.includes('Pi Skill 校验产生诊断') || message.includes('SKILL.md name')) {
+    return new HttpError(422, message);
+  }
   if (message.includes('非法技能文件路径') || message.includes('不是目录') || message.includes('不是文件')) {
     return new HttpError(400, message);
   }

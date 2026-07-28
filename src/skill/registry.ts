@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, posix, resolve, sep } from 'node:path';
 import { logger } from '../logger.js';
 import type { JsonValue, ToolResult } from '../model/types.js';
@@ -49,6 +49,10 @@ export interface SkillRegistryOptions {
   env?: ConstructorParameters<typeof SkillProductService>[0];
 }
 
+interface UploadedProductInstallOptions {
+  destinationDir?: string;
+}
+
 /**
  * 渐进式技能加载（Claude Code 风格）+ 所有权/可见性（DESIGN-aios-integration §4）：
  * - 目录分层：`_public/<name>`（管理员上传，全员可见）、`users/<uid>/<name>`（个人，private/shared）；
@@ -60,6 +64,7 @@ export class SkillRegistry {
   private records: SkillProductRecord[] = [];
   private readonly service: SkillProductService;
   private readonly configuredRecords?: readonly SkillProductRecord[];
+  private mutationTail: Promise<void> = Promise.resolve();
 
   constructor(private readonly dir: string, opts: SkillRegistryOptions = {}) {
     this.configuredRecords = opts.records;
@@ -95,10 +100,7 @@ export class SkillRegistry {
   }
 
   async scan(): Promise<void> {
-    this.records = (this.configuredRecords
-      ? this.configuredRecords.map(normalizeSkillProductRecord)
-      : await enumerateSkillProductRecords(this.dir));
-    log.info({ count: this.records.length }, 'skill product sources loaded');
+    await this.withMutationLock(() => this.scanUnlocked());
   }
 
   /** 全量列表（管理/CLI 用；对外接口请用 listFor 按查看者过滤）。 */
@@ -122,9 +124,10 @@ export class SkillRegistry {
   }
 
   async listLoadedFor(viewer: SkillViewer): Promise<Skill[]> {
-    const loaded = await this.service.load(this.records, viewer);
+    const records = this.unambiguousAvailableRecords(viewer);
+    const loaded = await this.service.load(records, viewer);
     const byId = new Map(loaded.skills.map((item) => [item.source.id, item]));
-    return Promise.all(this.records
+    return Promise.all(records
       .filter((record) => byId.has(record.id))
       .map(async (record) => skillFromRecord(
         record,
@@ -135,7 +138,7 @@ export class SkillRegistry {
 
   /** 注入系统提示的技能摘要（按查看者过滤）；带总预算与单条描述截断，防止技能增多撑爆 system prompt。 */
   async summariesFor(viewer: SkillViewer): Promise<string> {
-    return this.service.prompt(this.records, viewer);
+    return this.service.prompt(this.unambiguousAvailableRecords(viewer), viewer);
   }
 
   /** 兼容旧调用：无查看者（public+shared）视角的摘要。 */
@@ -213,9 +216,9 @@ export class SkillRegistry {
   }
 
   async loadFor(name: string, viewer: SkillViewer): Promise<Skill | undefined> {
-    const record = this.records.find((item) => item.name === name
-      && this.visibleTo(skillFromRecord(item), viewer));
-    if (!record) return undefined;
+    const matches = this.unambiguousAvailableRecords(viewer).filter((item) => item.name === name);
+    if (matches.length !== 1) return undefined;
+    const record = matches[0]!;
     const loaded = await this.service.load([record], viewer);
     const item = loaded.skills[0];
     if (!item) return undefined;
@@ -296,65 +299,100 @@ export class SkillRegistry {
   }
 
   /** 用认证上下文覆盖上传包中的治理字段；归档只允许贡献经过校验的 name/version。 */
-  async installUploadedProduct(skillDir: string, viewer: SkillViewer): Promise<SkillProductRecord> {
-    if (!viewer.tenantId || !viewer.userId) throw new Error('导入技能需要完整用户身份');
-    const archived = await readUploadedDescription(skillDir);
-    const metadata = {
-      name: archived.name ?? safePathSegment(posix.basename(skillDir)),
-      version: archived.version ?? 'uploaded',
-      enabled: true,
-      reviewed: false,
-      tenantId: viewer.tenantId,
-      ownerUserId: viewer.userId,
-      visibility: 'private' as const,
-    };
-    const record = normalizeSkillProductRecord({
-      id: `${metadata.tenantId}:${metadata.ownerUserId}:${metadata.name}`,
-      path: skillDir,
-      ...metadata,
+  async installUploadedProduct(
+    skillDir: string,
+    viewer: SkillViewer,
+    options: UploadedProductInstallOptions = {},
+  ): Promise<SkillProductRecord> {
+    return this.withMutationLock(async () => {
+      if (!viewer.tenantId || !viewer.userId) throw new Error('导入技能需要完整用户身份');
+      const archived = await readUploadedDescription(skillDir);
+      const sourceDir = resolve(skillDir);
+      const destinationDir = resolve(options.destinationDir ?? skillDir);
+      const uploadRoot = resolve(this.uploadRootFor(viewer));
+      if (dirname(destinationDir) !== uploadRoot) throw new Error('导入技能目标路径非法');
+      const metadata = {
+        name: archived.name ?? safePathSegment(posix.basename(skillDir)),
+        version: archived.version ?? 'uploaded',
+        enabled: true,
+        reviewed: false,
+        tenantId: viewer.tenantId,
+        ownerUserId: viewer.userId,
+        visibility: 'private' as const,
+      };
+      const record = normalizeSkillProductRecord({
+        id: `${metadata.tenantId}:${metadata.ownerUserId}:${metadata.name}`,
+        path: destinationDir,
+        ...metadata,
+      });
+      // Refresh under the same mutation lock, but do not trust the uploaded sidecar
+      // until the server has replaced its governance fields below.
+      await this.scanUnlocked([destinationDir]);
+      this.assertNoNameConflict(record, false);
+      if (sourceDir !== destinationDir) await assertPathAbsent(destinationDir);
+      await writeProductRecord({ ...record, path: sourceDir });
+      let moved = false;
+      try {
+        if (sourceDir !== destinationDir) {
+          await mkdir(dirname(destinationDir), { recursive: true });
+          await rename(sourceDir, destinationDir);
+          moved = true;
+        }
+        await this.scanUnlocked();
+        return this.records.find((item) => resolve(item.path) === destinationDir) ?? record;
+      } catch (error) {
+        if (moved) await rename(destinationDir, sourceDir).catch(() => undefined);
+        await this.scanUnlocked([destinationDir]);
+        throw error;
+      }
     });
-    await writeProductRecord(record);
-    return record;
   }
 
   async review(name: string, viewer: SkillViewer, options: { global?: boolean } = {}): Promise<SkillProductRecord> {
-    if (viewer.role !== 'tenant_admin' && viewer.role !== 'platform_admin') {
-      throw new Error('仅租户或平台管理员可审核技能');
-    }
-    if (options.global && viewer.role !== 'platform_admin') {
-      throw new Error('仅平台管理员可全局发布技能');
-    }
-    const tenantRecords = this.records.filter((item) => item.name === name && item.tenantId === viewer.tenantId);
-    const pending = tenantRecords.filter((item) => !item.reviewed && this.isUploadedRecord(item));
-    if (pending.length > 1) throw new Error(`同名待审核技能 ${name} 不唯一`);
-    if (!pending.length) {
-      if (tenantRecords.some((item) => item.reviewed && this.isUploadedRecord(item))) {
-        throw new Error(`技能 ${name} 已审核`);
+    return this.withMutationLock(async () => {
+      if (viewer.role !== 'tenant_admin' && viewer.role !== 'platform_admin') {
+        throw new Error('仅租户或平台管理员可审核技能');
       }
-      throw new Error(`未找到技能 ${name}`);
-    }
-    const record = pending[0]!;
-    if (record.ownerUserId === viewer.userId) throw new Error('审核者不能审核自己上传的技能');
-    const validationRecord = normalizeSkillProductRecord({ ...record, reviewed: true });
-    const validation = await this.service.load([validationRecord], {
-      tenantId: record.tenantId,
-      userId: record.ownerUserId,
-      role: 'user',
+      if (options.global && viewer.role !== 'platform_admin') {
+        throw new Error('仅平台管理员可全局发布技能');
+      }
+      await this.scanUnlocked();
+      const tenantRecords = this.records.filter((item) => item.name === name && item.tenantId === viewer.tenantId);
+      const pending = tenantRecords.filter((item) => !item.reviewed && this.isUploadedRecord(item));
+      if (pending.length > 1) throw new Error(`同名待审核技能 ${name} 不唯一`);
+      if (!pending.length) {
+        if (tenantRecords.some((item) => item.reviewed && this.isUploadedRecord(item))) {
+          throw new Error(`技能 ${name} 已审核`);
+        }
+        throw new Error(`未找到技能 ${name}`);
+      }
+      const record = pending[0]!;
+      if (record.ownerUserId === viewer.userId) throw new Error('审核者不能审核自己上传的技能');
+      this.assertNoNameConflict(record, options.global === true);
+      const validationRecord = normalizeSkillProductRecord({ ...record, reviewed: true });
+      const validation = await this.service.load([validationRecord], {
+        tenantId: record.tenantId,
+        userId: record.ownerUserId,
+        role: 'user',
+      });
+      if (validation.diagnostics.length) {
+        throw new Error(`Pi Skill 校验产生诊断，技能保持待审核：${name}`);
+      }
+      if (validation.skills.length !== 1 || resolve(validation.skills[0]!.source.path) !== resolve(record.path)) {
+        throw new Error(`SKILL.md name 与产品 name 不一致或技能元数据无效：${name}`);
+      }
+      const next = normalizeSkillProductRecord({
+        ...record,
+        reviewed: true,
+        visibility: options.global ? 'public' : 'private',
+        allowedTenantIds: options.global ? ['*'] : undefined,
+      });
+      await writeProductRecord(next);
+      await this.scanUnlocked();
+      const persisted = this.records.find((item) => resolve(item.path) === resolve(record.path));
+      if (!persisted) throw new Error(`审核后未找到技能 ${name}`);
+      return persisted;
     });
-    if (validation.skills.length !== 1 || resolve(validation.skills[0]!.source.path) !== resolve(record.path)) {
-      throw new Error(`SKILL.md name 与产品 name 不一致或技能元数据无效：${name}`);
-    }
-    const next = normalizeSkillProductRecord({
-      ...record,
-      reviewed: true,
-      visibility: options.global ? 'public' : 'private',
-      allowedTenantIds: options.global ? ['*'] : undefined,
-    });
-    await writeProductRecord(next);
-    await this.scan();
-    const persisted = this.records.find((item) => resolve(item.path) === resolve(record.path));
-    if (!persisted) throw new Error(`审核后未找到技能 ${name}`);
-    return persisted;
   }
 
   private isUploadedRecord(record: SkillProductRecord): boolean {
@@ -364,6 +402,47 @@ export class SkillRegistry {
       userId: record.ownerUserId,
     });
     return dirname(resolve(record.path)) === resolve(uploadRoot);
+  }
+
+  private assertNoNameConflict(record: SkillProductRecord, global: boolean): void {
+    const conflict = this.records.find((item) => (
+      item.name === record.name
+      && resolve(item.path) !== resolve(record.path)
+      && (global || recordVisibleInTenant(item, record.tenantId))
+    ));
+    if (!conflict) return;
+    if (global) throw new Error(`Skill 全局名称冲突：${record.name}`);
+    throw new Error(`Skill 名称冲突：${record.name}`);
+  }
+
+  private unambiguousAvailableRecords(viewer: SkillViewer): SkillProductRecord[] {
+    const visible = this.records.filter((record) => (
+      record.enabled && record.reviewed && this.visibleTo(skillFromRecord(record), viewer)
+    ));
+    const counts = new Map<string, number>();
+    for (const record of visible) counts.set(record.name, (counts.get(record.name) ?? 0) + 1);
+    return visible.filter((record) => counts.get(record.name) === 1);
+  }
+
+  private async withMutationLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.mutationTail;
+    let release!: () => void;
+    this.mutationTail = new Promise<void>((resolveLock) => { release = resolveLock; });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  private async scanUnlocked(excludedPaths: readonly string[] = []): Promise<void> {
+    const excluded = new Set(excludedPaths.map((path) => resolve(path)));
+    const records = this.configuredRecords
+      ? this.configuredRecords.map(normalizeSkillProductRecord)
+      : await enumerateSkillProductRecords(this.dir);
+    this.records = records.filter((record) => !excluded.has(resolve(record.path)));
+    log.info({ count: this.records.length }, 'skill product sources loaded');
   }
 
   async delete(name: string, viewer?: SkillViewer): Promise<void> {
@@ -403,6 +482,16 @@ async function writeProductRecord(record: SkillProductRecord): Promise<void> {
   }
 }
 
+async function assertPathAbsent(path: string): Promise<void> {
+  try {
+    await stat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  throw new Error(`导入技能目录已存在：${path}`);
+}
+
 async function readUploadedDescription(skillDir: string): Promise<{ name?: string; version?: string }> {
   try {
     const parsed = JSON.parse(await readFile(join(skillDir, PRODUCT_RECORD_FILE), 'utf8')) as unknown;
@@ -424,6 +513,12 @@ function uploadedString(value: unknown, key: 'name' | 'version'): string | undef
   if (!normalized || normalized.includes('\0') || normalized.length > 200) return undefined;
   if (key === 'name' && !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(normalized)) return undefined;
   return normalized;
+}
+
+function recordVisibleInTenant(record: SkillProductRecord, tenantId: string): boolean {
+  return record.tenantId === tenantId
+    || record.allowedTenantIds?.includes(tenantId) === true
+    || record.allowedTenantIds?.includes('*') === true;
 }
 
 function skillFromRecord(

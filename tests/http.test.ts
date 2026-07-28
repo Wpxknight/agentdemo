@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, mkdir, readFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, stat } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1546,10 +1546,12 @@ describe('HTTP server', () => {
     await auth.createUser('default', 'admin', 'pw', 'platform_admin');
     await auth.createUser('default', 'tenant-admin', 'pw', 'tenant_admin');
     const uploader = await auth.createUser('default', 'uploader', 'pw', 'user');
+    await auth.createUser('default', 'second-uploader', 'pw', 'user');
     await auth.createUser('other', 'other-user', 'pw', 'user');
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
     const tenantAdminToken = (await auth.login('default', 'tenant-admin', 'pw'))!;
     const uploaderToken = (await auth.login('default', 'uploader', 'pw'))!;
+    const secondUploaderToken = (await auth.login('default', 'second-uploader', 'pw'))!;
     const otherToken = (await auth.login('other', 'other-user', 'pw'))!;
     const skillRoot = await mkdtemp(join(tmpdir(), 'aiop-http-skill-import-'));
     await mkdir(skillRoot, { recursive: true });
@@ -1588,6 +1590,28 @@ describe('HTTP server', () => {
     }).toString('base64');
 
     try {
+      const originalInstall = skills.installUploadedProduct.bind(skills);
+      const installSpy = vi.spyOn(skills, 'installUploadedProduct').mockImplementationOnce(async (...args) => {
+        await skills.scan();
+        expect(skills.list()).not.toContainEqual(expect.objectContaining({ name: 'staging-bypass' }));
+        return originalInstall(...args);
+      });
+      const stagingProbeData = storedZip({
+        'SKILL.md': '---\nname: staging-bypass\ndescription: Must remain pending\n---\nbody',
+        '.product.json': JSON.stringify({
+          name: 'staging-bypass', version: '1', enabled: true, reviewed: true,
+          tenantId: 'default', ownerUserId: uploader.id, visibility: 'public', allowedTenantIds: ['*'],
+        }),
+      }).toString('base64');
+      const stagingProbeImport = await fetch(`${importBase}/v1/skills/import`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ filename: 'staging-bypass.zip', data: `data:application/zip;base64,${stagingProbeData}` }),
+      });
+      expect(stagingProbeImport.status).toBe(201);
+      expect(installSpy).toHaveBeenCalledOnce();
+      installSpy.mockRestore();
+
       const imported = await fetch(`${importBase}/v1/skills/import`, {
         method: 'POST',
         headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
@@ -1616,6 +1640,18 @@ describe('HTTP server', () => {
       });
       expect(await skills.summariesFor({ tenantId: 'default', userId: uploader.id, role: 'user' })).not.toContain('imported');
       expect(piSkillLoader).not.toHaveBeenCalled();
+
+      const conflictingData = storedZip({
+        'SKILL.md': '---\nname: imported\ndescription: Conflicting upload\n---\nbody',
+        '.product.json': JSON.stringify({ name: 'imported', version: '2' }),
+      }).toString('base64');
+      const conflictingImport = await fetch(`${importBase}/v1/skills/import`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${secondUploaderToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ filename: 'imported-copy.zip', data: `data:application/zip;base64,${conflictingData}` }),
+      });
+      expect(conflictingImport.status).toBe(409);
+      await expect(stat(join(skillRoot, 'users', 'u_default_second-uploader', 'imported-copy'))).rejects.toThrow();
 
       const listed = await fetch(`${importBase}/v1/tools`, {
         headers: { authorization: `Bearer ${uploaderToken}` },
@@ -1725,6 +1761,30 @@ describe('HTTP server', () => {
       }).then((response) => response.json()) as typeof body;
       expect(otherAfterGlobal.tools).toContainEqual(expect.objectContaining({ name: 'globalized' }));
       expect(otherAfterGlobal.tools).not.toContainEqual(expect.objectContaining({ name: 'imported' }));
+
+      const invalidData = storedZip({
+        'SKILL.md': '---\nname: bad_name\ndescription: Invalid Pi name\n---\nbody',
+        '.product.json': JSON.stringify({ name: 'bad_name', version: '1' }),
+      }).toString('base64');
+      const invalidImport = await fetch(`${importBase}/v1/skills/import`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ filename: 'bad_name.zip', data: `data:application/zip;base64,${invalidData}` }),
+      });
+      expect(invalidImport.status).toBe(201);
+      const invalidReview = await fetch(`${importBase}/v1/skills/bad_name/review`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${tenantAdminToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ reviewed: true }),
+      });
+      expect(invalidReview.status).toBe(422);
+      expect(JSON.parse(await readFile(
+        join(skillRoot, 'users', uploader.id, 'bad_name', '.product.json'), 'utf8',
+      ))).toMatchObject({ reviewed: false });
+      const toolsAfterInvalidReview = await fetch(`${importBase}/v1/tools`, {
+        headers: { authorization: `Bearer ${uploaderToken}` },
+      }).then((response) => response.json()) as typeof body;
+      expect(toolsAfterInvalidReview.tools).not.toContainEqual(expect.objectContaining({ name: 'bad_name' }));
 
       const rootFiles = await fetch(`${importBase}/v1/skills/imported/files`, {
         headers: { authorization: `Bearer ${uploaderToken}` },

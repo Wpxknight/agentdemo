@@ -76,7 +76,12 @@ export async function loadAvailableSkills<TProduct extends PiSkillProduct>(
   }
   const allowedProductIds = new Set(sources.map(({ source }) => source.id));
   const result = await (deps.loader ?? loadSourcedSkills)(env, sources);
-  const returned = result.skills.filter(({ source }) => allowedProductIds.has(source.id));
+  const diagnosedProductIds = new Set(result.diagnostics
+    .filter(({ source }) => allowedProductIds.has(source.id))
+    .map(({ source }) => source.id));
+  const returned = result.skills.filter(({ source }) => (
+    allowedProductIds.has(source.id) && !diagnosedProductIds.has(source.id)
+  ));
   const mismatches = returned.filter(({ skill, source }) => !matchesProduct(skill, source));
   const loaded = returned
     .filter(({ skill, source }) => matchesProduct(skill, source))

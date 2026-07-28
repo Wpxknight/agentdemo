@@ -308,8 +308,28 @@ describe('SkillRegistry upload review governance', () => {
 
     await expect(reg.review('expected', {
       tenantId: 'default', userId: 'reviewer', role: 'tenant_admin',
-    })).rejects.toThrow('SKILL.md name');
+    })).rejects.toThrow('诊断');
     expect(reg.get('expected')?.reviewed).toBe(false);
+  });
+
+  it('rejects review on Pi invalid-metadata diagnostics and keeps the skill pending and absent', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-upload-diagnostic-'));
+    const skillDir = join(root, 'users', 'uploader', 'bad_name');
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(skillDir, 'SKILL.md'), '---\nname: bad_name\ndescription: invalid Pi name\n---\nbody');
+    await writeProduct(skillDir, { name: 'bad_name', version: '1' });
+    const reg = new SkillRegistry(root);
+    await reg.installUploadedProduct(skillDir, {
+      tenantId: 'default', userId: 'uploader', role: 'user',
+    });
+    await reg.scan();
+
+    await expect(reg.review('bad_name', {
+      tenantId: 'default', userId: 'reviewer', role: 'tenant_admin',
+    })).rejects.toThrow('诊断');
+    expect(JSON.parse(await readFile(join(skillDir, '.product.json'), 'utf8'))).toMatchObject({ reviewed: false });
+    expect(await reg.summariesFor({ tenantId: 'default', userId: 'uploader', role: 'user' })).toBe('');
+    expect(await reg.loadFor('bad_name', { tenantId: 'default', userId: 'uploader', role: 'user' })).toBeUndefined();
   });
 
   it('forbids an admin uploader from reviewing their own pending skill', async () => {
@@ -355,7 +375,7 @@ describe('SkillRegistry upload review governance', () => {
     await expect(reg.review('published', reviewer)).rejects.toThrow('已审核');
   });
 
-  it('reviews the pending user upload instead of a same-name built-in and rejects cross-tenant review', async () => {
+  it('rejects a pending upload that collides with a same-name built-in', async () => {
     const root = await mkdtemp(join(tmpdir(), 'aiop-upload-review-target-'));
     const builtInDir = join(root, 'collision');
     await mkdir(builtInDir);
@@ -374,15 +394,140 @@ describe('SkillRegistry upload review governance', () => {
     const reg = new SkillRegistry(root);
     await reg.scan();
 
+    const incomingDir = join(root, 'users', 'incoming', 'collision-copy');
+    await mkdir(incomingDir, { recursive: true });
+    await writeFile(join(incomingDir, 'SKILL.md'), '---\nname: collision\ndescription: incoming\n---\nbody');
+    await writeProduct(incomingDir, { name: 'collision', version: '3' });
+    await expect(reg.installUploadedProduct(incomingDir, {
+      tenantId: 'default', userId: 'incoming', role: 'user',
+    })).rejects.toThrow('名称冲突');
+
     await expect(reg.review('collision', {
-      tenantId: 'other', userId: 'other-admin', role: 'tenant_admin',
-    })).rejects.toThrow('未找到技能');
-    const reviewed = await reg.review('collision', {
       tenantId: 'default', userId: 'reviewer', role: 'tenant_admin',
-    });
-    expect(reviewed.path).toBe(uploadedDir);
+    })).rejects.toThrow('名称冲突');
+    expect(JSON.parse(await readFile(join(uploadedDir, '.product.json'), 'utf8'))).toMatchObject({ reviewed: false });
     expect(JSON.parse(await readFile(join(builtInDir, '.product.json'), 'utf8'))).toMatchObject({
       reviewed: true, visibility: 'public', allowedTenantIds: ['*'],
+    });
+  });
+
+  it('rejects same-tenant reviewed and pending name collisions during upload', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-upload-collision-'));
+    for (const [owner, reviewed] of [['reviewed-owner', true], ['pending-owner', false]] as const) {
+      const skillDir = join(root, 'users', owner, reviewed ? 'reviewed-name' : 'pending-name');
+      await mkdir(skillDir, { recursive: true });
+      const name = reviewed ? 'reviewed-name' : 'pending-name';
+      await writeFile(join(skillDir, 'SKILL.md'), `---\nname: ${name}\ndescription: existing\n---\nbody`);
+      await writeProduct(skillDir, {
+        name, version: '1', enabled: true, reviewed,
+        tenantId: 'default', ownerUserId: owner, visibility: 'private',
+      });
+    }
+    const reg = new SkillRegistry(root);
+    await reg.scan();
+    for (const name of ['reviewed-name', 'pending-name']) {
+      const incoming = join(root, 'users', 'incoming', `${name}-copy`);
+      await mkdir(incoming, { recursive: true });
+      await writeFile(join(incoming, 'SKILL.md'), `---\nname: ${name}\ndescription: incoming\n---\nbody`);
+      await writeProduct(incoming, { name, version: '2' });
+      await expect(reg.installUploadedProduct(incoming, {
+        tenantId: 'default', userId: 'incoming', role: 'user',
+      })).rejects.toThrow('名称冲突');
+    }
+  });
+
+  it('allows tenant-private duplicate names across isolated tenants but rejects a global review collision', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-upload-global-collision-'));
+    const defaultDir = join(root, 'users', 'default-owner', 'isolated');
+    await mkdir(defaultDir, { recursive: true });
+    await writeFile(join(defaultDir, 'SKILL.md'), '---\nname: isolated\ndescription: default\n---\nbody');
+    await writeProduct(defaultDir, { name: 'isolated', version: '1' });
+    const reg = new SkillRegistry(root);
+    await reg.installUploadedProduct(defaultDir, {
+      tenantId: 'default', userId: 'default-owner', role: 'user',
+    });
+    await reg.scan();
+    const otherDir = join(root, 'tenants', 'other', 'users', 'other-owner', 'isolated');
+    await mkdir(otherDir, { recursive: true });
+    await writeFile(join(otherDir, 'SKILL.md'), '---\nname: isolated\ndescription: other\n---\nbody');
+    await writeProduct(otherDir, { name: 'isolated', version: '1' });
+    await expect(reg.installUploadedProduct(otherDir, {
+      tenantId: 'other', userId: 'other-owner', role: 'user',
+    })).resolves.toMatchObject({ name: 'isolated', reviewed: false });
+    await reg.scan();
+
+    await expect(reg.review('isolated', {
+      tenantId: 'default', userId: 'platform-reviewer', role: 'platform_admin',
+    }, { global: true })).rejects.toThrow('全局名称冲突');
+  });
+
+  it('skips ambiguous reviewed names consistently across list, prompt, and lookup', async () => {
+    const records: SkillProductRecord[] = [
+      { id: 'a', name: 'duplicate', path: '/skills/a', version: '1', tenantId: 'default', visibility: 'public', enabled: true, reviewed: true },
+      { id: 'b', name: 'duplicate', path: '/skills/b', version: '1', tenantId: 'default', visibility: 'public', enabled: true, reviewed: true },
+    ];
+    const loader = vi.fn(async (_env, sources: Array<{ path: string; source: SkillProductRecord }>) => ({
+      skills: sources.map(({ path, source }) => ({
+        source,
+        skill: { name: source.name, description: source.id, content: source.id, filePath: join(path, 'SKILL.md') },
+      })),
+      diagnostics: [],
+    }));
+    const reg = new SkillRegistry('/unused', { records, loader, env: {} as never });
+    await reg.scan();
+    const viewer = { tenantId: 'default', userId: 'u', role: 'user' as const };
+
+    expect(await reg.listLoadedFor(viewer)).toEqual([]);
+    expect(await reg.summariesFor(viewer)).toBe('');
+    expect(await reg.loadFor('duplicate', viewer)).toBeUndefined();
+    expect(loader).not.toHaveBeenCalled();
+  });
+
+  it('serializes concurrent same-tenant imports so only one duplicate name succeeds', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-upload-concurrent-import-'));
+    const reg = new SkillRegistry(root);
+    await reg.scan();
+    const dirs = ['u1', 'u2'].map((owner) => join(root, 'users', owner, `concurrent-${owner}`));
+    for (const dir of dirs) {
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, 'SKILL.md'), '---\nname: concurrent\ndescription: concurrent\n---\nbody');
+      await writeProduct(dir, { name: 'concurrent', version: '1' });
+    }
+
+    const results = await Promise.allSettled(dirs.map((dir, index) => reg.installUploadedProduct(dir, {
+      tenantId: 'default', userId: `u${index + 1}`, role: 'user',
+    })));
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    expect(reg.list().filter((skill) => skill.name === 'concurrent')).toHaveLength(1);
+  });
+
+  it('serializes concurrent local and global review so persisted state matches the sole success', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-upload-concurrent-review-'));
+    const skillDir = join(root, 'users', 'uploader', 'race-review');
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(skillDir, 'SKILL.md'), '---\nname: race-review\ndescription: race review\n---\nbody');
+    await writeProduct(skillDir, {
+      name: 'race-review', version: '1', enabled: true, reviewed: false,
+      tenantId: 'default', ownerUserId: 'uploader', visibility: 'private',
+    });
+    const reg = new SkillRegistry(root);
+    await reg.scan();
+
+    const results = await Promise.allSettled([
+      reg.review('race-review', { tenantId: 'default', userId: 'tenant-reviewer', role: 'tenant_admin' }),
+      reg.review('race-review', { tenantId: 'default', userId: 'platform-reviewer', role: 'platform_admin' }, { global: true }),
+    ]);
+
+    const fulfilled = results.filter((result): result is PromiseFulfilledResult<SkillProductRecord> => result.status === 'fulfilled');
+    expect(fulfilled).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    const persisted = JSON.parse(await readFile(join(skillDir, '.product.json'), 'utf8')) as Record<string, unknown>;
+    expect(persisted).toMatchObject({
+      reviewed: true,
+      visibility: fulfilled[0]!.value.visibility,
+      ...(fulfilled[0]!.value.visibility === 'public' ? { allowedTenantIds: ['*'] } : {}),
     });
   });
 });

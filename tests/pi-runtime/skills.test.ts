@@ -46,7 +46,7 @@ describe('Pi skills bridge', () => {
         source,
         skill: { name: source.name, description: source.name, content: source.name, filePath: join(path, 'SKILL.md') },
       })),
-      diagnostics: [{ type: 'warning' as const, code: 'read_failed' as const, message: 'fixture', path: '/fixture', source: sources[0]!.source }],
+      diagnostics: [],
     }));
     const formatter = vi.fn((skills: Array<{ name: string }>) => skills.map((skill) => skill.name).join(','));
 
@@ -61,8 +61,37 @@ describe('Pi skills bridge', () => {
     expect(result.skills.map((skill) => skill.name)).toEqual(['allowed']);
     expect(result.loaded.map((item) => item.product.id)).toEqual(['allowed']);
     expect(result.prompt).toBe('allowed');
-    expect(result.diagnostics).toHaveLength(1);
+    expect(result.diagnostics).toEqual([]);
     expect(formatter).toHaveBeenCalledWith(result.skills);
+  });
+
+  it('drops a matching Pi skill when its source has any diagnostic', async () => {
+    const product: PiSkillProduct = {
+      id: 'diagnostic', name: 'diagnostic', path: '/skills/diagnostic', version: '1',
+      tenantId: 'tenant-a', visibility: 'public', enabled: true, reviewed: true,
+    };
+    const loader = vi.fn(async () => ({
+      skills: [{
+        source: product,
+        skill: { name: 'diagnostic', description: 'loaded', content: 'body', filePath: '/skills/diagnostic/SKILL.md' },
+      }],
+      diagnostics: [{
+        type: 'warning' as const, code: 'invalid_metadata' as const,
+        message: 'invalid name', path: '/skills/diagnostic/SKILL.md', source: product,
+      }],
+    }));
+
+    const result = await loadAvailableSkills(
+      {} as never,
+      [product],
+      { tenantId: 'tenant-a', userId: 'user-a', role: 'user' },
+      { loader },
+    );
+
+    expect(result.skills).toEqual([]);
+    expect(result.loaded).toEqual([]);
+    expect(result.prompt).toBe('');
+    expect(result.diagnostics).toEqual([expect.objectContaining({ source: product })]);
   });
 
   it('drops Pi skills whose loaded name does not match the canonical product name', async () => {
