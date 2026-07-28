@@ -140,7 +140,10 @@ class GovernedToolRuntime implements ToolRuntime {
           userId: context.identity.actorId, sessionId: context.sessionId,
           attemptId: context.attemptId, turnNo: context.turnNo, kind: 'approval',
           toolCallId: call.id, status: 'pending',
-          payload: approval.payload ?? { toolName: call.name, reason: policy.reason ?? null },
+          payload: approval.payload ?? {
+            call: { id: call.id, name: call.name, args: call.arguments },
+            reason: policy.reason ?? null,
+          },
           createdAt: this.now(),
         }],
       };
@@ -182,6 +185,13 @@ class GovernedToolRuntime implements ToolRuntime {
       || interaction.toolCallId !== existing.toolCallId || interaction.toolCallId !== call.id
       || interaction.resolution !== resolution.value) {
       return { outcome: { kind: 'recovery_required', message: 'approval resolution is not bound to the pending interaction' } };
+    }
+    const payloadIdentity = approvalPayloadIdentity(interaction.payload);
+    const callArgsDigest = digestToolValue(call.arguments);
+    if (!payloadIdentity || payloadIdentity.name !== call.name || payloadIdentity.name !== existing.toolName
+      || payloadIdentity.argsDigest !== callArgsDigest || payloadIdentity.argsDigest !== existing.argsDigest
+      || payloadIdentity.toolCallIds.some((toolCallId) => toolCallId !== call.id || toolCallId !== existing.toolCallId)) {
+      return { outcome: { kind: 'recovery_required', message: 'approval payload is not bound to the pending tool call' } };
     }
     return { decision: { approved: resolution.value, interactionId: resolution.interactionId } };
   }
@@ -322,6 +332,36 @@ function result(callId: string, content: string, isError = false): ToolExecution
 
 function safeMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function approvalPayloadIdentity(payload: JsonValue): {
+  name: string;
+  argsDigest: string;
+  toolCallIds: string[];
+} | undefined {
+  if (!isJsonObject(payload) || !isJsonObject(payload.call)) return undefined;
+  const pendingCall = payload.call;
+  if (typeof pendingCall.name !== 'string' || !Object.hasOwn(pendingCall, 'args')
+    || !isJsonValue(pendingCall.args)) return undefined;
+  const toolCallIds: string[] = [];
+  for (const key of ['id', 'toolCallId'] as const) {
+    if (!Object.hasOwn(pendingCall, key)) continue;
+    if (typeof pendingCall[key] !== 'string') return undefined;
+    toolCallIds.push(pendingCall[key]);
+  }
+  return { name: pendingCall.name, argsDigest: digestToolValue(pendingCall.args), toolCallIds };
+}
+
+function isJsonObject(value: JsonValue | undefined): value is Record<string, JsonValue> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isJsonValue(value: unknown): value is JsonValue {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  if (typeof value !== 'object') return false;
+  return Object.values(value as Record<string, unknown>).every(isJsonValue);
 }
 
 function stableJson(value: JsonValue): string {

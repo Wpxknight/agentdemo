@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import type {
+  DurableInteractionUpdate,
   DurableToolLedgerUpdate,
+  JsonValue,
   ToolCall,
   ToolExecutionContext,
 } from '@aiop/control-contracts';
@@ -44,19 +46,7 @@ class MemoryLedger implements ToolLedgerStore {
 }
 
 class MemoryInteractions implements ToolInteractionStore {
-  constructor(private readonly records: Array<{
-    tenantId: string;
-    runId: string;
-    id: string;
-    attemptId: string;
-    toolCallId: string;
-    kind: 'approval';
-    status: 'resolved';
-    resolution: boolean;
-    turnNo: number;
-    payload: null;
-    createdAt: Date;
-  }>) {}
+  constructor(private readonly records: DurableInteractionUpdate[]) {}
 
   async get(input: { tenantId: string; runId: string; interactionId: string }) {
     return this.records.find((record) => record.tenantId === input.tenantId
@@ -67,6 +57,10 @@ class MemoryInteractions implements ToolInteractionStore {
 const call = (logicalCallId = 'logical-a'): ToolCall => ({
   id: 'call-a', logicalCallId, name: 'write', arguments: { resource: 'deployment/a' },
 });
+
+const approvalPayload = (callValue: JsonValue = {
+  id: 'call-a', name: 'write', args: { resource: 'deployment/a' },
+}): JsonValue => ({ call: callValue, reason: 'production change' });
 
 describe('GovernedToolFactory', () => {
   it('does not execute the original tool when policy denies it', async () => {
@@ -126,7 +120,7 @@ describe('GovernedToolFactory', () => {
     const interactions = new MemoryInteractions([{
       tenantId: 'tenant-a', runId: 'run-a', id: 'approval-a', attemptId: 'attempt-a',
       toolCallId: 'call-a', kind: 'approval', status: 'resolved', resolution: true,
-      turnNo: 1, payload: null, createdAt: new Date(),
+      turnNo: 1, payload: approvalPayload(), createdAt: new Date(),
     }]);
     const resumed = await new GovernedToolFactory({ ledger, interactions }).create([definition]).execute(call(), {
       ...context,
@@ -197,6 +191,47 @@ describe('GovernedToolFactory', () => {
       attemptId: 'attempt-resume',
       interactionResolution: {
         interactionId: interaction.id, kind: 'approval', toolCallId: 'call-a', value: true,
+      },
+    })).resolves.toMatchObject({ kind: 'recovery_required' });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['null payload', null],
+    ['wrong tool name', approvalPayload({
+      id: 'call-a', name: 'delete', args: { resource: 'deployment/a' },
+    })],
+    ['wrong arguments', approvalPayload({
+      id: 'call-a', name: 'write', args: { resource: 'deployment/b' },
+    })],
+    ['malformed call', { call: 'write', reason: 'production change' }],
+    ['cross-ledger substituted pair', approvalPayload({
+      id: 'call-other', name: 'delete', args: { resource: 'deployment/b' },
+    })],
+  ] satisfies Array<[string, JsonValue]>)('rejects approval resume with %s', async (_case, payload) => {
+    const ledger = new MemoryLedger();
+    await ledger.putIfAbsent({
+      tenantId: 'tenant-a', runId: 'run-a', attemptId: 'attempt-a', turnNo: 1,
+      logicalCallId: 'logical-a', toolCallId: 'call-a', toolName: 'write',
+      argsDigest: digestToolValue({ resource: 'deployment/a' }), capability: 'retryable_write',
+      idempotencyKey: 'tenant-a:run-a:logical-a', approvedInteractionId: 'approval-a',
+      status: 'pending_approval', createdAt: new Date(), updatedAt: new Date(),
+    });
+    const execute = vi.fn(async () => ({ content: 'must not execute' }));
+    const interactions = new MemoryInteractions([{
+      tenantId: 'tenant-a', runId: 'run-a', id: 'approval-a', attemptId: 'attempt-a', turnNo: 1,
+      toolCallId: 'call-a', kind: 'approval', status: 'resolved', resolution: true,
+      payload, createdAt: new Date(),
+    }]);
+    const runtime = new GovernedToolFactory({ ledger, interactions }).create([{
+      name: 'write', description: 'write', inputSchema: {}, capability: 'retryable_write', execute,
+    }]);
+
+    await expect(runtime.execute(call(), {
+      ...context,
+      attemptId: 'attempt-resume',
+      interactionResolution: {
+        interactionId: 'approval-a', kind: 'approval', toolCallId: 'call-a', value: true,
       },
     })).resolves.toMatchObject({ kind: 'recovery_required' });
     expect(execute).not.toHaveBeenCalled();
