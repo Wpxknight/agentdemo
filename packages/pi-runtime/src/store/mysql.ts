@@ -9,6 +9,7 @@ import type {
   ClaimInboxInput, ConsumeInboxInput, DurableRunStore, EnqueueInboxInput, PiSessionRecord, RunInboxMessage,
   SessionEntryRecord, StoredRun,
 } from './types.js';
+import { assertAttemptAllowed } from '../run/limits.js';
 
 type Db = Kysely<any> | Transaction<any>;
 
@@ -34,9 +35,10 @@ export class MysqlRunStore implements DurableRunStore {
         status: record.status, waiting_reason: record.waitingReason ?? null, current_node: null, step_count: 0,
         input_tokens: record.usage.inputTokens, output_tokens: record.usage.outputTokens,
         cache_read_tokens: record.usage.cacheReadTokens, cache_creation_tokens: record.usage.cacheCreationTokens,
+        cost_usd: record.usage.costUsd ?? null, limits_json: record.limits ? JSON.stringify(record.limits) : null,
         error_message: null, started_at: null, updated_at: record.updatedAt, completed_at: null,
         cancel_requested_at: null, lease_owner: record.leaseOwner ?? null, lease_token: Number(record.leaseToken),
-        lease_expires_at: record.leaseExpiresAt ?? null, created_at: record.createdAt,
+        lease_expires_at: record.leaseExpiresAt ?? null, append_closed_at: null, created_at: record.createdAt,
       }).execute();
       return record;
     });
@@ -56,7 +58,12 @@ export class MysqlRunStore implements DurableRunStore {
       const row = await store.db.selectFrom('agent_runs').selectAll().where('tenant_id', '=', input.identity.tenantId)
         .where('run_id', '=', input.runId).forUpdate().executeTakeFirst();
       if (!row) throw new RunNotFoundError();
-      if (row.user_id !== input.identity.actorId || ['succeeded', 'cancelled'].includes(row.status)) return null;
+      if (!canManageRun(input.identity, row.user_id) || ['succeeded', 'cancelled'].includes(row.status)) return null;
+      if (['waiting', 'failed', 'recovery_required'].includes(row.status) && !input.resume) return null;
+      const attemptCount = await store.db.selectFrom('agent_run_attempts').select(({ fn }) => fn.countAll<number>().as('count'))
+        .where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId).executeTakeFirstOrThrow();
+      const limits = row.limits_json === null || row.limits_json === undefined ? undefined : reviveLimits(parse(row.limits_json));
+      assertAttemptAllowed(limits, Number(attemptCount.count), input.now);
       if (row.lease_owner && row.lease_owner !== input.workerId && row.lease_expires_at && row.lease_expires_at > input.now) return null;
       const same = row.lease_owner === input.workerId && row.lease_expires_at && row.lease_expires_at > input.now;
       const fencingToken = BigInt(same ? row.lease_token : Number(row.lease_token) + 1);
@@ -64,6 +71,7 @@ export class MysqlRunStore implements DurableRunStore {
       await store.db.updateTable('agent_runs').set({
         status: 'running', lease_owner: input.workerId, lease_token: Number(fencingToken),
         lease_expires_at: new Date(input.now.getTime() + input.leaseTtlMs), updated_at: input.now,
+        ...(input.resume && ['waiting', 'failed', 'recovery_required'].includes(row.status) ? { append_closed_at: null } : {}),
       }).where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId).execute();
       await store.db.insertInto('agent_run_attempts').values({
         tenant_id: input.identity.tenantId, run_id: input.runId, attempt_id: attemptId, worker_id: input.workerId,
@@ -85,7 +93,7 @@ export class MysqlRunStore implements DurableRunStore {
 
   async commitTurn(input: Parameters<DurableRunStore['commitTurn']>[0]): Promise<void> {
     await this.transaction(async (store) => {
-      const run = await store.assertLease(input.tenantId, input.runId, input.fencingToken, true);
+      const run = await store.assertLease(input.tenantId, input.runId, input.fencingToken, true, undefined, input.committedAt);
       if (run.cancel_requested_at) throw conflict('Cancellation won the commit race');
       const existing = await store.db.selectFrom('agent_turn_commits').selectAll()
         .where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId)
@@ -113,25 +121,28 @@ export class MysqlRunStore implements DurableRunStore {
         pi_session_id: piSessionId, pi_leaf_id: piLeafId, pi_entry_seq: piEntrySeq,
         commit_id: randomUUID(), transcript_version: Number(last?.version ?? 0) + 1, stop_reason: null,
         usage_json: JSON.stringify(input.usage), messages_json: JSON.stringify(input.checkpoint),
-        event_sequence_end: eventSequenceEnd, committed_at: store.now(),
+        event_sequence_end: eventSequenceEnd, committed_at: input.committedAt,
       }).execute();
       if (piSessionId) {
-        await store.db.updateTable('pi_sessions').set({ committed_leaf_id: piLeafId, updated_at: store.now() })
+        await store.db.updateTable('pi_sessions').set({ committed_leaf_id: piLeafId, updated_at: input.committedAt })
           .where('tenant_id', '=', input.tenantId).where('session_id', '=', piSessionId).execute();
       }
       await store.db.updateTable('agent_runs').set({
         status: input.status, input_tokens: input.usage.inputTokens, output_tokens: input.usage.outputTokens,
         cache_read_tokens: input.usage.cacheReadTokens, cache_creation_tokens: input.usage.cacheCreationTokens,
-        updated_at: store.now(),
+        cost_usd: input.usage.costUsd ?? null, updated_at: input.committedAt,
       }).where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId).execute();
     });
   }
 
   async requestCancellation(input: Parameters<DurableRunStore['requestCancellation']>[0]): Promise<void> {
-    const result = await this.db.updateTable('agent_runs').set({ cancel_requested_at: input.requestedAt, updated_at: input.requestedAt })
-      .where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId)
-      .where('user_id', '=', input.identity.actorId).executeTakeFirst();
-    if (!affected(result)) throw new RunNotFoundError();
+    await this.transaction(async (store) => {
+      const row = await store.db.selectFrom('agent_runs').selectAll().where('tenant_id', '=', input.identity.tenantId)
+        .where('run_id', '=', input.runId).forUpdate().executeTakeFirst();
+      if (!row || !canManageRun(input.identity, row.user_id)) throw new RunNotFoundError();
+      await store.db.updateTable('agent_runs').set({ cancel_requested_at: input.requestedAt, updated_at: input.requestedAt })
+        .where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId).execute();
+    });
   }
 
   async complete(input: Parameters<DurableRunStore['complete']>[0]): Promise<void> {
@@ -141,8 +152,9 @@ export class MysqlRunStore implements DurableRunStore {
       await store.db.updateTable('agent_runs').set({
         status, input_tokens: input.usage.inputTokens, output_tokens: input.usage.outputTokens,
         cache_read_tokens: input.usage.cacheReadTokens, cache_creation_tokens: input.usage.cacheCreationTokens,
+        cost_usd: input.usage.costUsd ?? null,
         error_message: input.error?.message ?? null, completed_at: input.completedAt, updated_at: input.completedAt,
-        lease_owner: null, lease_expires_at: null,
+        lease_owner: null, lease_expires_at: null, append_closed_at: row.append_closed_at ?? input.completedAt,
       }).where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId).execute();
       await store.db.updateTable('agent_run_attempts').set({ status, completed_at: input.completedAt })
         .where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId)
@@ -160,6 +172,21 @@ export class MysqlRunStore implements DurableRunStore {
     const row = await this.db.selectFrom('agent_runs').select('cancel_requested_at').where('tenant_id', '=', identity.tenantId)
       .where('run_id', '=', identity.runId).executeTakeFirst();
     return Boolean(row?.cancel_requested_at);
+  }
+
+  async countAttempts(identity: { tenantId: string; runId: string }): Promise<number> {
+    const row = await this.db.selectFrom('agent_run_attempts').select(({ fn }) => fn.countAll<number>().as('count'))
+      .where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId).executeTakeFirstOrThrow();
+    return Number(row.count);
+  }
+
+  async closeInbox(input: Parameters<DurableRunStore['closeInbox']>[0]): Promise<void> {
+    await this.transaction(async (store) => {
+      const row = await store.assertLease(input.tenantId, input.runId, input.fencingToken, true, input.workerId, input.now);
+      await store.db.updateTable('agent_runs').set({
+        append_closed_at: row.append_closed_at ?? input.now, updated_at: input.now,
+      }).where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId).execute();
+    });
   }
 
   readonly sessions = {
@@ -220,12 +247,16 @@ export class MysqlRunStore implements DurableRunStore {
 
   readonly inbox = {
     enqueue: async (input: EnqueueInboxInput): Promise<RunInboxMessage> => this.transaction(async (store) => {
+      const run = await store.db.selectFrom('agent_runs').selectAll().where('tenant_id', '=', input.tenantId)
+        .where('run_id', '=', input.runId).forUpdate().executeTakeFirst();
+      if (!run || !canManageRun(input.identity, run.user_id)) throw new RunNotFoundError();
+      if (run.append_closed_at || !['queued', 'running', 'waiting', 'recovery_required'].includes(run.status)) {
+        throw conflict('Run no longer accepts appended messages');
+      }
       const duplicate = await store.db.selectFrom('agent_run_inbox_messages').selectAll()
         .where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId)
         .where('idempotency_key', '=', input.idempotencyKey).executeTakeFirst();
       if (duplicate) return mapInbox(duplicate);
-      await store.db.selectFrom('agent_runs').select('run_id').where('tenant_id', '=', input.tenantId)
-        .where('run_id', '=', input.runId).forUpdate().executeTakeFirstOrThrow();
       const last = await store.db.selectFrom('agent_run_inbox_messages').select(({ fn }) => fn.max<number>('sequence').as('sequence'))
         .where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId).executeTakeFirst();
       const message: RunInboxMessage = {
@@ -297,9 +328,10 @@ function mapRun(row: any, commit?: any): StoredRun {
     tenantId: row.tenant_id, runId: row.run_id, actorId: row.user_id, sessionId: row.session_id,
     kernel: row.kernel, kernelVersion: row.kernel_version, status: row.status, waitingReason: row.waiting_reason ?? undefined,
     leaseToken: BigInt(row.lease_token), leaseOwner: row.lease_owner ?? undefined, leaseExpiresAt: row.lease_expires_at ?? undefined,
-    limits: undefined, usage: usage(row), createdAt: row.created_at, updatedAt: row.updated_at,
+    limits: row.limits_json === null || row.limits_json === undefined ? undefined : reviveLimits(parse(row.limits_json)),
+    usage: usage(row), createdAt: row.created_at, updatedAt: row.updated_at,
     cancelRequestedAt: row.cancel_requested_at ?? undefined, lastTurnNo: Number(commit?.turn_no ?? 0),
-    checkpoint: commit ? parse(commit.messages_json) : undefined,
+    checkpoint: commit ? parse(commit.messages_json) : undefined, appendClosedAt: row.append_closed_at ?? undefined,
   };
 }
 function mapSession(row: any): PiSessionRecord { return {
@@ -333,9 +365,18 @@ function reachable(records: SessionEntryRecord[], leaf: string | null): Set<stri
 function usage(row: any): AgentRunUsage { return {
   inputTokens: row.input_tokens, outputTokens: row.output_tokens,
   cacheReadTokens: row.cache_read_tokens, cacheCreationTokens: row.cache_creation_tokens,
+  costUsd: row.cost_usd === null || row.cost_usd === undefined ? undefined : Number(row.cost_usd),
 }; }
 function affected(result: any): boolean { return Number(result.numUpdatedRows ?? result.numAffectedRows ?? 0) > 0; }
 function parse(value: unknown): any { return typeof value === 'string' ? JSON.parse(value) : value; }
 function asRecord(value: unknown): Record<string, unknown> { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}; }
 function stringValue(value: unknown): string | null { return typeof value === 'string' ? value : null; }
 function conflict(message: string): AgentPlatformError { return new AgentPlatformError({ code: 'RUN_STATE_CONFLICT', message, retryable: false }); }
+function canManageRun(identity: { actorId: string; roles: readonly string[] }, actorId: string): boolean {
+  return identity.actorId === actorId || identity.roles.includes('tenant_admin') || identity.roles.includes('platform_admin');
+}
+function reviveLimits(value: any): any {
+  return value && typeof value === 'object' && value.deadlineAt
+    ? { ...value, deadlineAt: new Date(value.deadlineAt) }
+    : value;
+}

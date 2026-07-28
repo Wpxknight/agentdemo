@@ -20,8 +20,10 @@ describe('durable run inbox', () => {
       tenantId: 'tenant-a', runId: 'run-a', idempotencyKey: 'append-1', mode: 'steer' as const,
       message: { role: 'user' as const, text: 'please adjust' }, createdAt: now,
     };
-    const first = await store.inbox.enqueue(input);
-    const duplicate = await store.inbox.enqueue(input);
+    const [first, duplicate] = await Promise.all([
+      store.inbox.enqueue({ ...input, identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] } }),
+      store.inbox.enqueue({ ...input, identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] } }),
+    ]);
     expect(duplicate.id).toBe(first.id);
     expect(duplicate.sequence).toBe(1n);
     const claimed = await store.inbox.claimNext({
@@ -46,6 +48,52 @@ describe('durable run inbox', () => {
       tenantId: 'tenant-b', runId: 'run-a', workerId: 'worker-a', fencingToken: 1n,
       now: new Date(), claimTtlMs: 10,
     })).rejects.toMatchObject({ code: 'LEASE_LOST' });
+  });
+
+  it('closes appends before final drain while preserving every append accepted before the cutoff', async () => {
+    const store = new MemoryRunStore();
+    const now = new Date('2026-07-28T00:00:00.000Z');
+    const identity = { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] } as const;
+    await store.create({ record: {
+      tenantId: identity.tenantId, runId: 'run-closing', actorId: identity.actorId, sessionId: 'session-closing',
+      kernel: 'pi', kernelVersion: '0.82.1', status: 'queued', leaseToken: 0n,
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 }, createdAt: now, updatedAt: now,
+    } });
+    const claim = await store.claim({ identity, runId: 'run-closing', workerId: 'worker-a', now, leaseTtlMs: 1000 });
+    const accepted = await store.inbox.enqueue({
+      identity, tenantId: identity.tenantId, runId: 'run-closing', idempotencyKey: 'before-close', mode: 'steer',
+      message: { role: 'user', text: 'accepted' }, createdAt: now,
+    });
+    await store.closeInbox({
+      tenantId: identity.tenantId, runId: 'run-closing', workerId: 'worker-a',
+      fencingToken: claim!.fencingToken, now,
+    });
+
+    await expect(store.inbox.enqueue({
+      identity, tenantId: identity.tenantId, runId: 'run-closing', idempotencyKey: 'after-close', mode: 'steer',
+      message: { role: 'user', text: 'rejected' }, createdAt: now,
+    })).rejects.toMatchObject({ code: 'RUN_STATE_CONFLICT' });
+    await expect(store.inbox.claimNext({
+      tenantId: identity.tenantId, runId: 'run-closing', workerId: 'worker-a',
+      fencingToken: claim!.fencingToken, now, claimTtlMs: 1000,
+    })).resolves.toMatchObject({ id: accepted.id });
+  });
+
+  it('allows same-tenant administrators to append but hides another user run from regular users', async () => {
+    const store = new MemoryRunStore();
+    const now = new Date();
+    await store.create({ record: {
+      tenantId: 'tenant-a', runId: 'run-auth', actorId: 'owner', sessionId: 'session-auth', kernel: 'pi',
+      kernelVersion: '0.82.1', status: 'queued', leaseToken: 0n,
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 }, createdAt: now, updatedAt: now,
+    } });
+    const base = { tenantId: 'tenant-a', runId: 'run-auth', mode: 'steer' as const, message: { role: 'user' as const, text: 'x' }, createdAt: now };
+    await expect(store.inbox.enqueue({
+      ...base, identity: { tenantId: 'tenant-a', actorId: 'other', roles: ['user'] }, idempotencyKey: 'other',
+    })).rejects.toMatchObject({ code: 'RUN_NOT_FOUND' });
+    await expect(store.inbox.enqueue({
+      ...base, identity: { tenantId: 'tenant-a', actorId: 'admin', roles: ['platform_admin'] }, idempotencyKey: 'admin',
+    })).resolves.toMatchObject({ status: 'pending' });
   });
 });
 

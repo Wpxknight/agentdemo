@@ -10,6 +10,7 @@ export interface StoredRun extends RunRecord {
   result?: AgentRunResult;
   lastTurnNo: number;
   checkpoint?: unknown;
+  appendClosedAt?: Date;
 }
 
 export interface PiSessionRecord {
@@ -46,12 +47,21 @@ export interface RunInboxMessage {
 }
 
 export interface EnqueueInboxInput {
+  identity: ClaimRunInput['identity'];
   tenantId: string;
   runId: string;
   idempotencyKey: string;
   mode: RunInboxMessage['mode'];
   message: AgentInputMessage;
   createdAt: Date;
+}
+
+export interface CloseInboxInput {
+  tenantId: string;
+  runId: string;
+  workerId: string;
+  fencingToken: bigint;
+  now: Date;
 }
 
 export interface ClaimInboxInput {
@@ -88,6 +98,8 @@ export interface DurableRunStore extends RunStore {
   get(identity: { tenantId: string; runId: string }): Promise<StoredRun | undefined>;
   listEvents(identity: { tenantId: string; runId: string }, after?: bigint): Promise<AgentRunEvent[]>;
   isCancellationRequested(identity: { tenantId: string; runId: string }): Promise<boolean>;
+  countAttempts(identity: { tenantId: string; runId: string }): Promise<number>;
+  closeInbox(input: CloseInboxInput): Promise<void>;
   sessions: PiSessionStore;
   inbox: RunInboxStore;
 }

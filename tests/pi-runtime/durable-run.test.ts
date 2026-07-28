@@ -27,6 +27,7 @@ describe('MemoryRunStore durable contract', () => {
     await expect(store.commitTurn({
       tenantId: 'tenant-a', runId: 'run-a', attemptId: first!.attemptId, turnNo: 1,
       fencingToken: first!.fencingToken, checkpoint: { leafId: 'leaf-stale' }, events: [], status: 'running', usage,
+      committedAt: new Date(createdAt.getTime() + 11),
     })).rejects.toBeInstanceOf(LeaseLostError);
   });
 
@@ -38,6 +39,89 @@ describe('MemoryRunStore durable contract', () => {
       kernelVersion: '0.82.1', status: 'queued', leaseToken: 0n, usage, createdAt: now, updatedAt: now,
     } });
     await expect(store.get({ tenantId: 'tenant-b', runId: 'same-id' })).resolves.toBeUndefined();
+  });
+
+  it('enforces lease expiry for commit, complete, and inbox acknowledgement', async () => {
+    const start = new Date('2026-07-28T00:00:00.000Z');
+    const expired = new Date(start.getTime() + 11);
+    const store = new MemoryRunStore(() => expired);
+    const runId = 'expired-mutations';
+    await store.create({ record: {
+      tenantId: identity.tenantId, runId, actorId: identity.actorId, sessionId: 'expired-session', kernel: 'pi',
+      kernelVersion: '0.82.1', status: 'queued', leaseToken: 0n, usage, createdAt: start, updatedAt: start,
+    } });
+    const claim = await store.claim({ identity, runId, workerId: 'worker-a', now: start, leaseTtlMs: 10 });
+    const inbox = await store.inbox.enqueue({
+      identity, tenantId: identity.tenantId, runId, idempotencyKey: 'expired', mode: 'steer',
+      message: { role: 'user', text: 'late' }, createdAt: start,
+    } as never);
+    const claimedInbox = await store.inbox.claimNext({
+      tenantId: identity.tenantId, runId, workerId: 'worker-a', fencingToken: claim!.fencingToken,
+      now: start, claimTtlMs: 100,
+    });
+    expect(claimedInbox?.id).toBe(inbox.id);
+
+    await expect(store.commitTurn({
+      tenantId: identity.tenantId, runId, attemptId: claim!.attemptId, turnNo: 1,
+      fencingToken: claim!.fencingToken, checkpoint: {}, events: [], status: 'running', usage, committedAt: expired,
+    } as never)).rejects.toBeInstanceOf(LeaseLostError);
+    await expect(store.complete({
+      tenantId: identity.tenantId, runId, attemptId: claim!.attemptId, fencingToken: claim!.fencingToken,
+      status: 'failed', usage, completedAt: expired,
+    })).rejects.toBeInstanceOf(LeaseLostError);
+    await expect(store.inbox.markConsumed({
+      tenantId: identity.tenantId, runId, id: inbox.id, claimToken: claimedInbox!.claimToken!, workerId: 'worker-a',
+      fencingToken: claim!.fencingToken, now: expired, consumedAt: expired, claimTtlMs: 100,
+    })).rejects.toBeInstanceOf(LeaseLostError);
+  });
+
+  it('uses the Run Center owner-or-admin authorization rule atomically', async () => {
+    const store = new MemoryRunStore();
+    const now = new Date();
+    const runId = 'authorized-run';
+    await store.create({ record: {
+      tenantId: identity.tenantId, runId, actorId: identity.actorId, sessionId: 'authorized-session', kernel: 'pi',
+      kernelVersion: '0.82.1', status: 'queued', leaseToken: 0n, usage, createdAt: now, updatedAt: now,
+    } });
+    const admin = { tenantId: identity.tenantId, actorId: 'admin-a', roles: ['tenant_admin'] } as const;
+    const outsider = { tenantId: identity.tenantId, actorId: 'user-b', roles: ['user'] } as const;
+
+    await expect(store.claim({ identity: outsider, runId, workerId: 'outsider', now, leaseTtlMs: 1000 })).resolves.toBeNull();
+    const claim = await store.claim({ identity: admin, runId, workerId: 'admin', now, leaseTtlMs: 1000 });
+    expect(claim).not.toBeNull();
+    await expect(store.requestCancellation({ identity: admin, runId, requestedAt: now })).resolves.toBeUndefined();
+  });
+
+  it('reopens a failed run only through an explicit authorized resume claim', async () => {
+    const store = new MemoryRunStore();
+    const now = new Date('2026-07-28T00:00:00.000Z');
+    const runId = 'explicit-failed-resume';
+    await store.create({ record: {
+      tenantId: identity.tenantId, runId, actorId: identity.actorId, sessionId: 'failed-resume-session', kernel: 'pi',
+      kernelVersion: '0.82.1', status: 'queued', leaseToken: 0n, usage, createdAt: now, updatedAt: now,
+    } });
+    const first = await store.claim({ identity, runId, workerId: 'worker-a', now, leaseTtlMs: 1000 });
+    const failedAt = new Date(now.getTime() + 1);
+    await store.complete({
+      tenantId: identity.tenantId, runId, attemptId: first!.attemptId, fencingToken: first!.fencingToken,
+      status: 'failed', usage, completedAt: failedAt,
+    });
+    expect((await store.get({ tenantId: identity.tenantId, runId }))?.appendClosedAt).toEqual(failedAt);
+    await expect(store.claim({
+      identity, runId, workerId: 'ordinary-claim', now: new Date(now.getTime() + 2), leaseTtlMs: 1000,
+    })).resolves.toBeNull();
+
+    const admin = { tenantId: identity.tenantId, actorId: 'admin-a', roles: ['tenant_admin'] } as const;
+    const resumed = await store.claim({
+      identity: admin, runId, workerId: 'resume-worker', now: new Date(now.getTime() + 3), leaseTtlMs: 1000, resume: true,
+    });
+    expect(resumed?.record.status).toBe('running');
+    expect((await store.get({ tenantId: identity.tenantId, runId }))?.appendClosedAt).toBeUndefined();
+  });
+
+  it('exposes a fenced append cutoff operation on both stores', () => {
+    expect(typeof (new MemoryRunStore() as any).closeInbox).toBe('function');
+    expect(typeof (new MysqlRunStore({} as never) as any).closeInbox).toBe('function');
   });
 });
 
@@ -84,6 +168,7 @@ async function runStoreContract(store: DurableRunStore, runId: string): Promise<
   await expect(store.commitTurn({
     tenantId: identity.tenantId, runId, attemptId: second!.attemptId, turnNo: 1,
     fencingToken: second!.fencingToken, checkpoint: {}, events: [], status: 'succeeded', usage,
+    committedAt: reclaimedAt,
   })).rejects.toMatchObject({ code: 'RUN_STATE_CONFLICT' });
   await store.complete({
     tenantId: identity.tenantId, runId, attemptId: second!.attemptId, fencingToken: second!.fencingToken,
@@ -114,7 +199,7 @@ async function runStoreContract(store: DurableRunStore, runId: string): Promise<
       tenantId: identity.tenantId, runId: successRunId, type: 'turn_end', attemptId: successClaim!.attemptId,
       turnNo: 1, kernel: 'pi', kernelVersion: '0.82.1', correlationId: 'commit-success', createdAt: start,
     }],
-    status: 'running', usage,
+    status: 'running', usage, committedAt: start,
   });
   expect((await store.sessions.get(identity.tenantId, successSessionId))?.committedLeafId).toBe('committed-leaf');
   expect(await store.listEvents({ tenantId: identity.tenantId, runId: successRunId })).toHaveLength(1);
@@ -208,6 +293,60 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('shared RunStore MySQL integrati
       await db.destroy();
     }
   });
+
+  it('serializes idempotent inbox appends, fences cutoff, and round-trips limits and cost', async () => {
+    const pool = createMysqlPool(readMysqlConfig()!);
+    await runMigrations(pool);
+    const db = createKysely(pool);
+    const suffix = `${Date.now()}`;
+    const tenantId = 'pi-runtime-inbox-contract';
+    const runId = `run-${suffix}`;
+    const sessionId = `session-${suffix}`;
+    const now = new Date('2026-07-28T00:00:00.000Z');
+    const owner = { tenantId, actorId: 'owner-a', roles: ['user'] } as const;
+    const limits = { maxAttempts: 3, maxTurns: 4, maxCostUsd: 1.5, deadlineAt: new Date('2026-07-29T00:00:00.000Z') };
+    const persistedUsage = { ...usage, costUsd: 0.125 };
+    const store = new MysqlRunStore(db);
+    try {
+      await store.create({ record: {
+        tenantId, runId, actorId: owner.actorId, sessionId, kernel: 'pi', kernelVersion: '0.82.1',
+        status: 'queued', leaseToken: 0n, usage: persistedUsage, limits, createdAt: now, updatedAt: now,
+      } });
+      await expect(store.get({ tenantId, runId })).resolves.toMatchObject({
+        usage: { costUsd: 0.125 },
+        limits: { maxAttempts: 3, maxTurns: 4, maxCostUsd: 1.5, deadlineAt: limits.deadlineAt },
+      });
+      const claim = await store.claim({ identity: owner, runId, workerId: 'worker-a', now, leaseTtlMs: 1000 });
+      const append = {
+        identity: owner, tenantId, runId, idempotencyKey: 'same-key', mode: 'steer' as const,
+        message: { role: 'user' as const, text: 'accepted before close' }, createdAt: now,
+      };
+      const [first, duplicate] = await Promise.all([
+        new MysqlRunStore(db).inbox.enqueue(append),
+        new MysqlRunStore(db).inbox.enqueue(append),
+      ]);
+      expect(duplicate).toEqual(first);
+      await expect(store.inbox.enqueue({
+        ...append, identity: { tenantId, actorId: 'admin-a', roles: ['tenant_admin'] }, idempotencyKey: 'admin-key',
+      })).resolves.toMatchObject({ status: 'pending' });
+      await expect(store.inbox.enqueue({
+        ...append, identity: { tenantId: 'another-tenant', actorId: 'admin-a', roles: ['platform_admin'] },
+        tenantId: 'another-tenant', idempotencyKey: 'cross-tenant',
+      })).rejects.toMatchObject({ code: 'RUN_NOT_FOUND' });
+
+      await store.closeInbox({ tenantId, runId, workerId: 'worker-a', fencingToken: claim!.fencingToken, now });
+      await expect(store.inbox.enqueue({ ...append, idempotencyKey: 'after-close' }))
+        .rejects.toMatchObject({ code: 'RUN_STATE_CONFLICT' });
+      await expect(store.inbox.claimNext({
+        tenantId, runId, workerId: 'worker-a', fencingToken: claim!.fencingToken, now, claimTtlMs: 1000,
+      })).resolves.toMatchObject({ id: first.id, message: { text: 'accepted before close' } });
+    } finally {
+      for (const table of ['agent_run_inbox_messages', 'agent_run_attempts', 'agent_runs'] as const) {
+        await db.deleteFrom(table).where('tenant_id', '=', tenantId).where('run_id', '=', runId).execute();
+      }
+      await db.destroy();
+    }
+  });
 });
 
 describe('DurableRunManager', () => {
@@ -261,4 +400,127 @@ describe('DurableRunManager', () => {
     expect((await store.sessions.get('tenant-a', 'session-a'))?.committedLeafId).toBe('leaf-a');
     expect(await store.listEvents({ tenantId: 'tenant-a', runId: 'run-manager' })).toHaveLength(2);
   });
+
+  it('uses Pi entry deltas as the single authoritative usage source without double counting events', async () => {
+    const store = new MemoryRunStore();
+    let finished = false;
+    const root = {
+      type: 'message' as const, id: 'usage-root', parentId: null, timestamp: new Date().toISOString(),
+      message: { role: 'user' as const, content: 'start', timestamp: Date.now() },
+    };
+    const assistant = {
+      type: 'message' as const, id: 'usage-leaf', parentId: root.id, timestamp: new Date().toISOString(),
+      message: {
+        role: 'assistant' as const, content: [{ type: 'text' as const, text: 'answer' }], api: 'test', provider: 'test', model: 'test',
+        stopReason: 'stop' as const, timestamp: Date.now(),
+        usage: { input: 10, output: 5, cacheRead: 2, cacheWrite: 3, totalTokens: 20,
+          cost: { input: 0.1, output: 0.2, cacheRead: 0.01, cacheWrite: 0.02, total: 0.33 } },
+      },
+    };
+    const session: ManagedPiSession = {
+      async *continue() {
+        yield {
+          tenantId: '', runId: '', sequence: 1n, type: 'message_end', attemptId: '', turnNo: 0,
+          kernel: 'pi', kernelVersion: '0.82.1', correlationId: 'usage', createdAt: new Date(),
+          detail: { message: { usage: { input: 10, output: 5, cacheRead: 2, cacheWrite: 3, costTotal: 0.33 } } },
+        };
+        finished = true;
+      },
+      async entries() { return finished ? [root, assistant] : [root]; }, async leafId() { return assistant.id; },
+      async metadata() { return { id: 'usage-session', tenantId: 'tenant-a', createdAt: new Date().toISOString() }; },
+      async abort() {}, async close() {}, async steer() {}, async followUp() {}, async appendCustomEntry() { return 'marker'; },
+    };
+    const manager = new DurableRunManager({
+      store, heartbeatMs: 0, sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+    const handle = await manager.run({
+      runId: 'usage-run', identity, sessionId: 'usage-session', input: [{ role: 'user', text: 'start' }],
+    });
+    const result = await handle.result();
+    expect(result.usage).toEqual({
+      inputTokens: 10, outputTokens: 5, cacheReadTokens: 2, cacheCreationTokens: 3, costUsd: 0.33,
+    });
+    expect((await store.get({ tenantId: identity.tenantId, runId: 'usage-run' }))?.usage).toEqual(result.usage);
+  });
+
+  it('establishes the append cutoff before its final inbox drain', async () => {
+    const calls: string[] = [];
+    const base = new MemoryRunStore();
+    const store = new Proxy(base, {
+      get(target, property) {
+        if (property === 'closeInbox') return async (...args: unknown[]) => {
+          calls.push('close');
+          return Reflect.apply(target.closeInbox, target, args);
+        };
+        if (property === 'inbox') return {
+          ...target.inbox,
+          claimNext: async (...args: unknown[]) => {
+            calls.push('drain');
+            return (target.inbox.claimNext as (...values: unknown[]) => Promise<unknown>)(...args);
+          },
+        };
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const session = emptySession('cutoff-session');
+    const manager = new DurableRunManager({
+      store: store as never, heartbeatMs: 0, sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+    const result = await (await manager.run({
+      runId: 'cutoff-run', identity, sessionId: 'cutoff-session', input: [{ role: 'user', text: 'start' }],
+    })).result();
+    expect(result.status).toBe('succeeded');
+    expect(calls.lastIndexOf('close')).toBeGreaterThanOrEqual(0);
+    expect(calls.lastIndexOf('close')).toBeLessThan(calls.lastIndexOf('drain'));
+  });
+
+  it.each([
+    [{ maxAttempts: 0 }, 'Maximum attempts exceeded'],
+    [{ maxTurns: 0 }, 'Maximum turns exceeded'],
+    [{ deadlineAt: new Date('2020-01-01T00:00:00.000Z') }, 'Run deadline exceeded'],
+  ] as const)('enforces pre-execution run limits %j', async (limits, message) => {
+    const manager = new DurableRunManager({
+      store: new MemoryRunStore(), sessions: { create: async () => { throw new Error('session must not start'); }, load: async () => { throw new Error('session must not load'); } },
+      eventOptions: () => ({}), now: () => new Date('2026-07-28T00:00:00.000Z'), heartbeatMs: 0,
+    });
+    const handle = await manager.run({
+      runId: `limit-${message}`, identity, sessionId: `session-${message}`, input: [{ role: 'user', text: 'start' }], limits,
+    });
+    await expect(handle.result()).rejects.toThrow(message);
+  });
+
+  it.each([
+    ['input', { maxInputTokens: 1 }, 'message_end', { message: { usage: { input: 2, output: 0, cacheRead: 0, cacheWrite: 0 } } }],
+    ['output', { maxOutputTokens: 1 }, 'message_end', { message: { usage: { input: 0, output: 2, cacheRead: 0, cacheWrite: 0 } } }],
+    ['cost', { maxCostUsd: 0.1 }, 'message_end', { message: { usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costTotal: 0.2 } } }],
+    ['tool', { maxToolCalls: 0 }, 'tool_execution_start', { toolCallId: 'call-a', toolName: 'write' }],
+  ] as const)('enforces observed %s limits during execution', async (name, limits, type, detail) => {
+    const store = new MemoryRunStore();
+    const session: ManagedPiSession = {
+      ...emptySession(`limit-${name}`),
+      async *continue() {
+        yield {
+          tenantId: '', runId: '', sequence: 1n, type, attemptId: '', turnNo: 0,
+          kernel: 'pi', kernelVersion: '0.82.1', correlationId: name, createdAt: new Date(), detail,
+        };
+      },
+    };
+    const manager = new DurableRunManager({
+      store, heartbeatMs: 0, sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+    const result = await (await manager.run({
+      runId: `observed-${name}`, identity, sessionId: `limit-${name}`, input: [{ role: 'user', text: 'start' }], limits,
+    })).result();
+    expect(result).toMatchObject({ status: 'failed', error: { code: 'RUN_LIMIT_EXCEEDED' } });
+    if (name === 'cost') expect(result.error?.message).toBe('Maximum cost exceeded');
+  });
 });
+
+function emptySession(id: string): ManagedPiSession {
+  return {
+    async *continue() {}, async entries() { return []; }, async leafId() { return null; },
+    async metadata() { return { id, tenantId: 'tenant-a', createdAt: new Date().toISOString() }; },
+    async abort() {}, async close() {}, async steer() {}, async followUp() {}, async appendCustomEntry() { return 'marker'; },
+  };
+}

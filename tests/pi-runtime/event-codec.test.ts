@@ -90,8 +90,9 @@ describe('Pi EventCodec', () => {
       correlationId: 'c', sequence: () => 1n });
     expect(codec.fromPi({ type: 'message_end', message: {
       role: 'assistant', content: [], stopReason: 'stop', timestamp: 1,
-      usage: { input: 40, output: 10, cacheRead: 2, cacheWrite: 1, totalTokens: 53 },
-    } } as never).detail).toMatchObject({ message: { usage: { totalTokens: 53 } } });
+      usage: { input: 40, output: 10, cacheRead: 2, cacheWrite: 1, totalTokens: 53,
+        cost: { input: 0.4, output: 0.2, cacheRead: 0.01, cacheWrite: 0.02, total: 0.63 } },
+    } } as never).detail).toMatchObject({ message: { usage: { totalTokens: 53, costTotal: 0.63 } } });
     expect(codec.fromPi({ type: 'session_before_compact', branchEntries: [], preparation: {
       tokensBefore: 987, messagesToSummarize: [], retainedTail: [], firstKeptEntryId: undefined,
     }, signal: new AbortController().signal } as never).detail).toMatchObject({ tokensBefore: 987 });

@@ -68,6 +68,10 @@ describe('durable runtime migrations', () => {
     expect(source).toContain('create table if not exists pi_sessions');
     expect(source).toContain('create table if not exists pi_session_entries');
     expect(source).toContain('create table if not exists agent_run_inbox_messages');
+    expect(source).toContain('add column limits_json json');
+    expect(source).toContain('add column append_closed_at datetime(3)');
+    expect(source).toContain('add column cost_usd decimal(18,8)');
+    expect(source).toContain('idx_agent_runs_session_status');
     for (const column of ['pi_session_id', 'pi_leaf_id', 'pi_entry_seq']) expect(source).toContain(column);
     expect(source).toContain('unique key uq_pi_session_entry_seq');
     expect(source).toContain('unique key uq_agent_run_inbox_idempotency');
@@ -85,6 +89,8 @@ describe('durable runtime migrations', () => {
     expect(source).toContain('agent_turn_commits:');
     expect(source).toContain('sequence: number');
     expect(source).toContain('limits_json: nullablejsoncolumn');
+    expect(source).toContain('append_closed_at: date | null');
+    expect(source).toContain('cost_usd: string | number | null');
     expect(source).toContain('correlation_id: string | null');
     expect(source).not.toContain('langgraph_checkpoints:');
     expect(source).not.toContain('langgraph_checkpoint_writes:');

@@ -117,10 +117,22 @@ export interface RunRecord {
 }
 
 export interface CreateRunRecord { record: RunRecord }
-export interface ClaimRunInput { identity: IdentityContext; runId: string; workerId: string; now: Date; leaseTtlMs: number }
+export interface ClaimRunInput {
+  identity: IdentityContext;
+  runId: string;
+  workerId: string;
+  now: Date;
+  leaseTtlMs: number;
+  /**
+   * Explicit migration-era resume path. Authorized resumes may reopen appendability for
+   * waiting, failed, or recovery-required runs; ordinary claims cannot revive those states.
+   * Succeeded and cancelled runs remain terminal even when this is true.
+   */
+  resume?: boolean;
+}
 export interface ClaimedRun { record: RunRecord; attemptId: string; fencingToken: bigint }
 export interface RenewLeaseInput { tenantId: string; runId: string; workerId: string; fencingToken: bigint; now: Date; leaseTtlMs: number }
-export interface CommitTurnInput { tenantId: string; runId: string; attemptId: string; turnNo: number; fencingToken: bigint; checkpoint: JsonValue; events: readonly Omit<AgentRunEvent, 'sequence'>[]; status: AgentRunStatus; usage: AgentRunUsage }
+export interface CommitTurnInput { tenantId: string; runId: string; attemptId: string; turnNo: number; fencingToken: bigint; checkpoint: JsonValue; events: readonly Omit<AgentRunEvent, 'sequence'>[]; status: AgentRunStatus; usage: AgentRunUsage; committedAt: Date }
 export interface RequestCancellationInput { identity: IdentityContext; runId: string; reason?: string; requestedAt: Date }
 export interface CompleteRunInput { tenantId: string; runId: string; attemptId: string; fencingToken: bigint; status: Extract<AgentRunStatus, 'succeeded' | 'failed' | 'cancelled' | 'recovery_required'>; usage: AgentRunUsage; error?: AgentPlatformErrorData; completedAt: Date }
 

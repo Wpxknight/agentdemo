@@ -1,6 +1,12 @@
 -- 0023_pi_session_and_run_inbox：Pi 会话树、提交水位线与跨 Worker durable inbox。
 -- 仅新增结构；旧应用可安全忽略。
 
+ALTER TABLE agent_runs
+  ADD COLUMN cost_usd DECIMAL(18,8) NULL AFTER cache_creation_tokens,
+  ADD COLUMN limits_json JSON NULL AFTER cost_usd,
+  ADD COLUMN append_closed_at DATETIME(3) NULL AFTER lease_expires_at,
+  ADD KEY idx_agent_runs_session_status (tenant_id, session_id, status);
+
 CREATE TABLE IF NOT EXISTS pi_sessions (
   tenant_id         VARCHAR(64)  NOT NULL,
   session_id        VARCHAR(128) NOT NULL,

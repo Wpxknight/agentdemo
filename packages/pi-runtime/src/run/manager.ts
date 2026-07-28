@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { AgentPlatformError } from '@aiop/control-contracts';
 import type {
-  AgentInputMessage, AgentRunEvent, AgentRunResult, AppendRunMessageInput, CancelRunInput, DurableRunRuntime,
+  AgentInputMessage, AgentRunEvent, AgentRunResult, AgentRunUsage, AppendRunMessageInput, CancelRunInput, DurableRunRuntime,
   RunHandle, StartRunInput, ResumeRunInput,
 } from '@aiop/control-contracts';
 import type { SessionMetadata, SessionTreeEntry } from '@earendil-works/pi-agent-core';
@@ -11,6 +11,7 @@ import { drainDurableInbox, type InboxCapableSession } from './inbox.js';
 import { startLeaseHeartbeat } from './lease.js';
 import { nextTurnNo } from './attempt.js';
 import type { DurableRunStore } from '../store/types.js';
+import { assertToolCallsAllowed, assertTurnAllowed, assertUsageAllowed } from './limits.js';
 
 const ZERO_USAGE = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 } as const;
 
@@ -112,10 +113,13 @@ export class DurableRunManager implements DurableRunRuntime {
     identity: StartRunInput['identity'], runId: string, initialMessage: AgentInputMessage, resume: boolean,
     externalSignal: AbortSignal | undefined, stream: AsyncEventStream<AgentRunEvent>,
   ): Promise<AgentRunResult> {
-    const claimed = await this.options.store.claim({ identity, runId, workerId: this.workerId, now: this.now(), leaseTtlMs: this.leaseTtlMs });
+    const claimed = await this.options.store.claim({
+      identity, runId, workerId: this.workerId, now: this.now(), leaseTtlMs: this.leaseTtlMs, resume,
+    });
     if (!claimed) throw new Error('Run is not claimable');
     const storedRun = await this.options.store.get({ tenantId: identity.tenantId, runId });
     const turnNo = nextTurnNo(storedRun?.lastTurnNo ?? 0);
+    assertTurnAllowed(claimed.record.limits, turnNo);
     const abort = new AbortController();
     const onAbort = () => abort.abort(externalSignal?.reason);
     externalSignal?.addEventListener('abort', onAbort, { once: true });
@@ -137,10 +141,24 @@ export class DurableRunManager implements DurableRunRuntime {
         ? await this.options.sessions.load({ metadata, initialMessage, events })
         : await this.options.sessions.create({ id: claimed.record.sessionId, initialMessage, events, session: { tenantId: identity.tenantId } });
       this.active.set(activeKey, { abort, session });
+      const baselineUsage = usageFromEntries(await session.entries());
       let stopInboxPump = false;
+      const stopControl = new AbortController();
+      const controlSignal = AbortSignal.any([abort.signal, stopControl.signal]);
       const pumpInbox = async (): Promise<void> => {
         while (!stopInboxPump && !abort.signal.aborted) {
           try {
+            if (await this.options.store.isCancellationRequested({ tenantId: identity.tenantId, runId })) {
+              abort.abort(new Error('Run cancellation requested'));
+              await session!.abort();
+              return;
+            }
+            if (claimed.record.limits?.deadlineAt && claimed.record.limits.deadlineAt <= this.now()) {
+              const error = new AgentPlatformError({ code: 'RUN_LIMIT_EXCEEDED', message: 'Run deadline exceeded', retryable: false });
+              abort.abort(error);
+              await session!.abort();
+              return;
+            }
             await drainDurableInbox({
               store: this.options.store, session: session!, entries: await session!.entries(),
               tenantId: identity.tenantId, runId, workerId: this.workerId, fencingToken: claimed.fencingToken,
@@ -150,55 +168,74 @@ export class DurableRunManager implements DurableRunRuntime {
             abort.abort(error);
             return;
           }
-          await delay(this.inboxPollMs, abort.signal);
+          await delay(this.inboxPollMs, controlSignal);
         }
       };
       const inboxPump = pumpInbox();
       const durableEvents: Array<Omit<AgentRunEvent, 'sequence'>> = [];
+      let observedUsage = zeroUsage();
+      let observedToolCalls = 0;
       try {
         for await (const event of session.continue(abort.signal)) {
           await abortIfCancellationRequested(this.options.store, { tenantId: identity.tenantId, runId }, abort);
           const normalized = normalizeEvent(event, identity.tenantId, runId, claimed.attemptId, turnNo);
+          if (normalized.type === 'message_end') observedUsage = addUsage(observedUsage, usageFromEvent(normalized));
+          if (normalized.type === 'tool_execution_start') observedToolCalls += 1;
+          assertUsageAllowed(claimed.record.limits, addUsage(claimed.record.usage, observedUsage));
+          assertToolCallsAllowed(claimed.record.limits, observedToolCalls);
           durableEvents.push(withoutSequence(normalized));
           stream.push(normalized);
         }
       } finally {
         stopInboxPump = true;
+        stopControl.abort();
         await inboxPump;
       }
+      await this.options.store.closeInbox({
+        tenantId: identity.tenantId, runId, workerId: this.workerId,
+        fencingToken: claimed.fencingToken, now: this.now(),
+      });
       await drainDurableInbox({
         store: this.options.store, session, entries: await session.entries(), tenantId: identity.tenantId, runId,
         workerId: this.workerId, fencingToken: claimed.fencingToken, now: this.now, claimTtlMs: this.inboxClaimTtlMs,
       });
       const entries = await session.entries();
+      const actualUsage = addUsage(claimed.record.usage, subtractUsage(usageFromEntries(entries), baselineUsage));
+      assertUsageAllowed(claimed.record.limits, actualUsage);
+      assertToolCallsAllowed(claimed.record.limits, Math.max(observedToolCalls, toolCallsFromEntries(entries)));
       await this.syncEntries(identity.tenantId, claimed.record.sessionId, entries);
       const leafId = await session.leafId();
+      const committedAt = this.now();
       await this.options.store.commitTurn({
         tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, turnNo, fencingToken: claimed.fencingToken,
         checkpoint: { piSessionId: claimed.record.sessionId, piLeafId: leafId },
-        events: durableEvents, status: 'succeeded', usage: claimed.record.usage,
+        events: durableEvents, status: 'succeeded', usage: actualUsage, committedAt,
       });
       await this.options.store.complete({
         tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, fencingToken: claimed.fencingToken,
-        status: 'succeeded', usage: claimed.record.usage, completedAt: this.now(),
+        status: 'succeeded', usage: actualUsage, completedAt: this.now(),
       });
-      return { runId, status: 'succeeded', text: assistantText(entries, leafId), usage: claimed.record.usage };
+      return { runId, status: 'succeeded', text: assistantText(entries, leafId), usage: actualUsage };
     } catch (error) {
       if (abort.signal.aborted) {
         await session?.abort().catch(() => {});
-        const status = await this.options.store.isCancellationRequested({ tenantId: identity.tenantId, runId }) ? 'cancelled' : 'recovery_required';
+        const cancellation = await this.options.store.isCancellationRequested({ tenantId: identity.tenantId, runId });
+        const limitError = abort.signal.reason instanceof AgentPlatformError && abort.signal.reason.code === 'RUN_LIMIT_EXCEEDED'
+          ? abort.signal.reason : undefined;
+        const status = cancellation ? 'cancelled' : limitError ? 'failed' : 'recovery_required';
+        const errorData = limitError ? { code: limitError.code, message: limitError.message, retryable: limitError.retryable } : undefined;
         await this.options.store.complete({
           tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, fencingToken: claimed.fencingToken,
-          status, usage: claimed.record.usage, completedAt: this.now(),
+          status, usage: claimed.record.usage, error: errorData, completedAt: this.now(),
         }).catch(() => {});
-        return { runId, status, usage: claimed.record.usage };
+        return { runId, status, usage: claimed.record.usage, error: errorData };
       }
       const recoveryRequired = hasErrorCode(error, 'TOOL_RESULT_UNKNOWN');
       const status = recoveryRequired ? 'recovery_required' : 'failed';
-      const errorData = {
-        code: recoveryRequired ? 'TOOL_RESULT_UNKNOWN' as const : 'MODEL_PROVIDER_ERROR' as const,
-        message: error instanceof Error ? error.message : String(error), retryable: false,
-      };
+      const errorData = error instanceof AgentPlatformError
+        ? { code: error.code, message: error.message, retryable: error.retryable }
+        : { code: recoveryRequired ? 'TOOL_RESULT_UNKNOWN' as const : 'MODEL_PROVIDER_ERROR' as const,
+            message: error instanceof Error ? error.message : String(error), retryable: false };
       await this.options.store.complete({
         tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, fencingToken: claimed.fencingToken,
         status, usage: claimed.record.usage, error: errorData, completedAt: this.now(),
@@ -251,6 +288,70 @@ function assistantText(entries: readonly SessionTreeEntry[], leafId: string | nu
   }
   return undefined;
 }
+
+function zeroUsage(): AgentRunUsage {
+  return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
+}
+
+function addUsage(left: AgentRunUsage, right: AgentRunUsage): AgentRunUsage {
+  const cost = left.costUsd === undefined && right.costUsd === undefined ? undefined : (left.costUsd ?? 0) + (right.costUsd ?? 0);
+  return {
+    inputTokens: left.inputTokens + right.inputTokens,
+    outputTokens: left.outputTokens + right.outputTokens,
+    cacheReadTokens: left.cacheReadTokens + right.cacheReadTokens,
+    cacheCreationTokens: left.cacheCreationTokens + right.cacheCreationTokens,
+    ...(cost === undefined ? {} : { costUsd: cost }),
+  };
+}
+
+function subtractUsage(value: AgentRunUsage, baseline: AgentRunUsage): AgentRunUsage {
+  const cost = value.costUsd === undefined ? undefined : Math.max(0, value.costUsd - (baseline.costUsd ?? 0));
+  return {
+    inputTokens: Math.max(0, value.inputTokens - baseline.inputTokens),
+    outputTokens: Math.max(0, value.outputTokens - baseline.outputTokens),
+    cacheReadTokens: Math.max(0, value.cacheReadTokens - baseline.cacheReadTokens),
+    cacheCreationTokens: Math.max(0, value.cacheCreationTokens - baseline.cacheCreationTokens),
+    ...(cost === undefined ? {} : { costUsd: cost }),
+  };
+}
+
+function usageFromEntries(entries: readonly SessionTreeEntry[]): AgentRunUsage {
+  let result = zeroUsage();
+  for (const entry of entries) {
+    const usage = entry.type === 'message'
+      ? entry.message.role === 'assistant' ? entry.message.usage : undefined
+      : entry.type === 'compaction' || entry.type === 'branch_summary' ? entry.usage : undefined;
+    if (!usage) continue;
+    result = addUsage(result, {
+      inputTokens: finite(usage.input), outputTokens: finite(usage.output),
+      cacheReadTokens: finite(usage.cacheRead), cacheCreationTokens: finite(usage.cacheWrite),
+      ...(Number.isFinite(usage.cost?.total) ? { costUsd: usage.cost.total } : {}),
+    });
+  }
+  return result;
+}
+
+function usageFromEvent(event: AgentRunEvent): AgentRunUsage {
+  const detail = event.detail && typeof event.detail === 'object' ? event.detail as Record<string, unknown> : {};
+  const message = detail.message && typeof detail.message === 'object' ? detail.message as Record<string, unknown> : {};
+  const usage = message.usage && typeof message.usage === 'object' ? message.usage as Record<string, unknown> : {};
+  return {
+    inputTokens: finite(usage.input), outputTokens: finite(usage.output),
+    cacheReadTokens: finite(usage.cacheRead), cacheCreationTokens: finite(usage.cacheWrite),
+    ...(Number.isFinite(usage.costTotal) ? { costUsd: Number(usage.costTotal) } : {}),
+  };
+}
+
+function toolCallsFromEntries(entries: readonly SessionTreeEntry[]): number {
+  let total = 0;
+  for (const entry of entries) {
+    if (entry.type !== 'message' || entry.message.role !== 'assistant') continue;
+    total += entry.message.content.filter((block) => block.type === 'toolCall').length;
+  }
+  return total;
+}
+
+function finite(value: unknown): number { return typeof value === 'number' && Number.isFinite(value) ? value : 0; }
 
 async function delay(ms: number, signal: AbortSignal): Promise<void> {
   if (ms <= 0 || signal.aborted) return;

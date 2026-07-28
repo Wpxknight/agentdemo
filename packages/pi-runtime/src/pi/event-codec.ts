@@ -185,7 +185,11 @@ function safeModel(model: unknown): Record<string, unknown> | undefined {
 function safeUsage(usage: unknown): Record<string, unknown> | undefined {
   if (!usage || typeof usage !== 'object') return undefined;
   const u = usage as Record<string, unknown>;
-  return { input: numberValue(u.input), output: numberValue(u.output), cacheRead: numberValue(u.cacheRead), cacheWrite: numberValue(u.cacheWrite), totalTokens: numberValue(u.totalTokens) };
+  const cost = u.cost && typeof u.cost === 'object' ? u.cost as Record<string, unknown> : undefined;
+  return {
+    input: numberValue(u.input), output: numberValue(u.output), cacheRead: numberValue(u.cacheRead),
+    cacheWrite: numberValue(u.cacheWrite), totalTokens: numberValue(u.totalTokens), costTotal: numberValue(cost?.total),
+  };
 }
 
 function safeSignal(signal: AbortSignal): Record<string, unknown> {

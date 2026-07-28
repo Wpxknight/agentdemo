@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { MemoryStore } from '../src/db/memory.js';
 import { MysqlStore } from '../src/db/mysql.js';
-import { createDefaultDurableRunRuntime, resolveRuntimeModelConfig, resolveRuntimeSandboxConfig } from '../src/runtime.js';
+import { buildRuntime, createDefaultDurableRunRuntime, resolveRuntimeModelConfig, resolveRuntimeSandboxConfig } from '../src/runtime.js';
 import { ConfigSchema, SandboxConfigSchema, type Config } from '../src/config/schema.js';
-import { DurableRunManager } from '../packages/pi-runtime/src/index.js';
+import { DurableRunManager } from '@aiop/pi-runtime';
 
 const config: Config = {
   models: {
@@ -39,14 +39,43 @@ describe('resolveRuntimeModelConfig', () => {
 });
 
 describe('production durable runtime assembly', () => {
-  it('constructs the shared durable Pi runtime for a MysqlStore', async () => {
+  it('keeps the MysqlStore durable primary path disabled by default', async () => {
     const runtime = await createDefaultDurableRunRuntime(
       new MysqlStore({} as never),
       { id: 'configured', protocol: 'openai', baseURL: 'http://model.local/v1', apiKey: 'secret', model: 'custom-model' },
       'system prompt',
     );
 
+    expect(runtime).toBeUndefined();
+  });
+
+  it('constructs the shared durable Pi runtime only when explicitly enabled', async () => {
+    const runtime = await createDefaultDurableRunRuntime(
+      new MysqlStore({} as never),
+      { id: 'configured', protocol: 'openai', baseURL: 'http://model.local/v1', apiKey: 'secret', model: 'custom-model' },
+      'system prompt',
+      true,
+    );
+
     expect(runtime).toBeInstanceOf(DurableRunManager);
+  });
+
+  it('preserves an explicitly injected durable runtime without enabling automatic assembly', async () => {
+    const injected = { run() {}, resume() {}, cancel() {}, append() {} } as never;
+    const runtime = await buildRuntime(config, { store: new MemoryStore(), durableRunRuntime: injected });
+    try {
+      expect(runtime.durableRunRuntime).toBe(injected);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it('imports the Pi runtime through its public workspace package boundary', async () => {
+    const source = await import('node:fs/promises').then(({ readFile }) => readFile(
+      new URL('../src/runtime.ts', import.meta.url), 'utf8',
+    ));
+    expect(source).toContain("from '@aiop/pi-runtime'");
+    expect(source).not.toContain("from '../packages/pi-runtime/src/index.js'");
   });
 });
 

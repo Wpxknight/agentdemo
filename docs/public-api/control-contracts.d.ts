@@ -253,6 +253,12 @@ export interface ClaimRunInput {
     workerId: string;
     now: Date;
     leaseTtlMs: number;
+    /**
+     * Explicit migration-era resume path. Authorized resumes may reopen appendability for
+     * waiting, failed, or recovery-required runs; ordinary claims cannot revive those states.
+     * Succeeded and cancelled runs remain terminal even when this is true.
+     */
+    resume?: boolean;
 }
 export interface ClaimedRun {
     record: RunRecord;
@@ -277,6 +283,7 @@ export interface CommitTurnInput {
     events: readonly Omit<AgentRunEvent, 'sequence'>[];
     status: AgentRunStatus;
     usage: AgentRunUsage;
+    committedAt: Date;
 }
 export interface RequestCancellationInput {
     identity: IdentityContext;

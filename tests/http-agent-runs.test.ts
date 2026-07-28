@@ -160,6 +160,62 @@ describe('Agent Run Center HTTP API', () => {
     })));
   });
 
+  it('supervises immediate durable recovery failures and returned handles', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const authProvider = new LocalAuthProvider({ store: localStore, secret: 'durable-recovery-secret' });
+    const user = await authProvider.createUser('default', 'recoverer', 'pw', 'user');
+    const token = (await authProvider.login('default', 'recoverer', 'pw'))!;
+    const now = new Date();
+    await localStore.putAgentRunBindingIfAbsent({
+      tenantId: 'default', userId: user.id, sessionId: 'durable-recovery-session', runId: 'durable-recovery-run',
+      kernel: 'pi', kernelVersion: '0.82.1', graphName: '', graphVersion: '', createdAt: now,
+    });
+    await localStore.updateAgentRun('default', 'durable-recovery-run', { status: 'failed', updatedAt: now });
+    const eventDrained = vi.fn();
+    const result = vi.fn(async () => { throw new Error('nonclaimable recovery'); });
+    const handle = {
+      runId: 'durable-recovery-run', status: 'running' as const,
+      events: {
+        async *[Symbol.asyncIterator]() {
+          eventDrained();
+          yield { type: 'node' } as never;
+        },
+      },
+      result,
+    };
+    const resume = vi.fn(async () => handle);
+    resume.mockRejectedValueOnce(new Error('immediate nonclaimable recovery'));
+    const rt = {
+      model: { id: 'mock', async *stream() {} }, tools: new ToolRegistry(), store: localStore,
+      policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(), authProvider,
+      jwtSecret: 'durable-recovery-secret', systemExtra: '', durableRunRuntime: { resume },
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' },
+    } as unknown as Runtime;
+    const recoveryServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => recoveryServer.listen(0, '127.0.0.1', resolve));
+    const recoveryBase = `http://127.0.0.1:${(recoveryServer.address() as AddressInfo).port}`;
+    try {
+      const immediateFailure = await fetch(`${recoveryBase}/v1/agent/runs/durable-recovery-run/resume`, {
+        method: 'POST', headers: auth(token), body: '{}',
+      });
+      expect(immediateFailure.status).toBe(202);
+      await vi.waitFor(() => expect(resume).toHaveBeenCalledOnce());
+
+      const handleFailure = await fetch(`${recoveryBase}/v1/agent/runs/durable-recovery-run/resume`, {
+        method: 'POST', headers: auth(token), body: '{}',
+      });
+      expect(handleFailure.status).toBe(202);
+      await vi.waitFor(() => {
+        expect(resume).toHaveBeenCalledTimes(2);
+        expect(eventDrained).toHaveBeenCalledOnce();
+        expect(result).toHaveBeenCalledOnce();
+      });
+    } finally {
+      await new Promise<void>((resolve) => recoveryServer.close(() => resolve()));
+    }
+  });
+
   it.each([
     ['approve', true],
     ['deny', false],

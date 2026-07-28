@@ -312,8 +312,11 @@ export declare function startLeaseHeartbeat(input: {
 }): () => void;
 
 // file: run/limits.d.ts
-import { type RunLimits } from '@aiop/control-contracts';
+import { type AgentRunUsage, type RunLimits } from '@aiop/control-contracts';
 export declare function assertAttemptAllowed(limits: RunLimits | undefined, attemptCount: number, now: Date): void;
+export declare function assertTurnAllowed(limits: RunLimits | undefined, turnNo: number): void;
+export declare function assertUsageAllowed(limits: RunLimits | undefined, usage: AgentRunUsage): void;
+export declare function assertToolCallsAllowed(limits: RunLimits | undefined, toolCalls: number): void;
 
 // file: run/manager.d.ts
 import type { AgentInputMessage, AgentRunEvent, AppendRunMessageInput, CancelRunInput, DurableRunRuntime, RunHandle, StartRunInput, ResumeRunInput } from '@aiop/control-contracts';
@@ -452,6 +455,11 @@ export declare class MemoryRunStore implements DurableRunStore {
         tenantId: string;
         runId: string;
     }): Promise<boolean>;
+    countAttempts(identity: {
+        tenantId: string;
+        runId: string;
+    }): Promise<number>;
+    closeInbox(input: Parameters<DurableRunStore['closeInbox']>[0]): Promise<void>;
     readonly sessions: {
         create: (input: {
             tenantId: string;
@@ -508,6 +516,11 @@ export declare class MysqlRunStore implements DurableRunStore {
         tenantId: string;
         runId: string;
     }): Promise<boolean>;
+    countAttempts(identity: {
+        tenantId: string;
+        runId: string;
+    }): Promise<number>;
+    closeInbox(input: Parameters<DurableRunStore['closeInbox']>[0]): Promise<void>;
     readonly sessions: {
         create: (input: {
             tenantId: string;
@@ -627,6 +640,7 @@ export interface StoredRun extends RunRecord {
     result?: AgentRunResult;
     lastTurnNo: number;
     checkpoint?: unknown;
+    appendClosedAt?: Date;
 }
 export interface PiSessionRecord {
     tenantId: string;
@@ -659,12 +673,20 @@ export interface RunInboxMessage {
     consumedAt?: Date;
 }
 export interface EnqueueInboxInput {
+    identity: ClaimRunInput['identity'];
     tenantId: string;
     runId: string;
     idempotencyKey: string;
     mode: RunInboxMessage['mode'];
     message: AgentInputMessage;
     createdAt: Date;
+}
+export interface CloseInboxInput {
+    tenantId: string;
+    runId: string;
+    workerId: string;
+    fencingToken: bigint;
+    now: Date;
 }
 export interface ClaimInboxInput {
     tenantId: string;
@@ -713,6 +735,11 @@ export interface DurableRunStore extends RunStore {
         tenantId: string;
         runId: string;
     }): Promise<boolean>;
+    countAttempts(identity: {
+        tenantId: string;
+        runId: string;
+    }): Promise<number>;
+    closeInbox(input: CloseInboxInput): Promise<void>;
     sessions: PiSessionStore;
     inbox: RunInboxStore;
 }

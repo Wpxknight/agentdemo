@@ -210,21 +210,26 @@ export class PiMysqlSessionRepo implements SessionRepo<PiMysqlSessionMetadata, {
   async fork(source: PiMysqlSessionMetadata, options: SessionForkOptions & { id?: string; tenantId: string; metadata?: Record<string, unknown> }): Promise<Session<PiMysqlSessionMetadata>> {
     if (source.tenantId !== options.tenantId) throw new Error('Cannot fork a Pi session across tenants');
     const sourceStorage = new PiMysqlSessionStorage(this.db, source, this.openFromCommitted);
-    const entries = await sourceStorage.getEntries();
+    const entries = await getEntriesToFork(sourceStorage, options);
     const target = await this.create(options);
     const storage = target.getStorage();
-    const selected = selectForkEntries(entries, options.entryId, options.position);
-    for (const entry of selected) await storage.appendEntry(structuredClone(entry));
-    await storage.setLeafId(selected.at(-1)?.id ?? null);
+    for (const entry of entries) await storage.appendEntry(structuredClone(entry));
     return target;
   }
 }
 
-function selectForkEntries(entries: SessionTreeEntry[], entryId?: string, position: 'before' | 'at' = 'at'): SessionTreeEntry[] {
-  if (!entryId) return entries;
-  const index = entries.findIndex((entry) => entry.id === entryId);
-  if (index < 0) throw new Error('Fork entry not found');
-  return entries.slice(0, position === 'before' ? index : index + 1);
+async function getEntriesToFork(
+  storage: PiMysqlSessionStorage,
+  options: SessionForkOptions,
+): Promise<SessionTreeEntry[]> {
+  if (!options.entryId) return storage.getEntries();
+  const target = await storage.getEntry(options.entryId);
+  if (!target) throw new SessionError('invalid_fork_target', `Entry ${options.entryId} not found`);
+  if ((options.position ?? 'before') === 'at') return storage.getPathToRootOrCompaction(target.id);
+  if (target.type !== 'message' || target.message.role !== 'user') {
+    throw new SessionError('invalid_fork_target', `Entry ${options.entryId} is not a user message`);
+  }
+  return storage.getPathToRootOrCompaction(target.parentId);
 }
 
 function parseJson(value: unknown): unknown { return typeof value === 'string' ? JSON.parse(value) : value; }

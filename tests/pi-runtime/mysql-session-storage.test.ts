@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { InMemorySessionStorage, Session, type SessionTreeEntry } from '@earendil-works/pi-agent-core';
+import { InMemorySessionRepo, InMemorySessionStorage, Session, type SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import { EventCodec, PiAgentSession, PiMysqlSessionRepo, PiMysqlSessionStorage } from '../../packages/pi-runtime/src/index.js';
 import { drainDurableInbox, MysqlRunStore } from '../../packages/pi-runtime/src/index.js';
 import { readMysqlConfig } from '../../src/config/mysql.js';
@@ -113,6 +113,49 @@ describe('PiMysqlSessionStorage behavior', () => {
     expect(await mysql.getLabel('assistant')).toBe(await memory.getLabel('assistant'));
     expect(await mysql.getSessionName()).toBe(await memory.getSessionName());
   });
+
+  it('matches Pi 0.82.1 fork ancestry, default position, validation, and entry shape', async () => {
+    const db = new SessionTestDb('tenant-a', 'source');
+    const mysqlRepo = new PiMysqlSessionRepo(db as never, false);
+    const mysqlSource = await mysqlRepo.open({ id: 'source', tenantId: 'tenant-a', createdAt: new Date().toISOString() });
+    const memoryRepo = new InMemorySessionRepo();
+    const memorySource = await memoryRepo.create({ id: 'source' });
+    const entries: SessionTreeEntry[] = [
+      messageEntry('root', null, 'root'),
+      assistantEntry('assistant-a', 'root', 'answer'),
+      { type: 'custom', customType: 'side', data: {}, id: 'unrelated', parentId: 'root', timestamp: new Date().toISOString() },
+      messageEntry('user-b', 'assistant-a', 'branch question'),
+      assistantEntry('assistant-b', 'user-b', 'branch answer'),
+    ];
+    for (const entry of entries) {
+      await mysqlSource.getStorage().appendEntry(entry);
+      await memorySource.getStorage().appendEntry(entry);
+    }
+
+    const mysqlFork = await mysqlRepo.fork(await mysqlSource.getMetadata(), {
+      id: 'mysql-fork', tenantId: 'tenant-a', entryId: 'user-b',
+    });
+    const memoryFork = await memoryRepo.fork(await memorySource.getMetadata(), { id: 'memory-fork', entryId: 'user-b' });
+    expect(await mysqlFork.getEntries()).toEqual(await memoryFork.getEntries());
+    expect((await mysqlFork.getEntries()).map((entry) => entry.id)).toEqual(['root', 'assistant-a']);
+    expect((await mysqlFork.getEntries()).some((entry) => entry.type === 'leaf')).toBe(false);
+
+    const mysqlAt = await mysqlRepo.fork(await mysqlSource.getMetadata(), {
+      id: 'mysql-at', tenantId: 'tenant-a', entryId: 'assistant-b', position: 'at',
+    });
+    const memoryAt = await memoryRepo.fork(await memorySource.getMetadata(), {
+      id: 'memory-at', entryId: 'assistant-b', position: 'at',
+    });
+    expect(await mysqlAt.getEntries()).toEqual(await memoryAt.getEntries());
+    expect((await mysqlAt.getEntries()).map((entry) => entry.id)).toEqual(['root', 'assistant-a', 'user-b', 'assistant-b']);
+
+    await expect(mysqlRepo.fork(await mysqlSource.getMetadata(), {
+      id: 'invalid-missing', tenantId: 'tenant-a', entryId: 'missing',
+    })).rejects.toMatchObject({ code: 'invalid_fork_target' });
+    await expect(mysqlRepo.fork(await mysqlSource.getMetadata(), {
+      id: 'invalid-before', tenantId: 'tenant-a', entryId: 'assistant-a', position: 'before',
+    })).rejects.toMatchObject({ code: 'invalid_fork_target' });
+  });
 });
 
 describe.runIf(Boolean(process.env.MYSQL_HOST))('Pi MySQL crash recovery integration', () => {
@@ -139,10 +182,11 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('Pi MySQL crash recovery integra
       const first = await store.claim({ identity, runId, workerId: 'worker-a', now: start, leaseTtlMs: 1000 });
       await store.commitTurn({
         tenantId, runId, attemptId: first!.attemptId, turnNo: 1, fencingToken: first!.fencingToken,
-        checkpoint: { piSessionId: sessionId, piLeafId: 'root' }, events: [], status: 'running', usage,
+        checkpoint: { piSessionId: sessionId, piLeafId: 'root' }, events: [], status: 'running', usage, committedAt: start,
       });
       await storage.appendEntry(messageEntry('uncommitted', 'root', 'hidden branch'));
       const inbox = await store.inbox.enqueue({
+        identity,
         tenantId, runId, idempotencyKey: 'marker-before-ack', mode: 'steer',
         message: { role: 'user', text: 'only once' }, createdAt: start,
       });
@@ -265,6 +309,16 @@ function messageEntry(id: string, parentId: string | null, content: string): Ses
   return { type: 'message', id, parentId, timestamp: new Date().toISOString(), message: { role: 'user', content, timestamp: Date.now() } };
 }
 
+function assistantEntry(id: string, parentId: string | null, text: string): SessionTreeEntry {
+  return {
+    type: 'message', id, parentId, timestamp: new Date().toISOString(), message: {
+      role: 'assistant', content: [{ type: 'text', text }], api: 'test', provider: 'test', model: 'test',
+      stopReason: 'stop', timestamp: Date.now(), usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
+        totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    },
+  };
+}
+
 async function collectEvents<T>(events: AsyncIterable<T>): Promise<T[]> {
   const collected: T[] = [];
   for await (const event of events) collected.push(event);
@@ -333,6 +387,7 @@ class InsertQuery {
   private value!: Row;
   constructor(private readonly db: SessionTestDb, private readonly table: string) {}
   values(value: Row) { this.value = value; return this; }
+  ignore() { return this; }
   async execute() { this.db.rows(this.table).push({ ...this.value }); return []; }
 }
 

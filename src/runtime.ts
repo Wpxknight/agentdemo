@@ -14,7 +14,7 @@ import {
   InMemoryCredentialStore, createModels, type Api, type Model as PiModel, type Provider as PiProvider,
 } from '@earendil-works/pi-ai';
 import { builtinProviders } from '@earendil-works/pi-ai/providers/all';
-import { createMysqlDurablePiRuntime } from '../packages/pi-runtime/src/index.js';
+import { createMysqlDurablePiRuntime } from '@aiop/pi-runtime';
 import { SandboxManager, type SandboxManagerLike } from './sandbox/lifecycle.js';
 import {
   SandboxRuntimeController,
@@ -204,8 +204,9 @@ export async function createDefaultDurableRunRuntime(
   store: Store,
   modelConfig: RuntimeModelConfig,
   systemPrompt?: string,
+  enabled = false,
 ): Promise<DurableRunRuntime | undefined> {
-  if (!(store instanceof MysqlStore)) return undefined;
+  if (!enabled || !(store instanceof MysqlStore)) return undefined;
   const targetApi = modelConfig.protocol === 'anthropic' ? 'anthropic-messages' : 'openai-completions';
   const provider = builtinProviders().find((candidate) => candidate.getModels().some((model) => model.api === targetApi));
   const template = provider?.getModels().find((model) => model.api === targetApi);
@@ -258,6 +259,7 @@ export async function buildRuntime(
     store?: Store;
     settingsSecretBox?: ReturnType<typeof createSettingsSecretBox>;
     durableRunRuntime?: DurableRunRuntime;
+    enableDefaultDurableRuntime?: boolean;
   } = {},
 ): Promise<Runtime> {
   let modelConfig = defaultRuntimeModelConfig(config);
@@ -612,7 +614,7 @@ export async function buildRuntime(
   modelConfig = await resolveRuntimeModelConfig(config, store, DEFAULT_TENANT);
   const model = createModel(modelConfig.id, modelConfig);
   const durableRunRuntime = options.durableRunRuntime
-    ?? await createDefaultDurableRunRuntime(store, modelConfig, systemExtra);
+    ?? await createDefaultDurableRunRuntime(store, modelConfig, systemExtra, options.enableDefaultDurableRuntime);
   const publicSandboxState = (): SandboxSettingsState => {
     const catalog = sandboxController.catalogInfo();
     return {

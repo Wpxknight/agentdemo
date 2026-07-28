@@ -706,10 +706,7 @@ export function createHttpServer(rt: Runtime): http.Server {
     abortLocal: (ctx, runId) => abortActiveRunById(activeRuns, ctx.tenantId, runId),
     recover: (ctx, run) => {
       if (rt.durableRunRuntime) {
-        void rt.durableRunRuntime.resume({
-          identity: { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] },
-          runId: run.runId,
-        }).catch((err) => log.error({ err, runId: run.runId }, 'durable run recovery failed'));
+        void superviseDurableRecovery(rt, ctx, run.runId);
         return;
       }
       scheduleAgentRecovery(rt, interactions, activeRuns, compactionWatermarks, ctx, run);
@@ -727,6 +724,21 @@ export function createHttpServer(rt: Runtime): http.Server {
       else res.end();
     });
   });
+}
+
+async function superviseDurableRecovery(rt: Runtime, ctx: RequestContext, runId: string): Promise<void> {
+  try {
+    const handle = await rt.durableRunRuntime!.resume({
+      identity: { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] },
+      runId,
+    });
+    for await (const _event of handle.events) {
+      // Recovery is detached from an HTTP response, but its event stream still needs a consumer.
+    }
+    await handle.result();
+  } catch (err) {
+    log.error({ err, runId }, 'durable run recovery failed');
+  }
 }
 
 async function handle(

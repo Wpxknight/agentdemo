@@ -5,6 +5,7 @@ import type {
   ClaimInboxInput, ConsumeInboxInput, DurableRunStore, EnqueueInboxInput, PiSessionRecord, RunInboxMessage,
   SessionEntryRecord, StoredRun,
 } from './types.js';
+import { assertAttemptAllowed } from '../run/limits.js';
 
 const clone = <T>(value: T): T => structuredClone(value);
 const key = (tenantId: string, id: string): string => `${tenantId}\0${id}`;
@@ -42,8 +43,11 @@ export class MemoryRunStore implements DurableRunStore {
       const runKey = key(input.identity.tenantId, input.runId);
       const run = this.runs.get(runKey);
       if (!run) throw new RunNotFoundError();
-      if (run.actorId !== input.identity.actorId) return null;
+      if (!canManageRun(input.identity, run.actorId)) return null;
       if (['succeeded', 'cancelled'].includes(run.status)) return null;
+      if (['waiting', 'failed', 'recovery_required'].includes(run.status) && !input.resume) return null;
+      assertAttemptAllowed(run.limits, [...this.attempts.values()].filter((attempt) =>
+        attempt.tenantId === run.tenantId && attempt.runId === run.runId).length, input.now);
       if (run.leaseOwner && run.leaseExpiresAt && run.leaseExpiresAt > input.now && run.leaseOwner !== input.workerId) return null;
       const sameLease = run.leaseOwner === input.workerId && Boolean(run.leaseExpiresAt && run.leaseExpiresAt > input.now);
       const fencingToken = sameLease ? run.leaseToken : run.leaseToken + 1n;
@@ -51,6 +55,7 @@ export class MemoryRunStore implements DurableRunStore {
       Object.assign(run, {
         leaseOwner: input.workerId, leaseToken: fencingToken,
         leaseExpiresAt: new Date(input.now.getTime() + input.leaseTtlMs), status: 'running', updatedAt: input.now,
+        ...(input.resume && ['waiting', 'failed', 'recovery_required'].includes(run.status) ? { appendClosedAt: undefined } : {}),
       });
       this.attempts.set(key(runKey, attemptId), { tenantId: run.tenantId, runId: run.runId, attemptId, status: 'running' });
       return { record: clone(run), attemptId, fencingToken };
@@ -65,7 +70,7 @@ export class MemoryRunStore implements DurableRunStore {
 
   async commitTurn(input: Parameters<DurableRunStore['commitTurn']>[0]): Promise<void> {
     await this.lock(async () => {
-      const run = this.requireLease(input, this.now(), false);
+      const run = this.requireLease(input, input.committedAt);
       if (input.turnNo <= run.lastTurnNo) {
         if (input.turnNo === run.lastTurnNo && JSON.stringify(run.checkpoint) === JSON.stringify(input.checkpoint)) return;
         throw conflict('Turn commit is not monotonic');
@@ -79,7 +84,7 @@ export class MemoryRunStore implements DurableRunStore {
         if (!session) throw conflict('Pi session not found');
         if (piLeafId && !this.hasSessionEntry(input.tenantId, piSessionId, piLeafId)) throw conflict('Pi leaf not found');
         session.committedLeafId = piLeafId;
-        session.updatedAt = this.now();
+        session.updatedAt = input.committedAt;
       }
       const storedEvents = this.events.get(key(input.tenantId, input.runId)) ?? [];
       for (const event of input.events) storedEvents.push(clone({ ...event, sequence: BigInt(storedEvents.length + 1) }));
@@ -88,25 +93,28 @@ export class MemoryRunStore implements DurableRunStore {
       run.checkpoint = clone(input.checkpoint);
       run.status = input.status;
       run.usage = clone(input.usage);
-      run.updatedAt = this.now();
+      run.updatedAt = input.committedAt;
     });
   }
 
   async requestCancellation(input: Parameters<DurableRunStore['requestCancellation']>[0]): Promise<void> {
-    const run = this.runs.get(key(input.identity.tenantId, input.runId));
-    if (!run || run.actorId !== input.identity.actorId) throw new RunNotFoundError();
-    run.cancelRequestedAt ??= input.requestedAt;
-    run.cancelReason ??= input.reason;
-    run.updatedAt = input.requestedAt;
+    await this.lock(async () => {
+      const run = this.runs.get(key(input.identity.tenantId, input.runId));
+      if (!run || !canManageRun(input.identity, run.actorId)) throw new RunNotFoundError();
+      run.cancelRequestedAt ??= input.requestedAt;
+      run.cancelReason ??= input.reason;
+      run.updatedAt = input.requestedAt;
+    });
   }
 
   async complete(input: Parameters<DurableRunStore['complete']>[0]): Promise<void> {
     await this.lock(async () => {
-      const run = this.requireLease(input, input.completedAt, false);
+      const run = this.requireLease(input, input.completedAt);
       const status = run.cancelRequestedAt ? 'cancelled' : input.status;
       run.status = status;
       run.usage = clone(input.usage);
       run.result = { runId: input.runId, status, usage: clone(input.usage), error: input.error };
+      run.appendClosedAt ??= input.completedAt;
       run.leaseOwner = undefined;
       run.leaseExpiresAt = undefined;
       run.updatedAt = input.completedAt;
@@ -121,6 +129,18 @@ export class MemoryRunStore implements DurableRunStore {
 
   async isCancellationRequested(identity: { tenantId: string; runId: string }): Promise<boolean> {
     return Boolean(this.runs.get(key(identity.tenantId, identity.runId))?.cancelRequestedAt);
+  }
+
+  async countAttempts(identity: { tenantId: string; runId: string }): Promise<number> {
+    return [...this.attempts.values()].filter((attempt) => attempt.tenantId === identity.tenantId && attempt.runId === identity.runId).length;
+  }
+
+  async closeInbox(input: Parameters<DurableRunStore['closeInbox']>[0]): Promise<void> {
+    await this.lock(async () => {
+      const run = this.requireLease(input, input.now);
+      run.appendClosedAt ??= input.now;
+      run.updatedAt = input.now;
+    });
   }
 
   readonly sessions = {
@@ -171,6 +191,11 @@ export class MemoryRunStore implements DurableRunStore {
 
   readonly inbox = {
     enqueue: async (input: EnqueueInboxInput): Promise<RunInboxMessage> => this.lock(async () => {
+      const run = this.runs.get(key(input.tenantId, input.runId));
+      if (!run || !canManageRun(input.identity, run.actorId)) throw new RunNotFoundError();
+      if (run.appendClosedAt || !['queued', 'running', 'waiting', 'recovery_required'].includes(run.status)) {
+        throw conflict('Run no longer accepts appended messages');
+      }
       const inboxKey = key(input.tenantId, input.runId);
       const messages = this.inboxMessages.get(inboxKey) ?? [];
       const duplicate = messages.find((message) => message.idempotencyKey === input.idempotencyKey);
@@ -196,7 +221,7 @@ export class MemoryRunStore implements DurableRunStore {
       return clone(message);
     }),
     markConsumed: async (input: ConsumeInboxInput): Promise<void> => this.lock(async () => {
-      this.requireLease(input, input.consumedAt, false);
+      this.requireLease(input, input.consumedAt);
       const message = (this.inboxMessages.get(key(input.tenantId, input.runId)) ?? []).find((item) => item.id === input.id);
       if (!message || message.claimOwner !== input.workerId || message.claimToken !== input.claimToken) throw new LeaseLostError();
       message.status = 'consumed';
@@ -248,4 +273,8 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function conflict(message: string): AgentPlatformError {
   return new AgentPlatformError({ code: 'RUN_STATE_CONFLICT', message, retryable: false });
+}
+
+function canManageRun(identity: { actorId: string; roles: readonly string[] }, actorId: string): boolean {
+  return identity.actorId === actorId || identity.roles.includes('tenant_admin') || identity.roles.includes('platform_admin');
 }

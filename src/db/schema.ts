@@ -182,6 +182,8 @@ export interface AgentRunsTable {
   output_tokens: number;
   cache_read_tokens: number;
   cache_creation_tokens: number;
+  cost_usd: string | number | null;
+  limits_json: NullableJsonColumn;
   error_message: string | null;
   started_at: Date | null;
   updated_at: Date;
@@ -190,6 +192,7 @@ export interface AgentRunsTable {
   lease_owner: string | null;
   lease_token: number;
   lease_expires_at: Date | null;
+  append_closed_at: Date | null;
   created_at: Date;
 }
 

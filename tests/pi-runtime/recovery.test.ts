@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { drainDurableInbox, DurableRunManager, MemoryRunStore, type ManagedPiSession } from '../../packages/pi-runtime/src/index.js';
 
 describe('durable Pi recovery', () => {
@@ -23,13 +23,45 @@ describe('durable Pi recovery', () => {
     await store.commitTurn({
       tenantId: 'tenant-a', runId: 'run-a', attemptId: claim!.attemptId, turnNo: 1,
       fencingToken: claim!.fencingToken, checkpoint: { piSessionId: 'session-a', piLeafId: 'uncommitted' },
-      events: [], status: 'succeeded', usage,
+      events: [], status: 'succeeded', usage, committedAt: now,
     });
     expect((await store.sessions.get('tenant-a', 'session-a'))?.committedLeafId).toBe('uncommitted');
   });
 });
 
 describe('fault recovery boundaries', () => {
+  it('observes cross-worker cancellation while the active session produces no events', async () => {
+    const store = new MemoryRunStore();
+    let aborted!: () => void;
+    const abortCalled = new Promise<void>((resolve) => { aborted = resolve; });
+    const session: ManagedPiSession = {
+      async *continue(signal) {
+        await new Promise<void>((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
+      },
+      async abort() { aborted(); }, async close() {}, async steer() {}, async followUp() {},
+      async appendCustomEntry() { return 'custom'; }, async entries() { return []; }, async leafId() { return null; },
+      async metadata() { return { id: 'session-stalled', tenantId: 'tenant-a', createdAt: new Date().toISOString() }; },
+    };
+    const manager = new DurableRunManager({
+      store, workerId: 'worker-a', heartbeatMs: 0, inboxPollMs: 1,
+      sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+    const identity = { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] } as const;
+    const handle = await manager.run({
+      runId: 'run-stalled-cancel', identity, sessionId: 'session-stalled', input: [{ role: 'user', text: 'start' }],
+    });
+    await vi.waitFor(async () => expect((await store.get({ tenantId: 'tenant-a', runId: 'run-stalled-cancel' }))?.status).toBe('running'));
+    await store.requestCancellation({
+      identity: { tenantId: 'tenant-a', actorId: 'admin', roles: ['tenant_admin'] },
+      runId: 'run-stalled-cancel', requestedAt: new Date(), reason: 'stop elsewhere',
+    });
+
+    await abortCalled;
+    await expect(handle.result()).resolves.toMatchObject({ status: 'cancelled' });
+  });
+
   it('does not recover a waiting interaction without an explicit resolution', async () => {
     const store = new MemoryRunStore();
     const now = new Date();
@@ -107,7 +139,7 @@ describe('fault recovery boundaries', () => {
     await store.requestCancellation({ identity, runId: 'run-cancel-race', requestedAt: now, reason: 'stop' });
     await expect(store.commitTurn({
       tenantId: 'tenant-a', runId: 'run-cancel-race', attemptId: claim!.attemptId, turnNo: 1,
-      fencingToken: claim!.fencingToken, checkpoint: {}, events: [], status: 'succeeded', usage,
+      fencingToken: claim!.fencingToken, checkpoint: {}, events: [], status: 'succeeded', usage, committedAt: now,
     })).rejects.toMatchObject({ code: 'RUN_STATE_CONFLICT' });
   });
 
@@ -122,6 +154,7 @@ describe('fault recovery boundaries', () => {
     } });
     const first = await store.claim({ identity, runId: 'run-inbox-crash', workerId: 'worker-a', now: current, leaseTtlMs: 10 });
     const item = await store.inbox.enqueue({
+      identity,
       tenantId: 'tenant-a', runId: 'run-inbox-crash', idempotencyKey: 'once', mode: 'steer',
       message: { role: 'user', text: 'only once' }, createdAt: current,
     });
