@@ -7,7 +7,7 @@ import {
   type Model,
 } from '@earendil-works/pi-ai';
 import { InMemorySessionRepo } from '@earendil-works/pi-agent-core';
-import { PiAgentSessionFactory, bridgeGovernedTools } from '../../packages/pi-runtime/src/index.js';
+import { GovernedToolExecutionError, PiAgentSessionFactory, bridgeGovernedTools } from '../../packages/pi-runtime/src/index.js';
 
 const model: Model<'pi-tool-test'> = {
   id: 'pi-tool-test', name: 'Pi Tool Test', api: 'pi-tool-test', provider: 'pi-tool-test', baseUrl: '',
@@ -91,7 +91,38 @@ describe('Pi governed tool bridge', () => {
       definition: { name: 'lookup', description: 'Lookup', capability: 'read', inputSchema: { type: 'object' } },
       execute: async () => ({ callId: 'call-1', content: 'denied', isError: true }),
     }]);
-    await expect(tool!.execute('call-1', {}, undefined, undefined, undefined)).rejects.toThrow('denied');
+    const rejected = tool!.execute('call-1', {}, undefined, undefined, undefined);
+    await expect(rejected).rejects.toBeInstanceOf(GovernedToolExecutionError);
+    await expect(rejected).rejects.toMatchObject({
+      call: { id: 'call-1', logicalCallId: 'call-1' },
+      result: { callId: 'call-1', content: 'denied', isError: true },
+    });
+  });
+
+  it('passes Pi cancellation and a caller-resolved logical id to governed execution', async () => {
+    let started!: () => void;
+    const didStart = new Promise<void>((resolve) => { started = resolve; });
+    let receivedSignal: AbortSignal | undefined;
+    const tools = bridgeGovernedTools([{
+      definition: { name: 'lookup', description: 'Lookup', capability: 'read', inputSchema: { type: 'object' } },
+      logicalCallId: () => 'logical-1',
+      execute: async (call, context) => {
+        receivedSignal = context.signal;
+        expect(call.logicalCallId).toBe('logical-1');
+        expect(context.logicalCallId).toBe('logical-1');
+        started();
+        return await new Promise((_, reject) => context.signal?.addEventListener('abort', () => reject(context.signal?.reason), { once: true }));
+      },
+    }]);
+    const session = await new PiAgentSessionFactory({ repository: new InMemorySessionRepo(), models: toolModels({}), model })
+      .create({ id: 'tool-cancel', initialMessage: { role: 'user', text: 'start' }, events: events() });
+    await session.setTools(tools);
+    const running = collect(session.continue());
+    await didStart;
+    await session.abort();
+    await Promise.race([running, new Promise((_, reject) => setTimeout(() => reject(new Error('tool abort timeout')), 1000))]);
+    expect(receivedSignal?.aborted).toBe(true);
+    await session.close();
   });
 });
 

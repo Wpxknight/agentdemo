@@ -26,12 +26,17 @@ export interface PiAgentSessionFactoryOptions<
   resources?: AgentHarnessResources;
 }
 
-export interface CreatePiAgentSessionInput<TCreateOptions extends SessionCreateOptions = SessionCreateOptions> {
+type RequiredKeys<T> = { [K in keyof T]-?: object extends Pick<T, K> ? never : K }[keyof T];
+type SessionCreateField<TCreateOptions extends SessionCreateOptions> =
+  [RequiredKeys<Omit<TCreateOptions, 'id'>>] extends [never]
+    ? { session?: Omit<TCreateOptions, 'id'> }
+    : { session: Omit<TCreateOptions, 'id'> };
+
+export type CreatePiAgentSessionInput<TCreateOptions extends SessionCreateOptions = SessionCreateOptions> = {
   id?: string;
-  session?: Omit<TCreateOptions, 'id'>;
   initialMessage: AgentInputMessage;
   events: EventCodecOptions;
-}
+} & SessionCreateField<TCreateOptions>;
 
 export interface LoadPiAgentSessionInput<TMetadata extends SessionMetadata = SessionMetadata> {
   metadata: TMetadata;
@@ -70,8 +75,9 @@ export class PiAgentSessionFactory<
 
 export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata> {
   private closed = false;
+  private closePromise?: Promise<void>;
   private pendingMessage?: AgentInputMessage;
-  private activeRun?: { cancel(): Promise<void> };
+  private activeRun?: { cancel(): Promise<void>; finalize(cancelRunning?: boolean): Promise<void> };
 
   constructor(
     private readonly session: Session<TMetadata>,
@@ -97,6 +103,7 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     const events: AgentRunEvent[] = [];
     let wake: (() => void) | undefined;
     let finished = false;
+    let forceDone = false;
     let failure: unknown;
     const unsubscribe = this.harness.subscribe((event) => {
       events.push(this.eventCodec.fromPi(event));
@@ -108,19 +115,34 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
       await this.harness.abort();
       await this.harness.waitForIdle();
     })();
-    this.activeRun = { cancel };
+    let removeSignalListener = () => {};
+    let finalizePromise: Promise<void> | undefined;
+    const active = {
+      cancel,
+      finalize: (cancelRunning = true) => finalizePromise ??= (async () => {
+        if (cancelRunning && !finished) await cancel();
+        removeSignalListener();
+        unsubscribe();
+        forceDone = true;
+        events.length = 0;
+        if (this.activeRun === active) this.activeRun = undefined;
+        wake?.();
+      })(),
+    };
+    this.activeRun = active;
     const abort = () => {
       failure = abortReason(signal!);
       cancelPromise = cancel().catch((error) => { failure = error; }).finally(() => { wake?.(); });
     };
     signal?.addEventListener('abort', abort, { once: true });
+    removeSignalListener = () => signal?.removeEventListener('abort', abort);
     const { text, images } = promptParts(initialMessage);
     const run = this.harness.prompt(text, images.length ? { images } : undefined).then(
       () => { finished = true; wake?.(); },
       (error) => { failure ??= error; finished = true; wake?.(); },
     );
     try {
-      while (!finished || events.length) {
+      while (!forceDone && (!finished || events.length)) {
         if (events.length) {
           yield events.shift()!;
           continue;
@@ -129,16 +151,8 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
       }
       if (failure) throw failure;
     } finally {
-      signal?.removeEventListener('abort', abort);
-      if (!finished) {
-        try { await cancel(); } catch (error) { failure ??= error; }
-        await run;
-      }
-      if (cancelPromise) {
-        try { await cancelPromise; } catch (error) { failure ??= error; }
-      }
-      unsubscribe();
-      this.activeRun = undefined;
+      try { await active.finalize(!finished); } catch (error) { failure ??= error; }
+      if (!finished) await run;
     }
   }
 
@@ -155,9 +169,8 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
   }
 
   async abort(): Promise<void> {
-    this.ensureOpen();
     if (this.activeRun) await this.activeRun.cancel();
-    else await this.harness.abort();
+    else if (!this.closed) await this.harness.abort();
   }
 
   setTools(tools: AgentHarnessTool<undefined>[]): Promise<void> {
@@ -178,14 +191,17 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
   }
 
   async close(): Promise<void> {
-    if (this.closed) return;
-    if (this.activeRun) {
-      await this.activeRun.cancel();
-    } else {
-      await this.harness.abort();
-      await this.harness.waitForIdle();
-    }
     this.closed = true;
+    return this.closePromise ??= (async () => {
+      const active = this.activeRun;
+      if (active) {
+        await active.cancel();
+        await active.finalize(false);
+      } else {
+        await this.harness.abort();
+        await this.harness.waitForIdle();
+      }
+    })();
   }
 
   private ensureOpen(): void {

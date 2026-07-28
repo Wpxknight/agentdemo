@@ -22,12 +22,21 @@ export interface PiAgentSessionFactoryOptions<TMetadata extends SessionMetadata,
     tools?: AgentHarnessTool<undefined>[];
     resources?: AgentHarnessResources;
 }
-export interface CreatePiAgentSessionInput<TCreateOptions extends SessionCreateOptions = SessionCreateOptions> {
-    id?: string;
+type RequiredKeys<T> = {
+    [K in keyof T]-?: object extends Pick<T, K> ? never : K;
+}[keyof T];
+type SessionCreateField<TCreateOptions extends SessionCreateOptions> = [
+    RequiredKeys<Omit<TCreateOptions, 'id'>>
+] extends [never] ? {
     session?: Omit<TCreateOptions, 'id'>;
+} : {
+    session: Omit<TCreateOptions, 'id'>;
+};
+export type CreatePiAgentSessionInput<TCreateOptions extends SessionCreateOptions = SessionCreateOptions> = {
+    id?: string;
     initialMessage: AgentInputMessage;
     events: EventCodecOptions;
-}
+} & SessionCreateField<TCreateOptions>;
 export interface LoadPiAgentSessionInput<TMetadata extends SessionMetadata = SessionMetadata> {
     metadata: TMetadata;
     initialMessage: AgentInputMessage;
@@ -45,6 +54,7 @@ export declare class PiAgentSession<TMetadata extends SessionMetadata = SessionM
     private readonly harness;
     private readonly eventCodec;
     private closed;
+    private closePromise?;
     private pendingMessage?;
     private activeRun?;
     constructor(session: Session<TMetadata>, harness: AgentHarness, initialMessage: AgentInputMessage, eventCodec: EventCodec);
@@ -60,10 +70,11 @@ export declare class PiAgentSession<TMetadata extends SessionMetadata = SessionM
     close(): Promise<void>;
     private ensureOpen;
 }
+export {};
 
 // file: pi/compaction.d.ts
-import { compact, type CompactionError, type CompactionPreparation, type CompactionSettings, type AgentMessage, type Result, type SessionTreeEntry } from '@earendil-works/pi-agent-core';
-export declare const preparePiCompaction: (messagesOrEntries: readonly AgentMessage[] | readonly SessionTreeEntry[], settings: CompactionSettings) => Result<CompactionPreparation | undefined, CompactionError>;
+import { compact, type CompactionError, type CompactionPreparation, type CompactionSettings, type Result, type SessionTreeEntry } from '@earendil-works/pi-agent-core';
+export declare const preparePiCompaction: (entries: readonly SessionTreeEntry[], settings: CompactionSettings) => Result<CompactionPreparation | undefined, CompactionError>;
 export declare const compactPiCompaction: typeof compact;
 export type { CompactionPreparation, CompactionSettings };
 
@@ -122,7 +133,7 @@ export type CompatibleAgentMessage = {
 };
 
 // file: pi/event-codec.d.ts
-import type { AgentRunEvent } from '@aiop/control-contracts';
+import type { AgentRunEvent, JsonValue } from '@aiop/control-contracts';
 import type { AgentHarnessEvent } from '@earendil-works/pi-agent-core';
 export interface EventCodecOptions {
     tenantId: string;
@@ -139,6 +150,8 @@ export declare class EventCodec {
     constructor(options: EventCodecOptions);
     fromPi(event: AgentHarnessEvent): AgentRunEvent;
 }
+export declare function toDurableJsonValue(value: unknown): JsonValue;
+export declare const PI_HARNESS_EVENT_TYPES: readonly ["agent_start", "agent_end", "turn_start", "turn_end", "message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_end", "tool_call", "tool_result", "queue_update", "save_point", "abort", "settled", "before_agent_start", "context", "before_provider_request", "before_provider_payload", "after_provider_response", "session_before_compact", "session_compact", "session_before_tree", "session_tree", "retry_scheduled", "retry_attempt_start", "retry_finished", "model_update", "thinking_level_update", "resources_update", "tools_update"];
 
 // file: pi/message-codec.d.ts
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
@@ -160,10 +173,29 @@ export { InMemorySessionRepo, JsonlSessionRepo, Session, type SessionMetadata, t
 export { formatSkillsForSystemPrompt, loadSourcedSkills, loadSkills, type Skill, type SkillDiagnostic, } from '@earendil-works/pi-agent-core';
 
 // file: pi/tool-bridge.d.ts
-import type { ToolCall, ToolDefinition, ToolResult } from '@aiop/control-contracts';
+import type { JsonValue, ToolCall, ToolDefinition, ToolResult } from '@aiop/control-contracts';
 import type { AgentHarnessTool } from '@earendil-works/pi-agent-core';
 export interface GovernedTool {
     definition: ToolDefinition;
-    execute(call: ToolCall): Promise<ToolResult>;
+    /** Optional migration resolver. New durable integrations should supply a stable logical id. */
+    logicalCallId?: (toolCallId: string, argumentsValue: JsonValue) => string;
+    execute(call: ToolCall, context: GovernedToolExecutionContext): Promise<ToolResult>;
 }
-export declare function bridgeGovernedTools(tools: readonly GovernedTool[]): AgentHarnessTool<undefined>[];
+export interface GovernedToolExecutionContext {
+    signal?: AbortSignal;
+    logicalCallId: string;
+    piContext?: unknown;
+}
+export interface GovernedToolBridgeOptions {
+    resolveLogicalCallId?: (input: {
+        toolCallId: string;
+        tool: ToolDefinition;
+        arguments: JsonValue;
+    }) => string;
+}
+export declare class GovernedToolExecutionError extends Error {
+    readonly call: ToolCall;
+    readonly result: ToolResult;
+    constructor(message: string, call: ToolCall, result: ToolResult, cause?: unknown);
+}
+export declare function bridgeGovernedTools(tools: readonly GovernedTool[], options?: GovernedToolBridgeOptions): AgentHarnessTool<undefined>[];

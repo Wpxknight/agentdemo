@@ -174,15 +174,51 @@ describe('PiAgentSessionFactory', () => {
     }
   });
 
+  it('finalizes an abandoned yielded iterator and makes concurrent close idempotent', async () => {
+    const controlled = testModels();
+    const session = await new PiAgentSessionFactory({ repository: new InMemorySessionRepo(), models: controlled.models, model })
+      .create({ id: 'abandoned', initialMessage: { role: 'user', text: 'start' }, events: eventContext('abandoned') });
+    const iterable = session.continue();
+    const iterator = iterable[Symbol.asyncIterator]();
+    await iterator.next();
+    const firstClose = session.close();
+    const secondClose = session.close();
+    controlled.release();
+    await Promise.race([Promise.all([firstClose, secondClose]),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('close timeout')), 1000))]);
+    await expect(iterator.next()).resolves.toMatchObject({ done: true });
+    await expect(collect(session.continue())).rejects.toThrow(/closed/i);
+  });
+
+  it('rejects a second iterator from the same iterable without leaking the active run', async () => {
+    const controlled = testModels();
+    const session = await new PiAgentSessionFactory({ repository: new InMemorySessionRepo(), models: controlled.models, model })
+      .create({ id: 'two-iterators', initialMessage: { role: 'user', text: 'start' }, events: eventContext('two-iterators') });
+    const iterable = session.continue();
+    const first = iterable[Symbol.asyncIterator]();
+    const second = iterable[Symbol.asyncIterator]();
+    await first.next();
+    await expect(second.next()).rejects.toThrow(/active/i);
+    const returned = first.return?.();
+    controlled.release();
+    await returned;
+    await session.close();
+  });
+
   it('uses Pi compaction preparation and does not import low-level loops', async () => {
+    expect(preparePiCompaction([], { enabled: true, reserveTokens: 64, keepRecentTokens: 1 }))
+      .toEqual({ ok: true, value: undefined });
     const prepared = preparePiCompaction([
-      { role: 'user', content: 'one', timestamp: 1 },
-      { role: 'assistant', content: [{ type: 'text', text: 'two' }], api: model.api,
+      { type: 'message', id: 'entry-1', parentId: null, timestamp: new Date(1).toISOString(),
+        message: { role: 'user', content: 'one', timestamp: 1 } },
+      { type: 'message', id: 'entry-2', parentId: 'entry-1', timestamp: new Date(2).toISOString(),
+        message: { role: 'assistant', content: [{ type: 'text', text: 'two' }], api: model.api,
         provider: model.provider, model: model.id,
         usage: { input: 500, output: 500, cacheRead: 0, cacheWrite: 0, totalTokens: 1000,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-        stopReason: 'stop', timestamp: 2 },
-      { role: 'user', content: 'three', timestamp: 3 },
+        stopReason: 'stop', timestamp: 2 } },
+      { type: 'message', id: 'entry-3', parentId: 'entry-2', timestamp: new Date(3).toISOString(),
+        message: { role: 'user', content: 'three', timestamp: 3 } },
     ], { enabled: true, reserveTokens: 64, keepRecentTokens: 1 });
     expect(prepared.ok).toBe(true);
     if (!prepared.ok || !prepared.value) throw new Error('expected Pi compaction preparation');

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { EventCodec } from '../../packages/pi-runtime/src/index.js';
+import { EventCodec, toDurableJsonValue } from '../../packages/pi-runtime/src/index.js';
 
 describe('Pi EventCodec', () => {
   it('projects a Harness tool event into a durable control event', () => {
@@ -14,7 +14,7 @@ describe('Pi EventCodec', () => {
       tenantId: 'tenant-1', runId: 'run-1', attemptId: 'attempt-1', turnNo: 2,
       kernel: 'pi', kernelVersion: '0.82.1', correlationId: 'correlation-1', sequence: 9n,
       type: 'tool_call',
-      detail: { version: 1, toolCallId: 'call-1', toolName: 'lookup', input: { key: 'value' } },
+      detail: { version: 1, toolCallId: 'call-1', toolName: 'lookup', inputKeys: ['key'] },
       createdAt: new Date('2026-07-28T00:00:00.000Z'),
     });
   });
@@ -27,7 +27,7 @@ describe('Pi EventCodec', () => {
     const projected = codec.fromPi({ type: 'future_event', value: 42 } as never);
     expect(projected.type).toBe('pi_extension');
     expect(projected.detail).toEqual({
-      version: 1, kind: 'pi_harness_event', event: { type: 'future_event', value: 42 },
+      version: 1, kind: 'pi_harness_event', originalType: 'future_event', keys: ['value'],
     });
   });
 
@@ -46,13 +46,8 @@ describe('Pi EventCodec', () => {
     } as never).detail;
 
     expect(() => JSON.stringify(detail)).not.toThrow();
-    expect(detail).toMatchObject({
-      event: {
-        count: '2', date: '2026-07-28T00:00:00.000Z', error: { message: 'boom' },
-        signal: { aborted: true, reason: { message: 'cancelled' } },
-        circular: { self: { kind: 'circular_reference' } },
-      },
-    });
+    expect(detail).toEqual({ version: 1, kind: 'pi_harness_event', originalType: 'future_event',
+      keys: ['circular', 'count', 'date', 'error', 'ignored', 'signal'] });
   });
 
   it('handles self-referential Error causes and AbortSignal reasons', () => {
@@ -65,11 +60,40 @@ describe('Pi EventCodec', () => {
     const controller = new AbortController();
     controller.abort(controller.signal);
 
-    const detail = codec.fromPi({ type: 'future_event', error, signal: controller.signal } as never).detail;
+    const detail = toDurableJsonValue({ error, signal: controller.signal });
     expect(() => JSON.stringify(detail)).not.toThrow();
-    expect(detail).toMatchObject({ event: {
-      error: { cause: { kind: 'circular_reference' } },
-      signal: { aborted: true, reason: { kind: 'circular_reference' } },
-    } });
+    expect(detail).toMatchObject({ error: { cause: { kind: 'circular_reference' } },
+      signal: { reason: { kind: 'circular_reference' } } });
+    expect(JSON.stringify(detail)).not.toContain('stack');
+    expect(toDurableJsonValue({ authorization: 'secret', apiKey: 'secret' })).toEqual({
+      apiKey: '[REDACTED]', authorization: '[REDACTED]',
+    });
+  });
+
+  it('allowlists provider fields and enforces a strict durable detail bound', () => {
+    const codec = new EventCodec({ tenantId: 't', runId: 'r', attemptId: 'a', turnNo: 1,
+      correlationId: 'c', sequence: () => 1n });
+    const projected = codec.fromPi({
+      type: 'before_provider_request',
+      model: { id: 'm', provider: 'p', api: 'a' }, sessionId: 's',
+      streamOptions: { headers: { authorization: 'Bearer secret', cookie: 'secret' }, metadata: { token: 'secret' } },
+    } as never);
+    const json = JSON.stringify(projected.detail);
+    expect(json).not.toContain('Bearer secret');
+    expect(json).not.toContain('cookie');
+    expect(projected.detail).toMatchObject({ streamOptionKeys: ['headers', 'metadata'], streamOptionCount: 2 });
+    expect(Buffer.byteLength(json)).toBeLessThanOrEqual(8192);
+  });
+
+  it('does not mark shared non-cyclic references as circular and truncates message text', () => {
+    const codec = new EventCodec({ tenantId: 't', runId: 'r', attemptId: 'a', turnNo: 1,
+      correlationId: 'c', sequence: () => 1n });
+    const shared = { value: 'ok' };
+    expect(JSON.stringify(toDurableJsonValue({ left: shared, right: shared }))).not.toContain('circular_reference');
+    const message = codec.fromPi({ type: 'message_end', message: {
+      role: 'user', content: [{ type: 'text', text: 'x'.repeat(20_000) }], timestamp: 1,
+    } } as never);
+    expect(Buffer.byteLength(JSON.stringify(message.detail))).toBeLessThanOrEqual(8192);
+    expect(JSON.stringify(message.detail)).not.toContain('x'.repeat(1000));
   });
 });

@@ -1,5 +1,4 @@
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
-import type { Message } from '@earendil-works/pi-ai';
 import type {
   CompatibleAgentMessage,
   CompatibleContentBlock,
@@ -21,23 +20,24 @@ export class MessageCodec {
   }
 
   fromPi(message: AgentMessage): CompatibleAgentMessage {
-    const cloned = structuredClone(message) as Message & { content?: unknown };
-    if (!('content' in cloned) || typeof cloned.content === 'string' || !Array.isArray(cloned.content)) {
-      return cloned as CompatibleAgentMessage;
+    const source = message as AgentMessage & { content?: unknown };
+    const base = { ...source };
+    if (!('content' in source) || typeof source.content === 'string' || !Array.isArray(source.content)) {
+      return base as CompatibleAgentMessage;
     }
     const content: CompatibleContentBlock[] = [];
     const extensions: PiContentExtension[] = [];
-    for (const [index, block] of cloned.content.entries()) {
+    for (const [index, block] of source.content.entries()) {
       if (isKnownContentBlock(block)) content.push(block);
       else extensions.push({
         version: 1,
         kind: 'pi_content_block',
         value: block,
-        ...(content.length || index < cloned.content.length - 1 ? { index } : {}),
+        ...(content.length || index < source.content.length - 1 ? { index } : {}),
       });
     }
     return {
-      ...cloned,
+      ...base,
       content,
       ...(extensions.length ? { extensions } : {}),
     } as CompatibleAgentMessage;

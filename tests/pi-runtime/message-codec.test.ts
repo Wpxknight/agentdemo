@@ -65,4 +65,22 @@ describe('Pi MessageCodec', () => {
 
     expect(codec.toPi(codec.fromPi(piMessage))).toEqual(piMessage);
   });
+
+  it('does not clone or mutate non-cloneable message fields', () => {
+    const detail = { callback: () => 'ok', marker: Symbol('marker') };
+    const block = { type: 'futureBlock', host: detail };
+    const piMessage = {
+      role: 'toolResult', toolCallId: 'call-1', toolName: 'lookup',
+      content: [block], details: detail, isError: false, timestamp: 16,
+    } as never;
+    const originalContent = (piMessage as { content: unknown[] }).content;
+
+    const compatible = codec.fromPi(piMessage);
+    if (compatible.role !== 'toolResult') throw new Error('expected tool result');
+    expect(compatible.details).toBe(detail);
+    expect(compatible.extensions?.[0]?.value).toBe(block);
+    expect((piMessage as { content: unknown[] }).content).toBe(originalContent);
+    expect(codec.toPi(compatible)).toEqual(piMessage);
+    expect(codec.toPi(compatible)).toEqual(piMessage);
+  });
 });
