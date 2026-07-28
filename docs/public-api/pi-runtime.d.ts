@@ -20,6 +20,7 @@ export * from './run/inbox.js';
 export * from './run/lease.js';
 export * from './run/limits.js';
 export * from './run/manager.js';
+export * from './run/mysql-assembly.js';
 export * from './run/recovery.js';
 
 // file: pi/agent.d.ts
@@ -82,6 +83,7 @@ export declare class PiAgentSession<TMetadata extends SessionMetadata = SessionM
     tools(): AgentHarnessTool<undefined>[];
     metadata(): Promise<TMetadata>;
     entries(): Promise<SessionTreeEntry[]>;
+    leafId(): Promise<string | null>;
     appendCustomEntry(customType: string, data?: unknown): Promise<string>;
     close(): Promise<void>;
     private installGovernedToolHook;
@@ -323,6 +325,7 @@ export interface ManagedPiSession extends InboxCapableSession {
         tenantId?: string;
     }>;
     entries(): Promise<SessionTreeEntry[]>;
+    leafId(): Promise<string | null>;
 }
 export interface DurableRunSessionFactory {
     create(input: {
@@ -364,6 +367,7 @@ export declare class DurableRunManager implements DurableRunRuntime {
     private readonly inboxPollMs;
     private readonly now;
     private readonly active;
+    private readonly executions;
     constructor(options: DurableRunManagerOptions);
     run(input: StartRunInput): Promise<RunHandle>;
     resume(input: ResumeRunInput): Promise<RunHandle>;
@@ -373,6 +377,41 @@ export declare class DurableRunManager implements DurableRunRuntime {
     private execute;
     private syncEntries;
 }
+
+// file: run/mysql-assembly.d.ts
+import type { AgentHarnessResources, AgentHarnessTool } from '@earendil-works/pi-agent-core';
+import type { Model, Models } from '@earendil-works/pi-ai';
+import type { Kysely } from 'kysely';
+import { PiAgentSessionFactory } from '../pi/agent.js';
+import { MysqlRunStore } from '../store/mysql.js';
+import { PiMysqlSessionRepo } from '../store/pi-session-mysql.js';
+import { DurableRunManager } from './manager.js';
+export interface MysqlDurablePiRuntimeOptions {
+    db: Kysely<any>;
+    models: Models;
+    model: Model<any>;
+    systemPrompt?: string;
+    tools?: AgentHarnessTool<undefined>[];
+    resources?: AgentHarnessResources;
+    workerId?: string;
+    leaseTtlMs?: number;
+    heartbeatMs?: number;
+    inboxClaimTtlMs?: number;
+    inboxPollMs?: number;
+    now?: () => Date;
+}
+export declare function createMysqlDurablePiRuntime(options: MysqlDurablePiRuntimeOptions): {
+    runtime: DurableRunManager;
+    store: MysqlRunStore;
+    sessions: PiMysqlSessionRepo;
+    factory: PiAgentSessionFactory<import("../store/pi-session-mysql.js").PiMysqlSessionMetadata, {
+        id?: string;
+        tenantId: string;
+        metadata?: Record<string, unknown>;
+    }, {
+        tenantId: string;
+    }>;
+};
 
 // file: run/recovery.d.ts
 import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
@@ -527,8 +566,9 @@ type PiDb = Kysely<PiMysqlSessionDatabase> | Transaction<PiMysqlSessionDatabase>
 export declare class PiMysqlSessionStorage implements SessionStorage<PiMysqlSessionMetadata> {
     private readonly db;
     private readonly metadata;
-    private readonly committedOnly;
-    constructor(db: PiDb, metadata: PiMysqlSessionMetadata, committedOnly?: boolean);
+    private readonly startFromCommitted;
+    private hasWritten;
+    constructor(db: PiDb, metadata: PiMysqlSessionMetadata, startFromCommitted?: boolean);
     getMetadata(): Promise<PiMysqlSessionMetadata>;
     getLeafId(): Promise<string | null>;
     setLeafId(leafId: string | null): Promise<void>;
@@ -545,7 +585,6 @@ export declare class PiMysqlSessionStorage implements SessionStorage<PiMysqlSess
     getEntries(options?: SessionEntryCursorOptions): Promise<SessionTreeEntry[]>;
     private visibleEntries;
     private sessionRow;
-    private pathFrom;
     private withTransaction;
 }
 export declare class PiMysqlSessionRepo implements SessionRepo<PiMysqlSessionMetadata, {
@@ -556,8 +595,8 @@ export declare class PiMysqlSessionRepo implements SessionRepo<PiMysqlSessionMet
     tenantId: string;
 }> {
     private readonly db;
-    private readonly committedOnly;
-    constructor(db: PiDb, committedOnly?: boolean);
+    private readonly openFromCommitted;
+    constructor(db: PiDb, openFromCommitted?: boolean);
     create(options: {
         id?: string;
         tenantId: string;

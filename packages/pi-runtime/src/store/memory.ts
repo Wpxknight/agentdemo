@@ -21,11 +21,16 @@ export class MemoryRunStore implements DurableRunStore {
   constructor(private readonly now: () => Date = () => new Date()) {}
 
   async create(input: Parameters<DurableRunStore['create']>[0]): Promise<StoredRun> {
-    const record: StoredRun = { ...clone(input.record), lastTurnNo: 0 };
-    const runKey = key(record.tenantId, record.runId);
-    if (this.runs.has(runKey)) throw conflict('Run already exists');
-    this.runs.set(runKey, record);
-    return clone(record);
+    return this.lock(async () => {
+      const record: StoredRun = { ...clone(input.record), lastTurnNo: 0 };
+      const runKey = key(record.tenantId, record.runId);
+      if (this.runs.has(runKey)) throw conflict('Run already exists');
+      const active = [...this.runs.values()].some((run) => run.tenantId === record.tenantId
+        && run.sessionId === record.sessionId && ['queued', 'running', 'waiting'].includes(run.status));
+      if (active) throw conflict('Session already has an active run');
+      this.runs.set(runKey, record);
+      return clone(record);
+    });
   }
 
   async get(identity: { tenantId: string; runId: string }): Promise<StoredRun | undefined> {

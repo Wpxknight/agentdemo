@@ -17,17 +17,29 @@ export class MysqlRunStore implements DurableRunStore {
 
   async create(input: Parameters<DurableRunStore['create']>[0]): Promise<RunRecord> {
     const record = input.record;
-    await this.db.insertInto('agent_runs').values({
-      tenant_id: record.tenantId, run_id: record.runId, user_id: record.actorId, session_id: record.sessionId,
-      kernel: record.kernel, kernel_version: record.kernelVersion, graph_name: '', graph_version: '', runtime_version: 'pi-durable-v1',
-      status: record.status, waiting_reason: record.waitingReason ?? null, current_node: null, step_count: 0,
-      input_tokens: record.usage.inputTokens, output_tokens: record.usage.outputTokens,
-      cache_read_tokens: record.usage.cacheReadTokens, cache_creation_tokens: record.usage.cacheCreationTokens,
-      error_message: null, started_at: null, updated_at: record.updatedAt, completed_at: null,
-      cancel_requested_at: null, lease_owner: record.leaseOwner ?? null, lease_token: Number(record.leaseToken),
-      lease_expires_at: record.leaseExpiresAt ?? null, created_at: record.createdAt,
-    }).execute();
-    return record;
+    return this.transaction(async (store) => {
+      await store.db.insertInto('pi_sessions').values({
+        tenant_id: record.tenantId, session_id: record.sessionId, current_leaf_id: null, committed_leaf_id: null,
+        metadata_json: null, created_at: record.createdAt, updated_at: record.updatedAt,
+      }).ignore().execute();
+      await store.db.selectFrom('pi_sessions').select('session_id')
+        .where('tenant_id', '=', record.tenantId).where('session_id', '=', record.sessionId).forUpdate().executeTakeFirstOrThrow();
+      const active = await store.db.selectFrom('agent_runs').select('run_id')
+        .where('tenant_id', '=', record.tenantId).where('session_id', '=', record.sessionId)
+        .where('status', 'in', ['queued', 'running', 'waiting']).limit(1).executeTakeFirst();
+      if (active) throw conflict('Session already has an active run');
+      await store.db.insertInto('agent_runs').values({
+        tenant_id: record.tenantId, run_id: record.runId, user_id: record.actorId, session_id: record.sessionId,
+        kernel: record.kernel, kernel_version: record.kernelVersion, graph_name: '', graph_version: '', runtime_version: 'pi-durable-v1',
+        status: record.status, waiting_reason: record.waitingReason ?? null, current_node: null, step_count: 0,
+        input_tokens: record.usage.inputTokens, output_tokens: record.usage.outputTokens,
+        cache_read_tokens: record.usage.cacheReadTokens, cache_creation_tokens: record.usage.cacheCreationTokens,
+        error_message: null, started_at: null, updated_at: record.updatedAt, completed_at: null,
+        cancel_requested_at: null, lease_owner: record.leaseOwner ?? null, lease_token: Number(record.leaseToken),
+        lease_expires_at: record.leaseExpiresAt ?? null, created_at: record.createdAt,
+      }).execute();
+      return record;
+    });
   }
 
   async get(identity: { tenantId: string; runId: string }): Promise<StoredRun | undefined> {

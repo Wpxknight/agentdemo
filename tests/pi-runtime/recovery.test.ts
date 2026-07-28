@@ -30,12 +30,56 @@ describe('durable Pi recovery', () => {
 });
 
 describe('fault recovery boundaries', () => {
+  it('does not recover a waiting interaction without an explicit resolution', async () => {
+    const store = new MemoryRunStore();
+    const now = new Date();
+    await store.create({ record: {
+      tenantId: 'tenant-a', runId: 'run-waiting', actorId: 'user-a', sessionId: 'session-waiting', kernel: 'pi',
+      kernelVersion: '0.82.1', status: 'waiting', waitingReason: 'question', leaseToken: 0n,
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 }, createdAt: now, updatedAt: now,
+    } });
+    const manager = new DurableRunManager({
+      store, sessions: { create: async () => { throw new Error('unused'); }, load: async () => { throw new Error('must not load'); } },
+      eventOptions: () => ({}),
+    });
+    await expect(manager.resume({
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] }, runId: 'run-waiting',
+    })).rejects.toMatchObject({ code: 'RUN_STATE_CONFLICT' });
+  });
+
+  it('rejects duplicate recovery while the first recovery owns the run', async () => {
+    const store = new MemoryRunStore();
+    const now = new Date();
+    await store.create({ record: {
+      tenantId: 'tenant-a', runId: 'run-duplicate', actorId: 'user-a', sessionId: 'session-duplicate', kernel: 'pi',
+      kernelVersion: '0.82.1', status: 'failed', leaseToken: 0n,
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 }, createdAt: now, updatedAt: now,
+    } });
+    let release!: () => void;
+    const wait = new Promise<void>((resolve) => { release = resolve; });
+    const session: ManagedPiSession = {
+      async *continue() { await wait; }, async abort() { release(); }, async close() {}, async steer() {}, async followUp() {},
+      async appendCustomEntry() { return 'custom'; }, async entries() { return []; }, async leafId() { return null; },
+      async metadata() { return { id: 'session-duplicate', tenantId: 'tenant-a', createdAt: now.toISOString() }; },
+    };
+    const manager = new DurableRunManager({
+      store, workerId: 'worker-a', heartbeatMs: 0, sessions: { create: async () => session, load: async () => session },
+      eventOptions: () => ({}),
+    });
+    const identity = { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] } as const;
+    const first = await manager.resume({ identity, runId: 'run-duplicate', resolution: { interactionId: 'q', value: 'yes' } });
+    await expect(manager.resume({ identity, runId: 'run-duplicate', resolution: { interactionId: 'q', value: 'yes' } }))
+      .rejects.toMatchObject({ code: 'RUN_STATE_CONFLICT' });
+    release();
+    await first.result();
+  });
+
   it('persists recovery_required instead of auto-replaying an uncertain non-idempotent failure', async () => {
     const store = new MemoryRunStore();
     const error = Object.assign(new Error('external result unknown'), { code: 'TOOL_RESULT_UNKNOWN' });
     const session: ManagedPiSession = {
       async *continue() { throw error; }, async abort() {}, async close() {}, async steer() {}, async followUp() {},
-      async appendCustomEntry() { return 'custom'; }, async entries() { return []; },
+      async appendCustomEntry() { return 'custom'; }, async entries() { return []; }, async leafId() { return null; },
       async metadata() { return { id: 'session-unknown', tenantId: 'tenant-a', createdAt: new Date().toISOString() }; },
     };
     const manager = new DurableRunManager({

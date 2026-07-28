@@ -19,6 +19,7 @@ import { SandboxManager } from '../src/sandbox/lifecycle.js';
 import { buildSandboxTools } from '../src/tools/builtin.js';
 import { buildSandboxProfileTools } from '../src/tools/sandbox-profiles.js';
 import type { ExecResult, SandboxHandle, SandboxProvider, SandboxSpec } from '../src/sandbox/types.js';
+import type { AppendRunMessageInput, DurableRunRuntime } from '@aiop/control-contracts';
 
 /** 纯文本回答的 mock 模型（不发起工具调用）。 */
 const model: ChatModel = {
@@ -745,6 +746,77 @@ describe('HTTP server', () => {
     expect(msgs[0]?.text).toContain('note.txt');
   });
 
+  it('finds a cross-worker active run even when a newer terminal run exists', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'cross-worker-secret' });
+    const admin = await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    const sessionId = 'cross-worker-session';
+    const older = new Date('2026-07-28T00:00:00.000Z');
+    await localStore.putAgentRunBindingIfAbsent({
+      tenantId: 'default', userId: admin.id, sessionId, runId: 'run-active-older', kernel: 'pi',
+      graphName: '', graphVersion: '', createdAt: older,
+    });
+    await localStore.updateAgentRun('default', 'run-active-older', { status: 'running', updatedAt: older });
+    const newer = new Date(older.getTime() + 1000);
+    await localStore.putAgentRunBindingIfAbsent({
+      tenantId: 'default', userId: admin.id, sessionId, runId: 'run-terminal-newer', kernel: 'pi',
+      graphName: '', graphVersion: '', createdAt: newer,
+    });
+    await localStore.updateAgentRun('default', 'run-terminal-newer', { status: 'succeeded', updatedAt: newer, completedAt: newer });
+    const append = vi.fn(async () => {});
+    const rt = {
+      model, tools: new ToolRegistry(), store: localStore, policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth, jwtSecret: 'cross-worker-secret', systemExtra: '', durableRunRuntime: { append },
+    } as unknown as Runtime;
+    const server = createHttpServer(rt);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const localBase = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const response = await fetch(`${localBase}/v1/sessions/${sessionId}/append`, {
+        method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${adminToken}` },
+        body: JSON.stringify({ task: 'cross worker steer' }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ queued: true });
+      expect(append).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-active-older' }));
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('rejects a durable run when another worker already owns the session', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'cross-worker-run-secret' });
+    const admin = await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    await localStore.putAgentRunBindingIfAbsent({
+      tenantId: 'default', userId: admin.id, sessionId: 'shared-session', runId: 'remote-running', kernel: 'pi',
+      graphName: '', graphVersion: '', createdAt: new Date(),
+    });
+    await localStore.updateAgentRun('default', 'remote-running', { status: 'running', updatedAt: new Date() });
+    const run = vi.fn(async () => { throw new Error('must not start a competing run'); });
+    const rt = {
+      model, tools: new ToolRegistry(), store: localStore, policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth, jwtSecret: 'cross-worker-run-secret', systemExtra: '', durableRunRuntime: { run },
+    } as unknown as Runtime;
+    const server = createHttpServer(rt);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const localBase = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const response = await fetch(`${localBase}/v1/agent`, {
+        method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${adminToken}` },
+        body: JSON.stringify({ sessionId: 'shared-session', task: 'competing request' }),
+      });
+      expect(response.status).toBe(409);
+      expect(run).not.toHaveBeenCalled();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it('routes active session appends through the durable runtime inbox', async () => {
     const localStore = new MemoryStore();
     await localStore.createTenant({ id: 'default', name: 'Default' });
@@ -754,23 +826,40 @@ describe('HTTP server', () => {
 
     let firstStarted!: () => void;
     const started = new Promise<void>((resolve) => { firstStarted = resolve; });
-    let releaseFirst!: () => void;
-    const release = new Promise<void>((resolve) => { releaseFirst = resolve; });
-    const seenMessages: Msg[][] = [];
-    const appendDurably = vi.fn(async () => {});
+    let appended!: (input: AppendRunMessageInput) => void;
+    const appendedInput = new Promise<AppendRunMessageInput>((resolve) => { appended = resolve; });
+    const appendDurably = vi.fn(async (input: AppendRunMessageInput) => appended(input));
+    const runDurably = vi.fn(async () => {
+      firstStarted();
+      return {
+        runId: 'durable-active-run', status: 'running' as const,
+        events: {
+          async *[Symbol.asyncIterator]() {
+            yield {
+              tenantId: 'default', runId: 'durable-active-run', sequence: 1n, type: 'text_delta',
+              attemptId: 'attempt-a', turnNo: 1, kernel: 'pi' as const, kernelVersion: '0.82.1',
+              correlationId: 'first', detail: { text: '第一段回答' }, createdAt: new Date(),
+            };
+            const input = await appendedInput;
+            yield {
+              tenantId: 'default', runId: 'durable-active-run', sequence: 2n, type: 'text_delta',
+              attemptId: 'attempt-a', turnNo: 1, kernel: 'pi' as const, kernelVersion: '0.82.1',
+              correlationId: 'second', detail: { text: `已纳入：${input.message.text}` }, createdAt: new Date(),
+            };
+          },
+        },
+        async result() {
+          const input = await appendedInput;
+          return {
+            runId: 'durable-active-run', status: 'succeeded' as const, text: `已纳入：${input.message.text}`,
+            usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0 },
+          };
+        },
+      };
+    });
     const queueModel: ChatModel = {
       id: 'queue',
-      async *stream(input): AsyncIterable<StreamEvent> {
-        seenMessages.push(input.messages.map((message) => ({ ...message })));
-        if (seenMessages.length === 1) {
-          firstStarted();
-          yield { type: 'text_delta', text: '第一段回答' };
-          await release;
-        } else {
-          yield { type: 'text_delta', text: `已纳入：${input.messages.at(-1)?.text ?? ''}` };
-        }
-        yield { type: 'stop', reason: 'end_turn' };
-      },
+      async *stream(): AsyncIterable<StreamEvent> { throw new Error('legacy runtime must not execute'); },
     };
     const rt = {
       model: queueModel,
@@ -781,7 +870,7 @@ describe('HTTP server', () => {
       authProvider: auth,
       jwtSecret: 'append-secret',
       systemExtra: '',
-      durableRunRuntime: { append: appendDurably },
+      durableRunRuntime: { run: runDurably, append: appendDurably } as unknown as DurableRunRuntime,
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
 
@@ -798,6 +887,12 @@ describe('HTTP server', () => {
       });
       await started;
 
+      const competing = await fetch(`${appendBase}/v1/agent`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ task: '并发启动另一个任务', sessionId: 'active-append' }),
+      });
+
       const appended = await fetch(`${appendBase}/v1/sessions/active-append/append`, {
         method: 'POST',
         headers,
@@ -805,21 +900,17 @@ describe('HTTP server', () => {
       });
       expect(appended.status).toBe(200);
       expect(await appended.json()).toEqual({ ok: true, sessionId: 'active-append', queued: true });
-      expect(seenMessages).toHaveLength(1);
+      expect(runDurably).toHaveBeenCalledOnce();
       expect(appendDurably).toHaveBeenCalledWith(expect.objectContaining({
         runId: expect.any(String), mode: 'steer',
         message: expect.objectContaining({ role: 'user', text: expect.stringContaining('中途修正') }),
       }));
 
-      releaseFirst();
       const runResponse = await run;
       expect(runResponse.status).toBe(200);
-      await runResponse.text();
-      expect(seenMessages).toHaveLength(1);
-
-      const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
-      const stored = await localStore.listMessages(ctx, 'active-append');
-      expect(stored.map((message) => message.role)).toEqual(['user', 'assistant']);
+      expect(await runResponse.text()).toContain('已纳入：中途修正');
+      expect(competing.status).toBe(409);
+      await competing.text();
     } finally {
       await new Promise<void>((resolve) => appendServer.close(() => resolve()));
     }

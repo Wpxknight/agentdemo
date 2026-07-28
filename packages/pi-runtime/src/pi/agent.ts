@@ -228,6 +228,10 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     return this.session.getEntries();
   }
 
+  leafId(): Promise<string | null> {
+    return this.session.getLeafId();
+  }
+
   appendCustomEntry(customType: string, data?: unknown): Promise<string> {
     this.ensureOpen();
     return this.session.appendCustomEntry(customType, data);

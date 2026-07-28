@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { AgentPlatformError } from '@aiop/control-contracts';
 import type {
   AgentInputMessage, AgentRunEvent, AgentRunResult, AppendRunMessageInput, CancelRunInput, DurableRunRuntime,
   RunHandle, StartRunInput, ResumeRunInput,
@@ -19,6 +20,7 @@ export interface ManagedPiSession extends InboxCapableSession {
   close(): Promise<void>;
   metadata(): Promise<SessionMetadata & { tenantId?: string }>;
   entries(): Promise<SessionTreeEntry[]>;
+  leafId(): Promise<string | null>;
 }
 
 export interface DurableRunSessionFactory {
@@ -46,6 +48,7 @@ export class DurableRunManager implements DurableRunRuntime {
   private readonly inboxPollMs: number;
   private readonly now: () => Date;
   private readonly active = new Map<string, { abort: AbortController; session?: ManagedPiSession }>();
+  private readonly executions = new Set<string>();
 
   constructor(private readonly options: DurableRunManagerOptions) {
     this.workerId = options.workerId ?? `${process.pid}:${randomUUID()}`;
@@ -71,6 +74,7 @@ export class DurableRunManager implements DurableRunRuntime {
   async resume(input: ResumeRunInput): Promise<RunHandle> {
     const run = await this.options.store.get({ tenantId: input.identity.tenantId, runId: input.runId });
     if (!run) throw new Error('Run not found');
+    if (run.status === 'waiting' && !input.resolution) throw conflict('Waiting run requires an interaction resolution');
     const message: AgentInputMessage = input.resolution
       ? { role: 'user', text: JSON.stringify(input.resolution) }
       : { role: 'user', text: 'Continue from the last committed state.' };
@@ -91,12 +95,15 @@ export class DurableRunManager implements DurableRunRuntime {
   private async start(
     identity: StartRunInput['identity'], runId: string, initialMessage: AgentInputMessage, resume: boolean, signal?: AbortSignal,
   ): Promise<RunHandle> {
+    const key = runKey(identity.tenantId, runId);
+    if (this.executions.has(key)) throw conflict('Run recovery is already active');
+    this.executions.add(key);
     const stream = new AsyncEventStream<AgentRunEvent>();
     let resolveResult!: (result: AgentRunResult) => void;
     let rejectResult!: (error: unknown) => void;
     const result = new Promise<AgentRunResult>((resolve, reject) => { resolveResult = resolve; rejectResult = reject; });
     const execution = this.execute(identity, runId, initialMessage, resume, signal, stream)
-      .then(resolveResult, rejectResult).finally(() => stream.close());
+      .then(resolveResult, rejectResult).finally(() => { stream.close(); this.executions.delete(key); });
     void execution;
     return { runId, status: 'running', events: stream, result: () => result };
   }
@@ -165,7 +172,7 @@ export class DurableRunManager implements DurableRunRuntime {
       });
       const entries = await session.entries();
       await this.syncEntries(identity.tenantId, claimed.record.sessionId, entries);
-      const leafId = entries.at(-1)?.id ?? null;
+      const leafId = await session.leafId();
       await this.options.store.commitTurn({
         tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, turnNo, fencingToken: claimed.fencingToken,
         checkpoint: { piSessionId: claimed.record.sessionId, piLeafId: leafId },
@@ -175,7 +182,7 @@ export class DurableRunManager implements DurableRunRuntime {
         tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, fencingToken: claimed.fencingToken,
         status: 'succeeded', usage: claimed.record.usage, completedAt: this.now(),
       });
-      return { runId, status: 'succeeded', usage: claimed.record.usage };
+      return { runId, status: 'succeeded', text: assistantText(entries, leafId), usage: claimed.record.usage };
     } catch (error) {
       if (abort.signal.aborted) {
         await session?.abort().catch(() => {});
@@ -224,6 +231,25 @@ function runKey(tenantId: string, runId: string): string { return `${tenantId}\0
 
 function hasErrorCode(error: unknown, code: string): boolean {
   return Boolean(error && typeof error === 'object' && (error as { code?: unknown }).code === code);
+}
+
+function conflict(message: string): AgentPlatformError {
+  return new AgentPlatformError({ code: 'RUN_STATE_CONFLICT', message, retryable: false });
+}
+
+function assistantText(entries: readonly SessionTreeEntry[], leafId: string | null): string | undefined {
+  const byId = new Map(entries.map((entry) => [entry.id, entry]));
+  let cursor = leafId;
+  while (cursor) {
+    const entry = byId.get(cursor);
+    if (!entry) return undefined;
+    if (entry.type === 'message' && entry.message.role === 'assistant') {
+      const text = entry.message.content.filter((block) => block.type === 'text').map((block) => block.text).join('');
+      return text || undefined;
+    }
+    cursor = entry.parentId;
+  }
+  return undefined;
 }
 
 async function delay(ms: number, signal: AbortSignal): Promise<void> {

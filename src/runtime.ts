@@ -10,6 +10,11 @@ import { HookRunner } from './agent/hooks.js';
 import { PlanApprovalState } from './agent/plan.js';
 import { AgentRuntime, createConfiguredAgentRuntime } from './agent/runtime.js';
 import type { DurableRunRuntime } from '@aiop/control-contracts';
+import {
+  InMemoryCredentialStore, createModels, type Api, type Model as PiModel, type Provider as PiProvider,
+} from '@earendil-works/pi-ai';
+import { builtinProviders } from '@earendil-works/pi-ai/providers/all';
+import { createMysqlDurablePiRuntime } from '../packages/pi-runtime/src/index.js';
 import { SandboxManager, type SandboxManagerLike } from './sandbox/lifecycle.js';
 import {
   SandboxRuntimeController,
@@ -193,6 +198,48 @@ export async function resolveRuntimeModelConfig(
   const fallback = defaultRuntimeModelConfig(config);
   const persisted = await store?.getLlmSettings({ tenantId });
   return persisted ? toRuntimeModelConfig(persisted) : fallback;
+}
+
+export async function createDefaultDurableRunRuntime(
+  store: Store,
+  modelConfig: RuntimeModelConfig,
+  systemPrompt?: string,
+): Promise<DurableRunRuntime | undefined> {
+  if (!(store instanceof MysqlStore)) return undefined;
+  const targetApi = modelConfig.protocol === 'anthropic' ? 'anthropic-messages' : 'openai-completions';
+  const provider = builtinProviders().find((candidate) => candidate.getModels().some((model) => model.api === targetApi));
+  const template = provider?.getModels().find((model) => model.api === targetApi);
+  if (!provider || !template) throw new Error(`Pi provider unavailable for protocol: ${modelConfig.protocol}`);
+  const providerId = `aiop-${modelConfig.protocol}`;
+  const credentials = new InMemoryCredentialStore();
+  await credentials.modify(providerId, async () => ({ type: 'api_key', key: modelConfig.apiKey }));
+  const models = createModels({ credentials });
+  const pricing = modelConfig.pricing;
+  const model: PiModel<Api> = {
+    ...template,
+    id: modelConfig.model,
+    name: modelConfig.id,
+    provider: providerId,
+    baseUrl: modelConfig.baseURL,
+    contextWindow: modelConfig.contextWindowTokens ?? template.contextWindow,
+    cost: pricing ? {
+      input: pricing.input,
+      output: pricing.output,
+      cacheRead: pricing.cacheRead ?? pricing.input,
+      cacheWrite: pricing.cacheWrite ?? pricing.input,
+    } : template.cost,
+  };
+  const configuredProvider: PiProvider = {
+    ...provider,
+    id: providerId,
+    name: `AIOP ${modelConfig.protocol}`,
+    baseUrl: modelConfig.baseURL,
+    getModels: () => [model],
+  };
+  models.setProvider(configuredProvider);
+  return createMysqlDurablePiRuntime({
+    db: store.database(), models, model, systemPrompt,
+  }).runtime;
 }
 
 /** 数据库页面设置优先；config.sandbox 仅在数据库尚无记录时作为启动 bootstrap。 */
@@ -564,6 +611,8 @@ export async function buildRuntime(
   };
   modelConfig = await resolveRuntimeModelConfig(config, store, DEFAULT_TENANT);
   const model = createModel(modelConfig.id, modelConfig);
+  const durableRunRuntime = options.durableRunRuntime
+    ?? await createDefaultDurableRunRuntime(store, modelConfig, systemExtra);
   const publicSandboxState = (): SandboxSettingsState => {
     const catalog = sandboxController.catalogInfo();
     return {
@@ -670,7 +719,7 @@ export async function buildRuntime(
       runStore: store,
       runtimeStore: store.agentRuntimeStore(),
     }),
-    durableRunRuntime: options.durableRunRuntime,
+    durableRunRuntime,
     model,
     modelConfig,
     modelOptions,

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
-  Session, type SessionEntryCursorOptions, type SessionForkOptions, type SessionMetadata, type SessionRepo,
+  Session, SessionError, type SessionEntryCursorOptions, type SessionForkOptions, type SessionMetadata, type SessionRepo,
   type SessionStats, type SessionStorage, type SessionTreeEntry,
 } from '@earendil-works/pi-agent-core';
 import type { ColumnType, Kysely, Transaction } from 'kysely';
@@ -27,23 +27,27 @@ export interface PiMysqlSessionDatabase {
 type PiDb = Kysely<PiMysqlSessionDatabase> | Transaction<PiMysqlSessionDatabase>;
 
 export class PiMysqlSessionStorage implements SessionStorage<PiMysqlSessionMetadata> {
+  private hasWritten = false;
+
   constructor(
     private readonly db: PiDb,
     private readonly metadata: PiMysqlSessionMetadata,
-    private readonly committedOnly = false,
+    private readonly startFromCommitted = false,
   ) {}
 
   async getMetadata(): Promise<PiMysqlSessionMetadata> { return structuredClone(this.metadata); }
 
   async getLeafId(): Promise<string | null> {
     const row = await this.sessionRow();
-    return this.committedOnly ? row.committed_leaf_id : row.current_leaf_id;
+    return this.startFromCommitted && !this.hasWritten ? row.committed_leaf_id : row.current_leaf_id;
   }
 
   async setLeafId(leafId: string | null): Promise<void> {
     if (leafId && !await this.getEntry(leafId)) throw new Error('Leaf must reference an entry in the same tenant and session');
-    await this.db.updateTable('pi_sessions').set({ current_leaf_id: leafId, updated_at: new Date() })
-      .where('tenant_id', '=', this.metadata.tenantId).where('session_id', '=', this.metadata.id).execute();
+    await this.appendEntry({
+      type: 'leaf', id: await this.createEntryId(), parentId: await this.getLeafId(),
+      timestamp: new Date().toISOString(), targetId: leafId,
+    });
   }
 
   async createEntryId(): Promise<string> { return randomUUID(); }
@@ -64,7 +68,12 @@ export class PiMysqlSessionStorage implements SessionStorage<PiMysqlSessionMetad
         entry_seq: Number(last?.entry_seq ?? 0) + 1, parent_id: entry.parentId, entry_type: entry.type,
         entry_json: JSON.stringify(entry), created_at: new Date(entry.timestamp),
       }).execute();
+      await db.updateTable('pi_sessions').set({
+        current_leaf_id: entry.type === 'leaf' ? entry.targetId : entry.id,
+        updated_at: new Date(entry.timestamp),
+      }).where('tenant_id', '=', this.metadata.tenantId).where('session_id', '=', this.metadata.id).execute();
     });
+    this.hasWritten = true;
   }
 
   async getEntry(id: string): Promise<SessionTreeEntry | undefined> {
@@ -103,18 +112,26 @@ export class PiMysqlSessionStorage implements SessionStorage<PiMysqlSessionMetad
   }
 
   async getPathToRootOrCompaction(leafId: string | null): Promise<SessionTreeEntry[]> {
+    if (leafId === null) return [];
     const entries = await this.getEntries();
     const byId = new Map(entries.map((entry) => [entry.id, entry]));
     const path: SessionTreeEntry[] = [];
-    let cursor = leafId;
-    while (cursor) {
-      const entry = byId.get(cursor);
-      if (!entry) break;
-      path.push(entry);
-      if (entry.type === 'compaction') break;
-      cursor = entry.parentId;
+    let stopAtEntryId: string | null = null;
+    let current = byId.get(leafId);
+    if (!current) throw new SessionError('not_found', `Entry ${leafId} not found`);
+    while (current) {
+      path.unshift(current);
+      if (stopAtEntryId !== null && current.id === stopAtEntryId) break;
+      if (current.type === 'compaction') {
+        if (current.retainedTail) break;
+        stopAtEntryId = current.firstKeptEntryId ?? null;
+      }
+      if (!current.parentId) break;
+      const parent = byId.get(current.parentId);
+      if (!parent) throw new SessionError('invalid_session', `Entry ${current.parentId} not found`);
+      current = parent;
     }
-    return path.reverse();
+    return path;
   }
 
   async getEntries(options: SessionEntryCursorOptions = {}): Promise<SessionTreeEntry[]> {
@@ -124,11 +141,7 @@ export class PiMysqlSessionStorage implements SessionStorage<PiMysqlSessionMetad
     if (options.afterEntrySeq !== undefined) query = query.where('entry_seq', '>', options.afterEntrySeq);
     if (options.limit !== undefined) query = query.limit(options.limit);
     const rows = await query.execute();
-    const entries = rows.map((row) => parseEntry(row.entry_json));
-    if (!this.committedOnly) return entries;
-    const leaf = await this.getLeafId();
-    const reachable = new Set((await this.pathFrom(entries, leaf)).map((entry) => entry.id));
-    return entries.filter((entry) => reachable.has(entry.id));
+    return rows.map((row) => parseEntry(row.entry_json));
   }
 
   private async visibleEntries(): Promise<SessionTreeEntry[]> { return this.getEntries(); }
@@ -139,19 +152,6 @@ export class PiMysqlSessionStorage implements SessionStorage<PiMysqlSessionMetad
       .executeTakeFirstOrThrow();
   }
 
-  private async pathFrom(entries: SessionTreeEntry[], leafId: string | null): Promise<SessionTreeEntry[]> {
-    const byId = new Map(entries.map((entry) => [entry.id, entry]));
-    const path: SessionTreeEntry[] = [];
-    let cursor = leafId;
-    while (cursor) {
-      const entry = byId.get(cursor);
-      if (!entry) break;
-      path.push(entry);
-      cursor = entry.parentId;
-    }
-    return path.reverse();
-  }
-
   private async withTransaction<T>(work: (db: Transaction<PiMysqlSessionDatabase>) => Promise<T>): Promise<T> {
     if (this.db.isTransaction) return work(this.db as Transaction<PiMysqlSessionDatabase>);
     return (this.db as Kysely<PiMysqlSessionDatabase>).transaction().execute(work);
@@ -159,7 +159,7 @@ export class PiMysqlSessionStorage implements SessionStorage<PiMysqlSessionMetad
 }
 
 export class PiMysqlSessionRepo implements SessionRepo<PiMysqlSessionMetadata, { id?: string; tenantId: string; metadata?: Record<string, unknown> }, { tenantId: string }> {
-  constructor(private readonly db: PiDb, private readonly committedOnly = false) {}
+  constructor(private readonly db: PiDb, private readonly openFromCommitted = true) {}
 
   async create(options: { id?: string; tenantId: string; metadata?: Record<string, unknown> }): Promise<Session<PiMysqlSessionMetadata>> {
     const id = options.id ?? randomUUID();
@@ -167,12 +167,14 @@ export class PiMysqlSessionRepo implements SessionRepo<PiMysqlSessionMetadata, {
     await this.db.insertInto('pi_sessions').values({
       tenant_id: options.tenantId, session_id: id, current_leaf_id: null, committed_leaf_id: null,
       metadata_json: options.metadata ? JSON.stringify(options.metadata) : null, created_at: now, updated_at: now,
-    }).execute();
-    return this.open({ id, tenantId: options.tenantId, createdAt: now.toISOString(), metadata: options.metadata });
+    }).ignore().execute();
+    return new Session(new PiMysqlSessionStorage(
+      this.db, { id, tenantId: options.tenantId, createdAt: now.toISOString(), metadata: options.metadata }, false,
+    ));
   }
 
   async open(metadata: PiMysqlSessionMetadata): Promise<Session<PiMysqlSessionMetadata>> {
-    return new Session(new PiMysqlSessionStorage(this.db, metadata, this.committedOnly));
+    return new Session(new PiMysqlSessionStorage(this.db, metadata, this.openFromCommitted));
   }
 
   async list(options: { tenantId: string }): Promise<PiMysqlSessionMetadata[]> {
@@ -193,7 +195,7 @@ export class PiMysqlSessionRepo implements SessionRepo<PiMysqlSessionMetadata, {
 
   async fork(source: PiMysqlSessionMetadata, options: SessionForkOptions & { id?: string; tenantId: string; metadata?: Record<string, unknown> }): Promise<Session<PiMysqlSessionMetadata>> {
     if (source.tenantId !== options.tenantId) throw new Error('Cannot fork a Pi session across tenants');
-    const sourceStorage = new PiMysqlSessionStorage(this.db, source, this.committedOnly);
+    const sourceStorage = new PiMysqlSessionStorage(this.db, source, this.openFromCommitted);
     const entries = await sourceStorage.getEntries();
     const target = await this.create(options);
     const storage = target.getStorage();

@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { MemoryStore } from '../src/db/memory.js';
-import { resolveRuntimeModelConfig, resolveRuntimeSandboxConfig } from '../src/runtime.js';
+import { MysqlStore } from '../src/db/mysql.js';
+import { createDefaultDurableRunRuntime, resolveRuntimeModelConfig, resolveRuntimeSandboxConfig } from '../src/runtime.js';
 import { ConfigSchema, SandboxConfigSchema, type Config } from '../src/config/schema.js';
+import { DurableRunManager } from '../packages/pi-runtime/src/index.js';
 
 const config: Config = {
   models: {
@@ -33,6 +35,18 @@ describe('resolveRuntimeModelConfig', () => {
       apiKey: 'plain-persisted-key',
       model: 'persisted-model',
     });
+  });
+});
+
+describe('production durable runtime assembly', () => {
+  it('constructs the shared durable Pi runtime for a MysqlStore', async () => {
+    const runtime = await createDefaultDurableRunRuntime(
+      new MysqlStore({} as never),
+      { id: 'configured', protocol: 'openai', baseURL: 'http://model.local/v1', apiKey: 'secret', model: 'custom-model' },
+      'system prompt',
+    );
+
+    expect(runtime).toBeInstanceOf(DurableRunManager);
   });
 });
 

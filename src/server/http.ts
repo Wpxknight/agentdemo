@@ -1513,8 +1513,7 @@ async function handle(
     const body = await readJson(req);
     const message = userMessageFromBody(body);
     const activeRun = findActiveRun(activeRuns, activeRunKey(ctx, sessionId));
-    const durableRun = activeRun ?? (await rt.store.listAgentRuns(ctx, { sessionId, limit: 1 }))
-      .find((run) => run.status === 'queued' || run.status === 'running' || run.status === 'waiting');
+    const durableRun = activeRun ?? await findAppendableRun(rt, ctx, sessionId);
     const mode = body.mode === 'follow_up' ? 'follow_up' : 'steer';
     const idempotencyKey = req.headers['idempotency-key']?.toString()
       ?? (typeof body.idempotencyKey === 'string' ? body.idempotencyKey : randomUUID());
@@ -1754,6 +1753,12 @@ async function handle(
   }
 
   sendJson(res, 404, { error: `未知路由: ${route}` });
+}
+
+async function findAppendableRun(rt: Runtime, ctx: RequestContext, sessionId: string): Promise<AgentRunRecord | undefined> {
+  const candidates = (await Promise.all((['running', 'waiting', 'queued'] as const)
+    .map((status) => rt.store.listAgentRuns(ctx, { sessionId, status, limit: 1 })))).flat();
+  return candidates.sort((left, right) => right.updatedAt.getTime() - left.updatedAt.getTime())[0];
 }
 
 function toolCategory(name: string): string {
@@ -2136,6 +2141,7 @@ async function runAgentSse(
   req: Req,
   res: Res,
 ): Promise<void> {
+  if (rt.durableRunRuntime) return runDurableAgentSse(rt, activeRuns, req, res);
   const ctx = await requireAuth(rt, req);
   const body = await readJson(req);
   const userText = userTextFromBody(body);
@@ -2474,6 +2480,63 @@ async function runAgentSse(
       log.error({ err }, 'agent 运行失败');
       sse('error', { error: err instanceof Error ? err.message : '运行失败' });
     }
+  } finally {
+    removeActiveRun(activeRuns, activeKey, activeRun);
+    res.off('close', onClose);
+    if (!res.destroyed && !res.writableEnded) res.end();
+  }
+}
+
+async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req: Req, res: Res): Promise<void> {
+  const runtime = rt.durableRunRuntime!;
+  const ctx = await requireAuth(rt, req);
+  const body = await readJson(req);
+  const sessionId = sessionIdFromBody(body);
+  const text = userTextFromBody(body);
+  const blocks = attachmentImageBlocks(body);
+  const activeKey = activeRunKey(ctx, sessionId);
+  if (findActiveRun(activeRuns, activeKey) || await findAppendableRun(rt, ctx, sessionId)) {
+    throw new HttpError(409, '该会话已有正在运行的任务；可通过 append 追加消息，或先终止当前运行');
+  }
+  const handle = await runtime.run({
+    runId: randomUUID(),
+    identity: { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] },
+    sessionId,
+    input: [{
+      role: 'user', text,
+      content: blocks.map((block) => block.type === 'text'
+        ? { type: 'text' as const, text: block.text }
+        : { type: 'image' as const, mimeType: block.mimeType, data: block.data }),
+    }],
+    kernel: 'pi',
+  });
+  const abort = new AbortController();
+  const activeRun: ActiveAgentRun = { tenantId: ctx.tenantId, runId: handle.runId, abort };
+  addActiveRun(activeRuns, activeKey, activeRun);
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+  });
+  const sse = (event: string, data: unknown): void => {
+    if (res.destroyed || res.writableEnded) return;
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+  sse('session', { sessionId, runId: handle.runId });
+  const onClose = () => {
+    if (abort.signal.aborted) return;
+    abort.abort(new Error('客户端连接已关闭'));
+    void runtime.cancel({
+      identity: { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] },
+      runId: handle.runId,
+      reason: '客户端连接已关闭',
+    }).catch(() => {});
+  };
+  res.on('close', onClose);
+  try {
+    for await (const event of handle.events) sse(event.type, event.detail ?? {});
+    const result = await handle.result();
+    sse('done', { sessionId, ...result });
   } finally {
     removeActiveRun(activeRuns, activeKey, activeRun);
     res.off('close', onClose);

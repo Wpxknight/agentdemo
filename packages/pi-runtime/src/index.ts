@@ -19,4 +19,5 @@ export * from './run/inbox.js';
 export * from './run/lease.js';
 export * from './run/limits.js';
 export * from './run/manager.js';
+export * from './run/mysql-assembly.js';
 export * from './run/recovery.js';

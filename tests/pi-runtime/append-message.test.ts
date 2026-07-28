@@ -69,6 +69,7 @@ describe('active durable inbox delivery', () => {
       async steer() { release(); }, async followUp() { release(); }, async abort() { release(); }, async close() {},
       async metadata() { return { id: 'session-poll', tenantId: 'tenant-a', createdAt: new Date().toISOString() }; },
       async entries() { return entries; },
+      async leafId() { return entries.at(-1)?.id ?? null; },
       async appendCustomEntry(customType, data) {
         const id = `custom-${entries.length}`;
         entries.push({ type: 'custom', customType, data, id, parentId: entries.at(-1)?.id ?? null, timestamp: new Date().toISOString() });

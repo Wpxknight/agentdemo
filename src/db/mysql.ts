@@ -221,6 +221,10 @@ function parseSchedulerSettings(value: unknown): SchedulerSettings | undefined {
 export class MysqlStore implements Store {
   constructor(private readonly db: Kysely<Database>) {}
 
+  database(): Kysely<Database> {
+    return this.db;
+  }
+
   agentRuntimeStore() {
     return new MysqlRuntimeStore(this.db as unknown as Kysely<RuntimeMysqlDatabase>);
   }
