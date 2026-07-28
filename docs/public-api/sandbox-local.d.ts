@@ -1,4 +1,4 @@
-import type { AcquireSandboxInput, DownloadFile, SandboxCommand, SandboxHandle, SandboxOutput, SandboxProvider, UploadFile } from '@aiop/agent-contracts';
+import type { AcquireSandboxInput, DownloadFile, SandboxCommand, SandboxHandle, SandboxOutput, SandboxProvider, UploadFile } from '@aiop/sandbox-core';
 export declare class LocalSandboxProvider implements SandboxProvider {
     private readonly handles;
     acquire(input: AcquireSandboxInput): Promise<SandboxHandle>;

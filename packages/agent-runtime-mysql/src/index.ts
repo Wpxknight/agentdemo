@@ -1,4 +1,4 @@
-import { AgentPlatformError, type AgentRunEvent } from '@aiop/agent-contracts';
+import { AgentPlatformError, type AgentRunEvent } from '@aiop/control-contracts';
 import type {
   AttemptRecord,
   CommitTurnInput,

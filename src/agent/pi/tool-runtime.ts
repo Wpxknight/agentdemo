@@ -3,7 +3,7 @@ import type {
   JsonValue,
   ToolExecutionOutcome,
   ToolRuntime,
-} from '@aiop/agent-contracts';
+} from '@aiop/control-contracts';
 import type { ToolLedgerRepository } from '@aiop/agent-runtime-core';
 import {
   ToolConcurrencyController,

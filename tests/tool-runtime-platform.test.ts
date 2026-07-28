@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { JsonValue } from '@aiop/agent-contracts';
+import type { JsonValue } from '@aiop/control-contracts';
 import { MemoryRuntimeStore } from '../packages/agent-runtime-core/src/memory-store.js';
 import {
   PiToolOutputLimiter,

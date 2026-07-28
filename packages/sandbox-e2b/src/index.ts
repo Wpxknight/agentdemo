@@ -8,7 +8,7 @@ import type {
   SandboxOutput,
   SandboxProvider,
   UploadFile,
-} from '@aiop/agent-contracts';
+} from '@aiop/sandbox-core';
 
 interface E2BSandboxClient {
   sandboxId: string;

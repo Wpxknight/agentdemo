@@ -11,7 +11,7 @@ import type {
   SandboxOutput,
   SandboxProvider,
   UploadFile,
-} from '@aiop/agent-contracts';
+} from '@aiop/sandbox-core';
 
 interface LocalHandle extends SandboxHandle { root: string }
 

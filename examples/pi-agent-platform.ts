@@ -1,4 +1,5 @@
-import type { ModelProvider, ToolRuntime } from '@aiop/agent-contracts';
+import type { ToolRuntime } from '@aiop/control-contracts';
+import type { ModelProvider } from '@aiop/agent-runtime-core';
 import { PiAgentKernel } from '@aiop/agent-kernel-pi';
 import { DurableAgentRuntime, MemoryRuntimeStore } from '@aiop/agent-runtime-core';
 

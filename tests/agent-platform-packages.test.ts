@@ -11,21 +11,21 @@ describe('agent platform package boundaries', () => {
   it('declares the contracts and runtime core workspaces', async () => {
     const rootManifest = JSON.parse(await readFile(new URL('package.json', root), 'utf8')) as { workspaces?: string[] };
     expect(rootManifest.workspaces).toContain('packages/*');
-    expect((await manifest('agent-contracts')).name).toBe('@aiop/agent-contracts');
+    expect((await manifest('control-contracts')).name).toBe('@aiop/control-contracts');
     expect((await manifest('agent-runtime-core')).name).toBe('@aiop/agent-runtime-core');
     expect((await manifest('agent-runtime-aiop')).name).toBe('@aiop/agent-runtime-aiop');
   });
 
   it('exports package-root public APIs', async () => {
-    for (const name of ['agent-contracts', 'agent-runtime-core', 'agent-runtime-aiop']) {
+    for (const name of ['control-contracts', 'agent-runtime-core', 'agent-runtime-aiop']) {
       expect((await manifest(name)).exports).toEqual({
-        '.': { types: './dist/index.d.ts', import: './dist/index.js' },
+        '.': { types: './bin/index.d.ts', import: './bin/index.js' },
       });
     }
   });
 
   it('keeps product and LangGraph types outside public contracts', async () => {
-    const contracts = await readFile(new URL('packages/agent-contracts/src/index.ts', root), 'utf8');
+    const contracts = await readFile(new URL('packages/control-contracts/src/index.ts', root), 'utf8');
     for (const forbidden of ['RequestContext', "../db/store", 'langgraph', '@langchain']) {
       expect(contracts.toLowerCase()).not.toContain(forbidden.toLowerCase());
     }
@@ -40,7 +40,7 @@ describe('agent platform package boundaries', () => {
 
   it('keeps every public package free of product imports and undeclared workspace dependencies', async () => {
     const names = [
-      'agent-contracts', 'agent-kernel-pi', 'agent-runtime-aiop', 'agent-runtime-core', 'agent-runtime-mysql',
+      'control-contracts', 'agent-kernel-pi', 'agent-runtime-aiop', 'agent-runtime-core', 'agent-runtime-mysql',
       'mcp-runtime', 'sandbox-core', 'sandbox-e2b', 'sandbox-local', 'sandbox-opensandbox',
       'scheduler-core', 'scheduler-mysql', 'skill-runtime', 'tool-runtime',
     ];

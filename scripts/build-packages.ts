@@ -4,7 +4,7 @@ import ts from 'typescript';
 
 const root = resolve(import.meta.dirname, '..');
 const packages = [
-  'agent-contracts',
+  'control-contracts',
   'agent-runtime-core',
   'sandbox-core',
   'scheduler-core',
@@ -28,7 +28,7 @@ if (parsed.errors.length) fail(parsed.errors);
 
 for (const name of packages) {
   const packageRoot = resolve(root, 'packages', name);
-  const outDir = resolve(packageRoot, 'dist');
+  const outDir = resolve(packageRoot, 'bin');
   await rm(outDir, { recursive: true, force: true });
   const program = ts.createProgram({
     rootNames: [resolve(packageRoot, 'src/index.ts')],

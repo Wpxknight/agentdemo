@@ -1,7 +1,7 @@
 import type {
   ModelConcurrencyController,
   ModelConcurrencyInput,
-} from '@aiop/agent-contracts';
+} from './kernel.js';
 
 export interface FifoModelConcurrencyControllerOptions {
   maxConcurrentPerTenantModel?: number;

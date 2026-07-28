@@ -36,7 +36,8 @@ import type {
 import { DEFAULT_SESSION_TITLE } from './store.js';
 import { nextRunAt } from '../scheduler/cron.js';
 import { MemoryRuntimeStore } from '@aiop/agent-runtime-core';
-import type { InteractionRecord as RuntimeInteractionRecord, JsonValue } from '@aiop/agent-runtime-core';
+import type { InteractionRecord as RuntimeInteractionRecord } from '@aiop/agent-runtime-core';
+import type { JsonValue } from '@aiop/control-contracts';
 
 interface MsgRow {
   tenantId: string;

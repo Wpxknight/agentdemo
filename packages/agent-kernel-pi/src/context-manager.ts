@@ -18,7 +18,8 @@ import {
   type SimpleStreamOptions,
   type Usage,
 } from '@earendil-works/pi-ai';
-import type { AgentRunUsage, KernelMessage } from '@aiop/agent-contracts';
+import type { AgentRunUsage } from '@aiop/control-contracts';
+import type { KernelMessage } from '@aiop/agent-runtime-core';
 
 export interface ContextUsage {
   tokens: number;

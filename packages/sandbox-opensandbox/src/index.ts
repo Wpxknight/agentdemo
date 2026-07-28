@@ -9,7 +9,7 @@ import type {
   SandboxOutput,
   SandboxProvider,
   UploadFile,
-} from '@aiop/agent-contracts';
+} from '@aiop/sandbox-core';
 
 interface OpenSandboxClient {
   id: string;

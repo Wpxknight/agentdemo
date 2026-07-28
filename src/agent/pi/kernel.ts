@@ -3,15 +3,15 @@ import type {
   KernelMessage,
   ModelConcurrencyController,
   ModelProvider,
-  ToolRuntime,
-} from '@aiop/agent-contracts';
+} from '@aiop/agent-runtime-core';
+import type { ToolRuntime } from '@aiop/control-contracts';
 import { PiAgentKernel, PiContextManager } from '@aiop/agent-kernel-pi';
 import { FifoModelConcurrencyController } from '@aiop/agent-runtime-core';
 import type { Msg, StreamEvent, ToolDef } from '../../model/types.js';
 import type { AgentKernel } from '../kernel.js';
 import type { RunAgentOptions, RunAgentResult } from '../run-types.js';
 import { executeToolCall } from '../services/tool-broker.js';
-import { AgentPlatformError } from '@aiop/agent-contracts';
+import { AgentPlatformError } from '@aiop/control-contracts';
 import { compactMessages, SUMMARY_PREFIX } from '../context.js';
 import { buildSystemPrompt } from '../services/prompt.js';
 
@@ -147,7 +147,7 @@ async function* adaptModel(
   messages: readonly KernelMessage[],
   tools: readonly { name: string; description: string; inputSchema: Record<string, unknown> }[],
   signal?: AbortSignal,
-): AsyncIterable<import('@aiop/agent-contracts').ModelStreamEvent> {
+): AsyncIterable<import('@aiop/agent-runtime-core').ModelStreamEvent> {
   for await (const event of options.model.stream({
     system,
     messages: fromPiKernelMessages(messages),

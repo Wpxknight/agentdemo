@@ -3,12 +3,12 @@
   "version": "0.1.0-preview.1",
   "type": "module",
   "sideEffects": false,
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
-  "files": ["dist"],
+  "main": "./bin/index.js",
+  "types": "./bin/index.d.ts",
+  "exports": { ".": { "types": "./bin/index.d.ts", "import": "./bin/index.js" } },
+  "files": ["bin"],
   "dependencies": {
-    "@aiop/agent-contracts": "0.1.0-preview.1",
+    "@aiop/control-contracts": "0.1.0-preview.1",
     "@aiop/agent-runtime-core": "0.1.0-preview.1",
     "@earendil-works/pi-agent-core": "0.82.1"
   },

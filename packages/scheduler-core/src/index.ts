@@ -1,4 +1,4 @@
-import type { AgentRuntime } from '@aiop/agent-contracts';
+import type { AgentRuntime } from '@aiop/control-contracts';
 
 export interface ClaimedTask {
   taskId: string;

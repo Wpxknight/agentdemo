@@ -1,4 +1,4 @@
-import type { JsonValue, ToolCall, ToolCapability, ToolExecutionContext, ToolExecutionOutcome, ToolResult, ToolRuntime } from '@aiop/agent-contracts';
+import type { JsonValue, ToolCall, ToolCapability, ToolExecutionContext, ToolExecutionOutcome, ToolResult, ToolRuntime } from '@aiop/control-contracts';
 import type { ToolLedgerRepository } from '@aiop/agent-runtime-core';
 export interface RegisteredTool {
     name: string;

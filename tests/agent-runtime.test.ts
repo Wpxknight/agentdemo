@@ -570,7 +570,7 @@ describe('AgentRuntime', () => {
   });
 });
 
-function fromCommittedText(messages: readonly import('@aiop/agent-contracts').KernelMessage[]): string[] {
+function fromCommittedText(messages: readonly import('@aiop/agent-runtime-core').KernelMessage[]): string[] {
   return messages.flatMap((message) => message.role === 'user' || message.role === 'assistant'
     ? message.content.flatMap((block) => block.type === 'text' ? [block.text] : [])
     : message.results.map((result) => result.content));

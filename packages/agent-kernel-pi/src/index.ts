@@ -25,22 +25,24 @@ import {
 import {
   AgentPlatformError,
   type AgentContentBlock,
-  type AgentKernel,
   type AgentRunUsage,
   type DurableInteractionUpdate,
   type DurableToolLedgerUpdate,
   type JsonValue,
-  type KernelControl,
-  type KernelExit,
-  type KernelMessage,
-  type KernelRunInput,
-  type ModelConcurrencyController,
-  type ModelProvider,
   type ToolCall,
   type ToolDefinition,
   type ToolRuntime,
   type WaitingReason,
-} from '@aiop/agent-contracts';
+} from '@aiop/control-contracts';
+import type {
+  AgentKernel,
+  KernelControl,
+  KernelExit,
+  KernelMessage,
+  KernelRunInput,
+  ModelConcurrencyController,
+  ModelProvider,
+} from '@aiop/agent-runtime-core';
 import type { CompactionPolicy, ContextManager } from './context-manager.js';
 
 export * from './context-manager.js';

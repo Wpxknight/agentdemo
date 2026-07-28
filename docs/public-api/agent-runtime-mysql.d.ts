@@ -1,4 +1,4 @@
-import { type AgentRunEvent } from '@aiop/agent-contracts';
+import { type AgentRunEvent } from '@aiop/control-contracts';
 import type { AttemptRecord, CommitTurnInput, InteractionRecord, LeaseRecord, RunIdentity, RunRecord, RuntimeStore, RuntimeTransaction, ToolLedgerRecord, TurnCommit, TurnSnapshot } from '@aiop/agent-runtime-core';
 import type { ColumnType, Generated, Kysely, Transaction } from 'kysely';
 type JsonColumn = ColumnType<unknown, string, string>;

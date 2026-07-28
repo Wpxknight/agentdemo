@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AgentPlatformError, type AgentKernel, type RuntimeObservation } from '@aiop/agent-contracts';
+import { AgentPlatformError, type RuntimeObservation } from '@aiop/control-contracts';
+import type { AgentKernel } from '@aiop/agent-runtime-core';
 import { DurableAgentRuntime } from '../packages/agent-runtime-core/src/runtime.js';
 import { MemoryRuntimeStore } from '../packages/agent-runtime-core/src/memory-store.js';
 import { MemoryStore } from '../src/db/memory.js';

@@ -9,7 +9,7 @@ describe('sandbox platform packages', () => {
     for (const name of ['sandbox-core', 'sandbox-local', 'sandbox-opensandbox', 'sandbox-e2b']) {
       const manifest = JSON.parse(await readFile(new URL(`../packages/${name}/package.json`, import.meta.url), 'utf8'));
       expect(manifest.name).toBe(`@aiop/${name}`);
-      expect(manifest.exports).toEqual({ '.': { types: './dist/index.d.ts', import: './dist/index.js' } });
+      expect(manifest.exports).toEqual({ '.': { types: './bin/index.d.ts', import: './bin/index.js' } });
     }
   });
 

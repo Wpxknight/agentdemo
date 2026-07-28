@@ -15,7 +15,8 @@ import {
   truncateLine,
   truncateTail,
 } from '@earendil-works/pi-agent-core';
-import type { ModelProvider, ToolRuntime } from '@aiop/agent-contracts';
+import type { ToolRuntime } from '@aiop/control-contracts';
+import type { ModelProvider } from '@aiop/agent-runtime-core';
 import {
   DurableAgentRuntime,
   MemoryRuntimeStore,

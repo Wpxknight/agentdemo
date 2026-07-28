@@ -41,6 +41,6 @@ describe('Pi delivery baseline', () => {
     expect(dockerfile).toContain('COPY scripts/build-packages.ts ./scripts/build-packages.ts');
     expect(dockerfile).toContain('RUN npm run build:packages');
     expect(dockerfile).toContain('COPY --from=deps /app/packages ./packages');
-    expect(dockerignore).toContain('packages/*/dist');
+    expect(dockerignore).toContain('packages/*/bin');
   });
 });

@@ -1,4 +1,4 @@
-import type { IdentityContext, JsonValue, ToolDefinition } from '@aiop/agent-contracts';
+import type { IdentityContext, JsonValue, ToolDefinition } from '@aiop/control-contracts';
 
 export interface McpToolDescription {
   name: string;

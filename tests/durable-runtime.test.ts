@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { AgentKernel, KernelExit } from '@aiop/agent-contracts';
+import type { AgentKernel, KernelExit } from '@aiop/agent-runtime-core';
 import { DurableAgentRuntime } from '../packages/agent-runtime-core/src/runtime.js';
 import { MemoryRuntimeStore } from '../packages/agent-runtime-core/src/memory-store.js';
 

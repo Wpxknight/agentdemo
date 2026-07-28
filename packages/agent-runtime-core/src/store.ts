@@ -7,11 +7,10 @@ import type {
   DurableInteractionUpdate,
   DurableToolLedgerUpdate,
   IdentityContext,
-  KernelMessage,
-  ModelBinding,
   RunLimits,
   WaitingReason,
-} from '@aiop/agent-contracts';
+} from '@aiop/control-contracts';
+import type { KernelMessage, ModelBinding } from './kernel.js';
 
 export interface RunIdentity {
   tenantId: string;

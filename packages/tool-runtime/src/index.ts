@@ -7,7 +7,7 @@ import type {
   ToolExecutionOutcome,
   ToolResult,
   ToolRuntime,
-} from '@aiop/agent-contracts';
+} from '@aiop/control-contracts';
 import type { ToolLedgerRecord, ToolLedgerRepository } from '@aiop/agent-runtime-core';
 import { truncateHead, truncateLine, truncateTail } from '@earendil-works/pi-agent-core';
 

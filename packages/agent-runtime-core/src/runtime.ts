@@ -2,14 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import {
   AgentPlatformError,
-  type AgentKernel,
   type AgentKernelName,
   type AgentRunEvent,
   type AgentRunResult,
   type CancelRunInput,
-  type KernelEvent,
-  type KernelMessage,
-  type ModelBinding,
   type ResumeRunInput,
   type ResolvedInteraction,
   type RunLimits,
@@ -17,7 +13,8 @@ import {
   type RuntimeObservation,
   type StartRunInput,
   type ToolDefinition,
-} from '@aiop/agent-contracts';
+} from '@aiop/control-contracts';
+import type { AgentKernel, KernelEvent, KernelMessage, ModelBinding } from './kernel.js';
 import type { RunIdentity, RunRecord, RuntimeStore, TurnCommit, TurnSnapshot } from './store.js';
 
 const ZERO_USAGE = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 } as const;
@@ -39,6 +36,10 @@ export interface DurableAgentRuntimeOptions {
   now?: () => Date;
   observeEvent?: (event: KernelEvent) => void | Promise<void>;
   observe?: (observation: RuntimeObservation) => void | Promise<void>;
+}
+
+export interface DurableRuntimeStartRunInput extends StartRunInput {
+  messages?: readonly KernelMessage[];
 }
 
 export class DurableAgentRuntime {
@@ -74,7 +75,7 @@ export class DurableAgentRuntime {
     this.now = options.now ?? (() => new Date());
   }
 
-  async run(input: StartRunInput): Promise<RunHandle> {
+  async run(input: DurableRuntimeStartRunInput): Promise<RunHandle> {
     const kernel = this.resolveKernel(input.kernel ?? this.options.defaultKernel);
     const runId = input.runId ?? randomUUID();
     const now = this.now();

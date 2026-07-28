@@ -11,9 +11,11 @@ import {
 import {
   DurableAgentRuntime,
   FifoModelConcurrencyController,
+  type KernelMessage,
+  type ModelConcurrencyController,
   type RuntimeStore,
 } from '@aiop/agent-runtime-core';
-import { AgentPlatformError, type ModelConcurrencyController } from '@aiop/agent-contracts';
+import { AgentPlatformError } from '@aiop/control-contracts';
 import type { AgentRunBinding, Store } from '../db/store.js';
 import { AgentRunCancelledError, AgentRunCoordinator } from './run-coordinator.js';
 import { reqContext } from './tools.js';
@@ -394,7 +396,7 @@ function piOptionGate(env: NodeJS.ProcessEnv, mode: PiMode) {
   };
 }
 
-function lastReplayText(messages: readonly import('@aiop/agent-contracts').KernelMessage[]): string {
+function lastReplayText(messages: readonly KernelMessage[]): string {
   const assistant = [...messages].reverse().find((message) => message.role === 'assistant');
   if (!assistant || assistant.role !== 'assistant') return '';
   return assistant.content.flatMap((block) => block.type === 'text' ? [block.text] : []).join('');
