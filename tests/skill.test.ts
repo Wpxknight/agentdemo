@@ -1,6 +1,7 @@
 import { mkdtemp, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
+import { hostname, tmpdir } from 'node:os';
+import { basename, dirname, join, resolve } from 'node:path';
 import { deflateRawSync } from 'node:zlib';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { SkillRegistry } from '../src/skill/registry.js';
@@ -529,6 +530,131 @@ describe('SkillRegistry upload review governance', () => {
       visibility: fulfilled[0]!.value.visibility,
       ...(fulfilled[0]!.value.visibility === 'public' ? { allowedTenantIds: ['*'] } : {}),
     });
+  });
+
+  it('serializes same-name imports across separate registry instances sharing a filesystem', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-upload-cross-process-import-'));
+    const registries = [new SkillRegistry(root), new SkillRegistry(root)];
+    await Promise.all(registries.map((registry) => registry.scan()));
+    const dirs = ['u1', 'u2'].map((owner) => join(root, 'users', owner, `distributed-${owner}`));
+    for (const dir of dirs) {
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, 'SKILL.md'), '---\nname: distributed\ndescription: distributed\n---\nbody');
+      await writeProduct(dir, { name: 'distributed', version: '1' });
+    }
+
+    const results = await Promise.allSettled(registries.map((registry, index) => (
+      registry.installUploadedProduct(dirs[index]!, {
+        tenantId: 'default', userId: `u${index + 1}`, role: 'user',
+      })
+    )));
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    const verificationRegistry = new SkillRegistry(root);
+    await verificationRegistry.scan();
+    expect(verificationRegistry.list().filter((skill) => skill.name === 'distributed')).toHaveLength(1);
+  });
+
+  it('serializes local and global review across separate registry instances', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-upload-cross-process-review-'));
+    const skillDir = join(root, 'users', 'uploader', 'distributed-review');
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(skillDir, 'SKILL.md'), '---\nname: distributed-review\ndescription: review\n---\nbody');
+    await writeProduct(skillDir, {
+      name: 'distributed-review', version: '1', enabled: true, reviewed: false,
+      tenantId: 'default', ownerUserId: 'uploader', visibility: 'private',
+    });
+    const registries = [new SkillRegistry(root), new SkillRegistry(root)];
+    await Promise.all(registries.map((registry) => registry.scan()));
+
+    const results = await Promise.allSettled([
+      registries[0]!.review('distributed-review', {
+        tenantId: 'default', userId: 'tenant-reviewer', role: 'tenant_admin',
+      }),
+      registries[1]!.review('distributed-review', {
+        tenantId: 'default', userId: 'platform-reviewer', role: 'platform_admin',
+      }, { global: true }),
+    ]);
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+  });
+
+  it('recovers an expired distributed name lock and releases its own lock', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-upload-stale-lock-'));
+    const name = 'stale-lock';
+    const lockKey = `skill-name:${name}`;
+    const lockPath = join(
+      dirname(root),
+      `.${basename(root)}-locks`,
+      createHash('sha256').update(lockKey).digest('hex'),
+    );
+    const expiredOwnerDir = join(lockPath, 'expired-owner');
+    await mkdir(expiredOwnerDir, { recursive: true });
+    await writeFile(join(expiredOwnerDir, 'owner.json'), JSON.stringify({
+      token: 'expired-owner', key: lockKey, leaseUntil: Date.now() - 60_000,
+      hostname: hostname(), pid: 2_147_483_647,
+    }));
+    const skillDir = join(root, 'users', 'uploader', name);
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(skillDir, 'SKILL.md'), `---\nname: ${name}\ndescription: stale\n---\nbody`);
+    await writeProduct(skillDir, { name, version: '1' });
+    const registry = new SkillRegistry(root);
+
+    await expect(registry.installUploadedProduct(skillDir, {
+      tenantId: 'default', userId: 'uploader', role: 'user',
+    })).resolves.toMatchObject({ name, reviewed: false });
+    await expect(stat(lockPath)).rejects.toThrow();
+  });
+
+  it('does not recover an expired distributed name lock while its owner process is alive', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-upload-live-lock-'));
+    const name = 'live-lock';
+    const lockKey = `skill-name:${name}`;
+    const lockPath = join(
+      dirname(root),
+      `.${basename(root)}-locks`,
+      createHash('sha256').update(lockKey).digest('hex'),
+    );
+    const liveOwnerDir = join(lockPath, 'live-owner');
+    await mkdir(liveOwnerDir, { recursive: true });
+    await writeFile(join(liveOwnerDir, 'owner.json'), JSON.stringify({
+      token: 'live-owner', key: lockKey, leaseUntil: Date.now() - 60_000,
+      hostname: hostname(), pid: process.pid,
+    }));
+    const skillDir = join(root, 'users', 'uploader', name);
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(skillDir, 'SKILL.md'), `---\nname: ${name}\ndescription: live\n---\nbody`);
+    await writeProduct(skillDir, { name, version: '1' });
+    const registry = new SkillRegistry(root, { nameLockTimeoutMs: 50 });
+
+    await expect(registry.installUploadedProduct(skillDir, {
+      tenantId: 'default', userId: 'uploader', role: 'user',
+    })).rejects.toThrow('获取技能名称锁超时');
+    await expect(stat(lockPath)).resolves.toBeDefined();
+  });
+
+  it('releases the distributed name lock when review validation fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-upload-failed-lock-'));
+    const skillDir = join(root, 'users', 'uploader', 'retry-review');
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(skillDir, 'SKILL.md'), '---\nname: wrong-name\ndescription: invalid\n---\nbody');
+    await writeProduct(skillDir, {
+      name: 'retry-review', version: '1', enabled: true, reviewed: false,
+      tenantId: 'default', ownerUserId: 'uploader', visibility: 'private',
+    });
+    const first = new SkillRegistry(root);
+    const second = new SkillRegistry(root);
+    await Promise.all([first.scan(), second.scan()]);
+    await expect(first.review('retry-review', {
+      tenantId: 'default', userId: 'reviewer-one', role: 'tenant_admin',
+    })).rejects.toThrow('诊断');
+    await writeFile(join(skillDir, 'SKILL.md'), '---\nname: retry-review\ndescription: valid\n---\nbody');
+
+    await expect(second.review('retry-review', {
+      tenantId: 'default', userId: 'reviewer-two', role: 'tenant_admin',
+    })).resolves.toMatchObject({ name: 'retry-review', reviewed: true });
   });
 });
 
