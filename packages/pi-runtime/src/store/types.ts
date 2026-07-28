@@ -13,6 +13,8 @@ export interface StoredRun extends RunRecord {
   appendClosedAt?: Date;
 }
 
+export type DurableRunCreateResult = RunRecord & { sessionCreated: boolean };
+
 export interface PiSessionRecord {
   tenantId: string;
   sessionId: string;
@@ -64,6 +66,15 @@ export interface CloseInboxInput {
   now: Date;
 }
 
+export interface AppendRunEventsInput {
+  tenantId: string;
+  runId: string;
+  attemptId: string;
+  fencingToken: bigint;
+  events: readonly Omit<AgentRunEvent, 'sequence'>[];
+  appendedAt: Date;
+}
+
 export interface ClaimInboxInput {
   tenantId: string;
   runId: string;
@@ -95,8 +106,10 @@ export interface RunInboxStore {
 }
 
 export interface DurableRunStore extends RunStore {
+  create(input: CreateRunRecord): Promise<DurableRunCreateResult>;
   get(identity: { tenantId: string; runId: string }): Promise<StoredRun | undefined>;
   listEvents(identity: { tenantId: string; runId: string }, after?: bigint): Promise<AgentRunEvent[]>;
+  appendEvents(input: AppendRunEventsInput): Promise<void>;
   isCancellationRequested(identity: { tenantId: string; runId: string }): Promise<boolean>;
   countAttempts(identity: { tenantId: string; runId: string }): Promise<number>;
   closeInbox(input: CloseInboxInput): Promise<void>;

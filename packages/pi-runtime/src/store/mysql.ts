@@ -16,13 +16,14 @@ type Db = Kysely<any> | Transaction<any>;
 export class MysqlRunStore implements DurableRunStore {
   constructor(private readonly db: Db, private readonly transactionalView = false, private readonly now: () => Date = () => new Date()) {}
 
-  async create(input: Parameters<DurableRunStore['create']>[0]): Promise<RunRecord> {
+  async create(input: Parameters<DurableRunStore['create']>[0]): Promise<RunRecord & { sessionCreated: boolean }> {
     const record = input.record;
     return this.transaction(async (store) => {
-      await store.db.insertInto('pi_sessions').values({
+      const insertedSession = await store.db.insertInto('pi_sessions').values({
         tenant_id: record.tenantId, session_id: record.sessionId, current_leaf_id: null, committed_leaf_id: null,
         metadata_json: null, created_at: record.createdAt, updated_at: record.updatedAt,
-      }).ignore().execute();
+      }).ignore().executeTakeFirst();
+      const sessionCreated = Number(insertedSession.numInsertedOrUpdatedRows ?? 0) > 0;
       await store.db.selectFrom('pi_sessions').select('session_id')
         .where('tenant_id', '=', record.tenantId).where('session_id', '=', record.sessionId).forUpdate().executeTakeFirstOrThrow();
       const active = await store.db.selectFrom('agent_runs').select('run_id')
@@ -40,7 +41,7 @@ export class MysqlRunStore implements DurableRunStore {
         cancel_requested_at: null, lease_owner: record.leaseOwner ?? null, lease_token: Number(record.leaseToken),
         lease_expires_at: record.leaseExpiresAt ?? null, append_closed_at: null, created_at: record.createdAt,
       }).execute();
-      return record;
+      return { ...record, sessionCreated };
     });
   }
 
@@ -186,6 +187,13 @@ export class MysqlRunStore implements DurableRunStore {
     const rows = await this.db.selectFrom('agent_run_events').selectAll().where('tenant_id', '=', identity.tenantId)
       .where('run_id', '=', identity.runId).where('sequence', '>', Number(after)).orderBy('sequence', 'asc').execute();
     return rows.map(mapEvent);
+  }
+
+  async appendEvents(input: Parameters<DurableRunStore['appendEvents']>[0]): Promise<void> {
+    await this.transaction(async (store) => {
+      await store.assertLease(input.tenantId, input.runId, input.fencingToken, true, undefined, input.appendedAt);
+      for (const event of input.events) await store.appendEvent(event);
+    });
   }
 
   async isCancellationRequested(identity: { tenantId: string; runId: string }): Promise<boolean> {

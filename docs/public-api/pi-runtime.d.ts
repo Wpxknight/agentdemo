@@ -437,7 +437,9 @@ export declare class MemoryRunStore implements DurableRunStore {
     private readonly inboxMessages;
     private transactionTail;
     constructor(now?: () => Date);
-    create(input: Parameters<DurableRunStore['create']>[0]): Promise<StoredRun>;
+    create(input: Parameters<DurableRunStore['create']>[0]): Promise<StoredRun & {
+        sessionCreated: boolean;
+    }>;
     get(identity: {
         tenantId: string;
         runId: string;
@@ -451,6 +453,7 @@ export declare class MemoryRunStore implements DurableRunStore {
         tenantId: string;
         runId: string;
     }, after?: bigint): Promise<AgentRunEvent[]>;
+    appendEvents(input: Parameters<DurableRunStore['appendEvents']>[0]): Promise<void>;
     isCancellationRequested(identity: {
         tenantId: string;
         runId: string;
@@ -498,7 +501,9 @@ export declare class MysqlRunStore implements DurableRunStore {
     private readonly transactionalView;
     private readonly now;
     constructor(db: Db, transactionalView?: boolean, now?: () => Date);
-    create(input: Parameters<DurableRunStore['create']>[0]): Promise<RunRecord>;
+    create(input: Parameters<DurableRunStore['create']>[0]): Promise<RunRecord & {
+        sessionCreated: boolean;
+    }>;
     get(identity: {
         tenantId: string;
         runId: string;
@@ -512,6 +517,7 @@ export declare class MysqlRunStore implements DurableRunStore {
         tenantId: string;
         runId: string;
     }, after?: bigint): Promise<AgentRunEvent[]>;
+    appendEvents(input: Parameters<DurableRunStore['appendEvents']>[0]): Promise<void>;
     isCancellationRequested(identity: {
         tenantId: string;
         runId: string;
@@ -642,6 +648,9 @@ export interface StoredRun extends RunRecord {
     checkpoint?: unknown;
     appendClosedAt?: Date;
 }
+export type DurableRunCreateResult = RunRecord & {
+    sessionCreated: boolean;
+};
 export interface PiSessionRecord {
     tenantId: string;
     sessionId: string;
@@ -688,6 +697,14 @@ export interface CloseInboxInput {
     fencingToken: bigint;
     now: Date;
 }
+export interface AppendRunEventsInput {
+    tenantId: string;
+    runId: string;
+    attemptId: string;
+    fencingToken: bigint;
+    events: readonly Omit<AgentRunEvent, 'sequence'>[];
+    appendedAt: Date;
+}
 export interface ClaimInboxInput {
     tenantId: string;
     runId: string;
@@ -723,6 +740,7 @@ export interface RunInboxStore {
     list(tenantId: string, runId: string): Promise<RunInboxMessage[]>;
 }
 export interface DurableRunStore extends RunStore {
+    create(input: CreateRunRecord): Promise<DurableRunCreateResult>;
     get(identity: {
         tenantId: string;
         runId: string;
@@ -731,6 +749,7 @@ export interface DurableRunStore extends RunStore {
         tenantId: string;
         runId: string;
     }, after?: bigint): Promise<AgentRunEvent[]>;
+    appendEvents(input: AppendRunEventsInput): Promise<void>;
     isCancellationRequested(identity: {
         tenantId: string;
         runId: string;

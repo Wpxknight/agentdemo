@@ -21,7 +21,7 @@ export class MemoryRunStore implements DurableRunStore {
 
   constructor(private readonly now: () => Date = () => new Date()) {}
 
-  async create(input: Parameters<DurableRunStore['create']>[0]): Promise<StoredRun> {
+  async create(input: Parameters<DurableRunStore['create']>[0]): Promise<StoredRun & { sessionCreated: boolean }> {
     return this.lock(async () => {
       const record: StoredRun = { ...clone(input.record), lastTurnNo: 0 };
       const runKey = key(record.tenantId, record.runId);
@@ -29,8 +29,14 @@ export class MemoryRunStore implements DurableRunStore {
       const active = [...this.runs.values()].some((run) => run.tenantId === record.tenantId
         && run.sessionId === record.sessionId && ['queued', 'running', 'waiting'].includes(run.status));
       if (active) throw conflict('Session already has an active run');
+      const sessionKey = key(record.tenantId, record.sessionId);
+      const sessionCreated = !this.sessionRecords.has(sessionKey);
+      if (sessionCreated) this.sessionRecords.set(sessionKey, {
+        tenantId: record.tenantId, sessionId: record.sessionId, createdAt: record.createdAt, updatedAt: record.createdAt,
+        currentLeafId: null, committedLeafId: null,
+      });
       this.runs.set(runKey, record);
-      return clone(record);
+      return clone({ ...record, sessionCreated });
     });
   }
 
@@ -131,6 +137,15 @@ export class MemoryRunStore implements DurableRunStore {
 
   async listEvents(identity: { tenantId: string; runId: string }, after = 0n): Promise<AgentRunEvent[]> {
     return clone((this.events.get(key(identity.tenantId, identity.runId)) ?? []).filter((event) => event.sequence > after));
+  }
+
+  async appendEvents(input: Parameters<DurableRunStore['appendEvents']>[0]): Promise<void> {
+    await this.lock(async () => {
+      this.requireLease(input, input.appendedAt);
+      const storedEvents = this.events.get(key(input.tenantId, input.runId)) ?? [];
+      for (const event of input.events) storedEvents.push(clone({ ...event, sequence: BigInt(storedEvents.length + 1) }));
+      this.events.set(key(input.tenantId, input.runId), storedEvents);
+    });
   }
 
   async isCancellationRequested(identity: { tenantId: string; runId: string }): Promise<boolean> {

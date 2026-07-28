@@ -63,14 +63,12 @@ export class DurableRunManager implements DurableRunRuntime {
   async run(input: StartRunInput): Promise<RunHandle> {
     const runId = input.runId ?? randomUUID();
     const now = this.now();
-    const existingSession = await this.options.store.sessions.get(input.identity.tenantId, input.sessionId);
-    await this.options.store.create({ record: {
+    const reservation = await this.options.store.create({ record: {
       tenantId: input.identity.tenantId, runId, actorId: input.identity.actorId, sessionId: input.sessionId,
       kernel: 'pi', kernelVersion: '0.82.1', status: 'queued', leaseToken: 0n, limits: input.limits,
       usage: ZERO_USAGE, createdAt: now, updatedAt: now,
     } });
-    await this.options.store.sessions.create({ tenantId: input.identity.tenantId, sessionId: input.sessionId, createdAt: now });
-    return this.start(input.identity, runId, input.input[0] ?? { role: 'user', text: '' }, false, Boolean(existingSession), input.signal);
+    return this.start(input.identity, runId, input.input[0] ?? { role: 'user', text: '' }, false, !reservation.sessionCreated, input.signal);
   }
 
   async resume(input: ResumeRunInput): Promise<RunHandle> {
@@ -136,6 +134,8 @@ export class DurableRunManager implements DurableRunRuntime {
     let baselineUsage = zeroUsage();
     let observedUsage = zeroUsage();
     let hasObservedUsage = false;
+    const durableEvents: Array<Omit<AgentRunEvent, 'sequence'>> = [];
+    let eventsPersisted = false;
     try {
       const events = this.options.eventOptions({ tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, turnNo });
       const sessionRecord = await this.options.store.sessions.get(identity.tenantId, claimed.record.sessionId);
@@ -178,12 +178,13 @@ export class DurableRunManager implements DurableRunRuntime {
         }
       };
       const inboxPump = pumpInbox();
-      const durableEvents: Array<Omit<AgentRunEvent, 'sequence'>> = [];
       const currentToolCallIds = new Set<string>();
       try {
         for await (const event of session.continue(abort.signal)) {
           await abortIfCancellationRequested(this.options.store, { tenantId: identity.tenantId, runId }, abort);
           const normalized = normalizeEvent(event, identity.tenantId, runId, claimed.attemptId, turnNo);
+          durableEvents.push(withoutSequence(normalized));
+          stream.push(normalized);
           if (normalized.type === 'message_end') {
             observedUsage = addUsage(observedUsage, usageFromEvent(normalized));
             hasObservedUsage = true;
@@ -192,8 +193,6 @@ export class DurableRunManager implements DurableRunRuntime {
           const toolCallId = toolCallIdFromEvent(normalized);
           if (toolCallId) currentToolCallIds.add(toolCallId);
           assertToolCallsAllowed(claimed.record.limits, unionSize(persistedToolCallIds, currentToolCallIds));
-          durableEvents.push(withoutSequence(normalized));
-          stream.push(normalized);
         }
       } finally {
         stopInboxPump = true;
@@ -220,6 +219,7 @@ export class DurableRunManager implements DurableRunRuntime {
         checkpoint: { piSessionId: claimed.record.sessionId, piLeafId: leafId },
         events: durableEvents, status: 'succeeded', usage: actualUsage, committedAt,
       });
+      eventsPersisted = true;
       await this.options.store.complete({
         tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, fencingToken: claimed.fencingToken,
         status: 'succeeded', usage: actualUsage, completedAt: this.now(),
@@ -227,6 +227,13 @@ export class DurableRunManager implements DurableRunRuntime {
       return { runId, status: 'succeeded', text: assistantText(entries, leafId), usage: actualUsage };
     } catch (error) {
       const actualUsage = await terminalUsage(session, claimed.record.usage, baselineUsage, observedUsage, hasObservedUsage);
+      if (!eventsPersisted && durableEvents.length > 0) {
+        await this.options.store.appendEvents({
+          tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, fencingToken: claimed.fencingToken,
+          events: durableEvents, appendedAt: this.now(),
+        });
+        eventsPersisted = true;
+      }
       if (abort.signal.aborted) {
         await session?.abort().catch(() => {});
         const cancellation = await this.options.store.isCancellationRequested({ tenantId: identity.tenantId, runId });

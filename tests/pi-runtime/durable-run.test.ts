@@ -69,6 +69,11 @@ describe('MemoryRunStore durable contract', () => {
       tenantId: identity.tenantId, runId, attemptId: claim!.attemptId, fencingToken: claim!.fencingToken,
       status: 'failed', usage, completedAt: expired,
     })).rejects.toBeInstanceOf(LeaseLostError);
+    const { sequence: _sequence, ...expiredEvent } = toolEvent('tool_execution_start', 'expired-tool-call');
+    await expect(store.appendEvents({
+      tenantId: identity.tenantId, runId, attemptId: claim!.attemptId, fencingToken: claim!.fencingToken,
+      events: [expiredEvent], appendedAt: expired,
+    })).rejects.toBeInstanceOf(LeaseLostError);
     await expect(store.inbox.markConsumed({
       tenantId: identity.tenantId, runId, id: inbox.id, claimToken: claimedInbox!.claimToken!, workerId: 'worker-a',
       fencingToken: claim!.fencingToken, now: expired, consumedAt: expired, claimTtlMs: 100,
@@ -149,6 +154,8 @@ describe('MemoryRunStore durable contract', () => {
   it('exposes a fenced append cutoff operation on both stores', () => {
     expect(typeof (new MemoryRunStore() as any).closeInbox).toBe('function');
     expect(typeof (new MysqlRunStore({} as never) as any).closeInbox).toBe('function');
+    expect(typeof (new MemoryRunStore() as any).appendEvents).toBe('function');
+    expect(typeof (new MysqlRunStore({} as never) as any).appendEvents).toBe('function');
   });
 });
 
@@ -321,6 +328,28 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('shared RunStore MySQL integrati
     }
   });
 
+  it('returns the atomic reused-session fact when a concurrent starter reserves after the first run terminates', async () => {
+    const pool = createMysqlPool(readMysqlConfig()!);
+    await runMigrations(pool);
+    const db = createKysely(pool);
+    const suffix = `mysql-${Date.now()}`;
+    const sessionId = `atomic-session-classification-${suffix}`;
+    const runIds = [`atomic-first-run-${suffix}`, `atomic-second-run-${suffix}`];
+    try {
+      const result = await runAtomicSessionClassificationRace(new MysqlRunStore(db), suffix);
+      expect(result).toMatchObject({ firstStatus: 'failed', secondStatus: 'succeeded', factoryCreates: 1, factoryLoads: 1 });
+    } finally {
+      for (const runId of runIds) {
+        for (const table of ['agent_run_inbox_messages', 'agent_run_events', 'agent_turn_commits', 'agent_run_attempts', 'agent_runs'] as const) {
+          await db.deleteFrom(table).where('tenant_id', '=', identity.tenantId).where('run_id', '=', runId).execute();
+        }
+      }
+      await db.deleteFrom('pi_session_entries').where('tenant_id', '=', identity.tenantId).where('session_id', '=', sessionId).execute();
+      await db.deleteFrom('pi_sessions').where('tenant_id', '=', identity.tenantId).where('session_id', '=', sessionId).execute();
+      await db.destroy();
+    }
+  });
+
   it('serializes idempotent inbox appends, fences cutoff, and round-trips limits and cost', async () => {
     const pool = createMysqlPool(readMysqlConfig()!);
     await runMigrations(pool);
@@ -487,6 +516,11 @@ describe('DurableRunManager', () => {
     },
   );
 
+  it('uses the atomic session reservation result when concurrent starters observed a missing session', async () => {
+    const result = await runAtomicSessionClassificationRace(new MemoryRunStore(), 'memory');
+    expect(result).toMatchObject({ firstStatus: 'failed', secondStatus: 'succeeded', factoryCreates: 1, factoryLoads: 1 });
+  });
+
   it('coordinates a Pi session and commits its leaf without running a copied agent loop', async () => {
     const store = new MemoryRunStore(() => new Date('2026-07-28T00:00:00.100Z'));
     let continued = 0;
@@ -647,6 +681,7 @@ describe('DurableRunManager', () => {
     const expectedUsage = { inputTokens: 7, outputTokens: 3, cacheReadTokens: 1, cacheCreationTokens: 2, costUsd: 0.4 };
     expect(result).toMatchObject({ status: expectedStatus, usage: expectedUsage });
     expect((await store.get({ tenantId: identity.tenantId, runId }))?.usage).toEqual(expectedUsage);
+    expect(await store.listEvents({ tenantId: identity.tenantId, runId })).toHaveLength(1);
   });
 
   it('persists authoritative entry usage when cancellation follows a usage event', async () => {
@@ -689,6 +724,7 @@ describe('DurableRunManager', () => {
     const expectedUsage = { inputTokens: 5, outputTokens: 2, cacheReadTokens: 1, cacheCreationTokens: 0, costUsd: 0.2 };
     expect(result).toMatchObject({ status: 'cancelled', usage: expectedUsage });
     expect((await store.get({ tenantId: identity.tenantId, runId }))?.usage).toEqual(expectedUsage);
+    expect(await store.listEvents({ tenantId: identity.tenantId, runId })).toHaveLength(1);
   });
 
   it('passes an already-aborted external signal into the session immediately', async () => {
@@ -805,31 +841,37 @@ describe('DurableRunManager', () => {
     const store = new MemoryRunStore();
     const runId = 'resumed-tool-budget';
     const sessionId = 'resumed-tool-session';
-    const now = new Date('2026-07-29T00:00:00.000Z');
-    await store.create({ record: {
-      tenantId: identity.tenantId, runId, actorId: identity.actorId, sessionId, kernel: 'pi', kernelVersion: '0.82.1',
-      status: 'queued', leaseToken: 0n, usage, limits: { maxToolCalls: 1 }, createdAt: now, updatedAt: now,
-    } });
-    await store.sessions.create({ tenantId: identity.tenantId, sessionId, createdAt: now });
-    const first = await store.claim({ identity, runId, workerId: 'first-worker', now, leaseTtlMs: 1000 });
-    await store.commitTurn({
-      tenantId: identity.tenantId, runId, attemptId: first!.attemptId, turnNo: 1, fencingToken: first!.fencingToken,
-      checkpoint: { piSessionId: sessionId, piLeafId: null },
-      events: [toolEvent('tool_execution_start', 'prior-call'), toolEvent('tool_result', 'prior-call')].map(withoutTestSequence),
-      status: 'running', usage, committedAt: now,
-    });
-    await store.complete({
-      tenantId: identity.tenantId, runId, attemptId: first!.attemptId, fencingToken: first!.fencingToken,
-      status: 'failed', usage, completedAt: new Date(now.getTime() + 1),
-    });
-    const session: ManagedPiSession = {
+    const firstSession: ManagedPiSession = {
+      ...emptySession(sessionId),
+      async *continue() {
+        yield toolEvent('tool_execution_start', 'prior-call');
+        yield toolEvent('tool_result', 'prior-call');
+        throw new Error('provider failed after tool result');
+      },
+    };
+    const resumedSession: ManagedPiSession = {
       ...emptySession(sessionId), async *continue() { yield toolEvent('tool_execution_start', 'current-call'); },
     };
     const manager = new DurableRunManager({
-      store, heartbeatMs: 0, sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+      store, heartbeatMs: 0,
+      sessions: { create: async () => firstSession, load: async () => resumedSession },
+      eventOptions: () => ({}),
     });
+
+    const firstResult = await (await manager.run({
+      runId, identity, sessionId, input: [{ role: 'user', text: 'first attempt' }], limits: { maxToolCalls: 1 },
+    })).result();
+    expect(firstResult.status).toBe('failed');
+    expect((await store.sessions.get(identity.tenantId, sessionId))?.committedLeafId).toBeNull();
+    expect((await store.listEvents({ tenantId: identity.tenantId, runId })).map((event) => event.detail)).toEqual([
+      expect.objectContaining({ toolCallId: 'prior-call' }),
+      expect.objectContaining({ toolCallId: 'prior-call' }),
+    ]);
+
     const result = await (await manager.resume({ identity, runId })).result();
     expect(result).toMatchObject({ status: 'failed', error: { code: 'RUN_LIMIT_EXCEEDED', message: 'Maximum tool calls exceeded' } });
+    expect((await store.listEvents({ tenantId: identity.tenantId, runId })).map((event) =>
+      (event.detail as { toolCallId?: string } | undefined)?.toolCallId)).toEqual(['prior-call', 'prior-call', 'current-call']);
   });
 
   it.each([
@@ -955,9 +997,75 @@ function toolEvent(type: 'tool_execution_start' | 'tool_result', toolCallId: str
   };
 }
 
-function withoutTestSequence(event: AgentRunEvent): Omit<AgentRunEvent, 'sequence'> {
-  const { sequence: _sequence, ...stored } = event;
-  return stored;
+async function runAtomicSessionClassificationRace(base: DurableRunStore, suffix: string) {
+  let reservationStarted = false;
+  let createCalls = 0;
+  let preReservationGets = 0;
+  let releasePreObservations!: () => void;
+  const bothPreObserved = new Promise<void>((resolve) => { releasePreObservations = resolve; });
+  let releaseSecondReservation!: () => void;
+  const firstRunCompleted = new Promise<void>((resolve) => { releaseSecondReservation = resolve; });
+  const sessions = new Proxy(base.sessions, {
+    get(target, property) {
+      if (property === 'get') return async (tenantId: string, sessionId: string) => {
+        if (!reservationStarted) {
+          preReservationGets += 1;
+          if (preReservationGets === 2) releasePreObservations();
+          await bothPreObserved;
+          return undefined;
+        }
+        return target.get(tenantId, sessionId);
+      };
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const store = new Proxy(base, {
+    get(target, property) {
+      if (property === 'sessions') return sessions;
+      if (property === 'create') return async (...args: Parameters<DurableRunStore['create']>) => {
+        reservationStarted = true;
+        createCalls += 1;
+        if (createCalls === 2) await firstRunCompleted;
+        return target.create(...args);
+      };
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const sessionId = `atomic-session-classification-${suffix}`;
+  const runIds = [`atomic-first-run-${suffix}`, `atomic-second-run-${suffix}`] as const;
+  const failedSession: ManagedPiSession = {
+    ...emptySession(sessionId), async *continue() { throw new Error('first run failed'); },
+  };
+  const committedSession = emptySession(sessionId);
+  let factoryCreates = 0;
+  let factoryLoads = 0;
+  const manager = new DurableRunManager({
+    store, heartbeatMs: 0,
+    sessions: {
+      create: async () => {
+        factoryCreates += 1;
+        if (factoryCreates > 1) throw new Error('stale pre-observation selected current leaf');
+        return failedSession;
+      },
+      load: async () => { factoryLoads += 1; return committedSession; },
+    },
+    eventOptions: () => ({}),
+  });
+
+  const firstHandlePromise = manager.run({
+    runId: runIds[0], identity, sessionId, input: [{ role: 'user', text: 'first' }],
+  });
+  const secondHandlePromise = manager.run({
+    runId: runIds[1], identity, sessionId, input: [{ role: 'user', text: 'second' }],
+  });
+  const firstResult = await (await firstHandlePromise).result();
+  releaseSecondReservation();
+  const secondResult = await (await secondHandlePromise).result();
+  return {
+    firstStatus: firstResult.status, secondStatus: secondResult.status, factoryCreates, factoryLoads, sessionId, runIds,
+  };
 }
 
 function emptySession(id: string): ManagedPiSession {
