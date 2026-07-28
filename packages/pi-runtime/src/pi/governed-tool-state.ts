@@ -6,50 +6,91 @@ export interface GovernedToolFailure {
   result: ToolResult;
 }
 
-interface GovernedToolFailureTracker {
-  failures: Map<string, GovernedToolFailure>;
+export interface GovernedToolFailureTracker {
+  failures: Map<string, GovernedToolFailure[]>;
 }
 
-const TRACKERS = new WeakMap<AgentHarnessTool<undefined>, GovernedToolFailureTracker>();
+interface GovernedToolDescriptor {
+  createScoped(): { tool: AgentHarnessTool<undefined>; tracker: GovernedToolFailureTracker };
+}
+
+export interface GovernedToolScope {
+  tools: AgentHarnessTool<undefined>[];
+  patch(event: Extract<AgentHarnessEvent, { type: 'tool_result' }>): { details: unknown; isError: true } | undefined;
+  hasPending(): boolean;
+  clear(): void;
+}
+
+const GOVERNED_TOOL_DESCRIPTOR = Symbol('aiop.pi.governedToolDescriptor');
+const SCOPED_TRACKERS = new WeakMap<AgentHarnessTool<undefined>, GovernedToolFailureTracker>();
 
 export function createGovernedToolFailureTracker(): GovernedToolFailureTracker {
   return { failures: new Map() };
 }
 
-export function associateGovernedTool(
+export function markGovernedToolPrototype(
+  tool: AgentHarnessTool<undefined>, descriptor: GovernedToolDescriptor,
+): void {
+  Object.defineProperty(tool, GOVERNED_TOOL_DESCRIPTOR, { value: descriptor });
+}
+
+export function markScopedGovernedTool(
   tool: AgentHarnessTool<undefined>, tracker: GovernedToolFailureTracker,
 ): void {
-  TRACKERS.set(tool, tracker);
+  SCOPED_TRACKERS.set(tool, tracker);
 }
 
 export function recordGovernedToolFailure(
   tracker: GovernedToolFailureTracker, toolCallId: string, failure: GovernedToolFailure,
 ): void {
-  tracker.failures.set(toolCallId, failure);
+  const queue = tracker.failures.get(toolCallId);
+  if (queue) queue.push(failure);
+  else tracker.failures.set(toolCallId, [failure]);
 }
 
-export function governedToolResultHook(tools: readonly AgentHarnessTool<undefined>[]): {
-  patch(event: Extract<AgentHarnessEvent, { type: 'tool_result' }>): { details: unknown; isError: true } | undefined;
-  clear(): void;
-} {
+export function scopeGovernedTools(tools: readonly AgentHarnessTool<undefined>[]): GovernedToolScope {
+  const scoped = tools.map((tool) => {
+    const descriptor = governedDescriptor(tool);
+    return descriptor ? descriptor.createScoped().tool : tool;
+  });
+  return adoptGovernedToolScope(scoped);
+}
+
+export function adoptGovernedToolScope(tools: readonly AgentHarnessTool<undefined>[]): GovernedToolScope {
   const trackersByName = new Map<string, GovernedToolFailureTracker>();
   for (const tool of tools) {
-    const tracker = TRACKERS.get(tool);
+    const tracker = SCOPED_TRACKERS.get(tool);
     if (tracker) trackersByName.set(tool.name, tracker);
   }
   const trackers = new Set(trackersByName.values());
   return {
+    tools: [...tools],
     patch(event) {
-      const failure = trackersByName.get(event.toolName)?.failures.get(event.toolCallId);
-      trackersByName.get(event.toolName)?.failures.delete(event.toolCallId);
-      if (!event.isError || !failure) return undefined;
+      if (!event.isError) return undefined;
+      const tracker = trackersByName.get(event.toolName);
+      const queue = tracker?.failures.get(event.toolCallId);
+      const failure = queue?.shift();
+      if (queue?.length === 0) tracker?.failures.delete(event.toolCallId);
+      if (!failure) return undefined;
       return {
         details: { version: 1, kind: 'governed_tool_error', call: failure.call, result: failure.result },
         isError: true,
       };
     },
+    hasPending() {
+      for (const tracker of trackers) {
+        for (const queue of tracker.failures.values()) if (queue.length > 0) return true;
+      }
+      return false;
+    },
     clear() {
       for (const tracker of trackers) tracker.failures.clear();
     },
   };
+}
+
+function governedDescriptor(tool: AgentHarnessTool<undefined>): GovernedToolDescriptor | undefined {
+  return (tool as AgentHarnessTool<undefined> & {
+    [GOVERNED_TOOL_DESCRIPTOR]?: GovernedToolDescriptor;
+  })[GOVERNED_TOOL_DESCRIPTOR];
 }

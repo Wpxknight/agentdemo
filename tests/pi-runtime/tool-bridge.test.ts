@@ -16,12 +16,16 @@ const model: Model<'pi-tool-test'> = {
 };
 
 function toolModels(argumentsValue: Record<string, unknown>) {
+  return toolCallModels([{ id: 'call-1', name: 'lookup', arguments: argumentsValue }]);
+}
+
+function toolCallModels(toolCalls: Array<{ id: string; name: string; arguments: Record<string, unknown> }>) {
   const models = createModels();
   let call = 0;
   const stream = () => {
     const output = createAssistantMessageEventStream();
     const content = call++ === 0
-      ? [{ type: 'toolCall' as const, id: 'call-1', name: 'lookup', arguments: argumentsValue }]
+      ? toolCalls.map((toolCall) => ({ type: 'toolCall' as const, ...toolCall }))
       : [{ type: 'text' as const, text: 'complete' }];
     const message: AssistantMessage = {
       role: 'assistant', content, api: model.api, provider: model.provider, model: model.id,
@@ -130,6 +134,130 @@ describe('Pi governed tool bridge', () => {
     await session.close();
   });
 
+  it('isolates a shared bridged tool prototype across successful and failed sessions with the same call id', async () => {
+    const tools = bridgeGovernedTools([{
+      definition: { name: 'lookup', description: 'Lookup', capability: 'read', inputSchema: { type: 'object' } },
+      logicalCallId: (_id, args) => `logical-${(args as { owner: string }).owner}`,
+      execute: async (call) => {
+        const owner = (call.arguments as { owner: string }).owner;
+        return { callId: call.id, content: owner === 'failed' ? 'denied-failed' : 'ok-success',
+          isError: owner === 'failed', digest: `digest-${owner}` };
+      },
+    }]);
+    const repository = new InMemorySessionRepo();
+    const failed = await new PiAgentSessionFactory({ repository, models: toolModels({ owner: 'failed' }), model, tools })
+      .create({ id: 'shared-failed', initialMessage: { role: 'user', text: 'start' }, events: events() });
+    const success = await new PiAgentSessionFactory({ repository, models: toolModels({ owner: 'success' }), model, tools })
+      .create({ id: 'shared-success', initialMessage: { role: 'user', text: 'start' }, events: events() });
+    expect(failed.tools()[0]).not.toBe(tools[0]);
+    expect(success.tools()[0]).not.toBe(tools[0]);
+    expect(failed.tools()[0]).not.toBe(success.tools()[0]);
+
+    const [failedEvents, successEvents] = await within(Promise.all([
+      collect(failed.continue()), collect(success.continue()),
+    ]), 'shared success/failure sessions');
+    const failedJson = durableStringify({ events: failedEvents, entries: await failed.entries() });
+    const successJson = durableStringify({ events: successEvents, entries: await success.entries() });
+    expect(failedJson).toContain('logical-failed');
+    expect(failedJson).toContain('digest-failed');
+    expect(failedJson).not.toContain('logical-success');
+    expect(successJson).not.toContain('logical-failed');
+    expect(successJson).not.toContain('digest-failed');
+    await Promise.all([failed.close(), success.close()]);
+  });
+
+  it('isolates distinct failures across two sessions sharing a prototype and call id', async () => {
+    const tools = bridgeGovernedTools([{
+      definition: { name: 'lookup', description: 'Lookup', capability: 'read', inputSchema: { type: 'object' } },
+      logicalCallId: (_id, args) => `logical-${(args as { owner: string }).owner}`,
+      execute: async (call) => {
+        const owner = (call.arguments as { owner: string }).owner;
+        return { callId: call.id, content: `denied-${owner}`, isError: true, digest: `digest-${owner}` };
+      },
+    }]);
+    const repository = new InMemorySessionRepo();
+    const sessionA = await new PiAgentSessionFactory({ repository, models: toolModels({ owner: 'a', tokenCount: 1 }), model, tools })
+      .create({ id: 'shared-a', initialMessage: { role: 'user', text: 'start' }, events: events() });
+    const sessionB = await new PiAgentSessionFactory({ repository, models: toolModels({ owner: 'b', tokenCount: 2 }), model, tools })
+      .create({ id: 'shared-b', initialMessage: { role: 'user', text: 'start' }, events: events() });
+
+    const [eventsA, eventsB] = await within(Promise.all([
+      collect(sessionA.continue()), collect(sessionB.continue()),
+    ]), 'shared failed sessions');
+    const jsonA = durableStringify({ events: eventsA, entries: await sessionA.entries() });
+    const jsonB = durableStringify({ events: eventsB, entries: await sessionB.entries() });
+    expect(jsonA).toContain('logical-a');
+    expect(jsonA).toContain('digest-a');
+    expect(jsonA).not.toContain('logical-b');
+    expect(jsonA).not.toContain('digest-b');
+    expect(jsonB).toContain('logical-b');
+    expect(jsonB).toContain('digest-b');
+    expect(jsonB).not.toContain('logical-a');
+    expect(jsonB).not.toContain('digest-a');
+    await Promise.all([sessionA.close(), sessionB.close()]);
+  });
+
+  it('queues same-id failures within one session in tool completion order', async () => {
+    const tools = bridgeGovernedTools([{
+      definition: { name: 'lookup', description: 'Lookup', capability: 'read', inputSchema: { type: 'object' } },
+      logicalCallId: (_id, args) => `logical-${(args as { invocation: string }).invocation}`,
+      execute: async (call) => {
+        const invocation = (call.arguments as { invocation: string }).invocation;
+        return { callId: call.id, content: `denied-${invocation}`, isError: true, digest: `digest-${invocation}` };
+      },
+    }]);
+    const session = await new PiAgentSessionFactory({
+      repository: new InMemorySessionRepo(),
+      models: toolCallModels([
+        { id: 'same-id', name: 'lookup', arguments: { invocation: 'first' } },
+        { id: 'same-id', name: 'lookup', arguments: { invocation: 'second' } },
+      ]),
+      model, tools,
+    }).create({ id: 'same-id-queue', initialMessage: { role: 'user', text: 'start' }, events: events() });
+
+    const projected = await within(collect(session.continue()), 'same-id failure queue');
+    const governed = projected.filter((event) => event.type === 'tool_execution_end')
+      .map((event) => JSON.stringify(event.detail));
+    expect(governed).toHaveLength(2);
+    expect(governed.join('\n')).toContain('logical-first');
+    expect(governed.join('\n')).toContain('logical-second');
+    await session.close();
+  });
+
+  it('rejects setTools during an active run without losing the old governed failure', async () => {
+    let started!: () => void;
+    const didStart = new Promise<void>((resolve) => { started = resolve; });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const oldTools = bridgeGovernedTools([{
+      definition: { name: 'lookup', description: 'Lookup', capability: 'read', inputSchema: { type: 'object' } },
+      logicalCallId: () => 'logical-old',
+      execute: async (call) => {
+        started();
+        await gate;
+        return { callId: call.id, content: 'old denied', isError: true, digest: 'digest-old' };
+      },
+    }]);
+    const newTools = bridgeGovernedTools([{
+      definition: { name: 'replacement', description: 'Replacement', capability: 'read', inputSchema: { type: 'object' } },
+      execute: async (call) => ({ callId: call.id, content: 'new ok' }),
+    }]);
+    const session = await new PiAgentSessionFactory({
+      repository: new InMemorySessionRepo(), models: toolModels({ owner: 'old' }), model, tools: oldTools,
+    }).create({ id: 'active-set-tools', initialMessage: { role: 'user', text: 'start' }, events: events() });
+    const running = collect(session.continue());
+    await within(didStart, 'old tool start');
+
+    await expect(within(session.setTools(newTools), 'active setTools rejection')).rejects.toThrow(/active/i);
+    release();
+    const projected = await within(running, 'old tool completion');
+    const json = durableStringify({ events: projected, entries: await session.entries() });
+    expect(json).toContain('logical-old');
+    expect(json).toContain('digest-old');
+    expect(session.tools().map((tool) => tool.name)).toEqual(['lookup']);
+    await session.close();
+  });
+
   it('keeps a real Harness run alive when tool details are an unreadable Proxy', async () => {
     const unreadable = new Proxy({}, { get: () => { throw new Error('details getter failed'); } });
     const session = await new PiAgentSessionFactory({
@@ -178,4 +306,15 @@ async function collect<T>(source: AsyncIterable<T>): Promise<T[]> {
   const values: T[] = [];
   for await (const value of source) values.push(value);
   return values;
+}
+
+async function within<T>(promise: Promise<T>, label: string): Promise<T> {
+  return await Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} timeout`)), 1000)),
+  ]);
+}
+
+function durableStringify(value: unknown): string {
+  return JSON.stringify(value, (_key, item) => typeof item === 'bigint' ? item.toString() : item);
 }

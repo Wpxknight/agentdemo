@@ -12,7 +12,11 @@ import {
 } from '@earendil-works/pi-agent-core';
 import type { ImageContent, Model, Models } from '@earendil-works/pi-ai';
 import { EventCodec, type EventCodecOptions } from './event-codec.js';
-import { governedToolResultHook } from './governed-tool-state.js';
+import {
+  adoptGovernedToolScope,
+  scopeGovernedTools,
+  type GovernedToolScope,
+} from './governed-tool-state.js';
 
 export interface PiAgentSessionFactoryOptions<
   TMetadata extends SessionMetadata,
@@ -62,12 +66,13 @@ export class PiAgentSessionFactory<
   }
 
   private wrap(session: Session<TMetadata>, initialMessage: AgentInputMessage, events: EventCodecOptions): PiAgentSession<TMetadata> {
+    const governedTools = scopeGovernedTools(this.options.tools ?? []);
     const harness = new AgentHarness({
       session,
       models: this.options.models,
       model: this.options.model,
       systemPrompt: this.options.systemPrompt,
-      tools: this.options.tools,
+      tools: governedTools.tools,
       resources: this.options.resources,
     });
     return new PiAgentSession(session, harness, initialMessage, new EventCodec(events));
@@ -79,6 +84,7 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
   private closePromise?: Promise<void>;
   private pendingMessage?: AgentInputMessage;
   private activeRun?: { cancel(): Promise<void>; finalize(cancelRunning?: boolean): Promise<void> };
+  private governedToolScope: GovernedToolScope;
   private removeGovernedToolHook = () => {};
 
   constructor(
@@ -88,7 +94,8 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     private readonly eventCodec: EventCodec,
   ) {
     this.pendingMessage = initialMessage;
-    this.installGovernedToolHook(harness.getTools());
+    this.governedToolScope = adoptGovernedToolScope(harness.getTools());
+    this.installGovernedToolHook(this.governedToolScope);
   }
 
   continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent> {
@@ -191,8 +198,22 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
 
   async setTools(tools: AgentHarnessTool<undefined>[]): Promise<void> {
     this.ensureOpen();
-    await this.harness.setTools(tools, tools.map((tool) => tool.name));
-    this.installGovernedToolHook(tools);
+    if (this.activeRun) throw new Error('Cannot set Pi tools while an agent run is active');
+    const nextScope = scopeGovernedTools(tools);
+    if (this.governedToolScope.hasPending()) {
+      nextScope.clear();
+      throw new Error('Cannot replace Pi tools while governed failures are pending');
+    }
+    try {
+      await this.harness.setTools(nextScope.tools, nextScope.tools.map((tool) => tool.name));
+    } catch (error) {
+      nextScope.clear();
+      throw error;
+    }
+    this.removeGovernedToolHook();
+    this.governedToolScope.clear();
+    this.governedToolScope = nextScope;
+    this.installGovernedToolHook(nextScope);
   }
 
   tools(): AgentHarnessTool<undefined>[] {
@@ -227,12 +248,10 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     })();
   }
 
-  private installGovernedToolHook(tools: readonly AgentHarnessTool<undefined>[]): void {
-    this.removeGovernedToolHook();
-    const governed = governedToolResultHook(tools);
-    const removeHook = this.harness.on('tool_result', (event) => governed.patch(event));
+  private installGovernedToolHook(scope: GovernedToolScope): void {
+    const removeHook = this.harness.on('tool_result', (event) => scope.patch(event));
     this.removeGovernedToolHook = () => {
-      governed.clear();
+      scope.clear();
       removeHook();
       this.removeGovernedToolHook = () => {};
     };

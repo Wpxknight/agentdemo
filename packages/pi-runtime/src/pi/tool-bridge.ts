@@ -2,9 +2,11 @@ import type { JsonValue, ToolCall, ToolDefinition, ToolResult } from '@aiop/cont
 import type { TSchema } from '@earendil-works/pi-ai';
 import type { AgentHarnessTool } from '@earendil-works/pi-agent-core';
 import {
-  associateGovernedTool,
   createGovernedToolFailureTracker,
+  markGovernedToolPrototype,
+  markScopedGovernedTool,
   recordGovernedToolFailure,
+  type GovernedToolFailureTracker,
 } from './governed-tool-state.js';
 
 export interface GovernedTool {
@@ -39,10 +41,29 @@ export class GovernedToolExecutionError extends Error {
 export function bridgeGovernedTools(
   tools: readonly GovernedTool[], options: GovernedToolBridgeOptions = {},
 ): AgentHarnessTool<undefined>[] {
-  const tracker = createGovernedToolFailureTracker();
   return tools.map((governed) => {
-    const { definition, execute } = governed;
-    const tool: AgentHarnessTool<undefined> = {
+    const descriptor = {
+      createScoped: () => {
+        const tracker = createGovernedToolFailureTracker();
+        const tool = createAgentTool(governed, options, tracker);
+        markGovernedToolPrototype(tool, descriptor);
+        markScopedGovernedTool(tool, tracker);
+        return { tool, tracker };
+      },
+    };
+    const prototype = createAgentTool(governed, options);
+    markGovernedToolPrototype(prototype, descriptor);
+    return prototype;
+  });
+}
+
+function createAgentTool(
+  governed: GovernedTool,
+  options: GovernedToolBridgeOptions,
+  tracker?: GovernedToolFailureTracker,
+): AgentHarnessTool<undefined> {
+  const { definition, execute } = governed;
+  return {
     name: definition.name,
     label: definition.name,
     description: definition.description,
@@ -68,12 +89,12 @@ export function bridgeGovernedTools(
           : new GovernedToolExecutionError('Governed tool execution failed', call, {
           callId: toolCallId, content: error instanceof Error ? error.message : String(error), isError: true,
         }, error);
-        recordGovernedToolFailure(tracker, toolCallId, governedError);
+        if (tracker) recordGovernedToolFailure(tracker, toolCallId, governedError);
         throw governedError;
       }
       if (result.isError) {
         const error = new GovernedToolExecutionError(result.content, call, result);
-        recordGovernedToolFailure(tracker, toolCallId, error);
+        if (tracker) recordGovernedToolFailure(tracker, toolCallId, error);
         throw error;
       }
       return {
@@ -81,8 +102,5 @@ export function bridgeGovernedTools(
         details: result,
       };
     },
-    };
-    associateGovernedTool(tool, tracker);
-    return tool;
-  });
+  };
 }

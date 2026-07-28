@@ -58,6 +58,7 @@ export declare class PiAgentSession<TMetadata extends SessionMetadata = SessionM
     private closePromise?;
     private pendingMessage?;
     private activeRun?;
+    private governedToolScope;
     private removeGovernedToolHook;
     constructor(session: Session<TMetadata>, harness: AgentHarness, initialMessage: AgentInputMessage, eventCodec: EventCodec);
     continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent>;
@@ -162,21 +163,32 @@ export interface GovernedToolFailure {
     call: ToolCall;
     result: ToolResult;
 }
-interface GovernedToolFailureTracker {
-    failures: Map<string, GovernedToolFailure>;
+export interface GovernedToolFailureTracker {
+    failures: Map<string, GovernedToolFailure[]>;
 }
-export declare function createGovernedToolFailureTracker(): GovernedToolFailureTracker;
-export declare function associateGovernedTool(tool: AgentHarnessTool<undefined>, tracker: GovernedToolFailureTracker): void;
-export declare function recordGovernedToolFailure(tracker: GovernedToolFailureTracker, toolCallId: string, failure: GovernedToolFailure): void;
-export declare function governedToolResultHook(tools: readonly AgentHarnessTool<undefined>[]): {
+interface GovernedToolDescriptor {
+    createScoped(): {
+        tool: AgentHarnessTool<undefined>;
+        tracker: GovernedToolFailureTracker;
+    };
+}
+export interface GovernedToolScope {
+    tools: AgentHarnessTool<undefined>[];
     patch(event: Extract<AgentHarnessEvent, {
         type: 'tool_result';
     }>): {
         details: unknown;
         isError: true;
     } | undefined;
+    hasPending(): boolean;
     clear(): void;
-};
+}
+export declare function createGovernedToolFailureTracker(): GovernedToolFailureTracker;
+export declare function markGovernedToolPrototype(tool: AgentHarnessTool<undefined>, descriptor: GovernedToolDescriptor): void;
+export declare function markScopedGovernedTool(tool: AgentHarnessTool<undefined>, tracker: GovernedToolFailureTracker): void;
+export declare function recordGovernedToolFailure(tracker: GovernedToolFailureTracker, toolCallId: string, failure: GovernedToolFailure): void;
+export declare function scopeGovernedTools(tools: readonly AgentHarnessTool<undefined>[]): GovernedToolScope;
+export declare function adoptGovernedToolScope(tools: readonly AgentHarnessTool<undefined>[]): GovernedToolScope;
 export {};
 
 // file: pi/message-codec.d.ts
