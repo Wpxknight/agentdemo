@@ -63,13 +63,14 @@ export class DurableRunManager implements DurableRunRuntime {
   async run(input: StartRunInput): Promise<RunHandle> {
     const runId = input.runId ?? randomUUID();
     const now = this.now();
+    const existingSession = await this.options.store.sessions.get(input.identity.tenantId, input.sessionId);
     await this.options.store.create({ record: {
       tenantId: input.identity.tenantId, runId, actorId: input.identity.actorId, sessionId: input.sessionId,
       kernel: 'pi', kernelVersion: '0.82.1', status: 'queued', leaseToken: 0n, limits: input.limits,
       usage: ZERO_USAGE, createdAt: now, updatedAt: now,
     } });
     await this.options.store.sessions.create({ tenantId: input.identity.tenantId, sessionId: input.sessionId, createdAt: now });
-    return this.start(input.identity, runId, input.input[0] ?? { role: 'user', text: '' }, false, input.signal);
+    return this.start(input.identity, runId, input.input[0] ?? { role: 'user', text: '' }, false, Boolean(existingSession), input.signal);
   }
 
   async resume(input: ResumeRunInput): Promise<RunHandle> {
@@ -79,7 +80,7 @@ export class DurableRunManager implements DurableRunRuntime {
     const message: AgentInputMessage = input.resolution
       ? { role: 'user', text: JSON.stringify(input.resolution) }
       : { role: 'user', text: 'Continue from the last committed state.' };
-    return this.start(input.identity, input.runId, message, true, input.signal);
+    return this.start(input.identity, input.runId, message, true, true, input.signal);
   }
 
   async cancel(input: CancelRunInput): Promise<void> {
@@ -94,7 +95,8 @@ export class DurableRunManager implements DurableRunRuntime {
   }
 
   private async start(
-    identity: StartRunInput['identity'], runId: string, initialMessage: AgentInputMessage, resume: boolean, signal?: AbortSignal,
+    identity: StartRunInput['identity'], runId: string, initialMessage: AgentInputMessage, resume: boolean,
+    loadCommittedSession: boolean, signal?: AbortSignal,
   ): Promise<RunHandle> {
     const key = runKey(identity.tenantId, runId);
     if (this.executions.has(key)) throw conflict('Run recovery is already active');
@@ -103,7 +105,7 @@ export class DurableRunManager implements DurableRunRuntime {
     let resolveResult!: (result: AgentRunResult) => void;
     let rejectResult!: (error: unknown) => void;
     const result = new Promise<AgentRunResult>((resolve, reject) => { resolveResult = resolve; rejectResult = reject; });
-    const execution = this.execute(identity, runId, initialMessage, resume, signal, stream)
+    const execution = this.execute(identity, runId, initialMessage, resume, loadCommittedSession, signal, stream)
       .then(resolveResult, rejectResult).finally(() => { stream.close(); this.executions.delete(key); });
     void execution;
     return { runId, status: 'running', events: stream, result: () => result };
@@ -111,7 +113,7 @@ export class DurableRunManager implements DurableRunRuntime {
 
   private async execute(
     identity: StartRunInput['identity'], runId: string, initialMessage: AgentInputMessage, resume: boolean,
-    externalSignal: AbortSignal | undefined, stream: AsyncEventStream<AgentRunEvent>,
+    loadCommittedSession: boolean, externalSignal: AbortSignal | undefined, stream: AsyncEventStream<AgentRunEvent>,
   ): Promise<AgentRunResult> {
     const claimed = await this.options.store.claim({
       identity, runId, workerId: this.workerId, now: this.now(), leaseTtlMs: this.leaseTtlMs, resume,
@@ -119,6 +121,7 @@ export class DurableRunManager implements DurableRunRuntime {
     if (!claimed) throw new Error('Run is not claimable');
     const storedRun = await this.options.store.get({ tenantId: identity.tenantId, runId });
     const turnNo = nextTurnNo(storedRun?.lastTurnNo ?? 0);
+    const persistedToolCallIds = toolCallIdsFromEvents(await this.options.store.listEvents({ tenantId: identity.tenantId, runId }));
     const abort = new AbortController();
     const onAbort = () => abort.abort(externalSignal?.reason);
     externalSignal?.addEventListener('abort', onAbort, { once: true });
@@ -140,7 +143,7 @@ export class DurableRunManager implements DurableRunRuntime {
         id: claimed.record.sessionId, tenantId: identity.tenantId,
         createdAt: (sessionRecord?.createdAt ?? claimed.record.createdAt).toISOString(), metadata: sessionRecord?.metadata,
       };
-      session = resume
+      session = loadCommittedSession
         ? await this.options.sessions.load({ metadata, initialMessage, events })
         : await this.options.sessions.create({ id: claimed.record.sessionId, initialMessage, events, session: { tenantId: identity.tenantId } });
       this.active.set(activeKey, { abort, session });
@@ -176,7 +179,7 @@ export class DurableRunManager implements DurableRunRuntime {
       };
       const inboxPump = pumpInbox();
       const durableEvents: Array<Omit<AgentRunEvent, 'sequence'>> = [];
-      let observedToolCalls = 0;
+      const currentToolCallIds = new Set<string>();
       try {
         for await (const event of session.continue(abort.signal)) {
           await abortIfCancellationRequested(this.options.store, { tenantId: identity.tenantId, runId }, abort);
@@ -186,8 +189,9 @@ export class DurableRunManager implements DurableRunRuntime {
             hasObservedUsage = true;
             assertOnlineUsageAllowed(claimed.record.limits, addUsage(claimed.record.usage, observedUsage), observedUsage);
           }
-          if (normalized.type === 'tool_execution_start') observedToolCalls += 1;
-          assertToolCallsAllowed(claimed.record.limits, observedToolCalls);
+          const toolCallId = toolCallIdFromEvent(normalized);
+          if (toolCallId) currentToolCallIds.add(toolCallId);
+          assertToolCallsAllowed(claimed.record.limits, unionSize(persistedToolCallIds, currentToolCallIds));
           durableEvents.push(withoutSequence(normalized));
           stream.push(normalized);
         }
@@ -207,7 +211,7 @@ export class DurableRunManager implements DurableRunRuntime {
       const entries = await session.entries();
       const actualUsage = addUsage(claimed.record.usage, subtractUsage(usageFromEntries(entries), baselineUsage));
       assertUsageAllowed(claimed.record.limits, actualUsage);
-      assertToolCallsAllowed(claimed.record.limits, Math.max(observedToolCalls, toolCallsFromEntries(entries)));
+      assertToolCallsAllowed(claimed.record.limits, unionSize(persistedToolCallIds, currentToolCallIds));
       await this.syncEntries(identity.tenantId, claimed.record.sessionId, entries);
       const leafId = await session.leafId();
       const committedAt = this.now();
@@ -374,13 +378,24 @@ async function terminalUsage(
   return hasObservedUsage ? addUsage(committedUsage, observedUsage) : committedUsage;
 }
 
-function toolCallsFromEntries(entries: readonly SessionTreeEntry[]): number {
-  let total = 0;
-  for (const entry of entries) {
-    if (entry.type !== 'message' || entry.message.role !== 'assistant') continue;
-    total += entry.message.content.filter((block) => block.type === 'toolCall').length;
+function toolCallIdsFromEvents(events: readonly AgentRunEvent[]): Set<string> {
+  const ids = new Set<string>();
+  for (const event of events) {
+    const id = toolCallIdFromEvent(event);
+    if (id) ids.add(id);
   }
-  return total;
+  return ids;
+}
+
+function toolCallIdFromEvent(event: AgentRunEvent): string | undefined {
+  if (!['tool_execution_start', 'tool_execution_end', 'tool_call', 'tool_result'].includes(event.type)) return undefined;
+  const detail = event.detail && typeof event.detail === 'object' && !Array.isArray(event.detail)
+    ? event.detail as Record<string, unknown> : {};
+  return typeof detail.toolCallId === 'string' && detail.toolCallId ? detail.toolCallId : undefined;
+}
+
+function unionSize(left: ReadonlySet<string>, right: ReadonlySet<string>): number {
+  return new Set([...left, ...right]).size;
 }
 
 function finite(value: unknown): number { return typeof value === 'number' && Number.isFinite(value) ? value : 0; }

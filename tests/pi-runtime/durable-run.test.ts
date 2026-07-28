@@ -418,6 +418,75 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('shared RunStore MySQL integrati
 });
 
 describe('DurableRunManager', () => {
+  it('creates a genuinely new Pi session instead of loading committed state', async () => {
+    const store = new MemoryRunStore();
+    const session = emptySession('brand-new-session');
+    let createCalls = 0;
+    let loadCalls = 0;
+    const manager = new DurableRunManager({
+      store, heartbeatMs: 0,
+      sessions: {
+        create: async () => { createCalls += 1; return session; },
+        load: async () => { loadCalls += 1; return session; },
+      },
+      eventOptions: () => ({}),
+    });
+
+    const result = await (await manager.run({
+      runId: 'brand-new-run', identity, sessionId: 'brand-new-session', input: [{ role: 'user', text: 'start' }],
+    })).result();
+
+    expect(result.status).toBe('succeeded');
+    expect(createCalls).toBe(1);
+    expect(loadCalls).toBe(0);
+  });
+
+  it.each(['failed', 'cancelled', 'recovery_required'] as const)(
+    'loads the committed leaf for a new run after a %s run',
+    async (terminalStatus) => {
+      const store = new MemoryRunStore();
+      const sessionId = `committed-after-${terminalStatus}`;
+      const oldRunId = `old-${terminalStatus}`;
+      const now = new Date('2026-07-29T00:00:00.000Z');
+      await store.create({ record: {
+        tenantId: identity.tenantId, runId: oldRunId, actorId: identity.actorId, sessionId, kernel: 'pi',
+        kernelVersion: '0.82.1', status: 'queued', leaseToken: 0n, usage, createdAt: now, updatedAt: now,
+      } });
+      await store.sessions.create({ tenantId: identity.tenantId, sessionId, createdAt: now });
+      const oldClaim = await store.claim({ identity, runId: oldRunId, workerId: 'old-worker', now, leaseTtlMs: 1000 });
+      await store.complete({
+        tenantId: identity.tenantId, runId: oldRunId, attemptId: oldClaim!.attemptId,
+        fencingToken: oldClaim!.fencingToken, status: terminalStatus, usage, completedAt: new Date(now.getTime() + 1),
+      });
+
+      const committedRoot = messageEntryForUsage(`committed-root-${terminalStatus}`, null, 'user');
+      const committedLeaf = messageEntryForUsage(`committed-leaf-${terminalStatus}`, committedRoot.id, 'assistant', {
+        input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costTotal: 0,
+      });
+      const committedSession: ManagedPiSession = {
+        ...emptySession(sessionId),
+        async entries() { return [committedRoot, committedLeaf]; },
+        async leafId() { return committedLeaf.id; },
+      };
+      let loadedMetadata: { id: string; tenantId?: string } | undefined;
+      const manager = new DurableRunManager({
+        store, heartbeatMs: 0,
+        sessions: {
+          create: async () => { throw new Error('current leaf leaked into new run'); },
+          load: async ({ metadata }) => { loadedMetadata = metadata; return committedSession; },
+        },
+        eventOptions: () => ({}),
+      });
+
+      const result = await (await manager.run({
+        runId: `new-after-${terminalStatus}`, identity, sessionId, input: [{ role: 'user', text: 'start fresh' }],
+      })).result();
+
+      expect(result.status).toBe('succeeded');
+      expect(loadedMetadata).toMatchObject({ id: sessionId, tenantId: identity.tenantId });
+    },
+  );
+
   it('coordinates a Pi session and commits its leaf without running a copied agent loop', async () => {
     const store = new MemoryRunStore(() => new Date('2026-07-28T00:00:00.100Z'));
     let continued = 0;
@@ -679,6 +748,90 @@ describe('DurableRunManager', () => {
     expect(calls.lastIndexOf('close')).toBeLessThan(calls.lastIndexOf('drain'));
   });
 
+  it('does not charge a new run for tool calls from a previous run in the same session', async () => {
+    const store = new MemoryRunStore();
+    const sessionId = 'shared-tool-budget-session';
+    const oldToolEntry = toolCallEntry('old-tool-entry', null, 'old-call');
+    const firstSession: ManagedPiSession = {
+      ...emptySession(sessionId),
+      async *continue() {
+        yield toolEvent('tool_execution_start', 'old-call');
+        yield toolEvent('tool_result', 'old-call');
+      },
+      async entries() { return [oldToolEntry]; }, async leafId() { return oldToolEntry.id; },
+    };
+    const secondSession: ManagedPiSession = {
+      ...emptySession(sessionId), async entries() { return [oldToolEntry]; }, async leafId() { return oldToolEntry.id; },
+    };
+    let createCount = 0;
+    const manager = new DurableRunManager({
+      store, heartbeatMs: 0,
+      sessions: {
+        create: async () => (++createCount === 1 ? firstSession : secondSession),
+        load: async () => secondSession,
+      },
+      eventOptions: () => ({}),
+    });
+    expect((await (await manager.run({
+      runId: 'tool-run-one', identity, sessionId, input: [{ role: 'user', text: 'first' }], limits: { maxToolCalls: 1 },
+    })).result()).status).toBe('succeeded');
+
+    const second = await (await manager.run({
+      runId: 'tool-run-two', identity, sessionId, input: [{ role: 'user', text: 'second' }], limits: { maxToolCalls: 0 },
+    })).result();
+    expect(second.status).toBe('succeeded');
+  });
+
+  it('does not charge tool calls from an abandoned session branch', async () => {
+    const store = new MemoryRunStore();
+    const root = messageEntryForUsage('branch-root', null, 'user');
+    const abandoned = toolCallEntry('abandoned-tool', root.id, 'abandoned-call');
+    const current = messageEntryForUsage('branch-current', root.id, 'user');
+    const session: ManagedPiSession = {
+      ...emptySession('abandoned-branch-session'),
+      async entries() { return [root, abandoned, current]; }, async leafId() { return current.id; },
+    };
+    const manager = new DurableRunManager({
+      store, heartbeatMs: 0, sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+    const result = await (await manager.run({
+      runId: 'abandoned-branch-run', identity, sessionId: 'abandoned-branch-session',
+      input: [{ role: 'user', text: 'continue current branch' }], limits: { maxToolCalls: 0 },
+    })).result();
+    expect(result.status).toBe('succeeded');
+  });
+
+  it('carries the same run tool-call budget across a resumed attempt without double counting results', async () => {
+    const store = new MemoryRunStore();
+    const runId = 'resumed-tool-budget';
+    const sessionId = 'resumed-tool-session';
+    const now = new Date('2026-07-29T00:00:00.000Z');
+    await store.create({ record: {
+      tenantId: identity.tenantId, runId, actorId: identity.actorId, sessionId, kernel: 'pi', kernelVersion: '0.82.1',
+      status: 'queued', leaseToken: 0n, usage, limits: { maxToolCalls: 1 }, createdAt: now, updatedAt: now,
+    } });
+    await store.sessions.create({ tenantId: identity.tenantId, sessionId, createdAt: now });
+    const first = await store.claim({ identity, runId, workerId: 'first-worker', now, leaseTtlMs: 1000 });
+    await store.commitTurn({
+      tenantId: identity.tenantId, runId, attemptId: first!.attemptId, turnNo: 1, fencingToken: first!.fencingToken,
+      checkpoint: { piSessionId: sessionId, piLeafId: null },
+      events: [toolEvent('tool_execution_start', 'prior-call'), toolEvent('tool_result', 'prior-call')].map(withoutTestSequence),
+      status: 'running', usage, committedAt: now,
+    });
+    await store.complete({
+      tenantId: identity.tenantId, runId, attemptId: first!.attemptId, fencingToken: first!.fencingToken,
+      status: 'failed', usage, completedAt: new Date(now.getTime() + 1),
+    });
+    const session: ManagedPiSession = {
+      ...emptySession(sessionId), async *continue() { yield toolEvent('tool_execution_start', 'current-call'); },
+    };
+    const manager = new DurableRunManager({
+      store, heartbeatMs: 0, sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+    const result = await (await manager.resume({ identity, runId })).result();
+    expect(result).toMatchObject({ status: 'failed', error: { code: 'RUN_LIMIT_EXCEEDED', message: 'Maximum tool calls exceeded' } });
+  });
+
   it.each([
     [{ maxAttempts: 0 }, 'Maximum attempts exceeded'],
     [{ maxTurns: 0 }, 'Maximum turns exceeded'],
@@ -780,6 +933,31 @@ function messageEntryForUsage(
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: values.costTotal } },
     },
   };
+}
+
+function toolCallEntry(id: string, parentId: string | null, callId: string) {
+  return {
+    type: 'message' as const, id, parentId, timestamp: new Date().toISOString(),
+    message: {
+      role: 'assistant' as const,
+      content: [{ type: 'toolCall' as const, id: callId, name: 'lookup', arguments: {} }],
+      api: 'test', provider: 'test', model: 'test', stopReason: 'toolUse' as const, timestamp: Date.now(),
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    },
+  };
+}
+
+function toolEvent(type: 'tool_execution_start' | 'tool_result', toolCallId: string): AgentRunEvent {
+  return {
+    tenantId: '', runId: '', sequence: 1n, type, attemptId: '', turnNo: 0, kernel: 'pi', kernelVersion: '0.82.1',
+    correlationId: toolCallId, detail: { toolCallId, toolName: 'lookup' }, createdAt: new Date(),
+  };
+}
+
+function withoutTestSequence(event: AgentRunEvent): Omit<AgentRunEvent, 'sequence'> {
+  const { sequence: _sequence, ...stored } = event;
+  return stored;
 }
 
 function emptySession(id: string): ManagedPiSession {
