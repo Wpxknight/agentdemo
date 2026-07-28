@@ -90,25 +90,39 @@ export class PiMysqlSessionStorage implements SessionStorage<PiMysqlSessionMetad
 
   async getLabel(id: string): Promise<string | undefined> {
     const labels = await this.findEntries('label');
-    return labels.filter((entry) => entry.targetId === id).at(-1)?.label;
+    let result: string | undefined;
+    for (const entry of labels) {
+      if (entry.targetId !== id) continue;
+      result = entry.label?.trim() || undefined;
+    }
+    return result;
   }
 
   async getSessionName(): Promise<string | undefined> {
-    return (await this.findEntries('session_info')).at(-1)?.name;
+    return (await this.findEntries('session_info')).at(-1)?.name?.trim() || undefined;
   }
 
   async getSessionStats(): Promise<SessionStats> {
-    const messages = (await this.visibleEntries()).filter((entry) => entry.type === 'message');
+    const entries = await this.visibleEntries();
+    let messageCount = 0;
     let cachedTokens = 0;
     let uncachedTokens = 0;
+    let totalTokens = 0;
     let costTotal = 0;
-    for (const entry of messages) {
-      const usage = entry.message.role === 'assistant' ? entry.message.usage : undefined;
-      cachedTokens += usage?.cacheRead ?? 0;
-      uncachedTokens += (usage?.input ?? 0) + (usage?.output ?? 0) + (usage?.cacheWrite ?? 0);
-      costTotal += usage?.cost?.total ?? 0;
+    for (const entry of entries) {
+      if (entry.type === 'message') messageCount += 1;
+      const usage = entry.type === 'message'
+        ? entry.message.role === 'assistant' ? entry.message.usage : undefined
+        : entry.type === 'compaction' || entry.type === 'branch_summary' ? entry.usage : undefined;
+      if (!usage || typeof usage.input !== 'number' || typeof usage.output !== 'number'
+        || typeof usage.cacheRead !== 'number' || typeof usage.cacheWrite !== 'number'
+        || typeof usage.cost?.total !== 'number') continue;
+      cachedTokens += usage.cacheRead;
+      uncachedTokens += usage.input + usage.cacheWrite;
+      totalTokens += usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+      costTotal += usage.cost.total;
     }
-    return { messageCount: messages.length, cachedTokens, uncachedTokens, totalTokens: cachedTokens + uncachedTokens, costTotal };
+    return { messageCount, cachedTokens, uncachedTokens, totalTokens, costTotal };
   }
 
   async getPathToRootOrCompaction(leafId: string | null): Promise<SessionTreeEntry[]> {

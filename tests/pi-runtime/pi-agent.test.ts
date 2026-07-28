@@ -7,7 +7,7 @@ import {
   type Context,
   type Model,
 } from '@earendil-works/pi-ai';
-import { InMemorySessionRepo } from '@earendil-works/pi-agent-core';
+import { InMemorySessionRepo, InMemorySessionStorage, Session } from '@earendil-works/pi-agent-core';
 import {
   EventCodec,
   PiAgentSession,
@@ -103,6 +103,71 @@ describe('PiAgentSessionFactory', () => {
     const loaded = await factory.load({ metadata, initialMessage: { role: 'user', text: 'loaded' }, events: eventContext('run-loaded') });
     expect((await loaded.entries()).some((entry) => entry.type === 'message')).toBe(true);
     await loaded.close();
+  });
+
+  it('flushes an inbox marker at a save point after an overlapping assistant write', async () => {
+    const base = new InMemorySessionStorage({ metadata: { id: 'serialized', createdAt: new Date().toISOString() } });
+    await base.appendEntry({
+      type: 'message', id: 'root', parentId: null, timestamp: new Date().toISOString(),
+      message: { role: 'user', content: 'start', timestamp: Date.now() },
+    });
+    let assistantPaused!: () => void;
+    const paused = new Promise<void>((resolve) => { assistantPaused = resolve; });
+    let releaseAssistant!: () => void;
+    const assistantGate = new Promise<void>((resolve) => { releaseAssistant = resolve; });
+    const storage = new Proxy(base, {
+      get(target, property) {
+        if (property === 'appendEntry') return async (entry: Parameters<typeof base.appendEntry>[0]) => {
+          if (entry.type === 'message' && entry.message.role === 'assistant') {
+            assistantPaused();
+            await assistantGate;
+          }
+          return base.appendEntry(entry);
+        };
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const piSession = new Session(storage);
+    const handlers = new Map<string, Array<(event: never) => Promise<void> | void>>();
+    const assistant: AssistantMessage = {
+      role: 'assistant', content: [{ type: 'text', text: 'answer' }], api: model.api, provider: model.provider, model: model.id,
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: 'stop', timestamp: Date.now(),
+    };
+    const harness = {
+      subscribe: () => () => {},
+      on(type: string, handler: (event: never) => Promise<void> | void) {
+        const current = handlers.get(type) ?? [];
+        current.push(handler);
+        handlers.set(type, current);
+        return () => handlers.set(type, (handlers.get(type) ?? []).filter((candidate) => candidate !== handler));
+      },
+      async prompt() {
+        await piSession.appendMessage(assistant);
+        for (const handler of handlers.get('save_point') ?? []) await handler({ type: 'save_point' } as never);
+        for (const handler of handlers.get('settled') ?? []) await handler({ type: 'settled' } as never);
+      },
+      async abort() {}, async waitForIdle() {}, getTools: () => [],
+    };
+    const session = new PiAgentSession(
+      piSession, harness as never, { role: 'user', text: 'start' }, new EventCodec(eventContext('serialized')),
+    );
+
+    const running = collect(session.continue());
+    await paused;
+    const marker = session.appendCustomEntry('aiop.inbox_consumed', { inboxMessageId: 'inbox-a' });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    releaseAssistant();
+    const markerId = await marker;
+    await running;
+
+    const leaf = await session.leafId();
+    expect(leaf).toBe(markerId);
+    expect((await base.getPathToRootOrCompaction(leaf)).map((entry) => entry.id))
+      .toEqual(['root', expect.any(String), markerId]);
+    await session.close();
   });
 
   it('adapts governed tools through setTools and Pi validation/execution', async () => {

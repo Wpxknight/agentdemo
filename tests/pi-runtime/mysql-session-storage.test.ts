@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { Session, type SessionTreeEntry } from '@earendil-works/pi-agent-core';
-import { PiMysqlSessionRepo, PiMysqlSessionStorage } from '../../packages/pi-runtime/src/index.js';
+import { InMemorySessionStorage, Session, type SessionTreeEntry } from '@earendil-works/pi-agent-core';
+import { EventCodec, PiAgentSession, PiMysqlSessionRepo, PiMysqlSessionStorage } from '../../packages/pi-runtime/src/index.js';
 import { drainDurableInbox, MysqlRunStore } from '../../packages/pi-runtime/src/index.js';
 import { readMysqlConfig } from '../../src/config/mysql.js';
 import { createKysely, createMysqlPool, runMigrations } from '../../src/db/index.js';
@@ -61,6 +61,57 @@ describe('PiMysqlSessionStorage behavior', () => {
 
     expect((await storage.getPathToRootOrCompaction('compaction')).map((entry) => entry.id))
       .toEqual(['kept', 'compaction']);
+  });
+
+  it('matches Pi 0.82.1 stats, label, and session-name behavior', async () => {
+    const db = new SessionTestDb('tenant-a', 'session-a');
+    const mysql = new PiMysqlSessionStorage(db as never, metadata(), false);
+    const memory = new InMemorySessionStorage({ metadata: metadata() });
+    const usage = (input: number, output: number, cacheRead: number, cacheWrite: number, total: number) => ({
+      input, output, cacheRead, cacheWrite, totalTokens: total,
+      cost: { input: 0.1, output: 0.1, cacheRead: 0.1, cacheWrite: 0.1, total: total / 100 },
+    });
+    const entries: SessionTreeEntry[] = [
+      messageEntry('user', null, 'question'),
+      {
+        type: 'message', id: 'assistant', parentId: 'user', timestamp: new Date().toISOString(),
+        message: {
+          role: 'assistant', content: [{ type: 'text', text: 'answer' }], api: 'test', provider: 'test', model: 'test',
+          stopReason: 'stop', timestamp: Date.now(), usage: usage(10, 5, 2, 3, 20),
+        },
+      },
+      {
+        type: 'compaction', id: 'compact', parentId: 'assistant', timestamp: new Date().toISOString(),
+        summary: 'summary', tokensBefore: 100, usage: usage(7, 4, 1, 2, 14),
+      },
+      {
+        type: 'branch_summary', id: 'branch', parentId: 'compact', timestamp: new Date().toISOString(),
+        fromId: 'user', summary: 'branch summary', usage: usage(6, 3, 4, 1, 14),
+      },
+      { type: 'label', id: 'label-set', parentId: 'branch', timestamp: new Date().toISOString(), targetId: 'assistant', label: '  useful  ' },
+      { type: 'session_info', id: 'name-set', parentId: 'label-set', timestamp: new Date().toISOString(), name: '  Session name  ' },
+    ];
+    for (const entry of entries) {
+      await memory.appendEntry(entry);
+      await mysql.appendEntry(entry);
+    }
+
+    expect(await mysql.getSessionStats()).toEqual(await memory.getSessionStats());
+    expect(await mysql.getLabel('assistant')).toBe(await memory.getLabel('assistant'));
+    expect(await mysql.getSessionName()).toBe(await memory.getSessionName());
+
+    const blankLabel: SessionTreeEntry = {
+      type: 'label', id: 'label-clear', parentId: 'name-set', timestamp: new Date().toISOString(), targetId: 'assistant', label: '   ',
+    };
+    const blankName: SessionTreeEntry = {
+      type: 'session_info', id: 'name-clear', parentId: 'label-clear', timestamp: new Date().toISOString(), name: '   ',
+    };
+    for (const entry of [blankLabel, blankName]) {
+      await memory.appendEntry(entry);
+      await mysql.appendEntry(entry);
+    }
+    expect(await mysql.getLabel('assistant')).toBe(await memory.getLabel('assistant'));
+    expect(await mysql.getSessionName()).toBe(await memory.getSessionName());
   });
 });
 
@@ -132,6 +183,78 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('Pi MySQL crash recovery integra
       await db.destroy();
     }
   });
+
+  it('keeps an overlapping assistant write and inbox marker on one MySQL branch', async () => {
+    const pool = createMysqlPool(readMysqlConfig()!);
+    await runMigrations(pool);
+    const db = createKysely(pool);
+    const tenantId = 'pi-write-race';
+    const sessionId = `session-${Date.now()}`;
+    try {
+      const created = await new PiMysqlSessionRepo(db as never).create({ id: sessionId, tenantId });
+      const base = created.getStorage();
+      await base.appendEntry(messageEntry('root', null, 'start'));
+      let assistantPaused!: () => void;
+      const paused = new Promise<void>((resolve) => { assistantPaused = resolve; });
+      let releaseAssistant!: () => void;
+      const gate = new Promise<void>((resolve) => { releaseAssistant = resolve; });
+      const storage = new Proxy(base, {
+        get(target, property) {
+          if (property === 'appendEntry') return async (entry: SessionTreeEntry) => {
+            if (entry.type === 'message' && entry.message.role === 'assistant') {
+              assistantPaused();
+              await gate;
+            }
+            return base.appendEntry(entry);
+          };
+          const value = Reflect.get(target, property);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      const session = new Session(storage);
+      const handlers = new Map<string, Array<(event: never) => Promise<void> | void>>();
+      let sequence = 0n;
+      const harness = {
+        subscribe: () => () => {}, getTools: () => [], async abort() {}, async waitForIdle() {},
+        on(type: string, handler: (event: never) => Promise<void> | void) {
+          const current = handlers.get(type) ?? [];
+          current.push(handler);
+          handlers.set(type, current);
+          return () => handlers.set(type, (handlers.get(type) ?? []).filter((candidate) => candidate !== handler));
+        },
+        async prompt() {
+          await session.appendMessage({
+            role: 'assistant', content: [{ type: 'text', text: 'answer' }], api: 'test', provider: 'test', model: 'test',
+            usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+            stopReason: 'stop', timestamp: Date.now(),
+          });
+          for (const handler of handlers.get('save_point') ?? []) await handler({ type: 'save_point' } as never);
+          for (const handler of handlers.get('settled') ?? []) await handler({ type: 'settled' } as never);
+        },
+      };
+      const agent = new PiAgentSession(session, harness as never, { role: 'user', text: 'start' }, new EventCodec({
+        tenantId, runId: 'run-race', attemptId: 'attempt-race', turnNo: 1, correlationId: 'race',
+        sequence: () => ++sequence,
+      }));
+      const running = collectEvents(agent.continue());
+      await paused;
+      const marker = agent.appendCustomEntry('aiop.inbox_consumed', { inboxMessageId: 'inbox-race' });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      releaseAssistant();
+      const markerId = await marker;
+      await running;
+      const leaf = await agent.leafId();
+      expect(leaf).toBe(markerId);
+      expect((await base.getPathToRootOrCompaction(leaf)).map((entry) => entry.id))
+        .toEqual(['root', expect.any(String), markerId]);
+      await agent.close();
+    } finally {
+      await db.deleteFrom('pi_session_entries').where('tenant_id', '=', tenantId).where('session_id', '=', sessionId).execute();
+      await db.deleteFrom('pi_sessions').where('tenant_id', '=', tenantId).where('session_id', '=', sessionId).execute();
+      await db.destroy();
+    }
+  });
 });
 
 function metadata() {
@@ -140,6 +263,12 @@ function metadata() {
 
 function messageEntry(id: string, parentId: string | null, content: string): SessionTreeEntry {
   return { type: 'message', id, parentId, timestamp: new Date().toISOString(), message: { role: 'user', content, timestamp: Date.now() } };
+}
+
+async function collectEvents<T>(events: AsyncIterable<T>): Promise<T[]> {
+  const collected: T[] = [];
+  for await (const event of events) collected.push(event);
+  return collected;
 }
 
 type Row = Record<string, any>;

@@ -86,6 +86,11 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
   private activeRun?: { cancel(): Promise<void>; finalize(cancelRunning?: boolean): Promise<void> };
   private governedToolScope: GovernedToolScope;
   private removeGovernedToolHook = () => {};
+  private removeSafeWriteHooks = () => {};
+  private readonly pendingCustomEntries: Array<{
+    customType: string; data?: unknown; resolve(id: string): void; reject(error: unknown): void;
+  }> = [];
+  private customFlushTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly session: Session<TMetadata>,
@@ -96,6 +101,9 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     this.pendingMessage = initialMessage;
     this.governedToolScope = adoptGovernedToolScope(harness.getTools());
     this.installGovernedToolHook(this.governedToolScope);
+    const removeSavePoint = harness.on('save_point', () => this.flushPendingCustomEntries().then(() => undefined));
+    const removeSettled = harness.on('settled', () => this.flushPendingCustomEntries().then(() => undefined));
+    this.removeSafeWriteHooks = () => { removeSavePoint(); removeSettled(); };
   }
 
   continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent> {
@@ -143,6 +151,7 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
           forceDone = true;
           events.length = 0;
           if (this.activeRun === active) this.activeRun = undefined;
+          try { await this.flushPendingCustomEntries(); } catch (error) { errors.push(error); }
           wake?.();
           wake = undefined;
         }
@@ -234,7 +243,11 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
 
   appendCustomEntry(customType: string, data?: unknown): Promise<string> {
     this.ensureOpen();
-    return this.session.appendCustomEntry(customType, data);
+    const result = new Promise<string>((resolve, reject) => {
+      this.pendingCustomEntries.push({ customType, data, resolve, reject });
+    });
+    if (!this.activeRun) void this.flushPendingCustomEntries();
+    return result;
   }
 
   async close(): Promise<void> {
@@ -252,6 +265,7 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
         }
       } finally {
         try { this.removeGovernedToolHook(); } catch (error) { errors.push(error); }
+        try { this.removeSafeWriteHooks(); } catch (error) { errors.push(error); }
       }
       throwCollected(errors, 'Pi agent close failed');
     })();
@@ -264,6 +278,22 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
       removeHook();
       this.removeGovernedToolHook = () => {};
     };
+  }
+
+  private flushPendingCustomEntries(): Promise<void> {
+    const flush = async () => {
+      while (this.pendingCustomEntries.length) {
+        const entry = this.pendingCustomEntries.shift()!;
+        try {
+          entry.resolve(await this.session.appendCustomEntry(entry.customType, entry.data));
+        } catch (error) {
+          entry.reject(error);
+        }
+      }
+    };
+    const next = this.customFlushTail.then(flush, flush);
+    this.customFlushTail = next.catch(() => {});
+    return next;
   }
 
   private ensureOpen(): void {

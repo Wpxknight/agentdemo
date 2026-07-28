@@ -73,6 +73,9 @@ export declare class PiAgentSession<TMetadata extends SessionMetadata = SessionM
     private activeRun?;
     private governedToolScope;
     private removeGovernedToolHook;
+    private removeSafeWriteHooks;
+    private readonly pendingCustomEntries;
+    private customFlushTail;
     constructor(session: Session<TMetadata>, harness: AgentHarness, initialMessage: AgentInputMessage, eventCodec: EventCodec);
     continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent>;
     private iterate;
@@ -87,6 +90,7 @@ export declare class PiAgentSession<TMetadata extends SessionMetadata = SessionM
     appendCustomEntry(customType: string, data?: unknown): Promise<string>;
     close(): Promise<void>;
     private installGovernedToolHook;
+    private flushPendingCustomEntries;
     private ensureOpen;
 }
 export {};

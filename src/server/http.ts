@@ -2534,12 +2534,41 @@ async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req:
   };
   res.on('close', onClose);
   try {
-    for await (const event of handle.events) sse(event.type, event.detail ?? {});
+    let emittedText = false;
+    for await (const event of handle.events) {
+      const projected = durableHttpEvent(event);
+      if (projected) {
+        sse(projected.event, projected.data);
+        emittedText ||= projected.event === 'text_delta';
+      } else {
+        sse(event.type, event.detail ?? {});
+      }
+    }
     const result = await handle.result();
-    sse('done', { sessionId, ...result });
+    if (result.status === 'cancelled') {
+      sse('terminated', { sessionId, runId: result.runId, reason: result.error?.message });
+    } else if (result.status === 'failed' || result.status === 'recovery_required') {
+      sse('error', { error: result.error?.message ?? '运行失败', runId: result.runId, status: result.status });
+    } else {
+      if (result.status === 'succeeded' && result.text && !emittedText) sse('text_delta', { text: result.text });
+      sse('done', { sessionId, ...result });
+    }
+  } catch (error) {
+    sse('error', { error: error instanceof Error ? error.message : '运行失败', runId: handle.runId });
   } finally {
     removeActiveRun(activeRuns, activeKey, activeRun);
     res.off('close', onClose);
     if (!res.destroyed && !res.writableEnded) res.end();
   }
+}
+
+function durableHttpEvent(event: { type: string; detail?: unknown }): { event: string; data: unknown } | undefined {
+  if (event.type !== 'message_update' || !event.detail || typeof event.detail !== 'object') return undefined;
+  const update = (event.detail as { update?: unknown }).update;
+  if (!update || typeof update !== 'object') return undefined;
+  const value = update as { type?: unknown; delta?: unknown };
+  if ((value.type === 'text_delta' || value.type === 'thinking_delta') && typeof value.delta === 'string') {
+    return { event: value.type, data: { text: value.delta } };
+  }
+  return undefined;
 }

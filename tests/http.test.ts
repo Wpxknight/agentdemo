@@ -20,6 +20,7 @@ import { buildSandboxTools } from '../src/tools/builtin.js';
 import { buildSandboxProfileTools } from '../src/tools/sandbox-profiles.js';
 import type { ExecResult, SandboxHandle, SandboxProvider, SandboxSpec } from '../src/sandbox/types.js';
 import type { AppendRunMessageInput, DurableRunRuntime } from '@aiop/control-contracts';
+import { EventCodec } from '../packages/pi-runtime/src/index.js';
 
 /** 纯文本回答的 mock 模型（不发起工具调用）。 */
 const model: ChatModel = {
@@ -831,21 +832,23 @@ describe('HTTP server', () => {
     const appendDurably = vi.fn(async (input: AppendRunMessageInput) => appended(input));
     const runDurably = vi.fn(async () => {
       firstStarted();
+      let sequence = 0n;
+      const codec = new EventCodec({
+        tenantId: 'default', runId: 'durable-active-run', attemptId: 'attempt-a', turnNo: 1,
+        correlationId: 'http-compat', sequence: () => ++sequence,
+      });
+      const update = (delta: string) => codec.fromPi({
+        type: 'message_update',
+        message: { role: 'assistant', content: [{ type: 'text', text: delta }], stopReason: 'stop' },
+        assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta },
+      } as never);
       return {
         runId: 'durable-active-run', status: 'running' as const,
         events: {
           async *[Symbol.asyncIterator]() {
-            yield {
-              tenantId: 'default', runId: 'durable-active-run', sequence: 1n, type: 'text_delta',
-              attemptId: 'attempt-a', turnNo: 1, kernel: 'pi' as const, kernelVersion: '0.82.1',
-              correlationId: 'first', detail: { text: '第一段回答' }, createdAt: new Date(),
-            };
+            yield update('第一段回答');
             const input = await appendedInput;
-            yield {
-              tenantId: 'default', runId: 'durable-active-run', sequence: 2n, type: 'text_delta',
-              attemptId: 'attempt-a', turnNo: 1, kernel: 'pi' as const, kernelVersion: '0.82.1',
-              correlationId: 'second', detail: { text: `已纳入：${input.message.text}` }, createdAt: new Date(),
-            };
+            yield update(`已纳入：${input.message.text}`);
           },
         },
         async result() {
@@ -908,11 +911,66 @@ describe('HTTP server', () => {
 
       const runResponse = await run;
       expect(runResponse.status).toBe(200);
-      expect(await runResponse.text()).toContain('已纳入：中途修正');
+      const runBody = await runResponse.text();
+      expect(runBody).toContain('event: text_delta');
+      expect(runBody).toContain('已纳入：中途修正');
       expect(competing.status).toBe(409);
       await competing.text();
     } finally {
       await new Promise<void>((resolve) => appendServer.close(() => resolve()));
+    }
+  });
+
+  it('projects durable terminal results into legacy success, error, and terminated SSE semantics', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'durable-result-secret' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    const run = vi.fn(async (input: { input: Array<{ text?: string }> }) => {
+      const mode = input.input[0]?.text;
+      const status = mode === 'fail' ? 'failed' as const : mode === 'cancel' ? 'cancelled' as const : 'succeeded' as const;
+      return {
+        runId: `run-${mode}`, status: 'running' as const,
+        events: { async *[Symbol.asyncIterator]() {} },
+        async result() {
+          return {
+            runId: `run-${mode}`, status,
+            ...(status === 'succeeded' ? { text: 'fallback durable answer' } : {}),
+            ...(status === 'failed' ? { error: { code: 'MODEL_PROVIDER_ERROR' as const, message: 'provider failed', retryable: false } } : {}),
+            usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+          };
+        },
+      };
+    });
+    const rt = {
+      model, tools: new ToolRegistry(), store: localStore, policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth, jwtSecret: 'durable-result-secret', systemExtra: '', durableRunRuntime: { run },
+    } as unknown as Runtime;
+    const server = createHttpServer(rt);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const localBase = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const request = async (task: string, sessionId: string) => {
+      const response = await fetch(`${localBase}/v1/agent`, {
+        method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${adminToken}` },
+        body: JSON.stringify({ task, sessionId }),
+      });
+      return response.text();
+    };
+    try {
+      const success = await request('success', 'result-success');
+      expect(success).toContain('event: text_delta');
+      expect(success).toContain('fallback durable answer');
+      expect(success).toContain('event: done');
+
+      const failed = await request('fail', 'result-failed');
+      expect(failed).toContain('event: error');
+      expect(failed).toContain('provider failed');
+
+      const cancelled = await request('cancel', 'result-cancelled');
+      expect(cancelled).toContain('event: terminated');
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
 
