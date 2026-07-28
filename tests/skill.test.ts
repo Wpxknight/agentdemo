@@ -292,6 +292,101 @@ describe('SkillRegistry governed Pi loading', () => {
   });
 });
 
+describe('SkillRegistry upload review governance', () => {
+  it('rejects review when the uploaded product name does not match canonical SKILL.md metadata', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-upload-name-'));
+    const skillDir = join(root, 'users', 'uploader', 'expected');
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(skillDir, 'SKILL.md'), '---\nname: different\ndescription: mismatch\n---\nbody');
+    await writeProduct(skillDir, { name: 'expected', version: '1', reviewed: true });
+    const reg = new SkillRegistry(root);
+
+    await reg.installUploadedProduct(skillDir, {
+      tenantId: 'default', userId: 'uploader', role: 'user',
+    });
+    await reg.scan();
+
+    await expect(reg.review('expected', {
+      tenantId: 'default', userId: 'reviewer', role: 'tenant_admin',
+    })).rejects.toThrow('SKILL.md name');
+    expect(reg.get('expected')?.reviewed).toBe(false);
+  });
+
+  it('forbids an admin uploader from reviewing their own pending skill', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-upload-self-review-'));
+    const skillDir = join(root, 'users', 'admin', 'owned');
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(skillDir, 'SKILL.md'), '---\nname: owned\ndescription: owned\n---\nbody');
+    await writeProduct(skillDir, {
+      name: 'owned', version: '1', enabled: true, reviewed: false,
+      tenantId: 'default', ownerUserId: 'admin', visibility: 'private',
+    });
+    const reg = new SkillRegistry(root);
+    await reg.scan();
+
+    await expect(reg.review('owned', {
+      tenantId: 'default', userId: 'admin', role: 'tenant_admin',
+    })).rejects.toThrow('不能审核自己');
+  });
+
+  it('rejects ambiguous or repeated review transitions', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-upload-review-transition-'));
+    for (const owner of ['u1', 'u2']) {
+      const skillDir = join(root, 'users', owner, 'duplicate');
+      await mkdir(skillDir, { recursive: true });
+      await writeFile(join(skillDir, 'SKILL.md'), '---\nname: duplicate\ndescription: duplicate\n---\nbody');
+      await writeProduct(skillDir, {
+        name: 'duplicate', version: '1', enabled: true, reviewed: false,
+        tenantId: 'default', ownerUserId: owner, visibility: 'private',
+      });
+    }
+    const reviewedDir = join(root, 'users', 'u3', 'published');
+    await mkdir(reviewedDir, { recursive: true });
+    await writeFile(join(reviewedDir, 'SKILL.md'), '---\nname: published\ndescription: published\n---\nbody');
+    await writeProduct(reviewedDir, {
+      name: 'published', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', ownerUserId: 'u3', visibility: 'public', allowedTenantIds: ['*'],
+    });
+    const reg = new SkillRegistry(root);
+    await reg.scan();
+    const reviewer = { tenantId: 'default', userId: 'reviewer', role: 'tenant_admin' as const };
+
+    await expect(reg.review('duplicate', reviewer)).rejects.toThrow('不唯一');
+    await expect(reg.review('published', reviewer)).rejects.toThrow('已审核');
+  });
+
+  it('reviews the pending user upload instead of a same-name built-in and rejects cross-tenant review', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-upload-review-target-'));
+    const builtInDir = join(root, 'collision');
+    await mkdir(builtInDir);
+    await writeFile(join(builtInDir, 'SKILL.md'), '---\nname: collision\ndescription: built in\n---\nbody');
+    await writeProduct(builtInDir, {
+      name: 'collision', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public', allowedTenantIds: ['*'],
+    });
+    const uploadedDir = join(root, 'users', 'uploader', 'collision');
+    await mkdir(uploadedDir, { recursive: true });
+    await writeFile(join(uploadedDir, 'SKILL.md'), '---\nname: collision\ndescription: uploaded\n---\nbody');
+    await writeProduct(uploadedDir, {
+      name: 'collision', version: '2', enabled: true, reviewed: false,
+      tenantId: 'default', ownerUserId: 'uploader', visibility: 'private',
+    });
+    const reg = new SkillRegistry(root);
+    await reg.scan();
+
+    await expect(reg.review('collision', {
+      tenantId: 'other', userId: 'other-admin', role: 'tenant_admin',
+    })).rejects.toThrow('未找到技能');
+    const reviewed = await reg.review('collision', {
+      tenantId: 'default', userId: 'reviewer', role: 'tenant_admin',
+    });
+    expect(reviewed.path).toBe(uploadedDir);
+    expect(JSON.parse(await readFile(join(builtInDir, '.product.json'), 'utf8'))).toMatchObject({
+      reviewed: true, visibility: 'public', allowedTenantIds: ['*'],
+    });
+  });
+});
+
 describe('credential_file validation', () => {
   it.each(['', '.', '..', '../token.json', '/tmp/token.json', 'C:/token.json', 'sub\\token.json', 'sub/../token.json', 'token.json\0x', 'sub/'])('rejects unsafe target %j', (target) => {
     expect(() => normalizeCredentialFile(target)).toThrow('credential_file');
@@ -303,6 +398,17 @@ describe('credential_file validation', () => {
 });
 
 describe('importSkillZip', () => {
+  it('rolls back the extracted directory when post-extraction validation fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-import-skill-cleanup-'));
+
+    await expect(importSkillZip({
+      rootDir: root,
+      filename: 'broken.zip',
+      data: testZip({ 'README.md': 'missing skill' }),
+    })).rejects.toThrow('缺少 SKILL.md');
+    await expect(stat(join(root, 'broken'))).rejects.toThrow();
+  });
+
   it('extracts a zip with root SKILL.md into a named skill directory', async () => {
     const root = await mkdtemp(join(tmpdir(), 'aiop-import-skill-'));
     const zip = testZip({

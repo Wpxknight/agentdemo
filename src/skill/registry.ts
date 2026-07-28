@@ -1,5 +1,6 @@
-import { readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { join, posix, resolve, sep } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { dirname, join, posix, resolve, sep } from 'node:path';
 import { logger } from '../logger.js';
 import type { JsonValue, ToolResult } from '../model/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
@@ -80,6 +81,16 @@ export class SkillRegistry {
       : join(this.dir, TENANT_SKILLS_DIR, safePathSegment(viewer.tenantId));
     if (viewer.role && isAdminRole(viewer.role)) return join(tenantRoot, PUBLIC_SKILLS_DIR);
     if (!viewer.userId) throw new Error('导入技能需要用户身份');
+    return join(tenantRoot, USER_SKILLS_DIR, safePathSegment(viewer.userId));
+  }
+
+  /** 用户上传始终落入租户内的个人目录，不能通过管理员身份获得内置/公共目录信任。 */
+  uploadRootFor(viewer: SkillViewer): string {
+    if (!viewer.tenantId) throw new Error('导入技能需要租户身份');
+    if (!viewer.userId) throw new Error('导入技能需要用户身份');
+    const tenantRoot = viewer.tenantId === 'default'
+      ? this.dir
+      : join(this.dir, TENANT_SKILLS_DIR, safePathSegment(viewer.tenantId));
     return join(tenantRoot, USER_SKILLS_DIR, safePathSegment(viewer.userId));
   }
 
@@ -284,13 +295,75 @@ export class SkillRegistry {
     return skillFromRecord(record);
   }
 
-  /** 导入后把认证用户固化为权威产品 owner，避免信任 zip 内声明。 */
-  async setOwner(skillDir: string, owner: string): Promise<void> {
-    if (!owner) return;
-    const path = join(skillDir, PRODUCT_RECORD_FILE);
-    const metadata = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-    metadata.ownerUserId = owner;
-    await writeFile(path, `${JSON.stringify(metadata, null, 2)}\n`);
+  /** 用认证上下文覆盖上传包中的治理字段；归档只允许贡献经过校验的 name/version。 */
+  async installUploadedProduct(skillDir: string, viewer: SkillViewer): Promise<SkillProductRecord> {
+    if (!viewer.tenantId || !viewer.userId) throw new Error('导入技能需要完整用户身份');
+    const archived = await readUploadedDescription(skillDir);
+    const metadata = {
+      name: archived.name ?? safePathSegment(posix.basename(skillDir)),
+      version: archived.version ?? 'uploaded',
+      enabled: true,
+      reviewed: false,
+      tenantId: viewer.tenantId,
+      ownerUserId: viewer.userId,
+      visibility: 'private' as const,
+    };
+    const record = normalizeSkillProductRecord({
+      id: `${metadata.tenantId}:${metadata.ownerUserId}:${metadata.name}`,
+      path: skillDir,
+      ...metadata,
+    });
+    await writeProductRecord(record);
+    return record;
+  }
+
+  async review(name: string, viewer: SkillViewer, options: { global?: boolean } = {}): Promise<SkillProductRecord> {
+    if (viewer.role !== 'tenant_admin' && viewer.role !== 'platform_admin') {
+      throw new Error('仅租户或平台管理员可审核技能');
+    }
+    if (options.global && viewer.role !== 'platform_admin') {
+      throw new Error('仅平台管理员可全局发布技能');
+    }
+    const tenantRecords = this.records.filter((item) => item.name === name && item.tenantId === viewer.tenantId);
+    const pending = tenantRecords.filter((item) => !item.reviewed && this.isUploadedRecord(item));
+    if (pending.length > 1) throw new Error(`同名待审核技能 ${name} 不唯一`);
+    if (!pending.length) {
+      if (tenantRecords.some((item) => item.reviewed && this.isUploadedRecord(item))) {
+        throw new Error(`技能 ${name} 已审核`);
+      }
+      throw new Error(`未找到技能 ${name}`);
+    }
+    const record = pending[0]!;
+    if (record.ownerUserId === viewer.userId) throw new Error('审核者不能审核自己上传的技能');
+    const validationRecord = normalizeSkillProductRecord({ ...record, reviewed: true });
+    const validation = await this.service.load([validationRecord], {
+      tenantId: record.tenantId,
+      userId: record.ownerUserId,
+      role: 'user',
+    });
+    if (validation.skills.length !== 1 || resolve(validation.skills[0]!.source.path) !== resolve(record.path)) {
+      throw new Error(`SKILL.md name 与产品 name 不一致或技能元数据无效：${name}`);
+    }
+    const next = normalizeSkillProductRecord({
+      ...record,
+      reviewed: true,
+      visibility: options.global ? 'public' : 'private',
+      allowedTenantIds: options.global ? ['*'] : undefined,
+    });
+    await writeProductRecord(next);
+    await this.scan();
+    const persisted = this.records.find((item) => resolve(item.path) === resolve(record.path));
+    if (!persisted) throw new Error(`审核后未找到技能 ${name}`);
+    return persisted;
+  }
+
+  private isUploadedRecord(record: SkillProductRecord): boolean {
+    if (!record.ownerUserId) return false;
+    const uploadRoot = this.uploadRootFor({
+      tenantId: record.tenantId,
+      userId: record.ownerUserId,
+    });
+    return dirname(resolve(record.path)) === resolve(uploadRoot);
   }
 
   async delete(name: string, viewer?: SkillViewer): Promise<void> {
@@ -319,7 +392,38 @@ export class SkillRegistry {
 
 async function writeProductRecord(record: SkillProductRecord): Promise<void> {
   const { id: _id, path: _path, description: _description, ...metadata } = record;
-  await writeFile(join(record.path, PRODUCT_RECORD_FILE), `${JSON.stringify(metadata, null, 2)}\n`);
+  const target = join(record.path, PRODUCT_RECORD_FILE);
+  const temp = join(record.path, `.${PRODUCT_RECORD_FILE}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(temp, `${JSON.stringify(metadata, null, 2)}\n`, { flag: 'wx' });
+    await rename(temp, target);
+  } catch (error) {
+    await rm(temp, { force: true });
+    throw error;
+  }
+}
+
+async function readUploadedDescription(skillDir: string): Promise<{ name?: string; version?: string }> {
+  try {
+    const parsed = JSON.parse(await readFile(join(skillDir, PRODUCT_RECORD_FILE), 'utf8')) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const metadata = parsed as Record<string, unknown>;
+    return {
+      name: uploadedString(metadata.name, 'name'),
+      version: uploadedString(metadata.version, 'version'),
+    };
+  } catch {
+    return {};
+  }
+}
+
+function uploadedString(value: unknown, key: 'name' | 'version'): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  if (!normalized || normalized.includes('\0') || normalized.length > 200) return undefined;
+  if (key === 'name' && !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(normalized)) return undefined;
+  return normalized;
 }
 
 function skillFromRecord(

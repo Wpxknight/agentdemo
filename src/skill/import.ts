@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { basename, extname, join, posix, resolve, sep } from 'node:path';
 import { inflateRawSync } from 'node:zlib';
 
@@ -44,27 +44,32 @@ export async function importSkillZip(options: ImportSkillZipOptions): Promise<Im
     ? safeResolve(rootDir, topDirectory)
     : safeResolve(rootDir, skillDirName(options.filename));
 
-  await mkdir(targetDir, { recursive: true });
+  await mkdir(rootDir, { recursive: true });
+  await mkdir(targetDir);
+  try {
+    const written: string[] = [];
+    for (const entry of entries) {
+      const relativePath = preserveTopDirectory
+        ? entry.path
+        : posix.join(skillDirName(options.filename), entry.path);
+      const destination = safeResolve(rootDir, relativePath);
+      await mkdir(posixDirnameForFs(destination), { recursive: true });
+      await writeFile(destination, entry.data);
+      written.push(preserveTopDirectory ? entry.path.slice(topDirectory.length + 1) : entry.path);
+    }
 
-  const written: string[] = [];
-  for (const entry of entries) {
-    const relativePath = preserveTopDirectory
-      ? entry.path
-      : posix.join(skillDirName(options.filename), entry.path);
-    const destination = safeResolve(rootDir, relativePath);
-    await mkdir(posixDirnameForFs(destination), { recursive: true });
-    await writeFile(destination, entry.data);
-    written.push(preserveTopDirectory ? entry.path.slice(topDirectory.length + 1) : entry.path);
+    await readFile(join(targetDir, 'SKILL.md'), 'utf8').catch(() => {
+      throw new Error('技能包缺少 SKILL.md');
+    });
+
+    return {
+      skillDir: targetDir,
+      files: written.sort(),
+    };
+  } catch (error) {
+    await rm(targetDir, { recursive: true, force: true });
+    throw error;
   }
-
-  await readFile(join(targetDir, 'SKILL.md'), 'utf8').catch(() => {
-    throw new Error('技能包缺少 SKILL.md');
-  });
-
-  return {
-    skillDir: targetDir,
-    files: written.sort(),
-  };
 }
 
 function readZipEntries(zip: Buffer): ZipEntry[] {

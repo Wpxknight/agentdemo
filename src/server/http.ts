@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { SignJWT, jwtVerify } from 'jose';
 import { logger } from '../logger.js';
@@ -33,7 +33,7 @@ import { createModel } from '../model/factory.js';
 import { estimateCost } from '../model/cost.js';
 import type { JsonValue, Msg, ToolCall } from '../model/types.js';
 import { importSkillZip } from '../skill/import.js';
-import type { Skill, SkillRegistry } from '../skill/registry.js';
+import type { Skill, SkillProductRecord, SkillRegistry } from '../skill/registry.js';
 import { McpServerSchema } from '../config/schema.js';
 import {
   parseSandboxSettings,
@@ -1037,7 +1037,7 @@ async function handle(
   }
 
   if (route === 'POST /v1/skills/import') {
-    // 上传放开给所有登录用户：管理员 → _public（全员可见）；普通用户 → users/<uid>（默认私有）。
+    // 上传放开给所有登录用户，但统一落 tenant/users/<uid>，并由服务端写入待审核私有元数据。
     const ctx = await requireAuth(rt, req);
     if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
     const body = await readJson(req, SKILL_IMPORT_MAX_BODY);
@@ -1047,21 +1047,54 @@ async function handle(
     if (!/\.zip$/i.test(filename)) throw new HttpError(400, '仅支持导入 zip 技能包');
 
     const imported = await importSkillZip({
-      rootDir: rt.skillRegistry.importRootFor(ctx),
+      rootDir: rt.skillRegistry.uploadRootFor(ctx),
       filename,
       data: decodeSkillImportData(data),
     });
-    await rt.skillRegistry.setOwner(imported.skillDir, ctx.userId);
-    await rt.skillRegistry.scan();
+    let product: SkillProductRecord;
+    try {
+      product = await rt.skillRegistry.installUploadedProduct(imported.skillDir, ctx);
+      await rt.skillRegistry.scan();
+      const persisted = rt.skillRegistry.list().find((item) => resolve(item.dir) === resolve(imported.skillDir));
+      if (!persisted) throw new Error('导入后未发现有效技能产品记录');
+    } catch (error) {
+      await rm(imported.skillDir, { recursive: true, force: true });
+      await rt.skillRegistry.scan();
+      throw error;
+    }
     rt.systemExtra = rt.skillRegistry.summaries();
-    const importedProduct = rt.skillRegistry.list().find((item) => resolve(item.dir) === resolve(imported.skillDir));
-    const skill = importedProduct ? await rt.skillRegistry.loadFor(importedProduct.name, ctx) : undefined;
-    if (!skill) throw new HttpError(422, '导入后未发现有效技能');
     await rt.audit?.record({
       kind: 'auth', action: 'skill-imported', tenantId: ctx.tenantId,
-      detail: { skill: skill.name, by: ctx.userId, visibility: skill.visibility },
+      detail: { skill: product.name, by: ctx.userId, visibility: product.visibility, pendingReview: true },
     });
-    return sendJson(res, 201, { skill: publicSkill(skill, rt.skillRegistry, ctx) });
+    const { id: _id, path: _path, description: _description, ...publicProduct } = product;
+    return sendJson(res, 201, { product: publicProduct, pendingReview: true });
+  }
+
+  const skillReviewMatch = /^\/v1\/skills\/([^/]+)\/review$/.exec(path);
+  if (method === 'POST' && skillReviewMatch) {
+    const ctx = await requireAuth(rt, req);
+    if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
+    if (ctx.role !== 'tenant_admin' && ctx.role !== 'platform_admin') {
+      throw new HttpError(403, '仅租户或平台管理员可审核技能');
+    }
+    const body = await readJson(req);
+    if (body.reviewed !== true) throw new HttpError(400, 'reviewed 必须为 true');
+    const global = body.global === true;
+    if (global && ctx.role !== 'platform_admin') throw new HttpError(403, '仅平台管理员可全局发布技能');
+    const name = decodeURIComponent(skillReviewMatch[1]!);
+    try {
+      const product = await rt.skillRegistry.review(name, ctx, { global });
+      rt.systemExtra = rt.skillRegistry.summaries();
+      await rt.audit?.record({
+        kind: 'auth', action: 'skill-reviewed', tenantId: ctx.tenantId,
+        detail: { skill: product.name, by: ctx.userId, global },
+      });
+      const { id: _id, path: _path, description: _description, ...publicProduct } = product;
+      return sendJson(res, 200, { product: publicProduct });
+    } catch (error) {
+      throw skillHttpError(error);
+    }
   }
 
   // 共享 / 取消共享：仅所有者（private ↔ shared；对应前端"共享"按钮）。
@@ -1847,6 +1880,10 @@ function parentSkillPath(path: string): string | null {
 function skillHttpError(err: unknown): HttpError {
   const message = err instanceof Error ? err.message : String(err || '技能操作失败');
   if (message.includes('未找到技能')) return new HttpError(404, message);
+  if (message.includes('不能审核自己') || message.includes('仅租户或平台管理员') || message.includes('仅平台管理员')) {
+    return new HttpError(403, message);
+  }
+  if (message.includes('已审核') || message.includes('不唯一')) return new HttpError(409, message);
   if (message.includes('非法技能文件路径') || message.includes('不是目录') || message.includes('不是文件')) {
     return new HttpError(400, message);
   }

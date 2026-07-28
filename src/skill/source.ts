@@ -62,8 +62,9 @@ async function appendRecord(
     if (expectedOwnerUserId && metadata.ownerUserId !== expectedOwnerUserId) {
       throw new Error('ownerUserId 与用户目录不一致');
     }
-    if (expectedOwnerUserId && metadata.visibility === 'public') {
-      throw new Error('用户目录中的 Skill 不能声明 public');
+    if (expectedOwnerUserId && metadata.visibility === 'public'
+      && (!metadata.reviewed || !metadata.allowedTenantIds?.includes('*'))) {
+      throw new Error('用户目录中的 public Skill 必须经过全局审核');
     }
     if (!expectedOwnerUserId && metadata.visibility !== 'public') {
       throw new Error('公共目录中的 Skill 必须声明 public');
