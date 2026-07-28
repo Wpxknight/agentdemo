@@ -4,6 +4,14 @@ import { describe, expect, it } from 'vitest';
 const root = new URL('../', import.meta.url);
 
 describe('Pi delivery baseline', () => {
+  it('builds workspace package declarations before runtime refactor checks', async () => {
+    const manifest = JSON.parse(await readFile(new URL('package.json', root), 'utf8')) as {
+      scripts: Record<string, string>;
+    };
+
+    expect(manifest.scripts['test:runtime-refactor']).toMatch(/^npm run build:packages && npm run typecheck/);
+  });
+
   it('runs the Node, package, full test, web, audit, and image gates in GitLab CI', async () => {
     const source = await readFile(new URL('.gitlab-ci.yml', root), 'utf8');
 
@@ -31,7 +39,7 @@ describe('Pi delivery baseline', () => {
     expect(source).toMatch(/name: AIOP_PI_MODE\s+value: full/);
   });
 
-  it('builds public package dist inside the image instead of copying host artifacts', async () => {
+  it('builds public package bin output inside the image instead of copying host artifacts', async () => {
     const [dockerfile, dockerignore] = await Promise.all([
       readFile(new URL('Dockerfile', root), 'utf8'),
       readFile(new URL('.dockerignore', root), 'utf8'),

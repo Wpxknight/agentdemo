@@ -49,8 +49,9 @@ describe('@aiop/control-contracts', () => {
 
   it('does not expose implementation or transport types', async () => {
     const sources = await readSources(new URL('packages/control-contracts/src/', root));
-    const declarations = await readSources(new URL('packages/control-contracts/bin/', root), '.d.ts');
-    const publicContract = `${sources}\n${declarations}`;
+    const snapshot = await readFile(new URL('docs/public-api/control-contracts.d.ts', root), 'utf8');
+    const declarations = await readSources(new URL('packages/control-contracts/bin/', root), '.d.ts', true);
+    const publicContract = `${sources}\n${snapshot}\n${declarations}`;
     const forbidden = [
       /\bAgentKernel\b/,
       /\bKernelMessage\b/,
@@ -77,10 +78,17 @@ describe('@aiop/control-contracts', () => {
   });
 });
 
-async function readSources(directory: URL, suffix = '.ts'): Promise<string> {
-  const entries: Dirent[] = await readdir(directory, { withFileTypes: true });
+async function readSources(directory: URL, suffix = '.ts', optional = false): Promise<string> {
+  const entries: Dirent[] = await readdir(directory, { withFileTypes: true }).catch((error: unknown) => {
+    if (optional && isMissing(error)) return [];
+    throw error;
+  });
   const files = entries
     .filter((entry) => entry.isFile() && entry.name.endsWith(suffix))
     .sort((left, right) => left.name.localeCompare(right.name));
   return (await Promise.all(files.map((entry) => readFile(new URL(entry.name, directory), 'utf8')))).join('\n');
+}
+
+function isMissing(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && 'code' in error && error.code === 'ENOENT';
 }
