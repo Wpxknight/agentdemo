@@ -249,6 +249,9 @@ export interface AgentTurnCommitsTable {
   run_id: string;
   attempt_id: string;
   turn_no: number;
+  pi_session_id: string | null;
+  pi_leaf_id: string | null;
+  pi_entry_seq: number | null;
   commit_id: string;
   transcript_version: number;
   stop_reason: string | null;
@@ -256,6 +259,43 @@ export interface AgentTurnCommitsTable {
   messages_json: JsonColumn;
   event_sequence_end: number;
   committed_at: Date;
+}
+
+export interface PiSessionsTable {
+  tenant_id: string;
+  session_id: string;
+  current_leaf_id: string | null;
+  committed_leaf_id: string | null;
+  metadata_json: NullableJsonColumn;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface PiSessionEntriesTable {
+  tenant_id: string;
+  session_id: string;
+  entry_id: string;
+  entry_seq: number;
+  parent_id: string | null;
+  entry_type: string;
+  entry_json: JsonColumn;
+  created_at: Date;
+}
+
+export interface AgentRunInboxMessagesTable {
+  tenant_id: string;
+  run_id: string;
+  message_id: string;
+  sequence: number;
+  idempotency_key: string;
+  mode: string;
+  message_json: JsonColumn;
+  status: string;
+  claim_owner: string | null;
+  claim_token: string | null;
+  claim_expires_at: Date | null;
+  created_at: Date;
+  consumed_at: Date | null;
 }
 
 export interface Database {
@@ -277,4 +317,7 @@ export interface Database {
   agent_run_attempts: AgentRunAttemptsTable;
   agent_turn_snapshots: AgentTurnSnapshotsTable;
   agent_turn_commits: AgentTurnCommitsTable;
+  pi_sessions: PiSessionsTable;
+  pi_session_entries: PiSessionEntriesTable;
+  agent_run_inbox_messages: AgentRunInboxMessagesTable;
 }

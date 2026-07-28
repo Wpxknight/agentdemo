@@ -9,6 +9,18 @@ export * from './pi/models.js';
 export * from './pi/session.js';
 export * from './pi/skills.js';
 export * from './pi/tool-bridge.js';
+export * from './store/types.js';
+export * from './store/memory.js';
+export * from './store/mysql.js';
+export * from './store/pi-session-mysql.js';
+export * from './run/attempt.js';
+export * from './run/cancellation.js';
+export * from './run/event-stream.js';
+export * from './run/inbox.js';
+export * from './run/lease.js';
+export * from './run/limits.js';
+export * from './run/manager.js';
+export * from './run/recovery.js';
 
 // file: pi/agent.d.ts
 import type { AgentInputMessage, AgentRunEvent } from '@aiop/control-contracts';
@@ -70,6 +82,7 @@ export declare class PiAgentSession<TMetadata extends SessionMetadata = SessionM
     tools(): AgentHarnessTool<undefined>[];
     metadata(): Promise<TMetadata>;
     entries(): Promise<SessionTreeEntry[]>;
+    appendCustomEntry(customType: string, data?: unknown): Promise<string>;
     close(): Promise<void>;
     private installGovernedToolHook;
     private ensureOpen;
@@ -237,3 +250,428 @@ export declare class GovernedToolExecutionError extends Error {
     constructor(message: string, call: ToolCall, result: ToolResult, cause?: unknown);
 }
 export declare function bridgeGovernedTools(tools: readonly GovernedTool[], options?: GovernedToolBridgeOptions): AgentHarnessTool<undefined>[];
+
+// file: run/attempt.d.ts
+export declare function nextTurnNo(lastTurnNo: number): number;
+
+// file: run/cancellation.d.ts
+import type { DurableRunStore } from '../store/types.js';
+export declare function abortIfCancellationRequested(store: DurableRunStore, identity: {
+    tenantId: string;
+    runId: string;
+}, abort: AbortController): Promise<void>;
+
+// file: run/event-stream.d.ts
+export declare class AsyncEventStream<T> implements AsyncIterable<T> {
+    private readonly values;
+    private readonly waiters;
+    private closed;
+    push(value: T): void;
+    close(): void;
+    [Symbol.asyncIterator](): AsyncIterator<T>;
+}
+
+// file: run/inbox.d.ts
+import type { AgentInputMessage } from '@aiop/control-contracts';
+import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
+import type { DurableRunStore } from '../store/types.js';
+export interface InboxCapableSession {
+    steer(message: AgentInputMessage): Promise<void>;
+    followUp(message: AgentInputMessage): Promise<void>;
+    appendCustomEntry(customType: string, data?: unknown): Promise<string>;
+}
+export declare function drainDurableInbox(input: {
+    store: DurableRunStore;
+    session: InboxCapableSession;
+    entries: readonly SessionTreeEntry[];
+    tenantId: string;
+    runId: string;
+    workerId: string;
+    fencingToken: bigint;
+    now: () => Date;
+    claimTtlMs: number;
+}): Promise<void>;
+
+// file: run/lease.d.ts
+import type { DurableRunStore } from '../store/types.js';
+export declare function startLeaseHeartbeat(input: {
+    store: DurableRunStore;
+    tenantId: string;
+    runId: string;
+    workerId: string;
+    fencingToken: bigint;
+    leaseTtlMs: number;
+    heartbeatMs: number;
+    abort: AbortController;
+    now: () => Date;
+}): () => void;
+
+// file: run/limits.d.ts
+import { type RunLimits } from '@aiop/control-contracts';
+export declare function assertAttemptAllowed(limits: RunLimits | undefined, attemptCount: number, now: Date): void;
+
+// file: run/manager.d.ts
+import type { AgentInputMessage, AgentRunEvent, AppendRunMessageInput, CancelRunInput, DurableRunRuntime, RunHandle, StartRunInput, ResumeRunInput } from '@aiop/control-contracts';
+import type { SessionMetadata, SessionTreeEntry } from '@earendil-works/pi-agent-core';
+import { type InboxCapableSession } from './inbox.js';
+import type { DurableRunStore } from '../store/types.js';
+export interface ManagedPiSession extends InboxCapableSession {
+    continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent>;
+    abort(): Promise<void>;
+    close(): Promise<void>;
+    metadata(): Promise<SessionMetadata & {
+        tenantId?: string;
+    }>;
+    entries(): Promise<SessionTreeEntry[]>;
+}
+export interface DurableRunSessionFactory {
+    create(input: {
+        id?: string;
+        initialMessage: AgentInputMessage;
+        events: unknown;
+        session?: Record<string, unknown>;
+    }): Promise<ManagedPiSession>;
+    load(input: {
+        metadata: SessionMetadata & {
+            tenantId?: string;
+        };
+        initialMessage: AgentInputMessage;
+        events: unknown;
+    }): Promise<ManagedPiSession>;
+}
+export interface DurableRunManagerOptions {
+    store: DurableRunStore;
+    sessions: DurableRunSessionFactory;
+    eventOptions(input: {
+        tenantId: string;
+        runId: string;
+        attemptId: string;
+        turnNo: number;
+    }): unknown;
+    workerId?: string;
+    leaseTtlMs?: number;
+    heartbeatMs?: number;
+    inboxClaimTtlMs?: number;
+    inboxPollMs?: number;
+    now?: () => Date;
+}
+export declare class DurableRunManager implements DurableRunRuntime {
+    private readonly options;
+    private readonly workerId;
+    private readonly leaseTtlMs;
+    private readonly heartbeatMs;
+    private readonly inboxClaimTtlMs;
+    private readonly inboxPollMs;
+    private readonly now;
+    private readonly active;
+    constructor(options: DurableRunManagerOptions);
+    run(input: StartRunInput): Promise<RunHandle>;
+    resume(input: ResumeRunInput): Promise<RunHandle>;
+    cancel(input: CancelRunInput): Promise<void>;
+    append(input: AppendRunMessageInput): Promise<void>;
+    private start;
+    private execute;
+    private syncEntries;
+}
+
+// file: run/recovery.d.ts
+import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
+export declare function committedInboxIds(entries: readonly SessionTreeEntry[]): Set<string>;
+
+// file: store/memory.d.ts
+import { type AgentRunEvent } from '@aiop/control-contracts';
+import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
+import type { ClaimInboxInput, ConsumeInboxInput, DurableRunStore, EnqueueInboxInput, PiSessionRecord, RunInboxMessage, SessionEntryRecord, StoredRun } from './types.js';
+export declare class MemoryRunStore implements DurableRunStore {
+    private readonly now;
+    private readonly runs;
+    private readonly attempts;
+    private readonly events;
+    private readonly sessionRecords;
+    private readonly sessionEntries;
+    private readonly inboxMessages;
+    private transactionTail;
+    constructor(now?: () => Date);
+    create(input: Parameters<DurableRunStore['create']>[0]): Promise<StoredRun>;
+    get(identity: {
+        tenantId: string;
+        runId: string;
+    }): Promise<StoredRun | undefined>;
+    claim(input: Parameters<DurableRunStore['claim']>[0]): Promise<Awaited<ReturnType<DurableRunStore['claim']>>>;
+    renewLease(input: Parameters<DurableRunStore['renewLease']>[0]): Promise<void>;
+    commitTurn(input: Parameters<DurableRunStore['commitTurn']>[0]): Promise<void>;
+    requestCancellation(input: Parameters<DurableRunStore['requestCancellation']>[0]): Promise<void>;
+    complete(input: Parameters<DurableRunStore['complete']>[0]): Promise<void>;
+    listEvents(identity: {
+        tenantId: string;
+        runId: string;
+    }, after?: bigint): Promise<AgentRunEvent[]>;
+    isCancellationRequested(identity: {
+        tenantId: string;
+        runId: string;
+    }): Promise<boolean>;
+    readonly sessions: {
+        create: (input: {
+            tenantId: string;
+            sessionId: string;
+            createdAt: Date;
+            metadata?: Record<string, unknown>;
+        }) => Promise<PiSessionRecord>;
+        get: (tenantId: string, sessionId: string) => Promise<PiSessionRecord | undefined>;
+        appendEntry: (tenantId: string, sessionId: string, entry: SessionTreeEntry) => Promise<SessionEntryRecord>;
+        listEntries: (tenantId: string, sessionId: string, options?: {
+            afterSequence?: bigint;
+            committedOnly?: boolean;
+        }) => Promise<SessionEntryRecord[]>;
+        setCurrentLeaf: (tenantId: string, sessionId: string, leafId: string | null) => Promise<void>;
+    };
+    readonly inbox: {
+        enqueue: (input: EnqueueInboxInput) => Promise<RunInboxMessage>;
+        claimNext: (input: ClaimInboxInput) => Promise<RunInboxMessage | undefined>;
+        markConsumed: (input: ConsumeInboxInput) => Promise<void>;
+        list: (tenantId: string, runId: string) => Promise<RunInboxMessage[]>;
+    };
+    private requireLease;
+    private hasSessionEntry;
+    private reachableEntryIds;
+    private lock;
+}
+
+// file: store/mysql.d.ts
+import { type AgentRunEvent, type RunRecord } from '@aiop/control-contracts';
+import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
+import type { Kysely, Transaction } from 'kysely';
+import type { ClaimInboxInput, ConsumeInboxInput, DurableRunStore, EnqueueInboxInput, PiSessionRecord, RunInboxMessage, SessionEntryRecord, StoredRun } from './types.js';
+type Db = Kysely<any> | Transaction<any>;
+export declare class MysqlRunStore implements DurableRunStore {
+    private readonly db;
+    private readonly transactionalView;
+    private readonly now;
+    constructor(db: Db, transactionalView?: boolean, now?: () => Date);
+    create(input: Parameters<DurableRunStore['create']>[0]): Promise<RunRecord>;
+    get(identity: {
+        tenantId: string;
+        runId: string;
+    }): Promise<StoredRun | undefined>;
+    claim(input: Parameters<DurableRunStore['claim']>[0]): Promise<Awaited<ReturnType<DurableRunStore['claim']>>>;
+    renewLease(input: Parameters<DurableRunStore['renewLease']>[0]): Promise<void>;
+    commitTurn(input: Parameters<DurableRunStore['commitTurn']>[0]): Promise<void>;
+    requestCancellation(input: Parameters<DurableRunStore['requestCancellation']>[0]): Promise<void>;
+    complete(input: Parameters<DurableRunStore['complete']>[0]): Promise<void>;
+    listEvents(identity: {
+        tenantId: string;
+        runId: string;
+    }, after?: bigint): Promise<AgentRunEvent[]>;
+    isCancellationRequested(identity: {
+        tenantId: string;
+        runId: string;
+    }): Promise<boolean>;
+    readonly sessions: {
+        create: (input: {
+            tenantId: string;
+            sessionId: string;
+            createdAt: Date;
+            metadata?: Record<string, unknown>;
+        }) => Promise<PiSessionRecord>;
+        get: (tenantId: string, sessionId: string) => Promise<PiSessionRecord | undefined>;
+        appendEntry: (tenantId: string, sessionId: string, entry: SessionTreeEntry) => Promise<SessionEntryRecord>;
+        listEntries: (tenantId: string, sessionId: string, options?: {
+            afterSequence?: bigint;
+            committedOnly?: boolean;
+        }) => Promise<SessionEntryRecord[]>;
+        setCurrentLeaf: (tenantId: string, sessionId: string, leafId: string | null) => Promise<void>;
+    };
+    readonly inbox: {
+        enqueue: (input: EnqueueInboxInput) => Promise<RunInboxMessage>;
+        claimNext: (input: ClaimInboxInput) => Promise<RunInboxMessage | undefined>;
+        markConsumed: (input: ConsumeInboxInput) => Promise<void>;
+        list: (tenantId: string, runId: string) => Promise<RunInboxMessage[]>;
+    };
+    private transaction;
+    private assertLease;
+    private appendEvent;
+}
+export {};
+
+// file: store/pi-session-mysql.d.ts
+import { Session, type SessionEntryCursorOptions, type SessionForkOptions, type SessionMetadata, type SessionRepo, type SessionStats, type SessionStorage, type SessionTreeEntry } from '@earendil-works/pi-agent-core';
+import type { ColumnType, Kysely, Transaction } from 'kysely';
+type JsonColumn = ColumnType<unknown, string, string>;
+type NullableJsonColumn = ColumnType<unknown, string | null, string | null>;
+export interface PiMysqlSessionMetadata extends SessionMetadata {
+    tenantId: string;
+    metadata?: Record<string, unknown>;
+}
+export interface PiMysqlSessionDatabase {
+    pi_sessions: {
+        tenant_id: string;
+        session_id: string;
+        current_leaf_id: string | null;
+        committed_leaf_id: string | null;
+        metadata_json: NullableJsonColumn;
+        created_at: Date;
+        updated_at: Date;
+    };
+    pi_session_entries: {
+        tenant_id: string;
+        session_id: string;
+        entry_id: string;
+        entry_seq: number;
+        parent_id: string | null;
+        entry_type: string;
+        entry_json: JsonColumn;
+        created_at: Date;
+    };
+}
+type PiDb = Kysely<PiMysqlSessionDatabase> | Transaction<PiMysqlSessionDatabase>;
+export declare class PiMysqlSessionStorage implements SessionStorage<PiMysqlSessionMetadata> {
+    private readonly db;
+    private readonly metadata;
+    private readonly committedOnly;
+    constructor(db: PiDb, metadata: PiMysqlSessionMetadata, committedOnly?: boolean);
+    getMetadata(): Promise<PiMysqlSessionMetadata>;
+    getLeafId(): Promise<string | null>;
+    setLeafId(leafId: string | null): Promise<void>;
+    createEntryId(): Promise<string>;
+    appendEntry(entry: SessionTreeEntry): Promise<void>;
+    getEntry(id: string): Promise<SessionTreeEntry | undefined>;
+    findEntries<TType extends SessionTreeEntry['type']>(type: TType): Promise<Array<Extract<SessionTreeEntry, {
+        type: TType;
+    }>>>;
+    getLabel(id: string): Promise<string | undefined>;
+    getSessionName(): Promise<string | undefined>;
+    getSessionStats(): Promise<SessionStats>;
+    getPathToRootOrCompaction(leafId: string | null): Promise<SessionTreeEntry[]>;
+    getEntries(options?: SessionEntryCursorOptions): Promise<SessionTreeEntry[]>;
+    private visibleEntries;
+    private sessionRow;
+    private pathFrom;
+    private withTransaction;
+}
+export declare class PiMysqlSessionRepo implements SessionRepo<PiMysqlSessionMetadata, {
+    id?: string;
+    tenantId: string;
+    metadata?: Record<string, unknown>;
+}, {
+    tenantId: string;
+}> {
+    private readonly db;
+    private readonly committedOnly;
+    constructor(db: PiDb, committedOnly?: boolean);
+    create(options: {
+        id?: string;
+        tenantId: string;
+        metadata?: Record<string, unknown>;
+    }): Promise<Session<PiMysqlSessionMetadata>>;
+    open(metadata: PiMysqlSessionMetadata): Promise<Session<PiMysqlSessionMetadata>>;
+    list(options: {
+        tenantId: string;
+    }): Promise<PiMysqlSessionMetadata[]>;
+    delete(metadata: PiMysqlSessionMetadata): Promise<void>;
+    fork(source: PiMysqlSessionMetadata, options: SessionForkOptions & {
+        id?: string;
+        tenantId: string;
+        metadata?: Record<string, unknown>;
+    }): Promise<Session<PiMysqlSessionMetadata>>;
+}
+export {};
+
+// file: store/types.d.ts
+import type { AgentInputMessage, AgentRunEvent, AgentRunResult, ClaimRunInput, ClaimedRun, CommitTurnInput, CompleteRunInput, CreateRunRecord, RenewLeaseInput, RequestCancellationInput, RunRecord, RunStore } from '@aiop/control-contracts';
+import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
+export interface StoredRun extends RunRecord {
+    cancelRequestedAt?: Date;
+    cancelReason?: string;
+    result?: AgentRunResult;
+    lastTurnNo: number;
+    checkpoint?: unknown;
+}
+export interface PiSessionRecord {
+    tenantId: string;
+    sessionId: string;
+    createdAt: Date;
+    updatedAt: Date;
+    currentLeafId: string | null;
+    committedLeafId: string | null;
+    metadata?: Record<string, unknown>;
+}
+export interface SessionEntryRecord {
+    tenantId: string;
+    sessionId: string;
+    sequence: bigint;
+    entry: SessionTreeEntry;
+}
+export interface RunInboxMessage {
+    tenantId: string;
+    runId: string;
+    id: string;
+    sequence: bigint;
+    idempotencyKey: string;
+    mode: 'steer' | 'follow_up';
+    message: AgentInputMessage;
+    status: 'pending' | 'claimed' | 'consumed';
+    claimOwner?: string;
+    claimToken?: string;
+    claimExpiresAt?: Date;
+    createdAt: Date;
+    consumedAt?: Date;
+}
+export interface EnqueueInboxInput {
+    tenantId: string;
+    runId: string;
+    idempotencyKey: string;
+    mode: RunInboxMessage['mode'];
+    message: AgentInputMessage;
+    createdAt: Date;
+}
+export interface ClaimInboxInput {
+    tenantId: string;
+    runId: string;
+    workerId: string;
+    fencingToken: bigint;
+    now: Date;
+    claimTtlMs: number;
+}
+export interface ConsumeInboxInput extends ClaimInboxInput {
+    id: string;
+    claimToken: string;
+    consumedAt: Date;
+}
+export interface PiSessionStore {
+    create(input: {
+        tenantId: string;
+        sessionId: string;
+        createdAt: Date;
+        metadata?: Record<string, unknown>;
+    }): Promise<PiSessionRecord>;
+    get(tenantId: string, sessionId: string): Promise<PiSessionRecord | undefined>;
+    appendEntry(tenantId: string, sessionId: string, entry: SessionTreeEntry): Promise<SessionEntryRecord>;
+    listEntries(tenantId: string, sessionId: string, options?: {
+        afterSequence?: bigint;
+        committedOnly?: boolean;
+    }): Promise<SessionEntryRecord[]>;
+    setCurrentLeaf(tenantId: string, sessionId: string, leafId: string | null): Promise<void>;
+}
+export interface RunInboxStore {
+    enqueue(input: EnqueueInboxInput): Promise<RunInboxMessage>;
+    claimNext(input: ClaimInboxInput): Promise<RunInboxMessage | undefined>;
+    markConsumed(input: ConsumeInboxInput): Promise<void>;
+    list(tenantId: string, runId: string): Promise<RunInboxMessage[]>;
+}
+export interface DurableRunStore extends RunStore {
+    get(identity: {
+        tenantId: string;
+        runId: string;
+    }): Promise<StoredRun | undefined>;
+    listEvents(identity: {
+        tenantId: string;
+        runId: string;
+    }, after?: bigint): Promise<AgentRunEvent[]>;
+    isCancellationRequested(identity: {
+        tenantId: string;
+        runId: string;
+    }): Promise<boolean>;
+    sessions: PiSessionStore;
+    inbox: RunInboxStore;
+}
+export type { ClaimRunInput, ClaimedRun, CommitTurnInput, CompleteRunInput, CreateRunRecord, RenewLeaseInput, RequestCancellationInput };

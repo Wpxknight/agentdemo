@@ -57,8 +57,6 @@ type ActiveAgentRun = {
   tenantId: string;
   runId: string;
   abort: AbortController;
-  append: (message: Msg) => void;
-  drain: () => Msg[];
 };
 type ActiveAgentRuns = Map<string, Set<ActiveAgentRun>>;
 /** 无效压缩水位（tenant+session → token 数）：摘要后仍超触发线时记录，历史没涨够前跳过重试。 */
@@ -707,6 +705,13 @@ export function createHttpServer(rt: Runtime): http.Server {
   const runCenter = new RunCenterService(rt.store, {
     abortLocal: (ctx, runId) => abortActiveRunById(activeRuns, ctx.tenantId, runId),
     recover: (ctx, run) => {
+      if (rt.durableRunRuntime) {
+        void rt.durableRunRuntime.resume({
+          identity: { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] },
+          runId: run.runId,
+        }).catch((err) => log.error({ err, runId: run.runId }, 'durable run recovery failed'));
+        return;
+      }
       scheduleAgentRecovery(rt, interactions, activeRuns, compactionWatermarks, ctx, run);
     },
   });
@@ -891,9 +896,14 @@ async function handle(
   const runCancelMatch = /^\/v1\/agent\/runs\/([^/]+)\/cancel$/.exec(path);
   if (method === 'POST' && runCancelMatch) {
     const ctx = await requireAuth(rt, req);
+    const runId = decodeURIComponent(runCancelMatch[1]!);
+    const result = await runCenter.cancel(ctx, runId);
+    await rt.durableRunRuntime?.cancel({
+      identity: { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] }, runId,
+    });
     return sendJson(res, 200, {
       ok: true,
-      ...await runCenter.cancel(ctx, decodeURIComponent(runCancelMatch[1]!)),
+      ...result,
     });
   }
 
@@ -1500,10 +1510,28 @@ async function handle(
   if (method === 'POST' && sessionAppendMatch) {
     const ctx = await requireAuth(rt, req);
     const sessionId = decodeURIComponent(sessionAppendMatch[1]!);
-    const message = userMessageFromBody(await readJson(req));
+    const body = await readJson(req);
+    const message = userMessageFromBody(body);
     const activeRun = findActiveRun(activeRuns, activeRunKey(ctx, sessionId));
-    if (activeRun) {
-      activeRun.append(message);
+    const durableRun = activeRun ?? (await rt.store.listAgentRuns(ctx, { sessionId, limit: 1 }))
+      .find((run) => run.status === 'queued' || run.status === 'running' || run.status === 'waiting');
+    const mode = body.mode === 'follow_up' ? 'follow_up' : 'steer';
+    const idempotencyKey = req.headers['idempotency-key']?.toString()
+      ?? (typeof body.idempotencyKey === 'string' ? body.idempotencyKey : randomUUID());
+    if (durableRun) {
+      if (!rt.durableRunRuntime) throw new HttpError(503, 'Durable run runtime 未配置，无法安全追加运行中消息');
+      await rt.durableRunRuntime.append({
+        identity: { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] },
+        runId: durableRun.runId,
+        message: {
+          role: 'user', text: message.text,
+          content: message.contentBlocks?.map((block) => block.type === 'text'
+            ? { type: 'text' as const, text: block.text }
+            : { type: 'image' as const, mimeType: block.mimeType, data: block.data }),
+        },
+        mode,
+        idempotencyKey,
+      });
       return sendJson(res, 200, { ok: true, sessionId, queued: true });
     }
     await rt.store.appendMessage(ctx, sessionId, message);
@@ -1966,13 +1994,10 @@ async function recoverAgentRun(
   }
 
   const abort = new AbortController();
-  const pendingMessages: Msg[] = [];
   const activeRun: ActiveAgentRun = {
     tenantId: run.tenantId,
     runId: run.runId,
     abort,
-    append: (message) => pendingMessages.push(message),
-    drain: () => pendingMessages.splice(0),
   };
   addActiveRun(activeRuns, activeKey, activeRun);
 
@@ -2053,7 +2078,6 @@ async function recoverAgentRun(
       compactionTriggerTokens: triggerTokens,
       compactionKeepRecent: COMPACTION_KEEP_RECENT,
       compactionWatermarkTokens: compactionWatermarks.get(activeKey),
-      drainPendingMessages: activeRun.drain,
       onEvent: (event) => {
         if (event.type !== 'context_compacted') return;
         if (event.afterTokens > triggerTokens) {
@@ -2072,11 +2096,6 @@ async function recoverAgentRun(
     });
   } finally {
     removeActiveRun(activeRuns, activeKey, activeRun);
-    for (const message of activeRun.drain()) {
-      await rt.store.appendMessage(ctx, run.sessionId, message).catch((err) => {
-        log.warn({ err, runId: run.runId }, '恢复运行残留消息落库失败');
-      });
-    }
   }
 }
 
@@ -2154,14 +2173,11 @@ async function runAgentSse(
   };
   sse('session', { sessionId, runId });
   const abort = new AbortController();
-  const pendingMessages: Msg[] = [];
   const activeKey = activeRunKey(ctx, sessionId);
   const activeRun: ActiveAgentRun = {
     tenantId: ctx.tenantId,
     runId,
     abort,
-    append: (message) => pendingMessages.push(message),
-    drain: () => pendingMessages.splice(0),
   };
   const onClose = () => {
     closed = true;
@@ -2401,7 +2417,6 @@ async function runAgentSse(
       compactionTriggerTokens: triggerTokens,
       compactionKeepRecent: COMPACTION_KEEP_RECENT,
       compactionWatermarkTokens: compactionWatermarks.get(activeKey),
-      drainPendingMessages: activeRun.drain,
       onEvent: (e) => {
         if (e.type === 'text_delta') streamedText += e.text;
         else if (e.type === 'thinking_delta') streamedThinking += e.text;
@@ -2460,17 +2475,7 @@ async function runAgentSse(
       sse('error', { error: err instanceof Error ? err.message : '运行失败' });
     }
   } finally {
-    // 先摘除注册再冲刷残留：摘除后新 append 直写库，不会再进内存队列。
-    // 残留消息（末次 drain 之后 / 运行报错或被终止时入队的）落库，避免用户消息静默丢失。
     removeActiveRun(activeRuns, activeKey, activeRun);
-    const leftover = activeRun.drain();
-    for (const m of leftover) {
-      try {
-        await rt.store.appendMessage(ctx, sessionId, m);
-      } catch (err) {
-        log.warn({ err, sessionId }, '运行结束后残留消息落库失败');
-      }
-    }
     res.off('close', onClose);
     if (!res.destroyed && !res.writableEnded) res.end();
   }

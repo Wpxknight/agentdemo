@@ -9,6 +9,7 @@ import { PermissionRules } from './agent/rules.js';
 import { HookRunner } from './agent/hooks.js';
 import { PlanApprovalState } from './agent/plan.js';
 import { AgentRuntime, createConfiguredAgentRuntime } from './agent/runtime.js';
+import type { DurableRunRuntime } from '@aiop/control-contracts';
 import { SandboxManager, type SandboxManagerLike } from './sandbox/lifecycle.js';
 import {
   SandboxRuntimeController,
@@ -113,6 +114,8 @@ export interface SandboxSettingsUpdate {
 export interface Runtime {
   /** Agent 执行 facade；支持 Legacy 与 Pi Kernel，历史 LangGraph Run 仅供查询。 */
   agentRuntime: AgentRuntime;
+  /** Pi-first durable control plane; deployments enable it while legacy callers migrate. */
+  durableRunRuntime?: DurableRunRuntime;
   model: ChatModel;
   modelConfig?: RuntimeModelConfig;
   modelOptions?: RuntimeModelConfig[];
@@ -204,7 +207,11 @@ export function resolveRuntimeSandboxConfig(
 /** 组装一次运行所需的全部组件（模型/工具/策略/持久化）。 */
 export async function buildRuntime(
   config: Config,
-  options: { store?: Store; settingsSecretBox?: ReturnType<typeof createSettingsSecretBox> } = {},
+  options: {
+    store?: Store;
+    settingsSecretBox?: ReturnType<typeof createSettingsSecretBox>;
+    durableRunRuntime?: DurableRunRuntime;
+  } = {},
 ): Promise<Runtime> {
   let modelConfig = defaultRuntimeModelConfig(config);
   const modelOptions: RuntimeModelConfig[] = Object.entries(config.models).map(([id, cfg]) => ({ id, ...cfg }));
@@ -663,6 +670,7 @@ export async function buildRuntime(
       runStore: store,
       runtimeStore: store.agentRuntimeStore(),
     }),
+    durableRunRuntime: options.durableRunRuntime,
     model,
     modelConfig,
     modelOptions,

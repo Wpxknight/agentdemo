@@ -745,7 +745,7 @@ describe('HTTP server', () => {
     expect(msgs[0]?.text).toContain('note.txt');
   });
 
-  it('queues active session appends into the current agent run', async () => {
+  it('routes active session appends through the durable runtime inbox', async () => {
     const localStore = new MemoryStore();
     await localStore.createTenant({ id: 'default', name: 'Default' });
     const auth = new LocalAuthProvider({ store: localStore, secret: 'append-secret' });
@@ -757,6 +757,7 @@ describe('HTTP server', () => {
     let releaseFirst!: () => void;
     const release = new Promise<void>((resolve) => { releaseFirst = resolve; });
     const seenMessages: Msg[][] = [];
+    const appendDurably = vi.fn(async () => {});
     const queueModel: ChatModel = {
       id: 'queue',
       async *stream(input): AsyncIterable<StreamEvent> {
@@ -780,6 +781,7 @@ describe('HTTP server', () => {
       authProvider: auth,
       jwtSecret: 'append-secret',
       systemExtra: '',
+      durableRunRuntime: { append: appendDurably },
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
 
@@ -804,19 +806,20 @@ describe('HTTP server', () => {
       expect(appended.status).toBe(200);
       expect(await appended.json()).toEqual({ ok: true, sessionId: 'active-append', queued: true });
       expect(seenMessages).toHaveLength(1);
+      expect(appendDurably).toHaveBeenCalledWith(expect.objectContaining({
+        runId: expect.any(String), mode: 'steer',
+        message: expect.objectContaining({ role: 'user', text: expect.stringContaining('中途修正') }),
+      }));
 
       releaseFirst();
       const runResponse = await run;
       expect(runResponse.status).toBe(200);
-      const body = await runResponse.text();
-      expect(body).toContain('已纳入：中途修正');
-      expect(seenMessages).toHaveLength(2);
-      expect(seenMessages[1]!.at(-1)).toMatchObject({ role: 'user', text: expect.stringContaining('中途修正') });
+      await runResponse.text();
+      expect(seenMessages).toHaveLength(1);
 
       const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
       const stored = await localStore.listMessages(ctx, 'active-append');
-      expect(stored.map((message) => message.role)).toEqual(['user', 'assistant', 'user', 'assistant']);
-      expect(stored[2]?.text).toContain('中途修正');
+      expect(stored.map((message) => message.role)).toEqual(['user', 'assistant']);
     } finally {
       await new Promise<void>((resolve) => appendServer.close(() => resolve()));
     }

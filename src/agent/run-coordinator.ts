@@ -3,6 +3,7 @@ import type { RequestContext } from '../auth/types.js';
 import type { AgentRunStatus, AgentRunUsage, Store } from '../db/store.js';
 import type { RunAgentResult } from './run-types.js';
 import { RecoveryRequiredError } from './tool-ledger/store.js';
+import type { AppendRunMessageInput, CancelRunInput, DurableRunRuntime } from '@aiop/control-contracts';
 
 const DEFAULT_LEASE_TTL_MS = 30_000;
 
@@ -42,11 +43,25 @@ export class AgentRunCoordinator {
   private readonly heartbeatMs: number;
   private readonly now: () => Date;
 
-  constructor(private readonly store: Store, options: AgentRunCoordinatorOptions = {}) {
+  constructor(
+    private readonly store: Store,
+    options: AgentRunCoordinatorOptions = {},
+    private readonly durableRuntime?: Pick<DurableRunRuntime, 'append' | 'cancel'>,
+  ) {
     this.ownerId = options.ownerId ?? `${process.pid}:${randomUUID()}`;
     this.leaseTtlMs = options.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS;
     this.heartbeatMs = options.heartbeatMs ?? Math.max(1_000, Math.floor(this.leaseTtlMs / 3));
     this.now = options.now ?? (() => new Date());
+  }
+
+  append(input: AppendRunMessageInput): Promise<void> {
+    if (!this.durableRuntime) throw new Error('Durable run runtime is not configured');
+    return this.durableRuntime.append(input);
+  }
+
+  cancel(input: CancelRunInput): Promise<void> {
+    if (!this.durableRuntime) throw new Error('Durable run runtime is not configured');
+    return this.durableRuntime.cancel(input);
   }
 
   async start(ctx: RequestContext, runId: string): Promise<AgentRunExecution> {

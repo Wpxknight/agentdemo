@@ -228,6 +228,11 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     return this.session.getEntries();
   }
 
+  appendCustomEntry(customType: string, data?: unknown): Promise<string> {
+    this.ensureOpen();
+    return this.session.appendCustomEntry(customType, data);
+  }
+
   async close(): Promise<void> {
     this.closed = true;
     return this.closePromise ??= (async () => {

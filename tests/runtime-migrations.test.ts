@@ -63,6 +63,18 @@ describe('durable runtime migrations', () => {
     expect(source).toContain("default '0.82.1'");
   });
 
+  it('adds Pi sessions, append-only entries, durable inbox, and turn watermarks without dropping legacy data', async () => {
+    const source = await sql('0023_pi_session_and_run_inbox.sql');
+    expect(source).toContain('create table if not exists pi_sessions');
+    expect(source).toContain('create table if not exists pi_session_entries');
+    expect(source).toContain('create table if not exists agent_run_inbox_messages');
+    for (const column of ['pi_session_id', 'pi_leaf_id', 'pi_entry_seq']) expect(source).toContain(column);
+    expect(source).toContain('unique key uq_pi_session_entry_seq');
+    expect(source).toContain('unique key uq_agent_run_inbox_idempotency');
+    expect(source).toContain('unique key uq_agent_run_inbox_sequence');
+    expect(source).not.toMatch(/drop\s+(table|column)/);
+  });
+
   it('registers the new tables and columns in the Kysely schema', async () => {
     const source = (await readFile(new URL('../schema.ts', migrations), 'utf8')).toLowerCase();
     for (const table of ['agentrunattemptstable', 'agentturnsnapshotstable', 'agentturncommitstable']) {

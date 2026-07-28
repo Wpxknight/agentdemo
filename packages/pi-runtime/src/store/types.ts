@@ -1,0 +1,95 @@
+import type {
+  AgentInputMessage, AgentRunEvent, AgentRunResult, ClaimRunInput, ClaimedRun, CommitTurnInput,
+  CompleteRunInput, CreateRunRecord, RenewLeaseInput, RequestCancellationInput, RunRecord, RunStore,
+} from '@aiop/control-contracts';
+import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
+
+export interface StoredRun extends RunRecord {
+  cancelRequestedAt?: Date;
+  cancelReason?: string;
+  result?: AgentRunResult;
+  lastTurnNo: number;
+  checkpoint?: unknown;
+}
+
+export interface PiSessionRecord {
+  tenantId: string;
+  sessionId: string;
+  createdAt: Date;
+  updatedAt: Date;
+  currentLeafId: string | null;
+  committedLeafId: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface SessionEntryRecord {
+  tenantId: string;
+  sessionId: string;
+  sequence: bigint;
+  entry: SessionTreeEntry;
+}
+
+export interface RunInboxMessage {
+  tenantId: string;
+  runId: string;
+  id: string;
+  sequence: bigint;
+  idempotencyKey: string;
+  mode: 'steer' | 'follow_up';
+  message: AgentInputMessage;
+  status: 'pending' | 'claimed' | 'consumed';
+  claimOwner?: string;
+  claimToken?: string;
+  claimExpiresAt?: Date;
+  createdAt: Date;
+  consumedAt?: Date;
+}
+
+export interface EnqueueInboxInput {
+  tenantId: string;
+  runId: string;
+  idempotencyKey: string;
+  mode: RunInboxMessage['mode'];
+  message: AgentInputMessage;
+  createdAt: Date;
+}
+
+export interface ClaimInboxInput {
+  tenantId: string;
+  runId: string;
+  workerId: string;
+  fencingToken: bigint;
+  now: Date;
+  claimTtlMs: number;
+}
+
+export interface ConsumeInboxInput extends ClaimInboxInput {
+  id: string;
+  claimToken: string;
+  consumedAt: Date;
+}
+
+export interface PiSessionStore {
+  create(input: { tenantId: string; sessionId: string; createdAt: Date; metadata?: Record<string, unknown> }): Promise<PiSessionRecord>;
+  get(tenantId: string, sessionId: string): Promise<PiSessionRecord | undefined>;
+  appendEntry(tenantId: string, sessionId: string, entry: SessionTreeEntry): Promise<SessionEntryRecord>;
+  listEntries(tenantId: string, sessionId: string, options?: { afterSequence?: bigint; committedOnly?: boolean }): Promise<SessionEntryRecord[]>;
+  setCurrentLeaf(tenantId: string, sessionId: string, leafId: string | null): Promise<void>;
+}
+
+export interface RunInboxStore {
+  enqueue(input: EnqueueInboxInput): Promise<RunInboxMessage>;
+  claimNext(input: ClaimInboxInput): Promise<RunInboxMessage | undefined>;
+  markConsumed(input: ConsumeInboxInput): Promise<void>;
+  list(tenantId: string, runId: string): Promise<RunInboxMessage[]>;
+}
+
+export interface DurableRunStore extends RunStore {
+  get(identity: { tenantId: string; runId: string }): Promise<StoredRun | undefined>;
+  listEvents(identity: { tenantId: string; runId: string }, after?: bigint): Promise<AgentRunEvent[]>;
+  isCancellationRequested(identity: { tenantId: string; runId: string }): Promise<boolean>;
+  sessions: PiSessionStore;
+  inbox: RunInboxStore;
+}
+
+export type { ClaimRunInput, ClaimedRun, CommitTurnInput, CompleteRunInput, CreateRunRecord, RenewLeaseInput, RequestCancellationInput };
