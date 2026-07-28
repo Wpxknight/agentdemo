@@ -82,7 +82,10 @@ async function appendRecord(
 async function directories(root: string): Promise<string[]> {
   try {
     const entries = await readdir(root, { withFileTypes: true });
-    return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+    return entries
+      .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
+      .map((entry) => entry.name)
+      .sort();
   } catch {
     return [];
   }

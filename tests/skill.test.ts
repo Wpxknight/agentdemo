@@ -1,7 +1,7 @@
 import { mkdtemp, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { hostname, tmpdir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { deflateRawSync } from 'node:zlib';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { SkillRegistry } from '../src/skill/registry.js';
@@ -108,6 +108,42 @@ describe('SkillRegistry', () => {
     expect(prompt).toContain('<name>inspect</name>');
     expect(prompt).toContain('<description>集群巡检</description>');
     expect(prompt).toContain(`<location>${join(dir, 'inspect', 'SKILL.md')}</location>`);
+  });
+
+  it('ignores reserved and hidden directories at every product-source level', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-hidden-skill-sources-'));
+    const hiddenRecords = [
+      { path: join(root, '.aiop-locks', 'lock-as-skill'), tenantId: 'default' },
+      { path: join(root, '.aiop-imports', 'import-as-skill'), tenantId: 'default' },
+      { path: join(root, '.hidden'), tenantId: 'default' },
+      { path: join(root, '_public', '.hidden'), tenantId: 'default' },
+      { path: join(root, 'users', 'owner', '.hidden'), tenantId: 'default', ownerUserId: 'owner' },
+      { path: join(root, 'tenants', 'tenant-a', '.hidden'), tenantId: 'tenant-a' },
+      { path: join(root, 'tenants', 'tenant-a', '_public', '.hidden'), tenantId: 'tenant-a' },
+      { path: join(root, 'tenants', 'tenant-a', 'users', 'owner', '.hidden'), tenantId: 'tenant-a', ownerUserId: 'owner' },
+    ];
+    for (const [index, record] of hiddenRecords.entries()) {
+      await mkdir(record.path, { recursive: true });
+      await writeFile(join(record.path, 'SKILL.md'), `---\nname: hidden-${index}\ndescription: hidden\n---\nbody`);
+      await writeProduct(record.path, {
+        name: `hidden-${index}`, version: '1', enabled: true, reviewed: true,
+        tenantId: record.tenantId, ownerUserId: record.ownerUserId,
+        visibility: record.ownerUserId ? 'private' : 'public',
+      });
+    }
+    const loadedSourceCounts: number[] = [];
+    const registry = new SkillRegistry(root, {
+      loader: async (_env, sources) => {
+        loadedSourceCounts.push(sources.length);
+        return { skills: [], diagnostics: [] };
+      },
+    });
+
+    await registry.scan();
+    await registry.listLoadedFor({ tenantId: 'default', userId: 'owner', role: 'user' });
+
+    expect(registry.list()).toEqual([]);
+    expect(loadedSourceCounts).toEqual([]);
   });
 
   it('load_skill returns full body and lists bundled files', async () => {
@@ -586,8 +622,8 @@ describe('SkillRegistry upload review governance', () => {
     const name = 'stale-lock';
     const lockKey = `skill-name:${name}`;
     const lockPath = join(
-      dirname(root),
-      `.${basename(root)}-locks`,
+      root,
+      '.aiop-locks',
       createHash('sha256').update(lockKey).digest('hex'),
     );
     const expiredOwnerDir = join(lockPath, 'expired-owner');
@@ -606,6 +642,7 @@ describe('SkillRegistry upload review governance', () => {
       tenantId: 'default', userId: 'uploader', role: 'user',
     })).resolves.toMatchObject({ name, reviewed: false });
     await expect(stat(lockPath)).rejects.toThrow();
+    expect((await stat(join(root, '.aiop-locks'))).mode & 0o777).toBe(0o700);
   });
 
   it('does not recover an expired distributed name lock while its owner process is alive', async () => {
@@ -613,8 +650,8 @@ describe('SkillRegistry upload review governance', () => {
     const name = 'live-lock';
     const lockKey = `skill-name:${name}`;
     const lockPath = join(
-      dirname(root),
-      `.${basename(root)}-locks`,
+      root,
+      '.aiop-locks',
       createHash('sha256').update(lockKey).digest('hex'),
     );
     const liveOwnerDir = join(lockPath, 'live-owner');

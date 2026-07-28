@@ -1555,6 +1555,7 @@ describe('HTTP server', () => {
     const otherToken = (await auth.login('other', 'other-user', 'pw'))!;
     const skillRoot = await mkdtemp(join(tmpdir(), 'aiop-http-skill-import-'));
     await mkdir(skillRoot, { recursive: true });
+    await mkdir(join(skillRoot, '.aiop-imports'), { mode: 0o777 });
     const piSkillLoader: ProductSkillLoader = vi.fn(async (env, sources) => (
       loadSourcedSkills<SkillProductRecord>(env, sources)
     ));
@@ -1592,6 +1593,7 @@ describe('HTTP server', () => {
     try {
       const originalInstall = skills.installUploadedProduct.bind(skills);
       const installSpy = vi.spyOn(skills, 'installUploadedProduct').mockImplementationOnce(async (...args) => {
+        expect(args[0].startsWith(`${join(skillRoot, '.aiop-imports')}/`)).toBe(true);
         await skills.scan();
         expect(skills.list()).not.toContainEqual(expect.objectContaining({ name: 'staging-bypass' }));
         return originalInstall(...args);
@@ -1610,6 +1612,7 @@ describe('HTTP server', () => {
       });
       expect(stagingProbeImport.status).toBe(201);
       expect(installSpy).toHaveBeenCalledOnce();
+      expect((await stat(join(skillRoot, '.aiop-imports'))).mode & 0o777).toBe(0o750);
       installSpy.mockRestore();
 
       const imported = await fetch(`${importBase}/v1/skills/import`, {

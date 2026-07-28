@@ -65,6 +65,8 @@ export interface SkillFileBody {
 export const PUBLIC_SKILLS_DIR = '_public';
 export const USER_SKILLS_DIR = 'users';
 export const TENANT_SKILLS_DIR = 'tenants';
+export const SKILL_LOCKS_DIR = '.aiop-locks';
+export const SKILL_IMPORTS_DIR = '.aiop-imports';
 export const PRODUCT_RECORD_FILE = '.product.json';
 
 export function normalizeCredentialFile(value: string): string {

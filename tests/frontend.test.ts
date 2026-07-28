@@ -1180,6 +1180,31 @@ describe('kubernetes frontend deployment', () => {
     expect(service).toMatch(/targetPort:\s+8080/);
   });
 
+  it('backs multi-replica skills with one RWX PVC and seeds image skills safely', async () => {
+    const deployment = await readFile('deploy/k8s/deployment-server.yaml', 'utf8');
+    const pvc = await readFile('deploy/k8s/pvc-skills.yaml', 'utf8');
+    const readme = await readFile('deploy/k8s/README.md', 'utf8');
+
+    expect(deployment).toMatch(/replicas:\s+[2-9]/);
+    expect(pvc).toMatch(/kind:\s+PersistentVolumeClaim/);
+    expect(pvc).toMatch(/name:\s+aiop-skills/);
+    expect(pvc).toContain('ReadWriteMany');
+    expect(pvc).toMatch(/storage:\s+5Gi/);
+    expect(pvc).not.toContain('storageClassName:');
+    expect(deployment.match(/image:\s+aiop:latest/g)).toHaveLength(2);
+    expect(deployment).toMatch(/initContainers:[\s\S]*name:\s+seed-skills/);
+    expect(deployment).toMatch(/seed-skills[\s\S]*runAsUser:\s+0/);
+    expect(deployment).toContain('cp -an /app/skills/. /skills-data/');
+    expect(deployment).toContain('chown -R node:node /skills-data');
+    expect(deployment).not.toMatch(/seed-skills[\s\S]*rm\s+-rf\s+\/skills-data/);
+    expect(deployment).toMatch(/name:\s+skills\s*\n\s+mountPath:\s+\/skills-data/);
+    expect(deployment).toMatch(/name:\s+skills\s*\n\s+mountPath:\s+\/app\/skills/);
+    expect(deployment).toMatch(/persistentVolumeClaim:\s*\n\s+claimName:\s+aiop-skills/);
+    expect(readme).toContain('ReadWriteMany');
+    expect(readme).toMatch(/StorageClass/i);
+    expect(readme).toContain('pvc-skills.yaml');
+  });
+
   it('applies the same sidecar layout to the dev deployment', async () => {
     const deployment = await readFile('deploy/dev-k8s/aiop-deployment.yaml', 'utf8');
 

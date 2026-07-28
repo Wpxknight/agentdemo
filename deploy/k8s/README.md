@@ -8,6 +8,16 @@ HTTP 服务 Pod 内包含两个容器：
 
 `deployment-server.yaml` 同时承载 HTTP + SSE 服务和调度器。调度器靠 DB 原子领取到点任务，避免重复执行。
 
+## 共享技能存储
+
+`aiop-server` 默认运行 2 个副本，因此所有副本必须把同一个 `aiop-skills` PVC 挂载到 `/app/skills`。
+PVC 使用 `ReadWriteMany`，默认申请 5Gi。集群的默认 StorageClass 必须支持 RWX；如果默认 StorageClass
+不支持 RWX，请在部署前为 `pvc-skills.yaml` 设置集群提供的 RWX `storageClassName`。
+
+`seed-skills` initContainer 与后端使用相同的 `aiop:latest` 镜像，把镜像内置技能以 `cp -an` 方式补充到 PVC，
+不会覆盖或删除 PVC 中已有的技能、`.aiop-locks` 或 `.aiop-imports`。随后它把共享目录归属设置为 `node:node`，
+主容器继续以非 root 的 node 用户运行，并可在共享目录中上传技能和创建跨 Pod 名称锁。
+
 ## 构建镜像
 
 ```sh
@@ -21,6 +31,7 @@ docker build -f web/Dockerfile -t aiop-web:latest .
 kubectl apply -f namespace.yaml
 kubectl apply -f configmap.yaml          # config.jsonc（按需改）
 kubectl apply -f secret.example.yaml     # 改成真实值后 apply（勿提交真实密钥）
+kubectl apply -f pvc-skills.yaml         # 需要支持 ReadWriteMany 的 StorageClass
 kubectl apply -f deployment-server.yaml
 kubectl apply -f service.yaml
 # 运维目标集群的 kubectl ServiceAccount + RBAC（按需）：

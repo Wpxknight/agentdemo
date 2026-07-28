@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
-import { basename, dirname, join, posix, resolve, sep } from 'node:path';
+import { dirname, join, posix, resolve, sep } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { logger } from '../logger.js';
 import type { JsonValue, ToolResult } from '../model/types.js';
@@ -10,6 +10,8 @@ import { isAdminRole } from '../auth/rbac.js';
 import { NodeExecutionEnv } from '@earendil-works/pi-agent-core/node';
 import {
   PUBLIC_SKILLS_DIR,
+  SKILL_IMPORTS_DIR,
+  SKILL_LOCKS_DIR,
   USER_SKILLS_DIR,
   type Skill,
   type SkillFileBody,
@@ -85,6 +87,10 @@ export class SkillRegistry {
 
   rootDir(): string {
     return this.dir;
+  }
+
+  importStagingRoot(): string {
+    return join(resolve(this.dir), SKILL_IMPORTS_DIR);
   }
 
   /** 技能导入的落盘根：管理员 → _public；普通用户 → users/<uid>。 */
@@ -451,10 +457,11 @@ export class SkillRegistry {
 
   private async withDistributedNameLock<T>(name: string, operation: () => Promise<T>): Promise<T> {
     const key = `skill-name:${name}`;
-    const lockRoot = join(dirname(resolve(this.dir)), `.${basename(resolve(this.dir))}-locks`);
+    const lockRoot = join(resolve(this.dir), SKILL_LOCKS_DIR);
     const lockPath = join(lockRoot, createHash('sha256').update(key).digest('hex'));
     const token = randomUUID();
-    await mkdir(lockRoot, { recursive: true });
+    await mkdir(lockRoot, { recursive: true, mode: 0o700 });
+    await chmod(lockRoot, 0o700);
     const startedAt = Date.now();
     for (;;) {
       const candidatePath = `${lockPath}.candidate-${token}`;

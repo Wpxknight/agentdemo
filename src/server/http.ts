@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFile, rm } from 'node:fs/promises';
-import { basename, dirname, join, resolve } from 'node:path';
+import { chmod, mkdir, readFile, rm } from 'node:fs/promises';
+import { basename, join } from 'node:path';
 import { SignJWT, jwtVerify } from 'jose';
 import { logger } from '../logger.js';
 import type { Runtime, RuntimeModelConfig } from '../runtime.js';
@@ -1046,8 +1046,10 @@ async function handle(
     if (!filename || !data) throw new HttpError(400, 'filename/data 必填');
     if (!/\.zip$/i.test(filename)) throw new HttpError(400, '仅支持导入 zip 技能包');
 
-    const registryRoot = resolve(rt.skillRegistry.rootDir());
-    const stagingRoot = join(dirname(registryRoot), `.${basename(registryRoot)}-imports`, randomUUID());
+    const stagingBase = rt.skillRegistry.importStagingRoot();
+    await mkdir(stagingBase, { recursive: true, mode: 0o750 });
+    await chmod(stagingBase, 0o750);
+    const stagingRoot = join(stagingBase, randomUUID());
     const uploadRoot = rt.skillRegistry.uploadRootFor(ctx);
     let imported: Awaited<ReturnType<typeof importSkillZip>>;
     try {
