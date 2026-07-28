@@ -48,6 +48,7 @@ describe('ToolRuntimeEngine', () => {
         get: async () => undefined,
         putIfAbsent: async () => { throw new Error('ledger unavailable'); },
         update: async () => undefined,
+        claimPendingApproval: async () => false,
       },
       definitions: [{
         name: 'write', description: 'write', inputSchema: { type: 'object' }, capability: 'retryable_write', execute,

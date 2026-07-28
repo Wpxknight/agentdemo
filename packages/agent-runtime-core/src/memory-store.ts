@@ -232,6 +232,16 @@ export class MemoryRuntimeStore implements RuntimeStore {
       if (!this.state.ledger.has(key)) throw new Error(`Tool ledger record not found: ${key}`);
       this.state.ledger.set(key, clone(record));
     },
+    claimPendingApproval: async (input: import('./store.js').ToolLedgerApprovalClaim): Promise<boolean> => {
+      const key = ledgerKey(input);
+      const current = this.state.ledger.get(key);
+      if (!current || current.status !== 'pending_approval' || current.attemptId !== input.attemptId
+        || current.turnNo !== input.turnNo || current.toolCallId !== input.toolCallId
+        || current.toolName !== input.toolName || current.argsDigest !== input.argsDigest
+        || current.approvedInteractionId !== input.approvedInteractionId) return false;
+      this.state.ledger.set(key, clone(input.started));
+      return true;
+    },
   };
 
   readonly events = {

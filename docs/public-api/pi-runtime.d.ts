@@ -810,15 +810,31 @@ export interface ToolInteractionStore {
 }
 
 // file: tools/audit.d.ts
-import type { ToolCall, ToolExecutionContext, ToolExecutionOutcome } from '@aiop/control-contracts';
-import type { GovernedToolDefinition } from './adapter.js';
+import type { ToolCapability } from '@aiop/control-contracts';
+export type ToolAuditStatus = 'unknown_tool' | 'cached_completed' | 'ledger_mismatch' | 'policy_denied' | 'approval_waiting' | 'invalid_resolution' | 'recovery_required' | 'success' | 'failure' | 'internal_error';
+export interface ToolAuditEvent {
+    tenantId: string;
+    actorId: string;
+    runId: string;
+    attemptId: string;
+    turnNo: number;
+    sessionId?: string;
+    toolName: string;
+    toolCallId: string;
+    logicalCallId: string;
+    capability?: ToolCapability;
+    argsDigest: string;
+    status: ToolAuditStatus;
+    outcomeKind: 'result' | 'waiting' | 'recovery_required' | 'exception';
+    isError: boolean;
+    errorCode?: string;
+    resultDigest?: string;
+    durationMs: number;
+    recordedAt: Date;
+}
 export interface ToolAudit {
-    record(input: {
-        call: ToolCall;
-        context: ToolExecutionContext;
-        tool: GovernedToolDefinition;
-        outcome: ToolExecutionOutcome;
-    }): Promise<void>;
+    record(event: ToolAuditEvent): Promise<void>;
+    failure?(error: unknown, event: ToolAuditEvent): void;
 }
 
 // file: tools/concurrency.d.ts
@@ -826,15 +842,17 @@ export interface ResourceConcurrency {
     run<T>(input: {
         tenantId: string;
         resourceKey?: string;
+        signal?: AbortSignal;
     }, work: () => Promise<T>): Promise<T>;
 }
 export declare class ResourceConcurrencyController implements ResourceConcurrency {
     private readonly maxConcurrentPerResource;
-    private readonly resources;
+    private readonly tenants;
     constructor(maxConcurrentPerResource?: number);
     run<T>(input: {
         tenantId: string;
         resourceKey?: string;
+        signal?: AbortSignal;
     }, work: () => Promise<T>): Promise<T>;
 }
 
@@ -872,6 +890,16 @@ export interface ToolLedgerStore {
     putIfAbsent(record: DurableToolLedgerUpdate): Promise<boolean>;
     get(identity: ToolLedgerIdentity): Promise<DurableToolLedgerUpdate | undefined>;
     update(record: DurableToolLedgerUpdate): Promise<void>;
+    claimPendingApproval(input: ToolApprovalClaim): Promise<boolean>;
+}
+export interface ToolApprovalClaim extends ToolLedgerIdentity {
+    attemptId: string;
+    turnNo: number;
+    toolCallId: string;
+    toolName: string;
+    argsDigest: string;
+    approvedInteractionId: string;
+    started: DurableToolLedgerUpdate;
 }
 export declare function digestToolValue(value: JsonValue | string): string;
 

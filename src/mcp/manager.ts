@@ -30,6 +30,7 @@ interface ServerState {
   client?: McpClientLike;
   handlers: ToolHandler[];
   connectedAt?: string;
+  generation: number;
 }
 
 /**
@@ -45,7 +46,7 @@ export class McpManager {
     private readonly connect: McpConnectFn,
   ) {
     for (const [name, cfg] of Object.entries(initial)) {
-      this.servers.set(name, { config: cfg, status: 'error', handlers: [] });
+      this.servers.set(name, { config: cfg, status: 'error', handlers: [], generation: 0 });
     }
   }
 
@@ -54,19 +55,28 @@ export class McpManager {
     await Promise.all([...this.servers.keys()].map((name) => this.connectServer(name)));
   }
 
-  private async connectServer(name: string): Promise<ServerState> {
+  private async connectServer(name: string, reservedGeneration?: number): Promise<ServerState> {
     const state = this.servers.get(name);
     if (!state) throw new Error(`mcp server 不存在: ${name}`);
+    const generation = reservedGeneration ?? ++state.generation;
+    let client: McpClientLike | undefined;
     try {
-      const client = await this.connect(name, state.config);
+      client = await this.connect(name, state.config);
       const { tools } = await client.listTools();
+      if (this.servers.get(name) !== state || state.generation !== generation) {
+        await client.close().catch(() => {});
+        return state;
+      }
+      const connectedClient = client;
       state.client = client;
-      state.handlers = tools.map((t) => this.makeHandler(name, state.config, client, t));
+      state.handlers = tools.map((t) => this.makeHandler(name, state.config, connectedClient, t));
       state.status = 'connected';
       state.error = undefined;
       state.connectedAt = new Date().toISOString();
       log.info({ server: name, tools: tools.length }, 'mcp server connected');
     } catch (err) {
+      await client?.close().catch(() => {});
+      if (this.servers.get(name) !== state || state.generation !== generation) return state;
       state.client = undefined;
       state.handlers = [];
       state.status = 'error';
@@ -105,7 +115,7 @@ export class McpManager {
   /** 新增 server 并连接；连接失败时保留 error 状态（可 reconnect），不抛异常。 */
   async add(name: string, config: McpServerConfig): Promise<McpServerInfo> {
     if (this.servers.has(name)) throw new Error(`mcp server 已存在: ${name}`);
-    this.servers.set(name, { config, status: 'error', handlers: [] });
+    this.servers.set(name, { config, status: 'error', handlers: [], generation: 0 });
     await this.connectServer(name);
     return this.info(name)!;
   }
@@ -114,6 +124,7 @@ export class McpManager {
   async remove(name: string): Promise<boolean> {
     const state = this.servers.get(name);
     if (!state) return false;
+    state.generation += 1;
     this.servers.delete(name);
     await state.client?.close().catch(() => {});
     return true;
@@ -123,10 +134,20 @@ export class McpManager {
   async reconnect(name: string): Promise<McpServerInfo> {
     const state = this.servers.get(name);
     if (!state) throw new Error(`mcp server 不存在: ${name}`);
-    await state.client?.close().catch(() => {});
+    const generation = ++state.generation;
+    const previousClient = state.client;
     state.client = undefined;
-    await this.connectServer(name);
-    return this.info(name)!;
+    state.handlers = [];
+    await previousClient?.close().catch(() => {});
+    if (this.servers.get(name) !== state || state.generation !== generation) {
+      const current = this.info(name);
+      if (!current) throw new Error(`mcp server 不存在: ${name}`);
+      return current;
+    }
+    await this.connectServer(name, generation);
+    const current = this.info(name);
+    if (!current) throw new Error(`mcp server 不存在: ${name}`);
+    return current;
   }
 
   /** 单个 server 的公开信息（不含 headers 敏感值）。 */
@@ -160,6 +181,7 @@ export class McpManager {
   }
 
   async close(): Promise<void> {
+    for (const state of this.servers.values()) state.generation += 1;
     await Promise.all(
       [...this.servers.values()].map((s) => s.client?.close().catch(() => {})),
     );
@@ -173,7 +195,20 @@ function mcpCapability(
 ): 'read' | 'retryable_write' | 'non_idempotent_write' {
   const configured = config.toolCapabilities?.[tool.name];
   if (configured) return configured;
-  if (tool.annotations?.readOnlyHint === true) return 'read';
-  if (tool.annotations?.idempotentHint === true && tool.annotations.readOnlyHint === false) return 'retryable_write';
-  return 'non_idempotent_write';
+  const annotated = tool.annotations?.readOnlyHint === true
+    ? 'read'
+    : tool.annotations?.idempotentHint === true && tool.annotations.readOnlyHint === false
+      ? 'retryable_write'
+      : 'non_idempotent_write';
+  return moreRestrictive('non_idempotent_write', annotated);
+}
+
+const CAPABILITY_RESTRICTION = {
+  read: 0,
+  retryable_write: 1,
+  non_idempotent_write: 2,
+} as const;
+
+function moreRestrictive<T extends keyof typeof CAPABILITY_RESTRICTION>(left: T, right: T): T {
+  return CAPABILITY_RESTRICTION[left] >= CAPABILITY_RESTRICTION[right] ? left : right;
 }

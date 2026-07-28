@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { McpManager, mcpToolName } from '../src/mcp/manager.js';
 import { connectMcp } from '../src/mcp/client.js';
-import type { McpClientLike, McpServerConfig } from '../src/mcp/types.js';
+import type { McpClientLike, McpServerConfig, McpToolInfo } from '../src/mcp/types.js';
 
-function fakeClient(tools: { name: string; description?: string }[]): McpClientLike {
+function fakeClient(tools: Array<Pick<McpToolInfo, 'name' | 'description' | 'annotations'>>): McpClientLike {
   return {
     listTools: vi.fn(async () => ({
       tools: tools.map((t) => ({ ...t, inputSchema: { type: 'object' } })),
@@ -13,6 +13,16 @@ function fakeClient(tools: { name: string; description?: string }[]): McpClientL
     })),
     close: vi.fn(async () => {}),
   };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 describe('McpManager', () => {
@@ -31,6 +41,36 @@ describe('McpManager', () => {
     expect(tools).toHaveLength(1);
     expect(tools[0]!.def.name).toBe('mcp__fs__read');
     expect(tools[0]!.def.name).toBe(mcpToolName('fs', 'read'));
+  });
+
+  it('does not trust a server read-only annotation to downgrade the default capability', async () => {
+    const client = fakeClient([{ name: 'compromised', annotations: { readOnlyHint: true } }]);
+    const mgr = new McpManager(
+      { remote: { transport: 'http', url: 'http://untrusted.example' } },
+      async () => client,
+    );
+
+    await mgr.start();
+
+    expect(mgr.tools()[0]!.capability).toBe('non_idempotent_write');
+  });
+
+  it('allows trusted configuration to explicitly downgrade a tool capability', async () => {
+    const client = fakeClient([{ name: 'reviewed', annotations: { destructiveHint: true } }]);
+    const mgr = new McpManager(
+      {
+        remote: {
+          transport: 'http',
+          url: 'http://reviewed.example',
+          toolCapabilities: { reviewed: 'read' },
+        },
+      },
+      async () => client,
+    );
+
+    await mgr.start();
+
+    expect(mgr.tools()[0]!.capability).toBe('read');
   });
 
   it('dispatch forwards to callTool and extracts text', async () => {
@@ -122,6 +162,47 @@ describe('McpManager', () => {
   it('reconnect on unknown server throws', async () => {
     const mgr = new McpManager({}, async () => fakeClient([]));
     await expect(mgr.reconnect('nope')).rejects.toThrow('不存在');
+  });
+
+  it('keeps the newer reconnect when an older initial connection finishes last', async () => {
+    const firstConnection = deferred<McpClientLike>();
+    const secondConnection = deferred<McpClientLike>();
+    const oldClient = fakeClient([{ name: 'old' }]);
+    const newClient = fakeClient([{ name: 'new' }]);
+    let calls = 0;
+    const mgr = new McpManager(
+      { racing: { transport: 'stdio', command: 'x' } },
+      async () => (++calls === 1 ? firstConnection.promise : secondConnection.promise),
+    );
+
+    const starting = mgr.start();
+    const reconnecting = mgr.reconnect('racing');
+    secondConnection.resolve(newClient);
+    await reconnecting;
+    firstConnection.resolve(oldClient);
+    await starting;
+
+    expect(mgr.info('racing')?.tools).toEqual(['mcp__racing__new']);
+    expect(oldClient.close).toHaveBeenCalledOnce();
+    expect(newClient.close).not.toHaveBeenCalled();
+  });
+
+  it('closes a client whose connection finishes after the server is removed', async () => {
+    const connection = deferred<McpClientLike>();
+    const client = fakeClient([{ name: 'late' }]);
+    const mgr = new McpManager(
+      { removed: { transport: 'stdio', command: 'x' } },
+      async () => connection.promise,
+    );
+
+    const starting = mgr.start();
+    await expect(mgr.remove('removed')).resolves.toBe(true);
+    connection.resolve(client);
+    await starting;
+
+    expect(client.close).toHaveBeenCalledOnce();
+    expect(mgr.info('removed')).toBeUndefined();
+    expect(mgr.tools()).toEqual([]);
   });
 });
 

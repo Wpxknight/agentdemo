@@ -174,6 +174,7 @@ export declare class MemoryRuntimeStore implements RuntimeStore {
             logicalCallId: string;
         }) => Promise<ToolLedgerRecord | undefined>;
         update: (record: ToolLedgerRecord) => Promise<void>;
+        claimPendingApproval: (input: import("./store.js").ToolLedgerApprovalClaim) => Promise<boolean>;
     };
     readonly events: {
         append: (event: Omit<AgentRunEvent, "sequence">) => Promise<AgentRunEvent>;
@@ -374,6 +375,17 @@ export interface ToolLedgerRepository {
         logicalCallId: string;
     }): Promise<ToolLedgerRecord | undefined>;
     update(record: ToolLedgerRecord): Promise<void>;
+    claimPendingApproval(input: ToolLedgerApprovalClaim): Promise<boolean>;
+}
+export interface ToolLedgerApprovalClaim extends RunIdentity {
+    logicalCallId: string;
+    attemptId: string;
+    turnNo: number;
+    toolCallId: string;
+    toolName: string;
+    argsDigest: string;
+    approvedInteractionId: string;
+    started: ToolLedgerRecord;
 }
 export interface RunEventRepository {
     append(event: Omit<AgentRunEvent, 'sequence'>): Promise<AgentRunEvent>;

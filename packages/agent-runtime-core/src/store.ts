@@ -131,6 +131,18 @@ export interface ToolLedgerRepository {
   putIfAbsent(record: ToolLedgerRecord): Promise<boolean>;
   get(identity: RunIdentity & { logicalCallId: string }): Promise<ToolLedgerRecord | undefined>;
   update(record: ToolLedgerRecord): Promise<void>;
+  claimPendingApproval(input: ToolLedgerApprovalClaim): Promise<boolean>;
+}
+
+export interface ToolLedgerApprovalClaim extends RunIdentity {
+  logicalCallId: string;
+  attemptId: string;
+  turnNo: number;
+  toolCallId: string;
+  toolName: string;
+  argsDigest: string;
+  approvedInteractionId: string;
+  started: ToolLedgerRecord;
 }
 
 export interface RunEventRepository {

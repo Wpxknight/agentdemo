@@ -177,6 +177,7 @@ export declare class MysqlRuntimeStore implements RuntimeStore {
             logicalCallId: string;
         }) => Promise<ToolLedgerRecord | undefined>;
         update: (record: ToolLedgerRecord) => Promise<void>;
+        claimPendingApproval: (input: import("@aiop/agent-runtime-core").ToolLedgerApprovalClaim) => Promise<boolean>;
     };
     readonly events: {
         append: (event: Omit<AgentRunEvent, "sequence">) => Promise<AgentRunEvent>;

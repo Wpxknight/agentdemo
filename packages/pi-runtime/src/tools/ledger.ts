@@ -11,10 +11,21 @@ export interface ToolLedgerStore {
   putIfAbsent(record: DurableToolLedgerUpdate): Promise<boolean>;
   get(identity: ToolLedgerIdentity): Promise<DurableToolLedgerUpdate | undefined>;
   update(record: DurableToolLedgerUpdate): Promise<void>;
+  claimPendingApproval(input: ToolApprovalClaim): Promise<boolean>;
+}
+
+export interface ToolApprovalClaim extends ToolLedgerIdentity {
+  attemptId: string;
+  turnNo: number;
+  toolCallId: string;
+  toolName: string;
+  argsDigest: string;
+  approvedInteractionId: string;
+  started: DurableToolLedgerUpdate;
 }
 
 export function digestToolValue(value: JsonValue | string): string {
-  return createHash('sha256').update(typeof value === 'string' ? value : stable(value)).digest('hex');
+  return createHash('sha256').update(stable(value)).digest('hex');
 }
 
 function stable(value: JsonValue): string {

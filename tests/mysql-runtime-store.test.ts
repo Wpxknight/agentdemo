@@ -32,6 +32,24 @@ describe('MySQL runtime adapter contract', () => {
     expect(source).not.toContain("user_id: '', session_id: ''");
     expect(source).not.toContain('tool_call_id: null');
   });
+
+  it('claims a pending approval with one conditional atomic update', async () => {
+    const source = await readFile(sourceUrl, 'utf8');
+    const method = source.slice(
+      source.indexOf('claimPendingApproval:'),
+      source.indexOf('readonly events ='),
+    );
+    for (const predicate of [
+      "where('status', '=', 'pending_approval')",
+      "where('attempt_id', '=', input.attemptId)",
+      "where('turn_no', '=', input.turnNo)",
+      "where('tool_call_id', '=', input.toolCallId)",
+      "where('tool_name', '=', input.toolName)",
+      "where('args_digest', '=', input.argsDigest)",
+      "where('approved_interaction_id', '=', input.approvedInteractionId)",
+    ]) expect(method).toContain(predicate);
+    expect(method).toContain('numUpdatedRows');
+  });
 });
 
 describe('MySQL Run Center query contract', () => {

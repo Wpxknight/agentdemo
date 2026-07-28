@@ -8,6 +8,7 @@ import {
   type ResourceConcurrency,
 } from '@aiop/pi-runtime';
 import type { RunAgentOptions } from '../run-types.js';
+import { logger } from '../../logger.js';
 
 export function createAIOPToolRuntime(
   options: RunAgentOptions,
@@ -41,6 +42,18 @@ export function createAIOPToolRuntime(
     ledger,
     concurrency,
     interactions,
+    audit: {
+      record: async (event) => {
+        logger.info({ mod: 'pi-tool-audit', ...event }, 'governed tool outcome');
+      },
+      failure: (error, event) => {
+        logger.warn({
+          mod: 'pi-tool-audit', err: safeAuditError(error),
+          tenantId: event.tenantId, runId: event.runId,
+          toolCallId: event.toolCallId, status: event.status,
+        }, 'governed tool audit sink failed');
+      },
+    },
     policy: {
       check: async (call) => {
         await options.runGuard?.();
@@ -163,6 +176,17 @@ class MemoryToolLedger implements ToolLedgerRepository {
   async update(record: import('@aiop/control-contracts').DurableToolLedgerUpdate): Promise<void> {
     this.records.set(ledgerKey(record), structuredClone(record));
   }
+
+  async claimPendingApproval(input: import('@aiop/agent-runtime-core').ToolLedgerApprovalClaim): Promise<boolean> {
+    const key = ledgerKey(input);
+    const current = this.records.get(key);
+    if (!current || current.status !== 'pending_approval' || current.attemptId !== input.attemptId
+      || current.turnNo !== input.turnNo || current.toolCallId !== input.toolCallId
+      || current.toolName !== input.toolName || current.argsDigest !== input.argsDigest
+      || current.approvedInteractionId !== input.approvedInteractionId) return false;
+    this.records.set(key, structuredClone(input.started));
+    return true;
+  }
 }
 
 async function commitLedger(
@@ -176,6 +200,10 @@ async function commitLedger(
 
 function ledgerKey(input: { tenantId: string; runId: string; logicalCallId: string }): string {
   return `${input.tenantId}:${input.runId}:${input.logicalCallId}`;
+}
+
+function safeAuditError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function interactionKind(name: string): 'question' | 'plan' | undefined {

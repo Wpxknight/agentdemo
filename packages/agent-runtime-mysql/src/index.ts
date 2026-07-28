@@ -296,6 +296,20 @@ export class MysqlRuntimeStore implements RuntimeStore {
       }).where('tenant_id', '=', record.tenantId).where('run_id', '=', record.runId)
         .where('logical_call_id', '=', record.logicalCallId).execute();
     },
+    claimPendingApproval: async (input: import('@aiop/agent-runtime-core').ToolLedgerApprovalClaim): Promise<boolean> => {
+      const result = await this.db.updateTable('agent_tool_executions').set({
+        attempt_id: input.started.attemptId, turn_no: input.started.turnNo,
+        tool_call_id: input.started.toolCallId, idempotency_key: input.started.idempotencyKey,
+        capability: input.started.capability, approved_interaction_id: input.started.approvedInteractionId ?? null,
+        status: input.started.status, updated_at: input.started.updatedAt,
+      }).where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId)
+        .where('logical_call_id', '=', input.logicalCallId).where('status', '=', 'pending_approval')
+        .where('attempt_id', '=', input.attemptId).where('turn_no', '=', input.turnNo)
+        .where('tool_call_id', '=', input.toolCallId).where('tool_name', '=', input.toolName)
+        .where('args_digest', '=', input.argsDigest)
+        .where('approved_interaction_id', '=', input.approvedInteractionId).executeTakeFirst();
+      return Number(result.numUpdatedRows ?? 0) === 1;
+    },
   };
 
   readonly events = {

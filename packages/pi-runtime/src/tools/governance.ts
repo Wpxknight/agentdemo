@@ -9,7 +9,7 @@ import type {
 } from '@aiop/control-contracts';
 import type { GovernedToolDefinition } from './adapter.js';
 import type { ToolApproval, ToolApprovalDecision, ToolInteractionStore } from './approval.js';
-import type { ToolAudit } from './audit.js';
+import type { ToolAudit, ToolAuditEvent, ToolAuditStatus } from './audit.js';
 import { ResourceConcurrencyController, type ResourceConcurrency } from './concurrency.js';
 import { digestToolValue, type ToolLedgerStore } from './ledger.js';
 import type { ToolPolicy, ToolPolicyDecision } from './policy.js';
@@ -50,12 +50,24 @@ class GovernedToolRuntime implements ToolRuntime {
   }
 
   async execute(call: ToolCall, context: ToolExecutionContext): Promise<ToolExecutionOutcome> {
+    const startedAt = Date.now();
+    try {
+      const outcome = await this.executeGoverned(call, context);
+      await this.recordAuditBestEffort(call, context, outcome, startedAt);
+      return outcome;
+    } catch (error) {
+      await this.recordAuditBestEffort(call, context, undefined, startedAt, error);
+      throw error;
+    }
+  }
+
+  private async executeGoverned(call: ToolCall, context: ToolExecutionContext): Promise<ToolExecutionOutcome> {
     const tool = this.definitions.get(call.name);
     if (!tool) return result(call.id, `unknown tool: ${call.name}`, true);
     const policy = await this.options.policy?.check(call, context, tool) ?? { allowed: true };
-    if (!policy.allowed) return this.audited(call, context, tool, result(
+    if (!policy.allowed) return result(
       call.id, `blocked by policy: ${policy.reason ?? 'denied'}`, true,
-    ));
+    );
     if (tool.interactionKind) return this.executeInteraction(call, context, tool, tool.interactionKind);
 
     const argsDigest = digestToolValue(call.arguments);
@@ -84,8 +96,16 @@ class GovernedToolRuntime implements ToolRuntime {
     if (!approval.approved) return this.handleUnapproved(call, context, tool, policy, approval);
 
     const record = this.startedRecord(call, context, tool, argsDigest, approval, existing);
-    if (existing) await this.options.ledger.update(record);
-    else if (!await this.options.ledger.putIfAbsent(record)) return this.execute(call, context);
+    if (existing && trustedApproval) {
+      const claimed = await this.options.ledger.claimPendingApproval({
+        tenantId: existing.tenantId, runId: existing.runId, logicalCallId: existing.logicalCallId,
+        attemptId: existing.attemptId, turnNo: existing.turnNo, toolCallId: existing.toolCallId,
+        toolName: existing.toolName, argsDigest: existing.argsDigest,
+        approvedInteractionId: existing.approvedInteractionId!, started: record,
+      });
+      if (!claimed) return this.claimLoser(call, context);
+    } else if (existing) await this.options.ledger.update(record);
+    else if (!await this.options.ledger.putIfAbsent(record)) return this.executeGoverned(call, context);
 
     const execute = async (): Promise<ToolExecutionOutcome> => {
       try {
@@ -109,9 +129,9 @@ class GovernedToolRuntime implements ToolRuntime {
       }
     };
     const outcome = await this.concurrency.run({
-      tenantId: context.identity.tenantId, resourceKey: policy.resourceKey,
+      tenantId: context.identity.tenantId, resourceKey: policy.resourceKey, signal: context.signal,
     }, execute);
-    return this.audited(call, context, tool, outcome);
+    return outcome;
   }
 
   private async requestApproval(
@@ -151,9 +171,9 @@ class GovernedToolRuntime implements ToolRuntime {
     if (approval.interactionId) {
       return this.completeDenied(call, context, tool, approval.interactionId);
     }
-    return this.audited(call, context, tool, result(
+    return result(
       call.id, `needs approval: ${policy.reason ?? 'denied'}`, true,
-    ));
+    );
   }
 
   private async trustedApproval(
@@ -211,13 +231,32 @@ class GovernedToolRuntime implements ToolRuntime {
       return { kind: 'recovery_required', message: 'approval resolution does not match the pending tool call' };
     }
     const toolResult: ToolResult = { callId: call.id, content: 'approval denied', isError: true };
-    return this.audited(call, context, tool, {
+    return {
       kind: 'result', result: toolResult,
       ledgerUpdates: [{
         ...existing, attemptId: context.attemptId, turnNo: context.turnNo, toolCallId: call.id,
         status: 'completed', result: toolResult, resultDigest: digestToolValue(toolResult.content), updatedAt: this.now(),
       }],
+    };
+  }
+
+  private async claimLoser(
+    call: ToolCall,
+    context: ToolExecutionContext,
+  ): Promise<ToolExecutionOutcome> {
+    const current = await this.options.ledger.get({
+      tenantId: context.identity.tenantId, runId: context.runId, logicalCallId: call.logicalCallId,
     });
+    if (current?.status === 'completed' && current.result) return { kind: 'result', result: current.result };
+    if (current?.status === 'pending_approval') {
+      return { kind: 'waiting', reason: 'approval', interactionId: current.approvedInteractionId ?? 'pending' };
+    }
+    return {
+      kind: 'recovery_required', correlationId: current?.externalCorrelationId,
+      message: current?.status === 'started'
+        ? 'approved tool execution is already in progress'
+        : 'approved tool execution could not be claimed',
+    };
   }
 
   private async executeInteraction(
@@ -255,13 +294,13 @@ class GovernedToolRuntime implements ToolRuntime {
     const toolResult: ToolResult = {
       callId: call.id, content: `${kind} resolved: ${stableJson(resolution.value)}`,
     };
-    return this.audited(call, context, tool, {
+    return {
       kind: 'result', result: toolResult,
       ledgerUpdates: [{
         ...existing, attemptId: context.attemptId, turnNo: context.turnNo, toolCallId: call.id,
         status: 'completed', result: toolResult, resultDigest: digestToolValue(toolResult.content), updatedAt: this.now(),
       }],
-    });
+    };
   }
 
   private pendingRecord(
@@ -304,15 +343,59 @@ class GovernedToolRuntime implements ToolRuntime {
     };
   }
 
-  private async audited(
+  private async recordAuditBestEffort(
     call: ToolCall,
     context: ToolExecutionContext,
-    tool: GovernedToolDefinition,
-    outcome: ToolExecutionOutcome,
-  ): Promise<ToolExecutionOutcome> {
-    await this.options.audit?.record({ call, context, tool, outcome });
-    return outcome;
+    outcome: ToolExecutionOutcome | undefined,
+    startedAt: number,
+    error?: unknown,
+  ): Promise<void> {
+    if (!this.options.audit) return;
+    const tool = this.definitions.get(call.name);
+    const status = auditStatus(outcome, error);
+    const event: ToolAuditEvent = {
+      tenantId: context.identity.tenantId, actorId: context.identity.actorId,
+      runId: context.runId, attemptId: context.attemptId, turnNo: context.turnNo,
+      sessionId: context.sessionId, toolName: call.name, toolCallId: call.id,
+      logicalCallId: call.logicalCallId, capability: tool?.capability,
+      argsDigest: digestToolValue(call.arguments), status,
+      outcomeKind: outcome?.kind ?? 'exception',
+      isError: Boolean(error) || outcome?.kind === 'recovery_required'
+        || (outcome?.kind === 'result' && outcome.result.isError === true),
+      errorCode: auditErrorCode(status),
+      resultDigest: outcome?.kind === 'result' ? digestToolValue(outcome.result.content) : undefined,
+      durationMs: Math.max(0, Date.now() - startedAt), recordedAt: this.now(),
+    };
+    try {
+      await this.options.audit.record(event);
+    } catch (auditError) {
+      try {
+        this.options.audit.failure?.(auditError, event);
+      } catch {
+        // Both audit hooks are best-effort and must never affect durable execution facts.
+      }
+    }
   }
+}
+
+function auditStatus(outcome: ToolExecutionOutcome | undefined, error?: unknown): ToolAuditStatus {
+  if (error || !outcome) return 'internal_error';
+  if (outcome.kind === 'waiting') return 'approval_waiting';
+  if (outcome.kind === 'recovery_required') {
+    if (outcome.message === 'logical tool call identity changed across attempts') return 'ledger_mismatch';
+    if (outcome.message.includes('approval') || outcome.message.includes('interaction resolution')) return 'invalid_resolution';
+    return 'recovery_required';
+  }
+  if (outcome.result.content.startsWith('unknown tool:')) return 'unknown_tool';
+  if (outcome.result.content.startsWith('blocked by policy:')) return 'policy_denied';
+  if (outcome.result.isError) return 'failure';
+  return outcome.ledgerUpdates?.some((update) => update.status === 'completed') ? 'success' : 'cached_completed';
+}
+
+function auditErrorCode(status: ToolAuditStatus): string | undefined {
+  return status === 'success' || status === 'cached_completed' || status === 'approval_waiting'
+    ? undefined
+    : status.toUpperCase();
 }
 
 function ledgerMismatch(

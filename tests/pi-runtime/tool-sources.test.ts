@@ -5,7 +5,7 @@ import {
   UnifiedToolRegistry,
   type ToolLedgerStore,
 } from '../../packages/pi-runtime/src/index.js';
-import { ToolRegistry } from '../../src/agent/tools.js';
+import { ToolRegistry, defineTool } from '../../src/agent/tools.js';
 import { McpManager } from '../../src/mcp/manager.js';
 import { buildAskUserTool } from '../../src/tools/ask-user.js';
 import { buildSandboxTools } from '../../src/tools/builtin.js';
@@ -27,6 +27,13 @@ const ledger = (): ToolLedgerStore => {
     },
     get: async ({ logicalCallId }) => structuredClone(records.get(logicalCallId)),
     update: async (record) => { records.set(record.logicalCallId, structuredClone(record)); },
+    claimPendingApproval: async (input) => {
+      const current = records.get(input.logicalCallId);
+      if (!current || current.status !== 'pending_approval'
+        || current.approvedInteractionId !== input.approvedInteractionId) return false;
+      records.set(input.logicalCallId, structuredClone(input.started));
+      return true;
+    },
   };
 };
 
@@ -50,7 +57,13 @@ describe('real unified tool sources', () => {
 
   it('executes Pi, AIoP, MCP, and Sandbox tools from one real registry through governance', async () => {
     const mcpCall = vi.fn(async () => ({ content: [{ type: 'text', text: 'mcp-ok' }] }));
-    const mcp = new McpManager({ demo: { transport: 'http', url: 'https://mcp.example' } }, async () => ({
+    const mcp = new McpManager({
+      demo: {
+        transport: 'http',
+        url: 'https://mcp.example',
+        toolCapabilities: { example: 'read' },
+      },
+    }, async () => ({
       listTools: async () => ({ tools: [{
         name: 'example', description: 'example', inputSchema: { type: 'object' },
         annotations: { readOnlyHint: true },
@@ -91,7 +104,13 @@ describe('real unified tool sources', () => {
   });
 
   it('preserves explicit capabilities for real sources and rejects conflicts at assembly', async () => {
-    const mcp = new McpManager({ demo: { transport: 'http', url: 'https://mcp.example' } }, async () => ({
+    const mcp = new McpManager({
+      demo: {
+        transport: 'http',
+        url: 'https://mcp.example',
+        toolCapabilities: { read: 'read', mutate: 'retryable_write' },
+      },
+    }, async () => ({
       listTools: async () => ({ tools: [
         { name: 'read', inputSchema: {}, annotations: { readOnlyHint: true } },
         { name: 'mutate', inputSchema: {}, annotations: { readOnlyHint: false, idempotentHint: true } },
@@ -109,5 +128,24 @@ describe('real unified tool sources', () => {
   it('rejects a duplicate Pi name in the unified registry', () => {
     const registry = new UnifiedToolRegistry().registerPi(piRead(), 'read');
     expect(() => registry.registerPi(piRead(), 'read')).toThrow('duplicate tool: read');
+  });
+
+  it('propagates the governed abort signal into product tool context', async () => {
+    const received = vi.fn<(signal: AbortSignal | undefined) => void>();
+    const registry = new ToolRegistry().register(defineTool({
+      name: 'signal_probe', description: 'signal', inputSchema: {}, capability: 'read',
+      execute: async (_args, toolContext) => {
+        received(toolContext.signal);
+        return { id: '', content: 'ok' };
+      },
+    })).unified({ sessionId: 'session-a' });
+    const runtime = new GovernedToolFactory({ ledger: ledger() }).create(registry.definitions());
+    const abort = new AbortController();
+
+    await runtime.execute({
+      id: 'call-signal', logicalCallId: 'logical-signal', name: 'signal_probe', arguments: {},
+    }, { ...context, signal: abort.signal });
+
+    expect(received).toHaveBeenCalledWith(abort.signal);
   });
 });

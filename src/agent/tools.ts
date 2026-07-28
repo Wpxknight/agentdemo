@@ -11,6 +11,7 @@ export interface ToolContext {
   tenantId?: string;
   userId?: string;
   role?: Role;
+  signal?: AbortSignal;
   /** 实时输出回调：工具执行期把 stdout/stderr 分片回传（由 agent loop 注入，按工具调用归集）。 */
   onOutput?: OutputSink;
   /** 流式事件回调：工具主动推送结构化事件（如 todo_updated），由 agent loop 注入转发到 SSE。 */
@@ -118,6 +119,7 @@ export class ToolRegistry {
           const output = await tool.execute(call.arguments, {
             ...ctx,
             idempotencyKey: executionContext.idempotencyKey,
+            signal: executionContext.signal,
           });
           return { content: output.content, isError: output.isError };
         },
