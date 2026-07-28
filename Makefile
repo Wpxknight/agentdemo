@@ -10,9 +10,7 @@ test-agent-platform:
 	npm run test:agent-platform
 
 test-runtime-refactor:
-	npm run typecheck
-	npx vitest run tests/contracts tests/pi-runtime tests/integration
-	npm run verify:packages
+	npm run test:runtime-refactor
 
 image:
 	docker build -t $(IMAGE) .

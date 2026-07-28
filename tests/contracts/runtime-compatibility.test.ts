@@ -108,17 +108,23 @@ describe('runtime HTTP compatibility contracts', () => {
   });
 
   it('preserves the Session Message DTO role and content fields', async () => {
+    const sessionId = 'message-contract-session';
     await store.appendMessage(
       { tenantId: 'default', userId, role: 'user' },
-      'contract-session',
+      sessionId,
       { role: 'user', text: 'freeze the contract' },
     );
     await store.appendMessage(
       { tenantId: 'default', userId, role: 'user' },
-      'contract-session',
+      sessionId,
+      { role: 'assistant', text: 'contract reply' },
+    );
+    await store.appendMessage(
+      { tenantId: 'default', userId, role: 'user' },
+      sessionId,
       { role: 'tool', toolResults: [{ id: 'tool-message', content: 'ok' }] },
     );
-    const response = await fetch(`${baseUrl}/v1/sessions/contract-session/messages`, { headers: authHeaders() });
+    const response = await fetch(`${baseUrl}/v1/sessions/${sessionId}/messages`, { headers: authHeaders() });
     expect(response.status).toBe(200);
     const body = await response.json() as { messages: Array<Record<string, unknown>> };
     for (const message of body.messages) {
@@ -158,6 +164,13 @@ describe('runtime HTTP compatibility contracts', () => {
       runId: 'run-resume-contract', resumeFromCheckpoint: true,
       ctx: expect.objectContaining({ sessionId: 'resume-session' }),
     })));
+    await vi.waitFor(async () => {
+      const run = await store.getAgentRun(
+        { tenantId: 'default', userId, role: 'user' },
+        'run-resume-contract',
+      );
+      expect(run).toMatchObject({ status: 'succeeded', completedAt: expect.any(Date) });
+    });
   });
 
   it('preserves Run event, Interaction and Tool Ledger query fields', async () => {
@@ -172,8 +185,10 @@ describe('runtime HTTP compatibility contracts', () => {
     });
     await store.putInteraction({
       id: 'interaction-contract', tenantId: 'default', userId, sessionId: 'detail-session',
-      runId: 'run-detail-contract', kind: 'approval', toolCallId: 'tool-contract', payload: {},
-      status: 'resolved', resolution: true, expiresAt: new Date('2026-07-29T01:00:00.000Z'), createdAt,
+      runId: 'run-detail-contract', kind: 'approval', toolCallId: 'tool-contract',
+      payload: { question: 'public approval summary', secret: 'private interaction payload' },
+      status: 'resolved', resolution: { approved: true, secret: 'private interaction resolution' },
+      expiresAt: new Date('2026-07-29T01:00:00.000Z'), createdAt,
     });
     await store.putToolExecutionIfAbsent({
       tenantId: 'default', runId: 'run-detail-contract', sessionId: 'detail-session',
@@ -184,13 +199,18 @@ describe('runtime HTTP compatibility contracts', () => {
 
     const detailResponse = await fetch(`${baseUrl}/v1/agent/runs/run-detail-contract`, { headers: authHeaders() });
     expect(detailResponse.status).toBe(200);
-    expect(await detailResponse.json()).toMatchObject({
+    const detail = await detailResponse.json();
+    expect(detail).toMatchObject({
       run: { runId: 'run-detail-contract', sessionId: 'detail-session', status: 'failed', kernel: 'pi' },
       events: [{ type: 'node', runId: 'run-detail-contract', node: 'model', status: 'failed' }],
       interactions: [{ id: 'interaction-contract', kind: 'approval', status: 'resolved', toolCallId: 'tool-contract' }],
       tools: [{ toolCallId: 'tool-contract', toolName: 'kubectl', status: 'completed' }],
       canCancel: false, canResume: true,
     });
+    const serializedDetail = JSON.stringify(detail);
+    expect(serializedDetail).not.toContain('private output');
+    expect(serializedDetail).not.toContain('private interaction payload');
+    expect(serializedDetail).not.toContain('private interaction resolution');
 
     const eventResponse = await fetch(`${baseUrl}/v1/agent/runs/run-detail-contract/events`, { headers: authHeaders() });
     expect(eventResponse.status).toBe(200);
