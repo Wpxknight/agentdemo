@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { posix } from 'node:path';
 import { Sandbox } from '@alibaba-group/opensandbox';
 import type { ConnectionConfigOptions, Execution, ExecutionHandlers } from '@alibaba-group/opensandbox';
 import type {
@@ -110,6 +111,26 @@ class OpenSandboxHandle implements SandboxHandle {
 
   async readFile(path: string): Promise<Uint8Array> {
     return this.sbx.files.readBytes(path);
+  }
+
+  async writeFile(path: string, content: Uint8Array, options?: { mode?: number }): Promise<void> {
+    const quotedPath = `'${path.replace(/'/g, `'"'"'`)}'`;
+    if (options?.mode !== undefined) {
+      const quotedDir = `'${posix.dirname(path).replace(/'/g, `'"'"'`)}'`;
+      const prepared = await this.runCommand(
+        `mkdir -p ${quotedDir} && install -m ${options.mode.toString(8)} /dev/null ${quotedPath}`,
+      );
+      if (prepared.error || prepared.exitCode !== 0) {
+        throw new Error(prepared.error || prepared.stderr || '凭据文件安全初始化失败');
+      }
+    }
+    await this.sbx.files.writeFiles([{ path, data: content }]);
+    if (options?.mode !== undefined) {
+      const secured = await this.runCommand(`chmod ${options.mode.toString(8)} ${quotedPath}`);
+      if (secured.error || secured.exitCode !== 0) {
+        throw new Error(secured.error || secured.stderr || '凭据文件权限设置失败');
+      }
+    }
   }
 
   async setTimeout(ms: number): Promise<void> {

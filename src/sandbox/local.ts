@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -92,6 +92,14 @@ class LocalSandboxHandle implements SandboxHandle {
     // 相对路径按沙箱工作目录解析（命令默认 cwd 即此目录）；绝对路径原样读取。
     const target = path.isAbsolute(p) ? p : path.resolve(this.dir, p);
     return readFile(target);
+  }
+
+  async writeFile(p: string, content: Uint8Array, options?: { mode?: number }): Promise<void> {
+    if (this.killed) throw new Error('sandbox already killed');
+    const target = path.isAbsolute(p) ? p : path.resolve(this.dir, p);
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, content, { mode: options?.mode });
+    if (options?.mode !== undefined) await chmod(target, options.mode);
   }
 
   async setTimeout(_ms: number): Promise<void> {

@@ -282,6 +282,8 @@ export const ConfigSchema = z.object({
   skills: z
     .object({
       dir: z.string(),
+      /** Optional read-only image root for built-in skills. */
+      builtinDir: z.string().optional(),
       /** summaries() 注入 system prompt 的总字符预算（默认 4000）。 */
       summaryBudget: z.number().int().positive().optional(),
       /** 注入会话沙箱的稳定环境信息（如 AIOS_BASE_URL）；凭据禁止走此通道。 */

@@ -10,13 +10,13 @@ HTTP 服务 Pod 内包含两个容器：
 
 ## 共享技能存储
 
-`aiop-server` 默认运行 2 个副本，因此所有副本必须把同一个 `aiop-skills` PVC 挂载到 `/app/skills`。
+`aiop-server` 默认运行 2 个副本，因此所有副本把同一个 `aiop-skills` PVC 挂载到 `/skills-data`。
 PVC 使用 `ReadWriteMany`，默认申请 5Gi。集群的默认 StorageClass 必须支持 RWX；如果默认 StorageClass
 不支持 RWX，请在部署前为 `pvc-skills.yaml` 设置集群提供的 RWX `storageClassName`。
 
-`seed-skills` initContainer 与后端使用相同的 `aiop:latest` 镜像，把镜像内置技能以 `cp -an` 方式补充到 PVC，
-不会覆盖或删除 PVC 中已有的技能、`.aiop-locks` 或 `.aiop-imports`。随后它把共享目录归属设置为 `node:node`，
-主容器继续以非 root 的 node 用户运行，并可在共享目录中上传技能和创建跨 Pod 名称锁。
+镜像内置技能保持在只读镜像目录 `/app/skills`，产品上传、审核发布物、锁与导入暂存只写入 PVC
+`/skills-data`。后端 Registry 同时读取两类根目录，PVC 不再覆盖镜像内容，也不再由 root initContainer
+执行 `cp -an` 或递归 `chown`。Pod 通过 `fsGroup: 1000` 与 CSI/StorageClass 的权限策略获得共享卷写权限。
 
 ## 构建镜像
 

@@ -43,12 +43,13 @@ import { buildBrowserTools } from './tools/browser.js';
 import { McpManager } from './mcp/manager.js';
 import { connectMcp } from './mcp/client.js';
 import { SkillRegistry } from './skill/registry.js';
+import { MysqlSkillMutationLock } from './skill/lock.js';
 import { ClusterRegistry } from './config/clusters.js';
 import { buildKubectlTool } from './tools/kubectl.js';
 import { LogAuditSink } from './audit/sink.js';
 import type { AuditSink } from './audit/sink.js';
 import { readMysqlConfig } from './config/mysql.js';
-import { createStore } from './db/index.js';
+import { createMysqlPool, createStore } from './db/index.js';
 import { MysqlStore } from './db/mysql.js';
 import type { LlmSettings, SandboxSettings, Store } from './db/store.js';
 import {
@@ -271,7 +272,11 @@ export async function buildRuntime(
   if (!jwtSecretEnv) logger.warn('AIOP_JWT_SECRET 未设置，使用开发占位密钥（勿用于生产）');
   const jwtSecret = jwtSecretEnv ?? 'dev-insecure-secret';
 
-  const store = options.store ?? await createStore(readMysqlConfig());
+  const mysqlConfig = readMysqlConfig();
+  const store = options.store ?? await createStore(mysqlConfig);
+  const skillMutationLock = mysqlConfig && store instanceof MysqlStore
+    ? new MysqlSkillMutationLock(createMysqlPool(mysqlConfig))
+    : undefined;
   const logSink = new LogAuditSink();
   const audit: AuditSink = {
     async record(e) {
@@ -563,7 +568,11 @@ export async function buildRuntime(
   let systemExtra = '';
   let skillRegistry: SkillRegistry | undefined;
   if (config.skills?.dir) {
-    const skills = new SkillRegistry(config.skills.dir, { summaryBudget: config.skills.summaryBudget });
+    const skills = new SkillRegistry(config.skills.dir, {
+      summaryBudget: config.skills.summaryBudget,
+      builtinRoots: config.skills.builtinDir ? [config.skills.builtinDir] : [],
+      mutationLock: skillMutationLock,
+    });
     await skills.scan();
     const skillTools = buildSkillTools(skills, sandboxController, undefined, { credentials, audit });
     for (const tool of skillTools) tools.register(tool);
@@ -825,6 +834,7 @@ export async function buildRuntime(
       await sandboxUpdateTail;
       await sandboxController.disposeAll();
       await mcp?.close();
+      await skillMutationLock?.close?.();
       if (!options.store) await store.close();
     },
   };

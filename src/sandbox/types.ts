@@ -81,6 +81,8 @@ export interface SandboxHandle {
   runCommand(command: string, opts?: RunCommandOpts): Promise<ExecResult>;
   /** 读取沙箱内文件的原始字节（用于导出 / 下载）。文件不存在或不可读时抛错。 */
   readFile(path: string): Promise<Uint8Array>;
+  /** Writes bytes without placing file contents in a shell command or command log. */
+  writeFile?(path: string, content: Uint8Array, options?: { mode?: number }): Promise<void>;
   /** 续命，防止被回收。 */
   setTimeout(ms: number): Promise<void>;
   /** 销毁沙箱。 */

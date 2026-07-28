@@ -15,7 +15,7 @@ data:
         }
       },
       "defaultModel": "my-claude",
-      "skills": { "dir": "./skills" },
+      "skills": { "dir": "/skills-data", "builtinDir": "/app/skills" },
       "auth": { "provider": "local" },
       "sandbox": {
         "enabled": true,

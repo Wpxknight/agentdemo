@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, mkdir, readFile, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1640,6 +1641,7 @@ describe('HTTP server', () => {
       expect(persisted).toEqual({
         name: 'imported', version: '1', enabled: true, reviewed: false,
         tenantId: 'default', ownerUserId: uploader.id, visibility: 'private',
+        schemaVersion: 2, revision: 0,
       });
       expect(await skills.summariesFor({ tenantId: 'default', userId: uploader.id, role: 'user' })).not.toContain('imported');
       expect(piSkillLoader).not.toHaveBeenCalled();
@@ -1750,12 +1752,15 @@ describe('HTTP server', () => {
         body: JSON.stringify({ filename: 'globalized.zip', data: `data:application/zip;base64,${globalData}` }),
       });
       expect(globalImport.status).toBe(201);
+      const previousAudit = rt.audit;
+      rt.audit = { record: vi.fn(async () => { throw new Error('audit unavailable'); }) };
       const globalReview = await fetch(`${importBase}/v1/skills/globalized/review`, {
         method: 'POST',
         headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
         body: JSON.stringify({ reviewed: true, global: true }),
       });
       expect(globalReview.status).toBe(200);
+      rt.audit = previousAudit;
       expect(await globalReview.json()).toMatchObject({
         product: { reviewed: true, allowedTenantIds: ['*'], visibility: 'public' },
       });
@@ -1764,6 +1769,68 @@ describe('HTTP server', () => {
       }).then((response) => response.json()) as typeof body;
       expect(otherAfterGlobal.tools).toContainEqual(expect.objectContaining({ name: 'globalized' }));
       expect(otherAfterGlobal.tools).not.toContainEqual(expect.objectContaining({ name: 'imported' }));
+
+      const malformedBase64 = await fetch(`${importBase}/v1/skills/import`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ filename: 'bad.zip', data: '%%%not-base64%%%' }),
+      });
+      expect(malformedBase64.status).toBe(400);
+
+      const malformedArchive = await fetch(`${importBase}/v1/skills/import`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ filename: 'bad.zip', data: Buffer.from('not a zip').toString('base64') }),
+      });
+      expect(malformedArchive.status).toBe(422);
+
+      const originalConcurrentInstall = skills.installUploadedProduct.bind(skills);
+      const permitRoot = join(skillRoot, '.aiop-imports', '.concurrency');
+      const tenantPermitRoot = join(
+        permitRoot,
+        `tenant-${createHash('sha256').update('default').digest('hex')}`,
+      );
+      for (const slot of [join(permitRoot, 'global', '0'), join(tenantPermitRoot, '0')]) {
+        await rm(slot, { recursive: true, force: true });
+        const ownerDir = join(slot, '.released-owner');
+        await mkdir(ownerDir, { recursive: true });
+        await writeFile(join(ownerDir, 'owner.json'), JSON.stringify({
+          token: 'released-owner',
+        }));
+      }
+      const concurrentSpy = vi.spyOn(skills, 'installUploadedProduct').mockImplementation(async (...args) => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return originalConcurrentInstall(...args);
+      });
+      const replicaSkills = new SkillRegistry(skillRoot, { loader: piSkillLoader });
+      await replicaSkills.scan();
+      const replicaTools = new ToolRegistry();
+      replicaTools.register(replicaSkills.tool());
+      const replicaRuntime = {
+        ...rt,
+        tools: replicaTools,
+        skillRegistry: replicaSkills,
+      } as unknown as Runtime;
+      const replicaServer = createHttpServer(replicaRuntime);
+      await new Promise<void>((resolve) => replicaServer.listen(0, '127.0.0.1', resolve));
+      const replicaBase = `http://127.0.0.1:${(replicaServer.address() as AddressInfo).port}`;
+      const originalReplicaInstall = replicaSkills.installUploadedProduct.bind(replicaSkills);
+      const replicaSpy = vi.spyOn(replicaSkills, 'installUploadedProduct').mockImplementation(async (...args) => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return originalReplicaInstall(...args);
+      });
+      const concurrentImports = await Promise.all(['quota-a', 'quota-b', 'quota-c'].map((name, index) => fetch(`${index % 2 ? replicaBase : importBase}/v1/skills/import`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          filename: `${name}.zip`,
+          data: storedZip({ 'SKILL.md': `---\nname: ${name}\ndescription: quota\n---\nbody` }).toString('base64'),
+        }),
+      })));
+      expect(concurrentImports.map((response) => response.status).sort()).toEqual([201, 201, 429]);
+      concurrentSpy.mockRestore();
+      replicaSpy.mockRestore();
+      await new Promise<void>((resolve, reject) => replicaServer.close((err) => err ? reject(err) : resolve()));
 
       const invalidData = storedZip({
         'SKILL.md': '---\nname: bad_name\ndescription: Invalid Pi name\n---\nbody',
@@ -1816,8 +1883,12 @@ describe('HTTP server', () => {
         method: 'POST',
         headers: { authorization: `Bearer ${uploaderToken}` },
       });
-      expect(disabled.status).toBe(200);
-      expect(await disabled.json()).toMatchObject({ skill: { name: 'imported', enabled: false, status: '已禁用' } });
+      expect(disabled.status).toBe(403);
+      const adminDisabled = await fetch(`${importBase}/v1/skills/imported/disable`, {
+        method: 'POST', headers: { authorization: `Bearer ${tenantAdminToken}` },
+      });
+      expect(adminDisabled.status).toBe(200);
+      expect(await adminDisabled.json()).toMatchObject({ skill: { name: 'imported', enabled: false, status: '已禁用' } });
 
       const disabledLoad = await fetch(`${importBase}/v1/tools/call`, {
         method: 'POST',
@@ -1829,7 +1900,7 @@ describe('HTTP server', () => {
 
       const enabled = await fetch(`${importBase}/v1/skills/imported/enable`, {
         method: 'POST',
-        headers: { authorization: `Bearer ${uploaderToken}` },
+        headers: { authorization: `Bearer ${tenantAdminToken}` },
       });
       expect(enabled.status).toBe(200);
       expect(await enabled.json()).toMatchObject({ skill: { name: 'imported', enabled: true, status: '已启用' } });
@@ -1843,7 +1914,7 @@ describe('HTTP server', () => {
 
       const deleted = await fetch(`${importBase}/v1/skills/imported`, {
         method: 'DELETE',
-        headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
+        headers: { authorization: `Bearer ${tenantAdminToken}`, 'content-type': 'application/json' },
         body: JSON.stringify({ confirm: true }),
       });
       expect(deleted.status).toBe(200);

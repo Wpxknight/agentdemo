@@ -6,6 +6,7 @@ const h = vi.hoisted(() => ({
   runCode: vi.fn(),
   runCommand: vi.fn(),
   readFile: vi.fn(),
+  writeFile: vi.fn(),
   setTimeout: vi.fn(),
   kill: vi.fn(),
 }));
@@ -14,7 +15,7 @@ vi.mock('@e2b/code-interpreter', () => {
   class Sandbox {
     readonly sandboxId = 'sb-e2b';
     readonly commands = { run: h.runCommand };
-    readonly files = { read: h.readFile };
+    readonly files = { read: h.readFile, write: h.writeFile };
     async runCode(code: string, opts?: unknown) {
       return h.runCode(code, opts);
     }
@@ -40,11 +41,13 @@ beforeEach(() => {
   h.runCode.mockReset();
   h.runCommand.mockReset();
   h.readFile.mockReset();
+  h.writeFile.mockReset();
   h.setTimeout.mockReset();
   h.kill.mockReset();
   h.runCode.mockResolvedValue({ logs: { stdout: [], stderr: [] } });
   h.runCommand.mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 });
   h.readFile.mockResolvedValue(Uint8Array.from([1, 2, 3]));
+  h.writeFile.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -193,5 +196,18 @@ describe('E2bProvider standard SDK mode', () => {
     await handle.kill();
     expect(h.setTimeout).toHaveBeenLastCalledWith(9876);
     expect(h.kill).toHaveBeenCalledOnce();
+  });
+
+  it('precreates credential files privately and fails when chmod cannot be confirmed', async () => {
+    h.runCommand
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '', stderr: 'denied', exitCode: 1 });
+    const handle = await new E2bProvider({ apiKey: 'key' }).create({ key: 'session:dev' });
+
+    await expect(handle.writeFile?.('/workspace/secret/token.json', Uint8Array.from([1]), { mode: 0o600 }))
+      .rejects.toThrow('denied');
+
+    expect(h.runCommand.mock.calls[0]?.[0]).toContain('install -m 600');
+    expect(h.writeFile).toHaveBeenCalledOnce();
   });
 });

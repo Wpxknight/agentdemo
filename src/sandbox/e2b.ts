@@ -1,4 +1,5 @@
 import { Sandbox } from '@e2b/code-interpreter';
+import { posix } from 'node:path';
 import { AiosE2bProvider } from './aios-e2b.js';
 import type { AiosE2bProviderOptions } from './aios-e2b.js';
 import type {
@@ -68,6 +69,26 @@ class E2bHandle implements SandboxHandle {
 
   async readFile(path: string): Promise<Uint8Array> {
     return this.sbx.files.read(path, { format: 'bytes' });
+  }
+
+  async writeFile(path: string, content: Uint8Array, options?: { mode?: number }): Promise<void> {
+    const quotedPath = `'${path.replace(/'/g, `'"'"'`)}'`;
+    if (options?.mode !== undefined) {
+      const quotedDir = `'${posix.dirname(path).replace(/'/g, `'"'"'`)}'`;
+      const prepared = await this.sbx.commands.run(
+        `mkdir -p ${quotedDir} && install -m ${options.mode.toString(8)} /dev/null ${quotedPath}`,
+      );
+      if (prepared.exitCode !== 0 || prepared.error) {
+        throw new Error(prepared.error || prepared.stderr || '凭据文件安全初始化失败');
+      }
+    }
+    await this.sbx.files.write(path, Uint8Array.from(content).buffer);
+    if (options?.mode !== undefined) {
+      const secured = await this.sbx.commands.run(`chmod ${options.mode.toString(8)} ${quotedPath}`);
+      if (secured.exitCode !== 0 || secured.error) {
+        throw new Error(secured.error || secured.stderr || '凭据文件权限设置失败');
+      }
+    }
   }
 
   async setTimeout(ms: number): Promise<void> {

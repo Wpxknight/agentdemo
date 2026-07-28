@@ -2,6 +2,7 @@ import {
   AiosLifecycleHttpClient,
   AiosLifecycleHttpError,
 } from './aios-http.js';
+import { posix } from 'node:path';
 import type { AiosLifecycleHttpOptions } from './aios-http.js';
 import type {
   ExecResult,
@@ -105,6 +106,29 @@ class AiosE2bHandle implements SandboxHandle {
       throw new Error('AIOS Lifecycle returned an invalid file response');
     }
     return Uint8Array.from(Buffer.from(response.content, 'base64'));
+  }
+
+  async writeFile(path: string, content: Uint8Array, options?: { mode?: number }): Promise<void> {
+    const quotedPath = `'${path.replace(/'/g, `'"'"'`)}'`;
+    if (options?.mode !== undefined) {
+      const quotedDir = `'${posix.dirname(path).replace(/'/g, `'"'"'`)}'`;
+      const prepared = await this.runCommand(
+        `mkdir -p ${quotedDir} && install -m ${options.mode.toString(8)} /dev/null ${quotedPath}`,
+      );
+      if (prepared.error || prepared.exitCode !== 0) {
+        throw new Error(prepared.error || prepared.stderr || '凭据文件安全初始化失败');
+      }
+    }
+    await this.provider.request(`/sandboxes/${encodeURIComponent(this.sandboxId)}/filesystem/write`, {
+      method: 'POST',
+      body: { path, encoding: 'base64', content: Buffer.from(content).toString('base64') },
+    });
+    if (options?.mode !== undefined) {
+      const secured = await this.runCommand(`chmod ${options.mode.toString(8)} ${quotedPath}`);
+      if (secured.error || secured.exitCode !== 0) {
+        throw new Error(secured.error || secured.stderr || '凭据文件权限设置失败');
+      }
+    }
   }
 
   async setTimeout(ms: number): Promise<void> {

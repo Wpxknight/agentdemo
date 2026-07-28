@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { SkillRegistry } from '../src/skill/registry.js';
 import { importSkillZip } from '../src/skill/import.js';
 import { normalizeCredentialFile, type SkillProductRecord } from '../src/skill/product.js';
+import { MysqlSkillMutationLock } from '../src/skill/lock.js';
 
 function crc32(buf: Buffer): number {
   let crc = 0xffffffff;
@@ -108,6 +109,66 @@ describe('SkillRegistry', () => {
     expect(prompt).toContain('<name>inspect</name>');
     expect(prompt).toContain('<description>集群巡检</description>');
     expect(prompt).toContain(`<location>${join(dir, 'inspect', 'SKILL.md')}</location>`);
+  });
+
+  it('reads immutable built-ins separately from writable product storage', async () => {
+    const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-skills-'));
+    const productRoot = await mkdtemp(join(tmpdir(), 'aiop-product-skills-'));
+    const builtin = join(builtinRoot, 'builtin');
+    await mkdir(builtin);
+    await writeFile(join(builtin, 'SKILL.md'), '---\nname: builtin\ndescription: builtin\n---\nbody');
+    await writeProduct(builtin, {
+      name: 'builtin', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+    });
+    const registry = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+
+    await registry.scan();
+
+    expect(registry.get('builtin')?.dir).toBe(builtin);
+    expect(registry.importStagingRoot()).toContain(productRoot);
+  });
+
+  it('ignores legacy PVC seed copies that duplicate a read-only built-in', async () => {
+    const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-seed-source-'));
+    const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-seed-pvc-'));
+    for (const root of [builtinRoot, productRoot]) {
+      const skillDir = join(root, 'seeded');
+      await mkdir(skillDir);
+      await writeFile(join(skillDir, 'SKILL.md'), '---\nname: seeded\ndescription: seeded\n---\nbody');
+      await writeProduct(skillDir, {
+        name: 'seeded', version: '1', enabled: true, reviewed: true,
+        tenantId: 'default', visibility: 'public',
+      });
+    }
+    const registry = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+
+    await registry.scan();
+
+    expect(registry.list().filter((skill) => skill.name === 'seeded')).toHaveLength(1);
+    await expect(registry.loadFor('seeded', {
+      tenantId: 'default', userId: 'viewer', role: 'user',
+    })).resolves.toMatchObject({ dir: join(builtinRoot, 'seeded') });
+  });
+
+  it('keeps an interrupted published artifact invisible until its commit marker exists', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-publish-commit-state-'));
+    const artifact = join(root, '.aiop-published', 'global', '1-deadbeef', 'interrupted');
+    await mkdir(artifact, { recursive: true });
+    await writeFile(join(artifact, 'SKILL.md'), '---\nname: interrupted\ndescription: interrupted\n---\nbody');
+    await writeProduct(artifact, {
+      name: 'interrupted', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public', allowedTenantIds: ['*'],
+      submittedByUserId: 'uploader',
+    });
+    const registry = new SkillRegistry(root);
+
+    await registry.scan();
+    expect(registry.get('interrupted')).toBeUndefined();
+
+    await writeFile(join(artifact, '.aiop-committed'), 'committed\n');
+    await registry.scan();
+    expect(registry.get('interrupted')).toBeDefined();
   });
 
   it('ignores reserved and hidden directories at every product-source level', async () => {
@@ -330,6 +391,367 @@ describe('SkillRegistry governed Pi loading', () => {
 });
 
 describe('SkillRegistry upload review governance', () => {
+  it('uses connection-scoped MySQL advisory locks and releases the dedicated connection on failure', async () => {
+    const queries: Array<{ sql: string; params?: unknown[] }> = [];
+    let released = false;
+    const connection = {
+      query: async (sql: string, params?: unknown[]) => {
+        queries.push({ sql, params });
+        return sql.includes('GET_LOCK') ? [[{ acquired: 1 }], []] : [[{ released: 1 }], []];
+      },
+      release: () => { released = true; },
+    };
+    const pool = { promise: () => ({ getConnection: async () => connection, end: async () => undefined }) };
+    const lock = new MysqlSkillMutationLock(pool as never);
+
+    await expect(lock.withLock('skill-name:demo', 1000, async () => {
+      throw new Error('boom');
+    })).rejects.toThrow('boom');
+
+    expect(queries.map(({ sql }) => sql)).toEqual([
+      'SELECT GET_LOCK(?, ?) AS acquired',
+      'SELECT RELEASE_LOCK(?) AS released',
+    ]);
+    expect(released).toBe(true);
+  });
+
+  it('destroys a MySQL advisory-lock connection when release cannot be confirmed', async () => {
+    let released = false;
+    let destroyed = false;
+    const connection = {
+      query: async (sql: string) => (
+        sql.includes('GET_LOCK') ? [[{ acquired: 1 }], []] : [[{ released: 0 }], []]
+      ),
+      release: () => { released = true; },
+      destroy: () => { destroyed = true; },
+    };
+    const pool = { promise: () => ({ getConnection: async () => connection, end: async () => undefined }) };
+    const lock = new MysqlSkillMutationLock(pool as never);
+
+    await expect(lock.withLock('skill-name:demo', 1000, async () => 'ok')).resolves.toBe('ok');
+
+    expect(released).toBe(false);
+    expect(destroyed).toBe(true);
+  });
+
+  it('holds MySQL import slot locks on dedicated connections until explicit release', async () => {
+    let released = false;
+    const queries: string[] = [];
+    const connection = {
+      query: async (sql: string) => {
+        queries.push(sql);
+        return sql.includes('GET_LOCK') ? [[{ acquired: 1 }], []] : [[{ released: 1 }], []];
+      },
+      release: () => { released = true; },
+      destroy: () => undefined,
+    };
+    const pool = { promise: () => ({ getConnection: async () => connection, end: async () => undefined }) };
+    const lock = new MysqlSkillMutationLock(pool as never);
+
+    const release = await lock.tryAcquireSlot('skill-import:global', 4);
+
+    expect(release).toBeTypeOf('function');
+    expect(released).toBe(false);
+    await release?.();
+    expect(released).toBe(true);
+    expect(queries).toEqual([
+      'SELECT GET_LOCK(?, 0) AS acquired',
+      'SELECT RELEASE_LOCK(?) AS released',
+    ]);
+  });
+
+  it('holds global and tenant import slots with a pool capacity of one', async () => {
+    let connectionCount = 0;
+    let released = false;
+    const queries: string[] = [];
+    const connection = {
+      query: async (sql: string) => {
+        queries.push(sql);
+        return sql.includes('GET_LOCK') ? [[{ acquired: 1 }], []] : [[{ released: 1 }], []];
+      },
+      release: () => { released = true; },
+      destroy: () => undefined,
+    };
+    const pool = {
+      promise: () => ({
+        getConnection: async () => {
+          connectionCount += 1;
+          return connection;
+        },
+        end: async () => undefined,
+      }),
+    };
+    const lock = new MysqlSkillMutationLock(pool as never);
+
+    const release = await lock.tryAcquireSlots([
+      { keyPrefix: 'skill-import:global', limit: 4 },
+      { keyPrefix: 'skill-import:tenant:tenant-a', limit: 2 },
+    ]);
+
+    expect(release).toBeTypeOf('function');
+    expect(connectionCount).toBe(1);
+    expect(released).toBe(false);
+    await release?.();
+    expect(released).toBe(true);
+    expect(queries).toEqual([
+      'SELECT GET_LOCK(?, 0) AS acquired',
+      'SELECT GET_LOCK(?, 0) AS acquired',
+      'SELECT RELEASE_LOCK(?) AS released',
+      'SELECT RELEASE_LOCK(?) AS released',
+    ]);
+  });
+
+  it('uses only two connections for two concurrent global and tenant permits', async () => {
+    let connectionCount = 0;
+    const connections = Array.from({ length: 2 }, () => ({
+      query: async (sql: string) => (
+        sql.includes('GET_LOCK') ? [[{ acquired: 1 }], []] : [[{ released: 1 }], []]
+      ),
+      release: () => undefined,
+      destroy: () => undefined,
+    }));
+    const pool = {
+      promise: () => ({
+        getConnection: async () => {
+          const connection = connections[connectionCount];
+          connectionCount += 1;
+          if (!connection) throw new Error('pool capacity exceeded');
+          return connection;
+        },
+        end: async () => undefined,
+      }),
+    };
+    const lock = new MysqlSkillMutationLock(pool as never);
+
+    const [firstRelease, secondRelease] = await Promise.all([
+      lock.tryAcquireSlots([
+        { keyPrefix: 'skill-import:global', limit: 4 },
+        { keyPrefix: 'skill-import:tenant:tenant-a', limit: 2 },
+      ]),
+      lock.tryAcquireSlots([
+        { keyPrefix: 'skill-import:global', limit: 4 },
+        { keyPrefix: 'skill-import:tenant:tenant-a', limit: 2 },
+      ]),
+    ]);
+
+    expect(firstRelease).toBeTypeOf('function');
+    expect(secondRelease).toBeTypeOf('function');
+    expect(connectionCount).toBe(2);
+    await Promise.all([firstRelease?.(), secondRelease?.()]);
+  });
+
+  it('releases the global slot when no tenant slot is available', async () => {
+    let getLockCalls = 0;
+    let released = false;
+    let destroyed = false;
+    const queries: string[] = [];
+    const connection = {
+      query: async (sql: string) => {
+        queries.push(sql);
+        if (sql.includes('GET_LOCK')) {
+          getLockCalls += 1;
+          return [[{ acquired: getLockCalls === 1 ? 1 : 0 }], []];
+        }
+        return [[{ released: 1 }], []];
+      },
+      release: () => { released = true; },
+      destroy: () => { destroyed = true; },
+    };
+    const pool = { promise: () => ({ getConnection: async () => connection, end: async () => undefined }) };
+    const lock = new MysqlSkillMutationLock(pool as never);
+
+    await expect(lock.tryAcquireSlots([
+      { keyPrefix: 'skill-import:global', limit: 4 },
+      { keyPrefix: 'skill-import:tenant:tenant-a', limit: 2 },
+    ])).resolves.toBeUndefined();
+
+    expect(released).toBe(true);
+    expect(destroyed).toBe(false);
+    expect(queries).toEqual([
+      'SELECT GET_LOCK(?, 0) AS acquired',
+      'SELECT GET_LOCK(?, 0) AS acquired',
+      'SELECT GET_LOCK(?, 0) AS acquired',
+      'SELECT RELEASE_LOCK(?) AS released',
+    ]);
+  });
+
+  it('destroys the shared import-slot connection when a later lock query fails', async () => {
+    let getLockCalls = 0;
+    let released = false;
+    let destroyed = false;
+    const connection = {
+      query: async (sql: string) => {
+        if (sql.includes('GET_LOCK')) {
+          getLockCalls += 1;
+          if (getLockCalls === 2) throw new Error('tenant lock query failed');
+          return [[{ acquired: 1 }], []];
+        }
+        return [[{ released: 1 }], []];
+      },
+      release: () => { released = true; },
+      destroy: () => { destroyed = true; },
+    };
+    const pool = { promise: () => ({ getConnection: async () => connection, end: async () => undefined }) };
+    const lock = new MysqlSkillMutationLock(pool as never);
+
+    await expect(lock.tryAcquireSlots([
+      { keyPrefix: 'skill-import:global', limit: 4 },
+      { keyPrefix: 'skill-import:tenant:tenant-a', limit: 2 },
+    ])).rejects.toThrow('tenant lock query failed');
+
+    expect(released).toBe(false);
+    expect(destroyed).toBe(true);
+  });
+
+  it('destroys the shared import-slot connection when either release cannot be confirmed', async () => {
+    let releaseCalls = 0;
+    let released = false;
+    let destroyed = false;
+    const connection = {
+      query: async (sql: string) => {
+        if (sql.includes('GET_LOCK')) return [[{ acquired: 1 }], []];
+        releaseCalls += 1;
+        return [[{ released: releaseCalls === 1 ? 0 : 1 }], []];
+      },
+      release: () => { released = true; },
+      destroy: () => { destroyed = true; },
+    };
+    const pool = { promise: () => ({ getConnection: async () => connection, end: async () => undefined }) };
+    const lock = new MysqlSkillMutationLock(pool as never);
+
+    const release = await lock.tryAcquireSlots([
+      { keyPrefix: 'skill-import:global', limit: 4 },
+      { keyPrefix: 'skill-import:tenant:tenant-a', limit: 2 },
+    ]);
+    await release?.();
+
+    expect(releaseCalls).toBe(2);
+    expect(released).toBe(false);
+    expect(destroyed).toBe(true);
+  });
+
+  it('publishes an immutable digest-verified artifact and stale registries observe revocation without scan', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-published-artifact-'));
+    const uploadedDir = join(root, 'users', 'uploader', 'immutable');
+    await mkdir(uploadedDir, { recursive: true });
+    await writeFile(join(uploadedDir, 'SKILL.md'), '---\nname: immutable\ndescription: approved\n---\napproved body');
+    await writeProduct(uploadedDir, { name: 'immutable', version: '1' });
+    const first = new SkillRegistry(root);
+    const stale = new SkillRegistry(root);
+    await first.installUploadedProduct(uploadedDir, {
+      tenantId: 'default', userId: 'uploader', role: 'user',
+    });
+    await Promise.all([first.scan(), stale.scan()]);
+
+    const published = await first.review('immutable', {
+      tenantId: 'default', userId: 'reviewer', role: 'platform_admin',
+    }, { global: true });
+    expect(published.path).toContain(join(root, '.aiop-published'));
+    expect(published.ownerUserId).toBeUndefined();
+    expect(published.contentDigest).toMatch(/^[a-f0-9]{64}$/);
+    expect(published.revision).toBe(1);
+    expect((await stale.loadFor('immutable', {
+      tenantId: 'default', userId: 'viewer', role: 'user',
+    }))?.body).toContain('approved body');
+
+    await mkdir(uploadedDir, { recursive: true });
+    await writeFile(join(uploadedDir, 'SKILL.md'), '---\nname: immutable\ndescription: malicious\n---\nmalicious body');
+    await writeProduct(uploadedDir, { name: 'immutable', version: '1' });
+    await stale.installUploadedProduct(uploadedDir, {
+      tenantId: 'default', userId: 'uploader', role: 'user',
+    });
+    expect((await stale.loadFor('immutable', {
+      tenantId: 'default', userId: 'viewer', role: 'user',
+    }))?.body).toContain('approved body');
+    const uploaderLoad = await stale.tool().execute({ name: 'immutable' }, {
+      tenantId: 'default', userId: 'uploader', role: 'user', sessionId: 'shadow-check',
+    });
+    expect(uploaderLoad.isError).toBeFalsy();
+    expect(uploaderLoad.content).toContain('approved body');
+
+    await first.setEnabled('immutable', false, {
+      tenantId: 'default', userId: 'reviewer', role: 'platform_admin',
+    });
+    await expect(stale.loadFor('immutable', {
+      tenantId: 'default', userId: 'viewer', role: 'user',
+    })).resolves.toBeUndefined();
+
+    await expect(stale.delete('immutable', {
+      tenantId: 'default', userId: 'uploader', role: 'user',
+    })).resolves.toBeUndefined();
+    await expect(stat(published.path)).resolves.toBeDefined();
+    await first.delete('immutable', {
+      tenantId: 'default', userId: 'reviewer', role: 'platform_admin',
+    });
+    await expect(stale.loadFor('immutable', {
+      tenantId: 'default', userId: 'viewer', role: 'user',
+    })).resolves.toBeUndefined();
+  });
+
+  it('rejects a published artifact whose content no longer matches its digest', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-published-digest-'));
+    const uploadedDir = join(root, 'users', 'uploader', 'digest-check');
+    await mkdir(uploadedDir, { recursive: true });
+    await writeFile(join(uploadedDir, 'SKILL.md'), '---\nname: digest-check\ndescription: approved\n---\napproved');
+    await writeProduct(uploadedDir, { name: 'digest-check', version: '1' });
+    const registry = new SkillRegistry(root);
+    await registry.installUploadedProduct(uploadedDir, {
+      tenantId: 'default', userId: 'uploader', role: 'user',
+    });
+    const published = await registry.review('digest-check', {
+      tenantId: 'default', userId: 'reviewer', role: 'tenant_admin',
+    });
+    await writeFile(join(published.path, 'SKILL.md'), '---\nname: digest-check\ndescription: tampered\n---\ntampered');
+
+    await expect(registry.loadFor('digest-check', {
+      tenantId: 'default', userId: 'viewer', role: 'user',
+    })).resolves.toBeUndefined();
+  });
+
+  it('does not let pending uploads reserve the global published name and lets admins remove pending uploads', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-pending-governance-'));
+    const registry = new SkillRegistry(root);
+    for (const [tenantId, owner] of [['default', 'squatter'], ['other', 'publisher']] as const) {
+      const tenantRoot = tenantId === 'default' ? root : join(root, 'tenants', tenantId);
+      const dir = join(tenantRoot, 'users', owner, 'reserved');
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, 'SKILL.md'), '---\nname: reserved\ndescription: candidate\n---\nbody');
+      await writeProduct(dir, { name: 'reserved', version: '1' });
+      await registry.installUploadedProduct(dir, { tenantId, userId: owner, role: 'user' });
+    }
+
+    await expect(registry.review('reserved', {
+      tenantId: 'other', userId: 'platform-reviewer', role: 'platform_admin',
+    }, { global: true })).resolves.toMatchObject({ reviewed: true, visibility: 'public' });
+    await expect(registry.delete('reserved', {
+      tenantId: 'default', userId: 'tenant-reviewer', role: 'tenant_admin',
+    })).resolves.toBeUndefined();
+  });
+
+  it('preserves concurrent governance updates from separate long-lived registries', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-governance-cas-'));
+    const skillDir = join(root, 'users', 'owner', 'governed');
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(skillDir, 'SKILL.md'), '---\nname: governed\ndescription: governed\n---\nbody');
+    await writeProduct(skillDir, { name: 'governed', version: '1' });
+    const first = new SkillRegistry(root);
+    const second = new SkillRegistry(root);
+    await first.installUploadedProduct(skillDir, { tenantId: 'default', userId: 'owner', role: 'user' });
+    await Promise.all([first.scan(), second.scan()]);
+
+    await Promise.all([
+      first.setEnabled('governed', false, { tenantId: 'default', userId: 'owner', role: 'user' }),
+      second.setShared('governed', true, { tenantId: 'default', userId: 'owner', role: 'user' }),
+    ]);
+
+    const verifier = new SkillRegistry(root);
+    await verifier.scan();
+    expect(verifier.get('governed')?.product).toMatchObject({
+      enabled: false,
+      visibility: 'shared',
+      revision: 2,
+    });
+  });
   it('rejects review when the uploaded product name does not match canonical SKILL.md metadata', async () => {
     const root = await mkdtemp(join(tmpdir(), 'aiop-upload-name-'));
     const skillDir = join(root, 'users', 'uploader', 'expected');
@@ -412,7 +834,7 @@ describe('SkillRegistry upload review governance', () => {
     await expect(reg.review('published', reviewer)).rejects.toThrow('已审核');
   });
 
-  it('rejects a pending upload that collides with a same-name built-in', async () => {
+  it('allows a pending update beside a same-name built-in but rejects publishing over it', async () => {
     const root = await mkdtemp(join(tmpdir(), 'aiop-upload-review-target-'));
     const builtInDir = join(root, 'collision');
     await mkdir(builtInDir);
@@ -448,7 +870,7 @@ describe('SkillRegistry upload review governance', () => {
     });
   });
 
-  it('rejects same-tenant reviewed and pending name collisions during upload', async () => {
+  it('rejects same-tenant pending name collisions but allows pending updates beside reviewed products', async () => {
     const root = await mkdtemp(join(tmpdir(), 'aiop-upload-collision-'));
     for (const [owner, reviewed] of [['reviewed-owner', true], ['pending-owner', false]] as const) {
       const skillDir = join(root, 'users', owner, reviewed ? 'reviewed-name' : 'pending-name');
@@ -467,13 +889,15 @@ describe('SkillRegistry upload review governance', () => {
       await mkdir(incoming, { recursive: true });
       await writeFile(join(incoming, 'SKILL.md'), `---\nname: ${name}\ndescription: incoming\n---\nbody`);
       await writeProduct(incoming, { name, version: '2' });
-      await expect(reg.installUploadedProduct(incoming, {
+      const expectation = expect(reg.installUploadedProduct(incoming, {
         tenantId: 'default', userId: 'incoming', role: 'user',
-      })).rejects.toThrow('名称冲突');
+      }));
+      if (name === 'pending-name') await expectation.rejects.toThrow('名称冲突');
+      else await expectation.resolves.toMatchObject({ reviewed: false });
     }
   });
 
-  it('allows tenant-private duplicate names across isolated tenants but rejects a global review collision', async () => {
+  it('allows tenant-private duplicate names across isolated tenants and ignores pending records for global publication', async () => {
     const root = await mkdtemp(join(tmpdir(), 'aiop-upload-global-collision-'));
     const defaultDir = join(root, 'users', 'default-owner', 'isolated');
     await mkdir(defaultDir, { recursive: true });
@@ -495,7 +919,7 @@ describe('SkillRegistry upload review governance', () => {
 
     await expect(reg.review('isolated', {
       tenantId: 'default', userId: 'platform-reviewer', role: 'platform_admin',
-    }, { global: true })).rejects.toThrow('全局名称冲突');
+    }, { global: true })).resolves.toMatchObject({ reviewed: true, allowedTenantIds: ['*'] });
   });
 
   it('skips ambiguous reviewed names consistently across list, prompt, and lookup', async () => {
@@ -560,11 +984,11 @@ describe('SkillRegistry upload review governance', () => {
     const fulfilled = results.filter((result): result is PromiseFulfilledResult<SkillProductRecord> => result.status === 'fulfilled');
     expect(fulfilled).toHaveLength(1);
     expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
-    const persisted = JSON.parse(await readFile(join(skillDir, '.product.json'), 'utf8')) as Record<string, unknown>;
+    const persisted = JSON.parse(await readFile(join(fulfilled[0]!.value.path, '.product.json'), 'utf8')) as Record<string, unknown>;
     expect(persisted).toMatchObject({
       reviewed: true,
       visibility: fulfilled[0]!.value.visibility,
-      ...(fulfilled[0]!.value.visibility === 'public' ? { allowedTenantIds: ['*'] } : {}),
+      ...(fulfilled[0]!.value.allowedTenantIds?.includes('*') ? { allowedTenantIds: ['*'] } : {}),
     });
   });
 
@@ -630,7 +1054,7 @@ describe('SkillRegistry upload review governance', () => {
     await mkdir(expiredOwnerDir, { recursive: true });
     await writeFile(join(expiredOwnerDir, 'owner.json'), JSON.stringify({
       token: 'expired-owner', key: lockKey, leaseUntil: Date.now() - 60_000,
-      hostname: hostname(), pid: 2_147_483_647,
+      hostname: 'another-pod.example', pid: 2_147_483_647,
     }));
     const skillDir = join(root, 'users', 'uploader', name);
     await mkdir(skillDir, { recursive: true });
@@ -645,7 +1069,24 @@ describe('SkillRegistry upload review governance', () => {
     expect((await stat(join(root, '.aiop-locks'))).mode & 0o777).toBe(0o700);
   });
 
-  it('does not recover an expired distributed name lock while its owner process is alive', async () => {
+  it('recovers orphaned release-window lock directories with no active owner', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-upload-orphan-lock-'));
+    const name = 'orphan-lock';
+    const lockPath = join(root, '.aiop-locks', createHash('sha256').update(`skill-name:${name}`).digest('hex'));
+    await mkdir(join(lockPath, '.release-crashed'), { recursive: true });
+    const skillDir = join(root, 'users', 'uploader', name);
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(skillDir, 'SKILL.md'), `---\nname: ${name}\ndescription: orphan\n---\nbody`);
+    await writeProduct(skillDir, { name, version: '1' });
+    const registry = new SkillRegistry(root);
+
+    await expect(registry.installUploadedProduct(skillDir, {
+      tenantId: 'default', userId: 'uploader', role: 'user',
+    })).resolves.toMatchObject({ name, reviewed: false });
+    await expect(stat(lockPath)).rejects.toThrow();
+  });
+
+  it('recovers an expired distributed name lock even when the stale owner was on this host', async () => {
     const root = await mkdtemp(join(tmpdir(), 'aiop-upload-live-lock-'));
     const name = 'live-lock';
     const lockKey = `skill-name:${name}`;
@@ -668,8 +1109,8 @@ describe('SkillRegistry upload review governance', () => {
 
     await expect(registry.installUploadedProduct(skillDir, {
       tenantId: 'default', userId: 'uploader', role: 'user',
-    })).rejects.toThrow('获取技能名称锁超时');
-    await expect(stat(lockPath)).resolves.toBeDefined();
+    })).resolves.toMatchObject({ name, reviewed: false });
+    await expect(stat(lockPath)).rejects.toThrow();
   });
 
   it('releases the distributed name lock when review validation fails', async () => {
@@ -706,6 +1147,14 @@ describe('credential_file validation', () => {
 });
 
 describe('importSkillZip', () => {
+  it('rejects compressed archives above the route-specific package limit before parsing', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-import-skill-compressed-limit-'));
+    await expect(importSkillZip({
+      rootDir: root,
+      filename: 'oversized.zip',
+      data: Buffer.alloc(10_000_001),
+    })).rejects.toThrow('压缩包大小上限');
+  });
   it('rolls back the extracted directory when post-extraction validation fails', async () => {
     const root = await mkdtemp(join(tmpdir(), 'aiop-import-skill-cleanup-'));
 

@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, mkdir, readFile, rm } from 'node:fs/promises';
+import { chmod, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { SignJWT, jwtVerify } from 'jose';
 import { logger } from '../logger.js';
@@ -32,7 +32,7 @@ import { createScheduledTaskRunner } from '../scheduler/runner.js';
 import { createModel } from '../model/factory.js';
 import { estimateCost } from '../model/cost.js';
 import type { JsonValue, Msg, ToolCall } from '../model/types.js';
-import { importSkillZip } from '../skill/import.js';
+import { importSkillZip, MAX_SKILL_ZIP_BYTES } from '../skill/import.js';
 import type { Skill, SkillProductRecord, SkillRegistry } from '../skill/registry.js';
 import { McpServerSchema } from '../config/schema.js';
 import {
@@ -73,8 +73,136 @@ const GOAL_MODE_SYSTEM = [
   '持续记录关键行动和验证结果；完成后用简洁 Markdown 汇报目标是否达成、执行过的关键步骤和遗留风险。',
 ].join('\n');
 
-/** 技能 zip 以 base64 JSON 上传：44MB 的包编码后约 60MB，导入接口单独放宽到 128MB。 */
-const SKILL_IMPORT_MAX_BODY = 128_000_000;
+/** 10MB zip 的 base64 加 JSON 包装；该路由不继承通用大请求攻击面。 */
+const SKILL_IMPORT_MAX_BODY = Math.ceil(MAX_SKILL_ZIP_BYTES * 4 / 3) + 64_000;
+const SKILL_IMPORT_GLOBAL_CONCURRENCY = 4;
+const SKILL_IMPORT_TENANT_CONCURRENCY = 2;
+
+async function acquireSkillImport(registry: SkillRegistry, tenantId: string): Promise<() => Promise<void>> {
+  const distributed = await registry.acquireImportPermit(
+    tenantId,
+    SKILL_IMPORT_GLOBAL_CONCURRENCY,
+    SKILL_IMPORT_TENANT_CONCURRENCY,
+  );
+  if (distributed.supported) {
+    if (!distributed.release) {
+      throw new HttpError(429, '技能导入并发已达上限，请稍后重试');
+    }
+    return distributed.release;
+  }
+  const permitRoot = join(registry.importStagingRoot(), '.concurrency');
+  const token = randomUUID();
+  const globalSlot = await acquireImportSlot(join(permitRoot, 'global'), SKILL_IMPORT_GLOBAL_CONCURRENCY, token);
+  if (!globalSlot) throw new HttpError(429, '技能导入并发已达上限，请稍后重试');
+  const tenantKey = createHash('sha256').update(tenantId).digest('hex');
+  const tenantSlot = await acquireImportSlot(
+    join(permitRoot, `tenant-${tenantKey}`),
+    SKILL_IMPORT_TENANT_CONCURRENCY,
+    token,
+  );
+  if (!tenantSlot) {
+    await releaseImportSlot(globalSlot, token);
+    throw new HttpError(429, '技能导入并发已达上限，请稍后重试');
+  }
+  let released = false;
+  return async () => {
+    if (released) return;
+    released = true;
+    await Promise.all([
+      releaseImportSlot(tenantSlot, token),
+      releaseImportSlot(globalSlot, token),
+    ]);
+  };
+}
+
+async function acquireImportSlot(root: string, limit: number, token: string): Promise<string | undefined> {
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  for (let index = 0; index < limit; index += 1) {
+    const slot = join(root, String(index));
+    const candidate = `${slot}.candidate-${token}`;
+    try {
+      const ownerDir = join(candidate, token);
+      await mkdir(ownerDir, { recursive: true });
+      await writeImportSlotOwner(ownerDir, token);
+      await rename(candidate, slot);
+      return slot;
+    } catch (error) {
+      await rm(candidate, { recursive: true, force: true });
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'EEXIST' && code !== 'ENOTEMPTY') {
+        throw error;
+      }
+      if (await recoverOrphanedImportSlot(slot)) index -= 1;
+    }
+  }
+  return undefined;
+}
+
+async function writeImportSlotOwner(ownerDir: string, token: string): Promise<void> {
+  const temp = join(ownerDir, `.owner-${token}.tmp`);
+  await writeFile(temp, `${JSON.stringify({ token })}\n`, { flag: 'w' });
+  await rename(temp, join(ownerDir, 'owner.json'));
+}
+
+async function readImportSlotOwner(ownerDir: string): Promise<{ token: string } | undefined> {
+  try {
+    const value = JSON.parse(await readFile(join(ownerDir, 'owner.json'), 'utf8')) as Record<string, unknown>;
+    if (typeof value.token !== 'string') return undefined;
+    return { token: value.token };
+  } catch {
+    return undefined;
+  }
+}
+
+async function readCurrentImportSlotOwner(
+  slot: string,
+): Promise<{ ownerDir: string; owner: { token: string } } | undefined> {
+  let entries;
+  try {
+    entries = await readdir(slot, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+    const ownerDir = join(slot, entry.name);
+    const owner = await readImportSlotOwner(ownerDir);
+    if (owner?.token === entry.name) return { ownerDir, owner };
+  }
+  return undefined;
+}
+
+async function recoverOrphanedImportSlot(slot: string): Promise<boolean> {
+  const current = await readCurrentImportSlotOwner(slot);
+  // Active permits are deliberately fail-closed: without a connection-scoped
+  // authority we never expire another process's live generation by wall clock.
+  if (current) return false;
+  const retired = `${slot}.expired-${randomUUID()}`;
+  try {
+    await rename(slot, retired);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw error;
+  }
+  await rm(retired, { recursive: true, force: true });
+  return true;
+}
+
+async function releaseImportSlot(slot: string, token: string): Promise<void> {
+  const ownerDir = join(slot, token);
+  const releaseEntry = join(slot, `.released-${token}`);
+  try {
+    await rename(ownerDir, releaseEntry);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if ((await readImportSlotOwner(releaseEntry))?.token !== token) {
+    await rename(releaseEntry, ownerDir).catch(() => undefined);
+    return;
+  }
+  await rm(releaseEntry, { recursive: true, force: true });
+}
 
 /** 读取并解析 JSON 请求体（默认限制 8MB，支持聊天附件以 base64 形式上传）。 */
 async function readJson(req: Req, maxSize = 8_000_000): Promise<Record<string, unknown>> {
@@ -1040,46 +1168,53 @@ async function handle(
     // 上传放开给所有登录用户，但统一落 tenant/users/<uid>，并由服务端写入待审核私有元数据。
     const ctx = await requireAuth(rt, req);
     if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
-    const body = await readJson(req, SKILL_IMPORT_MAX_BODY);
-    const filename = str(body, 'filename');
-    const data = str(body, 'data');
-    if (!filename || !data) throw new HttpError(400, 'filename/data 必填');
-    if (!/\.zip$/i.test(filename)) throw new HttpError(400, '仅支持导入 zip 技能包');
+    const releaseImport = await acquireSkillImport(rt.skillRegistry, ctx.tenantId);
+    try {
+      const body = await readJson(req, SKILL_IMPORT_MAX_BODY);
+      const filename = str(body, 'filename');
+      const data = str(body, 'data');
+      if (!filename || !data) throw new HttpError(400, 'filename/data 必填');
+      if (!/\.zip$/i.test(filename)) throw new HttpError(400, '仅支持导入 zip 技能包');
 
-    const stagingBase = rt.skillRegistry.importStagingRoot();
-    await mkdir(stagingBase, { recursive: true, mode: 0o750 });
-    await chmod(stagingBase, 0o750);
-    const stagingRoot = join(stagingBase, randomUUID());
-    const uploadRoot = rt.skillRegistry.uploadRootFor(ctx);
-    let imported: Awaited<ReturnType<typeof importSkillZip>>;
-    try {
-      imported = await importSkillZip({
-        rootDir: stagingRoot,
-        filename,
-        data: decodeSkillImportData(data),
+      const stagingBase = rt.skillRegistry.importStagingRoot();
+      await mkdir(stagingBase, { recursive: true, mode: 0o750 });
+      await chmod(stagingBase, 0o750);
+      const stagingRoot = join(stagingBase, randomUUID());
+      const uploadRoot = rt.skillRegistry.uploadRootFor(ctx);
+      let imported: Awaited<ReturnType<typeof importSkillZip>>;
+      try {
+        imported = await importSkillZip({
+          rootDir: stagingRoot,
+          filename,
+          data: decodeSkillImportData(data),
+        });
+      } catch (error) {
+        await rm(stagingRoot, { recursive: true, force: true });
+        throw skillArchiveHttpError(error);
+      }
+      const destinationDir = join(uploadRoot, basename(imported.skillDir));
+      let product: SkillProductRecord;
+      try {
+        product = await rt.skillRegistry.installUploadedProduct(imported.skillDir, ctx, { destinationDir });
+      } catch (error) {
+        await rm(imported.skillDir, { recursive: true, force: true });
+        await rt.skillRegistry.scan();
+        throw skillHttpError(error);
+      } finally {
+        await rm(stagingRoot, { recursive: true, force: true });
+      }
+      rt.systemExtra = rt.skillRegistry.summaries();
+      await rt.audit?.record({
+        kind: 'auth', action: 'skill-imported', tenantId: ctx.tenantId,
+        detail: { skill: product.name, by: ctx.userId, visibility: product.visibility, pendingReview: true },
       });
-    } catch (error) {
-      await rm(stagingRoot, { recursive: true, force: true });
-      throw error;
-    }
-    const destinationDir = join(uploadRoot, basename(imported.skillDir));
-    let product: SkillProductRecord;
-    try {
-      product = await rt.skillRegistry.installUploadedProduct(imported.skillDir, ctx, { destinationDir });
-    } catch (error) {
-      await rm(imported.skillDir, { recursive: true, force: true });
-      await rt.skillRegistry.scan();
-      throw skillHttpError(error);
+      const { id: _id, path: _path, description: _description, ...publicProduct } = product;
+      return sendJson(res, 201, { product: publicProduct, pendingReview: true });
     } finally {
-      await rm(stagingRoot, { recursive: true, force: true });
+      await releaseImport().catch((error) => {
+        log.warn({ err: String(error) }, 'skill import permit release failed');
+      });
     }
-    rt.systemExtra = rt.skillRegistry.summaries();
-    await rt.audit?.record({
-      kind: 'auth', action: 'skill-imported', tenantId: ctx.tenantId,
-      detail: { skill: product.name, by: ctx.userId, visibility: product.visibility, pendingReview: true },
-    });
-    const { id: _id, path: _path, description: _description, ...publicProduct } = product;
-    return sendJson(res, 201, { product: publicProduct, pendingReview: true });
   }
 
   const skillReviewMatch = /^\/v1\/skills\/([^/]+)\/review$/.exec(path);
@@ -1100,6 +1235,8 @@ async function handle(
       await rt.audit?.record({
         kind: 'auth', action: 'skill-reviewed', tenantId: ctx.tenantId,
         detail: { skill: product.name, by: ctx.userId, global },
+      }).catch((error) => {
+        log.error({ skill: product.name, err: String(error) }, 'published skill audit write failed after commit');
       });
       const { id: _id, path: _path, description: _description, ...publicProduct } = product;
       return sendJson(res, 200, { product: publicProduct });
@@ -1114,7 +1251,7 @@ async function handle(
     const ctx = await requireAuth(rt, req);
     if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
     const name = decodeURIComponent(skillShareMatch[1]!);
-    const skill = requireManagedSkill(rt, ctx, name);
+    const skill = await requireManagedSkill(rt, ctx, name);
     try {
       const updated = await rt.skillRegistry.setShared(skill.name, skillShareMatch[2] === 'share', ctx);
       rt.systemExtra = rt.skillRegistry.summaries();
@@ -1134,7 +1271,7 @@ async function handle(
     if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
     const name = decodeURIComponent(skillFilesMatch[1]!);
     // 可见性检查：越权技能等同不存在（404，不泄露存在性）。
-    if (!rt.skillRegistry.getFor(name, ctx)) throw new HttpError(404, `未找到技能 ${name}`);
+    if (!await rt.skillRegistry.getForFresh(name, ctx)) throw new HttpError(404, `未找到技能 ${name}`);
     const requestedPath = url.searchParams.get('path') ?? '';
     try {
       const entries = await rt.skillRegistry.listDir(name, requestedPath, ctx);
@@ -1160,7 +1297,7 @@ async function handle(
     const ctx = await requireAuth(rt, req);
     if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
     const name = decodeURIComponent(skillActionMatch[1]!);
-    const managed = requireManagedSkill(rt, ctx, name);
+    const managed = await requireManagedSkill(rt, ctx, name, true);
     const enabled = skillActionMatch[2] === 'enable';
     try {
       const skill = await rt.skillRegistry.setEnabled(managed.name, enabled, ctx);
@@ -1178,7 +1315,7 @@ async function handle(
     const body = await readJson(req);
     if (body.confirm !== true) throw new HttpError(400, '删除技能需要 confirm=true');
     const name = decodeURIComponent(skillDeleteMatch[1]!);
-    const managed = requireManagedSkill(rt, ctx, name);
+    const managed = await requireManagedSkill(rt, ctx, name);
     try {
       await rt.skillRegistry.delete(managed.name, ctx);
       rt.systemExtra = rt.skillRegistry.summaries();
@@ -1847,9 +1984,26 @@ function decodeSkillImportData(data: string): Buffer {
 function decodeBase64(raw: string): Buffer {
   const compact = raw.replace(/\s+/g, '');
   if (!compact) throw new HttpError(400, '技能包数据为空');
+  if (compact.length % 4 !== 0
+    || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(compact)) {
+    throw new HttpError(400, '技能包数据不是合法 base64');
+  }
   const data = Buffer.from(compact, 'base64');
   if (!data.length) throw new HttpError(400, '技能包数据为空');
+  if (data.length > MAX_SKILL_ZIP_BYTES) throw new HttpError(413, '技能压缩包大小超过 10MB 上限');
   return data;
+}
+
+function skillArchiveHttpError(err: unknown): HttpError {
+  if (err instanceof HttpError) return err;
+  const message = err instanceof Error ? err.message : String(err || '技能压缩包无效');
+  if (message.includes('大小上限') || message.includes('超过上限') || message.includes('maxOutputLength')) {
+    return new HttpError(413, message);
+  }
+  if (message.includes('非法 zip 路径') || message.includes('符号链接') || message.includes('文件类型')) {
+    return new HttpError(400, message);
+  }
+  return new HttpError(422, message);
 }
 
 function publicSkill(skill: Skill, registry: SkillRegistry, viewer?: RequestContext): Record<string, unknown> {
@@ -1873,12 +2027,21 @@ function publicSkill(skill: Skill, registry: SkillRegistry, viewer?: RequestCont
  * 技能管理护栏：不可见 → 404（不泄露存在性）；可见但非所有者 → 403。
  * 只有所有者能启停/删除/共享自己的技能；无主存量技能由 tenant:manage 管理员代管。
  */
-function requireManagedSkill(rt: Runtime, ctx: RequestContext, name: string): Skill {
+async function requireManagedSkill(
+  rt: Runtime,
+  ctx: RequestContext,
+  name: string,
+  preferReviewed = false,
+): Promise<Skill> {
   const registry = rt.skillRegistry;
   if (!registry) throw new HttpError(409, '未启用技能目录');
-  const skill = registry.getFor(name, ctx);
-  if (!skill) throw new HttpError(404, `未找到技能 ${name}`);
-  if (!registry.canManage(skill, ctx)) throw new HttpError(403, '仅技能所有者可执行该操作');
+  const skill = await registry.getManageableForFresh(name, ctx, preferReviewed);
+  if (!skill) {
+    if (await registry.hasVisibleForFresh(name, ctx)) {
+      throw new HttpError(403, '仅技能所有者可执行该操作');
+    }
+    throw new HttpError(404, `未找到技能 ${name}`);
+  }
   return skill;
 }
 

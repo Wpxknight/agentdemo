@@ -12,23 +12,9 @@ spec:
     metadata:
       labels: { app: aiop, component: server }
     spec:
-      initContainers:
-        - name: seed-skills
-          image: aiop:latest
-          imagePullPolicy: IfNotPresent
-          command:
-            - /bin/sh
-            - -c
-            - |
-              mkdir -p /skills-data
-              cp -an /app/skills/. /skills-data/
-              chown -R node:node /skills-data
-          securityContext:
-            runAsUser: 0
-            runAsGroup: 0
-          volumeMounts:
-            - name: skills
-              mountPath: /skills-data
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: aiop-web
           image: aiop-web:latest
@@ -70,7 +56,7 @@ spec:
               mountPath: /config
               readOnly: true
             - name: skills
-              mountPath: /app/skills
+              mountPath: /skills-data
           readinessProbe:
             httpGet: { path: /readyz, port: 8081 }
             initialDelaySeconds: 5

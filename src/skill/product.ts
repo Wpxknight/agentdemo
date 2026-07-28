@@ -25,6 +25,16 @@ export interface SkillProductRecord {
   allowedRoles?: readonly Role[];
   credentials?: readonly string[];
   credentialFile?: string;
+  /** Sidecar schema for rolling-compatible product metadata evolution. */
+  schemaVersion?: number;
+  /** Monotonic governance revision; mutations use it as a filesystem CAS token. */
+  revision?: number;
+  /** SHA-256 over immutable artifact files (excluding the mutable product sidecar). */
+  contentDigest?: string;
+  /** Versioned artifact identity, normally `<version>-<digest-prefix>`. */
+  artifactVersion?: string;
+  /** Original uploader retained for audit only; it does not grant artifact ownership. */
+  submittedByUserId?: string;
 }
 
 export type SkillProductMetadata = Omit<SkillProductRecord, 'id' | 'path' | 'description'>;
@@ -67,6 +77,9 @@ export const USER_SKILLS_DIR = 'users';
 export const TENANT_SKILLS_DIR = 'tenants';
 export const SKILL_LOCKS_DIR = '.aiop-locks';
 export const SKILL_IMPORTS_DIR = '.aiop-imports';
+export const SKILL_PUBLISHED_DIR = '.aiop-published';
+export const SKILL_TOMBSTONES_DIR = '.aiop-tombstones';
+export const PUBLISHED_COMMIT_FILE = '.aiop-committed';
 export const PRODUCT_RECORD_FILE = '.product.json';
 
 export function normalizeCredentialFile(value: string): string {
@@ -101,6 +114,11 @@ export function normalizeSkillProductRecord(record: SkillProductRecord): SkillPr
     allowedRoles: record.allowedRoles,
     credentials: record.credentials,
     credentialFile: record.credentialFile,
+    schemaVersion: record.schemaVersion,
+    revision: record.revision,
+    contentDigest: record.contentDigest,
+    artifactVersion: record.artifactVersion,
+    submittedByUserId: record.submittedByUserId,
   });
   return {
     ...record,
@@ -119,6 +137,7 @@ export function parseSkillProductMetadata(value: unknown): SkillProductMetadata 
   const allowedKeys = new Set([
     'name', 'version', 'enabled', 'reviewed', 'tenantId', 'allowedTenantIds',
     'ownerUserId', 'visibility', 'allowedRoles', 'credentials', 'credentialFile',
+    'schemaVersion', 'revision', 'contentDigest', 'artifactVersion', 'submittedByUserId',
   ]);
   const unknownKey = Object.keys(metadata).find((key) => !allowedKeys.has(key));
   if (unknownKey) throw new Error(`Skill 产品元数据包含未知字段 ${unknownKey}`);
@@ -143,13 +162,39 @@ export function parseSkillProductMetadata(value: unknown): SkillProductMetadata 
     allowedRoles: optionalRoles(metadata, 'allowedRoles'),
     credentials: optionalStringArray(metadata, 'credentials'),
     credentialFile: optionalString(metadata, 'credentialFile'),
+    schemaVersion: optionalPositiveInteger(metadata, 'schemaVersion'),
+    revision: optionalNonNegativeInteger(metadata, 'revision'),
+    contentDigest: optionalDigest(metadata, 'contentDigest'),
+    artifactVersion: optionalString(metadata, 'artifactVersion'),
+    submittedByUserId: optionalString(metadata, 'submittedByUserId'),
   };
   validateMetadata(parsed);
   return parsed;
 }
 
+function optionalPositiveInteger(value: Record<string, unknown>, key: string): number | undefined {
+  const item = value[key];
+  if (item === undefined) return undefined;
+  if (!Number.isInteger(item) || (item as number) < 1) throw new Error(`Skill 产品元数据 ${key} 必须是正整数`);
+  return item as number;
+}
+
+function optionalNonNegativeInteger(value: Record<string, unknown>, key: string): number | undefined {
+  const item = value[key];
+  if (item === undefined) return undefined;
+  if (!Number.isInteger(item) || (item as number) < 0) throw new Error(`Skill 产品元数据 ${key} 必须是非负整数`);
+  return item as number;
+}
+
+function optionalDigest(value: Record<string, unknown>, key: string): string | undefined {
+  const item = optionalString(value, key);
+  if (item !== undefined && !/^[a-f0-9]{64}$/.test(item)) throw new Error(`Skill 产品元数据 ${key} 无效`);
+  return item;
+}
+
 function validateMetadata(record: SkillProductMetadata | SkillProductRecord): void {
-  if (record.visibility === 'private' && !record.ownerUserId) {
+  if (record.visibility === 'private' && !record.ownerUserId
+    && !(record.reviewed && record.submittedByUserId)) {
     throw new Error('private Skill 产品元数据缺少 ownerUserId');
   }
   if (record.credentials?.length === 0) throw new Error('Skill credentials 不能为空数组');

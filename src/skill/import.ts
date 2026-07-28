@@ -21,9 +21,10 @@ interface ZipEntry {
 const EOCD_SIGNATURE = 0x06054b50;
 const CENTRAL_SIGNATURE = 0x02014b50;
 const LOCAL_SIGNATURE = 0x04034b50;
-const MAX_ZIP_ENTRIES = 2_048;
-const MAX_ZIP_ENTRY_BYTES = 16_000_000;
-const MAX_ZIP_TOTAL_BYTES = 64_000_000;
+export const MAX_SKILL_ZIP_BYTES = 10_000_000;
+const MAX_ZIP_ENTRIES = 512;
+const MAX_ZIP_ENTRY_BYTES = 8_000_000;
+const MAX_ZIP_TOTAL_BYTES = 32_000_000;
 const UNIX_FILE_TYPE_MASK = 0o170000;
 const UNIX_SYMLINK_TYPE = 0o120000;
 const DANGEROUS_EXTENSIONS = new Set([
@@ -32,6 +33,7 @@ const DANGEROUS_EXTENSIONS = new Set([
 
 export async function importSkillZip(options: ImportSkillZipOptions): Promise<ImportSkillZipResult> {
   if (!/\.zip$/i.test(options.filename)) throw new Error('仅支持导入 zip 技能包');
+  if (options.data.length > MAX_SKILL_ZIP_BYTES) throw new Error('技能压缩包大小上限为 10MB');
   const entries = readZipEntries(options.data);
   if (!entries.length) throw new Error('zip 技能包为空');
 

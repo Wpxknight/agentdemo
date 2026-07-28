@@ -3,7 +3,9 @@ import { join } from 'node:path';
 import { logger } from '../logger.js';
 import {
   PRODUCT_RECORD_FILE,
+  PUBLISHED_COMMIT_FILE,
   PUBLIC_SKILLS_DIR,
+  SKILL_PUBLISHED_DIR,
   TENANT_SKILLS_DIR,
   USER_SKILLS_DIR,
   normalizeSkillProductRecord,
@@ -21,7 +23,26 @@ export async function enumerateSkillProductRecords(root: string): Promise<SkillP
   for (const tenantId of await directories(tenantsRoot)) {
     await enumerateTenantRoot(join(tenantsRoot, tenantId), tenantId, records, false);
   }
+  await enumeratePublishedRoot(root, records);
   return records;
+}
+
+async function enumeratePublishedRoot(root: string, records: SkillProductRecord[]): Promise<void> {
+  const publishedRoot = join(root, SKILL_PUBLISHED_DIR);
+  for (const scope of await directories(publishedRoot)) {
+    for (const artifact of await directories(join(publishedRoot, scope))) {
+      for (const name of await directories(join(publishedRoot, scope, artifact))) {
+        const path = join(publishedRoot, scope, artifact, name);
+        try {
+          await readFile(join(path, PUBLISHED_COMMIT_FILE));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+          throw error;
+        }
+        await appendRecord(records, path, undefined);
+      }
+    }
+  }
 }
 
 async function enumerateTenantRoot(
@@ -50,13 +71,13 @@ async function enumerateTenantRoot(
 async function appendRecord(
   records: SkillProductRecord[],
   path: string,
-  expectedTenantId: string,
+  expectedTenantId?: string,
   expectedOwnerUserId?: string,
 ): Promise<void> {
   try {
     const raw = await readFile(join(path, PRODUCT_RECORD_FILE), 'utf8');
     const metadata = parseSkillProductMetadata(JSON.parse(raw));
-    if (metadata.tenantId !== expectedTenantId) {
+    if (expectedTenantId !== undefined && metadata.tenantId !== expectedTenantId) {
       throw new Error(`tenantId ${metadata.tenantId} 与目录租户 ${expectedTenantId} 不一致`);
     }
     if (expectedOwnerUserId && metadata.ownerUserId !== expectedOwnerUserId) {
@@ -66,7 +87,7 @@ async function appendRecord(
       && (!metadata.reviewed || !metadata.allowedTenantIds?.includes('*'))) {
       throw new Error('用户目录中的 public Skill 必须经过全局审核');
     }
-    if (!expectedOwnerUserId && metadata.visibility !== 'public') {
+    if (expectedTenantId !== undefined && !expectedOwnerUserId && metadata.visibility !== 'public') {
       throw new Error('公共目录中的 Skill 必须声明 public');
     }
     records.push(normalizeSkillProductRecord({
@@ -75,6 +96,11 @@ async function appendRecord(
       ...metadata,
     }));
   } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code && code !== 'ENOENT') throw error;
+    if (code !== 'ENOENT') {
+      log.error({ path, err: String(error) }, 'skill product source read failed');
+    }
     log.warn({ path, err: String(error) }, 'skipping skill with invalid or missing product metadata');
   }
 }
@@ -86,7 +112,8 @@ async function directories(root: string): Promise<string[]> {
       .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
       .map((entry) => entry.name)
       .sort();
-  } catch {
-    return [];
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
   }
 }

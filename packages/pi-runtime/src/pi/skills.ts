@@ -118,5 +118,7 @@ function isAvailableTo(product: PiSkillProduct, identity: PiSkillIdentity): bool
   if (product.allowedRoles?.length
     && (!identity.role || !product.allowedRoles.includes(identity.role))) return false;
   return product.visibility !== 'private'
-    || Boolean(identity.userId) && product.ownerUserId === identity.userId;
+    || Boolean(identity.userId)
+      && (product.ownerUserId === identity.userId
+        || (product as PiSkillProduct & { submittedByUserId?: string }).submittedByUserId === identity.userId);
 }

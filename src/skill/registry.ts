@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { dirname, join, posix, resolve, sep } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -12,6 +12,8 @@ import {
   PUBLIC_SKILLS_DIR,
   SKILL_IMPORTS_DIR,
   SKILL_LOCKS_DIR,
+  SKILL_PUBLISHED_DIR,
+  SKILL_TOMBSTONES_DIR,
   USER_SKILLS_DIR,
   type Skill,
   type SkillFileBody,
@@ -20,12 +22,14 @@ import {
   type SkillVisibility,
   TENANT_SKILLS_DIR,
   PRODUCT_RECORD_FILE,
+  PUBLISHED_COMMIT_FILE,
   normalizeSkillProductRecord,
   type SkillProductRecord,
 } from './product.js';
 import { canManageSkill, isSkillVisibleTo } from './visibility.js';
 import { enumerateSkillProductRecords } from './source.js';
 import { SkillProductService, type ProductSkillLoader } from './service.js';
+import type { SkillMutationLock } from './lock.js';
 
 export {
   PUBLIC_SKILLS_DIR,
@@ -43,11 +47,14 @@ const log = logger.child({ mod: 'skill' });
 const DISABLED_MARKER = '.disabled';
 const SHARED_MARKER = '.shared';
 const OWNER_MARKER = '.owner';
-const MARKER_FILES = new Set([DISABLED_MARKER, SHARED_MARKER, OWNER_MARKER, '.product.json']);
+const MARKER_FILES = new Set([
+  DISABLED_MARKER, SHARED_MARKER, OWNER_MARKER, PRODUCT_RECORD_FILE, PUBLISHED_COMMIT_FILE,
+]);
 const NAME_LOCK_LEASE_MS = 300_000;
 const NAME_LOCK_TIMEOUT_MS = 10_000;
 const NAME_LOCK_RETRY_MS = 10;
 const NAME_LOCK_OWNER_FILE = 'owner.json';
+const PRODUCT_SCHEMA_VERSION = 2;
 
 export interface SkillRegistryOptions {
   /** @deprecated Pi owns prompt formatting and does not apply a product-side budget. */
@@ -56,6 +63,9 @@ export interface SkillRegistryOptions {
   loader?: ProductSkillLoader;
   env?: ConstructorParameters<typeof SkillProductService>[0];
   nameLockTimeoutMs?: number;
+  /** Read-only image roots; mutations and uploads always use `dir`. */
+  builtinRoots?: readonly string[];
+  mutationLock?: SkillMutationLock;
 }
 
 interface UploadedProductInstallOptions {
@@ -74,11 +84,15 @@ export class SkillRegistry {
   private readonly service: SkillProductService;
   private readonly configuredRecords?: readonly SkillProductRecord[];
   private readonly nameLockTimeoutMs: number;
+  private readonly builtinRoots: readonly string[];
+  private readonly mutationLock?: SkillMutationLock;
   private mutationTail: Promise<void> = Promise.resolve();
 
   constructor(private readonly dir: string, opts: SkillRegistryOptions = {}) {
     this.configuredRecords = opts.records;
     this.nameLockTimeoutMs = opts.nameLockTimeoutMs ?? NAME_LOCK_TIMEOUT_MS;
+    this.builtinRoots = opts.builtinRoots ?? [];
+    this.mutationLock = opts.mutationLock;
     this.service = new SkillProductService(
       opts.env ?? new NodeExecutionEnv({ cwd: dir }),
       opts.loader,
@@ -91,6 +105,43 @@ export class SkillRegistry {
 
   importStagingRoot(): string {
     return join(resolve(this.dir), SKILL_IMPORTS_DIR);
+  }
+
+  async acquireImportPermit(
+    tenantId: string,
+    globalLimit: number,
+    tenantLimit: number,
+  ): Promise<{ supported: boolean; release?: () => Promise<void> }> {
+    if (this.mutationLock?.tryAcquireSlots) {
+      const release = await this.mutationLock.tryAcquireSlots([
+        { keyPrefix: 'skill-import:global', limit: globalLimit },
+        { keyPrefix: `skill-import:tenant:${tenantId}`, limit: tenantLimit },
+      ]);
+      return { supported: true, release };
+    }
+    if (!this.mutationLock?.tryAcquireSlot) return { supported: false };
+    const globalRelease = await this.mutationLock.tryAcquireSlot('skill-import:global', globalLimit);
+    if (!globalRelease) return { supported: true };
+    let tenantRelease: (() => Promise<void>) | undefined;
+    try {
+      tenantRelease = await this.mutationLock.tryAcquireSlot(`skill-import:tenant:${tenantId}`, tenantLimit);
+    } catch (error) {
+      await globalRelease();
+      throw error;
+    }
+    if (!tenantRelease) {
+      await globalRelease();
+      return { supported: true };
+    }
+    let released = false;
+    return {
+      supported: true,
+      release: async () => {
+        if (released) return;
+        released = true;
+        await Promise.all([tenantRelease(), globalRelease()]);
+      },
+    };
   }
 
   /** 技能导入的落盘根：管理员 → _public；普通用户 → users/<uid>。 */
@@ -139,10 +190,12 @@ export class SkillRegistry {
   }
 
   async listLoadedFor(viewer: SkillViewer): Promise<Skill[]> {
+    await this.refreshForRead();
     const records = this.unambiguousAvailableRecords(viewer);
-    const loaded = await this.service.load(records, viewer);
+    const verified = await this.verifiedRecords(records);
+    const loaded = await this.service.load(verified, viewer);
     const byId = new Map(loaded.skills.map((item) => [item.source.id, item]));
-    return Promise.all(records
+    return Promise.all(verified
       .filter((record) => byId.has(record.id))
       .map(async (record) => skillFromRecord(
         record,
@@ -153,7 +206,8 @@ export class SkillRegistry {
 
   /** 注入系统提示的技能摘要（按查看者过滤）；带总预算与单条描述截断，防止技能增多撑爆 system prompt。 */
   async summariesFor(viewer: SkillViewer): Promise<string> {
-    return this.service.prompt(this.unambiguousAvailableRecords(viewer), viewer);
+    await this.refreshForRead();
+    return this.service.prompt(await this.verifiedRecords(this.unambiguousAvailableRecords(viewer)), viewer);
   }
 
   /** 兼容旧调用：无查看者（public+shared）视角的摘要。 */
@@ -183,16 +237,15 @@ export class SkillRegistry {
           return { id: '', content: '参数 name 必须是非空字符串', isError: true };
         }
         // 可见性在执行链路同样强制（不信 LLM）：越权技能等同不存在，不泄露存在性。
-        const productSkill = registry.getFor(name, ctx);
-        if (!productSkill || !productSkill.reviewed) {
+        const skill = await registry.loadFor(name, ctx);
+        if (!skill) {
+          const reviewed = await registry.getReviewedForFresh(name, ctx);
+          if (reviewed && !reviewed.enabled) {
+            return { id: '', content: `技能已禁用：${name}`, isError: true };
+          }
           const avail = (await registry.listLoadedFor(ctx)).map((item) => item.name).join(', ') || '(无)';
           return { id: '', content: `未找到技能 ${name}。可用：${avail}`, isError: true };
         }
-        if (!productSkill.enabled) {
-          return { id: '', content: `技能已禁用：${name}`, isError: true };
-        }
-        const skill = await registry.loadFor(name, ctx);
-        if (!skill) return { id: '', content: `未找到技能 ${name}`, isError: true };
         const bundledFiles = skill.files
           .filter((file) => !file.isDirectory && file.path !== 'SKILL.md')
           .map((file) => file.path);
@@ -225,13 +278,46 @@ export class SkillRegistry {
     return record ? skillFromRecord(record) : undefined;
   }
 
+  async getForFresh(name: string, viewer?: SkillViewer): Promise<Skill | undefined> {
+    await this.refreshForRead();
+    return this.getFor(name, viewer);
+  }
+
+  async getReviewedForFresh(name: string, viewer: SkillViewer): Promise<Skill | undefined> {
+    await this.refreshForRead();
+    const matches = this.records.filter((record) => (
+      record.name === name && record.reviewed && this.visibleTo(skillFromRecord(record), viewer)
+    ));
+    return matches.length === 1 ? skillFromRecord(matches[0]!) : undefined;
+  }
+
+  async getManageableForFresh(
+    name: string,
+    viewer: SkillViewer,
+    preferReviewed = false,
+  ): Promise<Skill | undefined> {
+    await this.refreshForRead();
+    try {
+      return skillFromRecord(this.requireManageableRecord(name, viewer, preferReviewed));
+    } catch {
+      return undefined;
+    }
+  }
+
+  async hasVisibleForFresh(name: string, viewer: SkillViewer): Promise<boolean> {
+    await this.refreshForRead();
+    return this.records.some((record) => record.name === name && this.visibleTo(skillFromRecord(record), viewer));
+  }
+
   async getAvailableFor(name: string, viewer?: SkillViewer): Promise<Skill | undefined> {
     if (!viewer?.tenantId) return undefined;
     return this.loadFor(name, viewer);
   }
 
   async loadFor(name: string, viewer: SkillViewer): Promise<Skill | undefined> {
-    const matches = this.unambiguousAvailableRecords(viewer).filter((item) => item.name === name);
+    await this.refreshForRead();
+    const matches = (await this.verifiedRecords(this.unambiguousAvailableRecords(viewer)))
+      .filter((item) => item.name === name);
     if (matches.length !== 1) return undefined;
     const record = matches[0]!;
     const loaded = await this.service.load([record], viewer);
@@ -296,21 +382,15 @@ export class SkillRegistry {
   }
 
   async setEnabled(name: string, enabled: boolean, viewer?: SkillViewer): Promise<Skill> {
-    const skill = this.requireSkill(name, viewer);
-    const record = this.requireRecord(name, viewer);
-    record.enabled = enabled;
-    await writeProductRecord(record);
-    return skillFromRecord(record, undefined, await listSkillFiles(skill.dir));
+    return this.mutateRecord(name, viewer, async (record) => ({ ...record, enabled }), true);
   }
 
   /** 共享 / 取消共享（仅个人技能有意义；public 技能本就全员可见）。 */
   async setShared(name: string, shared: boolean, viewer?: SkillViewer): Promise<Skill> {
-    const skill = this.requireSkill(name, viewer);
-    if (skill.visibility === 'public') throw new Error('公共技能无需共享');
-    const record = this.requireRecord(name, viewer);
-    record.visibility = shared ? 'shared' : 'private';
-    await writeProductRecord(record);
-    return skillFromRecord(record);
+    return this.mutateRecord(name, viewer, async (record) => {
+      if (record.visibility === 'public') throw new Error('公共技能无需共享');
+      return { ...record, visibility: shared ? 'shared' : 'private' };
+    });
   }
 
   /** 用认证上下文覆盖上传包中的治理字段；归档只允许贡献经过校验的 name/version。 */
@@ -334,6 +414,8 @@ export class SkillRegistry {
         tenantId: viewer.tenantId,
         ownerUserId: viewer.userId,
         visibility: 'private' as const,
+        schemaVersion: PRODUCT_SCHEMA_VERSION,
+        revision: 0,
       };
       return this.withDistributedNameLock(metadata.name, async () => {
         const record = normalizeSkillProductRecord({
@@ -344,7 +426,7 @@ export class SkillRegistry {
         // Refresh under both the process-local and filesystem-backed name locks.
         // The uploaded sidecar remains untrusted until the server replaces it below.
         await this.scanUnlocked([destinationDir]);
-        this.assertNoNameConflict(record, false);
+        this.assertNoPendingNameConflict(record);
         if (sourceDir !== destinationDir) await assertPathAbsent(destinationDir);
         await writeProductRecord({ ...record, path: sourceDir });
         let moved = false;
@@ -379,14 +461,15 @@ export class SkillRegistry {
         const pending = tenantRecords.filter((item) => !item.reviewed && this.isUploadedRecord(item));
         if (pending.length > 1) throw new Error(`同名待审核技能 ${name} 不唯一`);
         if (!pending.length) {
-          if (tenantRecords.some((item) => item.reviewed && this.isUploadedRecord(item))) {
+          if (tenantRecords.some((item) => item.reviewed
+            && (this.isUploadedRecord(item) || Boolean(item.submittedByUserId)))) {
             throw new Error(`技能 ${name} 已审核`);
           }
           throw new Error(`未找到技能 ${name}`);
         }
         const record = pending[0]!;
         if (record.ownerUserId === viewer.userId) throw new Error('审核者不能审核自己上传的技能');
-        this.assertNoNameConflict(record, options.global === true);
+        this.assertNoNameConflict(record, options.global === true, true);
         const validationRecord = normalizeSkillProductRecord({ ...record, reviewed: true });
         const validation = await this.service.load([validationRecord], {
           tenantId: record.tenantId,
@@ -399,17 +482,89 @@ export class SkillRegistry {
         if (validation.skills.length !== 1 || resolve(validation.skills[0]!.source.path) !== resolve(record.path)) {
           throw new Error(`SKILL.md name 与产品 name 不一致或技能元数据无效：${name}`);
         }
-        const next = normalizeSkillProductRecord({
-          ...record,
-          reviewed: true,
-          visibility: options.global ? 'public' : 'private',
-          allowedTenantIds: options.global ? ['*'] : undefined,
-        });
-        await writeProductRecord(next);
-        await this.scanUnlocked();
-        const persisted = this.records.find((item) => resolve(item.path) === resolve(record.path));
-        if (!persisted) throw new Error(`审核后未找到技能 ${name}`);
-        return persisted;
+        const scope = options.global ? 'global' : `tenant-${safePathSegment(record.tenantId)}`;
+        const publishedRoot = join(resolve(this.dir), SKILL_PUBLISHED_DIR);
+        const stagingPath = join(publishedRoot, `.staging-${randomUUID()}`);
+        await mkdir(publishedRoot, { recursive: true, mode: 0o750 });
+        let publishedPath = stagingPath;
+        let publishedRecord: SkillProductRecord | undefined;
+        try {
+          await cp(record.path, stagingPath, { recursive: true, errorOnExist: true, force: false });
+          await rm(join(stagingPath, PRODUCT_RECORD_FILE), { force: true });
+          // Hash the copied bytes, not the mutable upload source, so the recorded digest
+          // always describes the exact artifact that will be exposed to Pi.
+          const digest = await contentDigest(stagingPath);
+          const artifactVersion = `${safePathSegment(record.version)}-${digest.slice(0, 16)}`;
+          const publishedParent = join(publishedRoot, scope, artifactVersion);
+          publishedPath = join(publishedParent, safePathSegment(record.name));
+          await mkdir(publishedParent, { recursive: true, mode: 0o750 });
+          await assertPathAbsent(publishedPath);
+          const next = normalizeSkillProductRecord({
+            ...record,
+            id: `published:${scope}:${record.name}`,
+            path: stagingPath,
+            ownerUserId: undefined,
+            submittedByUserId: record.ownerUserId,
+            reviewed: true,
+            visibility: options.global ? 'public' : 'private',
+            allowedTenantIds: options.global ? ['*'] : undefined,
+            schemaVersion: PRODUCT_SCHEMA_VERSION,
+            revision: 1,
+            contentDigest: digest,
+            artifactVersion,
+          });
+          publishedRecord = normalizeSkillProductRecord({ ...next, path: publishedPath });
+          await writeProductRecord(next);
+          await rename(stagingPath, publishedPath);
+          await fsyncParent(publishedPath);
+        } catch (error) {
+          const rollbackError = await rollbackPublishedArtifact(stagingPath, publishedPath);
+          if (rollbackError) {
+            throw new Error(`技能发布失败且 artifact 回滚失败：${String(error)}; rollback: ${rollbackError}`);
+          }
+          throw error;
+        }
+        let uploadTombstone: string | undefined;
+        try {
+          uploadTombstone = await renameToTombstone(record.path, this.dir);
+        } catch (error) {
+          const rollbackError = await rollbackPublishedArtifact(stagingPath, publishedPath);
+          if (rollbackError) {
+            throw new Error(`技能上传目录归档失败且 artifact 回滚失败：${String(error)}; rollback: ${rollbackError}`);
+          }
+          throw error;
+        }
+        try {
+          await commitPublishedArtifact(publishedPath);
+        } catch (error) {
+          const rollbackErrors: string[] = [];
+          const artifactRollback = await rollbackPublishedArtifact(stagingPath, publishedPath);
+          if (artifactRollback) rollbackErrors.push(`artifact: ${artifactRollback}`);
+          if (uploadTombstone) {
+            try {
+              await mkdir(dirname(record.path), { recursive: true });
+              await rename(uploadTombstone, record.path);
+              await fsyncParent(uploadTombstone);
+              await fsyncParent(record.path);
+            } catch (restoreError) {
+              rollbackErrors.push(`upload: ${String(restoreError)}`);
+            }
+          }
+          if (rollbackErrors.length) {
+            throw new Error(`技能发布提交失败且回滚不完整：${String(error)}; ${rollbackErrors.join('; ')}`);
+          }
+          throw error;
+        }
+        try {
+          await this.scanUnlocked();
+          const persisted = this.records.find((item) => resolve(item.path) === resolve(publishedPath));
+          if (persisted) return persisted;
+          log.warn({ skill: name, path: publishedPath }, 'published skill committed but refresh retained an older snapshot');
+        } catch (error) {
+          log.warn({ skill: name, path: publishedPath, err: String(error) }, 'published skill committed but refresh failed');
+        }
+        if (!publishedRecord) throw new Error(`审核后未找到技能 ${name}`);
+        return publishedRecord;
       });
     });
   }
@@ -423,15 +578,26 @@ export class SkillRegistry {
     return dirname(resolve(record.path)) === resolve(uploadRoot);
   }
 
-  private assertNoNameConflict(record: SkillProductRecord, global: boolean): void {
+  private assertNoNameConflict(record: SkillProductRecord, global: boolean, publishedOnly = false): void {
     const conflict = this.records.find((item) => (
       item.name === record.name
       && resolve(item.path) !== resolve(record.path)
+      && (!publishedOnly || item.reviewed)
       && (global || recordVisibleInTenant(item, record.tenantId))
     ));
     if (!conflict) return;
     if (global) throw new Error(`Skill 全局名称冲突：${record.name}`);
     throw new Error(`Skill 名称冲突：${record.name}`);
+  }
+
+  private assertNoPendingNameConflict(record: SkillProductRecord): void {
+    const conflict = this.records.find((item) => (
+      !item.reviewed
+      && item.name === record.name
+      && item.tenantId === record.tenantId
+      && resolve(item.path) !== resolve(record.path)
+    ));
+    if (conflict) throw new Error(`Skill 名称冲突：${record.name}`);
   }
 
   private unambiguousAvailableRecords(viewer: SkillViewer): SkillProductRecord[] {
@@ -441,6 +607,47 @@ export class SkillRegistry {
     const counts = new Map<string, number>();
     for (const record of visible) counts.set(record.name, (counts.get(record.name) ?? 0) + 1);
     return visible.filter((record) => counts.get(record.name) === 1);
+  }
+
+  private async refreshForRead(): Promise<void> {
+    if (!this.configuredRecords) await this.scanUnlocked();
+  }
+
+  private async verifiedRecords(records: readonly SkillProductRecord[]): Promise<SkillProductRecord[]> {
+    const checked = await Promise.all(records.map(async (record) => {
+      if (!record.contentDigest) return record;
+      try {
+        const actual = await contentDigest(record.path);
+        if (actual === record.contentDigest) return record;
+        log.error({ skill: record.name, expected: record.contentDigest, actual }, 'published skill digest mismatch');
+      } catch (error) {
+        log.error({ skill: record.name, err: String(error) }, 'published skill digest verification failed');
+      }
+      return undefined;
+    }));
+    return checked.filter((record): record is SkillProductRecord => record !== undefined);
+  }
+
+  private async mutateRecord(
+    name: string,
+    viewer: SkillViewer | undefined,
+    change: (record: SkillProductRecord) => Promise<SkillProductRecord> | SkillProductRecord,
+    preferReviewed = false,
+  ): Promise<Skill> {
+    return this.withMutationLock(() => this.withDistributedNameLock(name, async () => {
+      await this.scanUnlocked();
+      const current = this.requireManageableRecord(name, viewer, preferReviewed);
+      const next = normalizeSkillProductRecord({
+        ...await change(current),
+        revision: (current.revision ?? 0) + 1,
+        schemaVersion: PRODUCT_SCHEMA_VERSION,
+      });
+      await writeProductRecord(next, current.revision ?? 0);
+      await this.scanUnlocked();
+      const persisted = this.records.find((item) => resolve(item.path) === resolve(current.path));
+      if (!persisted) throw new Error(`更新后未找到技能 ${name}`);
+      return skillFromRecord(persisted, undefined, await listSkillFiles(persisted.path));
+    }));
   }
 
   private async withMutationLock<T>(operation: () => Promise<T>): Promise<T> {
@@ -457,6 +664,11 @@ export class SkillRegistry {
 
   private async withDistributedNameLock<T>(name: string, operation: () => Promise<T>): Promise<T> {
     const key = `skill-name:${name}`;
+    if (this.mutationLock) return this.mutationLock.withLock(key, this.nameLockTimeoutMs, operation);
+    return this.withFileNameLock(key, name, operation);
+  }
+
+  private async withFileNameLock<T>(key: string, name: string, operation: () => Promise<T>): Promise<T> {
     const lockRoot = join(resolve(this.dir), SKILL_LOCKS_DIR);
     const lockPath = join(lockRoot, createHash('sha256').update(key).digest('hex'));
     const token = randomUUID();
@@ -501,17 +713,44 @@ export class SkillRegistry {
 
   private async scanUnlocked(excludedPaths: readonly string[] = []): Promise<void> {
     const excluded = new Set(excludedPaths.map((path) => resolve(path)));
-    const records = this.configuredRecords
-      ? this.configuredRecords.map(normalizeSkillProductRecord)
-      : await enumerateSkillProductRecords(this.dir);
+    let records: SkillProductRecord[];
+    if (this.configuredRecords) {
+      records = this.configuredRecords.map(normalizeSkillProductRecord);
+    } else {
+      const builtinRecords = (await Promise.all(
+        this.builtinRoots.map((root) => this.enumerateWithSnapshot(root)),
+      )).flat();
+      const productRecords = await this.enumerateWithSnapshot(this.dir);
+      records = [
+        ...builtinRecords,
+        ...productRecords.filter((record) => !builtinRecords.some((builtin) => isSeededBuiltinCopy(record, builtin))),
+      ];
+    }
     this.records = records.filter((record) => !excluded.has(resolve(record.path)));
     log.info({ count: this.records.length }, 'skill product sources loaded');
   }
 
+  private async enumerateWithSnapshot(root: string): Promise<SkillProductRecord[]> {
+    try {
+      return await enumerateSkillProductRecords(root);
+    } catch (error) {
+      const resolvedRoot = resolve(root);
+      const snapshot = this.records.filter((record) => {
+        const path = resolve(record.path);
+        return path === resolvedRoot || path.startsWith(`${resolvedRoot}${sep}`);
+      });
+      log.error({ root, count: snapshot.length, err: String(error) }, 'skill source unavailable; retaining last snapshot');
+      return snapshot;
+    }
+  }
+
   async delete(name: string, viewer?: SkillViewer): Promise<void> {
-    const skill = this.requireSkill(name, viewer);
-    await rm(skill.dir, { recursive: true, force: true });
-    this.records = this.records.filter((record) => record !== skill.product);
+    await this.withMutationLock(() => this.withDistributedNameLock(name, async () => {
+      await this.scanUnlocked();
+      const record = this.requireManageableRecord(name, viewer);
+      await renameToTombstone(record.path, this.dir);
+      await this.scanUnlocked();
+    }));
   }
 
   private requireSkill(name: string, viewer?: SkillViewer): Skill {
@@ -530,19 +769,49 @@ export class SkillRegistry {
     if (!record) throw new Error(`未找到技能 ${name}`);
     return record;
   }
+
+  private requireManageableRecord(name: string, viewer?: SkillViewer, preferReviewed = false): SkillProductRecord {
+    if (!viewer) {
+      const record = this.records.find((item) => item.name === name);
+      if (!record) throw new Error(`未找到技能 ${name}`);
+      return record;
+    }
+    const candidates = this.records.filter((item) => item.name === name)
+      .map((record) => skillFromRecord(record))
+      .filter((skill) => this.canManage(skill, viewer));
+    const preferred = (preferReviewed
+      ? candidates.find((skill) => skill.tenantId === viewer?.tenantId && skill.reviewed)
+      : undefined)
+      ?? candidates.find((skill) => skill.tenantId === viewer?.tenantId && !skill.reviewed)
+      ?? candidates.find((skill) => skill.tenantId === viewer?.tenantId)
+      ?? candidates[0];
+    if (!preferred) throw new Error(`未找到技能 ${name} 或仅管理员可管理`);
+    return preferred.product;
+  }
 }
 
-async function writeProductRecord(record: SkillProductRecord): Promise<void> {
+async function writeProductRecord(record: SkillProductRecord, expectedRevision?: number): Promise<void> {
   const { id: _id, path: _path, description: _description, ...metadata } = record;
   const target = join(record.path, PRODUCT_RECORD_FILE);
   const temp = join(record.path, `.${PRODUCT_RECORD_FILE}.${randomUUID()}.tmp`);
   try {
+    if (expectedRevision !== undefined) {
+      const current = parsePersistedRevision(await readFile(target, 'utf8'));
+      if (current !== expectedRevision) throw new Error(`Skill 产品记录 revision 冲突：${record.name}`);
+    }
     await writeFile(temp, `${JSON.stringify(metadata, null, 2)}\n`, { flag: 'wx' });
+    await fsyncFile(temp);
     await rename(temp, target);
+    await fsyncParent(target);
   } catch (error) {
     await rm(temp, { force: true });
     throw error;
   }
+}
+
+function parsePersistedRevision(raw: string): number {
+  const value = JSON.parse(raw) as { revision?: unknown };
+  return typeof value.revision === 'number' ? value.revision : 0;
 }
 
 async function assertPathAbsent(path: string): Promise<void> {
@@ -595,25 +864,18 @@ async function readNameLockOwner(lockPath: string): Promise<NameLockOwner | unde
 
 async function recoverStaleNameLock(lockPath: string, key: string): Promise<void> {
   const current = await readCurrentNameLockOwner(lockPath);
-  if (!current
-    || current.owner.key !== key
-    || current.owner.leaseUntil > Date.now()
-    || !isNameLockOwnerProvablyDead(current.owner)) return;
-  const recoveryEntry = join(lockPath, `.stale-${randomUUID()}`);
-  try {
-    await rename(current.ownerDir, recoveryEntry);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-    throw error;
-  }
-  const recoveredOwner = await readNameLockOwner(recoveryEntry);
-  if (recoveredOwner?.token !== current.owner.token
-    || recoveredOwner.key !== key
-    || recoveredOwner.leaseUntil > Date.now()
-    || !isNameLockOwnerProvablyDead(recoveredOwner)) {
-    await rename(recoveryEntry, current.ownerDir).catch(() => undefined);
+  if (!current) {
+    const retiredPath = `${lockPath}.orphan-${randomUUID()}`;
+    try {
+      await rename(lockPath, retiredPath);
+      await rm(retiredPath, { recursive: true, force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
     return;
   }
+  if (current.owner.key !== key
+    || current.owner.leaseUntil > Date.now()) return;
   const retiredPath = `${lockPath}.stale-${randomUUID()}`;
   try {
     await rename(lockPath, retiredPath);
@@ -621,19 +883,13 @@ async function recoverStaleNameLock(lockPath: string, key: string): Promise<void
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw error;
   }
-  await rm(retiredPath, { recursive: true, force: true });
-}
-
-function isNameLockOwnerProvablyDead(owner: NameLockOwner): boolean {
-  if (owner.hostname !== hostname()
-    || !Number.isInteger(owner.pid)
-    || (owner.pid ?? 0) <= 0) return false;
-  try {
-    process.kill(owner.pid!, 0);
-    return false;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'ESRCH';
+  const recovered = await readCurrentNameLockOwner(retiredPath);
+  if (!recovered || recovered.owner.token !== current.owner.token
+    || recovered.owner.key !== key || recovered.owner.leaseUntil > Date.now()) {
+    await rename(retiredPath, lockPath).catch(() => undefined);
+    return;
   }
+  await rm(retiredPath, { recursive: true, force: true });
 }
 
 async function renewNameLock(lockPath: string, token: string, key: string): Promise<void> {
@@ -712,6 +968,16 @@ function recordVisibleInTenant(record: SkillProductRecord, tenantId: string): bo
   return record.tenantId === tenantId
     || record.allowedTenantIds?.includes(tenantId) === true
     || record.allowedTenantIds?.includes('*') === true;
+}
+
+/** Ignore legacy PVC copies made by the retired seed-skills initContainer. */
+function isSeededBuiltinCopy(record: SkillProductRecord, builtin: SkillProductRecord): boolean {
+  return record.name === builtin.name
+    && record.tenantId === builtin.tenantId
+    && record.reviewed && builtin.reviewed
+    && record.visibility === 'public' && builtin.visibility === 'public'
+    && !record.ownerUserId && !builtin.ownerUserId
+    && !record.submittedByUserId && !builtin.submittedByUserId;
 }
 
 function skillFromRecord(
@@ -809,5 +1075,88 @@ async function exists(path: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+async function contentDigest(root: string): Promise<string> {
+  const hash = createHash('sha256');
+  const visit = async (rel: string): Promise<void> => {
+    const target = safeResolve(root, rel);
+    const entries = await readdir(target, { withFileTypes: true });
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      if (entry.name === PRODUCT_RECORD_FILE || entry.name === PUBLISHED_COMMIT_FILE
+        || entry.name.startsWith(`.${PRODUCT_RECORD_FILE}.`)
+        || entry.name.startsWith(`.${PUBLISHED_COMMIT_FILE}.`)) continue;
+      const child = rel ? posix.join(rel, entry.name) : entry.name;
+      if (entry.isSymbolicLink()) throw new Error('Skill artifact 不允许符号链接');
+      hash.update(entry.isDirectory() ? `D\0${child}\0` : `F\0${child}\0`);
+      if (entry.isDirectory()) await visit(child);
+      else hash.update(await readFile(safeResolve(root, child)));
+    }
+  };
+  await visit('');
+  return hash.digest('hex');
+}
+
+async function renameToTombstone(path: string, root: string): Promise<string | undefined> {
+  const tombstoneRoot = join(resolve(root), SKILL_TOMBSTONES_DIR);
+  await mkdir(tombstoneRoot, { recursive: true, mode: 0o700 });
+  const target = join(tombstoneRoot, `${Date.now()}-${randomUUID()}`);
+  try {
+    await rename(path, target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  await Promise.all([fsyncParent(path), fsyncParent(target)]).catch((error) => {
+    log.warn({ path, target, err: String(error) }, 'skill tombstone directory fsync failed after rename');
+  });
+  return target;
+}
+
+async function rollbackPublishedArtifact(stagingPath: string, publishedPath: string): Promise<string | undefined> {
+  try {
+    await rm(stagingPath, { recursive: true, force: true });
+    await rm(publishedPath, { recursive: true, force: true });
+    await fsyncParent(publishedPath);
+    return undefined;
+  } catch (error) {
+    return String(error);
+  }
+}
+
+async function commitPublishedArtifact(publishedPath: string): Promise<void> {
+  const marker = join(publishedPath, PUBLISHED_COMMIT_FILE);
+  const temp = join(publishedPath, `.${PUBLISHED_COMMIT_FILE}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(temp, 'committed\n', { flag: 'wx' });
+    await fsyncFile(temp);
+    await rename(temp, marker);
+  } catch (error) {
+    await rm(temp, { force: true });
+    throw error;
+  }
+  // Marker visibility is the authorization commit point. A directory fsync error
+  // after the rename is an ambiguous durability result, so keep the committed state.
+  await fsyncParent(marker).catch((error) => {
+    log.warn({ path: publishedPath, err: String(error) }, 'published skill commit directory fsync failed');
+  });
+}
+
+async function fsyncFile(path: string): Promise<void> {
+  const handle = await open(path, 'r');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function fsyncParent(path: string): Promise<void> {
+  const handle = await open(dirname(path), 'r');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
   }
 }

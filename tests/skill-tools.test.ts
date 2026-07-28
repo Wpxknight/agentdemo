@@ -12,6 +12,7 @@ import type { ExecResult, SandboxHandle } from '../src/sandbox/types.js';
 class FakeSandbox implements SandboxHandle {
   readonly sandboxId = 'sbx-test';
   commands: string[] = [];
+  writtenFiles: Array<{ path: string; content: Uint8Array; mode?: number }> = [];
 
   async runCode(): Promise<ExecResult> {
     return { stdout: '', stderr: '' };
@@ -25,6 +26,9 @@ class FakeSandbox implements SandboxHandle {
   }
 
   async setTimeout(): Promise<void> {}
+  async writeFile(path: string, content: Uint8Array, options?: { mode?: number }): Promise<void> {
+    this.writtenFiles.push({ path, content, mode: options?.mode });
+  }
   async readFile(): Promise<Uint8Array> {
     return new Uint8Array();
   }
@@ -113,7 +117,7 @@ describe('buildSkillTools', () => {
     }
   });
 
-  it('quotes a credential target containing a single quote without command injection', async () => {
+  it('writes merged multi-provider credentials through the sandbox file API without shell secrets', async () => {
     const quotedDir = await mkdtemp(join(tmpdir(), 'aiop-skill-quoted-'));
     const skillDir = join(quotedDir, 'quoted');
     await mkdir(skillDir);
@@ -121,12 +125,12 @@ describe('buildSkillTools', () => {
     await writeFile(join(skillDir, '.product.json'), JSON.stringify({
       name: 'quoted', version: '1', enabled: true, reviewed: true,
       tenantId: 'default', visibility: 'public',
-      credentials: ['aios'], credentialFile: "sub/o'hare.json",
+      credentials: ['aios', 'gitlab'], credentialFile: "sub/o'hare.json",
     }));
     const quotedRegistry = new SkillRegistry(quotedDir);
     await quotedRegistry.scan();
     const sbx = new FakeSandbox();
-    const credentials = { get: async () => ({ token: 'secret' }) };
+    const credentials = { get: async (_tenant: string, _user: string, provider: string) => ({ token: `${provider}-secret` }) };
     const sync = buildSkillTools(quotedRegistry, fakeManager(sbx), undefined, {
       credentials: credentials as never,
     }).find((tool) => tool.def.name === 'skill__sync_to_sandbox')!;
@@ -136,9 +140,47 @@ describe('buildSkillTools', () => {
     });
 
     expect(result.isError).toBeFalsy();
-    const command = sbx.commands.find((item) => item.includes('AIOP_CRED_OK'))!;
-    expect(command).toContain(`o'"'"'hare.json`);
-    expect(command).not.toContain("o'hare.json'");
+    expect(sbx.writtenFiles).toHaveLength(1);
+    expect(sbx.writtenFiles[0]).toMatchObject({ path: "/workspace/skills/quoted/sub/o'hare.json", mode: 0o600 });
+    expect(JSON.parse(Buffer.from(sbx.writtenFiles[0]!.content).toString('utf8'))).toEqual({
+      providers: {
+        aios: { token: 'aios-secret' },
+        gitlab: { token: 'gitlab-secret' },
+      },
+    });
+    expect(sbx.commands.join('\n')).not.toContain('aios-secret');
+    expect(sbx.commands.join('\n')).not.toContain('gitlab-secret');
+    expect(sbx.commands.join('\n')).not.toContain(Buffer.from('aios-secret').toString('base64'));
+  });
+
+  it('keeps the multi-provider schema when only some credentials are available', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-skill-partial-creds-'));
+    const skillDir = join(root, 'partial-creds');
+    await mkdir(skillDir);
+    await writeFile(join(skillDir, 'SKILL.md'), '---\nname: partial-creds\ndescription: partial\n---\nbody');
+    await writeFile(join(skillDir, '.product.json'), JSON.stringify({
+      name: 'partial-creds', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+      credentials: ['aios', 'gitlab'], credentialFile: 'token.json',
+    }));
+    const registry = new SkillRegistry(root);
+    await registry.scan();
+    const sbx = new FakeSandbox();
+    const sync = buildSkillTools(registry, fakeManager(sbx), undefined, {
+      credentials: {
+        get: async (_tenant: string, _user: string, provider: string) => (
+          provider === 'aios' ? { token: 'available' } : undefined
+        ),
+      } as never,
+    }).find((tool) => tool.def.name === 'skill__sync_to_sandbox')!;
+
+    await sync.execute({ name: 'partial-creds' }, {
+      tenantId: 'default', userId: 'u1', role: 'user', sessionId: 'partial',
+    });
+
+    expect(JSON.parse(Buffer.from(sbx.writtenFiles[0]!.content).toString('utf8'))).toEqual({
+      providers: { aios: { token: 'available' } },
+    });
   });
 
   it('skill__sync_to_sandbox packs files, chunks base64, unpacks, and skips large files', async () => {

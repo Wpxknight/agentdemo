@@ -3,7 +3,7 @@ import { logger } from '../logger.js';
 import type { ToolContext } from '../agent/tools.js';
 import type { UserCredentials } from '../auth/credentials.js';
 import type { AuditSink } from '../audit/sink.js';
-import type { ExecResult, SandboxHandle } from '../sandbox/types.js';
+import type { SandboxHandle } from '../sandbox/types.js';
 import type { Skill } from './product.js';
 import { normalizeCredentialFile } from './product.js';
 
@@ -12,18 +12,6 @@ const log = logger.child({ mod: 'skill-credentials' });
 export interface SkillCredentialDeps {
   credentials?: UserCredentials;
   audit?: AuditSink;
-}
-
-export function quotePosix(value: string): string {
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
-}
-
-function failed(result: ExecResult): boolean {
-  return Boolean(result.error) || (typeof result.exitCode === 'number' && result.exitCode !== 0);
-}
-
-function execErrorText(result: ExecResult): string {
-  return result.error || result.stderr.trim() || `exit code ${result.exitCode}`;
 }
 
 export async function injectSkillCredentials(opts: {
@@ -41,22 +29,27 @@ export async function injectSkillCredentials(opts: {
   }
   const relFile = normalizeCredentialFile(skill.credentialFile ?? 'token.json');
   const filePath = posix.join(dest, relFile);
-  const fileDir = posix.dirname(filePath);
   const notes: string[] = [];
+  const providers: Record<string, unknown> = {};
   for (const provider of skill.credentials) {
     const payload = await deps.credentials.get(ctx.tenantId, ctx.userId, provider);
     if (payload === undefined) {
       notes.push(`\n注意：未找到当前用户的 ${provider} 凭据。请提示用户在 ${provider.toUpperCase()} 平台重新登录后重试；绝不要在对话中向用户索要密码。`);
       continue;
     }
-    const b64 = Buffer.from(JSON.stringify(payload, null, 2)).toString('base64');
-    const write = await sbx.runCommand(
-      `mkdir -p ${quotePosix(fileDir)} && printf '%s' ${quotePosix(b64)} | base64 -d > ${quotePosix(filePath)} && chmod 600 ${quotePosix(filePath)} && echo AIOP_CRED_OK`,
-    );
-    if (failed(write) || !write.stdout.includes('AIOP_CRED_OK')) {
-      notes.push(`\n注意：${provider} 凭据写入沙箱失败：${execErrorText(write)}`);
-      continue;
-    }
+    providers[provider] = payload;
+  }
+  if (!Object.keys(providers).length) return notes.join('');
+  if (!sbx.writeFile) return `${notes.join('')}\n注意：当前沙箱不支持安全文件上传，未注入平台凭据。`;
+  try {
+    const providerNames = Object.keys(providers);
+    const document = skill.credentials.length === 1 ? providers[providerNames[0]!] : { providers };
+    const bytes = Buffer.from(`${JSON.stringify(document, null, 2)}\n`, 'utf8');
+    await sbx.writeFile(filePath, bytes, { mode: 0o600 });
+  } catch (error) {
+    return `${notes.join('')}\n注意：凭据写入沙箱失败：${String(error)}`;
+  }
+  for (const provider of Object.keys(providers)) {
     markCredentialInjected();
     await deps.audit?.record({
       kind: 'sandbox', action: 'credential-injected', tenantId: ctx.tenantId,
