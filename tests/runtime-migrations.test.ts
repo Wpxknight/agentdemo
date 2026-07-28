@@ -54,6 +54,15 @@ describe('durable runtime migrations', () => {
     }
   });
 
+  it('purges retired runs and removes LangGraph checkpoint storage', async () => {
+    const source = await sql('0022_pi_only_runtime.sql');
+    expect(source).toContain("kernel <> 'pi'");
+    expect(source).toContain('drop trigger if exists trg_langgraph_checkpoints_read_only_insert');
+    expect(source).toContain('drop table if exists langgraph_checkpoint_writes');
+    expect(source).toContain('drop table if exists langgraph_checkpoints');
+    expect(source).toContain("default '0.82.1'");
+  });
+
   it('registers the new tables and columns in the Kysely schema', async () => {
     const source = (await readFile(new URL('../schema.ts', migrations), 'utf8')).toLowerCase();
     for (const table of ['agentrunattemptstable', 'agentturnsnapshotstable', 'agentturncommitstable']) {
@@ -65,5 +74,7 @@ describe('durable runtime migrations', () => {
     expect(source).toContain('sequence: number');
     expect(source).toContain('limits_json: nullablejsoncolumn');
     expect(source).toContain('correlation_id: string | null');
+    expect(source).not.toContain('langgraph_checkpoints:');
+    expect(source).not.toContain('langgraph_checkpoint_writes:');
   });
 });
