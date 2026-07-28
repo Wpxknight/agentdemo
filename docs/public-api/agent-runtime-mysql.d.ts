@@ -143,6 +143,7 @@ export declare class MysqlRuntimeStore implements RuntimeStore {
         get: (identity: RunIdentity) => Promise<RunRecord | undefined>;
         update: (identity: RunIdentity, patch: Partial<RunRecord>) => Promise<void>;
         acquireLease: (identity: RunIdentity, ownerId: string, now: Date, ttlMs: number) => Promise<LeaseRecord | undefined>;
+        renewLease: (identity: RunIdentity, ownerId: string, token: bigint, now: Date, ttlMs: number) => Promise<boolean>;
         assertLease: (identity: RunIdentity, ownerId: string, token: bigint, now: Date) => Promise<void>;
     };
     readonly attempts: {

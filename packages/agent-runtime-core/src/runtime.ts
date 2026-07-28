@@ -53,6 +53,7 @@ export class DurableAgentRuntime {
   private readonly toolSetVersion: string;
   private readonly policyVersion: string;
   private readonly leaseTtlMs: number;
+  private readonly leaseHeartbeatMs: number;
   private readonly maxDurableEventsPerTurn: number;
   private readonly now: () => Date;
   private readonly executions = new Map<string, Promise<AgentRunResult>>();
@@ -68,6 +69,7 @@ export class DurableAgentRuntime {
     this.toolSetVersion = options.toolSetVersion ?? 'default';
     this.policyVersion = options.policyVersion ?? 'default';
     this.leaseTtlMs = options.leaseTtlMs ?? 30_000;
+    this.leaseHeartbeatMs = Math.max(1, Math.floor(this.leaseTtlMs / 3));
     this.maxDurableEventsPerTurn = options.maxDurableEventsPerTurn ?? 256;
     this.now = options.now ?? (() => new Date());
   }
@@ -257,6 +259,12 @@ export class DurableAgentRuntime {
     await this.observe(record, attemptId, turnNo, correlationId, 'attempt_started', {
       kind: 'counter', name: 'runtime.attempts.started', value: 1,
     });
+    const leaseHeartbeat = setInterval(() => {
+      void this.options.store.runs.renewLease(
+        identity, this.workerId, lease.token, this.now(), this.leaseTtlMs,
+      ).catch(() => undefined);
+    }, this.leaseHeartbeatMs);
+    leaseHeartbeat.unref?.();
     try {
       while (true) {
         const turnStartedAt = this.now();
@@ -431,6 +439,7 @@ export class DurableAgentRuntime {
         },
       };
     } finally {
+      clearInterval(leaseHeartbeat);
       this.active.delete(runKey(identity));
     }
   }

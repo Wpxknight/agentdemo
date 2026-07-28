@@ -14,6 +14,40 @@ function completed(text = 'done'): KernelExit {
 }
 
 describe('DurableAgentRuntime', () => {
+  it('renews its lease while a kernel turn runs longer than the lease TTL', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-28T00:00:00.000Z'));
+    try {
+      const store = new MemoryRuntimeStore();
+      let markStarted!: () => void;
+      const started = new Promise<void>((resolve) => { markStarted = resolve; });
+      const kernel: AgentKernel = {
+        descriptor: { name: 'pi', version: '0.82.1', protocolVersion: '1' },
+        run: async () => {
+          markStarted();
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          return completed('long-running turn');
+        },
+      };
+      const runtime = new DurableAgentRuntime({
+        store,
+        kernels: [kernel],
+        defaultKernel: 'pi',
+        leaseTtlMs: 30,
+      });
+      const handle = await runtime.run({ identity, sessionId: 'session-long-turn', input: [] });
+      await started;
+      await vi.advanceTimersByTimeAsync(100);
+
+      await expect(handle.result()).resolves.toMatchObject({
+        status: 'succeeded',
+        text: 'long-running turn',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('creates a run, attempt, immutable snapshot and committed turn around a kernel', async () => {
     const store = new MemoryRuntimeStore();
     const kernel: AgentKernel = {

@@ -120,6 +120,15 @@ export class MysqlRuntimeStore implements RuntimeStore {
       }).where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId).execute();
       return { ownerId, token, expiresAt };
     }),
+    renewLease: async (
+      identity: RunIdentity, ownerId: string, token: bigint, now: Date, ttlMs: number,
+    ): Promise<boolean> => {
+      const result = await this.db.updateTable('agent_runs').set({
+        lease_expires_at: new Date(now.getTime() + ttlMs), updated_at: now,
+      }).where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId)
+        .where('lease_owner', '=', ownerId).where('lease_token', '=', Number(token)).executeTakeFirst();
+      return Number(result.numUpdatedRows ?? 0) > 0;
+    },
     assertLease: async (identity: RunIdentity, ownerId: string, token: bigint, now: Date): Promise<void> => {
       const row = await this.db.selectFrom('agent_runs').select('run_id')
         .where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId)

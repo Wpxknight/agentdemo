@@ -96,6 +96,19 @@ export class MemoryRuntimeStore implements RuntimeStore {
       this.state.runs.set(key, { ...current, leaseOwner: ownerId, leaseToken: token, leaseExpiresAt: expiresAt, updatedAt: now });
       return { ownerId, token, expiresAt: clone(expiresAt) };
     },
+    renewLease: async (
+      identity: RunIdentity, ownerId: string, token: bigint, now: Date, ttlMs: number,
+    ): Promise<boolean> => {
+      const key = runKey(identity);
+      const current = this.state.runs.get(key);
+      if (!current || current.leaseOwner !== ownerId || current.leaseToken !== token) return false;
+      this.state.runs.set(key, {
+        ...current,
+        leaseExpiresAt: new Date(now.getTime() + ttlMs),
+        updatedAt: now,
+      });
+      return true;
+    },
     assertLease: async (identity: RunIdentity, ownerId: string, token: bigint, now: Date): Promise<void> => {
       const current = this.state.runs.get(runKey(identity));
       if (!current || current.leaseOwner !== ownerId || current.leaseToken !== token

@@ -38,6 +38,7 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MySQL runtime adapter integrati
     const store = await createStore(readMysqlConfig()) as MysqlStore;
     const runtimeStore = store.agentRuntimeStore();
     const runId = `mysql-runtime-bigint-${Date.now()}`;
+    const commitId = `commit-${runId}`;
     const identity = { tenantId: 'it', runId };
     const now = new Date();
     await runtimeStore.runs.create({
@@ -77,7 +78,7 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MySQL runtime adapter integrati
         ...identity,
         attemptId: 'attempt-a',
         turnNo: 1,
-        commitId: 'commit-a',
+        commitId,
         transcriptVersion: 1n,
         stopReason: 'stop',
         usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0 },
@@ -86,7 +87,7 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MySQL runtime adapter integrati
       },
       events: [],
       runStatus: 'succeeded',
-    })).resolves.toMatchObject({ commitId: 'commit-a', transcriptVersion: 1n });
+    })).resolves.toMatchObject({ commitId, transcriptVersion: 1n });
 
     await store.close();
   });
