@@ -184,7 +184,9 @@ export class MysqlRuntimeStore implements RuntimeStore {
       if (!this.transactionalView) return this.transaction((tx) => tx.turns.commit(input));
       await this.assertCommitLease(input.snapshot, input.leaseOwner, input.leaseToken, input.commit.committedAt);
       const snapshot = await this.turns.getSnapshot(input.snapshot);
-      if (!snapshot || json(snapshot) !== json(input.snapshot)) throw commitFailed('snapshot mismatch');
+      if (!snapshot || snapshotFingerprint(snapshot) !== snapshotFingerprint(input.snapshot)) {
+        throw commitFailed('snapshot mismatch');
+      }
       const existing = await this.db.selectFrom('agent_turn_commits').selectAll()
         .where('tenant_id', '=', input.snapshot.tenantId).where('run_id', '=', input.snapshot.runId)
         .where('attempt_id', '=', input.snapshot.attemptId).where('turn_no', '=', input.snapshot.turnNo).executeTakeFirst();
@@ -334,6 +336,13 @@ export class MysqlRuntimeStore implements RuntimeStore {
 }
 
 function json(value: unknown): string { return JSON.stringify(value); }
+function snapshotFingerprint(snapshot: TurnSnapshot): string {
+  return JSON.stringify(snapshot, (_key, value) => {
+    if (typeof value === 'bigint') return { $bigint: value.toString() };
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+    return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)));
+  });
+}
 function parse(value: unknown): unknown { return typeof value === 'string' ? JSON.parse(value) : value; }
 
 function mapRun(row: any): RunRecord {

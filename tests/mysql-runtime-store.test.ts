@@ -1,5 +1,8 @@
 import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
+import { readMysqlConfig } from '../src/config/mysql.js';
+import { createStore } from '../src/db/index.js';
+import type { MysqlStore } from '../src/db/mysql.js';
 
 const sourceUrl = new URL('../packages/agent-runtime-mysql/src/index.ts', import.meta.url);
 
@@ -27,5 +30,64 @@ describe('MySQL runtime adapter contract', () => {
     ]) expect(source).toContain(field);
     expect(source).not.toContain("user_id: '', session_id: ''");
     expect(source).not.toContain('tool_call_id: null');
+  });
+});
+
+describe.runIf(Boolean(process.env.MYSQL_HOST))('MySQL runtime adapter integration', () => {
+  it('commits a persisted turn snapshot containing bigint versions', async () => {
+    const store = await createStore(readMysqlConfig()) as MysqlStore;
+    const runtimeStore = store.agentRuntimeStore();
+    const runId = `mysql-runtime-bigint-${Date.now()}`;
+    const identity = { tenantId: 'it', runId };
+    const now = new Date();
+    await runtimeStore.runs.create({
+      ...identity,
+      actorId: 'user-a',
+      sessionId: `session-${runId}`,
+      kernel: 'pi',
+      kernelVersion: '0.82.1',
+      runtimeVersion: 'test',
+      status: 'queued',
+      leaseToken: 0n,
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      createdAt: now,
+      updatedAt: now,
+    });
+    const lease = await runtimeStore.runs.acquireLease(identity, 'worker-a', now, 10_000);
+    const snapshot = {
+      ...identity,
+      attemptId: 'attempt-a',
+      turnNo: 1,
+      sessionVersion: 0n,
+      identity: { tenantId: 'it', actorId: 'user-a', roles: ['user'] },
+      modelBinding: { provider: 'fake', model: 'fake-1' },
+      promptVersion: 'prompt-v1',
+      toolSetVersion: 'tools-v1',
+      policyVersion: 'policy-v1',
+      messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'ping' }] }],
+      createdAt: now,
+    };
+    await runtimeStore.turns.createSnapshot(snapshot);
+
+    await expect(runtimeStore.turns.commit({
+      leaseOwner: 'worker-a',
+      leaseToken: lease!.token,
+      snapshot,
+      commit: {
+        ...identity,
+        attemptId: 'attempt-a',
+        turnNo: 1,
+        commitId: 'commit-a',
+        transcriptVersion: 1n,
+        stopReason: 'stop',
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0 },
+        messages: [{ role: 'assistant', content: [{ type: 'text', text: 'pong' }] }],
+        committedAt: new Date(now.getTime() + 1_000),
+      },
+      events: [],
+      runStatus: 'succeeded',
+    })).resolves.toMatchObject({ commitId: 'commit-a', transcriptVersion: 1n });
+
+    await store.close();
   });
 });
