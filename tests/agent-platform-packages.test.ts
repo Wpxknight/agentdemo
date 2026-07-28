@@ -14,10 +14,11 @@ describe('agent platform package boundaries', () => {
     expect((await manifest('control-contracts')).name).toBe('@aiop/control-contracts');
     expect((await manifest('agent-runtime-core')).name).toBe('@aiop/agent-runtime-core');
     expect((await manifest('agent-runtime-aiop')).name).toBe('@aiop/agent-runtime-aiop');
+    expect((await manifest('pi-runtime')).name).toBe('@aiop/pi-runtime');
   });
 
   it('exports package-root public APIs', async () => {
-    for (const name of ['control-contracts', 'agent-runtime-core', 'agent-runtime-aiop']) {
+    for (const name of ['control-contracts', 'agent-runtime-core', 'agent-runtime-aiop', 'pi-runtime']) {
       expect((await manifest(name)).exports).toEqual({
         '.': { types: './bin/index.d.ts', import: './bin/index.js' },
       });
@@ -70,7 +71,7 @@ describe('agent platform package boundaries', () => {
 
   it('keeps every public package free of product imports and undeclared workspace dependencies', async () => {
     const names = [
-      'control-contracts', 'agent-kernel-pi', 'agent-runtime-aiop', 'agent-runtime-core', 'agent-runtime-mysql',
+      'control-contracts', 'agent-kernel-pi', 'agent-runtime-aiop', 'agent-runtime-core', 'agent-runtime-mysql', 'pi-runtime',
       'mcp-runtime', 'sandbox-core', 'sandbox-e2b', 'sandbox-local', 'sandbox-opensandbox',
       'scheduler-core', 'scheduler-mysql', 'skill-runtime', 'tool-runtime',
     ];

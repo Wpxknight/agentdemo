@@ -9,6 +9,7 @@ const packages = [
   'sandbox-core',
   'scheduler-core',
   'agent-kernel-pi',
+  'pi-runtime',
   'agent-runtime-mysql',
   'agent-runtime-aiop',
   'mcp-runtime',
