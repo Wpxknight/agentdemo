@@ -49,7 +49,7 @@ npm --prefix web run build
 
 Run 事件可通过 `GET /v1/agent/runs/{runId}/events` 获取 SSE；使用 `Last-Event-ID` 或 `?after=<sequence>` 断点补发。
 
-GitLab CI 使用 Node 24 执行 Node 基线、Agent Platform、公共包 tarball、typecheck、全量测试、Web production build 和 high/critical audit 门禁；独立 Docker-in-Docker job 执行 `make image`。Dockerfile 在 builder stage 内运行 `npm run build:packages`，且 `.dockerignore` 排除宿主 `packages/*/dist`，镜像构建不依赖开发机残留产物。
+GitLab CI 使用 Node 24 执行 Node 基线、Agent Platform、公共包 tarball、typecheck、全量测试、Web production build 和 high/critical audit 门禁；独立 Docker-in-Docker job 执行 `make image`。Dockerfile 在 builder stage 内运行 `npm run build:packages`，且 `.dockerignore` 排除宿主 `packages/*/bin`，镜像构建不依赖开发机残留产物。
 
 故障矩阵可用以下命令复验：
 

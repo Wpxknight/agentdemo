@@ -94,7 +94,7 @@ npx vitest run --reporter=verbose tests/durable-runtime.test.ts tests/memory-run
 
 ## 发布与 API 门禁
 
-公共包输出 `dist/index.js` 与 `dist/index.d.ts`，API snapshots 位于 `/home/opt/develop/aicoding/aiop/docs/public-api`。`verify:packages` 会构建全部包、检查 API diff、执行 `npm pack --dry-run` 和真实 pack，并在临时非 AIOP 项目安装/导入全部 tarball；tarball 中不得包含 `src/`，跨包依赖必须声明。
+公共包输出 `bin/index.js` 与 `bin/index.d.ts`，API snapshots 位于 `/home/opt/develop/aicoding/aiop/docs/public-api`。`verify:packages` 会构建全部包、检查 API diff、执行 `npm pack --dry-run` 和真实 pack，并在临时非 AIOP 项目安装/导入全部 tarball；tarball 中不得包含 `src/`，跨包依赖必须声明。
 
 ## Run Center Web
 
@@ -107,7 +107,7 @@ npx vitest run --reporter=verbose tests/durable-runtime.test.ts tests/memory-run
 - `/home/opt/develop/aicoding/aiop/.gitlab-ci.yml` 使用 Node 24 执行 Node、Agent Platform、typecheck、全量测试、Web build、依赖审计和公共包门禁。
 - Docker-in-Docker job 执行 `make image`，包含公共包 import 和容器 Node 基线 smoke checks。
 - Docker builder stage 显式运行 `npm run build:packages`；runtime stage 从 builder 复制已构建 packages。
-- `/home/opt/develop/aicoding/aiop/.dockerignore` 排除宿主 `packages/*/dist`。清理构建上下文后镜像仍可构建，证明不依赖本地生成物。
+- `/home/opt/develop/aicoding/aiop/.dockerignore` 排除宿主 `packages/*/bin`。清理构建上下文后镜像仍可构建，证明不依赖本地生成物。
 - development K8s 清单使用 `AIOP_PI_MODE=full`，不再声明 Kernel 选择配置。
 
 ## 最终验证
@@ -124,7 +124,7 @@ npx vitest run --reporter=verbose tests/durable-runtime.test.ts tests/memory-run
 | `npm audit --audit-level=high` | 退出 0；0 high/critical，5 moderate，均为已记录的 Pi → Google GenAI → MCP SDK → Hono 链且当前无修复 |
 | `npm run verify:packages` | 全部公共包 build、API snapshot、pack、临时项目安装与动态 import 通过 |
 | `git diff --check` | 通过 |
-| `make image` | 退出 0；builder 内生成公共包 dist，镜像 `aiop:pi-agent-platform` 构建成功，容器公共包 import 输出 `workspace-ok`，容器 Node 24.18.0 通过基线 |
+| `make image` | 退出 0；builder 内生成公共包 bin，镜像 `aiop:pi-agent-platform` 构建成功，容器公共包 import 输出 `workspace-ok`，容器 Node 24.18.0 通过基线 |
 
 Docker 构建期间同样报告 5 个 moderate 漏洞以及待 allowScripts 复核的 `@google/genai`、`esbuild`、`protobufjs` 安装脚本；本次构建没有把这些警告误记为 high/critical 或伪造为已修复。
 

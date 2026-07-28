@@ -29,7 +29,10 @@ if (parsed.errors.length) fail(parsed.errors);
 for (const name of packages) {
   const packageRoot = resolve(root, 'packages', name);
   const outDir = resolve(packageRoot, 'bin');
-  await rm(outDir, { recursive: true, force: true });
+  await Promise.all([
+    rm(resolve(packageRoot, 'dist'), { recursive: true, force: true }),
+    rm(outDir, { recursive: true, force: true }),
+  ]);
   const program = ts.createProgram({
     rootNames: [resolve(packageRoot, 'src/index.ts')],
     options: { ...parsed.options, noEmit: false, rootDir: resolve(packageRoot, 'src'), outDir },
