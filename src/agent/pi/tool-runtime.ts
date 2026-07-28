@@ -10,7 +10,7 @@ import {
   ToolRuntimeEngine,
   type RegisteredTool,
 } from '@aiop/tool-runtime';
-import type { RunAgentOptions } from '../core.js';
+import type { RunAgentOptions } from '../run-types.js';
 
 export function createAIOPToolRuntime(
   options: RunAgentOptions,

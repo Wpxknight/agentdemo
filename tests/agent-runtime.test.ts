@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { AgentRuntime, createConfiguredAgentRuntime } from '../src/agent/runtime.js';
 import type { AgentKernel } from '../src/agent/kernel.js';
-import type { RunAgentOptions, RunAgentResult } from '../src/agent/core.js';
+import type { RunAgentOptions, RunAgentResult } from '../src/agent/run-types.js';
 import { ToolRegistry } from '../src/agent/tools.js';
 import { AllowAllPolicy } from '../src/agent/policy.js';
 import type { AgentRunBinding, AgentRunBindingStore } from '../src/agent/runtime.js';
@@ -103,7 +103,7 @@ describe('AgentRuntime', () => {
     expect(visible).toEqual([['get_pods'], []]);
   });
 
-  it('locks the Pi kernel for a run across runtime reconfiguration', async () => {
+  it('locks the Pi kernel for a run across runtime instances', async () => {
     const bindings = new Map<string, AgentRunBinding>();
     const bindingStore: AgentRunBindingStore = {
       getAgentRunBinding: async (_tenantId, runId) => bindings.get(runId),
@@ -119,14 +119,11 @@ describe('AgentRuntime', () => {
       usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
       compacted: false,
     };
-    const kernels = {
-      legacy: { name: 'legacy', run: async () => { calls.push('legacy'); return result; } } satisfies AgentKernel,
-      pi: { name: 'pi', run: async () => { calls.push('pi'); return result; } } satisfies AgentKernel,
-    };
+    const kernels = { pi: { name: 'pi', run: async () => { calls.push('pi'); return result; } } satisfies AgentKernel };
     const first = createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'pi' }, { kernels, bindingStore });
     await first.run({ ...runOptions(), runId: 'run-locked', ctx: { tenantId: 'tenant-a', userId: 'user-a', sessionId: 's' } });
-    const reconfigured = createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'legacy' }, { kernels, bindingStore });
-    await reconfigured.run({ ...runOptions(), runId: 'run-locked', ctx: { tenantId: 'tenant-a', userId: 'user-a', sessionId: 's' } });
+    const fresh = createConfiguredAgentRuntime({}, { kernels, bindingStore });
+    await fresh.run({ ...runOptions(), runId: 'run-locked', ctx: { tenantId: 'tenant-a', userId: 'user-a', sessionId: 's' } });
 
     expect(calls).toEqual(['pi', 'pi']);
     expect(bindings.get('run-locked')).toMatchObject({ kernel: 'pi' });

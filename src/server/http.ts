@@ -5,7 +5,7 @@ import { resolve } from 'node:path';
 import { SignJWT, jwtVerify } from 'jose';
 import { logger } from '../logger.js';
 import type { Runtime, RuntimeModelConfig } from '../runtime.js';
-import { COMPACTION_RETRY_GROWTH_TOKENS } from '../agent/core.js';
+import { COMPACTION_RETRY_GROWTH_TOKENS } from '../agent/compaction.js';
 import { resolveAgentRuntime } from '../agent/runtime.js';
 import {
   DEFAULT_CONTEXT_WINDOW_TOKENS,

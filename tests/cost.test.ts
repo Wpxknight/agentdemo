@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { estimateCost } from '../src/model/cost.js';
-import type { Usage } from '../src/agent/core.js';
+import type { Usage } from '../src/agent/run-types.js';
 
 const usage: Usage = {
   inputTokens: 1_000_000, // 含缓存

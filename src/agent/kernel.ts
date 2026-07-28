@@ -1,4 +1,4 @@
-import type { RunAgentOptions, RunAgentResult } from './core.js';
+import type { RunAgentOptions, RunAgentResult } from './run-types.js';
 
 /** 可观测、可配置的 Agent 执行内核名称。 */
 export type AgentKernelName = 'pi' | 'legacy' | (string & {});

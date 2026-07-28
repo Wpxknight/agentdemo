@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { RequestContext } from '../auth/types.js';
 import type { AgentRunStatus, AgentRunUsage, Store } from '../db/store.js';
-import type { RunAgentResult } from './core.js';
+import type { RunAgentResult } from './run-types.js';
 import { RecoveryRequiredError } from './tool-ledger/store.js';
 
 const DEFAULT_LEASE_TTL_MS = 30_000;

@@ -9,7 +9,7 @@ import { PiAgentKernel, PiContextManager } from '@aiop/agent-kernel-pi';
 import { FifoModelConcurrencyController } from '@aiop/agent-runtime-core';
 import type { Msg, StreamEvent, ToolDef } from '../../model/types.js';
 import type { AgentKernel } from '../kernel.js';
-import type { RunAgentOptions, RunAgentResult } from '../core.js';
+import type { RunAgentOptions, RunAgentResult } from '../run-types.js';
 import { executeToolCall } from '../services/tool-broker.js';
 
 export class PiAIOPAgentKernel implements AgentKernel {

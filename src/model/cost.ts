@@ -1,4 +1,4 @@
-import type { Usage } from '../agent/core.js';
+import type { Usage } from '../agent/run-types.js';
 
 /** 每百万 token 单价（美元）。 */
 export interface ModelPricing {

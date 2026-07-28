@@ -1,7 +1,7 @@
 import type { RequestContext } from '../../auth/types.js';
 import type { Store } from '../../db/store.js';
 import type { ToolContentBlock } from '../../model/types.js';
-import type { RunAgentResult } from '../core.js';
+import type { RunAgentResult } from '../run-types.js';
 
 export interface CommitSuccessInput {
   ctx: RequestContext;

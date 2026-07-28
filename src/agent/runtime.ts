@@ -1,6 +1,5 @@
-import type { RunAgentOptions, RunAgentResult } from './core.js';
+import type { RunAgentOptions, RunAgentResult } from './run-types.js';
 import type { AgentKernel, AgentKernelName } from './kernel.js';
-import { LegacyAgentKernel } from './legacy-kernel.js';
 import { PiAIOPAgentKernel } from './pi/kernel.js';
 import {
   createPiPlatformKernel,
@@ -15,7 +14,6 @@ import {
   type RuntimeStore,
 } from '@aiop/agent-runtime-core';
 import { AgentPlatformError, type ModelConcurrencyController } from '@aiop/agent-contracts';
-import { logger } from '../logger.js';
 import type { AgentRunBinding, Store } from '../db/store.js';
 import { AgentRunCancelledError, AgentRunCoordinator } from './run-coordinator.js';
 import { reqContext } from './tools.js';
@@ -29,13 +27,9 @@ export interface AgentRunBindingStore {
   putAgentRunBindingIfAbsent(binding: AgentRunBinding): Promise<boolean>;
 }
 
-type BuiltinKernelName = 'pi' | 'legacy';
-
 export interface AgentRuntimeOptions {
   kernel?: AgentKernel;
-  kernels?: Partial<Record<BuiltinKernelName, AgentKernel>>;
-  selector?: (options: RunAgentOptions) => BuiltinKernelName;
-  prepareOptions?: (kernel: BuiltinKernelName, options: RunAgentOptions) => RunAgentOptions;
+  prepareOptions?: (options: RunAgentOptions) => RunAgentOptions;
   configuredName?: AgentKernelName;
   bindingStore?: AgentRunBindingStore;
   runCoordinator?: AgentRunCoordinator;
@@ -48,9 +42,7 @@ export interface AgentRuntimeOptions {
 /** 供 HTTP、CLI、Scheduler 共用的稳定 Agent 运行入口。 */
 export class AgentRuntime {
   readonly kernel: AgentKernel;
-  private readonly kernels: Partial<Record<BuiltinKernelName, AgentKernel>>;
-  private readonly selector: (options: RunAgentOptions) => BuiltinKernelName;
-  private readonly prepareOptions: (kernel: BuiltinKernelName, options: RunAgentOptions) => RunAgentOptions;
+  private readonly prepareOptions: (options: RunAgentOptions) => RunAgentOptions;
   private readonly configuredName: AgentKernelName;
   private readonly bindingStore?: AgentRunBindingStore;
   private readonly runCoordinator?: AgentRunCoordinator;
@@ -60,17 +52,9 @@ export class AgentRuntime {
   private readonly toolConcurrency: ToolConcurrencyController;
 
   constructor(options: AgentRuntimeOptions = {}) {
-    const defaultKernel = options.kernel ?? options.kernels?.legacy ?? new LegacyAgentKernel();
-    const defaultBuiltinName: BuiltinKernelName = isBuiltinKernelName(defaultKernel.name)
-      ? defaultKernel.name
-      : 'legacy';
-    this.kernel = defaultKernel;
-    this.kernels = options.kernels ?? (isBuiltinKernelName(defaultKernel.name)
-      ? { [defaultBuiltinName]: defaultKernel }
-      : {});
-    this.selector = options.selector ?? (() => defaultBuiltinName);
-    this.prepareOptions = options.prepareOptions ?? ((_kernel, runOptions) => runOptions);
-    this.configuredName = options.configuredName ?? defaultKernel.name;
+    this.kernel = options.kernel ?? new PiAIOPAgentKernel();
+    this.prepareOptions = options.prepareOptions ?? ((runOptions) => runOptions);
+    this.configuredName = options.configuredName ?? this.kernel.name;
     this.bindingStore = options.bindingStore;
     this.runCoordinator = options.runCoordinator;
     this.runtimeStore = options.runtimeStore;
@@ -84,26 +68,22 @@ export class AgentRuntime {
   }
 
   async run(options: RunAgentOptions): Promise<RunAgentResult> {
-    if (!this.kernels.pi && !this.kernels.legacy) return this.kernel.run(options);
-    const candidate = this.selector(options);
-    const candidateOptions = this.prepareOptions(candidate, options);
-    if (candidate === 'pi' && candidateOptions.rolloutMode === 'replay') {
+    const prepared = this.prepareOptions(options);
+    if (this.kernel.name !== 'pi') return this.kernel.run(prepared);
+    if (prepared.rolloutMode === 'replay') {
       if (!this.runtimeStore) {
         throw new AgentPlatformError({
           code: 'RUN_STATE_CONFLICT', message: 'Replay requires a Durable Runtime Store', retryable: false,
         });
       }
-      return this.replayDurablePi(candidateOptions);
+      return this.replayDurablePi(prepared);
     }
-    const selected = await this.selectLockedKernel(options);
-    const kernel = this.kernels[selected];
-    if (!kernel) throw new Error(`Agent Kernel 不可用：${selected}`);
-    const prepared = selected === candidate ? candidateOptions : this.prepareOptions(selected, options);
-    if (selected === 'pi' && this.runtimeStore && prepared.runId) return this.runDurablePi(prepared);
-    if (!prepared.runId || !this.runCoordinator) return kernel.run(prepared);
+    await this.ensurePiBinding(prepared);
+    if (this.runtimeStore && prepared.runId) return this.runDurablePi(prepared);
+    if (!prepared.runId || !this.runCoordinator) return this.kernel.run(prepared);
     const execution = await this.runCoordinator.start(reqContext(prepared.ctx), prepared.runId);
     try {
-      const result = await kernel.run({
+      const result = await this.kernel.run({
         ...prepared,
         runLifecycle: execution,
         runGuard: () => execution.guard(),
@@ -266,9 +246,8 @@ export class AgentRuntime {
     };
   }
 
-  private async selectLockedKernel(options: RunAgentOptions): Promise<BuiltinKernelName> {
-    const selected = this.selector(options);
-    if (!options.runId || !this.bindingStore) return selected;
+  private async ensurePiBinding(options: RunAgentOptions): Promise<void> {
+    if (!options.runId || !this.bindingStore) return;
     const tenantId = options.ctx.tenantId ?? 'default';
     const userId = options.ctx.userId ?? '';
     const existing = await this.bindingStore.getAgentRunBinding(tenantId, options.runId);
@@ -278,27 +257,26 @@ export class AgentRuntime {
       userId,
       sessionId: options.ctx.sessionId,
       runId: options.runId,
-      kernel: selected,
-      kernelVersion: selected === 'pi' ? '0.82.1' : 'legacy-v1',
+      kernel: 'pi',
+      kernelVersion: '0.82.1',
       runtimeVersion: '1',
       graphName: '',
       graphVersion: '',
       createdAt: new Date(),
     };
-    if (await this.bindingStore.putAgentRunBindingIfAbsent(binding)) return selected;
+    if (await this.bindingStore.putAgentRunBindingIfAbsent(binding)) return;
     const raced = await this.bindingStore.getAgentRunBinding(tenantId, options.runId);
     if (!raced) throw new Error('Agent run binding 写入冲突');
-    return this.validateBinding(raced, options);
+    this.validateBinding(raced, options);
   }
 
-  private validateBinding(binding: AgentRunBinding, options: RunAgentOptions): BuiltinKernelName {
+  private validateBinding(binding: AgentRunBinding, options: RunAgentOptions): void {
     if (binding.userId !== (options.ctx.userId ?? '') || binding.sessionId !== options.ctx.sessionId) {
       throw new Error('Agent run binding 与当前用户或会话不匹配');
     }
-    if (binding.kernel !== 'pi' && binding.kernel !== 'legacy') {
+    if (binding.kernel !== 'pi') {
       throw new Error(`Agent Kernel 不可用：${binding.kernel}@${binding.kernelVersion ?? 'unknown'}`);
     }
-    return binding.kernel;
   }
 }
 
@@ -312,12 +290,13 @@ export function resolveAgentRuntime(runtime?: AgentRuntime): AgentRuntime {
 export function createConfiguredAgentRuntime(
   env: NodeJS.ProcessEnv = process.env,
   options: {
-    kernels?: Partial<Record<BuiltinKernelName, AgentKernel>>;
+    kernels?: { pi?: AgentKernel };
     bindingStore?: AgentRunBindingStore;
     runStore?: Store;
     runtimeStore?: RuntimeStore;
   } = {},
 ): AgentRuntime {
+  assertPiKernelConfiguration(env);
   const modelConcurrency = new FifoModelConcurrencyController({
     maxConcurrentPerTenantModel: modelConcurrencyLimit(env.AIOP_PI_MAX_CONCURRENT_MODEL_CALLS),
   });
@@ -332,27 +311,12 @@ export function createConfiguredAgentRuntime(
       env.AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE, 'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE', 1,
     ),
   });
-  const legacy = options.kernels?.legacy ?? new LegacyAgentKernel();
   const pi = options.kernels?.pi ?? new PiAIOPAgentKernel(modelConcurrency);
-  const kernels = { pi, legacy };
-  const configured = env.AIOP_AGENT_KERNEL?.trim().toLowerCase() || 'legacy';
   const piMode = resolvePiMode(env.AIOP_PI_MODE);
-  if (configured !== 'pi' && configured !== 'legacy' && configured !== 'tenant-rule') {
-    logger.warn({ configured }, '未知 Agent Kernel，回退 Legacy Kernel');
-  }
-  const requested = piMode !== 'disabled' && (configured === 'pi' || configured === 'tenant-rule')
-    ? configured
-    : 'legacy';
-  const rollout = rolloutSelector(env);
-  const selector = requested === 'tenant-rule'
-    ? rollout
-    : () => requested as BuiltinKernelName;
   return new AgentRuntime({
-    kernel: requested === 'pi' ? pi : legacy,
-    kernels,
-    selector,
+    kernel: pi,
     prepareOptions: piOptionGate(env, piMode),
-    configuredName: requested,
+    configuredName: 'pi',
     bindingStore: options.bindingStore,
     runCoordinator: options.runStore ? new AgentRunCoordinator(options.runStore) : undefined,
     runtimeStore: options.runtimeStore,
@@ -360,6 +324,13 @@ export function createConfiguredAgentRuntime(
     modelConcurrency,
     toolConcurrency,
   });
+}
+
+function assertPiKernelConfiguration(env: NodeJS.ProcessEnv): void {
+  const configured = env.AIOP_AGENT_KERNEL?.trim().toLowerCase();
+  if (configured && configured !== 'pi') {
+    throw new Error('AIOP_AGENT_KERNEL is retired; only pi is supported');
+  }
 }
 
 function toolConcurrencyLimit(value: string | undefined, name: string, fallback: number): number {
@@ -383,45 +354,27 @@ function abortMessage(reason: unknown): string {
   return typeof reason === 'string' && reason ? reason : 'Agent run cancelled';
 }
 
-function rolloutSelector(env: NodeJS.ProcessEnv): (options: RunAgentOptions) => BuiltinKernelName {
-  const piTestTenants = csv(env.AIOP_PI_TEST_TENANTS);
-  const piInternalUsers = csv(env.AIOP_PI_INTERNAL_USERS);
-  const piReadOnlySessions = csv(env.AIOP_PI_READ_ONLY_SESSIONS);
-  const piFullSessions = csv(env.AIOP_PI_FULL_SESSIONS);
-  return (options) => {
-    if (options.ctx.tenantId && piTestTenants.has(options.ctx.tenantId)) return 'pi';
-    if (options.ctx.userId && piInternalUsers.has(options.ctx.userId)) return 'pi';
-    if (piReadOnlySessions.has(options.ctx.sessionId)) return 'pi';
-    if (piFullSessions.has(options.ctx.sessionId)) return 'pi';
-    return 'legacy';
-  };
-}
-
 function csv(value: string | undefined): Set<string> {
   return new Set((value ?? '').split(',').map((item) => item.trim()).filter(Boolean));
 }
 
-function isBuiltinKernelName(name: AgentKernelName): name is BuiltinKernelName {
-  return name === 'pi' || name === 'legacy';
-}
-
-type PiMode = 'disabled' | 'read-only' | 'dry-run' | 'replay' | 'full';
+type PiMode = 'read-only' | 'dry-run' | 'replay' | 'full';
 
 function resolvePiMode(value: string | undefined): PiMode {
   const normalized = value?.trim().toLowerCase();
-  if (normalized === 'disabled' || normalized === 'read-only' || normalized === 'dry-run' || normalized === 'replay') {
+  if (!normalized || normalized === 'full') return 'full';
+  if (normalized === 'read-only' || normalized === 'dry-run' || normalized === 'replay') {
     return normalized;
   }
-  return 'full';
+  throw new Error('AIOP_PI_MODE must be one of read-only, dry-run, replay, full');
 }
 
 function piOptionGate(env: NodeJS.ProcessEnv, mode: PiMode) {
   const readOnlySessions = csv(env.AIOP_PI_READ_ONLY_SESSIONS);
-  return (kernel: BuiltinKernelName, options: RunAgentOptions): RunAgentOptions => {
-    if (kernel !== 'pi') return options;
+  return (options: RunAgentOptions): RunAgentOptions => {
     const prepared = {
       ...options,
-      rolloutMode: (mode === 'disabled' ? 'full' : mode) as NonNullable<RunAgentOptions['rolloutMode']>,
+      rolloutMode: mode,
       comparisonRunId: options.comparisonRunId ?? (env.AIOP_PI_COMPARISON_RUN_ID?.trim() || undefined),
     };
     const restriction = mode === 'dry-run' || mode === 'replay'
