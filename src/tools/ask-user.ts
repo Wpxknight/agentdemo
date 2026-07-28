@@ -1,6 +1,6 @@
 import type { JsonValue, ToolResult } from '../model/types.js';
 import type { QuestionSpec } from '../agent/question.js';
-import type { ToolContext, ToolHandler } from '../agent/tools.js';
+import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 
 /**
  * ask_user 工具（借鉴 Claude Code AskUserQuestionTool）：
@@ -43,8 +43,7 @@ function parseQuestions(args: JsonValue): QuestionSpec[] {
 }
 
 export function buildAskUserTool(): ToolHandler {
-  return {
-    def: {
+  return defineTool({
       name: 'ask_user',
       capability: 'read',
       description:
@@ -81,8 +80,7 @@ export function buildAskUserTool(): ToolHandler {
         },
         required: ['questions'],
       },
-    },
-    async run(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
+    async execute(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
       const questions = parseQuestions(args);
       if (!ctx.askUser) {
         return {
@@ -101,5 +99,5 @@ export function buildAskUserTool(): ToolHandler {
       });
       return { id: '', content: `用户回答：\n${lines.join('\n\n')}` };
     },
-  };
+  });
 }

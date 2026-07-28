@@ -1,5 +1,5 @@
 import type { JsonValue, ToolResult } from '../model/types.js';
-import type { ToolContext, ToolHandler } from '../agent/tools.js';
+import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import type { DesktopHandle } from '../sandbox/desktop.js';
 
 /** 按上下文取（必要时创建）一个浏览器会话。 */
@@ -28,21 +28,18 @@ function reqNumber(o: Record<string, JsonValue>, key: string): number {
  */
 export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
   return [
-    {
-      def: {
+    defineTool({
         name: 'desktop_stream_url',
         capability: 'read',
         description: '启动远端浏览器预览并返回 iframe 页面 URL。',
         inputSchema: { type: 'object', properties: {} },
-      },
-      async run(_args, ctx): Promise<ToolResult> {
+      async execute(_args, ctx): Promise<ToolResult> {
         const d = await resolve(ctx);
         const url = await d.startStream();
         return { id: '', content: `浏览器预览地址：${url}` };
       },
-    },
-    {
-      def: {
+    }),
+    defineTool({
         name: 'browser_navigate',
         capability: 'retryable_write',
         description: '在远端浏览器中打开指定 URL（启动 Chrome）。',
@@ -51,8 +48,7 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
           properties: { url: { type: 'string', description: '要打开的网址' } },
           required: ['url'],
         },
-      },
-      async run(args, ctx): Promise<ToolResult> {
+      async execute(args, ctx): Promise<ToolResult> {
         const o = asObject(args);
         const url = typeof o.url === 'string' ? o.url : '';
         if (!url) return { id: '', content: 'url 必填', isError: true };
@@ -60,9 +56,8 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
         await d.launch('google-chrome', url);
         return { id: '', content: `已在浏览器打开：${url}` };
       },
-    },
-    {
-      def: {
+    }),
+    defineTool({
         name: 'browser_click',
         capability: 'non_idempotent_write',
         description: '在远端浏览器坐标 (x,y) 处左键点击。',
@@ -74,8 +69,7 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
           },
           required: ['x', 'y'],
         },
-      },
-      async run(args, ctx): Promise<ToolResult> {
+      async execute(args, ctx): Promise<ToolResult> {
         const o = asObject(args);
         const x = reqNumber(o, 'x');
         const y = reqNumber(o, 'y');
@@ -83,9 +77,8 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
         await d.leftClick(x, y);
         return { id: '', content: `已点击 (${x}, ${y})` };
       },
-    },
-    {
-      def: {
+    }),
+    defineTool({
         name: 'browser_type',
         capability: 'non_idempotent_write',
         description: '在远端浏览器当前焦点处键入文本；文本以换行符结尾时额外按一次回车（提交表单/搜索）。',
@@ -94,23 +87,20 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
           properties: { text: { type: 'string' } },
           required: ['text'],
         },
-      },
-      async run(args, ctx: ToolContext): Promise<ToolResult> {
+      async execute(args, ctx: ToolContext): Promise<ToolResult> {
         const o = asObject(args);
         const text = typeof o.text === 'string' ? o.text : '';
         const d = await resolve(ctx);
         await d.write(text);
         return { id: '', content: `已输入 ${text.length} 个字符` };
       },
-    },
-    {
-      def: {
+    }),
+    defineTool({
         name: 'browser_current_url',
         capability: 'read',
         description: '获取远端浏览器当前页面的 URL；用户可在本地浏览器新标签页直接打开该地址操作。',
         inputSchema: { type: 'object', properties: {} },
-      },
-      async run(_args, ctx): Promise<ToolResult> {
+      async execute(_args, ctx): Promise<ToolResult> {
         const d = await resolve(ctx);
         if (!d.currentUrl) return { id: '', content: '当前沙箱后端不支持获取页面地址', isError: true };
         const url = await d.currentUrl();
@@ -118,15 +108,13 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
         if (!url || !/^https?:\/\//i.test(url)) return { id: '', content: '浏览器尚未打开任何页面' };
         return { id: '', content: `当前页面：${url}` };
       },
-    },
-    {
-      def: {
+    }),
+    defineTool({
         name: 'browser_screenshot',
         capability: 'read',
         description: '截取远端浏览器画面；返回字节数与预览地址。',
         inputSchema: { type: 'object', properties: {} },
-      },
-      async run(_args, ctx): Promise<ToolResult> {
+      async execute(_args, ctx): Promise<ToolResult> {
         const d = await resolve(ctx);
         const img = await d.screenshot();
         const text = `截图已捕获（${img.byteLength} 字节）。浏览器预览：${d.streamUrl()}`;
@@ -139,6 +127,6 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
           ],
         };
       },
-    },
+    }),
   ];
 }

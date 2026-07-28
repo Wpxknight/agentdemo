@@ -3,7 +3,7 @@ import { promisify } from 'node:util';
 import { posix } from 'node:path';
 import { logger } from '../logger.js';
 import type { JsonValue, ToolResult } from '../model/types.js';
-import type { ToolContext, ToolHandler } from '../agent/tools.js';
+import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import type { Skill, SkillRegistry } from '../skill/registry.js';
 import type { SandboxManagerLike } from '../sandbox/lifecycle.js';
 import { isSandboxAcquirer } from '../sandbox/acquisition.js';
@@ -97,8 +97,7 @@ export function buildSkillTools(
   const hasSandboxSync = Boolean(manager);
   const tools: ToolHandler[] = [registry.tool({ hasSandboxSync })];
 
-  tools.push({
-    def: {
+  tools.push(defineTool({
       name: 'skill__read_file',
       capability: 'read',
       description:
@@ -111,8 +110,7 @@ export function buildSkillTools(
         },
         required: ['name'],
       },
-    },
-    async run(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
+    async execute(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
       const o = asObject(args);
       const name = reqString(o, 'name');
       const path = typeof o.path === 'string' ? o.path : '';
@@ -142,13 +140,12 @@ export function buildSkillTools(
         return { id: '', content: `读取失败：${String(err)}`, isError: true };
       }
     },
-  });
+  }));
 
   if (manager) {
     const resolveSpec = async (ctx: ToolContext): Promise<SandboxSpec> =>
       resolveSandboxSpec(resolve ?? (() => ({})), ctx);
-    tools.push({
-      def: {
+    tools.push(defineTool({
         name: 'skill__sync_to_sandbox',
         capability: 'retryable_write',
         description:
@@ -166,8 +163,7 @@ export function buildSkillTools(
           },
           required: ['name'],
         },
-      },
-      async run(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
+      async execute(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
         const o = asObject(args);
         const name = reqString(o, 'name');
         const paths = optStringArray(o, 'paths');
@@ -263,7 +259,7 @@ export function buildSkillTools(
             + `在沙箱内执行脚本请以该目录为根，例如 cd '${dest}' 后运行相应 scripts。${credentialNote}${skippedNote}`,
         };
       },
-    });
+    }));
   }
 
   return tools;

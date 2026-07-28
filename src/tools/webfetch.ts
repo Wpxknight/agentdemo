@@ -1,6 +1,6 @@
 import { assertPublicUrl } from '../net/ssrf.js';
 import type { JsonValue, ToolResult } from '../model/types.js';
-import type { ToolContext, ToolHandler } from '../agent/tools.js';
+import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 
 /**
  * WebFetch 工具（借鉴 Claude Code WebFetchTool）：
@@ -59,8 +59,7 @@ function asObject(args: JsonValue): Record<string, JsonValue> {
 
 export function buildWebFetchTool(opts: WebFetchOptions = {}): ToolHandler {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  return {
-    def: {
+  return defineTool({
       name: 'web_fetch',
       capability: 'read',
       description:
@@ -74,8 +73,7 @@ export function buildWebFetchTool(opts: WebFetchOptions = {}): ToolHandler {
         },
         required: ['url'],
       },
-    },
-    async run(args: JsonValue, _ctx: ToolContext): Promise<ToolResult> {
+    async execute(args: JsonValue, _ctx: ToolContext): Promise<ToolResult> {
       const url = typeof asObject(args).url === 'string' ? (asObject(args).url as string) : '';
       if (!url) return { id: '', content: '参数 url 必填', isError: true };
 
@@ -110,5 +108,5 @@ export function buildWebFetchTool(opts: WebFetchOptions = {}): ToolHandler {
         return { id: '', content: `抓取失败：${msg}`, isError: true };
       }
     },
-  };
+  });
 }

@@ -2,7 +2,7 @@ import { readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join, posix, resolve, sep } from 'node:path';
 import { logger } from '../logger.js';
 import type { JsonValue, ToolResult } from '../model/types.js';
-import type { ToolContext, ToolHandler } from '../agent/tools.js';
+import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import { isAdminRole } from '../auth/rbac.js';
 import type { Role } from '../auth/types.js';
 
@@ -274,17 +274,16 @@ export class SkillRegistry {
   tool(opts: { hasSandboxSync?: boolean } = {}): ToolHandler {
     const registry = this;
     const hasSandboxSync = opts.hasSandboxSync ?? false;
-    return {
-      def: {
+    return defineTool({
         name: 'load_skill',
+        capability: 'read',
         description: '按名字加载某个技能的完整指令（渐进式披露）。',
         inputSchema: {
           type: 'object',
           properties: { name: { type: 'string', description: '技能名' } },
           required: ['name'],
         },
-      },
-      async run(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
+      async execute(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
         const name =
           args && typeof args === 'object' && !Array.isArray(args)
             ? (args as Record<string, JsonValue>).name
@@ -318,7 +317,7 @@ export class SkillRegistry {
         ].join('\n');
         return { id: '', content: skill.body + usage };
       },
-    };
+    });
   }
 
   /** 按名取技能（含禁用的；不做可见性过滤，管理路径用）；不存在返回 undefined。 */

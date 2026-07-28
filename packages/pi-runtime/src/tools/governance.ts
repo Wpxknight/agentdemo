@@ -8,7 +8,7 @@ import type {
   ToolRuntime,
 } from '@aiop/control-contracts';
 import type { GovernedToolDefinition } from './adapter.js';
-import type { ToolApproval, ToolApprovalDecision } from './approval.js';
+import type { ToolApproval, ToolApprovalDecision, ToolInteractionStore } from './approval.js';
 import type { ToolAudit } from './audit.js';
 import { ResourceConcurrencyController, type ResourceConcurrency } from './concurrency.js';
 import { digestToolValue, type ToolLedgerStore } from './ledger.js';
@@ -18,6 +18,7 @@ export interface GovernedToolFactoryOptions {
   ledger: ToolLedgerStore;
   policy?: ToolPolicy;
   approval?: ToolApproval;
+  interactions?: ToolInteractionStore;
   concurrency?: ResourceConcurrency;
   audit?: ToolAudit;
   now?: () => Date;
@@ -65,7 +66,7 @@ class GovernedToolRuntime implements ToolRuntime {
     if (mismatch) return mismatch;
     if (existing?.status === 'completed' && existing.result) return { kind: 'result', result: existing.result };
 
-    const trustedApproval = this.trustedApproval(call, context);
+    const trustedApproval = await this.trustedApproval(call, context, existing);
     if (trustedApproval?.outcome) return trustedApproval.outcome;
     if (existing?.status === 'pending_approval' && !trustedApproval) {
       return { kind: 'waiting', reason: 'approval', interactionId: existing.approvedInteractionId ?? 'pending' };
@@ -152,14 +153,35 @@ class GovernedToolRuntime implements ToolRuntime {
     ));
   }
 
-  private trustedApproval(call: ToolCall, context: ToolExecutionContext): {
+  private async trustedApproval(
+    call: ToolCall,
+    context: ToolExecutionContext,
+    existing: DurableToolLedgerUpdate | undefined,
+  ): Promise<{
     decision?: ToolApprovalDecision;
     outcome?: ToolExecutionOutcome;
-  } | undefined {
+  } | undefined> {
     const resolution = context.interactionResolution;
     if (!resolution) return undefined;
     if (resolution.kind !== 'approval' || resolution.toolCallId !== call.id || typeof resolution.value !== 'boolean') {
       return { outcome: { kind: 'recovery_required', message: 'approval resolution does not match the pending tool call' } };
+    }
+    if (!existing || existing.status !== 'pending_approval'
+      || existing.toolCallId !== call.id || existing.approvedInteractionId !== resolution.interactionId) {
+      return { outcome: { kind: 'recovery_required', message: 'approval resolution has no matching pending ledger record' } };
+    }
+    const interaction = await this.options.interactions?.get({
+      tenantId: context.identity.tenantId,
+      runId: context.runId,
+      interactionId: resolution.interactionId,
+    });
+    if (!interaction || interaction.tenantId !== context.identity.tenantId || interaction.runId !== context.runId
+      || interaction.id !== resolution.interactionId || interaction.kind !== 'approval'
+      || interaction.status !== 'resolved' || interaction.attemptId !== existing.attemptId
+      || interaction.turnNo !== existing.turnNo
+      || interaction.toolCallId !== existing.toolCallId || interaction.toolCallId !== call.id
+      || interaction.resolution !== resolution.value) {
+      return { outcome: { kind: 'recovery_required', message: 'approval resolution is not bound to the pending interaction' } };
     }
     return { decision: { approved: resolution.value, interactionId: resolution.interactionId } };
   }

@@ -1,5 +1,5 @@
 import type { JsonValue, ToolResult } from '../model/types.js';
-import type { ToolContext, ToolHandler } from '../agent/tools.js';
+import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import { reqContext } from '../agent/tools.js';
 import type { Store } from '../db/store.js';
 import { isValidCron } from '../scheduler/cron.js';
@@ -15,8 +15,7 @@ function asObject(args: JsonValue): Record<string, JsonValue> {
  */
 export function buildScheduleTools(store: Store): ToolHandler[] {
   return [
-    {
-      def: {
+    defineTool({
         name: 'schedule_task',
         capability: 'non_idempotent_write',
         description:
@@ -31,8 +30,7 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
           },
           required: ['cron', 'title', 'task'],
         },
-      },
-      async run(args, ctx: ToolContext): Promise<ToolResult> {
+      async execute(args, ctx: ToolContext): Promise<ToolResult> {
         const o = asObject(args);
         const cron = typeof o.cron === 'string' ? o.cron : '';
         const task = typeof o.task === 'string' ? o.task : '';
@@ -58,15 +56,13 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
           content: `已创建定时任务 #${created.id}「${created.title || created.task}」（cron=${cron}），下次执行：${created.nextRunAt.toISOString()}`,
         };
       },
-    },
-    {
-      def: {
+    }),
+    defineTool({
         name: 'list_scheduled_tasks',
         capability: 'read',
         description: '列出当前会话的定时任务及其下次执行时间。',
         inputSchema: { type: 'object', properties: {} },
-      },
-      async run(_args, ctx: ToolContext): Promise<ToolResult> {
+      async execute(_args, ctx: ToolContext): Promise<ToolResult> {
         const tasks = await store.listScheduledTasks(reqContext(ctx));
         if (!tasks.length) return { id: '', content: '（无定时任务）' };
         const lines = tasks.map(
@@ -75,9 +71,8 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
         );
         return { id: '', content: lines.join('\n') };
       },
-    },
-    {
-      def: {
+    }),
+    defineTool({
         name: 'cancel_scheduled_task',
         capability: 'retryable_write',
         description: '停用（取消）一个定时任务。',
@@ -86,17 +81,15 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
           properties: { id: { type: 'number', description: '任务 id' } },
           required: ['id'],
         },
-      },
-      async run(args, ctx: ToolContext): Promise<ToolResult> {
+      async execute(args, ctx: ToolContext): Promise<ToolResult> {
         const o = asObject(args);
         const id = typeof o.id === 'number' ? o.id : Number(o.id);
         if (!Number.isInteger(id)) return { id: '', content: 'id 必须是整数', isError: true };
         await store.setTaskEnabled(reqContext(ctx), id, false);
         return { id: '', content: `已停用定时任务 #${id}` };
       },
-    },
-    {
-      def: {
+    }),
+    defineTool({
         name: 'update_scheduled_task',
         capability: 'retryable_write',
         description: '修改定时任务：可更新 cron、任务描述、启用状态、preApproved（预批准需管理员）。仅传要改的字段。',
@@ -112,8 +105,7 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
           },
           required: ['id'],
         },
-      },
-      async run(args, ctx: ToolContext): Promise<ToolResult> {
+      async execute(args, ctx: ToolContext): Promise<ToolResult> {
         const o = asObject(args);
         const id = typeof o.id === 'number' ? o.id : Number(o.id);
         if (!Number.isInteger(id)) return { id: '', content: 'id 必须是整数', isError: true };
@@ -142,9 +134,8 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
           content: `已更新定时任务 #${id}：[${updated.enabled ? '启用' : '停用'}] cron=${updated.cron} 下次=${updated.nextRunAt.toISOString()} — ${updated.task}`,
         };
       },
-    },
-    {
-      def: {
+    }),
+    defineTool({
         name: 'delete_scheduled_task',
         capability: 'non_idempotent_write',
         description: '删除一个定时任务及其全部执行记录（不可恢复；如只想暂停请用 cancel_scheduled_task）。',
@@ -153,8 +144,7 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
           properties: { id: { type: 'number', description: '任务 id' } },
           required: ['id'],
         },
-      },
-      async run(args, ctx: ToolContext): Promise<ToolResult> {
+      async execute(args, ctx: ToolContext): Promise<ToolResult> {
         const o = asObject(args);
         const id = typeof o.id === 'number' ? o.id : Number(o.id);
         if (!Number.isInteger(id)) return { id: '', content: 'id 必须是整数', isError: true };
@@ -162,6 +152,6 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
         if (!ok) return { id: '', content: `定时任务 #${id} 不存在`, isError: true };
         return { id: '', content: `已删除定时任务 #${id} 及其执行记录` };
       },
-    },
+    }),
   ];
 }

@@ -10,10 +10,10 @@ import { FifoModelConcurrencyController } from '@aiop/agent-runtime-core';
 import type { Msg, StreamEvent, ToolDef } from '../../model/types.js';
 import type { AgentKernel } from '../kernel.js';
 import type { RunAgentOptions, RunAgentResult } from '../run-types.js';
-import { executeToolCall } from '../services/tool-broker.js';
 import { AgentPlatformError } from '@aiop/control-contracts';
 import { compactMessages, SUMMARY_PREFIX } from '../context.js';
 import { buildSystemPrompt } from '../services/prompt.js';
+import { createCompatibilityAIOPToolRuntime } from './tool-runtime.js';
 
 export class PiAIOPAgentKernel implements AgentKernel {
   readonly name = 'pi' as const;
@@ -79,30 +79,7 @@ export function createPiPlatformKernel(
   const modelProvider: ModelProvider = {
     stream: (input) => adaptModel(options, input.system, input.messages, input.tools, input.signal),
   };
-  const toolRuntime: ToolRuntime = durableToolRuntime ?? {
-    execute: async (call) => {
-      const toolResult = await executeToolCall({ id: call.id, name: call.name, args: call.arguments }, {
-        tools: options.tools,
-        policy: options.policy,
-        ctx: options.ctx,
-        approval: options.approval,
-        hooks: options.hooks,
-        toolLedger: options.toolLedger,
-        runId: options.runId,
-        askUser: options.askUser,
-        requestPlanApproval: options.requestPlanApproval,
-        signal: options.signal,
-        guard: options.runGuard,
-        onEvent: (event) => {
-          if (event.type !== 'tool_result') options.onEvent?.(event);
-        },
-      });
-      return {
-        kind: 'result',
-        result: { callId: call.id, content: toolResult.content, isError: toolResult.isError },
-      };
-    },
-  };
+  const toolRuntime: ToolRuntime = durableToolRuntime ?? createCompatibilityAIOPToolRuntime(options);
   const context = options.summarize && options.compactionTriggerTokens ? {
     manager: new PiContextManager({
       complete: async ({ sourceMessages }) => ({
@@ -138,7 +115,10 @@ export function createPiPlatformKernel(
 
 export function piToolDefinitions(options: RunAgentOptions) {
   const defs = options.filterToolDefs?.(options.tools.defs()) ?? options.tools.defs();
-  return defs.map((tool) => ({ ...tool, capability: capability(tool) }));
+  return defs.map((tool) => ({
+    ...tool,
+    capability: tool.capability ?? 'non_idempotent_write',
+  }));
 }
 
 async function* adaptModel(
@@ -219,10 +199,6 @@ export function fromPiKernelMessages(messages: readonly KernelMessage[]): Msg[] 
       toolResults: message.results.map((result) => ({ id: result.callId, content: result.content, isError: result.isError })),
     };
   });
-}
-
-function capability(tool: ToolDef): 'read' | 'non_idempotent_write' {
-  return /^(get|list|read|search|fetch|describe|query)(_|$)/i.test(tool.name) ? 'read' : 'non_idempotent_write';
 }
 
 export function emitPiCompatEvent(event: KernelEvent, sink?: (event: StreamEvent) => void): void {

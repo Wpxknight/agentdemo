@@ -3,6 +3,7 @@ import type { RequestContext, Role } from '../auth/types.js';
 import type { OutputSink } from '../sandbox/types.js';
 import type { QuestionAnswers, QuestionSpec } from './question.js';
 import type { ChangePlan } from './plan.js';
+import { UnifiedToolRegistry, type ToolSource } from '@aiop/pi-runtime';
 
 /** 工具执行时可用的运行上下文（含租户身份，用于隔离与鉴权）。 */
 export interface ToolContext {
@@ -32,9 +33,41 @@ export function reqContext(ctx: ToolContext): RequestContext {
   return { tenantId: ctx.tenantId, userId: ctx.userId, role: ctx.role };
 }
 
-export interface ToolHandler {
+export interface LegacyToolHandler {
   def: ToolDef;
   run(args: JsonValue, ctx: ToolContext): Promise<ToolResult>;
+}
+
+export interface ToolHandler {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  capability: 'read' | 'retryable_write' | 'non_idempotent_write';
+  execute(args: JsonValue, ctx: ToolContext): Promise<ToolResult>;
+  /** Task 11 compatibility aliases; Pi assembly does not use them. */
+  def: ToolDef;
+  run(args: JsonValue, ctx: ToolContext): Promise<ToolResult>;
+}
+
+export function defineTool(input: Omit<ToolHandler, 'def' | 'run'>): ToolHandler {
+  const def: ToolDef = {
+    name: input.name,
+    description: input.description,
+    inputSchema: input.inputSchema,
+    capability: input.capability,
+  };
+  return { ...input, def, run: input.execute };
+}
+
+type ToolRegistration = ToolHandler | LegacyToolHandler;
+
+function normalizeTool(handler: ToolRegistration): ToolHandler {
+  if ('execute' in handler && 'name' in handler) return handler;
+  return defineTool({
+    ...handler.def,
+    capability: handler.def.capability ?? 'non_idempotent_write',
+    execute: handler.run,
+  });
 }
 
 /**
@@ -42,13 +75,14 @@ export interface ToolHandler {
  * 统一对外暴露 defs() 并按名字 dispatch。
  */
 export class ToolRegistry {
-  private handlers = new Map<string, ToolHandler>();
+  private handlers = new Map<string, { tool: ToolHandler; source: Exclude<ToolSource, 'pi'> }>();
 
-  register(handler: ToolHandler): this {
-    if (this.handlers.has(handler.def.name)) {
-      throw new Error(`duplicate tool: ${handler.def.name}`);
+  register(handler: ToolRegistration, source: Exclude<ToolSource, 'pi'> = 'aiop'): this {
+    const tool = normalizeTool(handler);
+    if (this.handlers.has(tool.name)) {
+      throw new Error(`duplicate tool: ${tool.name}`);
     }
-    this.handlers.set(handler.def.name, handler);
+    this.handlers.set(tool.name, { tool, source });
     return this;
   }
 
@@ -61,16 +95,44 @@ export class ToolRegistry {
   }
 
   defs(): ToolDef[] {
-    return [...this.handlers.values()].map((h) => h.def);
+    return [...this.handlers.values()].map(({ tool }) => tool.def);
+  }
+
+  unified(
+    context: ToolContext | ((call: ToolCall) => ToolContext),
+    filter?: (defs: ToolDef[]) => ToolDef[],
+  ): UnifiedToolRegistry {
+    const allowed = new Set((filter ? filter(this.defs()) : this.defs()).map((definition) => definition.name));
+    const registry = new UnifiedToolRegistry();
+    for (const { tool, source } of this.handlers.values()) {
+      if (!allowed.has(tool.name)) continue;
+      registry.register(source, {
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema,
+        capability: tool.capability,
+        execute: async (call, executionContext) => {
+          const ctx = typeof context === 'function'
+            ? context({ id: call.id, name: call.name, args: call.arguments })
+            : context;
+          const output = await tool.execute(call.arguments, {
+            ...ctx,
+            idempotencyKey: executionContext.idempotencyKey,
+          });
+          return { content: output.content, isError: output.isError };
+        },
+      });
+    }
+    return registry;
   }
 
   async dispatch(call: ToolCall, ctx: ToolContext): Promise<ToolResult> {
-    const handler = this.handlers.get(call.name);
-    if (!handler) {
+    const registered = this.handlers.get(call.name);
+    if (!registered) {
       return { id: call.id, content: `unknown tool: ${call.name}`, isError: true };
     }
     try {
-      const result = await handler.run(call.args, ctx);
+      const result = await registered.tool.execute(call.args, ctx);
       return { ...result, id: call.id };
     } catch (err) {
       // Runtime interrupt/drain 等控制流异常必须穿透工具边界，不能被降级为普通 ToolResult。

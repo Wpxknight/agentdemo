@@ -41,6 +41,7 @@ export const connectMcp: McpConnectFn = async (name, cfg): Promise<McpClientLike
           name: t.name,
           description: t.description,
           inputSchema: (t.inputSchema ?? { type: 'object' }) as Record<string, unknown>,
+          annotations: t.annotations,
         })),
       };
     },

@@ -790,7 +790,7 @@ export declare function adaptPiAgentTool(tool: AgentTool, capability: ToolDefini
 export declare function resourceKeyFromArguments(toolName: string, args: JsonValue): string | undefined;
 
 // file: tools/approval.d.ts
-import type { JsonValue, ToolCall, ToolExecutionContext } from '@aiop/control-contracts';
+import type { DurableInteractionUpdate, JsonValue, ToolCall, ToolExecutionContext } from '@aiop/control-contracts';
 import type { ToolPolicyDecision } from './policy.js';
 export interface ToolApprovalDecision {
     approved: boolean;
@@ -800,6 +800,13 @@ export interface ToolApprovalDecision {
 }
 export interface ToolApproval {
     request(call: ToolCall, context: ToolExecutionContext, decision: ToolPolicyDecision): Promise<ToolApprovalDecision>;
+}
+export interface ToolInteractionStore {
+    get(input: {
+        tenantId: string;
+        runId: string;
+        interactionId: string;
+    }): Promise<DurableInteractionUpdate | undefined>;
 }
 
 // file: tools/audit.d.ts
@@ -834,7 +841,7 @@ export declare class ResourceConcurrencyController implements ResourceConcurrenc
 // file: tools/governance.d.ts
 import type { ToolRuntime } from '@aiop/control-contracts';
 import type { GovernedToolDefinition } from './adapter.js';
-import type { ToolApproval } from './approval.js';
+import type { ToolApproval, ToolInteractionStore } from './approval.js';
 import type { ToolAudit } from './audit.js';
 import { type ResourceConcurrency } from './concurrency.js';
 import { type ToolLedgerStore } from './ledger.js';
@@ -843,6 +850,7 @@ export interface GovernedToolFactoryOptions {
     ledger: ToolLedgerStore;
     policy?: ToolPolicy;
     approval?: ToolApproval;
+    interactions?: ToolInteractionStore;
     concurrency?: ResourceConcurrency;
     audit?: ToolAudit;
     now?: () => Date;

@@ -504,7 +504,7 @@ export async function buildRuntime(
     if (!sandboxController.enabled()) return;
     const codeEnabled = sandboxController.codeEnabled();
     if (codeEnabled) {
-      for (const tool of buildSandboxTools(sandboxController)) tools.register(tool);
+      for (const tool of buildSandboxTools(sandboxController)) tools.register(tool, 'sandbox');
     }
     const profileTools = buildSandboxProfileTools(
       sandboxController,
@@ -513,18 +513,18 @@ export async function buildRuntime(
     for (const tool of codeEnabled
       ? profileTools
       : profileTools.filter((tool) => tool.def.name === 'sandbox_list_profiles')) {
-      tools.register(tool);
+      tools.register(tool, 'sandbox');
     }
     if (codeEnabled && downloads) {
-      tools.register(buildExportTool(sandboxController, async () => ({}), downloads));
+      tools.register(buildExportTool(sandboxController, async () => ({}), downloads), 'sandbox');
     }
     if (codeEnabled && hasClusters && !sandboxCfg?.aios) {
-      tools.register(buildKubectlTool({ clusters, sandboxes: sandboxController, audit }));
+      tools.register(buildKubectlTool({ clusters, sandboxes: sandboxController, audit }), 'sandbox');
     }
     if (sandboxController.desktopEnabled()) {
-      for (const tool of buildBrowserTools((ctx) => sandboxController.desktop(ctx))) tools.register(tool);
+      for (const tool of buildBrowserTools((ctx) => sandboxController.desktop(ctx))) tools.register(tool, 'sandbox');
     }
-    if (codeEnabled && skillSyncTool) tools.register(skillSyncTool);
+    if (codeEnabled && skillSyncTool) tools.register(skillSyncTool, 'sandbox');
   };
 
   if (config.downloads?.enabled ?? true) {
@@ -545,7 +545,7 @@ export async function buildRuntime(
   const persistedMcp = await store.getMcpServers({ tenantId: DEFAULT_TENANT }).catch(() => undefined);
   const mcp = new McpManager(persistedMcp ?? config.mcpServers ?? {}, connectMcp);
   await mcp.start();
-  for (const t of mcp.tools()) tools.register(t);
+  for (const t of mcp.tools()) tools.register(t, 'mcp');
 
   for (const t of buildScheduleTools(store)) tools.register(t);
   tools.register(buildTodoTool());

@@ -645,7 +645,7 @@ function syncMcpTools(rt: Runtime): void {
   for (const def of rt.tools.defs()) {
     if (def.name.startsWith('mcp__')) rt.tools.unregister(def.name);
   }
-  for (const t of rt.mcp.tools()) rt.tools.register(t);
+  for (const t of rt.mcp.tools()) rt.tools.register(t, 'mcp');
 }
 
 /** 持久化当前 MCP server 配置（平台级，落 default 租户设置；失败仅记日志不阻塞请求）。 */

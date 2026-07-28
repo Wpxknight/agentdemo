@@ -1,5 +1,5 @@
 import type { JsonValue, TodoItem, ToolResult } from '../model/types.js';
-import type { ToolContext, ToolHandler } from '../agent/tools.js';
+import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 
 /**
  * TodoWrite 工具（借鉴 Claude Code TodoWriteTool）：
@@ -36,8 +36,7 @@ function render(todos: TodoItem[]): string {
 export function buildTodoTool(): ToolHandler {
   // 按会话保存最近一次清单，便于模型省略未变项时仍可回显完整状态（当前实现要求传全量）。
   const perSession = new Map<string, TodoItem[]>();
-  return {
-    def: {
+  return defineTool({
       name: 'todo_write',
       capability: 'retryable_write',
       description:
@@ -62,12 +61,11 @@ export function buildTodoTool(): ToolHandler {
         },
         required: ['todos'],
       },
-    },
-    async run(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
+    async execute(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
       const todos = parseTodos(args);
       perSession.set(ctx.sessionId, todos);
       ctx.emitEvent?.({ type: 'todo_updated', todos });
       return { id: '', content: render(todos) };
     },
-  };
+  });
 }

@@ -7,6 +7,8 @@ import type {
 import {
   GovernedToolFactory,
   ResourceConcurrencyController,
+  digestToolValue,
+  type ToolInteractionStore,
   type ToolLedgerStore,
 } from '../../packages/pi-runtime/src/index.js';
 
@@ -38,6 +40,27 @@ class MemoryLedger implements ToolLedgerStore {
 
   private key(tenantId: string, runId: string, logicalCallId: string): string {
     return `${tenantId}:${runId}:${logicalCallId}`;
+  }
+}
+
+class MemoryInteractions implements ToolInteractionStore {
+  constructor(private readonly records: Array<{
+    tenantId: string;
+    runId: string;
+    id: string;
+    attemptId: string;
+    toolCallId: string;
+    kind: 'approval';
+    status: 'resolved';
+    resolution: boolean;
+    turnNo: number;
+    payload: null;
+    createdAt: Date;
+  }>) {}
+
+  async get(input: { tenantId: string; runId: string; interactionId: string }) {
+    return this.records.find((record) => record.tenantId === input.tenantId
+      && record.runId === input.runId && record.id === input.interactionId);
   }
 }
 
@@ -100,7 +123,12 @@ describe('GovernedToolFactory', () => {
     expect(execute).not.toHaveBeenCalled();
     await ledger.putIfAbsent(waiting.ledgerUpdates![0]!);
 
-    const resumed = await new GovernedToolFactory({ ledger }).create([definition]).execute(call(), {
+    const interactions = new MemoryInteractions([{
+      tenantId: 'tenant-a', runId: 'run-a', id: 'approval-a', attemptId: 'attempt-a',
+      toolCallId: 'call-a', kind: 'approval', status: 'resolved', resolution: true,
+      turnNo: 1, payload: null, createdAt: new Date(),
+    }]);
+    const resumed = await new GovernedToolFactory({ ledger, interactions }).create([definition]).execute(call(), {
       ...context,
       attemptId: 'attempt-b',
       interactionResolution: {
@@ -113,6 +141,65 @@ describe('GovernedToolFactory', () => {
       ledgerUpdates: [expect.objectContaining({ status: 'completed' })],
     });
     expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['missing pending ledger', undefined, {
+      tenantId: 'tenant-a', runId: 'run-a', id: 'approval-a', attemptId: 'attempt-a',
+      toolCallId: 'call-a', kind: 'approval' as const, status: 'resolved' as const, resolution: true,
+      turnNo: 1, payload: null, createdAt: new Date(),
+    }],
+    ['forged interaction id', 'approval-real', {
+      tenantId: 'tenant-a', runId: 'run-a', id: 'approval-forged', attemptId: 'attempt-a',
+      toolCallId: 'call-a', kind: 'approval' as const, status: 'resolved' as const, resolution: true,
+      turnNo: 1, payload: null, createdAt: new Date(),
+    }],
+    ['stale attempt binding', 'approval-a', {
+      tenantId: 'tenant-a', runId: 'run-a', id: 'approval-a', attemptId: 'attempt-stale',
+      toolCallId: 'call-a', kind: 'approval' as const, status: 'resolved' as const, resolution: true,
+      turnNo: 1, payload: null, createdAt: new Date(),
+    }],
+    ['stale turn binding', 'approval-a', {
+      tenantId: 'tenant-a', runId: 'run-a', id: 'approval-a', attemptId: 'attempt-a',
+      toolCallId: 'call-a', kind: 'approval' as const, status: 'resolved' as const, resolution: true,
+      turnNo: 99, payload: null, createdAt: new Date(),
+    }],
+    ['cross-call binding', 'approval-a', {
+      tenantId: 'tenant-a', runId: 'run-a', id: 'approval-a', attemptId: 'attempt-a',
+      toolCallId: 'call-other', kind: 'approval' as const, status: 'resolved' as const, resolution: true,
+      turnNo: 1, payload: null, createdAt: new Date(),
+    }],
+    ['cross-tenant binding', 'approval-a', {
+      tenantId: 'tenant-b', runId: 'run-a', id: 'approval-a', attemptId: 'attempt-a',
+      toolCallId: 'call-a', kind: 'approval' as const, status: 'resolved' as const, resolution: true,
+      turnNo: 1, payload: null, createdAt: new Date(),
+    }],
+  ])('rejects a true resolution with %s', async (_case, pendingInteractionId, interaction) => {
+    const ledger = new MemoryLedger();
+    if (pendingInteractionId) {
+      await ledger.putIfAbsent({
+        tenantId: 'tenant-a', runId: 'run-a', attemptId: 'attempt-a', turnNo: 1,
+        logicalCallId: 'logical-a', toolCallId: 'call-a', toolName: 'write',
+        argsDigest: digestToolValue({ resource: 'deployment/a' }), capability: 'retryable_write',
+        idempotencyKey: 'tenant-a:run-a:logical-a', approvedInteractionId: pendingInteractionId,
+        status: 'pending_approval', createdAt: new Date(), updatedAt: new Date(),
+      });
+    }
+    const execute = vi.fn(async () => ({ content: 'must not execute' }));
+    const runtime = new GovernedToolFactory({
+      ledger, interactions: new MemoryInteractions([interaction]),
+    }).create([{
+      name: 'write', description: 'write', inputSchema: {}, capability: 'retryable_write', execute,
+    }]);
+
+    await expect(runtime.execute(call(), {
+      ...context,
+      attemptId: 'attempt-resume',
+      interactionResolution: {
+        interactionId: interaction.id, kind: 'approval', toolCallId: 'call-a', value: true,
+      },
+    })).resolves.toMatchObject({ kind: 'recovery_required' });
+    expect(execute).not.toHaveBeenCalled();
   });
 
   it('returns a committed completed ledger result without re-executing', async () => {

@@ -1,5 +1,5 @@
 import type { JsonValue, ToolResult } from '../model/types.js';
-import type { ToolContext, ToolHandler } from '../agent/tools.js';
+import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import type { SandboxManagerLike } from '../sandbox/lifecycle.js';
 import { isSandboxAcquirer, type SpecResolver } from '../sandbox/acquisition.js';
 import { sandboxIdentityKey, sandboxIdentityMetadata } from '../sandbox/keys.js';
@@ -59,8 +59,7 @@ export function buildSandboxTools(
     return { handle: await manager.get(spec), spec };
   };
   return [
-    {
-      def: {
+    defineTool({
         name: 'sbx__run_code',
         capability: 'non_idempotent_write',
         description:
@@ -76,17 +75,15 @@ export function buildSandboxTools(
           },
           required: ['code'],
         },
-      },
-      async run(args, ctx): Promise<ToolResult> {
+      async execute(args, ctx): Promise<ToolResult> {
         const o = asObject(args);
         const code = reqString(o, 'code');
         const language = typeof o.language === 'string' ? o.language : undefined;
         const sbx = (await acquire(ctx)).handle;
         return formatExec(await sbx.runCode(code, { language, onOutput: ctx.onOutput }));
       },
-    },
-    {
-      def: {
+    }),
+    defineTool({
         name: 'sbx__run_command',
         capability: 'non_idempotent_write',
         description: '在隔离沙箱中执行 shell 命令，返回 stdout/stderr 与退出码。',
@@ -97,13 +94,12 @@ export function buildSandboxTools(
           },
           required: ['command'],
         },
-      },
-      async run(args, ctx): Promise<ToolResult> {
+      async execute(args, ctx): Promise<ToolResult> {
         const o = asObject(args);
         const command = reqString(o, 'command');
         const sbx = (await acquire(ctx)).handle;
         return formatExec(await sbx.runCommand(command, { onOutput: ctx.onOutput }));
       },
-    },
+    }),
   ];
 }

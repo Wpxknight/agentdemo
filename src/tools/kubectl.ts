@@ -1,5 +1,5 @@
 import type { ToolResult } from '../model/types.js';
-import type { ToolContext, ToolHandler } from '../agent/tools.js';
+import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import type { ClusterRegistry, ClusterInfo } from '../config/clusters.js';
 import type { SandboxManagerLike } from '../sandbox/lifecycle.js';
 import { isSandboxAcquirer } from '../sandbox/acquisition.js';
@@ -53,8 +53,7 @@ function shellQuote(arg: string): string {
  */
 export function buildKubectlTool(opts: KubectlToolOptions): ToolHandler {
   const audit = opts.audit ?? new LogAuditSink();
-  return {
-    def: {
+  return defineTool({
       name: 'kubectl',
       capability: 'non_idempotent_write',
       description:
@@ -72,8 +71,7 @@ export function buildKubectlTool(opts: KubectlToolOptions): ToolHandler {
         },
         required: ['cluster', 'args'],
       },
-    },
-    async run(rawArgs, ctx: ToolContext): Promise<ToolResult> {
+    async execute(rawArgs, ctx: ToolContext): Promise<ToolResult> {
       const { cluster, args, dryRun } = parseKubectlArgs(rawArgs);
       if (!cluster) return { id: '', content: '缺少 cluster 参数', isError: true };
       const info = opts.clusters.get(cluster);
@@ -109,5 +107,5 @@ export function buildKubectlTool(opts: KubectlToolOptions): ToolHandler {
       const isError = Boolean(res.error) || (typeof res.exitCode === 'number' && res.exitCode !== 0);
       return { id: '', content: parts.join('\n\n') || '(no output)', isError };
     },
-  };
+  });
 }

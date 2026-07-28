@@ -1,6 +1,6 @@
 import { logger } from '../logger.js';
 import type { JsonValue, ToolResult } from '../model/types.js';
-import type { ToolHandler } from '../agent/tools.js';
+import { defineTool, type ToolHandler } from '../agent/tools.js';
 import type {
   McpClientLike,
   McpConnectFn,
@@ -61,7 +61,7 @@ export class McpManager {
       const client = await this.connect(name, state.config);
       const { tools } = await client.listTools();
       state.client = client;
-      state.handlers = tools.map((t) => this.makeHandler(name, client, t.name, t.description, t.inputSchema));
+      state.handlers = tools.map((t) => this.makeHandler(name, state.config, client, t));
       state.status = 'connected';
       state.error = undefined;
       state.connectedAt = new Date().toISOString();
@@ -78,30 +78,28 @@ export class McpManager {
 
   private makeHandler(
     server: string,
+    config: McpServerConfig,
     client: McpClientLike,
-    tool: string,
-    description: string | undefined,
-    inputSchema: Record<string, unknown>,
+    tool: import('./types.js').McpToolInfo,
   ): ToolHandler {
-    return {
-      def: {
-        name: mcpToolName(server, tool),
-        description: description ?? `MCP 工具 ${tool}（来自 ${server}）`,
-        inputSchema,
-      },
-      async run(args: JsonValue): Promise<ToolResult> {
+    return defineTool({
+        name: mcpToolName(server, tool.name),
+        description: tool.description ?? `MCP 工具 ${tool.name}（来自 ${server}）`,
+        inputSchema: tool.inputSchema,
+        capability: mcpCapability(config, tool),
+      async execute(args: JsonValue): Promise<ToolResult> {
         const argObj =
           args && typeof args === 'object' && !Array.isArray(args)
             ? (args as Record<string, unknown>)
             : {};
-        const res = await client.callTool({ name: tool, arguments: argObj });
+        const res = await client.callTool({ name: tool.name, arguments: argObj });
         return {
           id: '',
           content: textFromContent(res.content),
           isError: res.isError,
         };
       },
-    };
+    });
   }
 
   /** 新增 server 并连接；连接失败时保留 error 状态（可 reconnect），不抛异常。 */
@@ -167,4 +165,15 @@ export class McpManager {
     );
     this.servers.clear();
   }
+}
+
+function mcpCapability(
+  config: McpServerConfig,
+  tool: import('./types.js').McpToolInfo,
+): 'read' | 'retryable_write' | 'non_idempotent_write' {
+  const configured = config.toolCapabilities?.[tool.name];
+  if (configured) return configured;
+  if (tool.annotations?.readOnlyHint === true) return 'read';
+  if (tool.annotations?.idempotentHint === true && tool.annotations.readOnlyHint === false) return 'retryable_write';
+  return 'non_idempotent_write';
 }

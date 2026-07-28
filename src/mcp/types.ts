@@ -7,6 +7,11 @@ export interface McpToolInfo {
   name: string;
   description?: string;
   inputSchema: Record<string, unknown>;
+  annotations?: {
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+    idempotentHint?: boolean;
+  };
 }
 
 export interface McpCallResult {
@@ -29,6 +34,7 @@ export interface McpServerConfig {
   args?: string[];
   url?: string;
   headers?: Record<string, string>;
+  toolCapabilities?: Record<string, 'read' | 'retryable_write' | 'non_idempotent_write'>;
 }
 
 /** server 的公开状态信息（供管理 API / UI；不含 headers 等敏感值）。 */

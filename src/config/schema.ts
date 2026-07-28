@@ -27,6 +27,7 @@ export const McpServerSchema = z.object({
   args: z.array(z.string()).optional(),
   url: z.string().optional(),
   headers: z.record(z.string(), z.string()).optional(),
+  toolCapabilities: z.record(z.string(), z.enum(['read', 'retryable_write', 'non_idempotent_write'])).optional(),
 });
 
 export const SandboxProfileSchema = z.object({

@@ -1,4 +1,4 @@
-import type { JsonValue, ToolCall, ToolExecutionContext } from '@aiop/control-contracts';
+import type { DurableInteractionUpdate, JsonValue, ToolCall, ToolExecutionContext } from '@aiop/control-contracts';
 import type { ToolPolicyDecision } from './policy.js';
 
 export interface ToolApprovalDecision {
@@ -14,4 +14,12 @@ export interface ToolApproval {
     context: ToolExecutionContext,
     decision: ToolPolicyDecision,
   ): Promise<ToolApprovalDecision>;
+}
+
+export interface ToolInteractionStore {
+  get(input: {
+    tenantId: string;
+    runId: string;
+    interactionId: string;
+  }): Promise<DurableInteractionUpdate | undefined>;
 }

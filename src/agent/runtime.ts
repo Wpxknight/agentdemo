@@ -103,7 +103,7 @@ export class AgentRuntime {
 
   private async runDurablePi(options: RunAgentOptions): Promise<RunAgentResult> {
     const toolRuntime = createAIOPToolRuntime(
-      options, this.runtimeStore!.toolLedger, this.toolConcurrency,
+      options, this.runtimeStore!.toolLedger, this.toolConcurrency, this.runtimeStore!.interactions,
     );
     const kernel = createPiPlatformKernel(options, this.modelConcurrency, toolRuntime);
     let compacted = false;

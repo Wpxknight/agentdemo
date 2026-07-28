@@ -1,6 +1,6 @@
 import { posix } from 'node:path';
 import type { JsonValue, ToolResult } from '../model/types.js';
-import type { ToolContext, ToolHandler } from '../agent/tools.js';
+import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import type { SandboxManagerLike } from '../sandbox/lifecycle.js';
 import { isSandboxAcquirer } from '../sandbox/acquisition.js';
 import type { ExportSink } from '../server/downloads.js';
@@ -81,8 +81,7 @@ export function buildExportTool(
   resolve: SpecResolver,
   sink: ExportSink,
 ): ToolHandler {
-  return {
-    def: {
+  return defineTool({
       name: 'sbx__export_file',
       capability: 'retryable_write',
       description:
@@ -98,8 +97,7 @@ export function buildExportTool(
         },
         required: ['path'],
       },
-    },
-    async run(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
+    async execute(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
       const o = asObject(args);
       const path = reqString(o, 'path');
       const name = safeDownloadName(typeof o.filename === 'string' && o.filename ? o.filename : path);
@@ -146,5 +144,5 @@ export function buildExportTool(
         return { id: '', content: `导出失败：${String(err)}`, isError: true };
       }
     },
-  };
+  });
 }

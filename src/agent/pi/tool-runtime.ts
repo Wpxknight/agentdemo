@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { JsonValue, ToolExecutionOutcome, ToolRuntime } from '@aiop/control-contracts';
-import type { ToolLedgerRepository } from '@aiop/agent-runtime-core';
+import type { InteractionRepository, ToolLedgerRepository } from '@aiop/agent-runtime-core';
 import {
   GovernedToolFactory,
+  ResourceConcurrencyController,
   type GovernedToolDefinition,
   type ResourceConcurrency,
 } from '@aiop/pi-runtime';
@@ -12,26 +13,26 @@ export function createAIOPToolRuntime(
   options: RunAgentOptions,
   ledger: ToolLedgerRepository,
   concurrency: ResourceConcurrency,
+  interactions?: InteractionRepository,
+  commitLedgerUpdates = false,
 ): ToolRuntime {
-  const definitions: GovernedToolDefinition[] = options.tools.defs().map((definition) => ({
+  const durableGovernance = Boolean(interactions);
+  const unified = options.tools.unified((call) => ({
+    ...options.ctx,
+    ...(options.onEvent ? {
+      onOutput: ({ stream, text }: { stream: 'stdout' | 'stderr'; text: string }) =>
+        options.onEvent?.({ type: 'tool_output', toolId: call.id, stream, text }),
+      emitEvent: options.onEvent,
+    } : {}),
+    ...(options.askUser ? { askUser: options.askUser } : {}),
+    ...(options.requestPlanApproval ? { requestPlanApproval: options.requestPlanApproval } : {}),
+  }), options.filterToolDefs);
+  const definitions: GovernedToolDefinition[] = unified.definitions().map((definition) => ({
     ...definition,
-    capability: definition.capability ?? 'non_idempotent_write',
-    interactionKind: interactionKind(definition.name),
+    interactionKind: durableGovernance ? interactionKind(definition.name) : undefined,
     execute: async (call, context) => {
       await options.runGuard?.();
-      const result = await options.tools.dispatch({
-        id: call.id, name: call.name, args: call.arguments,
-      }, {
-        ...options.ctx,
-        idempotencyKey: context.idempotencyKey,
-        ...(options.onEvent ? {
-          onOutput: ({ stream, text }: { stream: 'stdout' | 'stderr'; text: string }) =>
-            options.onEvent?.({ type: 'tool_output', toolId: call.id, stream, text }),
-          emitEvent: options.onEvent,
-        } : {}),
-        ...(options.askUser ? { askUser: options.askUser } : {}),
-        ...(options.requestPlanApproval ? { requestPlanApproval: options.requestPlanApproval } : {}),
-      });
+      const result = await definition.execute(call, context);
       await options.runGuard?.();
       return { content: result.content, isError: result.isError };
     },
@@ -39,6 +40,7 @@ export function createAIOPToolRuntime(
   const runtime = new GovernedToolFactory({
     ledger,
     concurrency,
+    interactions,
     policy: {
       check: async (call) => {
         await options.runGuard?.();
@@ -56,6 +58,16 @@ export function createAIOPToolRuntime(
     approval: {
       request: async (call, context, decision) => {
         if (!decision.needsApproval) return { approved: true };
+        if (!durableGovernance) {
+          const approved = options.approval
+            ? await options.approval.request({
+                call: { id: call.id, name: call.name, args: call.arguments },
+                reason: decision.reason,
+                ctx: options.ctx,
+              })
+            : false;
+          return { approved };
+        }
         const interactionId = createHash('sha256')
           .update(`${context.runId}\0approval\0${call.id}`)
           .digest('hex');
@@ -84,6 +96,9 @@ export function createAIOPToolRuntime(
           value: toJsonValue(normalizedResolution),
         },
       });
+      if (commitLedgerUpdates) {
+        for (const update of outcome.ledgerUpdates ?? []) await commitLedger(ledger, update);
+      }
       if (!outcome.interactionUpdates?.length) return outcome;
       return {
         ...outcome,
@@ -119,6 +134,48 @@ export function createAIOPToolRuntime(
       };
     },
   };
+}
+
+export function createCompatibilityAIOPToolRuntime(options: RunAgentOptions): ToolRuntime {
+  return createAIOPToolRuntime(
+    options,
+    new MemoryToolLedger(),
+    new ResourceConcurrencyController(),
+    undefined,
+    true,
+  );
+}
+
+class MemoryToolLedger implements ToolLedgerRepository {
+  private readonly records = new Map<string, import('@aiop/control-contracts').DurableToolLedgerUpdate>();
+
+  async putIfAbsent(record: import('@aiop/control-contracts').DurableToolLedgerUpdate): Promise<boolean> {
+    const key = ledgerKey(record);
+    if (this.records.has(key)) return false;
+    this.records.set(key, structuredClone(record));
+    return true;
+  }
+
+  async get(input: { tenantId: string; runId: string; logicalCallId: string }) {
+    return structuredClone(this.records.get(ledgerKey(input)));
+  }
+
+  async update(record: import('@aiop/control-contracts').DurableToolLedgerUpdate): Promise<void> {
+    this.records.set(ledgerKey(record), structuredClone(record));
+  }
+}
+
+async function commitLedger(
+  ledger: ToolLedgerRepository,
+  update: import('@aiop/control-contracts').DurableToolLedgerUpdate,
+): Promise<void> {
+  const existing = await ledger.get(update);
+  if (existing) await ledger.update(update);
+  else await ledger.putIfAbsent(update);
+}
+
+function ledgerKey(input: { tenantId: string; runId: string; logicalCallId: string }): string {
+  return `${input.tenantId}:${input.runId}:${input.logicalCallId}`;
 }
 
 function interactionKind(name: string): 'question' | 'plan' | undefined {
