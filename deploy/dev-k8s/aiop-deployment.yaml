@@ -47,9 +47,7 @@ spec:
               value: "8081"
             - name: AIOP_EMBED_SCHEDULER
               value: "true"
-            # 测试环境的新 Run 全量使用 Pi；历史 LangGraph Run 仅保留查询。
-            - name: AIOP_AGENT_KERNEL
-              value: pi
+            # 测试环境的新 Run 全量使用 Pi。
             - name: AIOP_PI_MODE
               value: full
           envFrom:

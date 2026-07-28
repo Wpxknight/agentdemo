@@ -6,7 +6,7 @@ AIoP 是一个面向智能运维与平台工程场景的 Agent 应用平台。�
 
 ## 核心能力
 
-- 可切换的 Legacy/Pi Kernel，以及 Run、Attempt、Turn Snapshot/Commit、恢复和取消机制。
+- Pi Agent Runtime，以及 Run、Attempt、Turn Snapshot/Commit、恢复和取消机制。
 - Anthropic 与 OpenAI 协议模型适配，支持自定义模型地址、上下文管理和 Token/成本统计。
 - 统一 Tool Broker，集中处理权限规则、审批、PreToolUse Hook、审计和工具执行账本。
 - 内置工具、Skill 和 MCP Server 扩展体系。
@@ -97,10 +97,8 @@ curl http://127.0.0.1:8080/readyz
 | --- | --- |
 | `AIOP_CONFIG` | JSON/JSONC 配置文件路径，默认 `./config.jsonc` |
 | `HOST` / `PORT` | HTTP 服务监听地址和端口，默认 `0.0.0.0:8080` |
-| `AIOP_AGENT_KERNEL` | `legacy`、`pi` 或 `tenant-rule`；历史 LangGraph Run 仅可查询 |
-| `AIOP_PI_MODE` | `full`、`read-only`、`dry-run`、`replay` 或 `disabled`；`disabled` 立即回退 Legacy |
-| `AIOP_PI_TEST_TENANTS` / `AIOP_PI_INTERNAL_USERS` | `tenant-rule` 的 Pi tenant/user 灰度名单 |
-| `AIOP_PI_READ_ONLY_SESSIONS` / `AIOP_PI_FULL_SESSIONS` | `tenant-rule` 的只读/完整流量 session 名单 |
+| `AIOP_PI_MODE` | `full`、`read-only`、`dry-run` 或 `replay`；缺省为 `full` |
+| `AIOP_PI_READ_ONLY_SESSIONS` | 即使在 `full` 模式也只允许只读工具的 session 名单 |
 | `AIOP_EMBED_SCHEDULER` | 是否在 HTTP 服务进程内启动调度器 |
 | `AIOP_JWT_SECRET` | JWT 签名密钥，生产环境必须使用强随机值 |
 | `AIOP_SETTINGS_SECRET` | 持久化敏感设置的加密密钥，不得与 JWT 密钥复用 |

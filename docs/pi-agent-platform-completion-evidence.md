@@ -2,6 +2,8 @@
 
 日期：2026-07-27
 
+> 2026-07-28 后续决策：产品已收敛为 Pi-only Runtime，并新增 `0022_pi_only_runtime.sql` 删除非 Pi Run 与 LangGraph checkpoint 表。本文件其余阶段 8/10 描述仅记录 2026-07-27 当时的交付边界，不再作为当前操作说明；当前操作以 `docs/pi-agent-platform-operations.md` 为准。
+
 分支：`feature/pi-agent-platform-integration`
 
 ## 结论
@@ -106,7 +108,7 @@ npx vitest run --reporter=verbose tests/durable-runtime.test.ts tests/memory-run
 - Docker-in-Docker job 执行 `make image`，包含公共包 import 和容器 Node 基线 smoke checks。
 - Docker builder stage 显式运行 `npm run build:packages`；runtime stage 从 builder 复制已构建 packages。
 - `/home/opt/develop/aicoding/aiop/.dockerignore` 排除宿主 `packages/*/dist`。清理构建上下文后镜像仍可构建，证明不依赖本地生成物。
-- development K8s 清单的新 Run 使用 `AIOP_AGENT_KERNEL=pi` 与 `AIOP_PI_MODE=full`，不再保留可执行 LangGraph 配置。
+- development K8s 清单使用 `AIOP_PI_MODE=full`，不再声明 Kernel 选择配置。
 
 ## 最终验证
 
@@ -126,7 +128,7 @@ npx vitest run --reporter=verbose tests/durable-runtime.test.ts tests/memory-run
 
 Docker 构建期间同样报告 5 个 moderate 漏洞以及待 allowScripts 复核的 `@google/genai`、`esbuild`、`protobufjs` 安装脚本；本次构建没有把这些警告误记为 high/critical 或伪造为已修复。
 
-## 明确未完成的生产事项
+## 2026-07-27 当时未完成的生产事项（历史）
 
 | 阶段 | 未完成证据 | 完成前禁止事项 |
 | --- | --- | --- |
@@ -134,4 +136,4 @@ Docker 构建期间同样报告 5 个 moderate 漏洞以及待 allowScripts 复�
 | 8 | 一个真实 checkpoint 保留周期内无新 LangGraph Run | 不得声称存量已自然收敛 |
 | 10 | 真实备份恢复、历史 audit 查询、生产回滚窗口和清表审批 | 不得 DROP checkpoint 表或提交清表迁移 |
 
-当前仓库只包含 checkpoint 只读保护，不包含删除 `langgraph_checkpoints` 或 `langgraph_checkpoint_writes` 的迁移。
+该结论已被 2026-07-28 的 Pi-only 决策取代；当前仓库包含删除非 Pi Run 和 LangGraph checkpoint 表的迁移 `0022_pi_only_runtime.sql`。

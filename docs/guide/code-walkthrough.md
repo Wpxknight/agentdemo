@@ -1,6 +1,6 @@
 # AIoP 代码走读：从启动到一次 Agent Run
 
-> 历史说明：本文部分 LangGraph 路径和文件引用已随 Pi Agent Platform 迁移退役。现行入口见 `packages/agent-runtime-core`、`packages/agent-kernel-pi`、`packages/agent-runtime-aiop` 与 `src/agent/pi`。
+> 历史说明：本文 Legacy 与 LangGraph 章节完整记录旧架构，所引用的部分源码和配置已经删除，不可用于当前开发或运维。现行入口见 `packages/agent-runtime-core`、`packages/agent-kernel-pi`、`packages/agent-runtime-aiop`、`src/agent/runtime.ts` 与 `src/agent/pi`。
 
 > 目标读者：第一次接触 AIoP、准备开发功能或排查问题的后端、前端和平台研发。
 >

@@ -1,15 +1,14 @@
 # Pi Agent Platform 操作说明
 
-AIoP 新运行支持 `legacy` 与 `pi`。历史 `kernel=langgraph` 记录继续通过运行中心查询，但运行时代码和依赖已经删除，不能恢复或创建新的 LangGraph Run。
+AIoP 只使用 Pi Kernel。Legacy、LangGraph、Kernel 灰度选择和历史 LangGraph Run 查询均已移除；运行中心只读取 Pi Durable Runtime 数据。
 
-## 灰度与回滚
+## 执行模式
 
-- `AIOP_AGENT_KERNEL=legacy`：所有新 Run 使用 Legacy。
-- `AIOP_AGENT_KERNEL=pi`：新 Run 使用 Pi。
-- `AIOP_AGENT_KERNEL=tenant-rule`：按 `AIOP_PI_TEST_TENANTS`、`AIOP_PI_INTERNAL_USERS`、`AIOP_PI_READ_ONLY_SESSIONS`、`AIOP_PI_FULL_SESSIONS` 灰度。
+- `AIOP_PI_MODE=full`：Pi 可按现有 Policy、Approval 和 Hook 规则使用完整工具集，也是缺省模式。
 - `AIOP_PI_MODE=read-only`：Pi 仅暴露只读工具。
 - `AIOP_PI_MODE=dry-run` 或 `replay`：Pi 不暴露可执行工具，适合影子验证。
-- `AIOP_PI_MODE=disabled`：立即停止新 Pi Run 并回退 Legacy。已绑定 Pi 的 Run 不会切换 Kernel，只能继续、取消或进入人工恢复。
+
+`AIOP_AGENT_KERNEL` 已退役。若遗留部署仍将其设置为非 `pi` 值，服务会明确拒绝启动，不会静默回退。`AIOP_PI_MODE=disabled` 同样不再支持。
 
 ## 并发与容量
 
@@ -22,7 +21,9 @@ AIoP 新运行支持 `legacy` 与 `pi`。历史 `kernel=langgraph` 记录继续�
 
 ## 数据迁移
 
-迁移 `0015`～`0018` 增加 Attempt、Turn Snapshot/Commit、Ledger v2、事件 sequence 与 Scheduler 关联，迁移 `0020` 持久化跨进程恢复所需的 Run limits，迁移 `0021` 为 durable event 增加 Attempt、Turn、Kernel 与 correlation 身份列。迁移 `0019` 把历史 LangGraph checkpoint 表冻结为只读。回滚窗口结束前不要删除这些表；最终删除必须先完成真实备份恢复验证和审计保留确认。
+迁移 `0015`～`0018` 增加 Attempt、Turn Snapshot/Commit、Ledger v2、事件 sequence 与 Scheduler 关联，迁移 `0020` 持久化跨进程恢复所需的 Run limits，迁移 `0021` 为 durable event 增加 Attempt、Turn、Kernel 与 correlation 身份列。
+
+迁移 `0022_pi_only_runtime.sql` 会永久删除全部非 Pi Run 及其关联记录，并删除 `langgraph_checkpoints`、`langgraph_checkpoint_writes` 和只读触发器。部署包含该迁移的版本前必须备份数据库；迁移完成后不能依靠代码回滚恢复旧数据。
 
 ## 可观测性
 
@@ -58,16 +59,12 @@ npx vitest run --reporter=verbose tests/durable-runtime.test.ts tests/memory-run
 
 矩阵覆盖取消、deadline、shutdown、stale fencing、事务回滚、跨进程 resume、approval/question/plan、重复写复用、未知外部副作用保护、模型与工具并发释放以及 SSE 断点补发。
 
-## 生产外部待办
+## 生产部署门禁
 
-以下事项不能由仓库测试替代，目前均不得标记完成：
-
-- 阶段 7 的真实生产灰度阈值、持续窗口和安全事件统计；
-- 阶段 8 的真实 checkpoint 保留周期以及该周期内无新 LangGraph Run 的证据；
-- 阶段 10 前的真实备份恢复演练和历史审计查询；
-- 生产回滚窗口结束后的 checkpoint 清表审批、执行与验证。
-
-在以上证据齐备前，不得创建或执行删除 `langgraph_checkpoints`、`langgraph_checkpoint_writes` 的迁移。
+- 执行迁移 `0022` 前生成并校验数据库备份；
+- 确认业务接受删除非 Pi Run、历史 Timeline 和 LangGraph checkpoint；
+- 部署后确认 `agent_runs` 只包含 `kernel=pi`，且 LangGraph checkpoint 表不存在；
+- 观察 Pi Run 成功率、恢复失败、Lease 丢失和不确定工具副作用告警。
 
 ## 独立嵌入
 
