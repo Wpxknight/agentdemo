@@ -11,7 +11,7 @@ import { drainDurableInbox, type InboxCapableSession } from './inbox.js';
 import { startLeaseHeartbeat } from './lease.js';
 import { nextTurnNo } from './attempt.js';
 import type { DurableRunStore } from '../store/types.js';
-import { assertToolCallsAllowed, assertTurnAllowed, assertUsageAllowed } from './limits.js';
+import { assertToolCallsAllowed, assertUsageAllowed } from './limits.js';
 
 const ZERO_USAGE = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 } as const;
 
@@ -119,10 +119,10 @@ export class DurableRunManager implements DurableRunRuntime {
     if (!claimed) throw new Error('Run is not claimable');
     const storedRun = await this.options.store.get({ tenantId: identity.tenantId, runId });
     const turnNo = nextTurnNo(storedRun?.lastTurnNo ?? 0);
-    assertTurnAllowed(claimed.record.limits, turnNo);
     const abort = new AbortController();
     const onAbort = () => abort.abort(externalSignal?.reason);
     externalSignal?.addEventListener('abort', onAbort, { once: true });
+    if (externalSignal?.aborted) onAbort();
     const stopHeartbeat = startLeaseHeartbeat({
       store: this.options.store, tenantId: identity.tenantId, runId, workerId: this.workerId,
       fencingToken: claimed.fencingToken, leaseTtlMs: this.leaseTtlMs, heartbeatMs: this.heartbeatMs, abort, now: this.now,
@@ -130,6 +130,9 @@ export class DurableRunManager implements DurableRunRuntime {
     const activeKey = runKey(identity.tenantId, runId);
     this.active.set(activeKey, { abort });
     let session: ManagedPiSession | undefined;
+    let baselineUsage = zeroUsage();
+    let observedUsage = zeroUsage();
+    let hasObservedUsage = false;
     try {
       const events = this.options.eventOptions({ tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, turnNo });
       const sessionRecord = await this.options.store.sessions.get(identity.tenantId, claimed.record.sessionId);
@@ -141,7 +144,7 @@ export class DurableRunManager implements DurableRunRuntime {
         ? await this.options.sessions.load({ metadata, initialMessage, events })
         : await this.options.sessions.create({ id: claimed.record.sessionId, initialMessage, events, session: { tenantId: identity.tenantId } });
       this.active.set(activeKey, { abort, session });
-      const baselineUsage = usageFromEntries(await session.entries());
+      baselineUsage = usageFromEntries(await session.entries());
       let stopInboxPump = false;
       const stopControl = new AbortController();
       const controlSignal = AbortSignal.any([abort.signal, stopControl.signal]);
@@ -173,15 +176,17 @@ export class DurableRunManager implements DurableRunRuntime {
       };
       const inboxPump = pumpInbox();
       const durableEvents: Array<Omit<AgentRunEvent, 'sequence'>> = [];
-      let observedUsage = zeroUsage();
       let observedToolCalls = 0;
       try {
         for await (const event of session.continue(abort.signal)) {
           await abortIfCancellationRequested(this.options.store, { tenantId: identity.tenantId, runId }, abort);
           const normalized = normalizeEvent(event, identity.tenantId, runId, claimed.attemptId, turnNo);
-          if (normalized.type === 'message_end') observedUsage = addUsage(observedUsage, usageFromEvent(normalized));
+          if (normalized.type === 'message_end') {
+            observedUsage = addUsage(observedUsage, usageFromEvent(normalized));
+            hasObservedUsage = true;
+            assertOnlineUsageAllowed(claimed.record.limits, addUsage(claimed.record.usage, observedUsage), observedUsage);
+          }
           if (normalized.type === 'tool_execution_start') observedToolCalls += 1;
-          assertUsageAllowed(claimed.record.limits, addUsage(claimed.record.usage, observedUsage));
           assertToolCallsAllowed(claimed.record.limits, observedToolCalls);
           durableEvents.push(withoutSequence(normalized));
           stream.push(normalized);
@@ -217,6 +222,7 @@ export class DurableRunManager implements DurableRunRuntime {
       });
       return { runId, status: 'succeeded', text: assistantText(entries, leafId), usage: actualUsage };
     } catch (error) {
+      const actualUsage = await terminalUsage(session, claimed.record.usage, baselineUsage, observedUsage, hasObservedUsage);
       if (abort.signal.aborted) {
         await session?.abort().catch(() => {});
         const cancellation = await this.options.store.isCancellationRequested({ tenantId: identity.tenantId, runId });
@@ -226,9 +232,9 @@ export class DurableRunManager implements DurableRunRuntime {
         const errorData = limitError ? { code: limitError.code, message: limitError.message, retryable: limitError.retryable } : undefined;
         await this.options.store.complete({
           tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, fencingToken: claimed.fencingToken,
-          status, usage: claimed.record.usage, error: errorData, completedAt: this.now(),
+          status, usage: actualUsage, error: errorData, completedAt: this.now(),
         }).catch(() => {});
-        return { runId, status, usage: claimed.record.usage, error: errorData };
+        return { runId, status, usage: actualUsage, error: errorData };
       }
       const recoveryRequired = hasErrorCode(error, 'TOOL_RESULT_UNKNOWN');
       const status = recoveryRequired ? 'recovery_required' : 'failed';
@@ -238,9 +244,9 @@ export class DurableRunManager implements DurableRunRuntime {
             message: error instanceof Error ? error.message : String(error), retryable: false };
       await this.options.store.complete({
         tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, fencingToken: claimed.fencingToken,
-        status, usage: claimed.record.usage, error: errorData, completedAt: this.now(),
+        status, usage: actualUsage, error: errorData, completedAt: this.now(),
       });
-      return { runId, status, usage: claimed.record.usage, error: errorData };
+      return { runId, status, usage: actualUsage, error: errorData };
     } finally {
       stopHeartbeat();
       externalSignal?.removeEventListener('abort', onAbort);
@@ -340,6 +346,32 @@ function usageFromEvent(event: AgentRunEvent): AgentRunUsage {
     cacheReadTokens: finite(usage.cacheRead), cacheCreationTokens: finite(usage.cacheWrite),
     ...(Number.isFinite(usage.costTotal) ? { costUsd: Number(usage.costTotal) } : {}),
   };
+}
+
+function assertOnlineUsageAllowed(
+  limits: Parameters<typeof assertUsageAllowed>[0],
+  totalUsage: AgentRunUsage,
+  observedUsage: AgentRunUsage,
+): void {
+  if (observedUsage.costUsd !== undefined) return assertUsageAllowed(limits, totalUsage);
+  assertUsageAllowed(limits ? { ...limits, maxCostUsd: undefined } : undefined, totalUsage);
+}
+
+async function terminalUsage(
+  session: ManagedPiSession | undefined,
+  committedUsage: AgentRunUsage,
+  baselineUsage: AgentRunUsage,
+  observedUsage: AgentRunUsage,
+  hasObservedUsage: boolean,
+): Promise<AgentRunUsage> {
+  if (session) {
+    try {
+      return addUsage(committedUsage, subtractUsage(usageFromEntries(await session.entries()), baselineUsage));
+    } catch {
+      // Some provider/session failures make the final tree unreadable; retain priced event facts as a fallback.
+    }
+  }
+  return hasObservedUsage ? addUsage(committedUsage, observedUsage) : committedUsage;
 }
 
 function toolCallsFromEntries(entries: readonly SessionTreeEntry[]): number {

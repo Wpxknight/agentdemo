@@ -119,6 +119,33 @@ describe('MemoryRunStore durable contract', () => {
     expect((await store.get({ tenantId: identity.tenantId, runId }))?.appendClosedAt).toBeUndefined();
   });
 
+  it('rejects resuming an old failed run when its session has a newer active run', async () => {
+    const store = new MemoryRunStore();
+    const now = new Date('2026-07-28T00:00:00.000Z');
+    const oldRunId = 'old-failed-run';
+    const sessionId = 'shared-resume-session';
+    await store.create({ record: {
+      tenantId: identity.tenantId, runId: oldRunId, actorId: identity.actorId, sessionId, kernel: 'pi',
+      kernelVersion: '0.82.1', status: 'queued', leaseToken: 0n, usage, createdAt: now, updatedAt: now,
+    } });
+    const oldClaim = await store.claim({ identity, runId: oldRunId, workerId: 'old-worker', now, leaseTtlMs: 1000 });
+    await store.complete({
+      tenantId: identity.tenantId, runId: oldRunId, attemptId: oldClaim!.attemptId,
+      fencingToken: oldClaim!.fencingToken, status: 'failed', usage, completedAt: new Date(now.getTime() + 1),
+    });
+    await store.create({ record: {
+      tenantId: identity.tenantId, runId: 'new-active-run', actorId: identity.actorId, sessionId, kernel: 'pi',
+      kernelVersion: '0.82.1', status: 'queued', leaseToken: 0n, usage,
+      createdAt: new Date(now.getTime() + 2), updatedAt: new Date(now.getTime() + 2),
+    } });
+
+    await expect(store.claim({
+      identity, runId: oldRunId, workerId: 'resume-worker', now: new Date(now.getTime() + 3),
+      leaseTtlMs: 1000, resume: true,
+    })).rejects.toMatchObject({ code: 'RUN_STATE_CONFLICT' });
+    expect((await store.get({ tenantId: identity.tenantId, runId: oldRunId }))?.status).toBe('failed');
+  });
+
   it('exposes a fenced append cutoff operation on both stores', () => {
     expect(typeof (new MemoryRunStore() as any).closeInbox).toBe('function');
     expect(typeof (new MysqlRunStore({} as never) as any).closeInbox).toBe('function');
@@ -347,6 +374,47 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('shared RunStore MySQL integrati
       await db.destroy();
     }
   });
+
+  it('rejects cross-worker resume when a newer run is active in the same MySQL session', async () => {
+    const pool = createMysqlPool(readMysqlConfig()!);
+    await runMigrations(pool);
+    const db = createKysely(pool);
+    const suffix = `${Date.now()}`;
+    const tenantId = 'pi-runtime-resume-contract';
+    const sessionId = `session-${suffix}`;
+    const oldRunId = `old-${suffix}`;
+    const activeRunId = `active-${suffix}`;
+    const owner = { tenantId, actorId: 'owner-a', roles: ['user'] } as const;
+    const now = new Date();
+    const record = (runId: string, createdAt: Date) => ({
+      tenantId, runId, actorId: owner.actorId, sessionId, kernel: 'pi' as const, kernelVersion: '0.82.1',
+      status: 'queued' as const, leaseToken: 0n, usage, createdAt, updatedAt: createdAt,
+    });
+    const store = new MysqlRunStore(db);
+    try {
+      await store.create({ record: record(oldRunId, now) });
+      const oldClaim = await store.claim({ identity: owner, runId: oldRunId, workerId: 'worker-old', now, leaseTtlMs: 1000 });
+      await store.complete({
+        tenantId, runId: oldRunId, attemptId: oldClaim!.attemptId, fencingToken: oldClaim!.fencingToken,
+        status: 'failed', usage, completedAt: new Date(now.getTime() + 1),
+      });
+      await store.create({ record: record(activeRunId, new Date(now.getTime() + 2)) });
+
+      await expect(new MysqlRunStore(db).claim({
+        identity: owner, runId: oldRunId, workerId: 'worker-resume', now: new Date(now.getTime() + 3),
+        leaseTtlMs: 1000, resume: true,
+      })).rejects.toMatchObject({ code: 'RUN_STATE_CONFLICT' });
+      await expect(store.get({ tenantId, runId: oldRunId })).resolves.toMatchObject({ status: 'failed' });
+    } finally {
+      for (const runId of [oldRunId, activeRunId]) {
+        for (const table of ['agent_run_attempts', 'agent_runs'] as const) {
+          await db.deleteFrom(table).where('tenant_id', '=', tenantId).where('run_id', '=', runId).execute();
+        }
+      }
+      await db.deleteFrom('pi_sessions').where('tenant_id', '=', tenantId).where('session_id', '=', sessionId).execute();
+      await db.destroy();
+    }
+  });
 });
 
 describe('DurableRunManager', () => {
@@ -443,6 +511,142 @@ describe('DurableRunManager', () => {
     expect((await store.get({ tenantId: identity.tenantId, runId: 'usage-run' }))?.usage).toEqual(result.usage);
   });
 
+  it('waits for a priced usage fact before enforcing a cost limit', async () => {
+    const store = new MemoryRunStore();
+    let finished = false;
+    const root = messageEntryForUsage('cost-root', null, 'user');
+    const assistant = messageEntryForUsage('cost-leaf', root.id, 'assistant', {
+      input: 2, output: 1, cacheRead: 0, cacheWrite: 0, costTotal: 0.05,
+    });
+    const session: ManagedPiSession = {
+      ...emptySession('cost-sequence-session'),
+      async *continue() {
+        for (const type of ['agent_start', 'turn_start'] as const) {
+          yield { tenantId: '', runId: '', sequence: 1n, type, attemptId: '', turnNo: 0,
+            kernel: 'pi', kernelVersion: '0.82.1', correlationId: type, createdAt: new Date() };
+        }
+        yield { tenantId: '', runId: '', sequence: 2n, type: 'message_end', attemptId: '', turnNo: 0,
+          kernel: 'pi', kernelVersion: '0.82.1', correlationId: 'unpriced', createdAt: new Date(),
+          detail: { message: { usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0 } } } } as AgentRunEvent;
+        yield { tenantId: '', runId: '', sequence: 2n, type: 'message_end', attemptId: '', turnNo: 0,
+          kernel: 'pi', kernelVersion: '0.82.1', correlationId: 'priced', createdAt: new Date(),
+          detail: { message: { usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, costTotal: 0.05 } } } } as AgentRunEvent;
+        finished = true;
+      },
+      async entries() { return finished ? [root, assistant] : [root]; },
+      async leafId() { return assistant.id; },
+    };
+    const manager = new DurableRunManager({
+      store, heartbeatMs: 0, sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+    const result = await (await manager.run({
+      runId: 'cost-sequence-run', identity, sessionId: 'cost-sequence-session',
+      input: [{ role: 'user', text: 'start' }], limits: { maxCostUsd: 0.1 },
+    })).result();
+    expect(result).toMatchObject({ status: 'succeeded', usage: { costUsd: 0.05 } });
+  });
+
+  it.each([
+    ['provider failure', new Error('provider failed'), 'failed'],
+    ['unknown tool result', Object.assign(new Error('unknown result'), { code: 'TOOL_RESULT_UNKNOWN' }), 'recovery_required'],
+  ] as const)('persists authoritative entry usage after %s', async (_name, failure, expectedStatus) => {
+    const store = new MemoryRunStore();
+    let finished = false;
+    const root = messageEntryForUsage(`terminal-root-${expectedStatus}`, null, 'user');
+    const assistant = messageEntryForUsage(`terminal-leaf-${expectedStatus}`, root.id, 'assistant', {
+      input: 7, output: 3, cacheRead: 1, cacheWrite: 2, costTotal: 0.4,
+    });
+    const session: ManagedPiSession = {
+      ...emptySession(`terminal-session-${expectedStatus}`),
+      async *continue() {
+        yield { tenantId: '', runId: '', sequence: 1n, type: 'message_end', attemptId: '', turnNo: 0,
+          kernel: 'pi', kernelVersion: '0.82.1', correlationId: expectedStatus, createdAt: new Date(),
+          detail: { message: { usage: { input: 7, output: 3, cacheRead: 1, cacheWrite: 2, costTotal: 0.4 } } } };
+        finished = true;
+        throw failure;
+      },
+      async entries() { return finished ? [root, assistant] : [root]; },
+      async leafId() { return assistant.id; },
+    };
+    const manager = new DurableRunManager({
+      store, heartbeatMs: 0, sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+    const runId = `terminal-${expectedStatus}`;
+    const result = await (await manager.run({
+      runId, identity, sessionId: `terminal-session-${expectedStatus}`, input: [{ role: 'user', text: 'start' }],
+    })).result();
+    const expectedUsage = { inputTokens: 7, outputTokens: 3, cacheReadTokens: 1, cacheCreationTokens: 2, costUsd: 0.4 };
+    expect(result).toMatchObject({ status: expectedStatus, usage: expectedUsage });
+    expect((await store.get({ tenantId: identity.tenantId, runId }))?.usage).toEqual(expectedUsage);
+  });
+
+  it('persists authoritative entry usage when cancellation follows a usage event', async () => {
+    const store = new MemoryRunStore();
+    let usageProcessed!: () => void;
+    const processed = new Promise<void>((resolve) => { usageProcessed = resolve; });
+    let assistantAvailable = false;
+    const root = messageEntryForUsage('cancel-root', null, 'user');
+    const assistant = messageEntryForUsage('cancel-leaf', root.id, 'assistant', {
+      input: 5, output: 2, cacheRead: 1, cacheWrite: 0, costTotal: 0.2,
+    });
+    const session: ManagedPiSession = {
+      ...emptySession('cancel-usage-session'),
+      async *continue(signal) {
+        const activeSignal = signal!;
+        assistantAvailable = true;
+        yield { tenantId: '', runId: '', sequence: 1n, type: 'message_end', attemptId: '', turnNo: 0,
+          kernel: 'pi', kernelVersion: '0.82.1', correlationId: 'cancel-usage', createdAt: new Date(),
+          detail: { message: { usage: { input: 5, output: 2, cacheRead: 1, cacheWrite: 0, costTotal: 0.2 } } } };
+        usageProcessed();
+        await new Promise<never>((_resolve, reject) => {
+          const fail = () => reject(activeSignal.reason);
+          if (activeSignal.aborted) fail();
+          else activeSignal.addEventListener('abort', fail, { once: true });
+        });
+      },
+      async entries() { return assistantAvailable ? [root, assistant] : [root]; },
+      async leafId() { return assistant.id; },
+    };
+    const manager = new DurableRunManager({
+      store, heartbeatMs: 0, sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+    const runId = 'cancel-usage-run';
+    const handle = await manager.run({
+      runId, identity, sessionId: 'cancel-usage-session', input: [{ role: 'user', text: 'start' }],
+    });
+    await processed;
+    await manager.cancel({ identity, runId, reason: 'stop after usage' });
+    const result = await handle.result();
+    const expectedUsage = { inputTokens: 5, outputTokens: 2, cacheReadTokens: 1, cacheCreationTokens: 0, costUsd: 0.2 };
+    expect(result).toMatchObject({ status: 'cancelled', usage: expectedUsage });
+    expect((await store.get({ tenantId: identity.tenantId, runId }))?.usage).toEqual(expectedUsage);
+  });
+
+  it('passes an already-aborted external signal into the session immediately', async () => {
+    const store = new MemoryRunStore();
+    const external = new AbortController();
+    const reason = new Error('already stopped');
+    external.abort(reason);
+    let received: AbortSignal | undefined;
+    const session: ManagedPiSession = {
+      ...emptySession('already-aborted-session'),
+      async *continue(signal) {
+        received = signal!;
+        signal!.throwIfAborted();
+      },
+    };
+    const manager = new DurableRunManager({
+      store, heartbeatMs: 0, sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+    const result = await (await manager.run({
+      runId: 'already-aborted-run', identity, sessionId: 'already-aborted-session',
+      input: [{ role: 'user', text: 'start' }], signal: external.signal,
+    })).result();
+    expect(received?.aborted).toBe(true);
+    expect(received?.reason).toBe(reason);
+    expect(result.status).toBe('recovery_required');
+  });
+
   it('establishes the append cutoff before its final inbox drain', async () => {
     const calls: string[] = [];
     const base = new MemoryRunStore();
@@ -490,6 +694,26 @@ describe('DurableRunManager', () => {
     await expect(handle.result()).rejects.toThrow(message);
   });
 
+  it('rejects maxTurns before claiming or reopening the run', async () => {
+    const store = new MemoryRunStore();
+    const manager = new DurableRunManager({
+      store, sessions: { create: async () => { throw new Error('session must not start'); }, load: async () => { throw new Error('session must not load'); } },
+      eventOptions: () => ({}), heartbeatMs: 0,
+    });
+    const handle = await manager.run({
+      runId: 'preclaim-max-turns', identity, sessionId: 'preclaim-max-turns-session',
+      input: [{ role: 'user', text: 'start' }], limits: { maxTurns: 0 },
+    });
+    await expect(handle.result()).rejects.toThrow('Maximum turns exceeded');
+    await expect(store.get({ tenantId: identity.tenantId, runId: 'preclaim-max-turns' })).resolves.toMatchObject({
+      status: 'queued', leaseToken: 0n,
+    });
+    const stored = await store.get({ tenantId: identity.tenantId, runId: 'preclaim-max-turns' });
+    expect(stored?.leaseOwner).toBeUndefined();
+    expect(stored?.appendClosedAt).toBeUndefined();
+    expect(await store.countAttempts({ tenantId: identity.tenantId, runId: 'preclaim-max-turns' })).toBe(0);
+  });
+
   it.each([
     ['input', { maxInputTokens: 1 }, 'message_end', { message: { usage: { input: 2, output: 0, cacheRead: 0, cacheWrite: 0 } } }],
     ['output', { maxOutputTokens: 1 }, 'message_end', { message: { usage: { input: 0, output: 2, cacheRead: 0, cacheWrite: 0 } } }],
@@ -497,13 +721,22 @@ describe('DurableRunManager', () => {
     ['tool', { maxToolCalls: 0 }, 'tool_execution_start', { toolCallId: 'call-a', toolName: 'write' }],
   ] as const)('enforces observed %s limits during execution', async (name, limits, type, detail) => {
     const store = new MemoryRunStore();
+    let terminal = false;
     const session: ManagedPiSession = {
       ...emptySession(`limit-${name}`),
+      async entries() {
+        if (!terminal) return [];
+        throw new Error('terminal entries unavailable');
+      },
       async *continue() {
-        yield {
-          tenantId: '', runId: '', sequence: 1n, type, attemptId: '', turnNo: 0,
-          kernel: 'pi', kernelVersion: '0.82.1', correlationId: name, createdAt: new Date(), detail,
-        };
+        try {
+          yield {
+            tenantId: '', runId: '', sequence: 1n, type, attemptId: '', turnNo: 0,
+            kernel: 'pi', kernelVersion: '0.82.1', correlationId: name, createdAt: new Date(), detail,
+          };
+        } finally {
+          terminal = true;
+        }
       },
     };
     const manager = new DurableRunManager({
@@ -514,8 +747,40 @@ describe('DurableRunManager', () => {
     })).result();
     expect(result).toMatchObject({ status: 'failed', error: { code: 'RUN_LIMIT_EXCEEDED' } });
     if (name === 'cost') expect(result.error?.message).toBe('Maximum cost exceeded');
+    if (name !== 'tool') {
+      const eventUsage = (detail as { message: { usage: Record<string, number> } }).message.usage;
+      expect(result.usage).toMatchObject({
+        inputTokens: eventUsage.input, outputTokens: eventUsage.output,
+        cacheReadTokens: eventUsage.cacheRead, cacheCreationTokens: eventUsage.cacheWrite,
+        ...(eventUsage.costTotal === undefined ? {} : { costUsd: eventUsage.costTotal }),
+      });
+      expect((await store.get({ tenantId: identity.tenantId, runId: `observed-${name}` }))?.usage).toEqual(result.usage);
+    }
   });
 });
+
+function messageEntryForUsage(
+  id: string,
+  parentId: string | null,
+  role: 'user' | 'assistant',
+  usageDetail?: { input: number; output: number; cacheRead: number; cacheWrite: number; costTotal: number },
+) {
+  if (role === 'user') return {
+    type: 'message' as const, id, parentId, timestamp: new Date().toISOString(),
+    message: { role: 'user' as const, content: 'start', timestamp: Date.now() },
+  };
+  const values = usageDetail!;
+  return {
+    type: 'message' as const, id, parentId, timestamp: new Date().toISOString(),
+    message: {
+      role: 'assistant' as const, content: [{ type: 'text' as const, text: 'answer' }], api: 'test', provider: 'test', model: 'test',
+      stopReason: 'stop' as const, timestamp: Date.now(),
+      usage: { input: values.input, output: values.output, cacheRead: values.cacheRead, cacheWrite: values.cacheWrite,
+        totalTokens: values.input + values.output + values.cacheRead + values.cacheWrite,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: values.costTotal } },
+    },
+  };
+}
 
 function emptySession(id: string): ManagedPiSession {
   return {

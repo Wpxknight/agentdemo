@@ -216,6 +216,69 @@ describe('Agent Run Center HTTP API', () => {
     }
   });
 
+  it.each(['approval', 'question', 'plan'] as const)(
+    'routes resolved %s interactions through durable resume with the stored resolution',
+    async (kind) => {
+      const localStore = new MemoryStore();
+      await localStore.createTenant({ id: 'default', name: 'Default' });
+      const authProvider = new LocalAuthProvider({ store: localStore, secret: `durable-${kind}-secret` });
+      const admin = await authProvider.createUser('default', `admin-${kind}`, 'pw', 'platform_admin');
+      const token = (await authProvider.login('default', `admin-${kind}`, 'pw'))!;
+      const runId = `durable-${kind}-run`;
+      const sessionId = `durable-${kind}-session`;
+      const interactionId = `durable-${kind}-interaction`;
+      const now = new Date();
+      await localStore.putAgentRunBindingIfAbsent({
+        tenantId: 'default', userId: admin.id, sessionId, runId, kernel: 'pi', kernelVersion: '0.82.1',
+        graphName: '', graphVersion: '', createdAt: now,
+      });
+      await localStore.updateAgentRun('default', runId, { status: 'waiting', waitingReason: kind, updatedAt: now });
+      await localStore.putInteraction({
+        id: interactionId, tenantId: 'default', userId: admin.id, sessionId, runId, kind,
+        toolCallId: `call-${kind}`, payload: { id: interactionId, questions: [] }, status: 'pending',
+        expiresAt: new Date(now.getTime() + 60_000), createdAt: now,
+      });
+      const result = vi.fn(async () => ({
+        runId, status: 'succeeded' as const,
+        usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      }));
+      const resume = vi.fn(async () => ({
+        runId, status: 'running' as const, events: { async *[Symbol.asyncIterator]() {} }, result,
+      }));
+      const legacyRun = vi.fn(async () => { throw new Error('legacy recovery must not run'); });
+      const rt = {
+        agentRuntime: { run: legacyRun },
+        model: { id: 'mock', async *stream() {} }, tools: new ToolRegistry(), store: localStore,
+        policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(), authProvider,
+        jwtSecret: `durable-${kind}-secret`, systemExtra: '', durableRunRuntime: { resume },
+        defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' },
+      } as unknown as Runtime;
+      const localServer = createHttpServer(rt);
+      await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve));
+      const localBase = `http://127.0.0.1:${(localServer.address() as AddressInfo).port}`;
+      const answers = { Continue: [kind === 'plan' ? '批准' : 'Yes'] };
+      try {
+        const response = kind === 'approval'
+          ? await fetch(`${localBase}/v1/approvals/${interactionId}/approve`, {
+              method: 'POST', headers: auth(token), body: '{}',
+            })
+          : await fetch(`${localBase}/v1/questions/${interactionId}/answer`, {
+              method: 'POST', headers: auth(token), body: JSON.stringify({ answers }),
+            });
+        expect(response.status).toBe(200);
+        await vi.waitFor(() => expect(resume).toHaveBeenCalledWith({
+          identity: { tenantId: 'default', actorId: admin.id, roles: ['platform_admin'] },
+          runId,
+          resolution: { interactionId, value: kind === 'approval' ? true : answers },
+        }));
+        await vi.waitFor(() => expect(result).toHaveBeenCalledOnce());
+        expect(legacyRun).not.toHaveBeenCalled();
+      } finally {
+        await new Promise<void>((resolve) => localServer.close(() => resolve()));
+      }
+    },
+  );
+
   it.each([
     ['approve', true],
     ['deny', false],

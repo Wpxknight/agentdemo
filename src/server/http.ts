@@ -726,11 +726,17 @@ export function createHttpServer(rt: Runtime): http.Server {
   });
 }
 
-async function superviseDurableRecovery(rt: Runtime, ctx: RequestContext, runId: string): Promise<void> {
+async function superviseDurableRecovery(
+  rt: Runtime,
+  ctx: RequestContext,
+  runId: string,
+  resolution?: { interactionId: string; value: JsonValue },
+): Promise<void> {
   try {
     const handle = await rt.durableRunRuntime!.resume({
       identity: { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] },
       runId,
+      ...(resolution ? { resolution } : {}),
     });
     for await (const _event of handle.events) {
       // Recovery is detached from an HTTP response, but its event stream still needs a consumer.
@@ -1467,7 +1473,7 @@ async function handle(
     if (approved) await approvals.approve(id, ctx.tenantId);
     else await approvals.deny(id, ctx.tenantId);
     await scheduleResolvedInteractionRecovery(
-      rt, interactions, activeRuns, compactionWatermarks, ctx, resolved, approved, wasPending,
+      rt, interactions, activeRuns, compactionWatermarks, ctx, resolved, wasPending,
     );
     return sendJson(res, 200, { ok: true });
   }
@@ -1505,7 +1511,7 @@ async function handle(
     }).catch((error) => { throw interactionResolveHttpError(error, '问题不存在或已回答'); });
     questions.answer(id, ctx.tenantId, answers);
     await scheduleResolvedInteractionRecovery(
-      rt, interactions, activeRuns, compactionWatermarks, ctx, resolved, answers, wasPending,
+      rt, interactions, activeRuns, compactionWatermarks, ctx, resolved, wasPending,
     );
     return sendJson(res, 200, { ok: true });
   }
@@ -1939,7 +1945,6 @@ async function scheduleResolvedInteractionRecovery(
   compactionWatermarks: CompactionWatermarks,
   requester: RequestContext,
   interaction: Awaited<ReturnType<DurableInteractionService['resolve']>>,
-  value: JsonValue,
   newlyResolved: boolean,
 ): Promise<void> {
   const run = await rt.store.getAgentRun(requester, interaction.runId);
@@ -1955,10 +1960,15 @@ async function scheduleResolvedInteractionRecovery(
     },
     createdAt: new Date(),
   });
-  scheduleAgentRecovery(rt, interactions, activeRuns, compactionWatermarks, requester, run, {
+  const resolution = {
     interactionId: interaction.id,
-    value,
-  });
+    value: interaction.resolution as JsonValue,
+  };
+  if (rt.durableRunRuntime) {
+    void superviseDurableRecovery(rt, requester, run.runId, resolution);
+    return;
+  }
+  scheduleAgentRecovery(rt, interactions, activeRuns, compactionWatermarks, requester, run, resolution);
 }
 
 function interactionResolveHttpError(error: unknown, fallback: string): HttpError {

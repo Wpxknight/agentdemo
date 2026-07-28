@@ -5,7 +5,7 @@ import type {
   ClaimInboxInput, ConsumeInboxInput, DurableRunStore, EnqueueInboxInput, PiSessionRecord, RunInboxMessage,
   SessionEntryRecord, StoredRun,
 } from './types.js';
-import { assertAttemptAllowed } from '../run/limits.js';
+import { assertAttemptAllowed, assertTurnAllowed } from '../run/limits.js';
 
 const clone = <T>(value: T): T => structuredClone(value);
 const key = (tenantId: string, id: string): string => `${tenantId}\0${id}`;
@@ -46,8 +46,14 @@ export class MemoryRunStore implements DurableRunStore {
       if (!canManageRun(input.identity, run.actorId)) return null;
       if (['succeeded', 'cancelled'].includes(run.status)) return null;
       if (['waiting', 'failed', 'recovery_required'].includes(run.status) && !input.resume) return null;
+      if (input.resume && [...this.runs.values()].some((candidate) => candidate.tenantId === run.tenantId
+        && candidate.sessionId === run.sessionId && candidate.runId !== run.runId
+        && ['queued', 'running', 'waiting'].includes(candidate.status))) {
+        throw conflict('Session already has an active run');
+      }
       assertAttemptAllowed(run.limits, [...this.attempts.values()].filter((attempt) =>
         attempt.tenantId === run.tenantId && attempt.runId === run.runId).length, input.now);
+      assertTurnAllowed(run.limits, run.lastTurnNo + 1);
       if (run.leaseOwner && run.leaseExpiresAt && run.leaseExpiresAt > input.now && run.leaseOwner !== input.workerId) return null;
       const sameLease = run.leaseOwner === input.workerId && Boolean(run.leaseExpiresAt && run.leaseExpiresAt > input.now);
       const fencingToken = sameLease ? run.leaseToken : run.leaseToken + 1n;

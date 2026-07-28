@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { DurableRunManager, MemoryRunStore, type ManagedPiSession } from '../../packages/pi-runtime/src/index.js';
 import type { AgentRunEvent } from '@aiop/control-contracts';
 import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
@@ -99,6 +99,7 @@ describe('durable run inbox', () => {
 
 describe('active durable inbox delivery', () => {
   it('polls and steers Pi while continue is waiting without requiring an event yield', async () => {
+    vi.useFakeTimers();
     const store = new MemoryRunStore();
     let release!: () => void;
     const steered = new Promise<void>((resolve) => { release = resolve; });
@@ -128,21 +129,21 @@ describe('active durable inbox delivery', () => {
       store, workerId: 'worker-a', leaseTtlMs: 1000, heartbeatMs: 0, inboxPollMs: 5,
       sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
     });
-    const abort = new AbortController();
-    const handle = await manager.run({
-      runId: 'run-poll', identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
-      sessionId: 'session-poll', input: [{ role: 'user', text: 'start' }], signal: abort.signal,
-    });
-    await manager.append({
-      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] }, runId: 'run-poll',
-      message: { role: 'user', text: 'steer now' }, mode: 'steer', idempotencyKey: 'poll-1',
-    });
-    const startedAt = Date.now();
-    const timeout = setTimeout(() => { abort.abort(new Error('inbox was not polled')); release(); }, 100);
-    const result = await handle.result();
-    clearTimeout(timeout);
-    expect(result.status).toBe('succeeded');
-    expect(Date.now() - startedAt).toBeLessThan(80);
-    expect(entries).toContainEqual(expect.objectContaining({ type: 'custom', customType: 'aiop.inbox_consumed' }));
+    try {
+      const handle = await manager.run({
+        runId: 'run-poll', identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+        sessionId: 'session-poll', input: [{ role: 'user', text: 'start' }],
+      });
+      await manager.append({
+        identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] }, runId: 'run-poll',
+        message: { role: 'user', text: 'steer now' }, mode: 'steer', idempotencyKey: 'poll-1',
+      });
+      await vi.advanceTimersByTimeAsync(5);
+      const result = await handle.result();
+      expect(result.status).toBe('succeeded');
+      expect(entries).toContainEqual(expect.objectContaining({ type: 'custom', customType: 'aiop.inbox_consumed' }));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

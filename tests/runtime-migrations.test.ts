@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
+import { runMigrations } from '../src/db/index.js';
 
 const migrations = new URL('../src/db/migrations/', import.meta.url);
 
@@ -68,15 +69,51 @@ describe('durable runtime migrations', () => {
     expect(source).toContain('create table if not exists pi_sessions');
     expect(source).toContain('create table if not exists pi_session_entries');
     expect(source).toContain('create table if not exists agent_run_inbox_messages');
-    expect(source).toContain('add column limits_json json');
-    expect(source).toContain('add column append_closed_at datetime(3)');
-    expect(source).toContain('add column cost_usd decimal(18,8)');
-    expect(source).toContain('idx_agent_runs_session_status');
+    expect(source).not.toContain('add column limits_json json');
+    expect(source).not.toContain('add column append_closed_at datetime(3)');
+    expect(source).not.toContain('add column cost_usd decimal(18,8)');
+    expect(source).not.toContain('idx_agent_runs_session_status');
     for (const column of ['pi_session_id', 'pi_leaf_id', 'pi_entry_seq']) expect(source).toContain(column);
     expect(source).toContain('unique key uq_pi_session_entry_seq');
     expect(source).toContain('unique key uq_agent_run_inbox_idempotency');
     expect(source).toContain('unique key uq_agent_run_inbox_sequence');
     expect(source).not.toMatch(/drop\s+(table|column)/);
+  });
+
+  it('adds run controls in a new immutable migration version', async () => {
+    const source = await sql('0024_pi_run_controls.sql');
+    expect(source).toContain('alter table agent_runs');
+    expect(source).toContain('add column cost_usd decimal(18,8)');
+    expect(source).toContain('add column limits_json json');
+    expect(source).toContain('add column append_closed_at datetime(3)');
+    expect(source).toContain('idx_agent_runs_session_status');
+  });
+
+  it('upgrades a database that already recorded the original 0023 migration', async () => {
+    const columns = new Set<string>();
+    const indexes = new Set<string>();
+    const recorded = Array.from({ length: 23 }, (_, index) => ({ version: index + 1 }));
+    const query = async (statement: string, values?: unknown[]) => {
+      if (statement === 'SELECT version FROM schema_migrations') return [recorded];
+      if (statement.startsWith('INSERT INTO schema_migrations')) {
+        recorded.push({ version: Number(values?.[0]) });
+        return [{}];
+      }
+      if (statement.includes('ALTER TABLE agent_runs')) {
+        for (const column of ['cost_usd', 'limits_json', 'append_closed_at']) {
+          if (statement.includes(`ADD COLUMN ${column}`)) columns.add(column);
+        }
+        if (statement.includes('idx_agent_runs_session_status')) indexes.add('idx_agent_runs_session_status');
+      }
+      return [[]];
+    };
+    const pool = { promise: () => ({ query }) };
+
+    await runMigrations(pool as never);
+
+    expect(recorded.at(-1)?.version).toBe(24);
+    expect(columns).toEqual(new Set(['cost_usd', 'limits_json', 'append_closed_at']));
+    expect(indexes).toEqual(new Set(['idx_agent_runs_session_status']));
   });
 
   it('registers the new tables and columns in the Kysely schema', async () => {

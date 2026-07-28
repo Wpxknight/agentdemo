@@ -9,7 +9,7 @@ import type {
   ClaimInboxInput, ConsumeInboxInput, DurableRunStore, EnqueueInboxInput, PiSessionRecord, RunInboxMessage,
   SessionEntryRecord, StoredRun,
 } from './types.js';
-import { assertAttemptAllowed } from '../run/limits.js';
+import { assertAttemptAllowed, assertTurnAllowed } from '../run/limits.js';
 
 type Db = Kysely<any> | Transaction<any>;
 
@@ -55,15 +55,31 @@ export class MysqlRunStore implements DurableRunStore {
 
   async claim(input: Parameters<DurableRunStore['claim']>[0]): Promise<Awaited<ReturnType<DurableRunStore['claim']>>> {
     return this.transaction(async (store) => {
+      const candidate = await store.db.selectFrom('agent_runs').select(['session_id'])
+        .where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId).executeTakeFirst();
+      if (!candidate) throw new RunNotFoundError();
+      await store.db.selectFrom('pi_sessions').select('session_id')
+        .where('tenant_id', '=', input.identity.tenantId).where('session_id', '=', candidate.session_id)
+        .forUpdate().executeTakeFirstOrThrow();
       const row = await store.db.selectFrom('agent_runs').selectAll().where('tenant_id', '=', input.identity.tenantId)
         .where('run_id', '=', input.runId).forUpdate().executeTakeFirst();
       if (!row) throw new RunNotFoundError();
       if (!canManageRun(input.identity, row.user_id) || ['succeeded', 'cancelled'].includes(row.status)) return null;
       if (['waiting', 'failed', 'recovery_required'].includes(row.status) && !input.resume) return null;
+      if (input.resume) {
+        const active = await store.db.selectFrom('agent_runs').select('run_id')
+          .where('tenant_id', '=', input.identity.tenantId).where('session_id', '=', row.session_id)
+          .where('run_id', '!=', input.runId).where('status', 'in', ['queued', 'running', 'waiting'])
+          .limit(1).executeTakeFirst();
+        if (active) throw conflict('Session already has an active run');
+      }
       const attemptCount = await store.db.selectFrom('agent_run_attempts').select(({ fn }) => fn.countAll<number>().as('count'))
         .where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId).executeTakeFirstOrThrow();
       const limits = row.limits_json === null || row.limits_json === undefined ? undefined : reviveLimits(parse(row.limits_json));
       assertAttemptAllowed(limits, Number(attemptCount.count), input.now);
+      const lastTurn = await store.db.selectFrom('agent_turn_commits').select(({ fn }) => fn.max<number>('turn_no').as('turn_no'))
+        .where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId).executeTakeFirst();
+      assertTurnAllowed(limits, Number(lastTurn?.turn_no ?? 0) + 1);
       if (row.lease_owner && row.lease_owner !== input.workerId && row.lease_expires_at && row.lease_expires_at > input.now) return null;
       const same = row.lease_owner === input.workerId && row.lease_expires_at && row.lease_expires_at > input.now;
       const fencingToken = BigInt(same ? row.lease_token : Number(row.lease_token) + 1);
@@ -78,7 +94,11 @@ export class MysqlRunStore implements DurableRunStore {
         lease_token: Number(fencingToken), kernel: row.kernel, kernel_version: row.kernel_version, status: 'running',
         error_code: null, error_message: null, started_at: input.now, completed_at: null,
       }).execute();
-      return { record: mapRun({ ...row, status: 'running', lease_owner: input.workerId, lease_token: Number(fencingToken) }), attemptId, fencingToken };
+      return { record: mapRun({
+        ...row, status: 'running', lease_owner: input.workerId, lease_token: Number(fencingToken),
+        lease_expires_at: new Date(input.now.getTime() + input.leaseTtlMs),
+        ...(input.resume && ['waiting', 'failed', 'recovery_required'].includes(row.status) ? { append_closed_at: null } : {}),
+      }), attemptId, fencingToken };
     });
   }
 
