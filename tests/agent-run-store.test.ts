@@ -14,7 +14,7 @@ function binding(runId: string, userId = 'user-a', tenantId = 'tenant-a'): Agent
     userId,
     sessionId: `session-${runId}`,
     runId,
-    kernel: 'langgraph',
+    kernel: 'pi',
     graphName: 'aiop-agent',
     graphVersion: 'v1',
     createdAt: new Date('2026-07-22T00:00:00.000Z'),

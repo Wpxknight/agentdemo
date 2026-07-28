@@ -52,7 +52,7 @@ beforeAll(async () => {
   });
   await store.putAgentRunBindingIfAbsent({
     tenantId: 'default', userId: admin.id, sessionId: 'session-admin', runId: 'run-admin',
-    kernel: 'langgraph', graphName: 'aiop-agent', graphVersion: 'v1', createdAt: new Date(createdAt.getTime() + 1),
+    kernel: 'pi', graphName: 'aiop-agent', graphVersion: 'v1', createdAt: new Date(createdAt.getTime() + 1),
   });
 
   const rt = {
@@ -302,23 +302,6 @@ describe('Agent Run Center HTTP API', () => {
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({ error: expect.stringContaining('pending Interaction') });
     expect(run).not.toHaveBeenCalled();
-  });
-
-  it('keeps historical LangGraph runs query-only and rejects recovery', async () => {
-    await store.updateAgentRun('default', 'run-admin', { status: 'failed', updatedAt: new Date() });
-    const detail = await fetch(`${base}/v1/agent/runs/run-admin`, { headers: auth(adminToken) });
-    expect(detail.status).toBe(200);
-    await expect(detail.json()).resolves.toMatchObject({
-      run: { runId: 'run-admin', kernel: 'langgraph' },
-      canResume: false,
-      recoveryBlockedReason: expect.stringContaining('仅供查询'),
-    });
-
-    const response = await fetch(`${base}/v1/agent/runs/run-admin/resume`, {
-      method: 'POST', headers: auth(adminToken), body: '{}',
-    });
-    expect(response.status).toBe(409);
-    expect(run).not.toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-admin' }));
   });
 
   it('replays durable SSE events strictly after Last-Event-ID', async () => {

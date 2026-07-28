@@ -116,13 +116,18 @@ function toOptionalDate(value: Date | string | null): Date | undefined {
   return value === null ? undefined : toDate(value);
 }
 
+function piKernel(value: string): 'pi' {
+  if (value !== 'pi') throw new Error(`Unexpected retired Agent Kernel in database: ${value}`);
+  return 'pi';
+}
+
 function toAgentRun(row: Selectable<Database['agent_runs']>): AgentRunRecord {
   return {
     tenantId: row.tenant_id,
     runId: row.run_id,
     userId: row.user_id,
     sessionId: row.session_id,
-    kernel: row.kernel as AgentRunBinding['kernel'],
+    kernel: piKernel(row.kernel),
     kernelVersion: row.kernel_version,
     runtimeVersion: row.runtime_version,
     graphName: row.graph_name,
@@ -601,7 +606,7 @@ export class MysqlStore implements Store {
       runId: row.run_id,
       userId: row.user_id,
       sessionId: row.session_id,
-      kernel: row.kernel as AgentRunBinding['kernel'],
+      kernel: piKernel(row.kernel),
       kernelVersion: row.kernel_version,
       runtimeVersion: row.runtime_version,
       graphName: row.graph_name,
@@ -723,7 +728,7 @@ export class MysqlStore implements Store {
     return rows.map((row) => ({
       id: Number(row.id), tenantId: row.tenant_id, runId: row.run_id, sequence: Number(row.sequence), type: row.event_type,
       attemptId: row.attempt_id ?? undefined, turnNo: row.turn_no ?? undefined,
-      kernel: row.kernel === 'pi' || row.kernel === 'legacy' || row.kernel === 'langgraph' ? row.kernel : undefined,
+      kernel: row.kernel === 'pi' ? 'pi' : undefined,
       kernelVersion: row.kernel_version ?? undefined, correlationId: row.correlation_id ?? undefined,
       node: row.node_name ?? undefined, status: row.status ?? undefined,
       detail: parseJson(row.detail), createdAt: toDate(row.created_at),

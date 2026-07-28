@@ -18,7 +18,7 @@ export interface AgentRunRecord {
   userId: string;
   sessionId: string;
   runId: string;
-  kernel: 'pi' | 'legacy' | 'langgraph';
+  kernel: 'pi';
   kernelVersion?: string;
   runtimeVersion?: string;
   graphName: string;
@@ -54,7 +54,7 @@ export interface AgentRunEvent {
   runId: string;
   attemptId?: string;
   turnNo?: number;
-  kernel?: 'pi' | 'legacy' | 'langgraph';
+  kernel?: 'pi';
   kernelVersion?: string;
   correlationId?: string;
   node?: string;
@@ -238,7 +238,6 @@ function recoveryBlockedReason(
   tools: ToolExecutionRecord[],
   interactions: InteractionRecord[] = [],
 ): string | undefined {
-  if (run.kernel === 'langgraph') return '历史 LangGraph Run 仅供查询，不能恢复执行';
   if (run.leaseOwner && run.leaseExpiresAt && run.leaseExpiresAt.getTime() > Date.now()) {
     return '运行仍被执行实例持有，请等待租约释放或过期后再恢复';
   }

@@ -15,7 +15,7 @@ export interface AgentRunRecord {
     userId: string;
     sessionId: string;
     runId: string;
-    kernel: 'pi' | 'legacy' | 'langgraph';
+    kernel: 'pi';
     kernelVersion?: string;
     runtimeVersion?: string;
     graphName: string;
@@ -50,7 +50,7 @@ export interface AgentRunEvent {
     runId: string;
     attemptId?: string;
     turnNo?: number;
-    kernel?: 'pi' | 'legacy' | 'langgraph';
+    kernel?: 'pi';
     kernelVersion?: string;
     correlationId?: string;
     node?: string;
@@ -148,7 +148,7 @@ export declare class RunCenterService {
             userId: string;
             sessionId: string;
             runId: string;
-            kernel: "pi" | "legacy" | "langgraph";
+            kernel: "pi";
             kernelVersion?: string | undefined;
             runtimeVersion?: string | undefined;
             graphName: string;

@@ -10,7 +10,7 @@ async function seededStore(runId = 'run-a') {
   const store = new MemoryStore();
   await store.putAgentRunBindingIfAbsent({
     tenantId: ctx.tenantId, userId: ctx.userId, sessionId: 'session-a', runId,
-    kernel: 'langgraph', graphName: 'aiop-agent', graphVersion: 'v1',
+    kernel: 'pi', graphName: 'aiop-agent', graphVersion: 'v1',
     createdAt: new Date('2026-07-22T00:00:00.000Z'),
   });
   return store;

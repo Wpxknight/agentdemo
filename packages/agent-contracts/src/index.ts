@@ -8,7 +8,7 @@ export interface IdentityContext {
   correlationId?: string;
 }
 
-export type AgentKernelName = 'pi' | 'legacy' | (string & {});
+export type AgentKernelName = 'pi' | (string & {});
 export type AgentRunStatus =
   | 'queued'
   | 'running'

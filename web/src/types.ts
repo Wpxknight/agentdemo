@@ -157,7 +157,7 @@ export interface AgentRunSummary {
   userId: string;
   sessionId: string;
   runId: string;
-  kernel: 'pi' | 'legacy' | 'langgraph';
+  kernel: 'pi';
   kernelVersion?: string;
   runtimeVersion?: string;
   graphName: string;

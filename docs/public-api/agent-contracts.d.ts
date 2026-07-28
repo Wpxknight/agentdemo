@@ -8,7 +8,7 @@ export interface IdentityContext {
     resourceScopes?: readonly string[];
     correlationId?: string;
 }
-export type AgentKernelName = 'pi' | 'legacy' | (string & {});
+export type AgentKernelName = 'pi' | (string & {});
 export type AgentRunStatus = 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'recovery_required';
 export type WaitingReason = 'approval' | 'question' | 'plan' | 'external';
 export type AttemptStatus = 'running' | 'succeeded' | 'failed' | 'cancelled' | 'lost_lease';

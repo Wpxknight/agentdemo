@@ -377,7 +377,7 @@ export class MemoryStore implements Store {
       type: event.type,
       attemptId: event.attemptId,
       turnNo: event.turnNo,
-      kernel: event.kernel === 'pi' ? 'pi' : event.kernel === 'legacy' ? 'legacy' : undefined,
+      kernel: event.kernel === 'pi' ? 'pi' : undefined,
       kernelVersion: event.kernelVersion,
       correlationId: event.correlationId,
       detail: event.detail,

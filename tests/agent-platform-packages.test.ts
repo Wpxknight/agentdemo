@@ -31,6 +31,13 @@ describe('agent platform package boundaries', () => {
     }
   });
 
+  it('exposes only Pi records from the AIOP Run Center adapter', async () => {
+    const source = await readFile(new URL('packages/agent-runtime-aiop/src/index.ts', root), 'utf8');
+    expect(source).toContain("kernel: 'pi'");
+    expect(source).not.toMatch(/['"]legacy['"]/);
+    expect(source).not.toMatch(/['"]langgraph['"]/i);
+  });
+
   it('keeps every public package free of product imports and undeclared workspace dependencies', async () => {
     const names = [
       'agent-contracts', 'agent-kernel-pi', 'agent-runtime-aiop', 'agent-runtime-core', 'agent-runtime-mysql',

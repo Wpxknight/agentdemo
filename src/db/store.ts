@@ -126,7 +126,7 @@ export interface AgentRunBinding {
   userId: string;
   sessionId: string;
   runId: string;
-  kernel: 'pi' | 'legacy' | 'langgraph';
+  kernel: 'pi';
   kernelVersion?: string;
   runtimeVersion?: string;
   graphName: string;
@@ -196,7 +196,7 @@ export interface AgentRunEvent {
   type: string;
   attemptId?: string;
   turnNo?: number;
-  kernel?: 'pi' | 'legacy' | 'langgraph';
+  kernel?: 'pi';
   kernelVersion?: string;
   correlationId?: string;
   node?: string;
