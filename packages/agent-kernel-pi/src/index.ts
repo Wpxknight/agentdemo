@@ -56,11 +56,14 @@ export interface PiAgentKernelOptions {
   toolRuntime: ToolRuntime;
   systemPrompt?: string;
   protocolVersion?: string;
+  getFollowUpMessages?: () => Promise<readonly KernelMessage[]>;
+  transformContext?: (messages: readonly KernelMessage[], signal?: AbortSignal) => Promise<readonly KernelMessage[]>;
   context?: {
     manager: ContextManager;
     triggerTokens: number;
     keepRecentMessages: number;
     watermarkTokens?: number;
+    summaryPrefix?: string;
   };
 }
 
@@ -120,6 +123,15 @@ export class PiAgentKernel implements AgentKernel {
       model: toPiModel(input),
       convertToLlm: (messages) => messages as Message[],
       toolExecution: 'sequential',
+      transformContext: this.options.transformContext
+        ? async (messages, signal) => toPiMessages(
+            await this.options.transformContext!(fromPiMessages(messages, logicalCalls), signal),
+            logicalCalls,
+          )
+        : undefined,
+      getFollowUpMessages: this.options.getFollowUpMessages
+        ? async () => toPiMessages(await this.options.getFollowUpMessages!(), logicalCalls)
+        : undefined,
       beforeToolCall: async ({ assistantMessage }) => {
         await control.guard();
         if (assistantMessage.stopReason === 'length') {
@@ -180,9 +192,11 @@ export class PiAgentKernel implements AgentKernel {
   ): Promise<readonly KernelMessage[]> {
     const context = this.options.context;
     if (!context || input.messages.length === 0) return input.messages;
-    const inspected = await context.manager.inspect(input.messages);
+    const summaryPrefix = context.summaryPrefix ?? 'Context summary:\n';
+    const executionMessages = executionContextMessages(input.messages, summaryPrefix);
+    const inspected = await context.manager.inspect(executionMessages);
     if (inspected.tokens <= (context.watermarkTokens ?? 0)) return input.messages;
-    const recent = input.messages.slice(-Math.max(1, context.keepRecentMessages));
+    const recent = executionMessages.slice(-Math.max(1, context.keepRecentMessages));
     const recentUsage = await context.manager.inspect(recent);
     const reserveTokens = Math.max(256, Math.ceil(context.triggerTokens * 0.15));
     const policy: CompactionPolicy = {
@@ -191,17 +205,18 @@ export class PiAgentKernel implements AgentKernel {
       keepRecentTokens: Math.max(1, recentUsage.tokens),
     };
     if (!context.manager.shouldCompact(inspected, policy)) return input.messages;
-    const prepared = context.manager.prepare(input.messages, policy);
+    const prepared = context.manager.prepare(executionMessages, policy);
     if (!prepared || prepared.summarizedMessages === 0) return input.messages;
     try {
       const compacted = await context.manager.compact({ prepared, signal: input.signal });
       if (!compacted.summary.trim()) return input.messages;
       if (compacted.usage) addUsage(usage, toPiUsage(compacted.usage));
-      const messages: KernelMessage[] = [{
+      const compactedMessages: KernelMessage[] = [{
         role: 'user',
-        content: [{ type: 'text', text: `Context summary:\n${compacted.summary.trim()}` }],
+        content: [{ type: 'text', text: `${summaryPrefix}${compacted.summary.trim()}` }],
       }, ...compacted.retainedMessages];
-      const after = await context.manager.inspect(messages);
+      const messages = preserveUserInputs(input.messages, compactedMessages, summaryPrefix);
+      const after = await context.manager.inspect(compactedMessages);
       await control.emit({
         type: 'context_compacted',
         tokensBefore: compacted.tokensBefore,
@@ -394,6 +409,9 @@ export class PiAgentKernel implements AgentKernel {
           reason = event.reason;
         }
       }
+      if (input.signal?.aborted) {
+        throw input.signal.reason instanceof Error ? input.signal.reason : new Error('Agent run aborted');
+      }
       const stopReason = reason === 'length' ? 'length' : content.some((block) => block.type === 'toolCall') ? 'toolUse' : 'stop';
       const message: AssistantMessage = { ...partial(), stopReason };
       stream.push({ type: 'done', reason: stopReason, message });
@@ -455,6 +473,39 @@ export class PiAgentKernel implements AgentKernel {
   }
 }
 
+function preserveUserInputs(
+  original: readonly KernelMessage[],
+  compacted: readonly KernelMessage[],
+  summaryPrefix: string,
+): KernelMessage[] {
+  const retainedCounts = new Map<string, number>();
+  for (const message of compacted) {
+    if (message.role !== 'user') continue;
+    const key = JSON.stringify(message.content);
+    retainedCounts.set(key, (retainedCounts.get(key) ?? 0) + 1);
+  }
+  const missing: KernelMessage[] = [];
+  for (const message of original) {
+    if (message.role !== 'user' || userMessageText(message).startsWith(summaryPrefix)) continue;
+    const key = JSON.stringify(message.content);
+    const retained = retainedCounts.get(key) ?? 0;
+    if (retained > 0) retainedCounts.set(key, retained - 1);
+    else missing.push(message);
+  }
+  return [...missing, ...compacted];
+}
+
+function executionContextMessages(messages: readonly KernelMessage[], summaryPrefix: string): readonly KernelMessage[] {
+  const summaryIndex = messages.findLastIndex(
+    (message) => message.role === 'user' && userMessageText(message).startsWith(summaryPrefix),
+  );
+  return summaryIndex < 0 ? messages : messages.slice(summaryIndex);
+}
+
+function userMessageText(message: Extract<KernelMessage, { role: 'user' }>): string {
+  return message.content.flatMap((block) => block.type === 'text' ? [block.text] : []).join('');
+}
+
 function toPiModel(input: KernelRunInput): Model<any> {
   return {
     id: input.model.model,
@@ -478,6 +529,7 @@ function toPiMessages(messages: readonly KernelMessage[], logicalCalls?: Map<str
       result.push({ role: 'user', content: toPiContent(message.content), timestamp: Date.now() });
     } else if (message.role === 'assistant') {
       const content: AssistantMessage['content'] = [
+        ...(message.thinking ? [{ type: 'thinking' as const, thinking: message.thinking }] : []),
         ...message.content.flatMap((block): AssistantMessage['content'] => block.type === 'text'
           ? [{ type: 'text', text: block.text }]
           : []),
@@ -514,6 +566,7 @@ function fromPiMessages(messages: readonly AgentMessage[], logicalCalls?: Readon
         content: message.content.flatMap((block): AgentContentBlock[] => block.type === 'text'
           ? [{ type: 'text', text: block.text }]
           : []),
+        thinking: message.content.flatMap((block) => block.type === 'thinking' ? [block.thinking] : []).join('') || undefined,
         toolCalls: message.content.flatMap((block): ToolCall[] => block.type === 'toolCall' ? [{
           id: block.id, logicalCallId: logicalCalls?.get(block.id) ?? block.id,
           name: block.name, arguments: toJsonValue(block.arguments),

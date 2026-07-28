@@ -118,6 +118,7 @@ export type KernelMessage = {
 } | {
     role: 'assistant';
     content: readonly AgentContentBlock[];
+    thinking?: string;
     toolCalls?: readonly ToolCall[];
 } | {
     role: 'tool';

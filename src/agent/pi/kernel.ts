@@ -11,6 +11,9 @@ import type { Msg, StreamEvent, ToolDef } from '../../model/types.js';
 import type { AgentKernel } from '../kernel.js';
 import type { RunAgentOptions, RunAgentResult } from '../run-types.js';
 import { executeToolCall } from '../services/tool-broker.js';
+import { AgentPlatformError } from '@aiop/agent-contracts';
+import { compactMessages, SUMMARY_PREFIX } from '../context.js';
+import { buildSystemPrompt } from '../services/prompt.js';
 
 export class PiAIOPAgentKernel implements AgentKernel {
   readonly name = 'pi' as const;
@@ -22,6 +25,7 @@ export class PiAIOPAgentKernel implements AgentKernel {
   async run(options: RunAgentOptions): Promise<RunAgentResult> {
     const kernel = createPiPlatformKernel(options, this.modelConcurrency);
     let compacted = false;
+    let thinking = '';
     const messages = toPiKernelMessages(options.messages ?? [], options.task, options.taskContentBlocks);
     const exit = await kernel.run({
       runId: options.runId ?? `compat:${options.ctx.sessionId}`,
@@ -40,12 +44,23 @@ export class PiAIOPAgentKernel implements AgentKernel {
     }, {
       emit: async (event) => {
         if (event.type === 'context_compacted') compacted = true;
+        if (event.type === 'thinking_delta') thinking += event.text;
         emitPiCompatEvent(event, options.onEvent);
       },
       guard: options.runGuard ?? (async () => undefined),
       shouldStopAfterTurn: async () => false,
     });
     const resultMessages = fromPiKernelMessages(exit.messages);
+    const finalAssistant = resultMessages.findLast((message) => message.role === 'assistant');
+    if (finalAssistant && thinking) finalAssistant.thinking = thinking;
+    if (exit.outcome === 'failed' || exit.outcome === 'recovery_required') {
+      if (options.signal?.aborted && options.signal.reason instanceof Error) throw options.signal.reason;
+      throw new AgentPlatformError(exit.error ?? {
+        code: exit.outcome === 'recovery_required' ? 'TOOL_RESULT_UNKNOWN' : 'MODEL_PROVIDER_ERROR',
+        message: `Agent run ${exit.outcome}`,
+        retryable: false,
+      });
+    }
     return {
       messages: resultMessages,
       text: lastAssistantText(exit.messages) ?? '',
@@ -97,8 +112,28 @@ export function createPiPlatformKernel(
     triggerTokens: options.compactionTriggerTokens,
     keepRecentMessages: options.compactionKeepRecent ?? 8,
     watermarkTokens: options.compactionWatermarkTokens,
+    summaryPrefix: SUMMARY_PREFIX,
   } : undefined;
-  return new PiAgentKernel({ modelProvider, modelConcurrency, toolRuntime, systemPrompt: options.system, context });
+  return new PiAgentKernel({
+    modelProvider,
+    modelConcurrency,
+    toolRuntime,
+    systemPrompt: buildSystemPrompt(options.system, options.unattended),
+    context,
+    getFollowUpMessages: options.drainPendingMessages
+      ? async () => toPiKernelMessages(await options.drainPendingMessages!())
+      : undefined,
+    transformContext: options.contextBudgetTokens
+      ? async (messages) => {
+          const productMessages = fromPiKernelMessages(messages);
+          const summaryIndex = productMessages.findLastIndex((message) => message.text?.startsWith(SUMMARY_PREFIX));
+          const executionMessages = summaryIndex < 0 ? productMessages : productMessages.slice(summaryIndex);
+          return toPiKernelMessages(compactMessages(
+            executionMessages, options.contextBudgetTokens!, options.keepImages,
+          ));
+        }
+      : undefined,
+  });
 }
 
 export function piToolDefinitions(options: RunAgentOptions) {
@@ -148,6 +183,7 @@ export function toPiKernelMessages(
     if (message.role === 'assistant') return [{
       role: 'assistant',
       content: message.text ? [{ type: 'text', text: message.text }] : [],
+      thinking: message.thinking,
       toolCalls: message.toolCalls?.map((call) => ({
         id: call.id, logicalCallId: call.id, name: call.name, arguments: call.args,
       })),
@@ -170,11 +206,12 @@ export function fromPiKernelMessages(messages: readonly KernelMessage[]): Msg[] 
     if (message.role === 'user') return {
       role: 'user',
       text: message.content.filter((block) => block.type === 'text').map((block) => block.text).join(''),
-      contentBlocks: [...message.content],
+      contentBlocks: message.content.flatMap((block) => block.type === 'image' ? [block] : []),
     };
     if (message.role === 'assistant') return {
       role: 'assistant',
       text: message.content.filter((block) => block.type === 'text').map((block) => block.text).join(''),
+      thinking: message.thinking,
       toolCalls: message.toolCalls?.map((call) => ({ id: call.id, name: call.name, args: call.arguments })),
     };
     return {

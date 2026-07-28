@@ -259,6 +259,7 @@ function fromPiMessages(messages: readonly AgentMessage[]): KernelMessage[] {
       return [{
         role: 'assistant',
         content: message.content.flatMap((block) => block.type === 'text' ? [{ type: 'text' as const, text: block.text }] : []),
+        thinking: message.content.flatMap((block) => block.type === 'thinking' ? [block.thinking] : []).join('') || undefined,
         toolCalls: message.content.flatMap((block) => block.type === 'toolCall' ? [{
           id: block.id, logicalCallId: block.id, name: block.name, arguments: JSON.parse(JSON.stringify(block.arguments)),
         }] : []),

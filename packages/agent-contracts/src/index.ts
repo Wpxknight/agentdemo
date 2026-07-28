@@ -132,7 +132,7 @@ export interface AgentKernel {
 
 export type KernelMessage =
   | { role: 'user'; content: readonly AgentContentBlock[] }
-  | { role: 'assistant'; content: readonly AgentContentBlock[]; toolCalls?: readonly ToolCall[] }
+  | { role: 'assistant'; content: readonly AgentContentBlock[]; thinking?: string; toolCalls?: readonly ToolCall[] }
   | { role: 'tool'; results: readonly ToolResult[] };
 
 export interface KernelTurnResult {

@@ -1,4 +1,4 @@
-import { type AgentKernel, type KernelControl, type KernelExit, type KernelRunInput, type ModelConcurrencyController, type ModelProvider, type ToolRuntime } from '@aiop/agent-contracts';
+import { type AgentKernel, type KernelControl, type KernelExit, type KernelMessage, type KernelRunInput, type ModelConcurrencyController, type ModelProvider, type ToolRuntime } from '@aiop/agent-contracts';
 import type { ContextManager } from './context-manager.js';
 export * from './context-manager.js';
 export interface PiAgentKernelOptions {
@@ -7,11 +7,14 @@ export interface PiAgentKernelOptions {
     toolRuntime: ToolRuntime;
     systemPrompt?: string;
     protocolVersion?: string;
+    getFollowUpMessages?: () => Promise<readonly KernelMessage[]>;
+    transformContext?: (messages: readonly KernelMessage[], signal?: AbortSignal) => Promise<readonly KernelMessage[]>;
     context?: {
         manager: ContextManager;
         triggerTokens: number;
         keepRecentMessages: number;
         watermarkTokens?: number;
+        summaryPrefix?: string;
     };
 }
 export declare class PiAgentKernel implements AgentKernel {
