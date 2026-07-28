@@ -30,4 +30,28 @@ describe('Pi EventCodec', () => {
       version: 1, kind: 'pi_harness_event', event: { type: 'future_event', value: 42 },
     });
   });
+
+  it('projects complex event detail into deterministic JSON-safe values', () => {
+    const codec = new EventCodec({
+      tenantId: 'tenant-1', runId: 'run-1', attemptId: 'attempt-1', turnNo: 1,
+      correlationId: 'correlation-1', sequence: () => 1n,
+    });
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const controller = new AbortController();
+    controller.abort(new Error('cancelled'));
+    const detail = codec.fromPi({
+      type: 'future_event', date: new Date('2026-07-28T00:00:00.000Z'), count: 2n,
+      error: new Error('boom'), signal: controller.signal, circular, ignored: undefined,
+    } as never).detail;
+
+    expect(() => JSON.stringify(detail)).not.toThrow();
+    expect(detail).toMatchObject({
+      event: {
+        count: '2', date: '2026-07-28T00:00:00.000Z', error: { message: 'boom' },
+        signal: { aborted: true, reason: { message: 'cancelled' } },
+        circular: { self: { kind: 'circular_reference' } },
+      },
+    });
+  });
 });

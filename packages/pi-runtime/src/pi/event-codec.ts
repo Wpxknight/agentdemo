@@ -30,12 +30,43 @@ export class EventCodec {
       correlationId: this.options.correlationId,
       sequence: this.options.sequence(),
       type: known ? event.type : 'pi_extension',
-      detail: (known
+      detail: toJsonValue(known
         ? { version: 1, ...withoutType(event) }
         : { version: 1, kind: 'pi_harness_event', event }) as JsonValue,
       createdAt: this.now(),
     };
   }
+}
+
+function toJsonValue(value: unknown, seen = new WeakSet<object>()): JsonValue {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : String(value);
+  if (typeof value === 'bigint') return value.toString();
+  if (typeof value === 'undefined' || typeof value === 'function' || typeof value === 'symbol') return null;
+  if (value instanceof Date) return value.toISOString();
+  if (value instanceof Error) return toJsonValue({
+    name: value.name, message: value.message, stack: value.stack, cause: value.cause,
+  }, seen);
+  if (typeof AbortSignal !== 'undefined' && value instanceof AbortSignal) {
+    return toJsonValue({ aborted: value.aborted, ...(value.aborted ? { reason: value.reason } : {}) }, seen);
+  }
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return { kind: 'circular_reference' };
+    seen.add(value);
+    return value.map((item) => toJsonValue(item, seen));
+  }
+  if (typeof value === 'object') {
+    if (seen.has(value)) return { kind: 'circular_reference' };
+    seen.add(value);
+    const result: Record<string, JsonValue> = {};
+    for (const key of Object.keys(value).sort()) {
+      const item = (value as Record<string, unknown>)[key];
+      if (typeof item === 'undefined' || typeof item === 'function' || typeof item === 'symbol') continue;
+      result[key] = toJsonValue(item, seen);
+    }
+    return result;
+  }
+  return String(value);
 }
 
 const KNOWN_EVENTS = new Set([

@@ -1,4 +1,4 @@
-import type { AgentInputMessage } from '@aiop/control-contracts';
+import type { AgentInputMessage, AgentRunEvent } from '@aiop/control-contracts';
 import {
   AgentHarness,
   type AgentHarnessEvent,
@@ -11,6 +11,7 @@ import {
   type SessionTreeEntry,
 } from '@earendil-works/pi-agent-core';
 import type { ImageContent, Model, Models } from '@earendil-works/pi-ai';
+import { EventCodec, type EventCodecOptions } from './event-codec.js';
 
 export interface PiAgentSessionFactoryOptions<
   TMetadata extends SessionMetadata,
@@ -29,11 +30,13 @@ export interface CreatePiAgentSessionInput<TCreateOptions extends SessionCreateO
   id?: string;
   session?: Omit<TCreateOptions, 'id'>;
   initialMessage: AgentInputMessage;
+  events: EventCodecOptions;
 }
 
 export interface LoadPiAgentSessionInput<TMetadata extends SessionMetadata = SessionMetadata> {
   metadata: TMetadata;
   initialMessage: AgentInputMessage;
+  events: EventCodecOptions;
 }
 
 export class PiAgentSessionFactory<
@@ -45,14 +48,14 @@ export class PiAgentSessionFactory<
 
   async create(input: CreatePiAgentSessionInput<TCreateOptions>): Promise<PiAgentSession<TMetadata>> {
     const createOptions = { ...input.session, ...(input.id ? { id: input.id } : {}) } as TCreateOptions;
-    return this.wrap(await this.options.repository.create(createOptions), input.initialMessage);
+    return this.wrap(await this.options.repository.create(createOptions), input.initialMessage, input.events);
   }
 
   async load(input: LoadPiAgentSessionInput<TMetadata>): Promise<PiAgentSession<TMetadata>> {
-    return this.wrap(await this.options.repository.open(input.metadata), input.initialMessage);
+    return this.wrap(await this.options.repository.open(input.metadata), input.initialMessage, input.events);
   }
 
-  private wrap(session: Session<TMetadata>, initialMessage: AgentInputMessage): PiAgentSession<TMetadata> {
+  private wrap(session: Session<TMetadata>, initialMessage: AgentInputMessage, events: EventCodecOptions): PiAgentSession<TMetadata> {
     const harness = new AgentHarness({
       session,
       models: this.options.models,
@@ -61,61 +64,82 @@ export class PiAgentSessionFactory<
       tools: this.options.tools,
       resources: this.options.resources,
     });
-    return new PiAgentSession(session, harness, initialMessage);
+    return new PiAgentSession(session, harness, initialMessage, new EventCodec(events));
   }
 }
 
 export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata> {
   private closed = false;
+  private pendingMessage?: AgentInputMessage;
+  private activeRun?: { cancel(): Promise<void> };
 
   constructor(
     private readonly session: Session<TMetadata>,
     private readonly harness: AgentHarness,
-    private readonly initialMessage: AgentInputMessage,
-  ) {}
+    initialMessage: AgentInputMessage,
+    private readonly eventCodec: EventCodec,
+  ) {
+    this.pendingMessage = initialMessage;
+  }
 
-  continue(signal?: AbortSignal): AsyncIterable<AgentHarnessEvent> {
+  continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent> {
+    const owner = this;
+    return { [Symbol.asyncIterator]: () => owner.iterate(signal) };
+  }
+
+  private async *iterate(signal?: AbortSignal): AsyncGenerator<AgentRunEvent> {
     this.ensureOpen();
-    if (signal?.aborted) {
-      return {
-        async *[Symbol.asyncIterator]() {
-          throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError');
-        },
-      };
-    }
-    const events: AgentHarnessEvent[] = [];
+    if (this.activeRun) throw new Error('Pi agent session already has an active continue');
+    if (!this.pendingMessage) throw new Error('Pi agent session has no pending input');
+    if (signal?.aborted) throw abortReason(signal);
+    const initialMessage = this.pendingMessage;
+    this.pendingMessage = undefined;
+    const events: AgentRunEvent[] = [];
     let wake: (() => void) | undefined;
     let finished = false;
     let failure: unknown;
     const unsubscribe = this.harness.subscribe((event) => {
-      events.push(event);
+      events.push(this.eventCodec.fromPi(event));
       wake?.();
       wake = undefined;
     });
-    const abort = () => { void this.harness.abort(); };
+    let cancelPromise: Promise<void> | undefined;
+    const cancel = () => cancelPromise ??= (async () => {
+      await this.harness.abort();
+      await this.harness.waitForIdle();
+    })();
+    this.activeRun = { cancel };
+    const abort = () => {
+      failure = abortReason(signal!);
+      cancelPromise = cancel().catch((error) => { failure = error; }).finally(() => { wake?.(); });
+    };
     signal?.addEventListener('abort', abort, { once: true });
-    const { text, images } = promptParts(this.initialMessage);
+    const { text, images } = promptParts(initialMessage);
     const run = this.harness.prompt(text, images.length ? { images } : undefined).then(
       () => { finished = true; wake?.(); },
-      (error) => { failure = error; finished = true; wake?.(); },
+      (error) => { failure ??= error; finished = true; wake?.(); },
     );
-    return {
-      async *[Symbol.asyncIterator]() {
-        try {
-          while (!finished || events.length) {
-            if (events.length) {
-              yield events.shift()!;
-              continue;
-            }
-            await new Promise<void>((resolve) => { wake = resolve; });
-          }
-          if (failure) throw failure;
-        } finally {
-          signal?.removeEventListener('abort', abort);
-          unsubscribe();
+    try {
+      while (!finished || events.length) {
+        if (events.length) {
+          yield events.shift()!;
+          continue;
         }
-      },
-    };
+        await new Promise<void>((resolve) => { wake = resolve; });
+      }
+      if (failure) throw failure;
+    } finally {
+      signal?.removeEventListener('abort', abort);
+      if (!finished) {
+        try { await cancel(); } catch (error) { failure ??= error; }
+        await run;
+      }
+      if (cancelPromise) {
+        try { await cancelPromise; } catch (error) { failure ??= error; }
+      }
+      unsubscribe();
+      this.activeRun = undefined;
+    }
   }
 
   async steer(message: AgentInputMessage): Promise<void> {
@@ -132,7 +156,8 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
 
   async abort(): Promise<void> {
     this.ensureOpen();
-    await this.harness.abort();
+    if (this.activeRun) await this.activeRun.cancel();
+    else await this.harness.abort();
   }
 
   setTools(tools: AgentHarnessTool<undefined>[]): Promise<void> {
@@ -154,14 +179,22 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
 
   async close(): Promise<void> {
     if (this.closed) return;
-    await this.harness.abort();
-    await this.harness.waitForIdle();
+    if (this.activeRun) {
+      await this.activeRun.cancel();
+    } else {
+      await this.harness.abort();
+      await this.harness.waitForIdle();
+    }
     this.closed = true;
   }
 
   private ensureOpen(): void {
     if (this.closed) throw new Error('Pi agent session is closed');
   }
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException('The operation was aborted', 'AbortError');
 }
 
 function promptParts(message: AgentInputMessage): { text: string; images: ImageContent[] } {

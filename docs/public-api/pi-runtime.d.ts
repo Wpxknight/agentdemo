@@ -10,9 +10,10 @@ export * from './pi/skills.js';
 export * from './pi/tool-bridge.js';
 
 // file: pi/agent.d.ts
-import type { AgentInputMessage } from '@aiop/control-contracts';
-import { AgentHarness, type AgentHarnessEvent, type AgentHarnessResources, type AgentHarnessTool, type Session, type SessionCreateOptions, type SessionMetadata, type SessionRepo, type SessionTreeEntry } from '@earendil-works/pi-agent-core';
+import type { AgentInputMessage, AgentRunEvent } from '@aiop/control-contracts';
+import { AgentHarness, type AgentHarnessResources, type AgentHarnessTool, type Session, type SessionCreateOptions, type SessionMetadata, type SessionRepo, type SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import type { Model, Models } from '@earendil-works/pi-ai';
+import { EventCodec, type EventCodecOptions } from './event-codec.js';
 export interface PiAgentSessionFactoryOptions<TMetadata extends SessionMetadata, TCreateOptions extends SessionCreateOptions, TListOptions> {
     repository: SessionRepo<TMetadata, TCreateOptions, TListOptions>;
     models: Models;
@@ -25,10 +26,12 @@ export interface CreatePiAgentSessionInput<TCreateOptions extends SessionCreateO
     id?: string;
     session?: Omit<TCreateOptions, 'id'>;
     initialMessage: AgentInputMessage;
+    events: EventCodecOptions;
 }
 export interface LoadPiAgentSessionInput<TMetadata extends SessionMetadata = SessionMetadata> {
     metadata: TMetadata;
     initialMessage: AgentInputMessage;
+    events: EventCodecOptions;
 }
 export declare class PiAgentSessionFactory<TMetadata extends SessionMetadata = SessionMetadata, TCreateOptions extends SessionCreateOptions = SessionCreateOptions, TListOptions = void> {
     private readonly options;
@@ -40,10 +43,13 @@ export declare class PiAgentSessionFactory<TMetadata extends SessionMetadata = S
 export declare class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata> {
     private readonly session;
     private readonly harness;
-    private readonly initialMessage;
+    private readonly eventCodec;
     private closed;
-    constructor(session: Session<TMetadata>, harness: AgentHarness, initialMessage: AgentInputMessage);
-    continue(signal?: AbortSignal): AsyncIterable<AgentHarnessEvent>;
+    private pendingMessage?;
+    private activeRun?;
+    constructor(session: Session<TMetadata>, harness: AgentHarness, initialMessage: AgentInputMessage, eventCodec: EventCodec);
+    continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent>;
+    private iterate;
     steer(message: AgentInputMessage): Promise<void>;
     followUp(message: AgentInputMessage): Promise<void>;
     abort(): Promise<void>;
