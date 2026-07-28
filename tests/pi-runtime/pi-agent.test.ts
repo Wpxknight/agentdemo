@@ -7,7 +7,7 @@ import {
   type Context,
   type Model,
 } from '@earendil-works/pi-ai';
-import { InMemorySessionRepo, InMemorySessionStorage, Session } from '@earendil-works/pi-agent-core';
+import { AgentHarness, InMemorySessionRepo, InMemorySessionStorage, Session } from '@earendil-works/pi-agent-core';
 import {
   EventCodec,
   PiAgentSession,
@@ -105,7 +105,7 @@ describe('PiAgentSessionFactory', () => {
     await loaded.close();
   });
 
-  it('flushes an inbox marker at a save point after an overlapping assistant write', async () => {
+  it('flushes sequential inbox markers through real Harness safe-point events before finalization', async () => {
     const base = new InMemorySessionStorage({ metadata: { id: 'serialized', createdAt: new Date().toISOString() } });
     await base.appendEntry({
       type: 'message', id: 'root', parentId: null, timestamp: new Date().toISOString(),
@@ -129,45 +129,42 @@ describe('PiAgentSessionFactory', () => {
       },
     });
     const piSession = new Session(storage);
-    const handlers = new Map<string, Array<(event: never) => Promise<void> | void>>();
-    const assistant: AssistantMessage = {
-      role: 'assistant', content: [{ type: 'text', text: 'answer' }], api: model.api, provider: model.provider, model: model.id,
-      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-      stopReason: 'stop', timestamp: Date.now(),
-    };
-    const harness = {
-      subscribe: () => () => {},
-      on(type: string, handler: (event: never) => Promise<void> | void) {
-        const current = handlers.get(type) ?? [];
-        current.push(handler);
-        handlers.set(type, current);
-        return () => handlers.set(type, (handlers.get(type) ?? []).filter((candidate) => candidate !== handler));
-      },
-      async prompt() {
-        await piSession.appendMessage(assistant);
-        for (const handler of handlers.get('save_point') ?? []) await handler({ type: 'save_point' } as never);
-        for (const handler of handlers.get('settled') ?? []) await handler({ type: 'settled' } as never);
-      },
-      async abort() {}, async waitForIdle() {}, getTools: () => [],
-    };
+    const controlled = testModels();
+    const harness = new AgentHarness({ session: piSession, models: controlled.models, model, tools: [] });
     const session = new PiAgentSession(
-      piSession, harness as never, { role: 'user', text: 'start' }, new EventCodec(eventContext('serialized')),
+      piSession, harness, { role: 'user', text: 'start' }, new EventCodec(eventContext('serialized')),
     );
 
-    const running = collect(session.continue());
+    const iterator = session.continue()[Symbol.asyncIterator]();
+    expect((await iterator.next()).done).toBe(false);
+    let markersCompleted = false;
+    const markers = (async () => {
+      await session.appendCustomEntry('aiop.inbox_consumed', { inboxMessageId: 'inbox-a' });
+      await session.appendCustomEntry('aiop.inbox_consumed', { inboxMessageId: 'inbox-b' });
+      markersCompleted = true;
+    })();
+    controlled.release();
     await paused;
-    const marker = session.appendCustomEntry('aiop.inbox_consumed', { inboxMessageId: 'inbox-a' });
-    await new Promise<void>((resolve) => setImmediate(resolve));
     releaseAssistant();
-    const markerId = await marker;
-    await running;
+
+    let sawSettled = false;
+    while (!sawSettled) {
+      const next = await iterator.next();
+      expect(next.done).toBe(false);
+      sawSettled = next.value!.type === 'settled';
+    }
+    await Promise.resolve();
+    const completedBeforeFinalize = markersCompleted;
+    while (!(await iterator.next()).done) { /* finalize */ }
+    await markers;
 
     const leaf = await session.leafId();
-    expect(leaf).toBe(markerId);
-    expect((await base.getPathToRootOrCompaction(leaf)).map((entry) => entry.id))
-      .toEqual(['root', expect.any(String), markerId]);
+    const path = await base.getPathToRootOrCompaction(leaf);
     await session.close();
+
+    expect(completedBeforeFinalize).toBe(true);
+    expect(path.filter((entry) => entry.type === 'custom').map((entry) => entry.data))
+      .toEqual([{ inboxMessageId: 'inbox-a' }, { inboxMessageId: 'inbox-b' }]);
   });
 
   it('adapts governed tools through setTools and Pi validation/execution', async () => {

@@ -86,7 +86,6 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
   private activeRun?: { cancel(): Promise<void>; finalize(cancelRunning?: boolean): Promise<void> };
   private governedToolScope: GovernedToolScope;
   private removeGovernedToolHook = () => {};
-  private removeSafeWriteHooks = () => {};
   private readonly pendingCustomEntries: Array<{
     customType: string; data?: unknown; resolve(id: string): void; reject(error: unknown): void;
   }> = [];
@@ -101,9 +100,6 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     this.pendingMessage = initialMessage;
     this.governedToolScope = adoptGovernedToolScope(harness.getTools());
     this.installGovernedToolHook(this.governedToolScope);
-    const removeSavePoint = harness.on('save_point', () => this.flushPendingCustomEntries().then(() => undefined));
-    const removeSettled = harness.on('settled', () => this.flushPendingCustomEntries().then(() => undefined));
-    this.removeSafeWriteHooks = () => { removeSavePoint(); removeSettled(); };
   }
 
   continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent> {
@@ -123,10 +119,16 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     let finished = false;
     let forceDone = false;
     let failure: unknown;
-    const unsubscribe = this.harness.subscribe((event) => {
+    const forwardEvent = (event: AgentHarnessEvent) => {
       events.push(this.eventCodec.fromPi(event));
       wake?.();
       wake = undefined;
+    };
+    const unsubscribe = this.harness.subscribe((event) => {
+      if (event.type === 'save_point' || event.type === 'settled') {
+        return this.flushPendingCustomEntries().then(() => { forwardEvent(event); });
+      }
+      forwardEvent(event);
     });
     let cancelPromise: Promise<void> | undefined;
     const cancel = () => cancelPromise ??= (async () => {
@@ -265,7 +267,6 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
         }
       } finally {
         try { this.removeGovernedToolHook(); } catch (error) { errors.push(error); }
-        try { this.removeSafeWriteHooks(); } catch (error) { errors.push(error); }
       }
       throwCollected(errors, 'Pi agent close failed');
     })();

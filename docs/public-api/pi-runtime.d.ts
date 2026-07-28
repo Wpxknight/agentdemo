@@ -73,7 +73,6 @@ export declare class PiAgentSession<TMetadata extends SessionMetadata = SessionM
     private activeRun?;
     private governedToolScope;
     private removeGovernedToolHook;
-    private removeSafeWriteHooks;
     private readonly pendingCustomEntries;
     private customFlushTail;
     constructor(session: Session<TMetadata>, harness: AgentHarness, initialMessage: AgentInputMessage, eventCodec: EventCodec);
