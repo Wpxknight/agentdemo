@@ -5,6 +5,7 @@ import { createStore } from '../src/db/index.js';
 import type { MysqlStore } from '../src/db/mysql.js';
 
 const sourceUrl = new URL('../packages/agent-runtime-mysql/src/index.ts', import.meta.url);
+const mysqlStoreSourceUrl = new URL('../src/db/mysql.ts', import.meta.url);
 
 describe('MySQL runtime adapter contract', () => {
   it('keeps commit and event sequence allocation inside Kysely transactions', async () => {
@@ -30,6 +31,19 @@ describe('MySQL runtime adapter contract', () => {
     ]) expect(source).toContain(field);
     expect(source).not.toContain("user_id: '', session_id: ''");
     expect(source).not.toContain('tool_call_id: null');
+  });
+});
+
+describe('MySQL Run Center query contract', () => {
+  it('lists committed turns in indexed transcript order', async () => {
+    const source = await readFile(mysqlStoreSourceUrl, 'utf8');
+    const method = source.slice(
+      source.indexOf('async listAgentRunTurns'),
+      source.indexOf('async listAgentRunInteractions'),
+    );
+
+    expect(method).toContain("orderBy('transcript_version', 'asc')");
+    expect(method).not.toContain("orderBy('turn_no', 'asc')");
   });
 });
 

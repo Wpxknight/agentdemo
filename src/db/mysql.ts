@@ -753,7 +753,7 @@ export class MysqlStore implements Store {
   async listAgentRunTurns(ctx: RequestContext, runId: string) {
     if (!await this.getAgentRun(ctx, runId)) return [];
     const rows = await this.db.selectFrom('agent_turn_commits').selectAll()
-      .where('tenant_id', '=', ctx.tenantId).where('run_id', '=', runId).orderBy('turn_no', 'asc').execute();
+      .where('tenant_id', '=', ctx.tenantId).where('run_id', '=', runId).orderBy('transcript_version', 'asc').execute();
     return rows.map((row) => ({
       attemptId: row.attempt_id,
       turnNo: row.turn_no,
