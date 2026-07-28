@@ -46,6 +46,7 @@ export function buildAskUserTool(): ToolHandler {
   return {
     def: {
       name: 'ask_user',
+      capability: 'read',
       description:
         '向用户提结构化选择题以澄清需求、获取偏好或让其决策（如缺少平台地址/参数时）。'
         + '1-4 题，每题 2-4 个选项；用户还可自由输入“其他”。仅在确有必要时使用，不要用于可自行判断的问题。',

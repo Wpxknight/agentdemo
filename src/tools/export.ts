@@ -84,6 +84,7 @@ export function buildExportTool(
   return {
     def: {
       name: 'sbx__export_file',
+      capability: 'retryable_write',
       description:
         '把沙箱中已生成的文件（Excel/CSV/Markdown/PDF/图片/压缩包等）导出为用户可下载的链接。'
         + '当用户要“下载/导出/保存到本地”某个生成结果时使用。返回一个有时效的下载链接，'

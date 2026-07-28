@@ -1,29 +1,24 @@
 import { createHash } from 'node:crypto';
-import type {
-  JsonValue,
-  ToolExecutionOutcome,
-  ToolRuntime,
-} from '@aiop/control-contracts';
+import type { JsonValue, ToolExecutionOutcome, ToolRuntime } from '@aiop/control-contracts';
 import type { ToolLedgerRepository } from '@aiop/agent-runtime-core';
 import {
-  ToolConcurrencyController,
-  ToolRuntimeEngine,
-  type RegisteredTool,
-} from '@aiop/tool-runtime';
+  GovernedToolFactory,
+  type GovernedToolDefinition,
+  type ResourceConcurrency,
+} from '@aiop/pi-runtime';
 import type { RunAgentOptions } from '../run-types.js';
 
 export function createAIOPToolRuntime(
   options: RunAgentOptions,
   ledger: ToolLedgerRepository,
-  concurrencyController: ToolConcurrencyController,
+  concurrency: ResourceConcurrency,
 ): ToolRuntime {
-  const definitions: RegisteredTool[] = options.tools.defs().map((definition) => ({
+  const definitions: GovernedToolDefinition[] = options.tools.defs().map((definition) => ({
     ...definition,
-    capability: capability(definition.name),
+    capability: definition.capability ?? 'non_idempotent_write',
     interactionKind: interactionKind(definition.name),
     execute: async (call, context) => {
       await options.runGuard?.();
-      throwIfAborted(context.signal);
       const result = await options.tools.dispatch({
         id: call.id, name: call.name, args: call.arguments,
       }, {
@@ -38,18 +33,18 @@ export function createAIOPToolRuntime(
         ...(options.requestPlanApproval ? { requestPlanApproval: options.requestPlanApproval } : {}),
       });
       await options.runGuard?.();
-      throwIfAborted(context.signal);
       return { content: result.content, isError: result.isError };
     },
   }));
-  const engine = new ToolRuntimeEngine({
+  const runtime = new GovernedToolFactory({
     ledger,
-    definitions,
-    concurrencyController,
+    concurrency,
     policy: {
       check: async (call) => {
         await options.runGuard?.();
-        const decision = await options.policy.check({ id: call.id, name: call.name, args: call.arguments }, options.ctx);
+        const decision = await options.policy.check({
+          id: call.id, name: call.name, args: call.arguments,
+        }, options.ctx);
         return {
           allowed: !decision.blocked,
           reason: decision.reason,
@@ -75,22 +70,14 @@ export function createAIOPToolRuntime(
         };
       },
     },
-    hooks: options.hooks ? {
-      before: async (call) => {
-        if (options.hooks!.empty) return { allowed: true };
-        const decision = await options.hooks!.preTool({
-          id: call.id, name: call.name, args: call.arguments,
-        }, options.ctx);
-        return { allowed: !decision.denied, reason: decision.reason };
-      },
-    } : undefined,
-  });
+  }).create(definitions);
+
   return {
     execute: async (call, context): Promise<ToolExecutionOutcome> => {
       const normalizedResolution = context.interactionResolution && options.durableInteractions
         ? await options.durableInteractions.wait(context.interactionResolution.interactionId)
         : undefined;
-      const outcome = await engine.execute(call, normalizedResolution === undefined ? context : {
+      const outcome = await runtime.execute(call, normalizedResolution === undefined ? context : {
         ...context,
         interactionResolution: {
           ...context.interactionResolution!,
@@ -119,24 +106,19 @@ export function createAIOPToolRuntime(
                 }],
                 plan: interaction.payload,
               }
-            : interaction.kind === 'question'
-              ? { ...base, ...(asObject(interaction.payload)) }
-              : { ...base, ...(asObject(interaction.payload)) };
+            : { ...base, ...asObject(interaction.payload) };
           return {
             ...interaction,
             userId: interaction.userId ?? context.identity.actorId,
             sessionId: interaction.sessionId ?? context.sessionId,
             payload,
-            expiresAt: interaction.expiresAt ?? new Date(interaction.createdAt.getTime() + 24 * 60 * 60 * 1000),
+            expiresAt: interaction.expiresAt
+              ?? new Date(interaction.createdAt.getTime() + 24 * 60 * 60 * 1000),
           };
         }),
       };
     },
   };
-}
-
-function capability(name: string): 'read' | 'non_idempotent_write' {
-  return /^(get|list|read|search|fetch|describe|query)(_|$)/i.test(name) ? 'read' : 'non_idempotent_write';
 }
 
 function interactionKind(name: string): 'question' | 'plan' | undefined {
@@ -147,18 +129,11 @@ function interactionKind(name: string): 'question' | 'plan' | undefined {
 
 function resourceKey(toolName: string, args: JsonValue): string | undefined {
   if (!args || typeof args !== 'object' || Array.isArray(args)) return undefined;
-  const record = args as Record<string, JsonValue>;
   for (const key of ['resourceKey', 'cluster', 'namespace', 'resource', 'target']) {
-    const value = record[key];
+    const value = args[key];
     if (typeof value === 'string' && value.trim()) return `${toolName}:${key}:${value.trim()}`;
   }
   return undefined;
-}
-
-function throwIfAborted(signal?: AbortSignal): void {
-  if (!signal?.aborted) return;
-  if (signal.reason instanceof Error) throw signal.reason;
-  throw new Error(typeof signal.reason === 'string' && signal.reason ? signal.reason : '运行已终止');
 }
 
 function toJsonValue(value: unknown): JsonValue {

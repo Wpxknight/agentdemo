@@ -61,6 +61,7 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
     {
       def: {
         name: 'sandbox_list_profiles',
+        capability: 'read',
         description: '列出当前支持的沙箱模板/profile，便于根据任务选择 code/browser/netdiag 等沙箱。',
         inputSchema: { type: 'object', properties: {} },
       },
@@ -76,6 +77,7 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
     {
       def: {
         name: 'sandbox_ensure',
+        capability: 'retryable_write',
         description: '按指定 profile 拉起或复用当前会话的沙箱。profile 省略时使用默认代码沙箱。',
         inputSchema: {
           type: 'object',
@@ -96,6 +98,7 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
     {
       def: {
         name: 'sandbox_run_code',
+        capability: 'non_idempotent_write',
         description: '在指定 profile 沙箱中执行代码。先用 sandbox_list_profiles 判断任务该使用哪种沙箱。',
         inputSchema: {
           type: 'object',
@@ -118,6 +121,7 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
     {
       def: {
         name: 'sandbox_run_command',
+        capability: 'non_idempotent_write',
         description: '在指定 profile 沙箱中执行 shell 命令。网络/运维排查应选择 netdiag 等运维 profile。',
         inputSchema: {
           type: 'object',

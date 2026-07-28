@@ -9,6 +9,14 @@ export * from './pi/models.js';
 export * from './pi/session.js';
 export * from './pi/skills.js';
 export * from './pi/tool-bridge.js';
+export * from './tools/adapter.js';
+export * from './tools/approval.js';
+export * from './tools/audit.js';
+export * from './tools/concurrency.js';
+export * from './tools/governance.js';
+export * from './tools/ledger.js';
+export * from './tools/policy.js';
+export * from './tools/registry.js';
 export * from './store/types.js';
 export * from './store/memory.js';
 export * from './store/mysql.js';
@@ -763,3 +771,125 @@ export interface DurableRunStore extends RunStore {
     inbox: RunInboxStore;
 }
 export type { ClaimRunInput, ClaimedRun, CommitTurnInput, CompleteRunInput, CreateRunRecord, RenewLeaseInput, RequestCancellationInput };
+
+// file: tools/adapter.d.ts
+import type { JsonValue, ToolCall, ToolDefinition, ToolExecutionContext, ToolResult } from '@aiop/control-contracts';
+import type { AgentTool } from '@earendil-works/pi-agent-core';
+export interface GovernedToolDefinition extends ToolDefinition {
+    interactionKind?: 'question' | 'plan';
+    execute(call: ToolCall, context: ToolExecutionContext & {
+        idempotencyKey: string;
+    }): Promise<Omit<ToolResult, 'callId'>>;
+}
+export type ToolSource = 'pi' | 'aiop' | 'mcp' | 'sandbox';
+export interface RegisteredToolSource {
+    source: ToolSource;
+    definition: GovernedToolDefinition;
+}
+export declare function adaptPiAgentTool(tool: AgentTool, capability: ToolDefinition['capability']): GovernedToolDefinition;
+export declare function resourceKeyFromArguments(toolName: string, args: JsonValue): string | undefined;
+
+// file: tools/approval.d.ts
+import type { JsonValue, ToolCall, ToolExecutionContext } from '@aiop/control-contracts';
+import type { ToolPolicyDecision } from './policy.js';
+export interface ToolApprovalDecision {
+    approved: boolean;
+    pending?: boolean;
+    interactionId?: string;
+    payload?: JsonValue;
+}
+export interface ToolApproval {
+    request(call: ToolCall, context: ToolExecutionContext, decision: ToolPolicyDecision): Promise<ToolApprovalDecision>;
+}
+
+// file: tools/audit.d.ts
+import type { ToolCall, ToolExecutionContext, ToolExecutionOutcome } from '@aiop/control-contracts';
+import type { GovernedToolDefinition } from './adapter.js';
+export interface ToolAudit {
+    record(input: {
+        call: ToolCall;
+        context: ToolExecutionContext;
+        tool: GovernedToolDefinition;
+        outcome: ToolExecutionOutcome;
+    }): Promise<void>;
+}
+
+// file: tools/concurrency.d.ts
+export interface ResourceConcurrency {
+    run<T>(input: {
+        tenantId: string;
+        resourceKey?: string;
+    }, work: () => Promise<T>): Promise<T>;
+}
+export declare class ResourceConcurrencyController implements ResourceConcurrency {
+    private readonly maxConcurrentPerResource;
+    private readonly resources;
+    constructor(maxConcurrentPerResource?: number);
+    run<T>(input: {
+        tenantId: string;
+        resourceKey?: string;
+    }, work: () => Promise<T>): Promise<T>;
+}
+
+// file: tools/governance.d.ts
+import type { ToolRuntime } from '@aiop/control-contracts';
+import type { GovernedToolDefinition } from './adapter.js';
+import type { ToolApproval } from './approval.js';
+import type { ToolAudit } from './audit.js';
+import { type ResourceConcurrency } from './concurrency.js';
+import { type ToolLedgerStore } from './ledger.js';
+import type { ToolPolicy } from './policy.js';
+export interface GovernedToolFactoryOptions {
+    ledger: ToolLedgerStore;
+    policy?: ToolPolicy;
+    approval?: ToolApproval;
+    concurrency?: ResourceConcurrency;
+    audit?: ToolAudit;
+    now?: () => Date;
+}
+export declare class GovernedToolFactory {
+    private readonly options;
+    constructor(options: GovernedToolFactoryOptions);
+    create(definitions: readonly GovernedToolDefinition[]): ToolRuntime;
+}
+
+// file: tools/ledger.d.ts
+import type { DurableToolLedgerUpdate, JsonValue } from '@aiop/control-contracts';
+export interface ToolLedgerIdentity {
+    tenantId: string;
+    runId: string;
+    logicalCallId: string;
+}
+export interface ToolLedgerStore {
+    putIfAbsent(record: DurableToolLedgerUpdate): Promise<boolean>;
+    get(identity: ToolLedgerIdentity): Promise<DurableToolLedgerUpdate | undefined>;
+    update(record: DurableToolLedgerUpdate): Promise<void>;
+}
+export declare function digestToolValue(value: JsonValue | string): string;
+
+// file: tools/policy.d.ts
+import type { ToolCall, ToolExecutionContext } from '@aiop/control-contracts';
+import type { GovernedToolDefinition } from './adapter.js';
+export interface ToolPolicyDecision {
+    allowed: boolean;
+    reason?: string;
+    needsApproval?: boolean;
+    resourceKey?: string;
+}
+export interface ToolPolicy {
+    check(call: ToolCall, context: ToolExecutionContext, tool: GovernedToolDefinition): Promise<ToolPolicyDecision>;
+}
+
+// file: tools/registry.d.ts
+import type { GovernedToolDefinition, RegisteredToolSource, ToolSource } from './adapter.js';
+import type { ToolCapability } from '@aiop/control-contracts';
+import type { AgentTool } from '@earendil-works/pi-agent-core';
+export declare class UnifiedToolRegistry {
+    private readonly tools;
+    register(source: ToolSource, definition: GovernedToolDefinition): this;
+    registerPi(tool: AgentTool, capability: ToolCapability): this;
+    unregister(name: string): boolean;
+    names(): string[];
+    definitions(): GovernedToolDefinition[];
+    entries(): RegisteredToolSource[];
+}

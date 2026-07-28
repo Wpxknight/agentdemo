@@ -22,6 +22,7 @@ export interface ToolDef {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  capability?: 'read' | 'retryable_write' | 'non_idempotent_write';
 }
 
 /** 模型发起的一次工具调用。 */

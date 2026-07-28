@@ -31,6 +31,7 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
     {
       def: {
         name: 'desktop_stream_url',
+        capability: 'read',
         description: '启动远端浏览器预览并返回 iframe 页面 URL。',
         inputSchema: { type: 'object', properties: {} },
       },
@@ -43,6 +44,7 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
     {
       def: {
         name: 'browser_navigate',
+        capability: 'retryable_write',
         description: '在远端浏览器中打开指定 URL（启动 Chrome）。',
         inputSchema: {
           type: 'object',
@@ -62,6 +64,7 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
     {
       def: {
         name: 'browser_click',
+        capability: 'non_idempotent_write',
         description: '在远端浏览器坐标 (x,y) 处左键点击。',
         inputSchema: {
           type: 'object',
@@ -84,6 +87,7 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
     {
       def: {
         name: 'browser_type',
+        capability: 'non_idempotent_write',
         description: '在远端浏览器当前焦点处键入文本；文本以换行符结尾时额外按一次回车（提交表单/搜索）。',
         inputSchema: {
           type: 'object',
@@ -102,6 +106,7 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
     {
       def: {
         name: 'browser_current_url',
+        capability: 'read',
         description: '获取远端浏览器当前页面的 URL；用户可在本地浏览器新标签页直接打开该地址操作。',
         inputSchema: { type: 'object', properties: {} },
       },
@@ -117,6 +122,7 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
     {
       def: {
         name: 'browser_screenshot',
+        capability: 'read',
         description: '截取远端浏览器画面；返回字节数与预览地址。',
         inputSchema: { type: 'object', properties: {} },
       },

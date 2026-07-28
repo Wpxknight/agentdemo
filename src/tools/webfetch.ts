@@ -62,6 +62,7 @@ export function buildWebFetchTool(opts: WebFetchOptions = {}): ToolHandler {
   return {
     def: {
       name: 'web_fetch',
+      capability: 'read',
       description:
         '抓取指定 URL 的网页内容并返回纯文本（用于查阅文档、读取页面）。'
         + '仅支持 http/https，遵守域名白名单与私网防护。'

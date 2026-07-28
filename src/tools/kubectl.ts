@@ -56,6 +56,7 @@ export function buildKubectlTool(opts: KubectlToolOptions): ToolHandler {
   return {
     def: {
       name: 'kubectl',
+      capability: 'non_idempotent_write',
       description:
         '在指定集群执行 kubectl。cluster=集群名，args=参数数组（如 ["get","pods","-A"]），dryRun=true 时变更命令以 --dry-run=server 试运行。只读集群拒绝变更，危险命令被拦截，生产变更需审批。',
       inputSchema: {

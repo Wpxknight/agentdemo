@@ -1,0 +1,311 @@
+import type {
+  DurableToolLedgerUpdate,
+  JsonValue,
+  ToolCall,
+  ToolExecutionContext,
+  ToolExecutionOutcome,
+  ToolResult,
+  ToolRuntime,
+} from '@aiop/control-contracts';
+import type { GovernedToolDefinition } from './adapter.js';
+import type { ToolApproval, ToolApprovalDecision } from './approval.js';
+import type { ToolAudit } from './audit.js';
+import { ResourceConcurrencyController, type ResourceConcurrency } from './concurrency.js';
+import { digestToolValue, type ToolLedgerStore } from './ledger.js';
+import type { ToolPolicy, ToolPolicyDecision } from './policy.js';
+
+export interface GovernedToolFactoryOptions {
+  ledger: ToolLedgerStore;
+  policy?: ToolPolicy;
+  approval?: ToolApproval;
+  concurrency?: ResourceConcurrency;
+  audit?: ToolAudit;
+  now?: () => Date;
+}
+
+export class GovernedToolFactory {
+  constructor(private readonly options: GovernedToolFactoryOptions) {}
+
+  create(definitions: readonly GovernedToolDefinition[]): ToolRuntime {
+    return new GovernedToolRuntime(this.options, definitions);
+  }
+}
+
+class GovernedToolRuntime implements ToolRuntime {
+  private readonly definitions = new Map<string, GovernedToolDefinition>();
+  private readonly concurrency: ResourceConcurrency;
+  private readonly now: () => Date;
+
+  constructor(
+    private readonly options: GovernedToolFactoryOptions,
+    definitions: readonly GovernedToolDefinition[],
+  ) {
+    for (const definition of definitions) {
+      if (this.definitions.has(definition.name)) throw new Error(`duplicate tool: ${definition.name}`);
+      this.definitions.set(definition.name, definition);
+    }
+    this.concurrency = options.concurrency ?? new ResourceConcurrencyController();
+    this.now = options.now ?? (() => new Date());
+  }
+
+  async execute(call: ToolCall, context: ToolExecutionContext): Promise<ToolExecutionOutcome> {
+    const tool = this.definitions.get(call.name);
+    if (!tool) return result(call.id, `unknown tool: ${call.name}`, true);
+    const policy = await this.options.policy?.check(call, context, tool) ?? { allowed: true };
+    if (!policy.allowed) return this.audited(call, context, tool, result(
+      call.id, `blocked by policy: ${policy.reason ?? 'denied'}`, true,
+    ));
+    if (tool.interactionKind) return this.executeInteraction(call, context, tool, tool.interactionKind);
+
+    const argsDigest = digestToolValue(call.arguments);
+    const existing = await this.options.ledger.get({
+      tenantId: context.identity.tenantId, runId: context.runId, logicalCallId: call.logicalCallId,
+    });
+    const mismatch = ledgerMismatch(existing, call, argsDigest);
+    if (mismatch) return mismatch;
+    if (existing?.status === 'completed' && existing.result) return { kind: 'result', result: existing.result };
+
+    const trustedApproval = this.trustedApproval(call, context);
+    if (trustedApproval?.outcome) return trustedApproval.outcome;
+    if (existing?.status === 'pending_approval' && !trustedApproval) {
+      return { kind: 'waiting', reason: 'approval', interactionId: existing.approvedInteractionId ?? 'pending' };
+    }
+    if (existing && existing.status !== 'pending_approval' && existing.capability === 'non_idempotent_write') {
+      return {
+        kind: 'recovery_required',
+        correlationId: existing.externalCorrelationId,
+        message: 'non-idempotent tool result is unknown and cannot be replayed automatically',
+        ledgerUpdates: [{ ...existing, status: 'recovery_required', updatedAt: this.now() }],
+      };
+    }
+
+    const approval = trustedApproval?.decision ?? await this.requestApproval(call, context, policy);
+    if (!approval.approved) return this.handleUnapproved(call, context, tool, policy, approval);
+
+    const record = this.startedRecord(call, context, tool, argsDigest, approval, existing);
+    if (existing) await this.options.ledger.update(record);
+    else if (!await this.options.ledger.putIfAbsent(record)) return this.execute(call, context);
+
+    const execute = async (): Promise<ToolExecutionOutcome> => {
+      try {
+        const raw = await tool.execute(call, { ...context, idempotencyKey: record.idempotencyKey });
+        const toolResult: ToolResult = { ...raw, callId: call.id };
+        return {
+          kind: 'result', result: toolResult,
+          ledgerUpdates: [{
+            ...record, status: 'completed', result: toolResult,
+            resultDigest: digestToolValue(toolResult.content), updatedAt: this.now(),
+          }],
+        };
+      } catch (error) {
+        if (tool.capability === 'non_idempotent_write') {
+          return {
+            kind: 'recovery_required', message: safeMessage(error),
+            ledgerUpdates: [{ ...record, status: 'recovery_required', updatedAt: this.now() }],
+          };
+        }
+        return result(call.id, safeMessage(error), true);
+      }
+    };
+    const outcome = await this.concurrency.run({
+      tenantId: context.identity.tenantId, resourceKey: policy.resourceKey,
+    }, execute);
+    return this.audited(call, context, tool, outcome);
+  }
+
+  private async requestApproval(
+    call: ToolCall,
+    context: ToolExecutionContext,
+    policy: ToolPolicyDecision,
+  ): Promise<ToolApprovalDecision> {
+    if (this.options.approval) return this.options.approval.request(call, context, policy);
+    return { approved: !policy.needsApproval };
+  }
+
+  private async handleUnapproved(
+    call: ToolCall,
+    context: ToolExecutionContext,
+    tool: GovernedToolDefinition,
+    policy: ToolPolicyDecision,
+    approval: ToolApprovalDecision,
+  ): Promise<ToolExecutionOutcome> {
+    if (approval.pending && approval.interactionId) {
+      const pending = this.pendingRecord(call, context, tool, approval.interactionId);
+      return {
+        kind: 'waiting', reason: 'approval', interactionId: approval.interactionId,
+        ledgerUpdates: [pending],
+        interactionUpdates: [{
+          tenantId: context.identity.tenantId, runId: context.runId, id: approval.interactionId,
+          userId: context.identity.actorId, sessionId: context.sessionId,
+          attemptId: context.attemptId, turnNo: context.turnNo, kind: 'approval',
+          toolCallId: call.id, status: 'pending',
+          payload: approval.payload ?? { toolName: call.name, reason: policy.reason ?? null },
+          createdAt: this.now(),
+        }],
+      };
+    }
+    if (approval.interactionId) {
+      return this.completeDenied(call, context, tool, approval.interactionId);
+    }
+    return this.audited(call, context, tool, result(
+      call.id, `needs approval: ${policy.reason ?? 'denied'}`, true,
+    ));
+  }
+
+  private trustedApproval(call: ToolCall, context: ToolExecutionContext): {
+    decision?: ToolApprovalDecision;
+    outcome?: ToolExecutionOutcome;
+  } | undefined {
+    const resolution = context.interactionResolution;
+    if (!resolution) return undefined;
+    if (resolution.kind !== 'approval' || resolution.toolCallId !== call.id || typeof resolution.value !== 'boolean') {
+      return { outcome: { kind: 'recovery_required', message: 'approval resolution does not match the pending tool call' } };
+    }
+    return { decision: { approved: resolution.value, interactionId: resolution.interactionId } };
+  }
+
+  private async completeDenied(
+    call: ToolCall,
+    context: ToolExecutionContext,
+    tool: GovernedToolDefinition,
+    interactionId: string,
+  ): Promise<ToolExecutionOutcome> {
+    const existing = await this.options.ledger.get({
+      tenantId: context.identity.tenantId, runId: context.runId, logicalCallId: call.logicalCallId,
+    });
+    const mismatch = ledgerMismatch(existing, call, digestToolValue(call.arguments));
+    if (mismatch) return mismatch;
+    if (!existing || existing.status !== 'pending_approval' || existing.approvedInteractionId !== interactionId) {
+      return { kind: 'recovery_required', message: 'approval resolution does not match the pending tool call' };
+    }
+    const toolResult: ToolResult = { callId: call.id, content: 'approval denied', isError: true };
+    return this.audited(call, context, tool, {
+      kind: 'result', result: toolResult,
+      ledgerUpdates: [{
+        ...existing, attemptId: context.attemptId, turnNo: context.turnNo, toolCallId: call.id,
+        status: 'completed', result: toolResult, resultDigest: digestToolValue(toolResult.content), updatedAt: this.now(),
+      }],
+    });
+  }
+
+  private async executeInteraction(
+    call: ToolCall,
+    context: ToolExecutionContext,
+    tool: GovernedToolDefinition,
+    kind: 'question' | 'plan',
+  ): Promise<ToolExecutionOutcome> {
+    const existing = await this.options.ledger.get({
+      tenantId: context.identity.tenantId, runId: context.runId, logicalCallId: call.logicalCallId,
+    });
+    const mismatch = ledgerMismatch(existing, call, digestToolValue(call.arguments));
+    if (mismatch) return mismatch;
+    if (existing?.status === 'completed' && existing.result) return { kind: 'result', result: existing.result };
+    if (!context.interactionResolution) {
+      const interactionId = existing?.approvedInteractionId
+        ?? digestToolValue(`${context.identity.tenantId}:${context.runId}:${call.logicalCallId}:${kind}`);
+      const pending = existing ?? this.pendingRecord(call, context, tool, interactionId);
+      return {
+        kind: 'waiting', reason: kind, interactionId,
+        ledgerUpdates: existing ? undefined : [pending],
+        interactionUpdates: existing ? undefined : [{
+          tenantId: context.identity.tenantId, runId: context.runId, id: interactionId,
+          userId: context.identity.actorId, sessionId: context.sessionId,
+          attemptId: context.attemptId, turnNo: context.turnNo, kind,
+          toolCallId: call.id, status: 'pending', payload: call.arguments, createdAt: this.now(),
+        }],
+      };
+    }
+    const resolution = context.interactionResolution;
+    if (resolution.kind !== kind || resolution.toolCallId !== call.id || !existing
+      || existing.status !== 'pending_approval' || existing.approvedInteractionId !== resolution.interactionId) {
+      return { kind: 'recovery_required', message: 'interaction resolution does not match the pending tool call' };
+    }
+    const toolResult: ToolResult = {
+      callId: call.id, content: `${kind} resolved: ${stableJson(resolution.value)}`,
+    };
+    return this.audited(call, context, tool, {
+      kind: 'result', result: toolResult,
+      ledgerUpdates: [{
+        ...existing, attemptId: context.attemptId, turnNo: context.turnNo, toolCallId: call.id,
+        status: 'completed', result: toolResult, resultDigest: digestToolValue(toolResult.content), updatedAt: this.now(),
+      }],
+    });
+  }
+
+  private pendingRecord(
+    call: ToolCall,
+    context: ToolExecutionContext,
+    tool: GovernedToolDefinition,
+    interactionId: string,
+  ): DurableToolLedgerUpdate {
+    const now = this.now();
+    return {
+      tenantId: context.identity.tenantId, runId: context.runId, attemptId: context.attemptId,
+      turnNo: context.turnNo, logicalCallId: call.logicalCallId, toolCallId: call.id,
+      toolName: call.name, argsDigest: digestToolValue(call.arguments), capability: tool.capability,
+      idempotencyKey: `${context.identity.tenantId}:${context.runId}:${call.logicalCallId}`,
+      approvedInteractionId: interactionId, status: 'pending_approval', createdAt: now, updatedAt: now,
+    };
+  }
+
+  private startedRecord(
+    call: ToolCall,
+    context: ToolExecutionContext,
+    tool: GovernedToolDefinition,
+    argsDigest: string,
+    approval: ToolApprovalDecision,
+    existing?: DurableToolLedgerUpdate,
+  ): DurableToolLedgerUpdate {
+    const now = this.now();
+    if (existing) {
+      return {
+        ...existing, attemptId: context.attemptId, turnNo: context.turnNo,
+        toolCallId: call.id, status: 'started', updatedAt: now,
+      };
+    }
+    return {
+      tenantId: context.identity.tenantId, runId: context.runId, attemptId: context.attemptId,
+      turnNo: context.turnNo, logicalCallId: call.logicalCallId, toolCallId: call.id,
+      toolName: call.name, argsDigest, capability: tool.capability,
+      idempotencyKey: `${context.identity.tenantId}:${context.runId}:${call.logicalCallId}`,
+      approvedInteractionId: approval.interactionId, status: 'started', createdAt: now, updatedAt: now,
+    };
+  }
+
+  private async audited(
+    call: ToolCall,
+    context: ToolExecutionContext,
+    tool: GovernedToolDefinition,
+    outcome: ToolExecutionOutcome,
+  ): Promise<ToolExecutionOutcome> {
+    await this.options.audit?.record({ call, context, tool, outcome });
+    return outcome;
+  }
+}
+
+function ledgerMismatch(
+  existing: DurableToolLedgerUpdate | undefined,
+  call: ToolCall,
+  argsDigest: string,
+): ToolExecutionOutcome | undefined {
+  if (existing && (existing.toolName !== call.name || existing.argsDigest !== argsDigest)) {
+    return { kind: 'recovery_required', message: 'logical tool call identity changed across attempts' };
+  }
+  return undefined;
+}
+
+function result(callId: string, content: string, isError = false): ToolExecutionOutcome {
+  return { kind: 'result', result: { callId, content, isError } };
+}
+
+function safeMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function stableJson(value: JsonValue): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key]!)}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}

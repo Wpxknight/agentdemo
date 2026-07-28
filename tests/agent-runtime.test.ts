@@ -328,13 +328,17 @@ describe('AgentRuntime', () => {
     expect(handler).not.toHaveBeenCalled();
   });
 
+  it('rejects an invalid positive-integer resource concurrency limit', () => {
+    const name = 'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE';
+    expect(() => createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'pi', [name]: '0' }))
+      .toThrow(`${name} must be a positive integer`);
+  });
+
   it.each([
     'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_TENANT',
     'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_TOOL',
-    'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE',
-  ])('rejects an invalid positive-integer %s limit', (name) => {
-    expect(() => createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'pi', [name]: '0' }))
-      .toThrow(`${name} must be a positive integer`);
+  ])('ignores retired ordinary tool scheduling setting %s', (name) => {
+    expect(() => createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'pi', [name]: '0' })).not.toThrow();
   });
 
   it('shares the configured tenant/model ceiling across Durable Pi runtime instances', async () => {

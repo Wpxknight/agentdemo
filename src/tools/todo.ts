@@ -39,6 +39,7 @@ export function buildTodoTool(): ToolHandler {
   return {
     def: {
       name: 'todo_write',
+      capability: 'retryable_write',
       description:
         '维护当前任务的待办清单以跟踪多步进度。传入完整的 todos 列表（覆盖旧列表）；'
         + '每项含 content 与 status(pending/in_progress/completed)。适合 3 步以上的复杂任务，'

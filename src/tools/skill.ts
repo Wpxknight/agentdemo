@@ -100,6 +100,7 @@ export function buildSkillTools(
   tools.push({
     def: {
       name: 'skill__read_file',
+      capability: 'read',
       description:
         '读取技能目录内某个文件的内容（如子模块 SKILL.md、脚本源码）；path 指向目录或留空时返回该层文件清单。',
       inputSchema: {
@@ -149,6 +150,7 @@ export function buildSkillTools(
     tools.push({
       def: {
         name: 'skill__sync_to_sandbox',
+        capability: 'retryable_write',
         description:
           '把技能目录同步进当前会话沙箱（目标 /workspace/skills/<技能名>/），之后可在沙箱内执行其脚本。'
           + '默认跳过超过 2MB 的单个文件；需要大文件时用 paths 显式指定子路径（单次同步总量上限 16MB）。',

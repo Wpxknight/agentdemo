@@ -18,6 +18,7 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
     {
       def: {
         name: 'schedule_task',
+        capability: 'non_idempotent_write',
         description:
           '创建定时任务：给定 cron 表达式与任务描述，调度器将到点自动执行（如“每天1点巡检”→ cron "0 1 * * *"）。preApproved=true 时无人值守执行可自动通过生产审批。',
         inputSchema: {
@@ -61,6 +62,7 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
     {
       def: {
         name: 'list_scheduled_tasks',
+        capability: 'read',
         description: '列出当前会话的定时任务及其下次执行时间。',
         inputSchema: { type: 'object', properties: {} },
       },
@@ -77,6 +79,7 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
     {
       def: {
         name: 'cancel_scheduled_task',
+        capability: 'retryable_write',
         description: '停用（取消）一个定时任务。',
         inputSchema: {
           type: 'object',
@@ -95,6 +98,7 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
     {
       def: {
         name: 'update_scheduled_task',
+        capability: 'retryable_write',
         description: '修改定时任务：可更新 cron、任务描述、启用状态、preApproved（预批准需管理员）。仅传要改的字段。',
         inputSchema: {
           type: 'object',
@@ -142,6 +146,7 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
     {
       def: {
         name: 'delete_scheduled_task',
+        capability: 'non_idempotent_write',
         description: '删除一个定时任务及其全部执行记录（不可恢复；如只想暂停请用 cancel_scheduled_task）。',
         inputSchema: {
           type: 'object',

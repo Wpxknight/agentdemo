@@ -13,6 +13,7 @@ export function buildChangePlanTool(): ToolHandler {
   return {
     def: {
       name: 'submit_change_plan',
+      capability: 'read',
       description:
         '提交结构化变更方案供用户审批（用于生产环境变更前）。'
         + '包含 summary、changes[]、impact（影响面）、rollback（回滚方式）。'

@@ -62,6 +62,7 @@ export function buildSandboxTools(
     {
       def: {
         name: 'sbx__run_code',
+        capability: 'non_idempotent_write',
         description:
           '在隔离沙箱中执行代码（默认 Python），返回 stdout/stderr。可引用同会话先前定义的变量。',
         inputSchema: {
@@ -87,6 +88,7 @@ export function buildSandboxTools(
     {
       def: {
         name: 'sbx__run_command',
+        capability: 'non_idempotent_write',
         description: '在隔离沙箱中执行 shell 命令，返回 stdout/stderr 与退出码。',
         inputSchema: {
           type: 'object',

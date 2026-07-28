@@ -19,7 +19,7 @@ import { AgentPlatformError } from '@aiop/control-contracts';
 import type { AgentRunBinding, Store } from '../db/store.js';
 import { AgentRunCancelledError, AgentRunCoordinator } from './run-coordinator.js';
 import { reqContext } from './tools.js';
-import { ToolConcurrencyController } from '@aiop/tool-runtime';
+import { ResourceConcurrencyController } from '@aiop/pi-runtime';
 import { createAIOPToolRuntime } from './pi/tool-runtime.js';
 
 export type { AgentRunBinding } from '../db/store.js';
@@ -38,7 +38,7 @@ export interface AgentRuntimeOptions {
   runtimeStore?: RuntimeStore;
   runStore?: Store;
   modelConcurrency?: ModelConcurrencyController;
-  toolConcurrency?: ToolConcurrencyController;
+  toolConcurrency?: ResourceConcurrencyController;
 }
 
 /** 供 HTTP、CLI、Scheduler 共用的稳定 Agent 运行入口。 */
@@ -51,7 +51,7 @@ export class AgentRuntime {
   private readonly runtimeStore?: RuntimeStore;
   private readonly runStore?: Store;
   private readonly modelConcurrency: ModelConcurrencyController;
-  private readonly toolConcurrency: ToolConcurrencyController;
+  private readonly toolConcurrency: ResourceConcurrencyController;
 
   constructor(options: AgentRuntimeOptions = {}) {
     this.kernel = options.kernel ?? new PiAIOPAgentKernel();
@@ -62,7 +62,7 @@ export class AgentRuntime {
     this.runtimeStore = options.runtimeStore;
     this.runStore = options.runStore;
     this.modelConcurrency = options.modelConcurrency ?? new FifoModelConcurrencyController();
-    this.toolConcurrency = options.toolConcurrency ?? new ToolConcurrencyController();
+    this.toolConcurrency = options.toolConcurrency ?? new ResourceConcurrencyController();
   }
 
   get kernelName(): AgentKernelName {
@@ -302,17 +302,9 @@ export function createConfiguredAgentRuntime(
   const modelConcurrency = new FifoModelConcurrencyController({
     maxConcurrentPerTenantModel: modelConcurrencyLimit(env.AIOP_PI_MAX_CONCURRENT_MODEL_CALLS),
   });
-  const toolConcurrency = new ToolConcurrencyController({
-    maxConcurrentPerTenant: toolConcurrencyLimit(
-      env.AIOP_PI_MAX_CONCURRENT_TOOLS_PER_TENANT, 'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_TENANT', 8,
-    ),
-    maxConcurrentPerTool: toolConcurrencyLimit(
-      env.AIOP_PI_MAX_CONCURRENT_TOOLS_PER_TOOL, 'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_TOOL', 4,
-    ),
-    maxConcurrentPerResource: toolConcurrencyLimit(
-      env.AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE, 'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE', 1,
-    ),
-  });
+  const toolConcurrency = new ResourceConcurrencyController(toolConcurrencyLimit(
+    env.AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE, 'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE', 1,
+  ));
   const pi = options.kernels?.pi ?? new PiAIOPAgentKernel(modelConcurrency);
   const piMode = resolvePiMode(env.AIOP_PI_MODE);
   return new AgentRuntime({
