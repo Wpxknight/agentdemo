@@ -136,20 +136,22 @@ Pi 0.82.1 要求 Node.js `>=22.19.0`。当前 `package.json` 仍声明 `>=20`，
 
 ### 2.4 npm 包划分
 
+> 本节原始包表已被 [`2026-07-28-pi-first-runtime-refactoring.md`](../superpowers/plans/2026-07-28-pi-first-runtime-refactoring.md) 取代。当前稳定控制契约位于 `packages/control-contracts`，Kernel SPI 位于 `packages/agent-runtime-core/src/kernel.ts`；以下表格按当前仓库状态维护。
+
 | 包 | 主要职责 | 主要依赖 |
 | --- | --- | --- |
-| `@aiop/agent-contracts` | 身份、Run、模型、工具、事件和错误类型 | 无运行时依赖 |
-| `@aiop/agent-runtime-core` | Run/Attempt/Turn、Lease、取消、预算和恢复 | contracts |
-| `@aiop/agent-kernel-pi` | Pi loop、消息、模型、工具、事件和上下文辅助能力适配 | runtime-core、Pi |
-| `@aiop/tool-runtime` | Policy、Approval、Hook、Ledger、锁和工具分发 | contracts |
+| `@aiop/control-contracts` | 身份、Durable Run、Interaction、治理工具、事件和领域错误契约 | 无运行时依赖 |
+| `@aiop/agent-runtime-core` | 迁移期 Run/Attempt/Turn、Lease、Kernel SPI、取消、预算和恢复 | control-contracts |
+| `@aiop/agent-kernel-pi` | Pi loop、消息、模型、工具、事件和上下文辅助能力适配 | control-contracts、agent-runtime-core、Pi |
+| `@aiop/tool-runtime` | Policy、Approval、Hook、Ledger、锁和工具分发 | control-contracts、agent-runtime-core |
 | `@aiop/agent-runtime-mysql` | Runtime 表、事务、租约和迁移 | runtime-core、Kysely |
-| `@aiop/sandbox-core` | acquire、execute、upload、download、release 契约 | contracts |
+| `@aiop/sandbox-core` | acquire、execute、upload、download、release 契约 | control-contracts |
 | `@aiop/sandbox-opensandbox` | OpenSandbox Provider | sandbox-core、OpenSandbox SDK |
 | `@aiop/sandbox-e2b` | E2B Provider | sandbox-core、E2B SDK |
 | `@aiop/sandbox-local` | 开发测试 Provider | sandbox-core |
-| `@aiop/mcp-runtime` | MCP 连接、发现、schema 和调用适配 | contracts、MCP SDK |
-| `@aiop/skill-runtime` | Skill 解析、版本、启停和提示词投影；可复用 Pi Skill loader | contracts、pi-agent-core |
-| `@aiop/scheduler-core` | Cron、claim 和创建 Agent Run | contracts |
+| `@aiop/mcp-runtime` | MCP 连接、发现、schema 和调用适配 | control-contracts、MCP SDK |
+| `@aiop/skill-runtime` | Skill 解析、版本、启停和提示词投影；可复用 Pi Skill loader | pi-agent-core |
+| `@aiop/scheduler-core` | Cron、claim 和创建 Agent Run | control-contracts |
 | `@aiop/scheduler-mysql` | MySQL 多副本 Scheduler Store | scheduler-core、Kysely |
 | `@aiop/agent-runtime-aiop` | AIOP 认证、Store、HTTP/SSE 和管理面适配 | 上述按需模块 |
 

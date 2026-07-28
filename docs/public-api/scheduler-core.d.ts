@@ -1,3 +1,4 @@
+// file: index.d.ts
 import type { AgentRuntime } from '@aiop/control-contracts';
 export interface ClaimedTask {
     taskId: string;

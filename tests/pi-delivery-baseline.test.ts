@@ -4,11 +4,13 @@ import { describe, expect, it } from 'vitest';
 const root = new URL('../', import.meta.url);
 
 describe('Pi delivery baseline', () => {
-  it('builds workspace package declarations before runtime refactor checks', async () => {
+  it('builds workspace package declarations before every formal test entry point', async () => {
     const manifest = JSON.parse(await readFile(new URL('package.json', root), 'utf8')) as {
       scripts: Record<string, string>;
     };
 
+    expect(manifest.scripts.pretest).toBe('npm run build:packages');
+    expect(manifest.scripts['test:agent-platform']).toMatch(/^npm run build:packages && vitest run/);
     expect(manifest.scripts['test:runtime-refactor']).toMatch(/^npm run build:packages && npm run typecheck/);
   });
 

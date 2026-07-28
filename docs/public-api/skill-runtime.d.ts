@@ -1,3 +1,4 @@
+// file: index.d.ts
 import { type Skill } from '@earendil-works/pi-agent-core';
 export interface SkillSource {
     path: string;

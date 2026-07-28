@@ -1,3 +1,4 @@
+// file: index.d.ts
 import type { IdentityContext, JsonValue, ToolDefinition } from '@aiop/control-contracts';
 export interface McpToolDescription {
     name: string;

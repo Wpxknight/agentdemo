@@ -1,3 +1,4 @@
+// file: index.d.ts
 import type { IdentityContext } from '@aiop/control-contracts';
 export interface AcquireSandboxInput {
     identity: IdentityContext;

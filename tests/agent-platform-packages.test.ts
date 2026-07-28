@@ -24,6 +24,36 @@ describe('agent platform package boundaries', () => {
     }
   });
 
+  it('snapshots every declaration file in stable order without map references', async () => {
+    const contracts = await readFile(new URL('docs/public-api/control-contracts.d.ts', root), 'utf8');
+    const runtimeCore = await readFile(new URL('docs/public-api/agent-runtime-core.d.ts', root), 'utf8');
+
+    expect(contracts).toContain('// file: run.d.ts');
+    expect(contracts).toContain('export interface DurableRunRuntime');
+    expect(contracts).toContain('append(input: AppendRunMessageInput): Promise<void>;');
+    expect(contracts).toContain('export interface RunStore');
+    expect(contracts).toContain('renewLease(input: RenewLeaseInput): Promise<void>;');
+    expect(runtimeCore).toContain('// file: kernel.d.ts');
+    expect(runtimeCore).toContain('export interface AgentKernel');
+    expect(runtimeCore).toContain('// file: store.d.ts');
+
+    for (const snapshot of [contracts, runtimeCore]) {
+      const files = [...snapshot.matchAll(/^\/\/ file: (.+)$/gm)].map((match) => match[1]!);
+      expect(files).toEqual([...files].sort((left, right) => left.localeCompare(right)));
+      expect(snapshot).not.toContain('.d.ts.map');
+      expect(snapshot).not.toContain('sourceMappingURL');
+    }
+  });
+
+  it('does not generate source or declaration maps for publishable packages', async () => {
+    const config = JSON.parse(await readFile(new URL('tsconfig.packages.json', root), 'utf8')) as {
+      compilerOptions: Record<string, unknown>;
+    };
+
+    expect(config.compilerOptions.sourceMap).toBe(false);
+    expect(config.compilerOptions.declarationMap).toBe(false);
+  });
+
   it('keeps product and LangGraph types outside public contracts', async () => {
     const contracts = await readFile(new URL('packages/control-contracts/src/index.ts', root), 'utf8');
     for (const forbidden of ['RequestContext', "../db/store", 'langgraph', '@langchain']) {

@@ -147,6 +147,7 @@ export interface RuntimeTransaction {
   events: RunEventRepository;
 }
 
+/** Migration-era internal runtime SPI; it is not the control-contracts RunStore target port. */
 export interface RuntimeStore extends RuntimeTransaction {
   transaction<T>(work: (tx: RuntimeTransaction) => Promise<T>): Promise<T>;
 }

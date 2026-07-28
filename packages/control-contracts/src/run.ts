@@ -82,6 +82,10 @@ export interface RunHandle {
   result(): Promise<AgentRunResult>;
 }
 
+/**
+ * Target durable control-plane port implemented by the Pi-first run manager.
+ * Migration-era AgentRuntime and runtime-core SPIs must not be treated as implementations of this port.
+ */
 export interface DurableRunRuntime {
   run(input: StartRunInput): Promise<RunHandle>;
   resume(input: ResumeRunInput): Promise<RunHandle>;
@@ -89,6 +93,7 @@ export interface DurableRunRuntime {
   append(input: AppendRunMessageInput): Promise<void>;
 }
 
+/** Legacy compatibility surface retained while callers migrate to DurableRunRuntime. */
 export interface AgentRuntime extends Omit<DurableRunRuntime, 'append'> {
   append?(input: AppendRunMessageInput): Promise<void>;
 }
@@ -119,6 +124,10 @@ export interface CommitTurnInput { tenantId: string; runId: string; attemptId: s
 export interface RequestCancellationInput { identity: IdentityContext; runId: string; reason?: string; requestedAt: Date }
 export interface CompleteRunInput { tenantId: string; runId: string; attemptId: string; fencingToken: bigint; status: Extract<AgentRunStatus, 'succeeded' | 'failed' | 'cancelled' | 'recovery_required'>; usage: AgentRunUsage; error?: AgentPlatformErrorData; completedAt: Date }
 
+/**
+ * Target persistence port for durable run orchestration and fencing.
+ * The migration-era runtime-core RuntimeStore is an internal SPI with different snapshot semantics.
+ */
 export interface RunStore {
   create(input: CreateRunRecord): Promise<RunRecord>;
   claim(input: ClaimRunInput): Promise<ClaimedRun | null>;

@@ -1,3 +1,4 @@
+// file: index.d.ts
 import type { AcquireSandboxInput, DownloadFile, SandboxCommand, SandboxHandle, SandboxOutput, SandboxProvider, UploadFile } from '@aiop/sandbox-core';
 export declare class LocalSandboxProvider implements SandboxProvider {
     private readonly handles;

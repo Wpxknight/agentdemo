@@ -1,3 +1,4 @@
+// file: index.d.ts
 export interface RequestContext {
     tenantId: string;
     userId: string;

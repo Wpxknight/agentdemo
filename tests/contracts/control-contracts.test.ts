@@ -25,6 +25,10 @@ const root = new URL('../../', import.meta.url);
 describe('@aiop/control-contracts', () => {
   it('exports stable control-plane contracts', () => {
     const identity: IdentityContext = { tenantId: 't1', actorId: 'u1', roles: [] };
+    const runtimeMethods: Array<keyof DurableRunRuntime> = ['run', 'resume', 'cancel', 'append'];
+    const storeMethods: Array<keyof RunStore> = [
+      'create', 'claim', 'renewLease', 'commitTurn', 'requestCancellation', 'complete',
+    ];
     const contracts: [
       DurableRunRuntime,
       RunStore,
@@ -44,6 +48,8 @@ describe('@aiop/control-contracts', () => {
     ] | undefined = undefined;
 
     expect(identity.tenantId).toBe('t1');
+    expect(runtimeMethods).toEqual(['run', 'resume', 'cancel', 'append']);
+    expect(storeMethods).toEqual(['create', 'claim', 'renewLease', 'commitTurn', 'requestCancellation', 'complete']);
     expect(contracts).toBeUndefined();
   });
 

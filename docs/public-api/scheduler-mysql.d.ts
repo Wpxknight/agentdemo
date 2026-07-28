@@ -1,3 +1,4 @@
+// file: index.d.ts
 import type { Generated, Kysely } from 'kysely';
 import type { ClaimedTask, SchedulerStore, TaskAgentRunLink } from '@aiop/scheduler-core';
 export interface SchedulerMysqlDatabase {
