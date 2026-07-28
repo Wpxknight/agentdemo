@@ -14,10 +14,11 @@ import {
   type SkillViewer,
   type SkillVisibility,
   TENANT_SKILLS_DIR,
+  PRODUCT_RECORD_FILE,
   normalizeSkillProductRecord,
   type SkillProductRecord,
 } from './product.js';
-import { canManageSkill, isSkillRecordAvailableTo, isSkillVisibleTo } from './visibility.js';
+import { canManageSkill, isSkillVisibleTo } from './visibility.js';
 import { enumerateSkillProductRecords } from './source.js';
 import { SkillProductService, type ProductSkillLoader } from './service.js';
 
@@ -113,11 +114,12 @@ export class SkillRegistry {
     const loaded = await this.service.load(this.records, viewer);
     const byId = new Map(loaded.skills.map((item) => [item.source.id, item]));
     return Promise.all(this.records
-      .filter((record) => isSkillRecordAvailableTo(record, viewer))
-      .map(async (record) => {
-        const item = byId.get(record.id);
-        return skillFromRecord(record, item?.skill, await listSkillFiles(record.path).catch(() => []));
-      }));
+      .filter((record) => byId.has(record.id))
+      .map(async (record) => skillFromRecord(
+        record,
+        byId.get(record.id)!.skill,
+        await listSkillFiles(record.path).catch(() => []),
+      )));
   }
 
   /** 注入系统提示的技能摘要（按查看者过滤）；带总预算与单条描述截断，防止技能增多撑爆 system prompt。 */
@@ -154,7 +156,7 @@ export class SkillRegistry {
         // 可见性在执行链路同样强制（不信 LLM）：越权技能等同不存在，不泄露存在性。
         const productSkill = registry.getFor(name, ctx);
         if (!productSkill || !productSkill.reviewed) {
-          const avail = registry.listFor(ctx).filter((item) => item.enabled && item.reviewed).map((item) => item.name).join(', ') || '(无)';
+          const avail = (await registry.listLoadedFor(ctx)).map((item) => item.name).join(', ') || '(无)';
           return { id: '', content: `未找到技能 ${name}。可用：${avail}`, isError: true };
         }
         if (!productSkill.enabled) {
@@ -194,14 +196,14 @@ export class SkillRegistry {
     return record ? skillFromRecord(record) : undefined;
   }
 
-  getAvailableFor(name: string, viewer?: SkillViewer): Skill | undefined {
-    const skill = this.getFor(name, viewer);
-    return skill?.enabled && skill.reviewed ? skill : undefined;
+  async getAvailableFor(name: string, viewer?: SkillViewer): Promise<Skill | undefined> {
+    if (!viewer?.tenantId) return undefined;
+    return this.loadFor(name, viewer);
   }
 
   async loadFor(name: string, viewer: SkillViewer): Promise<Skill | undefined> {
     const record = this.records.find((item) => item.name === name
-      && item.enabled && item.reviewed && this.visibleTo(skillFromRecord(item), viewer));
+      && this.visibleTo(skillFromRecord(item), viewer));
     if (!record) return undefined;
     const loaded = await this.service.load([record], viewer);
     const item = loaded.skills[0];
@@ -215,8 +217,7 @@ export class SkillRegistry {
    * 不传 paths 收集整个技能目录；传 paths 时逐项解析（目录则递归展开）。
    */
   async collectFiles(name: string, paths?: string[], viewer?: SkillViewer): Promise<{ dir: string; files: SkillFileEntry[] }> {
-    const skill = this.requireSkill(name, viewer);
-    if (!skill.enabled) throw new Error(`技能已禁用：${name}`);
+    const skill = await this.requireAvailableSkill(name, viewer);
     if (!paths?.length) {
       return { dir: skill.dir, files: (await listSkillFiles(skill.dir)).filter((f) => !f.isDirectory) };
     }
@@ -235,7 +236,7 @@ export class SkillRegistry {
   }
 
   async listDir(name: string, path = '', viewer?: SkillViewer): Promise<SkillFileEntry[]> {
-    const skill = this.requireSkill(name, viewer);
+    const skill = await this.requireAvailableSkill(name, viewer);
     const rel = normalizeSkillPath(path);
     const target = safeResolve(skill.dir, rel);
     const info = await stat(target);
@@ -251,7 +252,7 @@ export class SkillRegistry {
   }
 
   async readFile(name: string, path: string, viewer?: SkillViewer): Promise<SkillFileBody> {
-    const skill = this.requireSkill(name, viewer);
+    const skill = await this.requireAvailableSkill(name, viewer);
     const rel = normalizeSkillPath(path);
     if (!rel) throw new Error('技能文件路径不能为空');
     const entry = await fileEntry(skill.dir, rel);
@@ -267,11 +268,9 @@ export class SkillRegistry {
 
   async setEnabled(name: string, enabled: boolean, viewer?: SkillViewer): Promise<Skill> {
     const skill = this.requireSkill(name, viewer);
-    const marker = join(skill.dir, DISABLED_MARKER);
-    if (enabled) await rm(marker, { force: true });
-    else await writeFile(marker, 'disabled\n');
     const record = this.requireRecord(name, viewer);
     record.enabled = enabled;
+    await writeProductRecord(record);
     return skillFromRecord(record, undefined, await listSkillFiles(skill.dir));
   }
 
@@ -279,18 +278,19 @@ export class SkillRegistry {
   async setShared(name: string, shared: boolean, viewer?: SkillViewer): Promise<Skill> {
     const skill = this.requireSkill(name, viewer);
     if (skill.visibility === 'public') throw new Error('公共技能无需共享');
-    const marker = join(skill.dir, SHARED_MARKER);
-    if (shared) await writeFile(marker, 'shared\n');
-    else await rm(marker, { force: true });
     const record = this.requireRecord(name, viewer);
     record.visibility = shared ? 'shared' : 'private';
+    await writeProductRecord(record);
     return skillFromRecord(record);
   }
 
-  /** 记录所有者（导入后调用；public 技能落 .owner 标记，个人技能由目录决定）。 */
+  /** 导入后把认证用户固化为权威产品 owner，避免信任 zip 内声明。 */
   async setOwner(skillDir: string, owner: string): Promise<void> {
     if (!owner) return;
-    await writeFile(join(skillDir, OWNER_MARKER), `${owner}\n`);
+    const path = join(skillDir, PRODUCT_RECORD_FILE);
+    const metadata = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+    metadata.ownerUserId = owner;
+    await writeFile(path, `${JSON.stringify(metadata, null, 2)}\n`);
   }
 
   async delete(name: string, viewer?: SkillViewer): Promise<void> {
@@ -303,12 +303,23 @@ export class SkillRegistry {
     return skillFromRecord(this.requireRecord(name, viewer));
   }
 
+  private async requireAvailableSkill(name: string, viewer?: SkillViewer): Promise<Skill> {
+    const skill = viewer?.tenantId ? await this.loadFor(name, viewer) : undefined;
+    if (!skill) throw new Error(`未找到技能 ${name}`);
+    return skill;
+  }
+
   private requireRecord(name: string, viewer?: SkillViewer): SkillProductRecord {
     const record = this.records.find((item) => item.name === name
       && (!viewer || this.visibleTo(skillFromRecord(item), viewer)));
     if (!record) throw new Error(`未找到技能 ${name}`);
     return record;
   }
+}
+
+async function writeProductRecord(record: SkillProductRecord): Promise<void> {
+  const { id: _id, path: _path, description: _description, ...metadata } = record;
+  await writeFile(join(record.path, PRODUCT_RECORD_FILE), `${JSON.stringify(metadata, null, 2)}\n`);
 }
 
 function skillFromRecord(
@@ -325,7 +336,7 @@ function skillFromRecord(
     tenantId: record.tenantId,
     allowedTenantIds: record.allowedTenantIds,
     allowedRoles: record.allowedRoles,
-    owner: record.ownerId ?? '',
+    owner: record.ownerUserId ?? '',
     visibility: record.visibility,
     credentials: [...(record.credentials ?? [])],
     credentialFile: record.credentialFile,

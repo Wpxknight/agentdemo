@@ -80,7 +80,7 @@ export function buildSkillTools(
       const o = asObject(args);
       const name = reqString(o, 'name');
       const path = typeof o.path === 'string' ? o.path : '';
-      if (!registry.getAvailableFor(name, ctx)) {
+      if (!await registry.getAvailableFor(name, ctx)) {
         return { id: '', content: `未找到技能 ${name}`, isError: true };
       }
       const listDir = async (dirPath: string): Promise<ToolResult> => {
@@ -133,7 +133,7 @@ export function buildSkillTools(
         const o = asObject(args);
         const name = reqString(o, 'name');
         const paths = optStringArray(o, 'paths');
-        const skill = registry.getAvailableFor(name, ctx);
+        const skill = await registry.getAvailableFor(name, ctx);
         if (!skill) return { id: '', content: `未找到技能 ${name}`, isError: true };
         const { dir, files } = await registry.collectFiles(name, paths, ctx);
 

@@ -234,7 +234,56 @@ export declare const PI_KERNEL_VERSION = "0.82.1";
 export { InMemorySessionRepo, JsonlSessionRepo, Session, type SessionMetadata, type SessionRepo, type SessionTreeEntry, } from '@earendil-works/pi-agent-core';
 
 // file: pi/skills.d.ts
+import { type ExecutionEnv, type Skill, type SkillDiagnostic } from '@earendil-works/pi-agent-core';
 export { formatSkillsForSystemPrompt, loadSourcedSkills, loadSkills, type Skill, type SkillDiagnostic, } from '@earendil-works/pi-agent-core';
+export interface PiSkillIdentity {
+    tenantId: string;
+    userId?: string;
+    role?: string;
+}
+/** Product DTO owned by the runtime package; applications may add fields structurally. */
+export interface PiSkillProduct {
+    id: string;
+    name: string;
+    path: string;
+    version: string;
+    tenantId: string;
+    allowedTenantIds?: readonly string[];
+    ownerUserId?: string;
+    visibility: 'public' | 'private' | 'shared';
+    enabled: boolean;
+    reviewed: boolean;
+    allowedRoles?: readonly string[];
+    credentials?: readonly string[];
+    credentialFile?: string;
+}
+export type PiAvailableSkillLoader<TProduct extends PiSkillProduct> = (env: ExecutionEnv, sources: Array<{
+    path: string;
+    source: TProduct;
+}>) => Promise<{
+    skills: Array<{
+        skill: Skill;
+        source: TProduct;
+    }>;
+    diagnostics: Array<SkillDiagnostic & {
+        source: TProduct;
+    }>;
+}>;
+export interface LoadAvailableSkillsDeps<TProduct extends PiSkillProduct> {
+    loader?: PiAvailableSkillLoader<TProduct>;
+    formatter?: (skills: Skill[]) => string;
+}
+export declare function loadAvailableSkills<TProduct extends PiSkillProduct>(env: ExecutionEnv, products: readonly TProduct[], identity: PiSkillIdentity, deps?: LoadAvailableSkillsDeps<TProduct>): Promise<{
+    skills: Skill[];
+    loaded: Array<{
+        skill: Skill;
+        product: TProduct;
+    }>;
+    prompt: string;
+    diagnostics: Array<SkillDiagnostic & {
+        source: TProduct;
+    }>;
+}>;
 
 // file: pi/tool-bridge.d.ts
 import type { JsonValue, ToolCall, ToolDefinition, ToolResult } from '@aiop/control-contracts';

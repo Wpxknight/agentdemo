@@ -55,6 +55,10 @@ describe('buildSkillTools', () => {
     const skill = join(dir, 'demo');
     await mkdir(join(skill, 'sub', 'scripts'), { recursive: true });
     await writeFile(join(skill, 'SKILL.md'), '---\nname: demo\ndescription: 演示\n---\n# 顶层文档');
+    await writeFile(join(skill, '.product.json'), JSON.stringify({
+      name: 'demo', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+    }));
     await writeFile(join(skill, 'sub', 'SKILL.md'), '# 子模块文档内容');
     await writeFile(join(skill, 'sub', 'scripts', 'run.py'), 'print("hello-from-skill")');
     // 超过 2MB 的大文件：默认同步应跳过
@@ -115,6 +119,8 @@ describe('buildSkillTools', () => {
     await mkdir(skillDir);
     await writeFile(join(skillDir, 'SKILL.md'), '---\nname: quoted\ndescription: quoted\n---\nbody');
     await writeFile(join(skillDir, '.product.json'), JSON.stringify({
+      name: 'quoted', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
       credentials: ['aios'], credentialFile: "sub/o'hare.json",
     }));
     const quotedRegistry = new SkillRegistry(quotedDir);
@@ -179,6 +185,10 @@ describe('SkillRegistry Pi summaries', () => {
       const d = join(dir, `s${i}`);
       await mkdir(d);
       await writeFile(join(d, 'SKILL.md'), `---\nname: s${i}\ndescription: ${'长'.repeat(400)}\n---\n正文`);
+      await writeFile(join(d, '.product.json'), JSON.stringify({
+        name: `s${i}`, version: '1', enabled: true, reviewed: true,
+        tenantId: 'default', visibility: 'public',
+      }));
     }
     const reg = new SkillRegistry(dir, { summaryBudget: 500 });
     await reg.scan();

@@ -1,4 +1,11 @@
 {
+  "name": "aios-request",
+  "version": "1.0.0",
+  "enabled": true,
+  "reviewed": true,
+  "tenantId": "default",
+  "allowedTenantIds": ["*"],
+  "visibility": "public",
   "credentials": ["aios"],
   "credentialFile": "aios-base/token.json"
 }

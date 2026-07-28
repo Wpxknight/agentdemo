@@ -4,15 +4,12 @@ import type { Skill, SkillProductRecord, SkillViewer } from './product.js';
 export function isSkillRecordVisibleTo(record: SkillProductRecord, viewer?: SkillViewer): boolean {
   if (!viewer?.tenantId) return false;
   const tenantAllowed = record.tenantId === viewer.tenantId
-    || record.allowedTenantIds?.includes(viewer.tenantId) === true;
+    || record.allowedTenantIds?.includes(viewer.tenantId) === true
+    || record.allowedTenantIds?.includes('*') === true;
   if (!tenantAllowed) return false;
   if (record.allowedRoles?.length && (!viewer.role || !record.allowedRoles.includes(viewer.role))) return false;
-  if (record.visibility === 'private') return Boolean(viewer.userId) && record.ownerId === viewer.userId;
+  if (record.visibility === 'private') return Boolean(viewer.userId) && record.ownerUserId === viewer.userId;
   return true;
-}
-
-export function isSkillRecordAvailableTo(record: SkillProductRecord, viewer?: SkillViewer): boolean {
-  return record.enabled && record.reviewed && isSkillRecordVisibleTo(record, viewer);
 }
 
 export function isSkillVisibleTo(skill: Skill, viewer?: SkillViewer): boolean {

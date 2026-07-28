@@ -1,20 +1,19 @@
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { logger } from '../logger.js';
 import {
   PRODUCT_RECORD_FILE,
   PUBLIC_SKILLS_DIR,
   TENANT_SKILLS_DIR,
   USER_SKILLS_DIR,
   normalizeSkillProductRecord,
+  parseSkillProductMetadata,
   type SkillProductRecord,
-  type SkillVisibility,
 } from './product.js';
 
-const DISABLED_MARKER = '.disabled';
-const SHARED_MARKER = '.shared';
-const OWNER_MARKER = '.owner';
+const log = logger.child({ mod: 'skill-source' });
 
-/** Enumerates product sources and marker metadata only; it never reads SKILL.md. */
+/** Enumerates authoritative product sidecars only; it never reads SKILL.md. */
 export async function enumerateSkillProductRecords(root: string): Promise<SkillProductRecord[]> {
   const records: SkillProductRecord[] = [];
   await enumerateTenantRoot(root, 'default', records, true);
@@ -34,51 +33,49 @@ async function enumerateTenantRoot(
   if (includeLegacy) {
     for (const entry of await directories(root)) {
       if (entry === PUBLIC_SKILLS_DIR || entry === USER_SKILLS_DIR || entry === TENANT_SKILLS_DIR) continue;
-      const record = await recordFor(join(root, entry), entry, tenantId, '', 'public');
-      if (record) records.push(record);
+      await appendRecord(records, join(root, entry), tenantId);
     }
   }
   for (const entry of await directories(join(root, PUBLIC_SKILLS_DIR))) {
-    const dir = join(root, PUBLIC_SKILLS_DIR, entry);
-    const owner = (await readFile(join(dir, OWNER_MARKER), 'utf8').catch(() => '')).trim();
-    const record = await recordFor(dir, entry, tenantId, owner, 'public');
-    if (record) records.push(record);
+    await appendRecord(records, join(root, PUBLIC_SKILLS_DIR, entry), tenantId);
   }
   const usersRoot = join(root, USER_SKILLS_DIR);
-  for (const owner of await directories(usersRoot)) {
-    for (const entry of await directories(join(usersRoot, owner))) {
-      const dir = join(usersRoot, owner, entry);
-      const visibility: SkillVisibility = await exists(join(dir, SHARED_MARKER)) ? 'shared' : 'private';
-      const record = await recordFor(dir, entry, tenantId, owner, visibility);
-      if (record) records.push(record);
+  for (const ownerUserId of await directories(usersRoot)) {
+    for (const entry of await directories(join(usersRoot, ownerUserId))) {
+      await appendRecord(records, join(usersRoot, ownerUserId, entry), tenantId, ownerUserId);
     }
   }
 }
 
-async function recordFor(
+async function appendRecord(
+  records: SkillProductRecord[],
   path: string,
-  name: string,
-  tenantId: string,
-  ownerId: string,
-  visibility: SkillVisibility,
-): Promise<SkillProductRecord | undefined> {
-  if (!await exists(join(path, 'SKILL.md'))) return undefined;
-  const sidecar: Partial<SkillProductRecord> = await readFile(join(path, PRODUCT_RECORD_FILE), 'utf8')
-    .then((raw) => JSON.parse(raw) as Partial<SkillProductRecord>)
-    .catch((): Partial<SkillProductRecord> => ({}));
-  return normalizeSkillProductRecord({
-    id: `${tenantId}:${ownerId || 'public'}:${name}`,
-    name,
-    path,
-    version: 'legacy',
-    tenantId,
-    ownerId: ownerId || undefined,
-    visibility,
-    enabled: !(await exists(join(path, DISABLED_MARKER))),
-    reviewed: true,
-    credentials: sidecar.credentials,
-    credentialFile: sidecar.credentialFile,
-  });
+  expectedTenantId: string,
+  expectedOwnerUserId?: string,
+): Promise<void> {
+  try {
+    const raw = await readFile(join(path, PRODUCT_RECORD_FILE), 'utf8');
+    const metadata = parseSkillProductMetadata(JSON.parse(raw));
+    if (metadata.tenantId !== expectedTenantId) {
+      throw new Error(`tenantId ${metadata.tenantId} 与目录租户 ${expectedTenantId} 不一致`);
+    }
+    if (expectedOwnerUserId && metadata.ownerUserId !== expectedOwnerUserId) {
+      throw new Error('ownerUserId 与用户目录不一致');
+    }
+    if (expectedOwnerUserId && metadata.visibility === 'public') {
+      throw new Error('用户目录中的 Skill 不能声明 public');
+    }
+    if (!expectedOwnerUserId && metadata.visibility !== 'public') {
+      throw new Error('公共目录中的 Skill 必须声明 public');
+    }
+    records.push(normalizeSkillProductRecord({
+      id: `${metadata.tenantId}:${metadata.ownerUserId ?? 'public'}:${metadata.name}`,
+      path,
+      ...metadata,
+    }));
+  } catch (error) {
+    log.warn({ path, err: String(error) }, 'skipping skill with invalid or missing product metadata');
+  }
 }
 
 async function directories(root: string): Promise<string[]> {
@@ -88,8 +85,4 @@ async function directories(root: string): Promise<string[]> {
   } catch {
     return [];
   }
-}
-
-async function exists(path: string): Promise<boolean> {
-  try { return (await stat(path)).isFile(); } catch { return false; }
 }

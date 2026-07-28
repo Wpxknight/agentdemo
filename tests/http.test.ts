@@ -1566,6 +1566,10 @@ describe('HTTP server', () => {
     const importBase = `http://127.0.0.1:${(importServer.address() as AddressInfo).port}`;
     const data = storedZip({
       'SKILL.md': '---\nname: imported\ndescription: Imported skill\n---\n# Imported',
+      '.product.json': JSON.stringify({
+        name: 'imported', version: '1', enabled: true, reviewed: true,
+        tenantId: 'default', visibility: 'public',
+      }),
       'scripts/run.sh': 'echo imported',
     }).toString('base64');
 

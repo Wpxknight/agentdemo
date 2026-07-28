@@ -1,6 +1,6 @@
 import { mkdtemp, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { deflateRawSync } from 'node:zlib';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { SkillRegistry } from '../src/skill/registry.js';
@@ -70,6 +70,10 @@ function testZip(files: Record<string, string>): Buffer {
   return Buffer.concat([...localParts, ...centralParts, end]);
 }
 
+async function writeProduct(dir: string, metadata: Record<string, unknown>): Promise<void> {
+  await writeFile(join(dir, '.product.json'), `${JSON.stringify(metadata, null, 2)}\n`);
+}
+
 describe('SkillRegistry', () => {
   let dir: string;
 
@@ -81,6 +85,10 @@ describe('SkillRegistry', () => {
       join(inspect, 'SKILL.md'),
       '---\nname: inspect\ndescription: 集群巡检\n---\n# 巡检步骤\n1. kubectl get pods',
     );
+    await writeProduct(inspect, {
+      name: 'inspect', version: '1.0.0', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+    });
     await writeFile(join(inspect, 'helper.sh'), 'echo hi');
     // 一个无 SKILL.md 的目录应被跳过
     await mkdir(join(dir, 'broken'));
@@ -134,15 +142,16 @@ describe('SkillRegistry', () => {
       updatedAt: expect.any(String),
     });
 
-    await expect(reg.readFile('inspect', 'SKILL.md')).resolves.toMatchObject({
+    const viewer = { tenantId: 'default', userId: 'u', role: 'user' as const };
+    await expect(reg.readFile('inspect', 'SKILL.md', viewer)).resolves.toMatchObject({
       path: 'SKILL.md',
       content: expect.stringContaining('# 巡检步骤'),
       entry: expect.objectContaining({ path: 'SKILL.md', isDirectory: false }),
     });
-    await expect(reg.listDir('inspect', 'scripts')).resolves.toEqual([
+    await expect(reg.listDir('inspect', 'scripts', viewer)).resolves.toEqual([
       expect.objectContaining({ path: 'scripts/run.sh', isDirectory: false }),
     ]);
-    await expect(reg.readFile('inspect', '../escape.txt')).rejects.toThrow('非法技能文件路径');
+    await expect(reg.readFile('inspect', '../escape.txt', viewer)).rejects.toThrow('非法技能文件路径');
   });
 
   it('disables, enables, and deletes skills without exposing disabled skills to load_skill', async () => {
@@ -150,6 +159,7 @@ describe('SkillRegistry', () => {
     await reg.scan();
 
     await reg.setEnabled('inspect', false);
+    await reg.scan();
     expect(reg.list().find((skill) => skill.name === 'inspect')?.enabled).toBe(false);
     expect(await reg.summariesFor({ tenantId: 'default', userId: 'u', role: 'user' })).not.toContain('<name>inspect</name>');
     const disabled = await reg.tool().run({ name: 'inspect' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
@@ -157,6 +167,7 @@ describe('SkillRegistry', () => {
     expect(disabled.content).toContain('技能已禁用');
 
     await reg.setEnabled('inspect', true);
+    await reg.scan();
     expect(reg.list().find((skill) => skill.name === 'inspect')?.enabled).toBe(true);
     expect(await reg.summariesFor({ tenantId: 'default', userId: 'u', role: 'user' })).toContain('<name>inspect</name>');
 
@@ -174,14 +185,87 @@ describe('SkillRegistry', () => {
 });
 
 describe('SkillRegistry governed Pi loading', () => {
+  it('loads reviewed built-in products through their explicit platform-global tenant contract', async () => {
+    const reg = new SkillRegistry(resolve('skills'));
+    await reg.scan();
+
+    expect((await reg.listLoadedFor({ tenantId: 'tenant-other', userId: 'u', role: 'user' }))
+      .map((skill) => skill.name).sort()).toEqual(['aios-request', 'aios-sandbox', 'netdiag']);
+  });
+
+  it('exposes only successfully loaded canonical Pi skills across list and lookup', async () => {
+    const records: SkillProductRecord[] = [
+      { id: 'valid', name: 'valid', path: '/skills/valid', version: '1', tenantId: 'tenant-a', visibility: 'public', enabled: true, reviewed: true },
+      { id: 'missing', name: 'missing', path: '/skills/missing', version: '1', tenantId: 'tenant-a', visibility: 'public', enabled: true, reviewed: true },
+      { id: 'mismatch', name: 'canonical', path: '/skills/mismatch', version: '1', tenantId: 'tenant-a', visibility: 'public', enabled: true, reviewed: true },
+    ];
+    const loader = vi.fn(async () => ({
+      skills: [
+        { source: records[0]!, skill: { name: 'valid', description: 'valid', content: 'valid', filePath: '/skills/valid/SKILL.md' } },
+        { source: records[2]!, skill: { name: 'different', description: 'different', content: 'different', filePath: '/skills/mismatch/SKILL.md' } },
+      ],
+      diagnostics: [{ type: 'warning' as const, code: 'read_failed' as const, message: 'missing', path: '/skills/missing', source: records[1]! }],
+    }));
+    const reg = new SkillRegistry('/unused', { records, loader, env: {} as never });
+    await reg.scan();
+    const viewer = { tenantId: 'tenant-a', userId: 'user-a', role: 'user' as const };
+
+    expect((await reg.listLoadedFor(viewer)).map((skill) => skill.name)).toEqual(['valid']);
+    expect(await reg.loadFor('missing', viewer)).toBeUndefined();
+    expect(await reg.loadFor('canonical', viewer)).toBeUndefined();
+    expect(await reg.getAvailableFor('canonical', viewer)).toBeUndefined();
+    await expect(reg.readFile('canonical', 'SKILL.md', viewer)).rejects.toThrow('未找到技能 canonical');
+  });
+
+  it('fails closed on real filesystem product metadata before invoking Pi', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-products-'));
+    const fixtures = [
+      ['tenant-a', 'allowed', { name: 'allowed', version: '1', enabled: true, reviewed: true, tenantId: 'tenant-a', visibility: 'public' }],
+      ['tenant-a', 'unreviewed', { name: 'unreviewed', version: '1', enabled: true, reviewed: false, tenantId: 'tenant-a', visibility: 'public' }],
+      ['tenant-a', 'admin-only', { name: 'admin-only', version: '1', enabled: true, reviewed: true, tenantId: 'tenant-a', visibility: 'public', allowedRoles: ['tenant_admin'] }],
+      ['tenant-b', 'foreign', { name: 'foreign', version: '1', enabled: true, reviewed: true, tenantId: 'tenant-b', visibility: 'public' }],
+    ] as const;
+    for (const [tenantId, name, metadata] of fixtures) {
+      const skillDir = join(root, 'tenants', tenantId, '_public', name);
+      await mkdir(skillDir, { recursive: true });
+      await writeFile(join(skillDir, 'SKILL.md'), `---\nname: ${name}\ndescription: ${name}\n---\nbody`);
+      await writeProduct(skillDir, metadata);
+    }
+    for (const name of ['invalid', 'incomplete', 'missing']) {
+      const skillDir = join(root, name);
+      await mkdir(skillDir);
+      await writeFile(join(skillDir, 'SKILL.md'), `---\nname: ${name}\ndescription: ${name}\n---\nbody`);
+      if (name === 'invalid') await writeFile(join(skillDir, '.product.json'), '{ broken');
+      if (name === 'incomplete') await writeProduct(skillDir, {
+        name, version: '1', enabled: true, tenantId: 'default', visibility: 'public',
+      });
+    }
+    const loader = vi.fn(async (_env, sources: Array<{ path: string; source: SkillProductRecord }>) => ({
+      skills: sources.map(({ path, source }) => ({
+        source,
+        skill: { name: source.name, description: source.name, content: 'body', filePath: join(path, 'SKILL.md') },
+      })),
+      diagnostics: [],
+    }));
+    const reg = new SkillRegistry(root, { loader, env: {} as never });
+    await reg.scan();
+    const viewer = { tenantId: 'tenant-a', userId: 'user-a', role: 'user' as const };
+
+    expect(reg.list().map((skill) => skill.name)).toEqual(['admin-only', 'allowed', 'unreviewed', 'foreign']);
+    expect((await reg.listLoadedFor(viewer)).map((skill) => skill.name)).toEqual(['allowed']);
+    expect(await reg.summariesFor(viewer)).toContain('<name>allowed</name>');
+    expect(await reg.loadFor('unreviewed', viewer)).toBeUndefined();
+    for (const call of loader.mock.calls) expect(call[1].map((item) => item.source.name)).toEqual(['allowed']);
+  });
+
   it('filters actual product records before every Pi loader call', async () => {
     const records: SkillProductRecord[] = [
-      { id: 'allowed', name: 'allowed', path: '/skills/allowed', tenantId: 'tenant-a', ownerId: 'user-a', visibility: 'private', enabled: true, reviewed: true, allowedRoles: ['user'] },
-      { id: 'disabled', name: 'disabled', path: '/skills/disabled', tenantId: 'tenant-a', visibility: 'public', enabled: false, reviewed: true },
-      { id: 'unreviewed', name: 'unreviewed', path: '/skills/unreviewed', tenantId: 'tenant-a', visibility: 'public', enabled: true, reviewed: false },
-      { id: 'foreign', name: 'foreign', path: '/skills/foreign', tenantId: 'tenant-b', visibility: 'public', enabled: true, reviewed: true },
-      { id: 'other-owner', name: 'other-owner', path: '/skills/other-owner', tenantId: 'tenant-a', ownerId: 'user-b', visibility: 'private', enabled: true, reviewed: true },
-      { id: 'admin-only', name: 'admin-only', path: '/skills/admin-only', tenantId: 'tenant-a', visibility: 'shared', enabled: true, reviewed: true, allowedRoles: ['tenant_admin'] },
+      { id: 'allowed', name: 'allowed', path: '/skills/allowed', version: '1', tenantId: 'tenant-a', ownerUserId: 'user-a', visibility: 'private', enabled: true, reviewed: true, allowedRoles: ['user'] },
+      { id: 'disabled', name: 'disabled', path: '/skills/disabled', version: '1', tenantId: 'tenant-a', visibility: 'public', enabled: false, reviewed: true },
+      { id: 'unreviewed', name: 'unreviewed', path: '/skills/unreviewed', version: '1', tenantId: 'tenant-a', visibility: 'public', enabled: true, reviewed: false },
+      { id: 'foreign', name: 'foreign', path: '/skills/foreign', version: '1', tenantId: 'tenant-b', visibility: 'public', enabled: true, reviewed: true },
+      { id: 'other-owner', name: 'other-owner', path: '/skills/other-owner', version: '1', tenantId: 'tenant-a', ownerUserId: 'user-b', visibility: 'private', enabled: true, reviewed: true },
+      { id: 'admin-only', name: 'admin-only', path: '/skills/admin-only', version: '1', tenantId: 'tenant-a', visibility: 'shared', enabled: true, reviewed: true, allowedRoles: ['tenant_admin'] },
     ];
     const loader = vi.fn(async (_env, sources: Array<{ path: string; source: SkillProductRecord }>) => ({
       skills: sources.map(({ path, source }) => ({
@@ -201,8 +285,8 @@ describe('SkillRegistry governed Pi loading', () => {
     expect(loaded.content).toContain('Pi body');
     expect(loader).toHaveBeenCalled();
     for (const call of loader.mock.calls) expect(call[1].map((item) => item.source.id)).toEqual(['allowed']);
-    expect(reg.getAvailableFor('disabled', viewer)).toBeUndefined();
-    expect(reg.getAvailableFor('unreviewed', viewer)).toBeUndefined();
+    expect(await reg.getAvailableFor('disabled', viewer)).toBeUndefined();
+    expect(await reg.getAvailableFor('unreviewed', viewer)).toBeUndefined();
     expect(reg.listFor({ ...viewer, tenantId: 'tenant-b' }).map((skill) => skill.name)).toEqual(['foreign']);
     expect(reg.listFor({ ...viewer, tenantId: 'tenant-c' })).toEqual([]);
   });

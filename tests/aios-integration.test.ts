@@ -20,6 +20,10 @@ import type { RequestContext } from '../src/auth/types.js';
 
 const SECRET = 'aios-test-secret';
 
+async function writeSkillProduct(path: string, metadata: Record<string, unknown>): Promise<void> {
+  await writeFile(join(path, '.product.json'), `${JSON.stringify(metadata, null, 2)}\n`);
+}
+
 function aiosProvider(store: MemoryStore, credentials: UserCredentials, userinfo: () => Promise<Response>) {
   const config = AiosConfigSchema.parse({
     verify: 'userinfo',
@@ -225,23 +229,35 @@ describe('SkillRegistry 所有权与可见性', () => {
     // 存量公共技能（旧布局：根目录，原地视为 public）
     await mkdir(join(dir, 'legacy'), { recursive: true });
     await writeFile(join(dir, 'legacy', 'SKILL.md'), '---\nname: legacy\ndescription: 存量技能\n---\n正文');
+    await writeSkillProduct(join(dir, 'legacy'), {
+      name: 'legacy', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+    });
     // 管理员上传的公共技能（带 .owner）
     await mkdir(join(dir, '_public', 'pub'), { recursive: true });
     await writeFile(join(dir, '_public', 'pub', 'SKILL.md'), '---\nname: pub\ndescription: 公共技能\n---\n正文');
-    await writeFile(join(dir, '_public', 'pub', '.owner'), 'u_admin\n');
+    await writeSkillProduct(join(dir, '_public', 'pub'), {
+      name: 'pub', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', ownerUserId: 'u_admin', visibility: 'public',
+    });
     // u1 的私有技能（声明凭据需求）
     await mkdir(join(dir, 'users', 'u1', 'mine'), { recursive: true });
     await writeFile(
       join(dir, 'users', 'u1', 'mine', 'SKILL.md'),
       '---\nname: mine\ndescription: u1 的私有技能\ncredentials: aios\ncredential_file: sub/token.json\n---\n正文',
     );
-    await writeFile(join(dir, 'users', 'u1', 'mine', '.product.json'), JSON.stringify({
+    await writeSkillProduct(join(dir, 'users', 'u1', 'mine'), {
+      name: 'mine', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', ownerUserId: 'u1', visibility: 'private',
       credentials: ['aios'], credentialFile: 'sub/token.json',
-    }));
+    });
     // u2 的已共享技能
     await mkdir(join(dir, 'users', 'u2', 'team'), { recursive: true });
     await writeFile(join(dir, 'users', 'u2', 'team', 'SKILL.md'), '---\nname: team\ndescription: u2 共享技能\n---\n正文');
-    await writeFile(join(dir, 'users', 'u2', 'team', '.shared'), 'shared\n');
+    await writeSkillProduct(join(dir, 'users', 'u2', 'team'), {
+      name: 'team', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', ownerUserId: 'u2', visibility: 'shared',
+    });
     reg = new SkillRegistry(dir);
     await reg.scan();
   });
@@ -346,6 +362,10 @@ describe('HTTP 越权防护（A/B 用户）', () => {
       join(skillDir, 'users', bob.id, 'bobskill', 'SKILL.md'),
       '---\nname: bobskill\ndescription: bob 的技能\n---\n正文',
     );
+    await writeSkillProduct(join(skillDir, 'users', bob.id, 'bobskill'), {
+      name: 'bobskill', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', ownerUserId: bob.id, visibility: 'private',
+    });
     const skillRegistry = new SkillRegistry(skillDir);
     await skillRegistry.scan();
 
