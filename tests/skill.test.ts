@@ -2,9 +2,10 @@ import { mkdtemp, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deflateRawSync } from 'node:zlib';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { SkillRegistry } from '../src/skill/registry.js';
 import { importSkillZip } from '../src/skill/import.js';
+import { normalizeCredentialFile, type SkillProductRecord } from '../src/skill/product.js';
 
 function crc32(buf: Buffer): number {
   let crc = 0xffffffff;
@@ -94,9 +95,10 @@ describe('SkillRegistry', () => {
     await reg.scan();
 
     expect(reg.list().map((s) => s.name)).toEqual(['inspect']);
-    expect(reg.summaries()).toContain('<name>inspect</name>');
-    expect(reg.summaries()).toContain('<description>集群巡检</description>');
-    expect(reg.summaries()).toContain(`<location>${join(dir, 'inspect', 'SKILL.md')}</location>`);
+    const prompt = await reg.summariesFor({ tenantId: 'default', userId: 'u', role: 'user' });
+    expect(prompt).toContain('<name>inspect</name>');
+    expect(prompt).toContain('<description>集群巡检</description>');
+    expect(prompt).toContain(`<location>${join(dir, 'inspect', 'SKILL.md')}</location>`);
   });
 
   it('load_skill returns full body and lists bundled files', async () => {
@@ -104,11 +106,11 @@ describe('SkillRegistry', () => {
     await reg.scan();
     const tool = reg.tool();
 
-    const res = await tool.run({ name: 'inspect' }, { sessionId: 's1' });
+    const res = await tool.run({ name: 'inspect' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
     expect(res.content).toContain('# 巡检步骤');
     expect(res.content).toContain('helper.sh');
 
-    const miss = await tool.run({ name: 'nope' }, { sessionId: 's1' });
+    const miss = await tool.run({ name: 'nope' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
     expect(miss.isError).toBe(true);
   });
 
@@ -119,7 +121,7 @@ describe('SkillRegistry', () => {
     const reg = new SkillRegistry(dir);
     await reg.scan();
 
-    const skill = reg.list()[0]!;
+    const skill = (await reg.loadFor('inspect', { tenantId: 'default', userId: 'u', role: 'user' }))!;
     expect(skill.files.map((file) => file.path)).toContain('SKILL.md');
     expect(skill.files.map((file) => file.path)).toContain('scripts');
     expect(skill.files.map((file) => file.path)).toContain('scripts/run.sh');
@@ -149,14 +151,14 @@ describe('SkillRegistry', () => {
 
     await reg.setEnabled('inspect', false);
     expect(reg.list().find((skill) => skill.name === 'inspect')?.enabled).toBe(false);
-    expect(reg.summaries()).not.toContain('<name>inspect</name>');
-    const disabled = await reg.tool().run({ name: 'inspect' }, { sessionId: 's1' });
+    expect(await reg.summariesFor({ tenantId: 'default', userId: 'u', role: 'user' })).not.toContain('<name>inspect</name>');
+    const disabled = await reg.tool().run({ name: 'inspect' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
     expect(disabled.isError).toBe(true);
     expect(disabled.content).toContain('技能已禁用');
 
     await reg.setEnabled('inspect', true);
     expect(reg.list().find((skill) => skill.name === 'inspect')?.enabled).toBe(true);
-    expect(reg.summaries()).toContain('<name>inspect</name>');
+    expect(await reg.summariesFor({ tenantId: 'default', userId: 'u', role: 'user' })).toContain('<name>inspect</name>');
 
     await reg.delete('inspect');
     await expect(stat(join(dir, 'inspect'))).rejects.toThrow();
@@ -167,7 +169,52 @@ describe('SkillRegistry', () => {
     const reg = new SkillRegistry(join(dir, 'does-not-exist'));
     await reg.scan();
     expect(reg.list()).toEqual([]);
-    expect(reg.summaries()).toBe('');
+    expect(await reg.summariesFor({ tenantId: 'default', userId: 'u', role: 'user' })).toBe('');
+  });
+});
+
+describe('SkillRegistry governed Pi loading', () => {
+  it('filters actual product records before every Pi loader call', async () => {
+    const records: SkillProductRecord[] = [
+      { id: 'allowed', name: 'allowed', path: '/skills/allowed', tenantId: 'tenant-a', ownerId: 'user-a', visibility: 'private', enabled: true, reviewed: true, allowedRoles: ['user'] },
+      { id: 'disabled', name: 'disabled', path: '/skills/disabled', tenantId: 'tenant-a', visibility: 'public', enabled: false, reviewed: true },
+      { id: 'unreviewed', name: 'unreviewed', path: '/skills/unreviewed', tenantId: 'tenant-a', visibility: 'public', enabled: true, reviewed: false },
+      { id: 'foreign', name: 'foreign', path: '/skills/foreign', tenantId: 'tenant-b', visibility: 'public', enabled: true, reviewed: true },
+      { id: 'other-owner', name: 'other-owner', path: '/skills/other-owner', tenantId: 'tenant-a', ownerId: 'user-b', visibility: 'private', enabled: true, reviewed: true },
+      { id: 'admin-only', name: 'admin-only', path: '/skills/admin-only', tenantId: 'tenant-a', visibility: 'shared', enabled: true, reviewed: true, allowedRoles: ['tenant_admin'] },
+    ];
+    const loader = vi.fn(async (_env, sources: Array<{ path: string; source: SkillProductRecord }>) => ({
+      skills: sources.map(({ path, source }) => ({
+        source,
+        skill: { name: source.name, description: 'loaded by Pi', content: 'Pi body', filePath: join(path, 'SKILL.md') },
+      })),
+      diagnostics: [],
+    }));
+    const reg = new SkillRegistry('/unused', { records, loader, env: {} as never });
+    await reg.scan();
+    const viewer = { tenantId: 'tenant-a', userId: 'user-a', role: 'user' as const };
+
+    const prompt = await reg.summariesFor(viewer);
+    expect(prompt).toContain('<name>allowed</name>');
+    expect((await reg.listLoadedFor(viewer)).map((skill) => skill.name)).toEqual(['allowed']);
+    const loaded = await reg.tool().run({ name: 'allowed' }, { sessionId: 's', ...viewer });
+    expect(loaded.content).toContain('Pi body');
+    expect(loader).toHaveBeenCalled();
+    for (const call of loader.mock.calls) expect(call[1].map((item) => item.source.id)).toEqual(['allowed']);
+    expect(reg.getAvailableFor('disabled', viewer)).toBeUndefined();
+    expect(reg.getAvailableFor('unreviewed', viewer)).toBeUndefined();
+    expect(reg.listFor({ ...viewer, tenantId: 'tenant-b' }).map((skill) => skill.name)).toEqual(['foreign']);
+    expect(reg.listFor({ ...viewer, tenantId: 'tenant-c' })).toEqual([]);
+  });
+});
+
+describe('credential_file validation', () => {
+  it.each(['', '.', '..', '../token.json', '/tmp/token.json', 'C:/token.json', 'sub\\token.json', 'sub/../token.json', 'token.json\0x', 'sub/'])('rejects unsafe target %j', (target) => {
+    expect(() => normalizeCredentialFile(target)).toThrow('credential_file');
+  });
+
+  it('accepts a normalized relative file including a single quote', () => {
+    expect(normalizeCredentialFile("sub/o'hare.json")).toBe("sub/o'hare.json");
   });
 });
 
@@ -204,6 +251,15 @@ describe('importSkillZip', () => {
     await expect(importSkillZip({ rootDir: root, filename: 'link.zip', data: zip })).rejects.toThrow('符号链接');
   });
 
+  it('rejects symbolic-link directory entries before skipping directories', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-import-skill-link-dir-'));
+    const zip = testZip({ 'link/': '' });
+    const central = zip.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    zip.writeUInt16LE(0x0314, central + 4);
+    zip.writeUInt32LE((0o120777 << 16) >>> 0, central + 38);
+    await expect(importSkillZip({ rootDir: root, filename: 'link-dir.zip', data: zip })).rejects.toThrow('符号链接');
+  });
+
   it('rejects oversized zip entries before inflation', async () => {
     const root = await mkdtemp(join(tmpdir(), 'aiop-import-skill-large-'));
     const zip = testZip({ 'SKILL.md': 'small' });
@@ -211,5 +267,28 @@ describe('importSkillZip', () => {
     zip.writeUInt32LE(20_000_000, central + 24);
 
     await expect(importSkillZip({ rootDir: root, filename: 'large.zip', data: zip })).rejects.toThrow('大小上限');
+  });
+
+  it('bounds actual inflation when a forged entry declares a small size', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-import-skill-bomb-'));
+    const zip = testZip({ 'SKILL.md': 'a'.repeat(17_000_000) });
+    const local = zip.indexOf(Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+    const central = zip.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    zip.writeUInt32LE(5, local + 22);
+    zip.writeUInt32LE(5, central + 24);
+
+    await expect(importSkillZip({ rootDir: root, filename: 'bomb.zip', data: zip })).rejects.toThrow(/上限|maxOutputLength|larger/);
+  });
+
+  it('rejects dangerous executable extensions and malformed directory paths', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-import-skill-type-'));
+    await expect(importSkillZip({
+      rootDir: root, filename: 'danger.zip',
+      data: testZip({ 'SKILL.md': '---\nname: danger\ndescription: danger\n---\nbody', 'payload.exe': 'MZ' }),
+    })).rejects.toThrow('文件类型');
+    await expect(importSkillZip({
+      rootDir: root, filename: 'bad-dir.zip',
+      data: testZip({ 'SKILL.md': 'ok', 'scripts//run.sh': 'echo no' }),
+    })).rejects.toThrow('非法 zip 路径');
   });
 });

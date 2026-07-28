@@ -37,7 +37,7 @@ import { buildSandboxTools } from './tools/builtin.js';
 import type { SpecResolver } from './sandbox/acquisition.js';
 import { buildExportTool } from './tools/export.js';
 import { DownloadStore } from './server/downloads.js';
-import { buildSkillTools } from './tools/skill.js';
+import { buildSkillTools } from './tools/skill/index.js';
 import { buildSandboxProfileTools } from './tools/sandbox-profiles.js';
 import { buildBrowserTools } from './tools/browser.js';
 import { McpManager } from './mcp/manager.js';

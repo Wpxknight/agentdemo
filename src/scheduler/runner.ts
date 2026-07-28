@@ -64,7 +64,9 @@ async function runScheduledTask(
     unattended: true, // 系统提示切换为“确认类操作跳过并汇报”，不对着空气等确认
     // 技能摘要按任务归属用户过滤（他人私有技能不可见），与交互链路同一套可见性规则。
     system: [
-      rt.skillRegistry?.summariesFor({ userId: t.userId, role: taskCtx.role }) ?? rt.systemExtra,
+      rt.skillRegistry
+        ? await rt.skillRegistry.summariesFor({ tenantId: taskCtx.tenantId, userId: t.userId, role: taskCtx.role })
+        : rt.systemExtra,
       rt.sandboxSettings?.enabled ? SANDBOX_SERVICE_NOTE : '',
       userHomeNote,
     ].filter(Boolean).join('\n\n'),

@@ -235,6 +235,9 @@ describe('SkillRegistry 所有权与可见性', () => {
       join(dir, 'users', 'u1', 'mine', 'SKILL.md'),
       '---\nname: mine\ndescription: u1 的私有技能\ncredentials: aios\ncredential_file: sub/token.json\n---\n正文',
     );
+    await writeFile(join(dir, 'users', 'u1', 'mine', '.product.json'), JSON.stringify({
+      credentials: ['aios'], credentialFile: 'sub/token.json',
+    }));
     // u2 的已共享技能
     await mkdir(join(dir, 'users', 'u2', 'team'), { recursive: true });
     await writeFile(join(dir, 'users', 'u2', 'team', 'SKILL.md'), '---\nname: team\ndescription: u2 共享技能\n---\n正文');
@@ -258,48 +261,48 @@ describe('SkillRegistry 所有权与可见性', () => {
   });
 
   it('listFor：public ∪ 自己的 ∪ shared；私有技能对他人不可见', () => {
-    const u1View = reg.listFor({ userId: 'u1', role: 'user' }).map((s) => s.name).sort();
+    const u1View = reg.listFor({ tenantId: 'default', userId: 'u1', role: 'user' }).map((s) => s.name).sort();
     expect(u1View).toEqual(['legacy', 'mine', 'pub', 'team']);
-    const u3View = reg.listFor({ userId: 'u3', role: 'user' }).map((s) => s.name).sort();
+    const u3View = reg.listFor({ tenantId: 'default', userId: 'u3', role: 'user' }).map((s) => s.name).sort();
     expect(u3View).toEqual(['legacy', 'pub', 'team']);
     // 管理员也看不到他人私有技能
-    const adminView = reg.listFor({ userId: 'u_admin', role: 'tenant_admin' }).map((s) => s.name).sort();
+    const adminView = reg.listFor({ tenantId: 'default', userId: 'u_admin', role: 'tenant_admin' }).map((s) => s.name).sort();
     expect(adminView).toEqual(['legacy', 'pub', 'team']);
   });
 
   it('canManage：仅所有者；无主存量技能由 tenant:manage 管理员代管', () => {
     const mine = reg.get('mine')!;
-    expect(reg.canManage(mine, { userId: 'u1', role: 'user' })).toBe(true);
-    expect(reg.canManage(mine, { userId: 'u_admin', role: 'platform_admin' })).toBe(false); // 管理员不能管他人技能
+    expect(reg.canManage(mine, { tenantId: 'default', userId: 'u1', role: 'user' })).toBe(true);
+    expect(reg.canManage(mine, { tenantId: 'default', userId: 'u_admin', role: 'platform_admin' })).toBe(false); // 管理员不能管他人技能
     const legacy = reg.get('legacy')!;
-    expect(reg.canManage(legacy, { userId: 'u_admin', role: 'tenant_admin' })).toBe(true);
-    expect(reg.canManage(legacy, { userId: 'u1', role: 'user' })).toBe(false);
+    expect(reg.canManage(legacy, { tenantId: 'default', userId: 'u_admin', role: 'tenant_admin' })).toBe(true);
+    expect(reg.canManage(legacy, { tenantId: 'default', userId: 'u1', role: 'user' })).toBe(false);
   });
 
   it('load_skill 执行链路做同一套可见性过滤（不信 LLM）', async () => {
     const tool = reg.tool();
     // u3 尝试加载 u1 的私有技能 → 等同不存在
-    const denied = await tool.run({ name: 'mine' }, { sessionId: 's', tenantId: 't1', userId: 'u3', role: 'user' });
+    const denied = await tool.run({ name: 'mine' }, { sessionId: 's', tenantId: 'default', userId: 'u3', role: 'user' });
     expect(denied.isError).toBe(true);
     expect(denied.content).toContain('未找到技能');
     // u1 自己可以加载
-    const ok = await tool.run({ name: 'mine' }, { sessionId: 's', tenantId: 't1', userId: 'u1', role: 'user' });
+    const ok = await tool.run({ name: 'mine' }, { sessionId: 's', tenantId: 'default', userId: 'u1', role: 'user' });
     expect(ok.isError).toBeUndefined();
   });
 
   it('setShared 切换 private ↔ shared；公共技能不可共享', async () => {
     const shared = await reg.setShared('mine', true);
     expect(shared.visibility).toBe('shared');
-    expect(reg.listFor({ userId: 'u3', role: 'user' }).map((s) => s.name)).toContain('mine');
+    expect(reg.listFor({ tenantId: 'default', userId: 'u3', role: 'user' }).map((s) => s.name)).toContain('mine');
     const back = await reg.setShared('mine', false);
     expect(back.visibility).toBe('private');
     await expect(reg.setShared('pub', true)).rejects.toThrow('公共技能');
   });
 
   it('importRootFor：管理员 → _public；普通用户 → users/<uid>', () => {
-    expect(reg.importRootFor({ userId: 'u_admin', role: 'tenant_admin' })).toBe(join(dir, '_public'));
-    expect(reg.importRootFor({ userId: 'u1', role: 'user' })).toBe(join(dir, 'users', 'u1'));
-    expect(reg.importRootFor({ userId: '../evil', role: 'user' })).toBe(join(dir, 'users', '.._evil'));
+    expect(reg.importRootFor({ tenantId: 'default', userId: 'u_admin', role: 'tenant_admin' })).toBe(join(dir, '_public'));
+    expect(reg.importRootFor({ tenantId: 'default', userId: 'u1', role: 'user' })).toBe(join(dir, 'users', 'u1'));
+    expect(reg.importRootFor({ tenantId: 'default', userId: '../evil', role: 'user' })).toBe(join(dir, 'users', '.._evil'));
   });
 });
 

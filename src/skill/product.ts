@@ -1,13 +1,30 @@
+import { posix } from 'node:path';
 import type { Role } from '../auth/types.js';
-import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 
-/** AIoP Skill product visibility. */
 export type SkillVisibility = 'public' | 'private' | 'shared';
 
 export interface SkillViewer {
+  tenantId?: string;
   userId?: string;
   role?: Role;
+}
+
+/** Authoritative AIoP product record. Pi receives this only after governance. */
+export interface SkillProductRecord {
+  id: string;
+  name: string;
+  path: string;
+  version?: string;
+  description?: string;
+  tenantId: string;
+  allowedTenantIds?: readonly string[];
+  ownerId?: string;
+  visibility: SkillVisibility;
+  enabled: boolean;
+  reviewed: boolean;
+  allowedRoles?: readonly Role[];
+  credentials?: readonly string[];
+  credentialFile?: string;
 }
 
 export interface Skill {
@@ -15,12 +32,17 @@ export interface Skill {
   description: string;
   dir: string;
   enabled: boolean;
+  reviewed: boolean;
+  tenantId: string;
+  allowedTenantIds?: readonly string[];
+  allowedRoles?: readonly Role[];
   owner: string;
   visibility: SkillVisibility;
   credentials: string[];
   credentialFile?: string;
   body: string;
   files: SkillFileEntry[];
+  product: SkillProductRecord;
 }
 
 export interface SkillFileEntry {
@@ -40,28 +62,37 @@ export interface SkillFileBody {
 
 export const PUBLIC_SKILLS_DIR = '_public';
 export const USER_SKILLS_DIR = 'users';
+export const TENANT_SKILLS_DIR = 'tenants';
+export const PRODUCT_RECORD_FILE = '.product.json';
 
-export interface SkillProductMetadata {
-  credentials: string[];
-  credentialFile?: string;
+export function normalizeCredentialFile(value: string): string {
+  if (!value || value.includes('\0') || value.includes('\\') || value.endsWith('/')
+    || value.startsWith('/') || /^[A-Za-z]:\//.test(value)) {
+    throw new Error('credential_file 必须是规范的相对文件路径');
+  }
+  const parts = value.split('/');
+  if (parts.some((part) => !part || part === '.' || part === '..')) {
+    throw new Error('credential_file 必须是规范的相对文件路径');
+  }
+  const normalized = posix.normalize(value);
+  if (!normalized || normalized === '.' || normalized.startsWith('../')) {
+    throw new Error('credential_file 必须是规范的相对文件路径');
+  }
+  return normalized;
 }
 
-/** Product-only metadata not interpreted by Pi's runtime Skill model. */
-export async function readSkillProductMetadata(dir: string): Promise<SkillProductMetadata> {
-  const raw = await readFile(join(dir, 'SKILL.md'), 'utf8');
-  const header = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(raw)?.[1] ?? '';
-  const values = new Map<string, string>();
-  for (const line of header.split(/\r?\n/)) {
-    const separator = line.indexOf(':');
-    if (separator < 0) continue;
-    const key = line.slice(0, separator).trim();
-    const value = line.slice(separator + 1).trim().replace(/^(['"])(.*)\1$/, '$2');
-    if (key) values.set(key, value);
+export function normalizeSkillProductRecord(record: SkillProductRecord): SkillProductRecord {
+  if (!record.id || !record.name || !record.path || !record.tenantId) {
+    throw new Error('Skill 产品记录缺少必填字段');
   }
-  const credentials = (values.get('credentials') ?? '')
-    .replace(/^\[|\]$/g, '')
-    .split(',')
-    .map((value) => value.trim())
-    .filter(Boolean);
-  return { credentials, credentialFile: values.get('credential_file') || undefined };
+  if (record.credentials && (!Array.isArray(record.credentials)
+    || record.credentials.some((item) => typeof item !== 'string' || !item))) {
+    throw new Error('Skill credentials 必须是非空字符串数组');
+  }
+  return {
+    ...record,
+    credentialFile: record.credentialFile === undefined
+      ? undefined
+      : normalizeCredentialFile(record.credentialFile),
+  };
 }

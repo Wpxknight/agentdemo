@@ -1024,7 +1024,9 @@ async function handle(
           inputSchema: def.inputSchema,
         })),
       // 技能按查看者过滤：public ∪ 自己的 ∪ shared（服务端过滤，不信前端）。
-      ...(rt.skillRegistry?.listFor(ctx).map((skill) => publicSkill(skill, rt.skillRegistry!, ctx)) ?? []),
+      ...(rt.skillRegistry
+        ? (await rt.skillRegistry.listLoadedFor(ctx)).map((skill) => publicSkill(skill, rt.skillRegistry!, ctx))
+        : []),
     ];
     const groups = tools.reduce<Record<string, number>>((acc, tool) => {
       const category = typeof tool.category === 'string' ? tool.category : 'builtin';
@@ -1052,7 +1054,8 @@ async function handle(
     await rt.skillRegistry.setOwner(imported.skillDir, ctx.userId);
     await rt.skillRegistry.scan();
     rt.systemExtra = rt.skillRegistry.summaries();
-    const skill = rt.skillRegistry.list().find((item) => resolve(item.dir) === resolve(imported.skillDir));
+    const importedProduct = rt.skillRegistry.list().find((item) => resolve(item.dir) === resolve(imported.skillDir));
+    const skill = importedProduct ? await rt.skillRegistry.loadFor(importedProduct.name, ctx) : undefined;
     if (!skill) throw new HttpError(422, '导入后未发现有效技能');
     await rt.audit?.record({
       kind: 'auth', action: 'skill-imported', tenantId: ctx.tenantId,
@@ -1069,7 +1072,7 @@ async function handle(
     const name = decodeURIComponent(skillShareMatch[1]!);
     const skill = requireManagedSkill(rt, ctx, name);
     try {
-      const updated = await rt.skillRegistry.setShared(skill.name, skillShareMatch[2] === 'share');
+      const updated = await rt.skillRegistry.setShared(skill.name, skillShareMatch[2] === 'share', ctx);
       rt.systemExtra = rt.skillRegistry.summaries();
       await rt.audit?.record({
         kind: 'auth', action: skillShareMatch[2] === 'share' ? 'skill-shared' : 'skill-unshared',
@@ -1090,7 +1093,7 @@ async function handle(
     if (!rt.skillRegistry.getFor(name, ctx)) throw new HttpError(404, `未找到技能 ${name}`);
     const requestedPath = url.searchParams.get('path') ?? '';
     try {
-      const entries = await rt.skillRegistry.listDir(name, requestedPath);
+      const entries = await rt.skillRegistry.listDir(name, requestedPath, ctx);
       return sendJson(res, 200, {
         path: requestedPath,
         parentPath: requestedPath ? parentSkillPath(requestedPath) : null,
@@ -1099,7 +1102,7 @@ async function handle(
     } catch (err) {
       if (String(err).includes('不是目录')) {
         try {
-          return sendJson(res, 200, await rt.skillRegistry.readFile(name, requestedPath));
+          return sendJson(res, 200, await rt.skillRegistry.readFile(name, requestedPath, ctx));
         } catch (readErr) {
           throw skillHttpError(readErr);
         }
@@ -1116,7 +1119,7 @@ async function handle(
     const managed = requireManagedSkill(rt, ctx, name);
     const enabled = skillActionMatch[2] === 'enable';
     try {
-      const skill = await rt.skillRegistry.setEnabled(managed.name, enabled);
+      const skill = await rt.skillRegistry.setEnabled(managed.name, enabled, ctx);
       rt.systemExtra = rt.skillRegistry.summaries();
       return sendJson(res, 200, { skill: publicSkill(skill, rt.skillRegistry, ctx) });
     } catch (err) {
@@ -1133,7 +1136,7 @@ async function handle(
     const name = decodeURIComponent(skillDeleteMatch[1]!);
     const managed = requireManagedSkill(rt, ctx, name);
     try {
-      await rt.skillRegistry.delete(managed.name);
+      await rt.skillRegistry.delete(managed.name, ctx);
       rt.systemExtra = rt.skillRegistry.summaries();
       await rt.audit?.record({
         kind: 'auth', action: 'skill-deleted', tenantId: ctx.tenantId,
@@ -1829,8 +1832,8 @@ function publicSkill(skill: Skill, registry: SkillRegistry, viewer?: RequestCont
 function requireManagedSkill(rt: Runtime, ctx: RequestContext, name: string): Skill {
   const registry = rt.skillRegistry;
   if (!registry) throw new HttpError(409, '未启用技能目录');
-  const skill = registry.get(name);
-  if (!skill || !registry.visibleTo(skill, ctx)) throw new HttpError(404, `未找到技能 ${name}`);
+  const skill = registry.getFor(name, ctx);
+  if (!skill) throw new HttpError(404, `未找到技能 ${name}`);
   if (!registry.canManage(skill, ctx)) throw new HttpError(403, '仅技能所有者可执行该操作');
   return skill;
 }
@@ -2093,7 +2096,7 @@ async function recoverAgentRun(
       toolLedger: new DurableToolLedger(rt.store),
       durableInteractions,
       system: [
-        rt.skillRegistry ? rt.skillRegistry.summariesFor(ctx) : rt.systemExtra,
+        rt.skillRegistry ? await rt.skillRegistry.summariesFor(ctx) : rt.systemExtra,
         rt.sandboxSettings?.enabled ? SANDBOX_SERVICE_NOTE : '',
         userHomeNote,
       ].filter(Boolean).join('\n\n'),
@@ -2428,7 +2431,7 @@ async function runAgentSse(
       // 技能摘要按当前用户过滤（他人私有技能对模型也不可见），与列表/执行链路同一套可见性。
       system: [
         parsedTask.goalMode ? GOAL_MODE_SYSTEM : '',
-        rt.skillRegistry ? rt.skillRegistry.summariesFor(ctx) : rt.systemExtra,
+        rt.skillRegistry ? await rt.skillRegistry.summariesFor(ctx) : rt.systemExtra,
         rt.sandboxSettings?.enabled ? SANDBOX_SERVICE_NOTE : '',
         userHomeNote,
       ].filter(Boolean).join('\n\n'),

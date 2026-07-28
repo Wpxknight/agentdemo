@@ -4,7 +4,6 @@ import { logger } from '../logger.js';
 import type { JsonValue, ToolResult } from '../model/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import { isAdminRole } from '../auth/rbac.js';
-import { formatSkillsForSystemPrompt, loadSourcedSkills } from '@aiop/pi-runtime';
 import { NodeExecutionEnv } from '@earendil-works/pi-agent-core/node';
 import {
   PUBLIC_SKILLS_DIR,
@@ -14,9 +13,13 @@ import {
   type SkillFileEntry,
   type SkillViewer,
   type SkillVisibility,
-  readSkillProductMetadata,
+  TENANT_SKILLS_DIR,
+  normalizeSkillProductRecord,
+  type SkillProductRecord,
 } from './product.js';
-import { canManageSkill, isSkillVisibleTo } from './visibility.js';
+import { canManageSkill, isSkillRecordAvailableTo, isSkillVisibleTo } from './visibility.js';
+import { enumerateSkillProductRecords } from './source.js';
+import { SkillProductService, type ProductSkillLoader } from './service.js';
 
 export {
   PUBLIC_SKILLS_DIR,
@@ -26,6 +29,7 @@ export {
   type SkillFileEntry,
   type SkillViewer,
   type SkillVisibility,
+  type SkillProductRecord,
 } from './product.js';
 
 const log = logger.child({ mod: 'skill' });
@@ -33,11 +37,14 @@ const log = logger.child({ mod: 'skill' });
 const DISABLED_MARKER = '.disabled';
 const SHARED_MARKER = '.shared';
 const OWNER_MARKER = '.owner';
-const MARKER_FILES = new Set([DISABLED_MARKER, SHARED_MARKER, OWNER_MARKER]);
+const MARKER_FILES = new Set([DISABLED_MARKER, SHARED_MARKER, OWNER_MARKER, '.product.json']);
 
 export interface SkillRegistryOptions {
   /** @deprecated Pi owns prompt formatting and does not apply a product-side budget. */
   summaryBudget?: number;
+  records?: readonly SkillProductRecord[];
+  loader?: ProductSkillLoader;
+  env?: ConstructorParameters<typeof SkillProductService>[0];
 }
 
 /**
@@ -48,9 +55,17 @@ export interface SkillRegistryOptions {
  * - 列表与执行链路（load_skill / skill__read_file / skill__sync_to_sandbox）双处做同一套可见性检查。
  */
 export class SkillRegistry {
-  private skills = new Map<string, Skill>();
+  private records: SkillProductRecord[] = [];
+  private readonly service: SkillProductService;
+  private readonly configuredRecords?: readonly SkillProductRecord[];
 
-  constructor(private readonly dir: string, _opts: SkillRegistryOptions = {}) {}
+  constructor(private readonly dir: string, opts: SkillRegistryOptions = {}) {
+    this.configuredRecords = opts.records;
+    this.service = new SkillProductService(
+      opts.env ?? new NodeExecutionEnv({ cwd: dir }),
+      opts.loader,
+    );
+  }
 
   rootDir(): string {
     return this.dir;
@@ -58,101 +73,25 @@ export class SkillRegistry {
 
   /** 技能导入的落盘根：管理员 → _public；普通用户 → users/<uid>。 */
   importRootFor(viewer: SkillViewer): string {
-    if (viewer.role && isAdminRole(viewer.role)) return join(this.dir, PUBLIC_SKILLS_DIR);
+    if (!viewer.tenantId) throw new Error('导入技能需要租户身份');
+    const tenantRoot = viewer.tenantId === 'default'
+      ? this.dir
+      : join(this.dir, TENANT_SKILLS_DIR, safePathSegment(viewer.tenantId));
+    if (viewer.role && isAdminRole(viewer.role)) return join(tenantRoot, PUBLIC_SKILLS_DIR);
     if (!viewer.userId) throw new Error('导入技能需要用户身份');
-    return join(this.dir, USER_SKILLS_DIR, safePathSegment(viewer.userId));
+    return join(tenantRoot, USER_SKILLS_DIR, safePathSegment(viewer.userId));
   }
 
   async scan(): Promise<void> {
-    this.skills.clear();
-    const env = new NodeExecutionEnv({ cwd: this.dir });
-    let entries: string[];
-    try {
-      entries = await readdir(this.dir);
-    } catch {
-      log.warn({ dir: this.dir }, 'skills 目录不存在，跳过');
-      await env.cleanup();
-      return;
-    }
-    try {
-      // 存量技能（旧布局：技能目录直接位于根下）原地视为 public，不搬家。
-      for (const entry of entries.sort()) {
-        if (entry === PUBLIC_SKILLS_DIR || entry === USER_SKILLS_DIR) continue;
-        await this.scanSkillDir(env, join(this.dir, entry), entry, '', 'public');
-      }
-      await this.scanRoot(env, join(this.dir, PUBLIC_SKILLS_DIR), '', 'public');
-      const usersRoot = join(this.dir, USER_SKILLS_DIR);
-      let userDirs: string[] = [];
-      try { userDirs = await readdir(usersRoot); } catch { /* 无个人技能 */ }
-      for (const uid of userDirs.sort()) {
-        try {
-          if ((await stat(join(usersRoot, uid))).isDirectory()) {
-            await this.scanRoot(env, join(usersRoot, uid), uid, 'user');
-          }
-        } catch {
-          // 跳过异常目录
-        }
-      }
-    } finally {
-      await env.cleanup();
-    }
-    log.info({ count: this.skills.size }, 'skills 扫描完成');
-  }
-
-  private async scanRoot(env: NodeExecutionEnv, root: string, dirOwner: string, kind: 'public' | 'user'): Promise<void> {
-    let entries: string[];
-    try {
-      entries = await readdir(root);
-    } catch {
-      return;
-    }
-    for (const entry of entries.sort()) {
-      await this.scanSkillDir(env, join(root, entry), entry, dirOwner, kind);
-    }
-  }
-
-  private async scanSkillDir(env: NodeExecutionEnv, skillDir: string, entry: string, dirOwner: string, kind: 'public' | 'user'): Promise<void> {
-    try {
-      if (!(await stat(skillDir)).isDirectory()) return;
-      const loaded = await loadSourcedSkills(env, [{ path: skillDir, source: { kind: 'aiop-product' } }]);
-      const piSkill = loaded.skills.find(({ skill }) => resolve(skill.filePath) === resolve(join(skillDir, 'SKILL.md')))?.skill;
-      if (!piSkill) throw new Error(loaded.diagnostics[0]?.message ?? '技能包缺少有效 SKILL.md');
-      const metadata = await readSkillProductMetadata(skillDir);
-      const baseName = piSkill.name || entry;
-      const files = await listSkillFiles(skillDir);
-      const enabled = !(await exists(join(skillDir, DISABLED_MARKER)));
-      const owner = kind === 'public'
-        ? (await readFile(join(skillDir, OWNER_MARKER), 'utf8').catch(() => '')).trim()
-        : dirOwner;
-      const visibility: SkillVisibility = kind === 'public'
-        ? 'public'
-        : (await exists(join(skillDir, SHARED_MARKER))) ? 'shared' : 'private';
-      // 同名消歧：public 命名空间优先占用裸名；个人技能与之冲突时挂 @owner 后缀。
-      const name = this.skills.has(baseName) ? `${baseName}@${owner || 'public'}` : baseName;
-      if (this.skills.has(name)) {
-        log.warn({ name, dir: skillDir }, '技能名冲突（含消歧后缀仍冲突），跳过');
-        return;
-      }
-      this.skills.set(name, {
-        name,
-        description: piSkill.description,
-        dir: skillDir,
-        enabled,
-        owner,
-        visibility,
-        credentials: metadata.credentials,
-        credentialFile: metadata.credentialFile,
-        body: piSkill.content.trim(),
-        files,
-      });
-    } catch (err) {
-      log.warn({ entry, err: String(err) }, '跳过无效技能目录');
-    }
+    this.records = (this.configuredRecords
+      ? this.configuredRecords.map(normalizeSkillProductRecord)
+      : await enumerateSkillProductRecords(this.dir));
+    log.info({ count: this.records.length }, 'skill product sources loaded');
   }
 
   /** 全量列表（管理/CLI 用；对外接口请用 listFor 按查看者过滤）。 */
   list(): Skill[] {
-    return [...this.skills.values()];
+    return this.records.map((record) => skillFromRecord(record));
   }
 
   /** 技能对查看者是否可见：public/shared 全员；private 仅所有者。身份缺失时按"非所有者"处理。 */
@@ -170,21 +109,25 @@ export class SkillRegistry {
     return this.list().filter((s) => this.visibleTo(s, viewer));
   }
 
+  async listLoadedFor(viewer: SkillViewer): Promise<Skill[]> {
+    const loaded = await this.service.load(this.records, viewer);
+    const byId = new Map(loaded.skills.map((item) => [item.source.id, item]));
+    return Promise.all(this.records
+      .filter((record) => isSkillRecordAvailableTo(record, viewer))
+      .map(async (record) => {
+        const item = byId.get(record.id);
+        return skillFromRecord(record, item?.skill, await listSkillFiles(record.path).catch(() => []));
+      }));
+  }
+
   /** 注入系统提示的技能摘要（按查看者过滤）；带总预算与单条描述截断，防止技能增多撑爆 system prompt。 */
-  summariesFor(viewer?: SkillViewer): string {
-    const items = this.listFor(viewer).filter((skill) => skill.enabled);
-    if (!items.length) return '';
-    return formatSkillsForSystemPrompt(items.map((skill) => ({
-      name: skill.name,
-      description: skill.description,
-      content: skill.body,
-      filePath: join(skill.dir, 'SKILL.md'),
-    })));
+  async summariesFor(viewer: SkillViewer): Promise<string> {
+    return this.service.prompt(this.records, viewer);
   }
 
   /** 兼容旧调用：无查看者（public+shared）视角的摘要。 */
   summaries(): string {
-    return this.summariesFor(undefined);
+    return '';
   }
 
   /** load_skill 工具：按名字展开完整 SKILL.md 正文。hasSandboxSync 决定使用说明里是否提及沙箱同步。 */
@@ -209,14 +152,16 @@ export class SkillRegistry {
           return { id: '', content: '参数 name 必须是非空字符串', isError: true };
         }
         // 可见性在执行链路同样强制（不信 LLM）：越权技能等同不存在，不泄露存在性。
-        const skill = registry.getFor(name, ctx);
-        if (!skill) {
-          const avail = registry.listFor(ctx).filter((item) => item.enabled).map((item) => item.name).join(', ') || '(无)';
+        const productSkill = registry.getFor(name, ctx);
+        if (!productSkill || !productSkill.reviewed) {
+          const avail = registry.listFor(ctx).filter((item) => item.enabled && item.reviewed).map((item) => item.name).join(', ') || '(无)';
           return { id: '', content: `未找到技能 ${name}。可用：${avail}`, isError: true };
         }
-        if (!skill.enabled) {
+        if (!productSkill.enabled) {
           return { id: '', content: `技能已禁用：${name}`, isError: true };
         }
+        const skill = await registry.loadFor(name, ctx);
+        if (!skill) return { id: '', content: `未找到技能 ${name}`, isError: true };
         const bundledFiles = skill.files
           .filter((file) => !file.isDirectory && file.path !== 'SKILL.md')
           .map((file) => file.path);
@@ -239,21 +184,38 @@ export class SkillRegistry {
 
   /** 按名取技能（含禁用的；不做可见性过滤，管理路径用）；不存在返回 undefined。 */
   get(name: string): Skill | undefined {
-    return this.skills.get(name);
+    const record = this.records.find((item) => item.name === name);
+    return record ? skillFromRecord(record) : undefined;
   }
 
   /** 按名取查看者可见的技能；不可见等同不存在。 */
   getFor(name: string, viewer?: SkillViewer): Skill | undefined {
-    const skill = this.skills.get(name);
-    return skill && this.visibleTo(skill, viewer) ? skill : undefined;
+    const record = this.records.find((item) => item.name === name && this.visibleTo(skillFromRecord(item), viewer));
+    return record ? skillFromRecord(record) : undefined;
+  }
+
+  getAvailableFor(name: string, viewer?: SkillViewer): Skill | undefined {
+    const skill = this.getFor(name, viewer);
+    return skill?.enabled && skill.reviewed ? skill : undefined;
+  }
+
+  async loadFor(name: string, viewer: SkillViewer): Promise<Skill | undefined> {
+    const record = this.records.find((item) => item.name === name
+      && item.enabled && item.reviewed && this.visibleTo(skillFromRecord(item), viewer));
+    if (!record) return undefined;
+    const loaded = await this.service.load([record], viewer);
+    const item = loaded.skills[0];
+    if (!item) return undefined;
+    const files = await listSkillFiles(item.source.path).catch(() => []);
+    return skillFromRecord(item.source, item.skill, files);
   }
 
   /**
    * 收集待同步的文件清单（重新扫盘，保证最新）：
    * 不传 paths 收集整个技能目录；传 paths 时逐项解析（目录则递归展开）。
    */
-  async collectFiles(name: string, paths?: string[]): Promise<{ dir: string; files: SkillFileEntry[] }> {
-    const skill = this.requireSkill(name);
+  async collectFiles(name: string, paths?: string[], viewer?: SkillViewer): Promise<{ dir: string; files: SkillFileEntry[] }> {
+    const skill = this.requireSkill(name, viewer);
     if (!skill.enabled) throw new Error(`技能已禁用：${name}`);
     if (!paths?.length) {
       return { dir: skill.dir, files: (await listSkillFiles(skill.dir)).filter((f) => !f.isDirectory) };
@@ -272,8 +234,8 @@ export class SkillRegistry {
     return { dir: skill.dir, files: out };
   }
 
-  async listDir(name: string, path = ''): Promise<SkillFileEntry[]> {
-    const skill = this.requireSkill(name);
+  async listDir(name: string, path = '', viewer?: SkillViewer): Promise<SkillFileEntry[]> {
+    const skill = this.requireSkill(name, viewer);
     const rel = normalizeSkillPath(path);
     const target = safeResolve(skill.dir, rel);
     const info = await stat(target);
@@ -288,8 +250,8 @@ export class SkillRegistry {
     return files.sort(compareFileEntry);
   }
 
-  async readFile(name: string, path: string): Promise<SkillFileBody> {
-    const skill = this.requireSkill(name);
+  async readFile(name: string, path: string, viewer?: SkillViewer): Promise<SkillFileBody> {
+    const skill = this.requireSkill(name, viewer);
     const rel = normalizeSkillPath(path);
     if (!rel) throw new Error('技能文件路径不能为空');
     const entry = await fileEntry(skill.dir, rel);
@@ -303,25 +265,26 @@ export class SkillRegistry {
     };
   }
 
-  async setEnabled(name: string, enabled: boolean): Promise<Skill> {
-    const skill = this.requireSkill(name);
+  async setEnabled(name: string, enabled: boolean, viewer?: SkillViewer): Promise<Skill> {
+    const skill = this.requireSkill(name, viewer);
     const marker = join(skill.dir, DISABLED_MARKER);
     if (enabled) await rm(marker, { force: true });
     else await writeFile(marker, 'disabled\n');
-    skill.enabled = enabled;
-    skill.files = await listSkillFiles(skill.dir);
-    return skill;
+    const record = this.requireRecord(name, viewer);
+    record.enabled = enabled;
+    return skillFromRecord(record, undefined, await listSkillFiles(skill.dir));
   }
 
   /** 共享 / 取消共享（仅个人技能有意义；public 技能本就全员可见）。 */
-  async setShared(name: string, shared: boolean): Promise<Skill> {
-    const skill = this.requireSkill(name);
+  async setShared(name: string, shared: boolean, viewer?: SkillViewer): Promise<Skill> {
+    const skill = this.requireSkill(name, viewer);
     if (skill.visibility === 'public') throw new Error('公共技能无需共享');
     const marker = join(skill.dir, SHARED_MARKER);
     if (shared) await writeFile(marker, 'shared\n');
     else await rm(marker, { force: true });
-    skill.visibility = shared ? 'shared' : 'private';
-    return skill;
+    const record = this.requireRecord(name, viewer);
+    record.visibility = shared ? 'shared' : 'private';
+    return skillFromRecord(record);
   }
 
   /** 记录所有者（导入后调用；public 技能落 .owner 标记，个人技能由目录决定）。 */
@@ -330,17 +293,46 @@ export class SkillRegistry {
     await writeFile(join(skillDir, OWNER_MARKER), `${owner}\n`);
   }
 
-  async delete(name: string): Promise<void> {
-    const skill = this.requireSkill(name);
+  async delete(name: string, viewer?: SkillViewer): Promise<void> {
+    const skill = this.requireSkill(name, viewer);
     await rm(skill.dir, { recursive: true, force: true });
-    this.skills.delete(name);
+    this.records = this.records.filter((record) => record !== skill.product);
   }
 
-  private requireSkill(name: string): Skill {
-    const skill = this.skills.get(name);
-    if (!skill) throw new Error(`未找到技能 ${name}`);
-    return skill;
+  private requireSkill(name: string, viewer?: SkillViewer): Skill {
+    return skillFromRecord(this.requireRecord(name, viewer));
   }
+
+  private requireRecord(name: string, viewer?: SkillViewer): SkillProductRecord {
+    const record = this.records.find((item) => item.name === name
+      && (!viewer || this.visibleTo(skillFromRecord(item), viewer)));
+    if (!record) throw new Error(`未找到技能 ${name}`);
+    return record;
+  }
+}
+
+function skillFromRecord(
+  record: SkillProductRecord,
+  piSkill?: { name: string; description: string; content: string },
+  files: SkillFileEntry[] = [],
+): Skill {
+  return {
+    name: piSkill?.name ?? record.name,
+    description: piSkill?.description ?? record.description ?? '',
+    dir: record.path,
+    enabled: record.enabled,
+    reviewed: record.reviewed,
+    tenantId: record.tenantId,
+    allowedTenantIds: record.allowedTenantIds,
+    allowedRoles: record.allowedRoles,
+    owner: record.ownerId ?? '',
+    visibility: record.visibility,
+    credentials: [...(record.credentials ?? [])],
+    credentialFile: record.credentialFile,
+    body: piSkill?.content.trim() ?? '',
+    files,
+    product: record,
+  };
 }
 
 async function listSkillFiles(dir: string, rel = ''): Promise<SkillFileEntry[]> {

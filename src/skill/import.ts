@@ -26,6 +26,9 @@ const MAX_ZIP_ENTRY_BYTES = 16_000_000;
 const MAX_ZIP_TOTAL_BYTES = 64_000_000;
 const UNIX_FILE_TYPE_MASK = 0o170000;
 const UNIX_SYMLINK_TYPE = 0o120000;
+const DANGEROUS_EXTENSIONS = new Set([
+  '.exe', '.dll', '.so', '.dylib', '.node', '.class', '.jar', '.apk', '.deb', '.rpm', '.msi', '.com',
+]);
 
 export async function importSkillZip(options: ImportSkillZipOptions): Promise<ImportSkillZipResult> {
   if (!/\.zip$/i.test(options.filename)) throw new Error('仅支持导入 zip 技能包');
@@ -75,6 +78,7 @@ function readZipEntries(zip: Buffer): ZipEntry[] {
 
   const entries: ZipEntry[] = [];
   let totalUncompressedSize = 0;
+  let totalActualSize = 0;
   let offset = centralOffset;
   for (let i = 0; i < entryCount; i++) {
     if (offset + 46 > zip.length || zip.readUInt32LE(offset) !== CENTRAL_SIGNATURE) {
@@ -98,7 +102,6 @@ function readZipEntries(zip: Buffer): ZipEntry[] {
     const rawName = zip.subarray(nameStart, nameEnd).toString('utf8');
     const entryPath = safeZipPath(rawName);
     offset = nextOffset;
-    if (!entryPath) continue;
     if (flags & 0x1) throw new Error('不支持加密 zip 条目');
     if (method !== 0 && method !== 8) throw new Error(`不支持的 zip 压缩方式：${method}`);
     const unixMode = externalAttributes >>> 16;
@@ -108,6 +111,7 @@ function readZipEntries(zip: Buffer): ZipEntry[] {
     if (compressedSize === 0xffffffff || uncompressedSize === 0xffffffff || localOffset === 0xffffffff) {
       throw new Error('不支持 ZIP64 技能包');
     }
+    if (!entryPath) continue;
     if (uncompressedSize > MAX_ZIP_ENTRY_BYTES) throw new Error('zip 单文件超过解压大小上限');
     totalUncompressedSize += uncompressedSize;
     if (totalUncompressedSize > MAX_ZIP_TOTAL_BYTES) throw new Error('zip 超过解压总大小上限');
@@ -121,7 +125,20 @@ function readZipEntries(zip: Buffer): ZipEntry[] {
     if (dataEnd > zip.length) throw new Error('zip 文件数据越界');
 
     const compressed = zip.subarray(dataStart, dataEnd);
-    const data = method === 0 ? Buffer.from(compressed) : inflateRawSync(compressed);
+    let data: Buffer;
+    try {
+      data = method === 0
+        ? Buffer.from(compressed)
+        : inflateRawSync(compressed, { maxOutputLength: MAX_ZIP_ENTRY_BYTES });
+    } catch (error) {
+      if (String(error).includes('maxOutputLength') || String(error).includes('larger than')) {
+        throw new Error('zip 实际解压大小超过上限');
+      }
+      throw error;
+    }
+    if (data.length > MAX_ZIP_ENTRY_BYTES) throw new Error('zip 实际解压大小超过上限');
+    totalActualSize += data.length;
+    if (totalActualSize > MAX_ZIP_TOTAL_BYTES) throw new Error('zip 实际解压总大小超过上限');
     if (data.length !== uncompressedSize) throw new Error('zip 文件大小校验失败');
     entries.push({ path: entryPath, data });
   }
@@ -150,14 +167,16 @@ function validateZipPath(path: string): string {
   if (!path || path.startsWith('/') || path.startsWith('//') || /^[A-Za-z]:\//.test(path)) {
     throw new Error('非法 zip 路径');
   }
-  const parts = path.split('/').filter(Boolean);
-  if (!parts.length || parts.some((part) => part === '.' || part === '..')) {
+  const parts = path.split('/');
+  if (!parts.length || parts.some((part) => !part || part === '.' || part === '..')) {
     throw new Error('非法 zip 路径');
   }
   const normalized = posix.normalize(parts.join('/'));
   if (normalized === '.' || normalized.startsWith('../') || normalized.includes('/../')) {
     throw new Error('非法 zip 路径');
   }
+  const extension = extname(posix.basename(normalized)).toLowerCase();
+  if (DANGEROUS_EXTENSIONS.has(extension)) throw new Error(`不允许的技能包文件类型：${extension}`);
   return normalized;
 }
 

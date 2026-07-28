@@ -1,0 +1,4 @@
+{
+  "credentials": ["aios"],
+  "credentialFile": "aios-base/token.json"
+}
