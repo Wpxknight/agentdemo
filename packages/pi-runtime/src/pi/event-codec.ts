@@ -44,6 +44,10 @@ function toJsonValue(value: unknown, seen = new WeakSet<object>()): JsonValue {
   if (typeof value === 'bigint') return value.toString();
   if (typeof value === 'undefined' || typeof value === 'function' || typeof value === 'symbol') return null;
   if (value instanceof Date) return value.toISOString();
+  if (typeof value === 'object') {
+    if (seen.has(value)) return { kind: 'circular_reference' };
+    seen.add(value);
+  }
   if (value instanceof Error) return toJsonValue({
     name: value.name, message: value.message, stack: value.stack, cause: value.cause,
   }, seen);
@@ -51,13 +55,9 @@ function toJsonValue(value: unknown, seen = new WeakSet<object>()): JsonValue {
     return toJsonValue({ aborted: value.aborted, ...(value.aborted ? { reason: value.reason } : {}) }, seen);
   }
   if (Array.isArray(value)) {
-    if (seen.has(value)) return { kind: 'circular_reference' };
-    seen.add(value);
     return value.map((item) => toJsonValue(item, seen));
   }
   if (typeof value === 'object') {
-    if (seen.has(value)) return { kind: 'circular_reference' };
-    seen.add(value);
     const result: Record<string, JsonValue> = {};
     for (const key of Object.keys(value).sort()) {
       const item = (value as Record<string, unknown>)[key];

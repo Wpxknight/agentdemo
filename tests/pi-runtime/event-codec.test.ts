@@ -54,4 +54,22 @@ describe('Pi EventCodec', () => {
       },
     });
   });
+
+  it('handles self-referential Error causes and AbortSignal reasons', () => {
+    const codec = new EventCodec({
+      tenantId: 'tenant-1', runId: 'run-1', attemptId: 'attempt-1', turnNo: 1,
+      correlationId: 'correlation-1', sequence: () => 1n,
+    });
+    const error = new Error('recursive');
+    error.cause = error;
+    const controller = new AbortController();
+    controller.abort(controller.signal);
+
+    const detail = codec.fromPi({ type: 'future_event', error, signal: controller.signal } as never).detail;
+    expect(() => JSON.stringify(detail)).not.toThrow();
+    expect(detail).toMatchObject({ event: {
+      error: { cause: { kind: 'circular_reference' } },
+      signal: { aborted: true, reason: { kind: 'circular_reference' } },
+    } });
+  });
 });

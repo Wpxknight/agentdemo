@@ -49,14 +49,28 @@ function events() {
 
 describe('Pi governed tool bridge', () => {
   it.each([
-    { args: { key: 'value' }, expectedCalls: 1 },
-    { args: { key: { nested: true } }, expectedCalls: 0 },
-  ])('uses real Harness schema validation and execution for $args', async ({ args, expectedCalls }) => {
+    {
+      schema: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] },
+      args: { key: 'value', extra: true }, expectedCalls: 1,
+    },
+    {
+      schema: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'], additionalProperties: false },
+      args: { key: 'value', extra: true }, expectedCalls: 0,
+    },
+    {
+      schema: { type: 'object', properties: { key: { oneOf: [{ type: 'string', minLength: 3 }, { type: 'number', minimum: 10 }] } }, required: ['key'] },
+      args: { key: 12 }, expectedCalls: 1,
+    },
+    {
+      schema: { type: 'object', properties: { key: { oneOf: [{ type: 'string', minLength: 3 }, { type: 'number', minimum: 10 }] } }, required: ['key'] },
+      args: { key: { nested: true } }, expectedCalls: 0,
+    },
+  ])('delegates JSON Schema semantics to the real Harness for $args', async ({ schema, args, expectedCalls }) => {
     const calls: unknown[] = [];
     const tools = bridgeGovernedTools([{
       definition: {
         name: 'lookup', description: 'Lookup', capability: 'read' as const,
-        inputSchema: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'], additionalProperties: false },
+        inputSchema: schema,
       },
       execute: async (call: unknown) => { calls.push(call); return { callId: 'call-1', content: 'ok' }; },
     }]);
