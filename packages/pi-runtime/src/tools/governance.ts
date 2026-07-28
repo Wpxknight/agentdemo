@@ -346,9 +346,10 @@ function approvalPayloadIdentity(payload: JsonValue): {
   const toolCallIds: string[] = [];
   for (const key of ['id', 'toolCallId'] as const) {
     if (!Object.hasOwn(pendingCall, key)) continue;
-    if (typeof pendingCall[key] !== 'string') return undefined;
+    if (typeof pendingCall[key] !== 'string' || pendingCall[key].length === 0) return undefined;
     toolCallIds.push(pendingCall[key]);
   }
+  if (toolCallIds.length === 0) return undefined;
   return { name: pendingCall.name, argsDigest: digestToolValue(pendingCall.args), toolCallIds };
 }
 

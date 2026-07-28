@@ -205,6 +205,15 @@ describe('GovernedToolFactory', () => {
       id: 'call-a', name: 'write', args: { resource: 'deployment/b' },
     })],
     ['malformed call', { call: 'write', reason: 'production change' }],
+    ['missing tool call id', approvalPayload({
+      name: 'write', args: { resource: 'deployment/a' },
+    })],
+    ['empty tool call id', approvalPayload({
+      id: '', name: 'write', args: { resource: 'deployment/a' },
+    })],
+    ['non-string tool call id', approvalPayload({
+      id: 42, name: 'write', args: { resource: 'deployment/a' },
+    })],
     ['cross-ledger substituted pair', approvalPayload({
       id: 'call-other', name: 'delete', args: { resource: 'deployment/b' },
     })],
