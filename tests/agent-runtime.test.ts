@@ -53,48 +53,27 @@ describe('AgentRuntime', () => {
     expect(runtime.kernelName).toBe('test');
   });
 
-  it('uses the legacy kernel by default', () => {
-    expect(new AgentRuntime().kernelName).toBe('legacy');
+  it('uses the Pi kernel by default', () => {
+    expect(new AgentRuntime().kernelName).toBe('pi');
   });
 
-  it('selects Pi only when explicitly configured and rejects new LangGraph traffic', () => {
-    expect(createConfiguredAgentRuntime({}).kernelName).toBe('legacy');
+  it('defaults to Pi and rejects retired kernel configuration', () => {
+    expect(createConfiguredAgentRuntime({}).kernelName).toBe('pi');
     expect(createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'pi' }).kernelName).toBe('pi');
-    expect(createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'langgraph' }).kernelName).toBe('legacy');
-    expect(createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'unknown' }).kernelName).toBe('legacy');
+    expect(() => createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'legacy' }))
+      .toThrow('AIOP_AGENT_KERNEL is retired; only pi is supported');
+    expect(() => createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'langgraph' }))
+      .toThrow('AIOP_AGENT_KERNEL is retired; only pi is supported');
   });
 
-  it('routes tenant-rule Pi rollout lists before legacy fallback', async () => {
-    const calls: string[] = [];
-    const result: RunAgentResult = {
-      messages: [], text: '', steps: 0,
-      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
-      compacted: false,
-    };
-    const kernel = (name: 'pi' | 'legacy'): AgentKernel => ({
-      name,
-      run: async () => { calls.push(name); return result; },
-    });
-    const runtime = createConfiguredAgentRuntime({
-      AIOP_AGENT_KERNEL: 'tenant-rule',
-      AIOP_PI_TEST_TENANTS: 'tenant-pi',
-      AIOP_PI_INTERNAL_USERS: 'user-pi',
-      AIOP_PI_READ_ONLY_SESSIONS: 'session-pi-ro',
-      AIOP_PI_FULL_SESSIONS: 'session-pi-full',
-    }, { kernels: { legacy: kernel('legacy'), pi: kernel('pi') } });
-
-    for (const ctx of [
-      { tenantId: 'tenant-pi', userId: 'u', sessionId: 's' },
-      { tenantId: 'tenant-x', userId: 'user-pi', sessionId: 's' },
-      { tenantId: 'tenant-x', userId: 'u', sessionId: 'session-pi-ro' },
-      { tenantId: 'tenant-x', userId: 'u', sessionId: 'session-pi-full' },
-      { tenantId: 'tenant-x', userId: 'u', sessionId: 'other' },
-    ]) await runtime.run({ ...runOptions(), ctx });
-
-    expect(calls).toEqual(['pi', 'pi', 'pi', 'pi', 'legacy']);
+  it('rejects disabled and unknown Pi modes', () => {
+    expect(() => createConfiguredAgentRuntime({ AIOP_PI_MODE: 'disabled' }))
+      .toThrow('AIOP_PI_MODE must be one of read-only, dry-run, replay, full');
+    expect(() => createConfiguredAgentRuntime({ AIOP_PI_MODE: 'unknown' }))
+      .toThrow('AIOP_PI_MODE must be one of read-only, dry-run, replay, full');
   });
 
-  it('supports immediate Pi rollback and gates shadow/read-only tools', async () => {
+  it('gates shadow/read-only tools', async () => {
     const visible: string[][] = [];
     const result: RunAgentResult = {
       messages: [], text: '', steps: 0,
@@ -112,16 +91,12 @@ describe('AgentRuntime', () => {
         return result;
       },
     };
-    expect(createConfiguredAgentRuntime({ AIOP_AGENT_KERNEL: 'pi', AIOP_PI_MODE: 'disabled' }, {
-      kernels: { pi },
-    }).kernelName).toBe('legacy');
-
     const readOnly = createConfiguredAgentRuntime({
-      AIOP_AGENT_KERNEL: 'pi', AIOP_PI_MODE: 'read-only',
+      AIOP_PI_MODE: 'read-only',
     }, { kernels: { pi } });
     await readOnly.run(runOptions());
     const dryRun = createConfiguredAgentRuntime({
-      AIOP_AGENT_KERNEL: 'pi', AIOP_PI_MODE: 'dry-run',
+      AIOP_PI_MODE: 'dry-run',
     }, { kernels: { pi } });
     await dryRun.run(runOptions());
 

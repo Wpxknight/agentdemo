@@ -23,14 +23,12 @@ describe('Pi delivery baseline', () => {
     expect(source).toContain('docker:27-dind');
   });
 
-  it('deploys new development runs on Pi without a LangGraph kernel fallback', async () => {
+  it('deploys new development runs in Pi full mode without kernel selection', async () => {
     const source = await readFile(new URL('deploy/dev-k8s/aiop-deployment.yaml', root), 'utf8');
 
-    expect(source).toContain('name: AIOP_AGENT_KERNEL');
-    expect(source).toMatch(/name: AIOP_AGENT_KERNEL\s+value: pi/);
+    expect(source).not.toContain('name: AIOP_AGENT_KERNEL');
     expect(source).toContain('name: AIOP_PI_MODE');
     expect(source).toMatch(/name: AIOP_PI_MODE\s+value: full/);
-    expect(source).not.toMatch(/value:\s*langgraph/i);
   });
 
   it('builds public package dist inside the image instead of copying host artifacts', async () => {
