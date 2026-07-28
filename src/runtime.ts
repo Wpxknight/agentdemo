@@ -277,6 +277,10 @@ export async function buildRuntime(
   const skillMutationLock = mysqlConfig && store instanceof MysqlStore
     ? new MysqlSkillMutationLock(createMysqlPool(mysqlConfig))
     : undefined;
+  if (config.skills?.requireDistributedLock && !skillMutationLock) {
+    if (!options.store) await store.close();
+    throw new Error('skills.requireDistributedLock requires a MySQL distributed mutation lock');
+  }
   const logSink = new LogAuditSink();
   const audit: AuditSink = {
     async record(e) {

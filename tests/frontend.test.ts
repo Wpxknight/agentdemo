@@ -1180,8 +1180,10 @@ describe('kubernetes frontend deployment', () => {
     expect(service).toMatch(/targetPort:\s+8080/);
   });
 
-  it('backs multi-replica skills with one RWX PVC and seeds image skills safely', async () => {
+  it('keeps image built-ins read-only and mounts one writable RWX product root', async () => {
     const deployment = await readFile('deploy/k8s/deployment-server.yaml', 'utf8');
+    const config = await readFile('deploy/k8s/configmap.yaml', 'utf8');
+    const secret = await readFile('deploy/k8s/secret.example.yaml', 'utf8');
     const pvc = await readFile('deploy/k8s/pvc-skills.yaml', 'utf8');
     const readme = await readFile('deploy/k8s/README.md', 'utf8');
 
@@ -1191,15 +1193,19 @@ describe('kubernetes frontend deployment', () => {
     expect(pvc).toContain('ReadWriteMany');
     expect(pvc).toMatch(/storage:\s+5Gi/);
     expect(pvc).not.toContain('storageClassName:');
-    expect(deployment.match(/image:\s+aiop:latest/g)).toHaveLength(2);
-    expect(deployment).toMatch(/initContainers:[\s\S]*name:\s+seed-skills/);
-    expect(deployment).toMatch(/seed-skills[\s\S]*runAsUser:\s+0/);
-    expect(deployment).toContain('cp -an /app/skills/. /skills-data/');
-    expect(deployment).toContain('chown -R node:node /skills-data');
-    expect(deployment).not.toMatch(/seed-skills[\s\S]*rm\s+-rf\s+\/skills-data/);
+    expect(deployment.match(/image:\s+aiop:latest/g)).toHaveLength(1);
+    expect(deployment).not.toContain('initContainers:');
+    expect(deployment).not.toContain('seed-skills');
+    expect(deployment).not.toContain('cp -an');
+    expect(deployment).not.toContain('chown');
+    expect(deployment).toMatch(/fsGroup:\s+1000/);
     expect(deployment).toMatch(/name:\s+skills\s*\n\s+mountPath:\s+\/skills-data/);
-    expect(deployment).toMatch(/name:\s+skills\s*\n\s+mountPath:\s+\/app\/skills/);
+    expect(deployment).not.toMatch(/name:\s+skills\s*\n\s+mountPath:\s+\/app\/skills/);
     expect(deployment).toMatch(/persistentVolumeClaim:\s*\n\s+claimName:\s+aiop-skills/);
+    expect(config).toContain('"skills": { "dir": "/skills-data", "builtinDir": "/app/skills"');
+    expect(config).toContain('"requireDistributedLock": true');
+    expect(deployment).toMatch(/envFrom:[\s\S]*secretRef:\s*\{ name:\s*aiop-secrets \}/);
+    expect(secret).toContain('MYSQL_HOST:');
     expect(readme).toContain('ReadWriteMany');
     expect(readme).toMatch(/StorageClass/i);
     expect(readme).toContain('pvc-skills.yaml');

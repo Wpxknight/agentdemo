@@ -1,6 +1,6 @@
-import { mkdtemp, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { hostname, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { deflateRawSync } from 'node:zlib';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -129,6 +129,158 @@ describe('SkillRegistry', () => {
     expect(registry.importStagingRoot()).toContain(productRoot);
   });
 
+  it('governs a read-only built-in through a shared overlay without mutating its image files', async () => {
+    const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-overlay-source-'));
+    const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-overlay-product-'));
+    const builtin = join(builtinRoot, 'governed-builtin');
+    await mkdir(builtin);
+    await writeFile(join(builtin, 'SKILL.md'), '---\nname: governed-builtin\ndescription: builtin\n---\nbody');
+    await writeProduct(builtin, {
+      name: 'governed-builtin', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+    });
+    const originalSidecar = await readFile(join(builtin, '.product.json'), 'utf8');
+    await chmod(join(builtin, 'SKILL.md'), 0o444);
+    await chmod(join(builtin, '.product.json'), 0o444);
+    await chmod(builtin, 0o555);
+    await chmod(builtinRoot, 0o555);
+    const first = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    const second = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    const admin = { tenantId: 'default', userId: 'admin', role: 'tenant_admin' as const };
+    const viewer = { tenantId: 'default', userId: 'viewer', role: 'user' as const };
+    await Promise.all([first.scan(), second.scan()]);
+
+    await first.setEnabled('governed-builtin', false, admin);
+    await expect(second.loadFor('governed-builtin', viewer)).resolves.toBeUndefined();
+    await second.setEnabled('governed-builtin', true, admin);
+    await expect(first.loadFor('governed-builtin', viewer)).resolves.toMatchObject({ body: 'body' });
+    await expect(first.setShared('governed-builtin', true, admin)).rejects.toThrow('公共技能无需共享');
+    await first.delete('governed-builtin', admin);
+
+    await expect(second.loadFor('governed-builtin', viewer)).resolves.toBeUndefined();
+    await expect(stat(builtin)).resolves.toBeDefined();
+    await expect(readFile(join(builtin, '.product.json'), 'utf8')).resolves.toBe(originalSidecar);
+    await expect(stat(join(productRoot, '.aiop-governance'))).resolves.toBeDefined();
+  });
+
+  it('keeps install, review, enable, and delete within one distributed lock connection', async () => {
+    const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-nested-lock-source-'));
+    const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-nested-lock-product-'));
+    const builtin = join(builtinRoot, 'nested-lock-builtin');
+    const pendingBuiltin = join(builtinRoot, 'pending-builtin');
+    const deletedBuiltin = join(builtinRoot, 'deleted-builtin');
+    await mkdir(builtin);
+    await mkdir(pendingBuiltin);
+    await mkdir(deletedBuiltin);
+    await writeFile(join(builtin, 'SKILL.md'), '---\nname: nested-lock-builtin\ndescription: builtin\n---\nbody');
+    await writeFile(join(pendingBuiltin, 'SKILL.md'), '---\nname: pending-builtin\ndescription: pending\n---\nbody');
+    await writeFile(join(deletedBuiltin, 'SKILL.md'), '---\nname: deleted-builtin\ndescription: deleted\n---\nbody');
+    await writeProduct(builtin, {
+      name: 'nested-lock-builtin', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+    });
+    await writeProduct(pendingBuiltin, {
+      name: 'pending-builtin', version: '1', enabled: true, reviewed: false,
+      tenantId: 'default', visibility: 'public',
+    });
+    await writeProduct(deletedBuiltin, {
+      name: 'deleted-builtin', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+    });
+    let lockHeld = false;
+    const mutationLock = {
+      async withLock<T>(_key: string, _timeoutMs: number, operation: () => Promise<T>): Promise<T> {
+        if (lockHeld) throw new Error('nested distributed lock');
+        lockHeld = true;
+        try {
+          return await operation();
+        } finally {
+          lockHeld = false;
+        }
+      },
+    };
+    const registry = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot], mutationLock });
+    await registry.scan();
+    const admin = { tenantId: 'default', userId: 'admin', role: 'tenant_admin' as const };
+
+    await expect(registry.setEnabled('nested-lock-builtin', false, admin))
+      .resolves.toMatchObject({ enabled: false });
+    await expect(registry.review('pending-builtin', admin))
+      .resolves.toMatchObject({ reviewed: true });
+    await expect(registry.delete('deleted-builtin', admin)).resolves.toBeUndefined();
+
+    const upload = join(productRoot, 'users', 'uploader', 'uploaded-product');
+    await mkdir(upload, { recursive: true });
+    await writeFile(join(upload, 'SKILL.md'), '---\nname: uploaded-product\ndescription: uploaded\n---\nbody');
+    await writeProduct(upload, { name: 'uploaded-product', version: '1' });
+    await expect(registry.installUploadedProduct(upload, {
+      tenantId: 'default', userId: 'uploader', role: 'user',
+    })).resolves.toMatchObject({ name: 'uploaded-product', reviewed: false });
+  }, 1_000);
+
+  it('keeps restrictive built-in governance across image updates and rebases explicit enablement', async () => {
+    const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-overlay-update-source-'));
+    const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-overlay-update-product-'));
+    const builtin = join(builtinRoot, 'updated-builtin');
+    await mkdir(builtin);
+    await writeFile(join(builtin, 'SKILL.md'), '---\nname: updated-builtin\ndescription: v1\n---\nv1');
+    await writeProduct(builtin, {
+      name: 'updated-builtin', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+    });
+    const first = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    const second = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    const admin = { tenantId: 'default', userId: 'admin', role: 'tenant_admin' as const };
+    const viewer = { tenantId: 'default', userId: 'viewer', role: 'user' as const };
+    await Promise.all([first.scan(), second.scan()]);
+
+    await first.setEnabled('updated-builtin', false, admin);
+    await writeFile(join(builtin, 'SKILL.md'), '---\nname: updated-builtin\ndescription: v2\n---\nv2');
+    await writeProduct(builtin, {
+      name: 'updated-builtin', version: '2', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+    });
+
+    await expect(second.loadFor('updated-builtin', viewer)).resolves.toBeUndefined();
+    await second.setEnabled('updated-builtin', true, admin);
+    await expect(first.loadFor('updated-builtin', viewer)).resolves.toMatchObject({ body: 'v2' });
+    await first.delete('updated-builtin', admin);
+    await writeFile(join(builtin, 'SKILL.md'), '---\nname: updated-builtin\ndescription: v3\n---\nv3');
+    await expect(second.loadFor('updated-builtin', viewer)).resolves.toBeUndefined();
+    await expect(stat(builtin)).resolves.toBeDefined();
+  });
+
+  it('reviews an unreviewed read-only built-in through the writable governance overlay', async () => {
+    const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-overlay-review-source-'));
+    const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-overlay-review-product-'));
+    const builtin = join(builtinRoot, 'review-builtin');
+    await mkdir(builtin);
+    await writeFile(join(builtin, 'SKILL.md'), '---\nname: review-builtin\ndescription: review\n---\nbody');
+    await writeProduct(builtin, {
+      name: 'review-builtin', version: '1', enabled: true, reviewed: false,
+      tenantId: 'default', visibility: 'public',
+    });
+    const originalSidecar = await readFile(join(builtin, '.product.json'), 'utf8');
+    await chmod(join(builtin, 'SKILL.md'), 0o444);
+    await chmod(join(builtin, '.product.json'), 0o444);
+    await chmod(builtin, 0o555);
+    await chmod(builtinRoot, 0o555);
+    const first = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    const second = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    await Promise.all([first.scan(), second.scan()]);
+
+    await expect(first.review('review-builtin', {
+      tenantId: 'default', userId: 'reviewer', role: 'platform_admin',
+    }, { global: true })).rejects.toThrow('内置技能不支持全局发布');
+    await expect(first.review('review-builtin', {
+      tenantId: 'default', userId: 'reviewer', role: 'tenant_admin',
+    })).resolves.toMatchObject({ reviewed: true, path: builtin });
+    await expect(second.loadFor('review-builtin', {
+      tenantId: 'default', userId: 'viewer', role: 'user',
+    })).resolves.toMatchObject({ body: 'body' });
+    await expect(readFile(join(builtin, '.product.json'), 'utf8')).resolves.toBe(originalSidecar);
+  });
+
   it('ignores legacy PVC seed copies that duplicate a read-only built-in', async () => {
     const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-seed-source-'));
     const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-seed-pvc-'));
@@ -149,6 +301,41 @@ describe('SkillRegistry', () => {
     await expect(registry.loadFor('seeded', {
       tenantId: 'default', userId: 'viewer', role: 'user',
     })).resolves.toMatchObject({ dir: join(builtinRoot, 'seeded') });
+
+    await registry.delete('seeded', {
+      tenantId: 'default', userId: 'admin', role: 'tenant_admin',
+    });
+    await expect(registry.loadFor('seeded', {
+      tenantId: 'default', userId: 'viewer', role: 'user',
+    })).resolves.toBeUndefined();
+    await expect(stat(join(productRoot, 'seeded'))).resolves.toBeDefined();
+
+    await rm(join(builtinRoot, 'seeded'), { recursive: true });
+    const afterImageUpdate = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    await afterImageUpdate.scan();
+    await expect(afterImageUpdate.loadFor('seeded', {
+      tenantId: 'default', userId: 'viewer', role: 'user',
+    })).resolves.toBeUndefined();
+  });
+
+  it('does not suppress an identical ownerless public product at a non-seed relative path', async () => {
+    const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-catalog-source-'));
+    const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-catalog-product-'));
+    const builtin = join(builtinRoot, 'same-name');
+    const product = join(productRoot, 'independent-product');
+    await mkdir(builtin);
+    await writeFile(join(builtin, 'SKILL.md'), '---\nname: same-name\ndescription: builtin\n---\nbuiltin');
+    await writeProduct(builtin, {
+      name: 'same-name', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+    });
+    await cp(builtin, product, { recursive: true });
+    const registry = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+
+    await registry.scan();
+
+    expect(registry.list().filter((skill) => skill.name === 'same-name')).toHaveLength(2);
+    expect(registry.list().map((skill) => resolve(skill.dir))).toContain(resolve(product));
   });
 
   it('keeps an interrupted published artifact invisible until its commit marker exists', async () => {
@@ -992,7 +1179,7 @@ describe('SkillRegistry upload review governance', () => {
     });
   });
 
-  it('serializes same-name imports across separate registry instances sharing a filesystem', async () => {
+  it('serializes same-name imports across registry instances in one process', async () => {
     const root = await mkdtemp(join(tmpdir(), 'aiop-upload-cross-process-import-'));
     const registries = [new SkillRegistry(root), new SkillRegistry(root)];
     await Promise.all(registries.map((registry) => registry.scan()));
@@ -1041,19 +1228,19 @@ describe('SkillRegistry upload review governance', () => {
     expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
   });
 
-  it('recovers an expired distributed name lock and releases its own lock', async () => {
+  it('uses a process-shared mutex instead of recovering filesystem lease owners', async () => {
     const root = await mkdtemp(join(tmpdir(), 'aiop-upload-stale-lock-'));
-    const name = 'stale-lock';
+    const name = 'process-lock';
     const lockKey = `skill-name:${name}`;
     const lockPath = join(
       root,
       '.aiop-locks',
       createHash('sha256').update(lockKey).digest('hex'),
     );
-    const expiredOwnerDir = join(lockPath, 'expired-owner');
+    const expiredOwnerDir = join(lockPath, 'foreign-live-owner');
     await mkdir(expiredOwnerDir, { recursive: true });
     await writeFile(join(expiredOwnerDir, 'owner.json'), JSON.stringify({
-      token: 'expired-owner', key: lockKey, leaseUntil: Date.now() - 60_000,
+      token: 'foreign-live-owner', key: lockKey, leaseUntil: Date.now() - 60_000,
       hostname: 'another-pod.example', pid: 2_147_483_647,
     }));
     const skillDir = join(root, 'users', 'uploader', name);
@@ -1065,55 +1252,10 @@ describe('SkillRegistry upload review governance', () => {
     await expect(registry.installUploadedProduct(skillDir, {
       tenantId: 'default', userId: 'uploader', role: 'user',
     })).resolves.toMatchObject({ name, reviewed: false });
-    await expect(stat(lockPath)).rejects.toThrow();
-    expect((await stat(join(root, '.aiop-locks'))).mode & 0o777).toBe(0o700);
+    await expect(stat(lockPath)).resolves.toBeDefined();
   });
 
-  it('recovers orphaned release-window lock directories with no active owner', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'aiop-upload-orphan-lock-'));
-    const name = 'orphan-lock';
-    const lockPath = join(root, '.aiop-locks', createHash('sha256').update(`skill-name:${name}`).digest('hex'));
-    await mkdir(join(lockPath, '.release-crashed'), { recursive: true });
-    const skillDir = join(root, 'users', 'uploader', name);
-    await mkdir(skillDir, { recursive: true });
-    await writeFile(join(skillDir, 'SKILL.md'), `---\nname: ${name}\ndescription: orphan\n---\nbody`);
-    await writeProduct(skillDir, { name, version: '1' });
-    const registry = new SkillRegistry(root);
-
-    await expect(registry.installUploadedProduct(skillDir, {
-      tenantId: 'default', userId: 'uploader', role: 'user',
-    })).resolves.toMatchObject({ name, reviewed: false });
-    await expect(stat(lockPath)).rejects.toThrow();
-  });
-
-  it('recovers an expired distributed name lock even when the stale owner was on this host', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'aiop-upload-live-lock-'));
-    const name = 'live-lock';
-    const lockKey = `skill-name:${name}`;
-    const lockPath = join(
-      root,
-      '.aiop-locks',
-      createHash('sha256').update(lockKey).digest('hex'),
-    );
-    const liveOwnerDir = join(lockPath, 'live-owner');
-    await mkdir(liveOwnerDir, { recursive: true });
-    await writeFile(join(liveOwnerDir, 'owner.json'), JSON.stringify({
-      token: 'live-owner', key: lockKey, leaseUntil: Date.now() - 60_000,
-      hostname: hostname(), pid: process.pid,
-    }));
-    const skillDir = join(root, 'users', 'uploader', name);
-    await mkdir(skillDir, { recursive: true });
-    await writeFile(join(skillDir, 'SKILL.md'), `---\nname: ${name}\ndescription: live\n---\nbody`);
-    await writeProduct(skillDir, { name, version: '1' });
-    const registry = new SkillRegistry(root, { nameLockTimeoutMs: 50 });
-
-    await expect(registry.installUploadedProduct(skillDir, {
-      tenantId: 'default', userId: 'uploader', role: 'user',
-    })).resolves.toMatchObject({ name, reviewed: false });
-    await expect(stat(lockPath)).rejects.toThrow();
-  });
-
-  it('releases the distributed name lock when review validation fails', async () => {
+  it('releases the shared name mutex when review validation fails', async () => {
     const root = await mkdtemp(join(tmpdir(), 'aiop-upload-failed-lock-'));
     const skillDir = join(root, 'users', 'uploader', 'retry-review');
     await mkdir(skillDir, { recursive: true });

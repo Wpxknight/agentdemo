@@ -14,9 +14,12 @@ HTTP 服务 Pod 内包含两个容器：
 PVC 使用 `ReadWriteMany`，默认申请 5Gi。集群的默认 StorageClass 必须支持 RWX；如果默认 StorageClass
 不支持 RWX，请在部署前为 `pvc-skills.yaml` 设置集群提供的 RWX `storageClassName`。
 
-镜像内置技能保持在只读镜像目录 `/app/skills`，产品上传、审核发布物、锁与导入暂存只写入 PVC
+镜像内置技能保持在只读镜像目录 `/app/skills`，产品上传、审核发布物、治理 overlay、历史 builtin 指纹与导入暂存只写入 PVC
 `/skills-data`。后端 Registry 同时读取两类根目录，PVC 不再覆盖镜像内容，也不再由 root initContainer
 执行 `cp -an` 或递归 `chown`。Pod 通过 `fsGroup: 1000` 与 CSI/StorageClass 的权限策略获得共享卷写权限。
+
+多副本清单设置 `skills.requireDistributedLock=true`，并通过 `aiop-secrets` 注入 MySQL 配置。启动时如果
+无法构造 MySQL advisory lock，后端会直接失败，避免把仅限单进程开发环境的内存 mutex 误当成跨 Pod 锁。
 
 ## 构建镜像
 

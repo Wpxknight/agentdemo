@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { MemoryStore } from '../src/db/memory.js';
 import { MysqlStore } from '../src/db/mysql.js';
 import { buildRuntime, createDefaultDurableRunRuntime, resolveRuntimeModelConfig, resolveRuntimeSandboxConfig } from '../src/runtime.js';
@@ -39,6 +42,17 @@ describe('resolveRuntimeModelConfig', () => {
 });
 
 describe('production durable runtime assembly', () => {
+  it('fails startup when shared skill storage requires a distributed mutation lock without MySQL', async () => {
+    const skillRoot = await mkdtemp(join(tmpdir(), 'aiop-runtime-distributed-skills-'));
+    const parsed = ConfigSchema.parse({
+      ...config,
+      skills: { dir: skillRoot, requireDistributedLock: true },
+    });
+
+    await expect(buildRuntime(parsed, { store: new MemoryStore() }))
+      .rejects.toThrow('distributed mutation lock');
+  });
+
   it('keeps the MysqlStore durable primary path disabled by default', async () => {
     const runtime = await createDefaultDurableRunRuntime(
       new MysqlStore({} as never),
