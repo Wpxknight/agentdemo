@@ -131,8 +131,8 @@ describe('buildSkillTools', () => {
   });
 });
 
-describe('SkillRegistry summaries budget', () => {
-  it('truncates long descriptions and folds overflow skills', async () => {
+describe('SkillRegistry Pi summaries', () => {
+  it('uses Pi system-prompt formatting without product-side truncation', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'aiop-skill-budget-'));
     for (let i = 0; i < 3; i++) {
       const d = join(dir, `s${i}`);
@@ -142,9 +142,9 @@ describe('SkillRegistry summaries budget', () => {
     const reg = new SkillRegistry(dir, { summaryBudget: 500 });
     await reg.scan();
     const text = reg.summaries();
-    // 预算内至少一条被截断收录，其余折叠为仅名字
-    expect(text).toContain('…');
-    expect(text).toContain('其余技能（可用 load_skill 按名加载）');
-    expect(text.length).toBeLessThan(700);
+    expect(text).toContain('<available_skills>');
+    expect(text).toContain('<name>s0</name>');
+    expect(text).toContain('<name>s2</name>');
+    expect(text).not.toContain('其余技能（可用 load_skill 按名加载）');
   });
 });

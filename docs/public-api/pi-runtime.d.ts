@@ -234,7 +234,48 @@ export declare const PI_KERNEL_VERSION = "0.82.1";
 export { InMemorySessionRepo, JsonlSessionRepo, Session, type SessionMetadata, type SessionRepo, type SessionTreeEntry, } from '@earendil-works/pi-agent-core';
 
 // file: pi/skills.d.ts
+import { type ExecutionEnv, type Skill, type SkillDiagnostic } from '@earendil-works/pi-agent-core';
 export { formatSkillsForSystemPrompt, loadSourcedSkills, loadSkills, type Skill, type SkillDiagnostic, } from '@earendil-works/pi-agent-core';
+export interface SkillIdentity {
+    tenantId: string;
+    actorId: string;
+    roles: readonly string[];
+}
+export type SkillVisibility = 'public' | 'private' | 'shared';
+/** Product-owned governance metadata carried through Pi as source data. */
+export interface SkillProductSource {
+    id: string;
+    version: string;
+    enabled: boolean;
+    reviewed: boolean;
+    audited: boolean;
+    tenantIds?: readonly string[];
+    visibility?: SkillVisibility;
+    ownerId?: string;
+    allowedRoles?: readonly string[];
+}
+export interface GovernedSkillSource {
+    path: string;
+    source: SkillProductSource;
+}
+export interface AvailableSkills {
+    skills: Skill[];
+    prompt: string;
+    diagnostics: Array<SkillDiagnostic & {
+        source: SkillProductSource;
+    }>;
+}
+export type PiSkillLoader = (env: ExecutionEnv, sources: GovernedSkillSource[]) => Promise<{
+    skills: Array<{
+        skill: Skill;
+        source: SkillProductSource;
+    }>;
+    diagnostics: Array<SkillDiagnostic & {
+        source: SkillProductSource;
+    }>;
+}>;
+/** Filter product records before Pi receives any filesystem source. */
+export declare function loadAvailableSkills(env: ExecutionEnv, identity: SkillIdentity, sources: readonly GovernedSkillSource[], loader?: PiSkillLoader): Promise<AvailableSkills>;
 
 // file: pi/tool-bridge.d.ts
 import type { JsonValue, ToolCall, ToolDefinition, ToolResult } from '@aiop/control-contracts';

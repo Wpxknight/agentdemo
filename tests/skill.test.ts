@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deflateRawSync } from 'node:zlib';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { SkillRegistry, parseFrontmatter } from '../src/skill/registry.js';
+import { SkillRegistry } from '../src/skill/registry.js';
 import { importSkillZip } from '../src/skill/import.js';
 
 function crc32(buf: Buffer): number {
@@ -69,23 +69,6 @@ function testZip(files: Record<string, string>): Buffer {
   return Buffer.concat([...localParts, ...centralParts, end]);
 }
 
-describe('parseFrontmatter', () => {
-  it('parses key: value and strips quotes', () => {
-    const { attrs, body } = parseFrontmatter(
-      '---\nname: demo\ndescription: "做演示"\n---\n正文内容',
-    );
-    expect(attrs.name).toBe('demo');
-    expect(attrs.description).toBe('做演示');
-    expect(body).toBe('正文内容');
-  });
-
-  it('returns raw body when no frontmatter', () => {
-    const { attrs, body } = parseFrontmatter('just text');
-    expect(attrs).toEqual({});
-    expect(body).toBe('just text');
-  });
-});
-
 describe('SkillRegistry', () => {
   let dir: string;
 
@@ -111,8 +94,9 @@ describe('SkillRegistry', () => {
     await reg.scan();
 
     expect(reg.list().map((s) => s.name)).toEqual(['inspect']);
-    expect(reg.summaries()).toContain('inspect: 集群巡检');
-    expect(reg.summaries()).toContain('用户请求与某个技能描述匹配时，请先调用 load_skill');
+    expect(reg.summaries()).toContain('<name>inspect</name>');
+    expect(reg.summaries()).toContain('<description>集群巡检</description>');
+    expect(reg.summaries()).toContain(`<location>${join(dir, 'inspect', 'SKILL.md')}</location>`);
   });
 
   it('load_skill returns full body and lists bundled files', async () => {
@@ -165,14 +149,14 @@ describe('SkillRegistry', () => {
 
     await reg.setEnabled('inspect', false);
     expect(reg.list().find((skill) => skill.name === 'inspect')?.enabled).toBe(false);
-    expect(reg.summaries()).not.toContain('inspect: 集群巡检');
+    expect(reg.summaries()).not.toContain('<name>inspect</name>');
     const disabled = await reg.tool().run({ name: 'inspect' }, { sessionId: 's1' });
     expect(disabled.isError).toBe(true);
     expect(disabled.content).toContain('技能已禁用');
 
     await reg.setEnabled('inspect', true);
     expect(reg.list().find((skill) => skill.name === 'inspect')?.enabled).toBe(true);
-    expect(reg.summaries()).toContain('inspect: 集群巡检');
+    expect(reg.summaries()).toContain('<name>inspect</name>');
 
     await reg.delete('inspect');
     await expect(stat(join(dir, 'inspect'))).rejects.toThrow();
@@ -208,5 +192,24 @@ describe('importSkillZip', () => {
     const zip = testZip({ '../escape.txt': 'nope' });
 
     await expect(importSkillZip({ rootDir: root, filename: 'bad.zip', data: zip })).rejects.toThrow('非法 zip 路径');
+  });
+
+  it('rejects symbolic-link zip entries', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-import-skill-link-'));
+    const zip = testZip({ 'SKILL.md': '../../outside' });
+    const central = zip.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    zip.writeUInt16LE(0x0314, central + 4); // Unix, ZIP 2.0
+    zip.writeUInt32LE((0o120777 << 16) >>> 0, central + 38);
+
+    await expect(importSkillZip({ rootDir: root, filename: 'link.zip', data: zip })).rejects.toThrow('符号链接');
+  });
+
+  it('rejects oversized zip entries before inflation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-import-skill-large-'));
+    const zip = testZip({ 'SKILL.md': 'small' });
+    const central = zip.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    zip.writeUInt32LE(20_000_000, central + 24);
+
+    await expect(importSkillZip({ rootDir: root, filename: 'large.zip', data: zip })).rejects.toThrow('大小上限');
   });
 });

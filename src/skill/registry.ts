@@ -4,102 +4,40 @@ import { logger } from '../logger.js';
 import type { JsonValue, ToolResult } from '../model/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import { isAdminRole } from '../auth/rbac.js';
-import type { Role } from '../auth/types.js';
+import { formatSkillsForSystemPrompt, loadSourcedSkills } from '@aiop/pi-runtime';
+import { NodeExecutionEnv } from '@earendil-works/pi-agent-core/node';
+import {
+  PUBLIC_SKILLS_DIR,
+  USER_SKILLS_DIR,
+  type Skill,
+  type SkillFileBody,
+  type SkillFileEntry,
+  type SkillViewer,
+  type SkillVisibility,
+  readSkillProductMetadata,
+} from './product.js';
+import { canManageSkill, isSkillVisibleTo } from './visibility.js';
+
+export {
+  PUBLIC_SKILLS_DIR,
+  USER_SKILLS_DIR,
+  type Skill,
+  type SkillFileBody,
+  type SkillFileEntry,
+  type SkillViewer,
+  type SkillVisibility,
+} from './product.js';
 
 const log = logger.child({ mod: 'skill' });
-
-/** 技能可见性：public 全员（管理员上传）；private 仅所有者；shared 所有者共享给租户内全员。 */
-export type SkillVisibility = 'public' | 'private' | 'shared';
-
-/** 可见性/归属判断所需的最小身份（ToolContext / RequestContext 均满足）。 */
-export interface SkillViewer {
-  userId?: string;
-  role?: Role;
-}
-
-export interface Skill {
-  name: string;
-  description: string;
-  dir: string;
-  enabled: boolean;
-  /** 所有者用户 id；'' 表示无主（迁移前的存量公共技能，由管理员代管）。 */
-  owner: string;
-  visibility: SkillVisibility;
-  /** frontmatter `credentials:` 声明的下游凭据需求（如 aios），同步进沙箱时按当前用户注入。 */
-  credentials: string[];
-  /** frontmatter `credential_file:` 凭据文件在技能内的相对路径（默认 token.json）。 */
-  credentialFile?: string;
-  /** SKILL.md frontmatter 之后的正文（按需 load 时返回）。 */
-  body: string;
-  /** 技能目录内的文件和目录元数据（包含 SKILL.md）。 */
-  files: SkillFileEntry[];
-}
-
-export interface SkillFileEntry {
-  path: string;
-  name: string;
-  isDirectory: boolean;
-  size: number;
-  updatedAt: string;
-}
-
-export interface SkillFileBody {
-  path: string;
-  parentPath: string | null;
-  entry: SkillFileEntry;
-  content: string;
-}
 
 const DISABLED_MARKER = '.disabled';
 const SHARED_MARKER = '.shared';
 const OWNER_MARKER = '.owner';
 const MARKER_FILES = new Set([DISABLED_MARKER, SHARED_MARKER, OWNER_MARKER]);
 
-/** 公共技能目录（管理员上传） / 个人技能目录根。 */
-export const PUBLIC_SKILLS_DIR = '_public';
-export const USER_SKILLS_DIR = 'users';
-
-/** summaries() 注入 system prompt 的默认字符预算与单条描述上限（借鉴 Claude Code SkillTool 的预算式披露）。 */
-const DEFAULT_SUMMARY_BUDGET = 4000;
-const MAX_SUMMARY_DESC_CHARS = 250;
-
 export interface SkillRegistryOptions {
-  /** summaries() 总字符预算；超出预算的技能折叠为仅名字一行。 */
+  /** @deprecated Pi owns prompt formatting and does not apply a product-side budget. */
   summaryBudget?: number;
-}
-
-/** 极简 frontmatter 解析：取首个 `---`...`---` 间的 key: value。 */
-export function parseFrontmatter(raw: string): {
-  attrs: Record<string, string>;
-  body: string;
-} {
-  const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(raw);
-  if (!m) return { attrs: {}, body: raw };
-  const attrs: Record<string, string> = {};
-  for (const line of m[1]!.split(/\r?\n/)) {
-    const idx = line.indexOf(':');
-    if (idx === -1) continue;
-    const key = line.slice(0, idx).trim();
-    let val = line.slice(idx + 1).trim();
-    if (
-      (val.startsWith('"') && val.endsWith('"')) ||
-      (val.startsWith("'") && val.endsWith("'"))
-    ) {
-      val = val.slice(1, -1);
-    }
-    if (key) attrs[key] = val;
-  }
-  return { attrs, body: m[2] ?? '' };
-}
-
-/** frontmatter credentials 值解析："aios" / "[aios, foo]" → ['aios','foo']。 */
-function parseCredentials(value: string | undefined): string[] {
-  if (!value) return [];
-  return value
-    .replace(/^\[|\]$/g, '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
 }
 
 /**
@@ -111,11 +49,8 @@ function parseCredentials(value: string | undefined): string[] {
  */
 export class SkillRegistry {
   private skills = new Map<string, Skill>();
-  private readonly summaryBudget: number;
 
-  constructor(private readonly dir: string, opts: SkillRegistryOptions = {}) {
-    this.summaryBudget = opts.summaryBudget ?? DEFAULT_SUMMARY_BUDGET;
-  }
+  constructor(private readonly dir: string, _opts: SkillRegistryOptions = {}) {}
 
   rootDir(): string {
     return this.dir;
@@ -130,42 +65,41 @@ export class SkillRegistry {
 
   async scan(): Promise<void> {
     this.skills.clear();
+    const env = new NodeExecutionEnv({ cwd: this.dir });
     let entries: string[];
     try {
       entries = await readdir(this.dir);
     } catch {
       log.warn({ dir: this.dir }, 'skills 目录不存在，跳过');
+      await env.cleanup();
       return;
     }
-
-    // 存量技能（旧布局：技能目录直接位于根下）原地视为 public，不搬家——
-    // 技能目录可能是只读挂载/多副本共享盘，移动有风险且无必要。
-    for (const entry of entries.sort()) {
-      if (entry === PUBLIC_SKILLS_DIR || entry === USER_SKILLS_DIR) continue;
-      await this.scanSkillDir(join(this.dir, entry), entry, '', 'public');
-    }
-
-    await this.scanRoot(join(this.dir, PUBLIC_SKILLS_DIR), '', 'public');
-    const usersRoot = join(this.dir, USER_SKILLS_DIR);
-    let userDirs: string[] = [];
     try {
-      userDirs = await readdir(usersRoot);
-    } catch {
-      // 无个人技能
-    }
-    for (const uid of userDirs.sort()) {
-      try {
-        if ((await stat(join(usersRoot, uid))).isDirectory()) {
-          await this.scanRoot(join(usersRoot, uid), uid, 'user');
-        }
-      } catch {
-        // 跳过异常目录
+      // 存量技能（旧布局：技能目录直接位于根下）原地视为 public，不搬家。
+      for (const entry of entries.sort()) {
+        if (entry === PUBLIC_SKILLS_DIR || entry === USER_SKILLS_DIR) continue;
+        await this.scanSkillDir(env, join(this.dir, entry), entry, '', 'public');
       }
+      await this.scanRoot(env, join(this.dir, PUBLIC_SKILLS_DIR), '', 'public');
+      const usersRoot = join(this.dir, USER_SKILLS_DIR);
+      let userDirs: string[] = [];
+      try { userDirs = await readdir(usersRoot); } catch { /* 无个人技能 */ }
+      for (const uid of userDirs.sort()) {
+        try {
+          if ((await stat(join(usersRoot, uid))).isDirectory()) {
+            await this.scanRoot(env, join(usersRoot, uid), uid, 'user');
+          }
+        } catch {
+          // 跳过异常目录
+        }
+      }
+    } finally {
+      await env.cleanup();
     }
     log.info({ count: this.skills.size }, 'skills 扫描完成');
   }
 
-  private async scanRoot(root: string, dirOwner: string, kind: 'public' | 'user'): Promise<void> {
+  private async scanRoot(env: NodeExecutionEnv, root: string, dirOwner: string, kind: 'public' | 'user'): Promise<void> {
     let entries: string[];
     try {
       entries = await readdir(root);
@@ -173,16 +107,18 @@ export class SkillRegistry {
       return;
     }
     for (const entry of entries.sort()) {
-      await this.scanSkillDir(join(root, entry), entry, dirOwner, kind);
+      await this.scanSkillDir(env, join(root, entry), entry, dirOwner, kind);
     }
   }
 
-  private async scanSkillDir(skillDir: string, entry: string, dirOwner: string, kind: 'public' | 'user'): Promise<void> {
+  private async scanSkillDir(env: NodeExecutionEnv, skillDir: string, entry: string, dirOwner: string, kind: 'public' | 'user'): Promise<void> {
     try {
       if (!(await stat(skillDir)).isDirectory()) return;
-      const raw = await readFile(join(skillDir, 'SKILL.md'), 'utf8');
-      const { attrs, body } = parseFrontmatter(raw);
-      const baseName = attrs.name || entry;
+      const loaded = await loadSourcedSkills(env, [{ path: skillDir, source: { kind: 'aiop-product' } }]);
+      const piSkill = loaded.skills.find(({ skill }) => resolve(skill.filePath) === resolve(join(skillDir, 'SKILL.md')))?.skill;
+      if (!piSkill) throw new Error(loaded.diagnostics[0]?.message ?? '技能包缺少有效 SKILL.md');
+      const metadata = await readSkillProductMetadata(skillDir);
+      const baseName = piSkill.name || entry;
       const files = await listSkillFiles(skillDir);
       const enabled = !(await exists(join(skillDir, DISABLED_MARKER)));
       const owner = kind === 'public'
@@ -199,14 +135,14 @@ export class SkillRegistry {
       }
       this.skills.set(name, {
         name,
-        description: attrs.description ?? '',
+        description: piSkill.description,
         dir: skillDir,
         enabled,
         owner,
         visibility,
-        credentials: parseCredentials(attrs.credentials),
-        credentialFile: attrs.credential_file || undefined,
-        body: body.trim(),
+        credentials: metadata.credentials,
+        credentialFile: metadata.credentialFile,
+        body: piSkill.content.trim(),
         files,
       });
     } catch (err) {
@@ -221,14 +157,12 @@ export class SkillRegistry {
 
   /** 技能对查看者是否可见：public/shared 全员；private 仅所有者。身份缺失时按"非所有者"处理。 */
   visibleTo(skill: Skill, viewer?: SkillViewer): boolean {
-    if (skill.visibility === 'public' || skill.visibility === 'shared') return true;
-    return Boolean(viewer?.userId) && skill.owner === viewer?.userId;
+    return isSkillVisibleTo(skill, viewer);
   }
 
   /** 查看者是否可管理（启停/删除/共享/改文件）：仅所有者；无主存量技能由管理员代管。 */
   canManage(skill: Skill, viewer?: SkillViewer): boolean {
-    if (skill.owner) return Boolean(viewer?.userId) && skill.owner === viewer?.userId;
-    return viewer?.role ? isAdminRole(viewer.role) : false;
+    return canManageSkill(skill, viewer);
   }
 
   /** 按查看者过滤的技能列表：public ∪ 自己的 ∪ shared。 */
@@ -240,29 +174,12 @@ export class SkillRegistry {
   summariesFor(viewer?: SkillViewer): string {
     const items = this.listFor(viewer).filter((skill) => skill.enabled);
     if (!items.length) return '';
-    const header = [
-      '可用技能（用 load_skill 加载完整指令）：',
-      '用户请求与某个技能描述匹配时，请先调用 load_skill 加载该技能，再按技能指令执行。',
-      '即使用户没有点名技能或 API，且浏览器、shell 等通用工具也能完成同类任务，只要主题命中某个技能描述，就必须优先加载并使用该技能。',
-      '每次加载技能后，先用一句话明确告知用户已加载的技能名称（如“已加载技能：aios-request”），再按技能指令继续。',
-    ];
-    let used = header.join('\n').length;
-    const lines: string[] = [];
-    const overflow: string[] = [];
-    for (const s of items) {
-      const desc = s.description.length > MAX_SUMMARY_DESC_CHARS
-        ? `${s.description.slice(0, MAX_SUMMARY_DESC_CHARS)}…`
-        : s.description;
-      const line = `- ${s.name}: ${desc}`;
-      if (used + line.length + 1 <= this.summaryBudget) {
-        lines.push(line);
-        used += line.length + 1;
-      } else {
-        overflow.push(s.name);
-      }
-    }
-    if (overflow.length) lines.push(`- 其余技能（可用 load_skill 按名加载）：${overflow.join(', ')}`);
-    return [...header, lines.join('\n')].join('\n');
+    return formatSkillsForSystemPrompt(items.map((skill) => ({
+      name: skill.name,
+      description: skill.description,
+      content: skill.body,
+      filePath: join(skill.dir, 'SKILL.md'),
+    })));
   }
 
   /** 兼容旧调用：无查看者（public+shared）视角的摘要。 */
