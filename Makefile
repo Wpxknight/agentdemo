@@ -1,13 +1,18 @@
 IMAGE ?= aiop:pi-agent-platform
 KUBECTL ?= kubectl
 
-.PHONY: verify-node test-agent-platform image deploy-staging rollback-staging
+.PHONY: verify-node test-agent-platform test-runtime-refactor image deploy-staging rollback-staging
 
 verify-node:
 	npm run verify:node
 
 test-agent-platform:
 	npm run test:agent-platform
+
+test-runtime-refactor:
+	npm run typecheck
+	npx vitest run tests/contracts tests/pi-runtime tests/integration
+	npm run verify:packages
 
 image:
 	docker build -t $(IMAGE) .
