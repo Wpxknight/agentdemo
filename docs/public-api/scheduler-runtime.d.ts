@@ -28,6 +28,11 @@ export interface RunDispatcher {
         runId: string;
     }>;
 }
+export interface ScheduledRunLookup {
+    findScheduledRun(input: ScheduledRunInput): Promise<{
+        runId: string;
+    } | undefined>;
+}
 export type ScheduledFireState = 'pending' | 'claimed' | 'started';
 export interface ScheduledFire extends ScheduledRunInput {
     state: ScheduledFireState;
@@ -118,7 +123,7 @@ export declare class SchedulerRecovery {
 
 // file: runner.d.ts
 import type { DurableRunRuntime } from '@aiop/control-contracts';
-import type { RunDispatcher } from './domain.js';
+import type { RunDispatcher, ScheduledRunLookup } from './domain.js';
 import type { SchedulerStore } from './store.js';
 export interface SchedulerRunnerOptions {
     store: SchedulerStore;
@@ -127,7 +132,7 @@ export interface SchedulerRunnerOptions {
     leaseMs?: number;
     retryDelayMs?: number;
 }
-export declare function createRunDispatcher(runtime: Pick<DurableRunRuntime, 'run'>): RunDispatcher;
+export declare function createRunDispatcher(runtime: Pick<DurableRunRuntime, 'run'>, lookup?: ScheduledRunLookup): RunDispatcher;
 export declare class SchedulerRunner {
     private readonly options;
     private readonly leaseMs;

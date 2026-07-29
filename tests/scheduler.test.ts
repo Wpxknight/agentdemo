@@ -1,9 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 import { readFile } from 'node:fs/promises';
 import { MemoryStore } from '../src/db/memory.js';
+import { MysqlStore } from '../src/db/mysql.js';
+import { MemorySchedulerStore } from '../packages/scheduler-runtime/src/index.js';
 import { Scheduler } from '../src/scheduler/ticker.js';
 import { isValidCron, nextRunAt } from '../src/scheduler/cron.js';
-import { createScheduledTaskRunner, shouldEmbedScheduler } from '../src/scheduler/runner.js';
+import {
+  createRuntimeScheduler,
+  createScheduledTaskRunner,
+  shouldEmbedScheduler,
+  startRuntimeScheduler,
+} from '../src/scheduler/runner.js';
 import { buildScheduleTools } from '../src/tools/schedule.js';
 import type { Runtime } from '../src/runtime.js';
 import type { RequestContext } from '../src/auth/types.js';
@@ -213,6 +220,38 @@ describe('createScheduledTaskRunner', () => {
 });
 
 describe('embedded scheduler deployment', () => {
+  it('uses an explicitly injected MemorySchedulerStore only for tests', async () => {
+    const fireTime = new Date('2026-07-29T01:00:00.000Z');
+    const store = new MemorySchedulerStore([{
+      taskId: 'task-a', tenantId: 'tenant-a', actorId: 'user-a', sessionId: 'session-a',
+      cron: '0 * * * *', input: [{ role: 'user', text: 'diagnose' }], nextFireAt: fireTime,
+    }]);
+    const run = vi.fn(async () => ({ runId: 'task-a:2026-07-29T01:00:00.000Z' }));
+    const scheduler = createRuntimeScheduler({
+      store: new MemoryStore(), durableRunRuntime: { run },
+    } as unknown as Runtime, { store, workerId: 'test-worker' });
+
+    expect(await scheduler.tick(fireTime)).toBe(1);
+    expect(run).toHaveBeenCalledOnce();
+  });
+
+  it('requires MysqlStore for production scheduler assembly', () => {
+    const runtime = {
+      store: new MemoryStore(), durableRunRuntime: { run: vi.fn() },
+    } as unknown as Runtime;
+
+    expect(() => startRuntimeScheduler(runtime)).toThrow('MysqlStore');
+  });
+
+  it('assembles the production scheduler for MysqlStore', () => {
+    const runtime = {
+      store: new MysqlStore({} as never), durableRunRuntime: { run: vi.fn() },
+    } as unknown as Runtime;
+
+    const scheduler = startRuntimeScheduler(runtime, { intervalMs: 60_000, workerId: 'worker-a' });
+    scheduler.stop();
+  });
+
   it('enables embedding only with an explicit truthy env value', () => {
     expect(shouldEmbedScheduler({})).toBe(false);
     expect(shouldEmbedScheduler({ AIOP_EMBED_SCHEDULER: 'false' })).toBe(false);

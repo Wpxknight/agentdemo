@@ -25,6 +25,10 @@ export interface RunDispatcher {
   startScheduledRun(input: ScheduledRunInput): Promise<{ runId: string }>;
 }
 
+export interface ScheduledRunLookup {
+  findScheduledRun(input: ScheduledRunInput): Promise<{ runId: string } | undefined>;
+}
+
 export type ScheduledFireState = 'pending' | 'claimed' | 'started';
 
 export interface ScheduledFire extends ScheduledRunInput {

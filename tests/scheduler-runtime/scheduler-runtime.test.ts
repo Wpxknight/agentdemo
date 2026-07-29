@@ -107,14 +107,35 @@ describe('scheduler runtime boundaries', () => {
   });
 
   it('treats an existing deterministic Run as successful crash compensation', async () => {
-    const run = vi.fn(async () => { throw new Error('Run already exists'); });
-    const dispatcher = createRunDispatcher({ run } as unknown as DurableRunRuntime);
+    const run = vi.fn(async () => { throw new Error('数据库写入结果未知'); });
+    const findScheduledRun = vi.fn(async () => ({ runId: 'fire-a' }));
+    const dispatcher = createRunDispatcher(
+      { run } as unknown as DurableRunRuntime,
+      { findScheduledRun },
+    );
 
     await expect(dispatcher.startScheduledRun({
       taskId: 'task-a', fireId: 'fire-a', fireTime,
       identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
       sessionId: 'session-a', input: [{ role: 'user', text: 'diagnose' }],
     })).resolves.toEqual({ runId: 'fire-a' });
+    expect(findScheduledRun).toHaveBeenCalledWith({
+      taskId: 'task-a', fireId: 'fire-a', fireTime,
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+      sessionId: 'session-a', input: [{ role: 'user', text: 'diagnose' }],
+    });
+  });
+
+  it('does not infer duplicate Runs from an error message', async () => {
+    const error = new Error('Run already exists');
+    const run = vi.fn(async () => { throw error; });
+    const dispatcher = createRunDispatcher({ run } as unknown as DurableRunRuntime);
+
+    await expect(dispatcher.startScheduledRun({
+      taskId: 'task-a', fireId: 'fire-a', fireTime,
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+      sessionId: 'session-a', input: [{ role: 'user', text: 'diagnose' }],
+    })).rejects.toBe(error);
   });
 
   it('exports the consolidated MySQL scheduler store', () => {

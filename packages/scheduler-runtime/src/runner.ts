@@ -1,5 +1,5 @@
 import type { DurableRunRuntime } from '@aiop/control-contracts';
-import type { RunDispatcher } from './domain.js';
+import type { RunDispatcher, ScheduledRunLookup } from './domain.js';
 import { SchedulerRecovery } from './recovery.js';
 import type { SchedulerStore } from './store.js';
 
@@ -11,7 +11,10 @@ export interface SchedulerRunnerOptions {
   retryDelayMs?: number;
 }
 
-export function createRunDispatcher(runtime: Pick<DurableRunRuntime, 'run'>): RunDispatcher {
+export function createRunDispatcher(
+  runtime: Pick<DurableRunRuntime, 'run'>,
+  lookup?: ScheduledRunLookup,
+): RunDispatcher {
   return {
     async startScheduledRun(input) {
       try {
@@ -24,8 +27,10 @@ export function createRunDispatcher(runtime: Pick<DurableRunRuntime, 'run'>): Ru
         return { runId: handle.runId };
       } catch (error) {
         // A worker may die after Run creation but before marking the fire started.
-        // The stable fire ID is the Run ID, so an existing Run completes compensation safely.
-        if (error instanceof Error && /run already exists/i.test(error.message)) return { runId: input.fireId };
+        // The stable fire ID is the Run ID. Compensate only after an explicit lookup proves
+        // that the deterministic Run exists; exception text is not a domain contract.
+        const existing = await lookup?.findScheduledRun(input);
+        if (existing?.runId === input.fireId) return existing;
         throw error;
       }
     },
