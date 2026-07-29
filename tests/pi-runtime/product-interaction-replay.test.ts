@@ -78,21 +78,40 @@ describe('product durable interaction replay', () => {
   });
 
   it.each([
-    { kind: 'question' as const, toolName: 'ask_user' as const, input: questionInput, value: { Continue: ['Yes'] } },
-    { kind: 'plan' as const, toolName: 'submit_change_plan' as const, input: planInput, value: true },
-  ])('resumes a transformed $kind payload when MySQL truncates createdAt to seconds', async (testCase) => {
+    {
+      kind: 'question' as const, toolName: 'ask_user' as const, input: questionInput,
+      value: { Continue: ['Yes'] }, milliseconds: 302, roundedSeconds: 0,
+    },
+    {
+      kind: 'plan' as const, toolName: 'submit_change_plan' as const, input: planInput,
+      value: true, milliseconds: 302, roundedSeconds: 0,
+    },
+    {
+      kind: 'plan' as const, toolName: 'submit_change_plan' as const, input: planInput,
+      value: true, milliseconds: 500, roundedSeconds: 1,
+    },
+    {
+      kind: 'question' as const, toolName: 'ask_user' as const, input: questionInput,
+      value: { Continue: ['Yes'] }, milliseconds: 700, roundedSeconds: 1,
+    },
+    {
+      kind: 'plan' as const, toolName: 'submit_change_plan' as const, input: planInput,
+      value: true, milliseconds: 700, roundedSeconds: 1,
+    },
+  ])('resumes a transformed $kind payload when MySQL rounds .$milliseconds to second +$roundedSeconds', async (testCase) => {
     const result = await runProductReplay(testCase, (interaction) => {
       const second = Math.floor(interaction.createdAt.getTime() / 1000) * 1000;
       return {
         ...interaction,
-        createdAt: new Date(second),
-        payload: { ...asObject(interaction.payload), createdAt: new Date(second + 302).toISOString() },
+        createdAt: new Date(second + testCase.roundedSeconds * 1000),
+        payload: { ...asObject(interaction.payload), createdAt: new Date(second + testCase.milliseconds).toISOString() },
       };
     });
 
     expect(result.resolved.createdAt.getTime() % 1000).toBe(0);
     expect(asObject(result.resolved.payload).createdAt).toBe(
-      new Date(result.resolved.createdAt.getTime() + 302).toISOString(),
+      new Date(result.resolved.createdAt.getTime()
+        - testCase.roundedSeconds * 1000 + testCase.milliseconds).toISOString(),
     );
     expect(result.resumed.error).toBeUndefined();
     expect(result.resumed).toMatchObject({ status: 'succeeded', text: 'continued after interaction' });
@@ -107,6 +126,25 @@ describe('product durable interaction replay', () => {
     const result = await runProductReplay(testCase, (interaction) => ({
       ...interaction,
       createdAt: new Date(interaction.createdAt.getTime() + 2_000),
+    }));
+
+    expect(result.resumed).toMatchObject({
+      status: 'recovery_required',
+      error: expect.objectContaining({
+        message: expect.stringContaining('interaction payload is not bound to the pending tool call'),
+      }),
+    });
+    expect(result.handler).not.toHaveBeenCalled();
+    expect(result.providerTurns).toBe(1);
+  });
+
+  it.each([
+    { kind: 'question' as const, toolName: 'ask_user' as const, input: questionInput, value: { Continue: ['Yes'] } },
+    { kind: 'plan' as const, toolName: 'submit_change_plan' as const, input: planInput, value: true },
+  ])('rejects a transformed $kind payload with an invalid createdAt timestamp', async (testCase) => {
+    const result = await runProductReplay(testCase, (interaction) => ({
+      ...interaction,
+      payload: { ...asObject(interaction.payload), createdAt: 'not-a-timestamp' },
     }));
 
     expect(result.resumed).toMatchObject({

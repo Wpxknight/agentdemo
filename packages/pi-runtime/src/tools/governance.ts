@@ -499,7 +499,8 @@ function interactionTimestampsMatch(payloadValue: unknown, interactionValue: Dat
   const payloadDate = new Date(payloadValue);
   const interactionDate = interactionValue instanceof Date ? interactionValue : new Date(interactionValue);
   if (Number.isNaN(payloadDate.getTime()) || Number.isNaN(interactionDate.getTime())) return false;
-  return Math.floor(payloadDate.getTime() / 1000) === Math.floor(interactionDate.getTime() / 1000);
+  const mysqlSecond = (date: Date) => Math.floor((date.getTime() + 500) / 1000);
+  return mysqlSecond(payloadDate) === mysqlSecond(interactionDate);
 }
 
 function isJsonObject(value: JsonValue | undefined): value is Record<string, JsonValue> {
