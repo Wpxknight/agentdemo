@@ -541,7 +541,7 @@ describe('scheduler runtime boundaries', () => {
   it('binds the durable Run and completes legacy history in separate MySQL transactions', async () => {
     const source = await readFile(new URL('../../packages/scheduler-runtime/src/mysql.ts', import.meta.url), 'utf8');
     const bindRun = source.slice(source.indexOf('async bindRun'), source.indexOf('async completeFire'));
-    const completeFire = source.slice(source.indexOf('async completeFire'), source.indexOf('async releaseFire'));
+    const completeFire = source.slice(source.indexOf('async completeFire'), source.indexOf('async listBound'));
 
     expect(bindRun).toContain('transaction().execute');
     expect(bindRun).toContain("insertInto('task_agent_runs')");
@@ -559,22 +559,27 @@ describe('scheduler runtime boundaries', () => {
   it('MySQL persists bound Runs with exact-token recovery fencing', async () => {
     const source = await readFile(new URL('../../packages/scheduler-runtime/src/mysql.ts', import.meta.url), 'utf8');
     const bindRun = source.slice(source.indexOf('async bindRun'), source.indexOf('async completeFire'));
-    const completeFire = source.slice(source.indexOf('async completeFire'), source.indexOf('async releaseFire'));
-    const releaseBound = source.slice(source.indexOf('async releaseBound'), source.indexOf('async releaseFire'));
-    const recoverExpired = source.slice(source.indexOf('async recoverExpired'), source.indexOf('\n}\n\nfunction toBoundFire'));
+    const completeFire = source.slice(source.indexOf('async completeFire'), source.indexOf('async listBound'));
+    const listBound = source.slice(source.indexOf('async listBound'), source.indexOf('async claimBound'));
     const claimBound = source.slice(source.indexOf('async claimBound'), source.indexOf('async releaseBound'));
+    const releaseBound = source.slice(source.indexOf('async releaseBound'), source.indexOf('async releaseFire'));
+    const releaseFire = source.slice(source.indexOf('async releaseFire'), source.indexOf('async recoverExpired'));
+    const recoverExpired = source.slice(
+      source.indexOf('async recoverExpired'), source.indexOf('\n}\n\nfunction toBoundFire'),
+    );
 
     expect(bindRun).toContain("state: 'bound'");
     expect(bindRun).toContain('claim_owner: null');
     expect(bindRun).not.toContain('claim_token: null');
     expect(bindRun).not.toContain('lease_expires_at: null');
-    expect(source).toContain('async listBound');
+    expect(listBound).toContain("where('state', '=', 'bound')");
+    expect(listBound).toContain("where('run_id', 'is not', null)");
     expect(claimBound).toContain("where('fire_id', '=', input.fireId)");
     expect(claimBound).toContain("where('state', '=', 'bound')");
     expect(claimBound).toContain("where('claim_token', '=', input.expectedClaimToken)");
     expect(claimBound).toContain("where('run_id', 'is not', null)");
     expect(claimBound).toContain("where('lease_expires_at', '<=', input.now)");
-    expect(claimBound).toContain('forUpdate()');
+    expect(claimBound).toContain('forUpdate().skipLocked()');
     expect(claimBound).toContain("state: 'recovering'");
     expect(releaseBound).toContain("where('state', '=', 'recovering')");
     expect(releaseBound).toContain("where('claim_token', '=', input.claimToken)");
@@ -585,6 +590,7 @@ describe('scheduler runtime boundaries', () => {
     expect(recoverExpired).toContain('transaction().execute');
     expect(completeFire).toContain("row.state !== 'bound' && row.state !== 'recovering'");
     expect(completeFire).toContain('row.run_id !== input.runId || input.result.runId !== input.runId');
+    expect(releaseFire).toContain("where('state', '=', 'claimed')");
   });
 
   it('dispatches product Runs without importing or entering the Pi loop', async () => {
@@ -678,7 +684,8 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlSchedulerStore production 
     const schedulerDb = db as unknown as Kysely<SchedulerMysqlDatabase>;
     const suffix = `${Date.now()}`;
     const tenantId = `scheduler-bound-${suffix}`;
-    const fireAt = new Date(Date.now() - 60_000);
+    const fireAt = new Date('1970-01-01T00:00:01.000Z');
+    const expiredAt = new Date(fireAt.getTime() + 11);
     let taskId: number | undefined;
 
     try {
@@ -687,13 +694,20 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlSchedulerStore production 
         cron: '* * * * *', task: 'bound', pre_approved: 1, enabled: 1, next_run_at: fireAt, last_run_at: null,
       }).executeTakeFirstOrThrow();
       taskId = Number(inserted.insertId);
+      expect(await db.selectFrom('scheduled_tasks').select('id')
+        .where('enabled', '=', 1).where('next_run_at', '<=', fireAt).where('id', '!=', taskId).limit(1).execute())
+        .toEqual([]);
+      expect(await db.selectFrom('scheduler_fires').select('fire_id')
+        .where('state', '=', 'pending')
+        .where((eb) => eb.or([eb('retry_at', 'is', null), eb('retry_at', '<=', expiredAt)]))
+        .limit(1).execute()).toEqual([]);
       const store = new MysqlSchedulerStore(schedulerDb);
       const [claimed] = await store.claimDue({ now: fireAt, limit: 1, workerId: 'worker-a', leaseMs: 10 });
       expect(claimed).toBeDefined();
+      expect(claimed!.taskId).toBe(String(taskId));
       await store.bindRun({
         fireId: claimed!.fireId, claimToken: claimed!.claimToken, runId: claimed!.fireId, boundAt: fireAt,
       });
-      const expiredAt = new Date(fireAt.getTime() + 11);
       expect(await store.recoverExpired(expiredAt)).toBe(0);
       expect(await store.claimDue({ now: expiredAt, limit: 1, workerId: 'ordinary', leaseMs: 10 })).toEqual([]);
       const [bound] = await store.listBound({ now: expiredAt, limit: 1 });
@@ -715,14 +729,28 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlSchedulerStore production 
         fireId: claimed!.fireId, expectedClaimToken: recovering!.claimToken,
         now: retryAt, workerId: 'worker-c', leaseMs: 10,
       });
-      await store.completeFire({
-        fireId: claimed!.fireId, claimToken: rebound!.claimToken, runId: claimed!.fireId,
-        result: succeeded(claimed!.fireId).result, completedAt: retryAt,
+      const recoveryExpiredAt = new Date(retryAt.getTime() + 11);
+      expect(await store.recoverExpired(recoveryExpiredAt)).toBe(1);
+      expect((await store.listBound({ now: recoveryExpiredAt, limit: 1 }))[0]).toMatchObject({
+        state: 'bound', claimToken: rebound!.claimToken, attempts: 1,
+      });
+      const finalRecovery = await store.claimBound({
+        fireId: claimed!.fireId, expectedClaimToken: rebound!.claimToken,
+        now: recoveryExpiredAt, workerId: 'worker-d', leaseMs: 10,
       });
       await expect(store.completeFire({
-        fireId: claimed!.fireId, claimToken: rebound!.claimToken, runId: claimed!.fireId,
-        result: succeeded(claimed!.fireId).result, completedAt: retryAt,
+        fireId: claimed!.fireId, claimToken: finalRecovery!.claimToken, runId: claimed!.fireId,
+        result: succeeded('different-result-run').result, completedAt: recoveryExpiredAt,
+      })).rejects.toThrow(`scheduled fire Run mismatch: ${claimed!.fireId}`);
+      await store.completeFire({
+        fireId: claimed!.fireId, claimToken: finalRecovery!.claimToken, runId: claimed!.fireId,
+        result: succeeded(claimed!.fireId).result, completedAt: recoveryExpiredAt,
+      });
+      await expect(store.completeFire({
+        fireId: claimed!.fireId, claimToken: finalRecovery!.claimToken, runId: claimed!.fireId,
+        result: succeeded(claimed!.fireId).result, completedAt: recoveryExpiredAt,
       })).resolves.toBeUndefined();
+      expect(await db.selectFrom('task_runs').selectAll().where('task_id', '=', taskId).execute()).toHaveLength(1);
     } finally {
       if (taskId !== undefined) {
         await db.deleteFrom('task_runs').where('task_id', '=', taskId).execute();

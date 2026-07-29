@@ -170,7 +170,7 @@ export class MysqlSchedulerStore implements SchedulerStore {
         .where('claim_token', '=', input.expectedClaimToken).where('run_id', 'is not', null)
         .where('lease_expires_at', '<=', input.now)
         .where((eb) => eb.or([eb('retry_at', 'is', null), eb('retry_at', '<=', input.now)]))
-        .forUpdate().executeTakeFirst();
+        .forUpdate().skipLocked().executeTakeFirst();
       if (!row || !row.run_id || !row.claim_token || !row.lease_expires_at) return undefined;
       const claimToken = randomUUID();
       const leaseExpiresAt = new Date(input.now.getTime() + input.leaseMs);
