@@ -90,8 +90,8 @@ interface LegacySeedMigrationOutcome {
 interface LegacyTombstoneMigrationState {
   schemaVersion: 1;
   tombstoneRelativePath: string;
-  inventoryFingerprint: string;
-  contentDigest: string;
+  inventoryFingerprint?: string;
+  contentDigest?: string;
   catalogFingerprint: string;
   result: 'no-candidate' | 'digest-mismatch' | 'ambiguous' | 'source-unavailable';
 }
@@ -972,9 +972,27 @@ export class SkillRegistry {
     const tombstones = await enumerateSkillProductRecords(tombstoneRoot);
     const catalogFingerprint = builtinCatalogFingerprint(catalog);
     for (const legacy of tombstones) {
-      const inventoryFingerprint = await artifactFingerprint(legacy.path);
       const cachedState = await readLegacyTombstoneMigrationState(this.dir, legacy.path);
+      const candidates = catalog.filter((entry) => entry.name === legacy.name
+        && entry.tenantId === legacy.tenantId
+        && entry.sourceVersion === legacy.version
+        && legacyRelativePathCandidates(legacy).includes(entry.relativePath));
+      if (!candidates.length) {
+        const state: LegacyTombstoneMigrationState = {
+          schemaVersion: 1,
+          tombstoneRelativePath: legacyTombstoneRelativePath(this.dir, legacy.path),
+          catalogFingerprint,
+          result: 'no-candidate',
+        };
+        if (!sameLegacyTombstoneMigrationState(cachedState, state)) {
+          await writeLegacyTombstoneMigrationState(this.dir, legacy.path, state);
+        }
+        outcome.unresolved += 1;
+        continue;
+      }
+      const inventoryFingerprint = await artifactFingerprint(legacy.path);
       const digest = cachedState?.inventoryFingerprint === inventoryFingerprint
+        && cachedState.contentDigest
         ? cachedState.contentDigest
         : await this.legacyContentDigest(legacy.path);
       const persistUnresolved = async (result: LegacyTombstoneMigrationState['result']): Promise<void> => {
@@ -991,14 +1009,6 @@ export class SkillRegistry {
         }
         outcome.unresolved += 1;
       };
-      const candidates = catalog.filter((entry) => entry.name === legacy.name
-        && entry.tenantId === legacy.tenantId
-        && entry.sourceVersion === legacy.version
-        && legacyRelativePathCandidates(legacy).includes(entry.relativePath));
-      if (!candidates.length) {
-        await persistUnresolved('no-candidate');
-        continue;
-      }
       const exactByIdentity = new Map(
         candidates.filter((entry) => entry.sourceDigest === digest).map((entry) => [entry.identity, entry]),
       );
@@ -1338,10 +1348,14 @@ function isLegacyTombstoneMigrationState(value: unknown): value is LegacyTombsto
   const state = value as Partial<LegacyTombstoneMigrationState>;
   return state.schemaVersion === 1
     && typeof state.tombstoneRelativePath === 'string' && state.tombstoneRelativePath.length > 0
-    && typeof state.inventoryFingerprint === 'string' && /^[a-f0-9]{64}$/.test(state.inventoryFingerprint)
-    && typeof state.contentDigest === 'string' && /^[a-f0-9]{64}$/.test(state.contentDigest)
     && typeof state.catalogFingerprint === 'string' && /^[a-f0-9]{64}$/.test(state.catalogFingerprint)
-    && ['no-candidate', 'digest-mismatch', 'ambiguous', 'source-unavailable'].includes(String(state.result));
+    && ['no-candidate', 'digest-mismatch', 'ambiguous', 'source-unavailable'].includes(String(state.result))
+    && (state.inventoryFingerprint === undefined
+      || typeof state.inventoryFingerprint === 'string' && /^[a-f0-9]{64}$/.test(state.inventoryFingerprint))
+    && (state.contentDigest === undefined
+      || typeof state.contentDigest === 'string' && /^[a-f0-9]{64}$/.test(state.contentDigest))
+    && (state.result === 'no-candidate'
+      || typeof state.inventoryFingerprint === 'string' && typeof state.contentDigest === 'string');
 }
 
 function sameLegacyTombstoneMigrationState(

@@ -681,17 +681,29 @@ describe('SkillRegistry', () => {
     const tombstone = join(productRoot, '.aiop-tombstones', `old-${absentName}`);
     await mkdir(join(productRoot, '.aiop-tombstones'), { recursive: true });
     await cp(absentBackup, tombstone, { recursive: true });
+    await rm(join(tombstone, 'SKILL.md'));
+    await symlink(join(absentBackup, 'SKILL.md'), join(tombstone, 'SKILL.md'));
 
     const first = new SkillRegistry(productRoot, registryOptions);
     await first.scan();
 
     await expect(stat(tombstone)).resolves.toBeDefined();
     await expect(stat(legacyMigrationMarker(productRoot))).rejects.toThrow();
-    expect(tombstoneDigestCalls).toBe(1);
+    expect(tombstoneDigestCalls).toBe(0);
+    const stateRoot = join(productRoot, '.aiop-governance', 'migrations',
+      'legacy-seed-governance-v1-tombstones');
+    const [stateFile] = await readdir(stateRoot);
+    const unresolvedState = JSON.parse(await readFile(join(stateRoot, stateFile!), 'utf8')) as Record<string, unknown>;
+    expect(unresolvedState).toMatchObject({ result: 'no-candidate' });
+    expect(unresolvedState).not.toHaveProperty('inventoryFingerprint');
+    expect(unresolvedState).not.toHaveProperty('contentDigest');
     await new SkillRegistry(productRoot, registryOptions).scan();
-    expect(tombstoneDigestCalls).toBe(1);
+    expect(tombstoneDigestCalls).toBe(0);
     await expect(stat(legacyMigrationMarker(productRoot))).rejects.toThrow();
 
+    await rm(join(tombstone, 'SKILL.md'));
+    await writeFile(join(tombstone, 'SKILL.md'),
+      `---\nname: ${absentName}\ndescription: first catalog\n---\nbody`);
     await cp(absentBackup, join(builtinRoot, absentName), { recursive: true });
     const second = new SkillRegistry(productRoot, registryOptions);
     await second.scan();
@@ -708,14 +720,18 @@ describe('SkillRegistry', () => {
     const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-tombstone-state-source-'));
     const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-tombstone-state-product-'));
     const current = join(builtinRoot, 'state-current');
-    await mkdir(current);
-    await writeFile(join(current, 'SKILL.md'), '---\nname: state-current\ndescription: current\n---\nbody');
-    await writeProduct(current, {
-      name: 'state-current', version: '1', enabled: true, reviewed: true,
-      tenantId: 'default', visibility: 'public',
-    });
+    const historical = join(builtinRoot, 'unknown-state');
+    for (const [path, name] of [[current, 'state-current'], [historical, 'unknown-state']] as const) {
+      await mkdir(path);
+      await writeFile(join(path, 'SKILL.md'), `---\nname: ${name}\ndescription: current\n---\nbody`);
+      await writeProduct(path, {
+        name, version: '1', enabled: true, reviewed: true,
+        tenantId: 'default', visibility: 'public',
+      });
+    }
     await new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] }).scan();
     await rm(legacyMigrationMarker(productRoot));
+    await rm(historical, { recursive: true });
     const tombstone = join(productRoot, '.aiop-tombstones', 'unknown-state');
     await mkdir(tombstone, { recursive: true });
     await writeFile(join(tombstone, 'SKILL.md'), '---\nname: unknown-state\ndescription: old\n---\nold');
