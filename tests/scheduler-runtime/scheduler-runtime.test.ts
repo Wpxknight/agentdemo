@@ -166,6 +166,69 @@ describe('SchedulerRunner', () => {
     expect((await store.listFires())[0]).toMatchObject({ state: 'started', runId: 'run-b', attempts: 2 });
   });
 
+  it('defers a bound fire after its Run result rejects and continues later fires', async () => {
+    const base = new MemorySchedulerStore([task, { ...task, taskId: 'task-b' }]);
+    const releaseFire = vi.spyOn(base, 'releaseFire');
+    const deferBound = vi.spyOn(base, 'deferBound');
+    const resultError = new Error('Durable Run result unavailable');
+    const dispatcher = createRunDispatcher({
+      run: async (input: StartRunInput) => ({
+        runId: input.runId!, status: 'running', events: { async *[Symbol.asyncIterator]() {} },
+        result: async () => {
+          if (input.runId!.startsWith('task-a:')) throw resultError;
+          return succeeded(input.runId!).result;
+        },
+      }),
+    } as unknown as DurableRunRuntime);
+    const runner = new SchedulerRunner({
+      store: base, dispatcher, boundRecovery: activeBoundRecovery,
+      workerId: 'worker-a', retryDelayMs: 100,
+    });
+
+    await expect(runner.tick(fireTime, 2)).resolves.toBe(2);
+    expect(releaseFire).not.toHaveBeenCalled();
+    expect(deferBound).toHaveBeenCalledWith(expect.objectContaining({
+      fireId: 'task-a:2026-07-29T01:00:00.000Z',
+      retryAt: new Date(fireTime.getTime() + 100),
+      error: String(resultError),
+    }));
+    expect((await base.listFires()).find((fire) => fire.fireId.startsWith('task-a:'))).toMatchObject({
+      state: 'bound', retryAt: new Date(fireTime.getTime() + 100), lastError: String(resultError),
+    });
+    expect((await base.listFires()).find((fire) => fire.fireId.startsWith('task-b:'))).toMatchObject({
+      state: 'started', attempts: 1,
+    });
+  });
+
+  it('defers a bound fire after completion temporarily fails and continues later fires', async () => {
+    const base = new MemorySchedulerStore([task, { ...task, taskId: 'task-b' }]);
+    const completeFire = vi.spyOn(base, 'completeFire').mockRejectedValueOnce(new Error('temporary completion failure'));
+    const releaseFire = vi.spyOn(base, 'releaseFire');
+    const deferBound = vi.spyOn(base, 'deferBound');
+    const runner = new SchedulerRunner({
+      store: base,
+      dispatcher: { startScheduledRun: async (input, onStarted) => dispatchSucceeded(input.fireId, onStarted) },
+      boundRecovery: activeBoundRecovery,
+      workerId: 'worker-a', retryDelayMs: 100,
+    });
+
+    await expect(runner.tick(fireTime, 2)).resolves.toBe(2);
+    expect(completeFire).toHaveBeenCalledTimes(2);
+    expect(releaseFire).not.toHaveBeenCalled();
+    expect(deferBound).toHaveBeenCalledWith(expect.objectContaining({
+      fireId: 'task-a:2026-07-29T01:00:00.000Z',
+      retryAt: new Date(fireTime.getTime() + 100),
+      error: 'Error: temporary completion failure',
+    }));
+    expect((await base.listFires()).find((fire) => fire.fireId.startsWith('task-a:'))).toMatchObject({
+      state: 'bound', retryAt: new Date(fireTime.getTime() + 100),
+      lastError: 'Error: temporary completion failure',
+    });
+    expect((await base.listFires()).find((fire) => fire.fireId.startsWith('task-b:'))).toMatchObject({
+      state: 'started', attempts: 1,
+    });
+  });
+
   it('recovers an expired worker claim and compensates by creating the Run once', async () => {
     const store = new MemorySchedulerStore([task]);
     const [abandoned] = await store.claimDue({ now: fireTime, limit: 1, workerId: 'dead-worker', leaseMs: 1_000 });
@@ -859,6 +922,30 @@ describe('scheduler runtime boundaries', () => {
       identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
       sessionId: 'session-a', input: [{ role: 'user', text: 'diagnose' }],
     });
+  });
+
+  it('does not repeat startup compensation after a created Run result rejects', async () => {
+    const resultError = new Error('Run result stream failed');
+    const run = vi.fn(async () => ({
+      runId: 'fire-a', status: 'running' as const,
+      events: { async *[Symbol.asyncIterator]() {} },
+      result: async () => { throw resultError; },
+    }));
+    const findScheduledRun = vi.fn(async () => succeeded('fire-a'));
+    const onStarted = vi.fn(async () => undefined);
+    const dispatcher = createRunDispatcher(
+      { run } as unknown as DurableRunRuntime,
+      { findScheduledRun },
+    );
+
+    await expect(dispatcher.startScheduledRun({
+      taskId: 'task-a', fireId: 'fire-a', fireTime,
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+      sessionId: 'session-a', input: [{ role: 'user', text: 'diagnose' }],
+    }, onStarted)).rejects.toBe(resultError);
+    expect(run).toHaveBeenCalledOnce();
+    expect(onStarted).toHaveBeenCalledOnce();
+    expect(findScheduledRun).not.toHaveBeenCalled();
   });
 
   it('does not infer duplicate Runs from an error message', async () => {

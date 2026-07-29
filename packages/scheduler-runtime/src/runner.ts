@@ -25,8 +25,9 @@ export function createRunDispatcher(
 ): RunDispatcher {
   return {
     async startScheduledRun(input, onStarted) {
+      let handle;
       try {
-        const handle = await runtime.run({
+        handle = await runtime.run({
           runId: input.fireId,
           identity: input.identity,
           sessionId: input.sessionId,
@@ -35,8 +36,6 @@ export function createRunDispatcher(
           limits: input.limits,
           signal: input.signal,
         });
-        await onStarted?.(handle.runId);
-        return { runId: handle.runId, result: await handle.result() };
       } catch (error) {
         // A worker may die after Run creation but before marking the fire started.
         // The stable fire ID is the Run ID. Compensate only after an explicit lookup proves
@@ -48,6 +47,8 @@ export function createRunDispatcher(
         }
         throw error;
       }
+      await onStarted?.(handle.runId);
+      return { runId: handle.runId, result: await handle.result() };
     },
   };
 }
@@ -151,6 +152,7 @@ export class SchedulerRunner {
       leaseMs: this.leaseMs,
     });
     for (const fire of fires) {
+      let bound = false;
       try {
         if (signal?.aborted) throw signal.reason ?? new Error('scheduler stopped');
         const prepared = await this.options.prepareRun?.(fire, now);
@@ -168,20 +170,28 @@ export class SchedulerRunner {
           execution: fire.execution,
           ...prepared,
           signal: runSignal,
-        }, (runId) => this.options.store.bindRun({
-          fireId: fire.fireId, claimToken: fire.claimToken, runId, boundAt: now,
-        }));
+        }, async (runId) => {
+          await this.options.store.bindRun({
+            fireId: fire.fireId, claimToken: fire.claimToken, runId, boundAt: now,
+          });
+          bound = true;
+        });
         if (signal?.aborted) throw signal.reason ?? new Error('scheduler stopped');
         await this.options.store.completeFire({
           fireId: fire.fireId, claimToken: fire.claimToken, runId, result, completedAt: now,
         });
       } catch (error) {
-        await this.options.store.releaseFire({
+        const retry = {
           fireId: fire.fireId,
           claimToken: fire.claimToken,
           retryAt: new Date(now.getTime() + this.retryDelayMs),
           error: String(error),
-        });
+        };
+        if (bound) {
+          await this.options.store.deferBound(retry).catch(() => undefined);
+        } else {
+          await this.options.store.releaseFire(retry).catch(() => undefined);
+        }
       }
     }
     return recovered + fires.length;
