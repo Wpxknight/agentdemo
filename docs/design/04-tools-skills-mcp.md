@@ -1,203 +1,74 @@
 # 工具、Skill 与 MCP 设计
 
-## 0. 开源与自研边界
+## 1. 统一执行链
 
-| 能力 | 所有权 | 说明 |
-| --- | --- | --- |
-| MCP 协议与 Client SDK | **开源引用** | `@modelcontextprotocol/sdk` 提供协议与 transport 能力 |
-| `McpManager`、连接热管理和工具映射 | **混合封装** | 基于 MCP SDK，把远程工具映射为 AIoP `ToolHandler` |
-| LangGraph `interrupt()` / `Command` | **开源引用** | 提供暂停与恢复原语 |
-| Tool Registry、Tool Broker、Rules、Policy、Approval、Hook、Ledger | **自研** | 定义工具可见性、执行顺序、安全边界和副作用恢复 |
-| Built-in 与 Skill 工具 | **自研** | AIoP 定义工具契约、参数、权限语义和执行逻辑 |
-| Sandbox/MCP 工具适配 | **混合封装** | 基于外部 SDK 或协议映射为 AIoP `ToolHandler` |
-
-Legacy 和 LangGraph 两种 Kernel 都调用同一个自研 Tool Broker。LangGraph 图不能直接绕过 Policy、Approval、Hook、Ledger 或 Registry dispatch。
-
-## 1. 总体结构
-
-AIoP 将内置工具、Sandbox 工具、Skill 工具和 MCP 工具统一为 `ToolHandler`，由 `ToolRegistry` 提供定义列表和 dispatch。
-
-~~~mermaid
+```mermaid
 flowchart LR
-  Legacy[Legacy Loop 自研]
-  LangGraph[AIoP LangGraph Graph 自研]
-  Model[Model ToolCall]
-  Broker[Tool Broker 自研]
-  Rules[Permission Rules]
-  Policy[Ops Policy]
-  Approval[Approval or Interaction]
-  Hook[PreToolUse Hooks]
-  Ledger[Tool Ledger]
-  Registry[Tool Registry]
-  Builtin[Built-in Tools]
-  Skill[Skill Tools]
-  MCP[MCP Tools]
-  Sandbox[Sandbox Tools]
+  Pi[Pi Tool Call]
+  Bridge[AIoP Tool Bridge]
+  Guard[Policy / Approval / Ledger / Audit]
+  Product[AIoP Product Tools]
+  MCP[MCP Runtime]
+  Sandbox[Sandbox Runtime]
+  Result[Pi Tool Result]
 
-  Model --> Legacy
-  Model --> LangGraph
-  Legacy --> Broker
-  LangGraph --> Broker
-  Broker --> Rules --> Policy --> Approval --> Hook --> Ledger --> Registry
-  Registry --> Builtin
-  Registry --> Skill
-  Registry --> MCP
-  Registry --> Sandbox
-~~~
+  Pi --> Bridge --> Guard
+  Guard --> Product --> Result
+  Guard --> MCP --> Result
+  Guard --> Sandbox --> Result
+```
 
-## 2. Tool Registry 与 Broker
+Pi 负责参数校验、Tool 事件、基础 dispatch 和输出截断。AIoP 不重复这些基础能力，只在 `packages/pi-runtime/src/tools/` 保留产品治理差异。
 
-`ToolRegistry` 负责注册、注销、列出定义和按名称调用。未知工具、参数异常和执行异常都转成 `ToolResult`，避免 Provider 协议被异常打断。
+## 2. Tool Registry 与治理
 
-`executeToolCalls()` 对同一模型轮次的调用使用 `Promise.all` 并发执行，但返回顺序与模型 call 顺序一致。对于传入相应选项的 HTTP 与 Scheduler 调用，单调用顺序为：
+- Pi adapter：`packages/pi-runtime/src/pi/tool-bridge.ts`
+- 统一 registry：`packages/pi-runtime/src/tools/registry.ts`
+- Governance：`packages/pi-runtime/src/tools/governance.ts`
+- Policy/Approval/Ledger/Audit：同目录对应文件
+- 产品工具：`src/tools/`
+- 应用注册：`src/agent/tools.ts` 与 `src/runtime.ts`
 
-1. Agent Run guard 与 AbortSignal。
-2. Policy 检查。
-3. Approval、durable approval 或拒绝。
-4. PreToolUse Hook。
-5. Tool Ledger begin 或 completed 结果复用。
-6. Registry dispatch。
-7. Ledger complete。
-8. 发出 tool output 和 tool result 事件。
+每次调用必须绑定 tenant、actor、run、attempt、turn、tool call 和 logical call。模型提供的同名字段不具有授权效力。
 
-CLI 虽复用 Tool Broker、Policy、Approval 和 Tool Ledger，但 `runOnce()` 当前没有传入 Permission Rules 的工具定义过滤或配置化 Hook，因此不具备与 HTTP/Scheduler 完全相同的调用链。
+## 3. Skill 边界
 
-LangGraph 路径中，`tools` 节点负责把 state 中的 ToolCall 交给 `executeToolCalls()`。节点只负责图状态转换和 durable interaction 的 interrupt 映射；真正的策略判断与副作用执行仍在 Tool Broker。
+Pi 复用范围：解析 `SKILL.md`、加载 sourced skills、生成 prompt 摘要和 invocation 格式。
 
-## 3. 权限规则与运维策略
+AIoP 自研范围位于 `src/skill/`：
 
-`PermissionRules` 支持 `allow`、`deny`、`ask`，优先级为 deny > ask > allow。规则可匹配工具名、MCP 前缀，以及 kubectl verb/目标或 Sandbox 命令文本。
+- 产品导入、升级、锁和 digest cache；
+- tenant/user 可见性与发布治理；
+- Credential 目标与运行期注入；
+- Sandbox 文件同步与审计。
 
-无条件 deny 的工具在注入模型前被剥离；带参数条件的规则只能在执行时判断。
+Skill 内容不得持久化真实 Credential。Pi loader 只接收已通过 AIoP 可见性检查的来源。
 
-`OpsPolicy` 继续实施不可绕过的底线：
+## 4. MCP Runtime
 
-- 高危 shell，如 `rm -rf /`、`mkfs`、设备写入、重启。
-- kubectl 未知集群、租户 ACL、namespace 白名单。
-- 危险 kubectl verb。
-- 角色写权限与只读集群。
-- 生产集群审批、已批准变更计划或 preApproved。
+`packages/mcp-runtime` 基于官方 `@modelcontextprotocol/sdk`，负责：
 
-规则 allow 可以跳过普通审批，但不能绕过危险命令、租户、namespace 和只读边界。
+- stdio/HTTP 等 client 连接；
+- tenant/actor 维度的 server snapshot；
+- 连接重建与过期 actor fencing；
+- Credential provider；
+- MCP tool 到 Pi Tool 的名称和 schema 映射。
 
-~~~mermaid
-flowchart TD
-  Call[ToolCall] --> Deny{deny rule}
-  Deny -->|yes| Block[Block and audit]
-  Deny -->|no| Hard{hard safety check}
-  Hard -->|fail| Block
-  Hard -->|pass| Ask{ask or production approval}
-  Ask -->|required| Wait[Approval interaction]
-  Ask -->|approved| Hooks[Run hooks]
-  Ask -->|not required| Hooks
-  Hooks -->|deny| Block
-  Hooks -->|allow or fail-open| Dispatch[Dispatch tool]
-~~~
+`src/runtime.ts` 从启动配置和持久化租户设置合并 server 配置。单个 MCP Server 失败不能阻断其他 Server；Tool 调用仍经过统一 Governance。
 
-## 4. Approval、Question 与 Plan
+## 5. Approval 与未知副作用
 
-交互分为内存兼容路径和 durable interaction 路径。LangGraph Kernel 使用 AIoP 持久记录与开源 interrupt 原语：
+- `approval`、`question`、`plan` 是 Durable Interaction，不是进程内 promise 的唯一事实源。
+- resolution 必须匹配 tenant、run、interaction、tool call 和 pending state。
+- 只读或确定幂等调用可按策略恢复。
+- 非幂等调用在结果未知时进入 `recovery_required`，人工确认后才能继续。
 
-- approval：批准一次工具调用。
-- question：`ask_user` 请求结构化回答。
-- plan：`submit_change_plan` 请求批准变更计划。
+## 6. 测试入口
 
-会话内 `PlanApprovalState` 可让后续同会话生产变更免于逐条审批；它不跨会话扩权。
-
-这里属于混合边界：LangGraph 提供 `interrupt()` / `Command(resume)`，AIoP 自研 Interaction 的创建、Store 记录、tenant/user/session/run 授权、等待和解析。
-
-## 5. Hook
-
-`HookRunner` 支持 command 和 webhook 两类 PreToolUse：
-
-- command 通过 stdin 接收 JSON。
-- webhook POST JSON，并使用 SSRF 校验。
-- 任一 Hook deny 即拦截。
-- Hook 执行失败默认 fail-open 并记录告警。
-
-合规硬限制必须使用 Permission Rules 或内置 Policy，不能只依赖 fail-open Hook。
-
-## 6. 内置工具
-
-当前组装的主要工具族：
-
-- Sandbox：运行命令、代码和文件操作。
-- Browser/Desktop：截图、交互与预览。
-- Export：从 Sandbox 导出受控下载文件。
-- kubectl：目标集群运维。
-- Schedule：创建、启停和查询定时任务。
-- Todo：更新模型侧任务清单。
-- Ask User：结构化提问。
-- Change Plan：提交变更计划审批。
-- Web Fetch：带域名和 SSRF 约束的抓取。
-- Sandbox Profile：发现可用模板。
-- Skill：加载内容、读取文件、同步到 Sandbox。
-
-工具是否注册取决于配置和运行期能力。例如禁用代码 Sandbox 时会注销 Skill 同步工具。
-
-## 7. Skill 系统
-
-`SkillRegistry` 扫描配置目录中的 `SKILL.md`，解析名称、描述和正文，生成受预算控制的摘要注入系统提示词。
-
-Skill 生命周期包括：
-
-- 扫描本地/导入目录。
-- 租户或管理员上传与导入。
-- 启用、禁用、共享、取消共享和删除。
-- 浏览 Skill 文件树并读取受限文件。
-- 通过 `load_skill` 按需读取完整说明。
-- 将 Skill 文件同步到当前用户会话的 Sandbox。
-
-安全规则：
-
-- 文件路径必须保持在 Skill 根目录内。
-- 同步限制文件数量、单文件大小和总大小。
-- 运行期凭据不能写入 Skill 文件或镜像。
-- 共享和管理动作按角色与所有权授权。
-
-## 8. MCP 管理
-
-`McpManager` 支持 stdio、SSE 和 HTTP 配置。工具命名为 `mcp__<server>__<tool>`，避免不同 Server 冲突。
-
-~~~mermaid
-sequenceDiagram
-  participant A as Admin API
-  participant M as McpManager
-  participant C as MCP Client
-  participant R as Tool Registry
-  participant S as Store
-
-  A->>M: add or reconnect server
-  M->>C: connect and listTools
-  alt connected
-    C-->>M: tool schemas
-    M->>R: replace MCP handlers
-    M->>S: persist configs
-  else failed
-    M-->>A: error status retained
-  end
-~~~
-
-单 Server 连接失败只把该 Server 标为 error，不影响其他 Server。add/remove/reconnect 后，HTTP 层重新同步 Registry。公开信息不返回 header 敏感值。
-
-## 9. 失败与测试边界
-
-- Policy block 返回工具错误结果，不调用目标工具。
-- Approval 拒绝返回明确错误结果。
-- Hook 故障告警但默认放行。
-- MCP 调用错误由对应 ToolResult 表达。
-- Tool Ledger 的不确定副作用进入 recovery_required。
-- 测试需覆盖规则优先级、kubectl 分类、并发结果顺序、Skill 路径穿越、同步限额、MCP 热更新和敏感配置隐藏。
-
-## 10. 源码依据
-
-- `src/agent/tools.ts`
-- `src/agent/services/tool-broker.ts`
-- `src/agent/rules.ts`
-- `src/agent/policy.ts`
-- `src/agent/hooks.ts`
-- `src/tools/`
-- `src/skill/registry.ts`
-- `src/skill/import.ts`
-- `src/mcp/manager.ts`
-- `src/mcp/client.ts`
+- `tests/pi-runtime/tool-governance.test.ts`
+- `tests/pi-runtime/tool-bridge.test.ts`
+- `tests/pi-runtime/tool-sources.test.ts`
+- `tests/durable-interaction.test.ts`
+- `tests/mcp-runtime/`
+- `tests/skill.test.ts`
+- `tests/policy.test.ts`、`tests/rules.test.ts`、`tests/hooks.test.ts`

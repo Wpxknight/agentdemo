@@ -1,199 +1,59 @@
 # 模型与上下文设计
 
-## 0. 开源与自研边界
+## 1. 所有权边界
 
-模型调用链不是由 LangGraph 或模型 SDK 整体提供。所有权如下：
+模型调用和上下文不再由 AIoP 自建一套 Provider-neutral loop。
 
-| 能力 | 所有权 | 实现位置 |
+| 能力 | 边界 | 当前路径 |
 | --- | --- | --- |
-| Anthropic/OpenAI 客户端与 LangChain 基础类型 | **开源引用** | `@anthropic-ai/sdk`、`openai`、`@langchain/core` |
-| `Msg`、`ToolCall`、`ToolResult`、`StreamEvent`、`ChatModel` | **自研** | `src/model/types.ts` |
-| Anthropic/OpenAI Adapter | **混合封装** | 基于开源 SDK 实现 AIoP 中立消息与事件映射，位于 `src/model/**` |
-| Model Gateway | **自研** | `src/agent/services/model-gateway.ts` |
-| Prompt、token 估算、硬裁剪、摘要压缩 | **自研** | `src/agent/services/prompt.ts`、`src/agent/context.ts`、`context-service.ts` |
-| LangGraph `model` 节点 | **自研** | 使用开源图 API 注册，但节点状态转换与服务调用由 AIoP 定义 |
+| Provider、模型流与 usage | Pi 复用 | `@earendil-works/pi-ai` |
+| Model 配置到 Pi model/provider 的映射 | 薄适配 | `packages/pi-runtime/src/pi/models.ts`、`src/runtime.ts` |
+| Agent message 与产品 DTO 转换 | 薄适配 | `packages/pi-runtime/src/pi/message-codec.ts` |
+| 流事件与 Durable Event 转换 | 薄适配 | `packages/pi-runtime/src/pi/event-codec.ts` |
+| Session Tree、branch、stats | Pi 复用 | Pi Session API |
+| SessionStorage 与 committed leaf | AIoP 自研 | `packages/pi-runtime/src/pi/session.ts`、`packages/pi-runtime/src/store/pi-session-mysql.ts` |
+| Compaction 执行 | Pi 复用 + 薄适配 | `packages/pi-runtime/src/pi/compaction.ts` |
+| 产品消息与用量投影 | AIoP 自研 | `src/agent/projections.ts` |
 
-Legacy Agent Loop 和 LangGraph Kernel 共用同一个 Model Gateway 与 Context Service。切换 Kernel 不会切换模型协议、重试、usage 或上下文治理语义。
+## 2. 模型选择
 
-## 1. 中立模型契约
+`src/runtime.ts` 从非敏感模型配置构造 Pi `Model` 与 `Provider`。协议、base URL、模型名称和能力由配置决定；凭据从受控 Credential Store 注入，不写入 Session、事件或文档。
 
-Agent 核心不直接使用 Anthropic 或 OpenAI 的 wire format，而使用 `src/model/types.ts` 定义的中立结构。
+Pi 的 retry、thinking level、stream event 和 provider error 是执行语义。AIoP 只增加模型并发配额、Durable Run 预算和产品级错误映射。
 
-| 类型 | 作用 |
-| --- | --- |
-| `Msg` | user/assistant/tool 消息、正文、思考、工具调用与多模态块 |
-| `ToolDef` | 暴露给模型的工具名称、描述和 JSON Schema |
-| `ToolCall` | 模型生成的调用 id、名称与参数 |
-| `ToolResult` | 文本回退、结构化内容块和错误标记 |
-| `StreamEvent` | 文本、思考、工具、用量、重试、压缩等中立事件 |
-| `ChatModel` | `stream(input)` 异步流接口 |
+## 3. Session 与上下文
 
-~~~mermaid
-flowchart LR
-  Agent[自研 Agent Core Services]
-  Neutral[Neutral Contracts]
-  Anthropic[Anthropic Adapter 混合封装]
-  OpenAI[OpenAI Adapter 混合封装]
-  AAPI[Anthropic compatible API]
-  OAPI[OpenAI compatible API]
+Pi Session Tree 保存完整会话分支；AIoP MySQL 保存：
 
-  Agent --> Neutral
-  Neutral --> Anthropic --> AAPI
-  Neutral --> OpenAI --> OAPI
-~~~
+- `pi_sessions.current_leaf_id`：当前工作 leaf；
+- `pi_sessions.committed_leaf_id`：最后一个已完成 Durable Turn 的 leaf；
+- `pi_session_entries`：Pi entry 与稳定 sequence；
+- Turn commit 中的 `pi_session_id`、`pi_leaf_id`、`pi_entry_seq`。
 
-Adapter 负责消息转换、工具 Schema 映射、流式事件转换、usage 归一化，并保留 Anthropic thinking block 及 signature。底层 SDK 是开源引用，转换规则和中立契约由 AIoP 自研。
+恢复时只使用 committed path。未提交分支可用于当前 Attempt 调试，但不能进入产品消息或后续恢复上下文。
 
-## 2. 模型配置与选择
+## 4. Compaction
 
-`createModel(id, config)` 根据 `protocol: anthropic | openai` 创建 Adapter。配置包含 base URL、API Key、模型名、上下文窗口、图片保留数量、reasoning effort 和 token 单价。
+Pi 提供 compaction、branch summary 和 Session stats。`packages/pi-runtime/src/pi/compaction.ts` 负责将 AIoP 的预算和事件要求映射到 Pi：
 
-启动时只读取 `default` 租户的 LLM 设置并创建进程级 Model 实例。设置 API 的 Store 调用带请求 tenant key，但 `updateModel()` 会立即替换该进程的全局 Model；当前实现并不是每租户独立模型路由。多租户部署中应把 LLM 设置视为平台级配置，限制修改权限，并避免用非 default tenant 写入造成数据库记录与实际全局运行态不一致。公开设置只返回 Key 是否设置与预览，不返回完整密钥。
+- 压缩前检查 Run 取消、lease 和预算；
+- 不把审批、ledger 或敏感 Tool 参数拼进摘要；
+- 记录 compaction 计数和 token/cost projection；
+- compaction 失败时保留最后 committed leaf。
 
-## 3. 提示词组合
+## 5. Codec 兼容性
 
-`buildSystemPrompt()` 组合平台基础行为、运行时额外 system 文本、Skill 摘要、沙箱能力提示和无人值守限制。
+`message-codec.ts` 和 `event-codec.ts` 是唯一兼容边界，必须保持：
 
-提示词是行为引导，不是授权边界。工具调用仍必须经过 Rules、Policy、Approval 和 Hook。
+- assistant text/thinking、ToolCall、ToolResult 的顺序；
+- image、usage、stop reason 和 provider metadata 的可解释映射；
+- 未知 Pi entry 可安全忽略或保留为 opaque metadata，不能破坏恢复；
+- 产品 DTO 不暴露凭据、内部 prompt 或 Tool 原始敏感参数。
 
-## 4. 模型轮次
+## 6. 测试入口
 
-~~~mermaid
-sequenceDiagram
-  participant G as Legacy or LangGraph Kernel
-  participant C as Context 自研
-  participant M as Model Gateway 自研
-  participant A as Adapter 混合封装
-  participant P as Provider
-
-  G->>C: compact at boundary
-  C-->>G: governed messages
-  G->>M: runModelTurn
-  M->>C: hard compact to request budget
-  M->>M: filter tool definitions
-  M->>A: stream system messages tools
-  A->>P: provider request
-  P-->>A: streaming chunks
-  A-->>M: neutral StreamEvent
-  M-->>G: text thinking calls usage
-~~~
-
-`runModelTurn()` 为一次完整尝试收集文本、思考、工具调用和 usage。可重试错误会整轮重放，前端通过 `model_retry` 回滚失败尝试的展示。
-
-LangGraph 只负责何时调度 `model` 节点；节点内部的上下文压缩、工具定义过滤、模型流消费、重试和 usage 聚合仍由 AIoP 自研代码执行。
-
-## 5. 上下文预算
-
-默认算法：
-
-`request budget = context window - 32000 output reserve - 16000 safety margin`
-
-且最小预算为 20,000 token。估算规则：
-
-- 文本约按 4 字符/token。
-- PNG/JPEG 图片取像素估算与 base64 长度估算的较大值。
-- 工具调用、结果、thinking 与 signature 都计入。
-- Provider tokenizer 可能不同，因此保留安全余量。
-
-## 6. 三层上下文治理
-
-~~~mermaid
-flowchart TD
-  Input[Full history]
-  Images[Keep recent image messages]
-  Single[Truncate oversized text fields]
-  Budget{Within hard budget}
-  Drop[Drop oldest messages preserving tool pairs]
-  Boundary{Reached summary trigger}
-  Summary[Summarize stale history]
-  Recent[Keep recent messages]
-  Send[Send to model]
-
-  Input --> Images --> Single --> Budget
-  Budget -->|no| Drop --> Boundary
-  Budget -->|yes| Boundary
-  Boundary -->|yes| Summary --> Recent --> Send
-  Boundary -->|no| Send
-~~~
-
-### 6.1 图片治理
-
-只保留最近 K 条带图消息中的图片，旧图片替换为文本占位。K 可为 0。该逻辑同时处理用户附件和工具截图。
-
-### 6.2 硬预算裁剪
-
-- 单条消息限制到预算的约四分之一，至少保留 2,000 token。
-- 再从最旧消息开始丢弃。
-- 不让结果以孤立 tool 消息开头。
-- 裁剪后确保首条 user 语义。
-- 最后一条消息保留，必要时转成 user 文本回退。
-
-### 6.3 摘要压缩
-
-达到触发阈值时，将旧消息渲染为受限纯文本，生成 `SUMMARY_PREFIX` 开头的历史摘要；近期消息和真实用户输入保持原样。压缩后完整替换会话历史。
-
-`compactionWatermark` 防止压缩后仍略高于阈值时每轮重复摘要。只有历史继续增长到 watermark 以上才再次尝试。
-
-## 7. 模型重试
-
-`MAX_MODEL_RETRIES = 10`，不含首次尝试。
-
-- 网络错误、5xx、408、429 可重试。
-- 其他 4xx 不重试。
-- 指数退避从默认 1 秒开始，上限 30 秒。
-- AbortSignal 可终止流和退避等待。
-- 每次失败产生 `model_retry`，包含应丢弃的文本、思考字符数和工具 id。
-
-重试是整轮重放，不能把失败流中的 tool_call 当作已确认调用。
-
-## 8. Thinking 与多模态
-
-Anthropic thinking block 包含 `thinking + signature`。跨工具轮次回填时必须原样保留。展示用聚合 thinking 与协议用 thinking blocks 分开保存。
-
-多模态统一为 `ToolContentBlock` 的 text 或 image。`ToolResult.content` 始终保留文本回退。
-
-## 9. 用量与成本
-
-模型 Adapter 发出 usage：
-
-- input tokens；
-- output tokens；
-- cache read tokens；
-- cache creation tokens。
-
-Agent Run 累加用量；会话成本根据租户模型设置中的每百万 token 单价折算。未配置价格时只能展示 token，不能推断真实账单。
-
-## 10. 错误边界
-
-| 场景 | 处理 |
-| --- | --- |
-| 上下文过长 | 请求前硬裁剪；边界处尝试摘要压缩 |
-| 单条消息过大 | 截断文本字段；图片按保留策略处理 |
-| 摘要失败 | 不破坏原历史，继续使用硬裁剪 |
-| Provider 断流 | 整轮重试并发出回滚信息 |
-| 不可重试 4xx | 立即失败并保存解释结果 |
-| 用户终止 | AbortSignal 中断流或退避 |
-| thinking signature 丢失 | 协议错误，需保留原始 block 修复 |
-
-## 11. 测试边界
-
-- Anthropic/OpenAI 消息与流事件映射。
-- ToolCall、ToolResult、多模态和 thinking block 回填。
-- token 估算、图片剥离、工具配对和首条 user 保证。
-- 单条超大消息和长历史裁剪。
-- 摘要切分、watermark 与完整历史替换。
-- 重试次数、4xx 分类、指数退避、AbortSignal。
-- usage 累加与成本计算。
-
-## 12. 源码依据
-
-- `src/model/types.ts`
-- `src/model/factory.ts`
-- `src/model/anthropic.ts`
-- `src/model/openai.ts`
-- `src/model/cost.ts`
-- `src/agent/context.ts`
-- `src/agent/services/context-service.ts`
-- `src/agent/services/model-gateway.ts`
-- `src/agent/services/prompt.ts`
-- `src/runtime.ts`
+- `tests/pi-runtime/message-codec.test.ts`
+- `tests/pi-runtime/event-codec.test.ts`
+- `tests/pi-runtime/mysql-session-storage.test.ts`
+- `tests/pi-runtime/session-projection.test.ts`
+- `tests/pi-runtime/model-concurrency.test.ts`
