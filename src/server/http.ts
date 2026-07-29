@@ -2793,13 +2793,19 @@ async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req:
       }
     }
     const result = await handle.result();
-    if (rt.piSessionStore && result.status === 'succeeded') await projectCommittedPiSession({
-      store: rt.store,
-      sessions: rt.piSessionStore,
-      ctx,
-      sessionId,
-      durationMs: Math.max(0, Date.now() - runStartedAt),
-    });
+    if (rt.piSessionStore && result.status === 'succeeded') {
+      try {
+        await projectCommittedPiSession({
+          store: rt.store,
+          sessions: rt.piSessionStore,
+          ctx,
+          sessionId,
+          durationMs: Math.max(0, Date.now() - runStartedAt),
+        });
+      } catch (projectionError) {
+        log.warn({ err: projectionError, sessionId, runId: result.runId }, 'durable 会话投影失败');
+      }
+    }
     if (result.status === 'cancelled') {
       sse('terminated', { sessionId, runId: result.runId, reason: result.error?.message });
     } else if (result.status === 'failed' || result.status === 'recovery_required') {

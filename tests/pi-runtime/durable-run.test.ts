@@ -186,6 +186,28 @@ describe('MysqlRunStore durable contract surface', () => {
     expect(assembly.store).toBeInstanceOf(MysqlRunStore);
     expect(assembly.sessions).toBeDefined();
   });
+
+  it('executes owner-scoped SQL reservations for same-tenant actors sharing an external session id', async () => {
+    const db = new MysqlCreateContractDb();
+    const store = new MysqlRunStore(db as never);
+    const now = new Date('2026-07-29T00:00:00.000Z');
+    const record = (actorId: string) => ({
+      tenantId: 'tenant-a', runId: `run-${actorId}`, actorId, sessionId: 'shared-session', kernel: 'pi' as const,
+      kernelVersion: '0.82.1', status: 'queued' as const, leaseToken: 0n, usage, createdAt: now, updatedAt: now,
+    });
+
+    await expect(store.create({ record: record('user-a') })).resolves.toMatchObject({ sessionCreated: true });
+    await expect(store.create({ record: record('user-b') })).resolves.toMatchObject({ sessionCreated: true });
+
+    expect(db.rows.pi_sessions.map((row) => row.session_id).sort()).toEqual([
+      piSessionStorageId('user-a', 'shared-session'),
+      piSessionStorageId('user-b', 'shared-session'),
+    ].sort());
+    expect(db.rows.agent_runs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ tenant_id: 'tenant-a', user_id: 'user-a', session_id: 'shared-session' }),
+      expect.objectContaining({ tenant_id: 'tenant-a', user_id: 'user-b', session_id: 'shared-session' }),
+    ]));
+  });
 });
 
 async function runStoreContract(store: DurableRunStore, runId: string): Promise<void> {
@@ -1098,4 +1120,76 @@ function emptySession(id: string): ManagedPiSession {
     async metadata() { return { id, tenantId: 'tenant-a', createdAt: new Date().toISOString() }; },
     async abort() {}, async close() {}, async steer() {}, async followUp() {}, async appendCustomEntry() { return 'marker'; },
   };
+}
+
+type MysqlContractRow = Record<string, any>;
+
+class MysqlCreateContractDb {
+  readonly rows = { pi_sessions: [] as MysqlContractRow[], agent_runs: [] as MysqlContractRow[] };
+
+  transaction() {
+    return { execute: async <T>(work: (db: MysqlCreateContractDb) => Promise<T>) => work(this) };
+  }
+
+  insertInto(table: keyof MysqlCreateContractDb['rows']) { return new MysqlContractInsert(this, table); }
+  selectFrom(table: keyof MysqlCreateContractDb['rows']) { return new MysqlContractSelect(this, table); }
+}
+
+class MysqlContractInsert {
+  private value!: MysqlContractRow;
+  private ignored = false;
+
+  constructor(
+    private readonly db: MysqlCreateContractDb,
+    private readonly table: keyof MysqlCreateContractDb['rows'],
+  ) {}
+
+  values(value: MysqlContractRow) { this.value = value; return this; }
+  ignore() { this.ignored = true; return this; }
+
+  async executeTakeFirst() {
+    const rows = this.db.rows[this.table];
+    const duplicate = this.table === 'pi_sessions' && rows.some((row) =>
+      row.tenant_id === this.value.tenant_id && row.session_id === this.value.session_id);
+    if (!duplicate) rows.push({ ...this.value });
+    else if (!this.ignored) throw new Error('duplicate key');
+    return { numInsertedOrUpdatedRows: duplicate ? 0n : 1n };
+  }
+
+  async execute() { await this.executeTakeFirst(); return []; }
+}
+
+class MysqlContractSelect {
+  private readonly filters: Array<(row: MysqlContractRow) => boolean> = [];
+  private columns?: string[];
+  private limitCount?: number;
+
+  constructor(
+    private readonly db: MysqlCreateContractDb,
+    private readonly table: keyof MysqlCreateContractDb['rows'],
+  ) {}
+
+  select(columns: string | string[]) { this.columns = Array.isArray(columns) ? columns : [columns]; return this; }
+  where(column: string, operator: string, value: unknown) {
+    this.filters.push((row) => operator === '=' ? row[column] === value
+      : operator === 'in' ? (value as unknown[]).includes(row[column]) : false);
+    return this;
+  }
+  forUpdate() { return this; }
+  limit(count: number) { this.limitCount = count; return this; }
+
+  async execute() {
+    let rows = this.db.rows[this.table].filter((row) => this.filters.every((filter) => filter(row)));
+    if (this.limitCount !== undefined) rows = rows.slice(0, this.limitCount);
+    return rows.map((row) => this.columns
+      ? Object.fromEntries(this.columns.map((column) => [column, row[column]]))
+      : { ...row });
+  }
+
+  async executeTakeFirst() { return (await this.execute())[0]; }
+  async executeTakeFirstOrThrow() {
+    const row = await this.executeTakeFirst();
+    if (!row) throw new Error('not found');
+    return row;
+  }
 }

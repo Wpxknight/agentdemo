@@ -1010,6 +1010,13 @@ describe('HTTP server', () => {
       expect(success).toContain('fallback durable answer');
       expect(success).toContain('event: done');
 
+      const projectionFailure = vi.spyOn(localStore, 'replaceMessages')
+        .mockRejectedValueOnce(new Error('projection store unavailable'));
+      const succeededDespiteProjectionFailure = await request('success', 'result-projection-failure');
+      expect(projectionFailure).toHaveBeenCalledOnce();
+      expect(succeededDespiteProjectionFailure).toContain('event: done');
+      expect(succeededDespiteProjectionFailure).not.toContain('event: error');
+
       const failed = await request('fail', 'result-failed');
       expect(failed).toContain('event: error');
       expect(failed).toContain('provider failed');
