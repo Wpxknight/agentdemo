@@ -13,6 +13,7 @@ export interface MysqlDurablePiRuntimeOptions {
   models: Models;
   model: Model<any>;
   systemPrompt?: string;
+  resolveSystemPrompt?: PiAgentSessionFactoryOptions<any, any, any>['resolveSystemPrompt'];
   tools?: AgentHarnessTool<undefined>[];
   resolveTools?: PiAgentSessionFactoryOptions<any, any, any>['resolveTools'];
   resources?: AgentHarnessResources;
@@ -29,7 +30,8 @@ export function createMysqlDurablePiRuntime(options: MysqlDurablePiRuntimeOption
   const sessions = new PiMysqlSessionRepo(options.db, true);
   const factory = new PiAgentSessionFactory({
     repository: sessions, models: options.models, model: options.model,
-    systemPrompt: options.systemPrompt, tools: options.tools, resolveTools: options.resolveTools, resources: options.resources,
+    systemPrompt: options.systemPrompt, resolveSystemPrompt: options.resolveSystemPrompt,
+    tools: options.tools, resolveTools: options.resolveTools, resources: options.resources,
   });
   const sequences = new Map<string, bigint>();
   const eventOptions: DurableRunManagerOptions['eventOptions'] = (input): EventCodecOptions => {

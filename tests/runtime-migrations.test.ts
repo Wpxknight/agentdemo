@@ -98,6 +98,16 @@ describe('durable runtime migrations', () => {
     }
   });
 
+  it('adds persisted Run execution profiles and idempotent scheduler history links', async () => {
+    const source = await sql('0026_scheduler_run_compat.sql');
+    expect(source).toContain('alter table agent_runs');
+    expect(source).toContain('add column execution_json json');
+    expect(source).toContain('alter table task_runs');
+    expect(source).toContain('add column fire_id varchar(255)');
+    expect(source).toContain('add column run_id varchar(128)');
+    expect(source).toContain('unique key uniq_task_runs_fire (fire_id)');
+  });
+
   it('upgrades a database that already recorded the original 0023 migration', async () => {
     const columns = new Set<string>();
     const indexes = new Set<string>();
@@ -109,7 +119,7 @@ describe('durable runtime migrations', () => {
         return [{}];
       }
       if (statement.includes('ALTER TABLE agent_runs')) {
-        for (const column of ['cost_usd', 'limits_json', 'append_closed_at']) {
+        for (const column of ['cost_usd', 'limits_json', 'append_closed_at', 'execution_json']) {
           if (statement.includes(`ADD COLUMN ${column}`)) columns.add(column);
         }
         if (statement.includes('idx_agent_runs_session_status')) indexes.add('idx_agent_runs_session_status');
@@ -120,8 +130,8 @@ describe('durable runtime migrations', () => {
 
     await runMigrations(pool as never);
 
-    expect(recorded.at(-1)?.version).toBe(25);
-    expect(columns).toEqual(new Set(['cost_usd', 'limits_json', 'append_closed_at']));
+    expect(recorded.at(-1)?.version).toBe(26);
+    expect(columns).toEqual(new Set(['cost_usd', 'limits_json', 'append_closed_at', 'execution_json']));
     expect(indexes).toEqual(new Set(['idx_agent_runs_session_status']));
   });
 
@@ -135,6 +145,7 @@ describe('durable runtime migrations', () => {
     expect(source).toContain('agent_turn_commits:');
     expect(source).toContain('sequence: number');
     expect(source).toContain('limits_json: nullablejsoncolumn');
+    expect(source).toContain('execution_json: nullablejsoncolumn');
     expect(source).toContain('append_closed_at: date | null');
     expect(source).toContain('cost_usd: string | number | null');
     expect(source).toContain('correlation_id: string | null');

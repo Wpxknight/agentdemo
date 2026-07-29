@@ -1,4 +1,9 @@
-import type { AgentInputMessage, IdentityContext } from '@aiop/control-contracts';
+import type {
+  AgentInputMessage,
+  IdentityContext,
+  RunExecutionProfile,
+  RunLimits,
+} from '@aiop/control-contracts';
 
 export interface ScheduledTask {
   taskId: string;
@@ -9,6 +14,7 @@ export interface ScheduledTask {
   cron: string;
   input: readonly AgentInputMessage[];
   nextFireAt: Date;
+  preApproved?: boolean;
   enabled?: boolean;
 }
 
@@ -19,6 +25,9 @@ export interface ScheduledRunInput {
   identity: IdentityContext;
   sessionId: string;
   input: readonly AgentInputMessage[];
+  execution?: RunExecutionProfile;
+  limits?: RunLimits;
+  signal?: AbortSignal;
 }
 
 export interface RunDispatcher {

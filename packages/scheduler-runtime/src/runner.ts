@@ -1,5 +1,10 @@
 import type { DurableRunRuntime } from '@aiop/control-contracts';
-import type { RunDispatcher, ScheduledRunLookup } from './domain.js';
+import type {
+  ClaimedScheduledFire,
+  RunDispatcher,
+  ScheduledRunInput,
+  ScheduledRunLookup,
+} from './domain.js';
 import { SchedulerRecovery } from './recovery.js';
 import type { SchedulerStore } from './store.js';
 
@@ -9,6 +14,7 @@ export interface SchedulerRunnerOptions {
   workerId: string;
   leaseMs?: number;
   retryDelayMs?: number;
+  prepareRun?(fire: ClaimedScheduledFire, now: Date): Promise<Pick<ScheduledRunInput, 'limits' | 'signal'>>;
 }
 
 export function createRunDispatcher(
@@ -23,6 +29,9 @@ export function createRunDispatcher(
           identity: input.identity,
           sessionId: input.sessionId,
           input: input.input,
+          execution: input.execution,
+          limits: input.limits,
+          signal: input.signal,
         });
         return { runId: handle.runId };
       } catch (error) {
@@ -56,6 +65,7 @@ export class SchedulerRunner {
     });
     for (const fire of fires) {
       try {
+        const prepared = await this.options.prepareRun?.(fire, now);
         const { runId } = await this.options.dispatcher.startScheduledRun({
           taskId: fire.taskId,
           fireId: fire.fireId,
@@ -63,6 +73,8 @@ export class SchedulerRunner {
           identity: fire.identity,
           sessionId: fire.sessionId,
           input: fire.input,
+          execution: fire.execution,
+          ...prepared,
         });
         await this.options.store.completeFire({ fireId: fire.fireId, claimToken: fire.claimToken, runId, completedAt: now });
       } catch (error) {

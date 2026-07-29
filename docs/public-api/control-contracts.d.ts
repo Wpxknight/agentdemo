@@ -167,6 +167,12 @@ export interface RunLimits {
     maxCostUsd?: number;
     deadlineAt?: Date;
 }
+export interface RunExecutionProfile {
+    /** The run has no interactive user waiting for confirmations. */
+    unattended?: boolean;
+    /** Approval-capable task creator explicitly authorized ordinary production changes. */
+    preApproved?: boolean;
+}
 export interface StartRunInput {
     runId?: string;
     identity: IdentityContext;
@@ -174,6 +180,7 @@ export interface StartRunInput {
     input: readonly AgentInputMessage[];
     kernel?: AgentKernelName;
     limits?: RunLimits;
+    execution?: RunExecutionProfile;
     signal?: AbortSignal;
 }
 export interface ResumeRunInput {
@@ -241,6 +248,7 @@ export interface RunRecord {
     leaseOwner?: string;
     leaseExpiresAt?: Date;
     limits?: RunLimits;
+    execution?: RunExecutionProfile;
     usage: AgentRunUsage;
     createdAt: Date;
     updatedAt: Date;

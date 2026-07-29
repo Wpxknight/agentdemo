@@ -100,6 +100,7 @@ import { OidcAuthProvider } from './auth/oidc.js';
 import { AiosAuthProvider } from './auth/aios.js';
 import { createAIOPToolRuntime } from './agent/pi/tool-runtime.js';
 import { UserCredentials } from './auth/credentials.js';
+import { buildSystemPrompt } from './agent/services/prompt.js';
 import type { AuthProvider } from './auth/provider.js';
 import type { RequestContext } from './auth/types.js';
 import {
@@ -325,6 +326,9 @@ async function createDefaultDurableRunAssembly(
   const runtimeStore = store.agentRuntimeStore();
   return createMysqlDurablePiRuntime({
     db: store.database(), models, model, systemPrompt,
+    resolveSystemPrompt: ({ execution }) => execution?.unattended
+      ? buildSystemPrompt(systemPrompt, true)
+      : systemPrompt,
     resolveTools: mcp ? async ({ identity, sessionId, events, interactionResolution }) => {
       if (!identity) return [];
       const definitions = await mcp.tools(identity);

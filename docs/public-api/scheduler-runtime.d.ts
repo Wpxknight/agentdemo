@@ -3,7 +3,7 @@ export declare function nextFireAt(cron: string, after: Date): Date;
 export declare function isValidCron(cron: string): boolean;
 
 // file: domain.d.ts
-import type { AgentInputMessage, IdentityContext } from '@aiop/control-contracts';
+import type { AgentInputMessage, IdentityContext, RunExecutionProfile, RunLimits } from '@aiop/control-contracts';
 export interface ScheduledTask {
     taskId: string;
     tenantId: string;
@@ -13,6 +13,7 @@ export interface ScheduledTask {
     cron: string;
     input: readonly AgentInputMessage[];
     nextFireAt: Date;
+    preApproved?: boolean;
     enabled?: boolean;
 }
 export interface ScheduledRunInput {
@@ -22,6 +23,9 @@ export interface ScheduledRunInput {
     identity: IdentityContext;
     sessionId: string;
     input: readonly AgentInputMessage[];
+    execution?: RunExecutionProfile;
+    limits?: RunLimits;
+    signal?: AbortSignal;
 }
 export interface RunDispatcher {
     startScheduledRun(input: ScheduledRunInput): Promise<{
@@ -103,6 +107,16 @@ export interface SchedulerMysqlDatabase {
         run_id: string;
         created_at: Date;
     };
+    task_runs: {
+        id: Generated<number>;
+        task_id: number;
+        fire_id: Generated<string | null>;
+        run_id: Generated<string | null>;
+        status: string;
+        detail: string | null;
+        steps: number | null;
+        created_at: Generated<Date>;
+    };
 }
 export declare class MysqlSchedulerStore implements SchedulerStore {
     private readonly db;
@@ -123,7 +137,7 @@ export declare class SchedulerRecovery {
 
 // file: runner.d.ts
 import type { DurableRunRuntime } from '@aiop/control-contracts';
-import type { RunDispatcher, ScheduledRunLookup } from './domain.js';
+import type { ClaimedScheduledFire, RunDispatcher, ScheduledRunInput, ScheduledRunLookup } from './domain.js';
 import type { SchedulerStore } from './store.js';
 export interface SchedulerRunnerOptions {
     store: SchedulerStore;
@@ -131,6 +145,7 @@ export interface SchedulerRunnerOptions {
     workerId: string;
     leaseMs?: number;
     retryDelayMs?: number;
+    prepareRun?(fire: ClaimedScheduledFire, now: Date): Promise<Pick<ScheduledRunInput, 'limits' | 'signal'>>;
 }
 export declare function createRunDispatcher(runtime: Pick<DurableRunRuntime, 'run'>, lookup?: ScheduledRunLookup): RunDispatcher;
 export declare class SchedulerRunner {

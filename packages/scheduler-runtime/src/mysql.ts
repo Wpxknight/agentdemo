@@ -44,6 +44,16 @@ export interface SchedulerMysqlDatabase {
     run_id: string;
     created_at: Date;
   };
+  task_runs: {
+    id: Generated<number>;
+    task_id: number;
+    fire_id: Generated<string | null>;
+    run_id: Generated<string | null>;
+    status: string;
+    detail: string | null;
+    steps: number | null;
+    created_at: Generated<Date>;
+  };
 }
 
 export class MysqlSchedulerStore implements SchedulerStore {
@@ -60,7 +70,10 @@ export class MysqlSchedulerStore implements SchedulerStore {
         await tx.insertInto('scheduler_fires').values({
           fire_id: scheduledFireId(String(task.id), fireTime), task_id: task.id,
           tenant_id: task.tenant_id, actor_id: task.user_id, session_id: task.session_id,
-          fire_time: fireTime, input_json: JSON.stringify([{ role: 'user', text: task.task }]),
+          fire_time: fireTime, input_json: JSON.stringify({
+            input: [{ role: 'user', text: task.task }],
+            execution: { unattended: true, preApproved: Boolean(task.pre_approved) },
+          }),
           state: 'pending', attempts: 0, run_id: null, claim_token: null, claim_owner: null,
           lease_expires_at: null, retry_at: null, last_error: null, created_at: input.now, updated_at: input.now,
         }).onDuplicateKeyUpdate({ fire_id: scheduledFireId(String(task.id), fireTime) }).execute();
@@ -85,7 +98,7 @@ export class MysqlSchedulerStore implements SchedulerStore {
         claimed.push({
           taskId: String(row.task_id), fireId: row.fire_id, fireTime: row.fire_time,
           identity: { tenantId: row.tenant_id, actorId: row.actor_id, roles: ['user'] },
-          sessionId: row.session_id, input: parseInput(row.input_json), state: 'claimed',
+          sessionId: row.session_id, ...parsePayload(row.input_json), state: 'claimed',
           attempts: row.attempts + 1, claimToken, claimedBy: input.workerId, leaseExpiresAt,
         });
       }
@@ -103,6 +116,10 @@ export class MysqlSchedulerStore implements SchedulerStore {
         state: 'started', run_id: input.runId, claim_token: null, claim_owner: null,
         lease_expires_at: null, retry_at: null, last_error: null, updated_at: input.completedAt,
       }).where('fire_id', '=', input.fireId).execute();
+      await tx.insertInto('task_runs').values({
+        task_id: row.task_id, fire_id: input.fireId, run_id: input.runId,
+        status: 'success', detail: input.runId, steps: null,
+      }).onDuplicateKeyUpdate({ run_id: input.runId, detail: input.runId }).execute();
       await tx.insertInto('task_agent_runs').values({
         tenant_id: row.tenant_id, task_id: row.task_id, run_id: input.runId, created_at: input.completedAt,
       }).onDuplicateKeyUpdate({ run_id: input.runId }).execute();
@@ -127,8 +144,12 @@ export class MysqlSchedulerStore implements SchedulerStore {
   }
 }
 
-function parseInput(value: string): ClaimedScheduledFire['input'] {
+function parsePayload(value: string): Pick<ClaimedScheduledFire, 'input' | 'execution'> {
   const parsed: unknown = typeof value === 'string' ? JSON.parse(value) : value;
-  if (!Array.isArray(parsed)) throw new Error('invalid scheduler fire input');
-  return parsed as ClaimedScheduledFire['input'];
+  if (Array.isArray(parsed)) return { input: parsed as ClaimedScheduledFire['input'] };
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray((parsed as { input?: unknown }).input)) {
+    throw new Error('invalid scheduler fire input');
+  }
+  const payload = parsed as { input: ClaimedScheduledFire['input']; execution?: ClaimedScheduledFire['execution'] };
+  return { input: payload.input, execution: payload.execution };
 }

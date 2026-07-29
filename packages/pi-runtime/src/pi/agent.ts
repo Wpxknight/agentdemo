@@ -1,6 +1,6 @@
 import type {
   AgentInputMessage, AgentRunEvent, DurableInteractionUpdate, DurableToolLedgerUpdate, IdentityContext,
-  InteractionResolution,
+  InteractionResolution, RunExecutionProfile,
 } from '@aiop/control-contracts';
 import {
   AgentHarness,
@@ -30,6 +30,7 @@ export interface PiAgentSessionFactoryOptions<
   models: Models;
   model: Model<any>;
   systemPrompt?: string;
+  resolveSystemPrompt?(input: { execution?: RunExecutionProfile }): string | undefined;
   tools?: AgentHarnessTool<undefined>[];
   resolveTools?(input: {
     identity?: IdentityContext;
@@ -50,6 +51,7 @@ export type CreatePiAgentSessionInput<TCreateOptions extends SessionCreateOption
   id?: string;
   identity?: IdentityContext;
   interactionResolution?: InteractionResolution;
+  execution?: RunExecutionProfile;
   initialMessage: AgentInputMessage;
   events: EventCodecOptions;
 } & SessionCreateField<TCreateOptions>;
@@ -58,6 +60,7 @@ export interface LoadPiAgentSessionInput<TMetadata extends SessionMetadata = Ses
   metadata: TMetadata;
   identity?: IdentityContext;
   interactionResolution?: InteractionResolution;
+  execution?: RunExecutionProfile;
   initialMessage: AgentInputMessage;
   events: EventCodecOptions;
 }
@@ -72,12 +75,16 @@ export class PiAgentSessionFactory<
   async create(input: CreatePiAgentSessionInput<TCreateOptions>): Promise<PiAgentSession<TMetadata>> {
     const createOptions = { ...input.session, ...(input.id ? { id: input.id } : {}) } as TCreateOptions;
     const tools = await this.resolveTools(input.identity, input.id, input.events, input.interactionResolution);
-    return this.wrap(await this.options.repository.create(createOptions), input.initialMessage, input.events, tools);
+    return this.wrap(
+      await this.options.repository.create(createOptions), input.initialMessage, input.events, tools, input.execution,
+    );
   }
 
   async load(input: LoadPiAgentSessionInput<TMetadata>): Promise<PiAgentSession<TMetadata>> {
     const tools = await this.resolveTools(input.identity, input.metadata.id, input.events, input.interactionResolution);
-    return this.wrap(await this.options.repository.open(input.metadata), input.initialMessage, input.events, tools);
+    return this.wrap(
+      await this.options.repository.open(input.metadata), input.initialMessage, input.events, tools, input.execution,
+    );
   }
 
   private async resolveTools(
@@ -90,13 +97,14 @@ export class PiAgentSessionFactory<
   private wrap(
     session: Session<TMetadata>, initialMessage: AgentInputMessage, events: EventCodecOptions,
     tools: AgentHarnessTool<undefined>[],
+    execution?: RunExecutionProfile,
   ): PiAgentSession<TMetadata> {
     const governedTools = scopeGovernedTools(tools);
     const harness = new AgentHarness({
       session,
       models: this.options.models,
       model: this.options.model,
-      systemPrompt: this.options.systemPrompt,
+      systemPrompt: this.options.resolveSystemPrompt?.({ execution }) ?? this.options.systemPrompt,
       tools: governedTools.tools,
       resources: this.options.resources,
     });

@@ -32,8 +32,8 @@ export interface ManagedPiSession extends InboxCapableSession {
 }
 
 export interface DurableRunSessionFactory {
-  create(input: { id?: string; identity: StartRunInput['identity']; interactionResolution?: ResumeRunInput['resolution']; initialMessage: AgentInputMessage; events: unknown; session?: Record<string, unknown> }): Promise<ManagedPiSession>;
-  load(input: { metadata: SessionMetadata & { tenantId?: string }; identity: StartRunInput['identity']; interactionResolution?: ResumeRunInput['resolution']; initialMessage: AgentInputMessage; events: unknown }): Promise<ManagedPiSession>;
+  create(input: { id?: string; identity: StartRunInput['identity']; interactionResolution?: ResumeRunInput['resolution']; execution?: StartRunInput['execution']; initialMessage: AgentInputMessage; events: unknown; session?: Record<string, unknown> }): Promise<ManagedPiSession>;
+  load(input: { metadata: SessionMetadata & { tenantId?: string }; identity: StartRunInput['identity']; interactionResolution?: ResumeRunInput['resolution']; execution?: StartRunInput['execution']; initialMessage: AgentInputMessage; events: unknown }): Promise<ManagedPiSession>;
 }
 
 export interface DurableRunManagerOptions {
@@ -73,6 +73,7 @@ export class DurableRunManager implements DurableRunRuntime {
     const reservation = await this.options.store.create({ record: {
       tenantId: input.identity.tenantId, runId, actorId: input.identity.actorId, sessionId: input.sessionId,
       kernel: 'pi', kernelVersion: '0.82.1', status: 'queued', leaseToken: 0n, limits: input.limits,
+      execution: input.execution,
       usage: ZERO_USAGE, createdAt: now, updatedAt: now,
     } });
     return this.start(input.identity, runId, input.input[0] ?? { role: 'user', text: '' }, false, !reservation.sessionCreated, input.signal);
@@ -165,8 +166,13 @@ export class DurableRunManager implements DurableRunRuntime {
         createdAt: (sessionRecord?.createdAt ?? claimed.record.createdAt).toISOString(), metadata: sessionRecord?.metadata,
       };
       session = loadCommittedSession
-        ? await this.options.sessions.load({ metadata, identity, interactionResolution, initialMessage, events })
-        : await this.options.sessions.create({ id: piSessionId, identity, interactionResolution, initialMessage, events, session: { tenantId: identity.tenantId } });
+        ? await this.options.sessions.load({
+            metadata, identity, interactionResolution, execution: claimed.record.execution, initialMessage, events,
+          })
+        : await this.options.sessions.create({
+            id: piSessionId, identity, interactionResolution, execution: claimed.record.execution,
+            initialMessage, events, session: { tenantId: identity.tenantId },
+          });
       this.active.set(activeKey, { abort, session });
       baselineUsage = usageFromEntries(await session.entries());
       let stopInboxPump = false;

@@ -11,7 +11,7 @@ import {
 } from '../../packages/scheduler-runtime/src/index.js';
 import { logger } from '../logger.js';
 import type { Runtime } from '../runtime.js';
-import type { ScheduledTask } from '../db/store.js';
+import { DEFAULT_TASK_MAX_RUN_MS, type ScheduledTask } from '../db/store.js';
 import { MysqlStore } from '../db/mysql.js';
 import type { TaskRunner } from './ticker.js';
 
@@ -31,7 +31,7 @@ export function createScheduledTaskRunner(rt: Runtime): TaskRunner {
       throw new Error('DurableRunRuntime is required for scheduled Run creation');
     }
     const dispatcher = createRunDispatcher(rt.durableRunRuntime, scheduledRunLookup(rt));
-    const fireTime = task.nextRunAt;
+    const fireTime = new Date();
     const result = await dispatcher.startScheduledRun({
       taskId: String(task.id),
       fireId: scheduledFireId(String(task.id), fireTime),
@@ -39,6 +39,12 @@ export function createScheduledTaskRunner(rt: Runtime): TaskRunner {
       identity: { tenantId: task.tenantId, actorId: task.userId, roles: ['user'] },
       sessionId: task.sessionId,
       input: [{ role: 'user', text: task.task }],
+      execution: { unattended: true, preApproved: task.preApproved },
+      limits: {
+        deadlineAt: new Date(fireTime.getTime() + (
+          (await rt.store.getSchedulerSettings({ tenantId: task.tenantId }))?.maxRunMs ?? DEFAULT_TASK_MAX_RUN_MS
+        )),
+      },
     });
     return { status: 'success', detail: result.runId };
   };
@@ -75,6 +81,13 @@ export function createRuntimeScheduler(
     workerId: options.workerId ?? `scheduler-${randomUUID()}`,
     leaseMs: options.leaseMs,
     retryDelayMs: options.retryDelayMs,
+    prepareRun: async (fire, now) => ({
+      limits: {
+        deadlineAt: new Date(now.getTime() + (
+          (await rt.store.getSchedulerSettings({ tenantId: fire.identity.tenantId }))?.maxRunMs ?? DEFAULT_TASK_MAX_RUN_MS
+        )),
+      },
+    }),
   });
   return new RuntimeSchedulerLoop(runner, options);
 }

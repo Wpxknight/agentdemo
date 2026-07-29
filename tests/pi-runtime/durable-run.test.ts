@@ -519,6 +519,30 @@ describe('DurableRunManager', () => {
     expect(loadCalls).toBe(0);
   });
 
+  it('persists the scheduled execution profile and supplies it to the Pi session factory', async () => {
+    const store = new MemoryRunStore();
+    const session = emptySession('scheduled-profile-session');
+    let createInput: unknown;
+    const manager = new DurableRunManager({
+      store, heartbeatMs: 0,
+      sessions: {
+        create: async (input) => { createInput = input; return session; },
+        load: async () => session,
+      },
+      eventOptions: () => ({}),
+    });
+    const execution = { unattended: true, preApproved: true };
+
+    await (await manager.run({
+      runId: 'scheduled-profile-run', identity, sessionId: 'scheduled-profile-session',
+      input: [{ role: 'user', text: 'scheduled' }], execution,
+    })).result();
+
+    expect(createInput).toMatchObject({ execution });
+    expect(await store.get({ tenantId: identity.tenantId, runId: 'scheduled-profile-run' }))
+      .toMatchObject({ execution });
+  });
+
   it.each(['failed', 'cancelled', 'recovery_required'] as const)(
     'loads the committed leaf for a new run after a %s run',
     async (terminalStatus) => {

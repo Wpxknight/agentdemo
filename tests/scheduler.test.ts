@@ -189,17 +189,25 @@ describe('Scheduler', () => {
 describe('createScheduledTaskRunner', () => {
   it('creates a product Run through DurableRunRuntime.run', async () => {
     const store = new MemoryStore();
+    await store.setSchedulerSettings({ tenantId: 't1' }, { maxRunMs: 5 * 60_000 });
     const run = vi.fn(async () => ({ runId: 'scheduled-run' }));
     const rt = {
       store,
       durableRunRuntime: { run },
     } as unknown as Runtime;
 
-    const result = await createScheduledTaskRunner(rt)({
-      id: 1, tenantId: 't1', userId: 'u1', sessionId: 'cron-sess',
-      cron: '* * * * *', title: '巡检', task: '巡检', preApproved: true, enabled: true,
-      nextRunAt: new Date(),
-    });
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-29T02:00:00.000Z'));
+    let result;
+    try {
+      result = await createScheduledTaskRunner(rt)({
+        id: 1, tenantId: 't1', userId: 'u1', sessionId: 'cron-sess',
+        cron: '* * * * *', title: '巡检', task: '巡检', preApproved: true, enabled: true,
+        nextRunAt: new Date('2026-07-29T01:00:00.000Z'),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
 
     expect(result.status).toBe('success');
     expect(result.detail).toBe('scheduled-run');
@@ -207,6 +215,8 @@ describe('createScheduledTaskRunner', () => {
       identity: { tenantId: 't1', actorId: 'u1', roles: ['user'] },
       sessionId: 'cron-sess',
       input: [{ role: 'user', text: '巡检' }],
+      execution: { unattended: true, preApproved: true },
+      limits: { deadlineAt: new Date('2026-07-29T02:05:00.000Z') },
     }));
   });
 
@@ -225,14 +235,20 @@ describe('embedded scheduler deployment', () => {
     const store = new MemorySchedulerStore([{
       taskId: 'task-a', tenantId: 'tenant-a', actorId: 'user-a', sessionId: 'session-a',
       cron: '0 * * * *', input: [{ role: 'user', text: 'diagnose' }], nextFireAt: fireTime,
+      preApproved: true,
     }]);
     const run = vi.fn(async () => ({ runId: 'task-a:2026-07-29T01:00:00.000Z' }));
+    const runtimeStore = new MemoryStore();
+    await runtimeStore.setSchedulerSettings({ tenantId: 'tenant-a' }, { maxRunMs: 5 * 60_000 });
     const scheduler = createRuntimeScheduler({
-      store: new MemoryStore(), durableRunRuntime: { run },
+      store: runtimeStore, durableRunRuntime: { run },
     } as unknown as Runtime, { store, workerId: 'test-worker' });
 
     expect(await scheduler.tick(fireTime)).toBe(1);
-    expect(run).toHaveBeenCalledOnce();
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      execution: { unattended: true, preApproved: true },
+      limits: { deadlineAt: new Date('2026-07-29T01:05:00.000Z') },
+    }));
   });
 
   it('requires MysqlStore for production scheduler assembly', () => {

@@ -61,6 +61,8 @@ export interface ScheduledTasksTable {
 export interface TaskRunsTable {
   id: Generated<number>;
   task_id: number;
+  fire_id: Generated<string | null>;
+  run_id: Generated<string | null>;
   status: string;
   detail: string | null;
   steps: number | null;
@@ -204,6 +206,7 @@ export interface AgentRunsTable {
   cache_creation_tokens: number;
   cost_usd: string | number | null;
   limits_json: NullableJsonColumn;
+  execution_json: NullableJsonColumn;
   error_message: string | null;
   started_at: Date | null;
   updated_at: Date;

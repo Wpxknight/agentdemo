@@ -122,6 +122,7 @@ export class MemorySchedulerStore implements SchedulerStore {
           identity: { tenantId: task.tenantId, actorId: task.actorId, roles: task.roles ?? ['user'] },
           sessionId: task.sessionId,
           input: task.input.map((message) => ({ ...message })),
+          execution: { unattended: true, preApproved: task.preApproved === true },
           state: 'pending',
           attempts: 0,
         });
@@ -152,6 +153,11 @@ function cloneFire(fire: ScheduledFire): ScheduledFire {
     ...fire,
     identity: { ...fire.identity, roles: [...fire.identity.roles] },
     input: fire.input.map((message) => ({ ...message })),
+    execution: fire.execution ? { ...fire.execution } : undefined,
+    limits: fire.limits ? {
+      ...fire.limits,
+      deadlineAt: fire.limits.deadlineAt ? new Date(fire.limits.deadlineAt) : undefined,
+    } : undefined,
     fireTime: new Date(fire.fireTime),
     leaseExpiresAt: fire.leaseExpiresAt ? new Date(fire.leaseExpiresAt) : undefined,
     retryAt: fire.retryAt ? new Date(fire.retryAt) : undefined,

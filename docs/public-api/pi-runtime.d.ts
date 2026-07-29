@@ -34,7 +34,7 @@ export * from './run/mysql-assembly.js';
 export * from './run/recovery.js';
 
 // file: pi/agent.d.ts
-import type { AgentInputMessage, AgentRunEvent, DurableInteractionUpdate, DurableToolLedgerUpdate, IdentityContext, InteractionResolution } from '@aiop/control-contracts';
+import type { AgentInputMessage, AgentRunEvent, DurableInteractionUpdate, DurableToolLedgerUpdate, IdentityContext, InteractionResolution, RunExecutionProfile } from '@aiop/control-contracts';
 import { AgentHarness, type AgentHarnessResources, type AgentHarnessTool, type Session, type SessionCreateOptions, type SessionMetadata, type SessionRepo, type SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import type { Model, Models } from '@earendil-works/pi-ai';
 import { EventCodec, type EventCodecOptions } from './event-codec.js';
@@ -43,6 +43,9 @@ export interface PiAgentSessionFactoryOptions<TMetadata extends SessionMetadata,
     models: Models;
     model: Model<any>;
     systemPrompt?: string;
+    resolveSystemPrompt?(input: {
+        execution?: RunExecutionProfile;
+    }): string | undefined;
     tools?: AgentHarnessTool<undefined>[];
     resolveTools?(input: {
         identity?: IdentityContext;
@@ -66,6 +69,7 @@ export type CreatePiAgentSessionInput<TCreateOptions extends SessionCreateOption
     id?: string;
     identity?: IdentityContext;
     interactionResolution?: InteractionResolution;
+    execution?: RunExecutionProfile;
     initialMessage: AgentInputMessage;
     events: EventCodecOptions;
 } & SessionCreateField<TCreateOptions>;
@@ -73,6 +77,7 @@ export interface LoadPiAgentSessionInput<TMetadata extends SessionMetadata = Ses
     metadata: TMetadata;
     identity?: IdentityContext;
     interactionResolution?: InteractionResolution;
+    execution?: RunExecutionProfile;
     initialMessage: AgentInputMessage;
     events: EventCodecOptions;
 }
@@ -442,6 +447,7 @@ export interface DurableRunSessionFactory {
         id?: string;
         identity: StartRunInput['identity'];
         interactionResolution?: ResumeRunInput['resolution'];
+        execution?: StartRunInput['execution'];
         initialMessage: AgentInputMessage;
         events: unknown;
         session?: Record<string, unknown>;
@@ -452,6 +458,7 @@ export interface DurableRunSessionFactory {
         };
         identity: StartRunInput['identity'];
         interactionResolution?: ResumeRunInput['resolution'];
+        execution?: StartRunInput['execution'];
         initialMessage: AgentInputMessage;
         events: unknown;
     }): Promise<ManagedPiSession>;
@@ -505,6 +512,7 @@ export interface MysqlDurablePiRuntimeOptions {
     models: Models;
     model: Model<any>;
     systemPrompt?: string;
+    resolveSystemPrompt?: PiAgentSessionFactoryOptions<any, any, any>['resolveSystemPrompt'];
     tools?: AgentHarnessTool<undefined>[];
     resolveTools?: PiAgentSessionFactoryOptions<any, any, any>['resolveTools'];
     resources?: AgentHarnessResources;
