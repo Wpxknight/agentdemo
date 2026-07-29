@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import type { AgentHarnessEvent } from '@earendil-works/pi-agent-core';
 import { EventCodec } from '../../packages/pi-runtime/src/index.js';
 import { toDurableJsonValue } from '../../packages/pi-runtime/src/pi/event-codec.js';
+import { projectDurableHttpEvent } from '../../src/server/http.js';
 
 describe('Pi EventCodec', () => {
   it('projects a Harness tool event into a durable control event', () => {
@@ -108,14 +110,14 @@ describe('Pi EventCodec', () => {
         cost: { input: 0.4, output: 0.2, cacheRead: 0.01, cacheWrite: 0.02, total: 0.63 } },
     } } as never).detail).toMatchObject({ message: { usage: { totalTokens: 53, costTotal: 0.63 } } });
     expect(codec.fromPi({ type: 'session_before_compact', branchEntries: [], preparation: {
-      tokensBefore: 987, messagesToSummarize: [], retainedTail: [], firstKeptEntryId: undefined,
+      tokensBefore: 987, messagesToSummarize: [], turnPrefixMessages: [], retainedTail: [], firstKeptEntryId: undefined,
     }, signal: new AbortController().signal } as never).detail).toMatchObject({ tokensBefore: 987 });
   });
 
   it('emits the real compaction fields required by the HTTP compatibility projection', () => {
     const codec = new EventCodec({ tenantId: 't', runId: 'r', attemptId: 'a', turnNo: 1,
       correlationId: 'c', sequence: () => 1n });
-    codec.fromPi({ type: 'session_before_compact', branchEntries: [], preparation: {
+    const beforeCompactEvent = { type: 'session_before_compact', branchEntries: [], preparation: {
       tokensBefore: 100, messagesToSummarize: [
         { role: 'user', content: 'old question', timestamp: 1 },
         { role: 'assistant', content: [{ type: 'text', text: 'old answer' }], timestamp: 2,
@@ -123,16 +125,32 @@ describe('Pi EventCodec', () => {
             input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
           } },
-      ], retainedTail: [], firstKeptEntryId: 'kept',
-    }, signal: new AbortController().signal } as never);
+      ], turnPrefixMessages: [
+        { role: 'user', content: 'current split-turn question', timestamp: 3 },
+      ], retainedTail: [], firstKeptEntryId: 'kept', isSplitTurn: true,
+      fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+      settings: { enabled: true, reserveTokens: 1_000, keepRecentTokens: 500 },
+    }, signal: new AbortController().signal } satisfies Extract<AgentHarnessEvent, { type: 'session_before_compact' }>;
+    codec.fromPi(beforeCompactEvent);
 
-    expect(codec.fromPi({ type: 'session_compact', fromHook: false, compactionEntry: {
+    const compactEvent = { type: 'session_compact', fromHook: false, compactionEntry: {
       type: 'compaction', id: 'compact', parentId: 'kept', timestamp: '2026-07-29T00:00:00.000Z',
       summary: 'short summary', firstKeptEntryId: 'kept', tokensBefore: 100, retainedTail: [],
-    } } as never).detail).toMatchObject({
+    } } satisfies Extract<AgentHarnessEvent, { type: 'session_compact' }>;
+    const durableEvent = codec.fromPi(compactEvent);
+
+    expect(durableEvent.detail).toMatchObject({
       tokensBefore: 100,
       tokensAfter: expect.any(Number),
-      summarizedMessages: 2,
+      summarizedMessages: 3,
+    });
+    expect(projectDurableHttpEvent(durableEvent)).toEqual({
+      event: 'context_compacted',
+      data: {
+        summarizedMessages: 3,
+        beforeTokens: 100,
+        afterTokens: expect.any(Number),
+      },
     });
   });
 

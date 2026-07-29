@@ -37,7 +37,8 @@ export class EventCodec {
     let detail: JsonValue;
     try {
       if (event.type === 'session_before_compact') {
-        this.pendingCompactionMessages = event.preparation.messagesToSummarize.length;
+        this.pendingCompactionMessages = event.preparation.messagesToSummarize.length
+          + event.preparation.turnPrefixMessages.length;
       }
       detail = toDurableJsonValue(known ? projectKnown(event, this.pendingCompactionMessages) : {
         version: 1, kind: 'pi_harness_event', originalType: limited(eventType, MAX_NAME), keys: safeKeys(event),
