@@ -47,6 +47,7 @@ function runProcess(
       cwd: opts.cwd,
       env: { ...process.env, ...opts.env },
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
     });
     opts.activeChildren?.add(child);
     let stdout = '';
@@ -54,7 +55,7 @@ function runProcess(
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGKILL');
+      void terminateProcessTree(child);
     }, opts.timeoutMs ?? 30_000);
 
     child.stdout.setEncoding('utf8');
@@ -202,11 +203,7 @@ class LocalSandboxHandle implements SandboxHandle {
     if (this.killed) return;
     this.killed = true;
     const active = [...this.activeChildren];
-    const exits = active.map(waitForProcessExit);
-    for (const child of active) {
-      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-    }
-    await Promise.all(exits);
+    await Promise.all(active.map(terminateProcessTree));
     await rm(this.dir, { recursive: true, force: true });
   }
 
@@ -304,10 +301,61 @@ class LocalSandboxHandle implements SandboxHandle {
   }
 }
 
+const processTreeTerminations = new WeakMap<ChildProcess, Promise<void>>();
+
+function terminateProcessTree(child: ChildProcess): Promise<void> {
+  const existing = processTreeTerminations.get(child);
+  if (existing) return existing;
+  const termination = terminateProcessTreeOnce(child);
+  processTreeTerminations.set(child, termination);
+  return termination;
+}
+
+async function terminateProcessTreeOnce(child: ChildProcess): Promise<void> {
+  const pid = child.pid;
+  if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    await waitForProcessExit(child);
+    return;
+  }
+  if (process.platform === 'win32') {
+    try {
+      await taskkillProcessTree(pid);
+    } catch {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }
+  } else {
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }
+  }
+  await waitForProcessExit(child);
+}
+
+function taskkillProcessTree(pid: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const killer = spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    killer.once('error', reject);
+    killer.once('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`taskkill exited with code ${code ?? 'unknown'}`));
+    });
+  });
+}
+
 function waitForProcessExit(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
   return new Promise((resolve) => {
-    const settled = () => resolve();
+    const settled = () => {
+      child.off('exit', settled);
+      child.off('error', settled);
+      resolve();
+    };
     child.once('exit', settled);
     child.once('error', settled);
   });

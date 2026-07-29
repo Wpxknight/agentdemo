@@ -426,34 +426,70 @@ describe('LocalSandboxProvider structured execution', () => {
     await handle.kill();
   });
 
-  it.each(['abort', 'timeout', 'stop'] as const)('%s terminates the active local child process', async (mode) => {
+  it.each(['abort', 'timeout', 'stop'] as const)('%s terminates the active local process tree promptly', async (mode) => {
     const runtime = new SandboxRuntime({ providerName: 'local', provider: new LocalSandboxProvider() });
     const lease = await runtime.acquire({ spec: { key: `local-child-${mode}` } });
-    const started = deferred<number>();
+    const started = deferred<{ parentPid: number; descendantPid: number }>();
     let output = '';
     const abort = new AbortController();
     const execution = runtime.execute({
       lease,
-      command: 'echo $$; exec sleep 60',
+      command: 'sleep 60 & child=$!; printf "%s %s\\n" "$$" "$child"; wait',
       ...(mode === 'abort' ? { signal: abort.signal } : {}),
       ...(mode === 'timeout' ? { timeoutMs: 1000 } : {}),
       onOutput: ({ text }) => {
         output += text;
-        const pid = Number.parseInt(output.trim(), 10);
-        if (Number.isInteger(pid)) started.resolve(pid);
+        const match = /^(\d+) (\d+)$/m.exec(output);
+        if (!match) return;
+        const parentPid = Number.parseInt(match[1]!, 10);
+        const descendantPid = Number.parseInt(match[2]!, 10);
+        if (validTestChildPid(parentPid) && validTestChildPid(descendantPid)) {
+          started.resolve({ parentPid, descendantPid });
+        }
       },
     });
-    const pid = await started.promise;
+    const pids = await started.promise;
 
-    if (mode === 'abort') abort.abort();
-    if (mode === 'stop') await runtime.stop({ lease });
-    if (mode === 'abort') await expect(execution).rejects.toMatchObject({ name: 'AbortError' });
-    else await execution;
+    try {
+      if (mode === 'abort') abort.abort();
+      if (mode === 'stop') await expectSettlesPromptly(runtime.stop({ lease }));
+      if (mode === 'abort') {
+        await expect(expectSettlesPromptly(execution)).rejects.toMatchObject({ name: 'AbortError' });
+      } else {
+        await expectSettlesPromptly(execution, mode === 'timeout' ? 2_000 : 500);
+      }
 
-    await vi.waitFor(() => expect(processExists(pid)).toBe(false));
-    await runtime.release({ lease });
+      await vi.waitFor(() => {
+        expect(processExists(pids.parentPid)).toBe(false);
+        expect(processExists(pids.descendantPid)).toBe(false);
+      });
+    } finally {
+      await Promise.all([cleanupTestChild(pids.parentPid), cleanupTestChild(pids.descendantPid)]);
+      await runtime.release({ lease });
+    }
   });
 });
+
+async function expectSettlesPromptly<T>(promise: Promise<T>, timeoutMs = 500): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('local process tree did not settle promptly')), timeoutMs)),
+  ]);
+}
+
+function validTestChildPid(pid: number): boolean {
+  return Number.isSafeInteger(pid) && pid > 1 && pid !== process.pid && pid !== process.ppid;
+}
+
+async function cleanupTestChild(pid: number): Promise<void> {
+  if (!validTestChildPid(pid) || !processExists(pid)) return;
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+  }
+  await vi.waitFor(() => expect(processExists(pid)).toBe(false));
+}
 
 function processExists(pid: number): boolean {
   try {
