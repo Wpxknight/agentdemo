@@ -964,18 +964,9 @@ async function persistRecoveryFailure(
   const message = safeRecoveryError(error);
   const failedAt = new Date();
   const identity = { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] };
-  const durable = await rt.store.durableRunStore().markRecoveryRequired({
+  await rt.store.durableRunStore().markRecoveryRequired({
     identity, runId, errorMessage: message, failedAt, expectedLease,
   });
-  if (!durable) {
-    const current = await rt.store.getAgentRun(ctx, runId);
-    const leaseActive = Boolean(current?.leaseOwner && current.leaseExpiresAt && current.leaseExpiresAt > failedAt);
-    if (current && !leaseActive && current.status !== 'succeeded' && current.status !== 'cancelled') {
-      await rt.store.updateAgentRun(ctx.tenantId, runId, {
-        status: 'recovery_required', errorMessage: message, completedAt: failedAt, updatedAt: failedAt, clearLease: true,
-      });
-    }
-  }
   await bestEffortAppendRecoveryEvent(rt, ctx, runId, 'failed', { error: message });
 }
 

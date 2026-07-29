@@ -1,12 +1,12 @@
 # aiop 后端镜像（HTTP+SSE 服务 / 调度器共用，入口参数区分）
 FROM node:24-slim AS deps
 WORKDIR /app
-COPY package.json package-lock.json* ./
+COPY package.json package-lock.json ./
 COPY packages ./packages
 COPY tsconfig.packages.json ./
 COPY scripts/build-packages.ts ./scripts/build-packages.ts
 # 当前镜像直接用 tsx 运行 TS；tsx 在 devDependencies 中，因此需保留 dev 依赖。
-RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+RUN npm ci
 RUN npm run build:packages
 
 FROM node:24-slim AS runtime

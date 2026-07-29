@@ -74,6 +74,10 @@ describe('frontend container proxy', () => {
     const dockerfile = await readFile('web/Dockerfile', 'utf8');
 
     expect(dockerfile).toContain('FROM node:24-slim AS build');
+    expect(dockerfile).toContain('COPY web/package.json web/package-lock.json ./');
+    expect(dockerfile).toContain('RUN npm ci');
+    expect(dockerfile).not.toContain('package-lock.json*');
+    expect(dockerfile).not.toContain('npm install');
     expect(dockerfile).toContain('npm run build');
     expect(dockerfile).toContain('COPY --from=build /app/dist /usr/share/nginx/html');
   });

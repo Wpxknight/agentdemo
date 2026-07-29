@@ -111,3 +111,15 @@
 - [x] Run `make verify-runtime-refactor`.
 - [x] Run `git diff --check` and the lockfile integrity check.
 - [x] Commit with subject `fix: harden durable runtime lifecycle` and exactly one `Co-authored-by: AIOS <noreply@bocloud.com>` trailer.
+
+### Task 9: Second review lifecycle hardening
+
+- [x] Reproduce escaped `AsyncLocalStorage` descendants being erased by a later transaction rollback, then replace the boolean context with an invalidatable token released only after deactivation.
+- [x] Reproduce stale recovery token1 overwriting token2's waiting state; require durable token equality in Memory and MySQL even after owner/expiry are cleared.
+- [x] Add conditional MySQL behavior parity coverage and an always-run MySQL source contract because `MYSQL_HOST` is unset in this environment.
+- [x] Reproduce the HTTP supervisor race and remove the generic unfenced `updateAgentRun` fallback; failed recovery event append remains best-effort.
+- [x] Require exact lockfile copies and unconditional `npm ci` in both backend and frontend Dockerfiles.
+- [x] Align inactive Memory cancellation with MySQL by persisting the cancellation reason as `errorMessage`.
+- [x] Restore the five optional WASM transitive packages to their pre-hardening versions with their original `resolved` and `integrity` metadata: `@emnapi/core@2.0.0-alpha.3`, `@emnapi/runtime@2.0.0-alpha.3`, `@emnapi/wasi-threads@2.0.1`, `@napi-rs/wasm-runtime@1.2.0`, and `@tybys/wasm-util@0.10.3`.
+- [x] Verify npm 11.6.2 accepts the restored lock with `npm ci --ignore-scripts --dry-run`; registry integrity and retired-workspace checks both report zero violations.
+- [x] Run final full gates and prepare the second-review fixes for commit.

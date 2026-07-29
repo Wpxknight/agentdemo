@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { LeaseLostError } from '@aiop/control-contracts';
 import {
   createMysqlDurablePiRuntime, DurableRunManager, GovernedToolOutcomeError, MemoryRunStore, MysqlRunStore,
@@ -46,6 +47,33 @@ describe('MemoryRunStore durable contract', () => {
       fencingToken: first!.fencingToken, checkpoint: { leafId: 'leaf-stale' }, events: [], status: 'running', usage,
       committedAt: new Date(createdAt.getTime() + 11),
     })).rejects.toBeInstanceOf(LeaseLostError);
+  });
+
+  it('does not let a stale recovery token overwrite a newer waiting state', async () => {
+    const store = new MemoryRunStore();
+    const startedAt = new Date('2026-07-29T00:00:00.000Z');
+    const runId = 'stale-recovery-token';
+    await store.create({ record: {
+      tenantId: identity.tenantId, runId, actorId: identity.actorId, sessionId: 'stale-recovery-session',
+      kernel: 'pi', kernelVersion: '0.82.1', status: 'queued', leaseToken: 0n, usage,
+      createdAt: startedAt, updatedAt: startedAt,
+    } });
+    const first = await store.claim({ identity, runId, workerId: 'worker-a', now: startedAt, leaseTtlMs: 10 });
+    const reclaimedAt = new Date(startedAt.getTime() + 11);
+    const second = await store.claim({ identity, runId, workerId: 'worker-b', now: reclaimedAt, leaseTtlMs: 1000 });
+    await store.commitTurn({
+      tenantId: identity.tenantId, runId, attemptId: second!.attemptId, turnNo: 1,
+      fencingToken: second!.fencingToken, checkpoint: {}, events: [], status: 'waiting', waitingReason: 'approval', usage,
+      committedAt: new Date(reclaimedAt.getTime() + 1),
+    });
+
+    await expect(store.markRecoveryRequired({
+      identity, runId, errorMessage: 'delayed worker-a failure', failedAt: new Date(reclaimedAt.getTime() + 2),
+      expectedLease: { ownerId: 'worker-a', token: first!.fencingToken },
+    })).resolves.toBe(false);
+    await expect(store.get({ tenantId: identity.tenantId, runId })).resolves.toMatchObject({
+      status: 'waiting', waitingReason: 'approval', leaseToken: second!.fencingToken,
+    });
   });
 
   it('never resolves a run through a different tenant', async () => {
@@ -224,6 +252,54 @@ describe('MemoryRunStore durable contract', () => {
       tenantId: identity.tenantId, runId: 'rollback-run', interactionId: 'rolled-back',
     })).resolves.toBeUndefined();
   });
+
+  it('invalidates escaped transaction contexts before a later rollback', async () => {
+    const store = new MemoryRunStore();
+    let releaseDescendant!: () => void;
+    const descendantGate = new Promise<void>((resolve) => { releaseDescendant = resolve; });
+    let descendantAttempted!: () => void;
+    const attempted = new Promise<void>((resolve) => { descendantAttempted = resolve; });
+    const record = (id: string) => ({
+      id, tenantId: identity.tenantId, runId: 'escaped-context-run', attemptId: 'attempt-a', turnNo: 1,
+      kind: 'approval' as const, status: 'pending' as const, payload: {}, createdAt: new Date(),
+    });
+    let descendant!: Promise<void>;
+
+    await store.transaction(async () => {
+      descendant = descendantGate.then(async () => {
+        descendantAttempted();
+        await store.interactions.put(record('descendant-write'));
+      });
+    });
+
+    let rollbackEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { rollbackEntered = resolve; });
+    let rejectRollback!: () => void;
+    const rollbackGate = new Promise<void>((resolve) => { rejectRollback = resolve; });
+    const rollingBack = store.transaction(async (tx) => {
+      await tx.interactions.put(record('rolled-back'));
+      rollbackEntered();
+      await rollbackGate;
+      throw new Error('rollback');
+    });
+    await entered;
+
+    releaseDescendant();
+    await attempted;
+    rejectRollback();
+
+    await expect(rollingBack).rejects.toThrow('rollback');
+    await expect(Promise.race([
+      descendant,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('descendant deadlocked')), 100)),
+    ])).resolves.toBeUndefined();
+    await expect(store.interactions.get({
+      tenantId: identity.tenantId, runId: 'escaped-context-run', interactionId: 'descendant-write',
+    })).resolves.toMatchObject({ id: 'descendant-write' });
+    await expect(store.interactions.get({
+      tenantId: identity.tenantId, runId: 'escaped-context-run', interactionId: 'rolled-back',
+    })).resolves.toBeUndefined();
+  });
 });
 
 describe('MysqlRunStore durable contract surface', () => {
@@ -238,6 +314,13 @@ describe('MysqlRunStore durable contract surface', () => {
     expect(assembly.runtime).toBeInstanceOf(DurableRunManager);
     expect(assembly.store).toBeInstanceOf(MysqlRunStore);
     expect(assembly.sessions).toBeDefined();
+  });
+
+  it('checks an expected recovery token even after the durable lease is cleared', () => {
+    const source = readFileSync(new URL('../../packages/pi-runtime/src/store/mysql.ts', import.meta.url), 'utf8');
+    expect(source).toContain('if (input.expectedLease) {');
+    expect(source).toContain('BigInt(row.lease_token) !== input.expectedLease.token');
+    expect(source).not.toContain('if (activeLease && (!input.expectedLease');
   });
 
   it('executes owner-scoped SQL reservations for same-tenant actors sharing an external session id', async () => {
@@ -364,6 +447,48 @@ describe('shared RunStore contract', () => {
 });
 
 describe.runIf(Boolean(process.env.MYSQL_HOST))('shared RunStore MySQL integration contract', () => {
+  it('does not let a stale MySQL recovery token overwrite a newer waiting state', async () => {
+    const pool = createMysqlPool(readMysqlConfig()!);
+    await runMigrations(pool);
+    const db = createKysely(pool);
+    const suffix = `${Date.now()}`;
+    const tenantId = 'pi-runtime-recovery-fence';
+    const runId = `stale-recovery-${suffix}`;
+    const sessionId = `session-${suffix}`;
+    const owner = { tenantId, actorId: 'owner-a', roles: ['user'] } as const;
+    const startedAt = new Date('2026-07-29T00:00:00.000Z');
+    const store = new MysqlRunStore(db);
+    try {
+      await store.create({ record: {
+        tenantId, runId, actorId: owner.actorId, sessionId, kernel: 'pi', kernelVersion: '0.82.1',
+        status: 'queued', leaseToken: 0n, usage, createdAt: startedAt, updatedAt: startedAt,
+      } });
+      const first = await store.claim({ identity: owner, runId, workerId: 'worker-a', now: startedAt, leaseTtlMs: 10 });
+      const reclaimedAt = new Date(startedAt.getTime() + 11);
+      const second = await store.claim({ identity: owner, runId, workerId: 'worker-b', now: reclaimedAt, leaseTtlMs: 1000 });
+      await store.commitTurn({
+        tenantId, runId, attemptId: second!.attemptId, turnNo: 1, fencingToken: second!.fencingToken,
+        checkpoint: {}, events: [], status: 'waiting', waitingReason: 'approval', usage,
+        committedAt: new Date(reclaimedAt.getTime() + 1),
+      });
+
+      await expect(store.markRecoveryRequired({
+        identity: owner, runId, errorMessage: 'delayed worker-a failure', failedAt: new Date(reclaimedAt.getTime() + 2),
+        expectedLease: { ownerId: 'worker-a', token: first!.fencingToken },
+      })).resolves.toBe(false);
+      await expect(store.get({ tenantId, runId })).resolves.toMatchObject({
+        status: 'waiting', waitingReason: 'approval', leaseToken: second!.fencingToken,
+      });
+    } finally {
+      for (const table of ['agent_turn_commits', 'agent_run_attempts', 'agent_runs'] as const) {
+        await db.deleteFrom(table).where('tenant_id', '=', tenantId).where('run_id', '=', runId).execute();
+      }
+      await db.deleteFrom('pi_sessions').where('tenant_id', '=', tenantId)
+        .where('session_id', '=', piSessionStorageId(owner.actorId, sessionId)).execute();
+      await db.destroy();
+    }
+  });
+
   it.each(['queued', 'waiting'] as const)('atomically cancels an inactive MySQL %s run', async (status) => {
     const pool = createMysqlPool(readMysqlConfig()!);
     await runMigrations(pool);
@@ -389,7 +514,8 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('shared RunStore MySQL integrati
       await manager.cancel({ identity: owner, runId, reason: 'mysql terminate' });
 
       await expect(store.get({ tenantId, runId })).resolves.toMatchObject({
-        status: 'cancelled', appendClosedAt: expect.any(Date), leaseOwner: undefined, leaseExpiresAt: undefined,
+        status: 'cancelled', errorMessage: 'mysql terminate', appendClosedAt: expect.any(Date),
+        leaseOwner: undefined, leaseExpiresAt: undefined,
       });
     } finally {
       for (const table of ['agent_run_attempts', 'agent_runs'] as const) {
@@ -1148,7 +1274,8 @@ describe('DurableRunManager', () => {
       await manager.cancel({ identity, runId, reason: 'session terminated' });
 
       expect(await store.get({ tenantId: identity.tenantId, runId })).toMatchObject({
-        status: 'cancelled', cancelReason: 'session terminated', appendClosedAt: expect.any(Date),
+        status: 'cancelled', cancelReason: 'session terminated', errorMessage: 'session terminated',
+        appendClosedAt: expect.any(Date),
         leaseOwner: undefined, leaseExpiresAt: undefined,
       });
     },

@@ -92,8 +92,10 @@ export class MysqlRunStore implements DurableProductRunStore {
         .where('run_id', '=', input.runId).forUpdate().executeTakeFirst();
       if (!row || !canManageRun(input.identity, row.user_id) || ['succeeded', 'cancelled'].includes(row.status)) return false;
       const activeLease = Boolean(row.lease_owner && row.lease_expires_at && row.lease_expires_at > input.failedAt);
-      if (activeLease && (!input.expectedLease || row.lease_owner !== input.expectedLease.ownerId
-        || BigInt(row.lease_token) !== input.expectedLease.token)) return false;
+      if (input.expectedLease) {
+        if (BigInt(row.lease_token) !== input.expectedLease.token
+          || (row.lease_owner && row.lease_owner !== input.expectedLease.ownerId)) return false;
+      } else if (activeLease) return false;
       await store.db.updateTable('agent_runs').set({
         status: 'recovery_required', waiting_reason: null, error_message: input.errorMessage,
         completed_at: input.failedAt, append_closed_at: row.append_closed_at ?? input.failedAt,

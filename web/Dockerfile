@@ -1,7 +1,7 @@
 FROM node:24-slim AS build
 WORKDIR /app
-COPY web/package.json web/package-lock.json* ./
-RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
 COPY web/ ./
 RUN npm run build
 

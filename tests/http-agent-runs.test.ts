@@ -249,6 +249,64 @@ describe('mandatory durable Run Center HTTP API', () => {
     });
   });
 
+  it('does not overwrite a newer waiting state when a stale recovery supervisor fails', async () => {
+    const durable = store.durableRunStore();
+    const markRecovery = vi.spyOn(durable, 'markRecoveryRequired');
+    const startedAt = new Date();
+    await store.updateAgentRun('default', 'run-user', {
+      status: 'failed', waitingReason: null, cancelRequestedAt: null, completedAt: startedAt, updatedAt: startedAt,
+    });
+    let releaseFailure!: () => void;
+    const failureGate = new Promise<void>((resolve) => { releaseFailure = resolve; });
+    let supervisorObservedLease!: () => void;
+    const leaseObserved = new Promise<void>((resolve) => { supervisorObservedLease = resolve; });
+    let firstClaim!: Awaited<ReturnType<typeof durable.claim>>;
+    resume.mockImplementationOnce(async (input) => {
+      firstClaim = await durable.claim({
+        identity: input.identity, runId: input.runId, workerId: 'worker-a', now: startedAt,
+        leaseTtlMs: 60_000, resume: true,
+      });
+      return {
+        runId: input.runId, status: 'running',
+        events: { async *[Symbol.asyncIterator]() { supervisorObservedLease(); await failureGate; } },
+        result: async () => { throw new Error('delayed worker-a failure'); },
+      };
+    });
+
+    const response = await fetch(`${base}/v1/agent/runs/run-user/resume`, {
+      method: 'POST', headers: auth(userToken), body: '{}',
+    });
+    expect(response.status).toBe(202);
+    await leaseObserved;
+    expect(firstClaim).toBeTruthy();
+    const reclaimedAt = new Date(startedAt.getTime() + 60_001);
+    const second = await durable.claim({
+      identity: { tenantId: 'default', actorId: userId, roles: ['user'] }, runId: 'run-user',
+      workerId: 'worker-b', now: reclaimedAt, leaseTtlMs: 60_000, resume: true,
+    });
+    await durable.commitTurn({
+      tenantId: 'default', runId: 'run-user', attemptId: second!.attemptId, turnNo: 1,
+      fencingToken: second!.fencingToken, checkpoint: {}, events: [], status: 'waiting', waitingReason: 'approval',
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      committedAt: new Date(reclaimedAt.getTime() + 1),
+    });
+
+    releaseFailure();
+    await vi.waitFor(async () => {
+      const recovery = (await store.listAgentRunEvents({ tenantId: 'default', userId, role: 'user' }, 'run-user'))
+        .filter((event) => event.type === 'recovery');
+      expect(recovery.at(-1)?.status).toBe('failed');
+    });
+    expect(markRecovery).toHaveBeenCalledWith(expect.objectContaining({
+      expectedLease: { ownerId: 'worker-a', token: firstClaim!.fencingToken },
+    }));
+    await expect(markRecovery.mock.results.at(-1)?.value).resolves.toBe(false);
+    await expect(durable.get({ tenantId: 'default', runId: 'run-user' })).resolves.toMatchObject({
+      status: 'waiting', waitingReason: 'approval', leaseToken: second!.fencingToken,
+    });
+    markRecovery.mockRestore();
+  });
+
   it('replays SSE events strictly after Last-Event-ID', async () => {
     await store.appendAgentRunEvent({
       tenantId: 'default', runId: 'run-user', type: 'turn_committed', status: 'succeeded', createdAt: new Date(),

@@ -15,6 +15,7 @@ import { piSessionStorageId } from './session-id.js';
 
 const clone = <T>(value: T): T => structuredClone(value);
 const key = (tenantId: string, id: string): string => `${tenantId}\0${id}`;
+type MutationContext = { active: boolean };
 
 export class MemoryRunStore implements DurableProductRunStore {
   private readonly runRecords = new Map<string, StoredRun>();
@@ -27,7 +28,7 @@ export class MemoryRunStore implements DurableProductRunStore {
   private readonly interactionRecords = new Map<string, DurableInteractionUpdate>();
   private readonly toolLedgerRecords = new Map<string, DurableToolLedgerUpdate>();
   private transactionTail: Promise<void> = Promise.resolve();
-  private readonly mutationContext = new AsyncLocalStorage<boolean>();
+  private readonly mutationContext = new AsyncLocalStorage<MutationContext>();
 
   constructor(private readonly now: () => Date = () => new Date()) {}
 
@@ -79,8 +80,10 @@ export class MemoryRunStore implements DurableProductRunStore {
       const run = this.runRecords.get(key(input.identity.tenantId, input.runId));
       if (!run || !canManageRun(input.identity, run.actorId) || ['succeeded', 'cancelled'].includes(run.status)) return false;
       const activeLease = Boolean(run.leaseOwner && run.leaseExpiresAt && run.leaseExpiresAt > input.failedAt);
-      if (activeLease && (!input.expectedLease || run.leaseOwner !== input.expectedLease.ownerId
-        || run.leaseToken !== input.expectedLease.token)) return false;
+      if (input.expectedLease) {
+        if (run.leaseToken !== input.expectedLease.token
+          || (run.leaseOwner && run.leaseOwner !== input.expectedLease.ownerId)) return false;
+      } else if (activeLease) return false;
       run.status = 'recovery_required';
       run.waitingReason = undefined;
       run.errorMessage = input.errorMessage;
@@ -221,6 +224,7 @@ export class MemoryRunStore implements DurableProductRunStore {
       if (inactive && (run.status === 'queued' || run.status === 'waiting')) {
         run.status = 'cancelled';
         run.waitingReason = undefined;
+        run.errorMessage = input.reason;
         run.result = { runId: run.runId, status: 'cancelled', usage: clone(run.usage) };
         run.appendClosedAt ??= input.requestedAt;
         run.completedAt ??= input.requestedAt;
@@ -550,12 +554,18 @@ export class MemoryRunStore implements DurableProductRunStore {
   }
 
   private async lock<T>(work: () => Promise<T>): Promise<T> {
-    if (this.mutationContext.getStore()) return work();
+    if (this.mutationContext.getStore()?.active) return work();
     let release!: () => void;
     const prior = this.transactionTail;
     this.transactionTail = new Promise<void>((resolve) => { release = resolve; });
     await prior;
-    try { return await this.mutationContext.run(true, work); } finally { release(); }
+    const context: MutationContext = { active: true };
+    try {
+      return await this.mutationContext.run(context, work);
+    } finally {
+      context.active = false;
+      release();
+    }
   }
 }
 
