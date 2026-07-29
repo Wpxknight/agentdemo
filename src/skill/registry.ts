@@ -962,12 +962,18 @@ export class SkillRegistry {
         && entry.tenantId === legacy.tenantId
         && entry.sourceVersion === legacy.version
         && legacyRelativePathCandidates(legacy).includes(entry.relativePath));
-      if (!candidates.length) continue;
+      if (!candidates.length) {
+        outcome.unresolved += 1;
+        continue;
+      }
       const digest = await contentDigest(legacy.path);
       const exactByIdentity = new Map(
         candidates.filter((entry) => entry.sourceDigest === digest).map((entry) => [entry.identity, entry]),
       );
-      if (!exactByIdentity.size) continue;
+      if (!exactByIdentity.size) {
+        outcome.unresolved += 1;
+        continue;
+      }
       if (exactByIdentity.size !== 1) {
         outcome.unresolved += 1;
         continue;

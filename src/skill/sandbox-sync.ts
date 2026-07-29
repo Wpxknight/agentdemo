@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { open } from 'node:fs/promises';
 import { posix, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import type { SandboxHandle } from '../sandbox/types.js';
@@ -20,12 +20,20 @@ export interface SandboxSyncResult {
   error?: string;
 }
 
+interface LocalFileReadResult {
+  content: Uint8Array;
+  overflow: boolean;
+}
+
+type LocalFileReader = (path: string, maxBytes: number) => Promise<LocalFileReadResult>;
+
 export async function syncSkillToSandbox(input: {
   name: string;
   dir: string;
   files: SkillFileEntry[];
   partial: boolean;
   sbx: SandboxHandle;
+  localFileReader?: LocalFileReader;
 }): Promise<SandboxSyncResult> {
   const kept = input.partial ? input.files : input.files.filter((file) => file.size <= SYNC_SKIP_FILE_BYTES);
   const skipped = input.partial ? [] : input.files.filter((file) => file.size > SYNC_SKIP_FILE_BYTES);
@@ -76,6 +84,7 @@ async function syncLocalSkillFiles(
     dir: string;
     partial: boolean;
     sbx: SandboxHandle;
+    localFileReader?: LocalFileReader;
   },
   result: Omit<SandboxSyncResult, 'error'>,
 ): Promise<SandboxSyncResult> {
@@ -91,11 +100,21 @@ async function syncLocalSkillFiles(
       if (relativeSource === '..' || relativeSource.startsWith(`..${sep}`) || relativeSource === '') {
         throw new Error('技能同步源路径越界');
       }
-      const content = await readFile(source);
+      const remaining = SYNC_TOTAL_BYTES - actualTotal;
+      const maxBytes = input.partial
+        ? remaining + 1
+        : SYNC_SKIP_FILE_BYTES + 1;
+      const { content, overflow } = await (input.localFileReader ?? readLocalFileBounded)(source, maxBytes);
+      if (content.byteLength > maxBytes) throw new Error('技能同步读取器返回内容超过请求上限');
       const actualFile = { ...file, size: content.byteLength };
-      if (!input.partial && content.byteLength > SYNC_SKIP_FILE_BYTES) {
+      if (!input.partial && (overflow || content.byteLength > SYNC_SKIP_FILE_BYTES)) {
         actualSkipped.push(actualFile);
         continue;
+      }
+      if (overflow) {
+        return { ...result, kept: prepared.map((item) => item.file), skipped: actualSkipped,
+          total: actualTotal + content.byteLength,
+          error: '待同步文件总量超过上限；请用 paths 参数缩小同步范围' };
       }
       actualTotal += content.byteLength;
       if (actualTotal > SYNC_TOTAL_BYTES) {
@@ -131,6 +150,22 @@ async function syncLocalSkillFiles(
     return actualResult;
   } catch (error) {
     return { ...result, error: `沙箱文件写入失败：${String(error)}` };
+  }
+}
+
+async function readLocalFileBounded(path: string, maxBytes: number): Promise<LocalFileReadResult> {
+  const file = await open(path, 'r');
+  const content = Buffer.allocUnsafe(maxBytes);
+  let offset = 0;
+  try {
+    while (offset < maxBytes) {
+      const { bytesRead } = await file.read(content, offset, Math.min(64 * 1024, maxBytes - offset), null);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    return { content: content.subarray(0, offset), overflow: offset === maxBytes };
+  } finally {
+    await file.close();
   }
 }
 

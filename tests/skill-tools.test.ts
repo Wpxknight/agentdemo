@@ -1,4 +1,4 @@
-import { access, mkdtemp, mkdir, readFile, readdir, symlink, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, mkdir, open, readFile, readdir, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
@@ -418,6 +418,113 @@ describe('buildSkillTools', () => {
     } finally {
       await fixedHandle.kill();
     }
+  });
+
+  it('bounds local reads before rejecting an oversized sparse file without reserving a generation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-local-sync-bounded-read-'));
+    const source = join(root, 'sparse.bin');
+    const sourceHandle = await open(source, 'w');
+    await sourceHandle.truncate(128 * 1024 * 1024);
+    await sourceHandle.close();
+    const handle = await new LocalSandboxProvider({ maxSyncBytes: SYNC_TOTAL_BYTES * 2 })
+      .create({ key: 'local-sync-bounded-read' });
+    const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
+    const reserve = handle.reserveSyncGeneration!.bind(handle);
+    let reservations = 0;
+    handle.reserveSyncGeneration = async (bytes: number) => {
+      reservations += 1;
+      await reserve(bytes);
+    };
+    let observedBytes = 0;
+    const input = {
+      name: 'bounded-read', dir: root, partial: true, sbx: handle,
+      files: [{
+        name: 'sparse.bin', path: 'sparse.bin', size: 1,
+        isDirectory: false, updatedAt: new Date().toISOString(),
+      }],
+      localFileReader: async (path: string, maxBytes: number) => {
+        const file = await open(path, 'r');
+        const content = Buffer.alloc(maxBytes);
+        try {
+          const { bytesRead } = await file.read(content, 0, maxBytes, 0);
+          observedBytes += bytesRead;
+          return { content: content.subarray(0, bytesRead), overflow: bytesRead === maxBytes };
+        } finally {
+          await file.close();
+        }
+      },
+    };
+    try {
+      const result = await syncSkillToSandbox(input);
+      expect(result.error).toMatch(/总量超过上限/);
+      expect(observedBytes).toBe(SYNC_TOTAL_BYTES + 1);
+      expect(reservations).toBe(0);
+      await expect(access(join(sandboxRoot, 'workspace', 'skills', 'bounded-read'))).rejects.toThrow();
+    } finally {
+      await handle.kill();
+    }
+  });
+
+  it('accepts multiple local files exactly at the total byte boundary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-local-sync-total-boundary-'));
+    const firstSize = Math.floor(SYNC_TOTAL_BYTES / 2);
+    const secondSize = SYNC_TOTAL_BYTES - firstSize;
+    await writeFile(join(root, 'first.bin'), Buffer.alloc(firstSize, 1));
+    await writeFile(join(root, 'second.bin'), Buffer.alloc(secondSize, 2));
+    const handle = await new LocalSandboxProvider({ maxSyncBytes: SYNC_TOTAL_BYTES })
+      .create({ key: 'local-sync-total-boundary' });
+    try {
+      const result = await syncSkillToSandbox({
+        name: 'total-boundary', dir: root, partial: true, sbx: handle,
+        files: [
+          { name: 'first.bin', path: 'first.bin', size: 1, isDirectory: false,
+            updatedAt: new Date().toISOString() },
+          { name: 'second.bin', path: 'second.bin', size: 1, isDirectory: false,
+            updatedAt: new Date().toISOString() },
+        ],
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.total).toBe(SYNC_TOTAL_BYTES);
+      await expect(handle.readFile(`${result.dest}/first.bin`)).resolves.toHaveLength(firstSize);
+      await expect(handle.readFile(`${result.dest}/second.bin`)).resolves.toHaveLength(secondSize);
+    } finally {
+      await handle.kill();
+    }
+  });
+
+  it('skips an actual large full-sync file even when less than the skip threshold remains', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-local-sync-skip-after-budget-'));
+    const sizes = new Map<string, number>();
+    const files = Array.from({ length: 8 }, (_, index) => {
+      const name = `normal-${index}.bin`;
+      sizes.set(name, index === 7 ? 1_000_000 : 2_000_000);
+      return { name, path: name, size: 1, isDirectory: false, updatedAt: new Date().toISOString() };
+    });
+    sizes.set('large.bin', 3_000_000);
+    files.push({
+      name: 'large.bin', path: 'large.bin', size: 1,
+      isDirectory: false, updatedAt: new Date().toISOString(),
+    });
+    const sandbox = Object.assign(new FakeSandbox(), {
+      supportsSecretFiles: false as const,
+      reserveSyncGeneration: vi.fn(async (_bytes: number) => {}),
+    });
+    const result = await syncSkillToSandbox({
+      name: 'skip-after-budget', dir: root, files, partial: false, sbx: sandbox,
+      localFileReader: async (path: string, maxBytes: number) => {
+        const name = path.slice(path.lastIndexOf('/') + 1);
+        const size = sizes.get(name)!;
+        const bytesRead = Math.min(size, maxBytes);
+        return { content: Buffer.alloc(bytesRead), overflow: size >= maxBytes };
+      },
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.total).toBe(15_000_000);
+    expect(result.kept).toHaveLength(8);
+    expect(result.skipped.map((file) => file.name)).toContain('large.bin');
+    expect(sandbox.reserveSyncGeneration).toHaveBeenCalledWith(15_000_000);
+    expect(sandbox.writtenFiles).toHaveLength(8);
   });
 
   it('keeps the multi-provider schema when only some credentials are available', async () => {

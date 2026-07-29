@@ -635,6 +635,46 @@ describe('SkillRegistry', () => {
     expect((await stat(unrelatedSkill)).atimeMs).toBe(initialAtime);
   });
 
+  it('keeps a never-cataloged legacy tombstone unresolved until its builtin first appears', async () => {
+    const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-first-catalog-source-'));
+    const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-first-catalog-product-'));
+    const backupRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-first-catalog-backup-'));
+    const currentName = 'first-catalog-a';
+    const absentName = 'first-catalog-b';
+    const current = join(builtinRoot, currentName);
+    const absentBackup = join(backupRoot, absentName);
+    for (const [path, name] of [[current, currentName], [absentBackup, absentName]] as const) {
+      await mkdir(path, { recursive: true });
+      await writeFile(join(path, 'SKILL.md'), `---\nname: ${name}\ndescription: first catalog\n---\nbody`);
+      await writeProduct(path, {
+        name, version: '1', enabled: true, reviewed: true,
+        tenantId: 'default', visibility: 'public',
+      });
+    }
+
+    await new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] }).scan();
+    await rm(legacyMigrationMarker(productRoot));
+    const tombstone = join(productRoot, '.aiop-tombstones', `old-${absentName}`);
+    await mkdir(join(productRoot, '.aiop-tombstones'), { recursive: true });
+    await cp(absentBackup, tombstone, { recursive: true });
+
+    const first = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    await first.scan();
+
+    await expect(stat(tombstone)).resolves.toBeDefined();
+    await expect(stat(legacyMigrationMarker(productRoot))).rejects.toThrow();
+
+    await cp(absentBackup, join(builtinRoot, absentName), { recursive: true });
+    const second = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    await second.scan();
+
+    await expect(second.loadFor(absentName, {
+      tenantId: 'default', userId: 'admin', role: 'tenant_admin',
+    })).resolves.toBeUndefined();
+    await expect(stat(tombstone)).rejects.toThrow();
+    await expect(stat(legacyMigrationMarker(productRoot))).resolves.toBeDefined();
+  });
+
   it('resolves a tombstone against the unique matching historical catalog digest', async () => {
     const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-history-digest-source-'));
     const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-history-digest-product-'));
