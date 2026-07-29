@@ -62,6 +62,7 @@ function managedSession(
 ): ManagedPiSession {
   return {
     continue: continueRun,
+    async replayInteraction() {},
     async abort() {},
     async close() {},
     async steer() {},

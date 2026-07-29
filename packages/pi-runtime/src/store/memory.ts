@@ -12,6 +12,7 @@ import type {
 import { assertAttemptAllowed, assertTurnAllowed } from '../run/limits.js';
 import { sessionStats } from './session-stats.js';
 import { piSessionStorageId } from './session-id.js';
+import { equalJsonValue } from '../tools/ledger.js';
 
 const clone = <T>(value: T): T => structuredClone(value);
 const key = (tenantId: string, id: string): string => `${tenantId}\0${id}`;
@@ -134,7 +135,7 @@ export class MemoryRunStore implements DurableProductRunStore {
         if (!interaction || interaction.status !== 'resolved' || !interaction.toolCallId
           || interaction.runId !== run.runId || interaction.tenantId !== run.tenantId
           || (run.status === 'waiting' && interaction.kind !== run.waitingReason)
-          || JSON.stringify(interaction.resolution) !== JSON.stringify(input.resolution.value)) {
+          || !equalJsonValue(interaction.resolution, input.resolution.value)) {
           throw conflict('Interaction resolution does not match the waiting run');
         }
       }

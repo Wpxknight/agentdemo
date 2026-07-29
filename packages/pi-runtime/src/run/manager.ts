@@ -16,12 +16,13 @@ import type { DurableRunStore } from '../store/types.js';
 import { assertToolCallsAllowed, assertUsageAllowed } from './limits.js';
 import { piSessionStorageId } from '../store/session-id.js';
 import { GovernedToolOutcomeError } from '../pi/tool-bridge.js';
+import { equalJsonValue } from '../tools/ledger.js';
 
 const ZERO_USAGE = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 } as const;
 
 export interface ManagedPiSession extends InboxCapableSession {
   continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent>;
-  replayInteraction?(
+  replayInteraction(
     resolution: ResolvedInteraction,
     signal?: AbortSignal,
     guard?: () => Promise<void>,
@@ -97,7 +98,7 @@ export class DurableRunManager implements DurableRunRuntime {
       if (!interaction || interaction.tenantId !== input.identity.tenantId || interaction.runId !== input.runId
         || interaction.status !== 'resolved' || !interaction.toolCallId
         || (run.status === 'waiting' && interaction.kind !== run.waitingReason)
-        || JSON.stringify(interaction.resolution) !== JSON.stringify(input.resolution.value)) {
+        || !equalJsonValue(interaction.resolution, input.resolution.value)) {
         throw conflict('Interaction resolution does not match the waiting run');
       }
       trustedResolution = {
@@ -105,7 +106,7 @@ export class DurableRunManager implements DurableRunRuntime {
         value: interaction.resolution ?? input.resolution.value,
       };
     }
-    const message: AgentInputMessage = { role: 'user', text: 'Continue from the last committed state.' };
+    const message: AgentInputMessage = { role: 'user', text: '' };
     return this.start(input.identity, input.runId, message, true, true, input.signal, trustedResolution);
   }
 
@@ -226,9 +227,6 @@ export class DurableRunManager implements DurableRunRuntime {
       try {
         if (interactionResolution) {
           await guardControl();
-          if (!session.replayInteraction) {
-            throw conflict('Loaded Pi session cannot replay the resolved interaction');
-          }
           await session.replayInteraction(interactionResolution, abort.signal, guardControl);
           await guardControl();
         }

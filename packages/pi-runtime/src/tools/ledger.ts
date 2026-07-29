@@ -28,6 +28,11 @@ export function digestToolValue(value: JsonValue | string): string {
   return createHash('sha256').update(stable(value)).digest('hex');
 }
 
+export function equalJsonValue(left: JsonValue | undefined, right: JsonValue | undefined): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return digestToolValue(left) === digestToolValue(right);
+}
+
 function stable(value: JsonValue): string {
   if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
   if (value && typeof value === 'object') {

@@ -115,6 +115,7 @@ describe('active durable inbox delivery', () => {
           kernel: 'pi', kernelVersion: '0.82.1', correlationId: 'done', createdAt: new Date(),
         };
       },
+      async replayInteraction() {},
       async steer() { release(); }, async followUp() { release(); }, async abort() { release(); }, async close() {},
       async metadata() { return { id: 'session-poll', tenantId: 'tenant-a', createdAt: new Date().toISOString() }; },
       async entries() { return entries; },

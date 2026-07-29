@@ -12,6 +12,7 @@ import type {
 import { assertAttemptAllowed, assertTurnAllowed } from '../run/limits.js';
 import { sessionStats } from './session-stats.js';
 import { piSessionStorageId } from './session-id.js';
+import { equalJsonValue } from '../tools/ledger.js';
 
 type Db = Kysely<any> | Transaction<any>;
 
@@ -132,8 +133,9 @@ export class MysqlRunStore implements DurableProductRunStore {
           .where('id', '=', input.resolution.interactionId).forUpdate().executeTakeFirst();
         if (!interaction || interaction.status !== 'resolved' || !interaction.tool_call_id
           || (row.status === 'waiting' && interaction.kind !== row.waiting_reason)
-          || JSON.stringify(interaction.resolution === null ? undefined : parse(interaction.resolution))
-            !== JSON.stringify(input.resolution.value)) {
+          || !equalJsonValue(
+            interaction.resolution === null ? undefined : parse(interaction.resolution), input.resolution.value,
+          )) {
           throw conflict('Interaction resolution does not match the waiting run');
         }
       }

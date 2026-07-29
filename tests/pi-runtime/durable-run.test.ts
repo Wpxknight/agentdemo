@@ -15,6 +15,30 @@ const identity = { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] } as
 const usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
 
 describe('MemoryRunStore durable contract', () => {
+  it('claims a resolved interaction when JSON object keys were inserted in a different order', async () => {
+    const store = new MemoryRunStore();
+    const runId = 'canonical-resolution-claim';
+    const now = new Date('2026-07-30T00:00:00.000Z');
+    await store.create({ record: {
+      tenantId: identity.tenantId, runId, actorId: identity.actorId, sessionId: 'canonical-resolution-session',
+      kernel: 'pi', kernelVersion: '0.82.1', status: 'waiting', waitingReason: 'approval', leaseToken: 0n,
+      usage, createdAt: now, updatedAt: now,
+    } });
+    await store.interactions.put({
+      tenantId: identity.tenantId, runId, id: 'canonical-resolution', attemptId: 'attempt-a', turnNo: 1,
+      kind: 'approval', toolCallId: 'call-a', status: 'resolved', payload: {},
+      resolution: { approved: true, audit: { actor: 'user-a', source: 'ui' } }, createdAt: now, resolvedAt: now,
+    });
+
+    await expect(store.claim({
+      identity, runId, workerId: 'worker-a', now, leaseTtlMs: 1_000, resume: true,
+      resolution: {
+        interactionId: 'canonical-resolution',
+        value: { audit: { source: 'ui', actor: 'user-a' }, approved: true },
+      },
+    })).resolves.toMatchObject({ record: { status: 'running' } });
+  });
+
   it('isolates same-named sessions by run owner', async () => {
     const store = new MemoryRunStore();
     const now = new Date('2026-07-29T00:00:00.000Z');
@@ -933,6 +957,7 @@ describe('DurableRunManager', () => {
           createdAt: new Date('2026-07-28T00:00:00.060Z'),
         };
       },
+      async replayInteraction() {},
       async metadata() { return { id: 'session-a', tenantId: 'tenant-a', createdAt: '2026-07-28T00:00:00.000Z' }; },
       async entries() { return [
         {
@@ -992,6 +1017,7 @@ describe('DurableRunManager', () => {
         };
         finished = true;
       },
+      async replayInteraction() {},
       async entries() { return finished ? [root, assistant] : [root]; }, async leafId() { return assistant.id; },
       async metadata() { return { id: 'usage-session', tenantId: 'tenant-a', createdAt: new Date().toISOString() }; },
       async abort() {}, async close() {}, async steer() {}, async followUp() {}, async appendCustomEntry() { return 'marker'; },
@@ -1094,17 +1120,21 @@ describe('DurableRunManager', () => {
     });
     expect(waitingRun?.appendClosedAt).toBeUndefined();
 
-    const resolution = { interactionId: 'approval-a', value: { approved: true } };
+    const committedResolution = { approved: true, audit: { actor: 'user-a', source: 'ui' } };
+    const resolution = {
+      interactionId: 'approval-a',
+      value: { audit: { source: 'ui', actor: 'user-a' }, approved: true },
+    };
     const pendingInteraction = await store.getInteraction({
       tenantId: identity.tenantId, runId, interactionId: resolution.interactionId,
     });
     await expect(store.resolveInteraction({
-      ...pendingInteraction!, status: 'resolved', resolution: resolution.value, resolvedAt: new Date(),
+      ...pendingInteraction!, status: 'resolved', resolution: committedResolution, resolvedAt: new Date(),
     })).resolves.toBe(true);
     const resumedResult = await (await secondManager.resume({ identity, runId, resolution })).result();
 
     const trustedResolution = {
-      ...resolution, kind: 'approval', toolCallId: 'call-a',
+      interactionId: resolution.interactionId, value: committedResolution, kind: 'approval', toolCallId: 'call-a',
     };
     expect(receivedResolution).toEqual(trustedResolution);
     expect(replayedResolution).toEqual(trustedResolution);
@@ -1927,6 +1957,7 @@ async function runAtomicSessionClassificationRace(base: DurableRunStore, suffix:
 function emptySession(id: string): ManagedPiSession {
   return {
     async *continue() {}, async entries() { return []; }, async leafId() { return null; },
+    async replayInteraction() {},
     async metadata() { return { id, tenantId: 'tenant-a', createdAt: new Date().toISOString() }; },
     async abort() {}, async close() {}, async steer() {}, async followUp() {}, async appendCustomEntry() { return 'marker'; },
   };

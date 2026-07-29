@@ -4,7 +4,10 @@ import type {
 } from '@aiop/control-contracts';
 import { AgentPlatformError } from '@aiop/control-contracts';
 import {
+  Agent,
   AgentHarness,
+  convertToLlm,
+  type AgentEvent,
   type AgentHarnessEvent,
   type AgentHarnessResources,
   type AgentHarnessTool,
@@ -117,17 +120,19 @@ export class PiAgentSessionFactory<
     execution?: RunExecutionProfile,
   ): PiAgentSession<TMetadata> {
     const governedTools = scopeGovernedTools(tools);
+    const models = identity && this.options.modelConcurrency
+      ? createConcurrentModels(this.options.models, this.options.modelConcurrency, identity)
+      : this.options.models;
+    const systemPrompt = this.options.resolveSystemPrompt?.({ execution }) ?? this.options.systemPrompt;
     const harness = new AgentHarness({
       session,
-      models: identity && this.options.modelConcurrency
-        ? createConcurrentModels(this.options.models, this.options.modelConcurrency, identity)
-        : this.options.models,
+      models,
       model: this.options.model,
-      systemPrompt: this.options.resolveSystemPrompt?.({ execution }) ?? this.options.systemPrompt,
+      systemPrompt,
       tools: governedTools.tools,
       resources: this.options.resources,
     });
-    return new PiAgentSession(session, harness, initialMessage, new EventCodec(events));
+    return new PiAgentSession(session, harness, initialMessage, new EventCodec(events), models, systemPrompt);
   }
 }
 
@@ -135,6 +140,8 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
   private closed = false;
   private closePromise?: Promise<void>;
   private pendingMessage?: AgentInputMessage;
+  private nativeContinuationPending = false;
+  private activeContinuationAgent?: Agent;
   private activeRun?: { cancel(): Promise<void>; finalize(cancelRunning?: boolean): Promise<void> };
   private governedToolScope: GovernedToolScope;
   private removeGovernedToolHook = () => {};
@@ -148,6 +155,8 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     private readonly harness: AgentHarness,
     initialMessage: AgentInputMessage,
     private readonly eventCodec: EventCodec,
+    private readonly models: Models = harness.models,
+    private readonly systemPrompt?: string,
   ) {
     this.pendingMessage = initialMessage;
     this.governedToolScope = adoptGovernedToolScope(harness.getTools());
@@ -257,6 +266,8 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     try {
       await this.session.moveTo(original.entry.id);
       await this.session.appendMessage(replacement);
+      this.pendingMessage = undefined;
+      this.nativeContinuationPending = true;
     } catch (error) {
       throw new GovernedToolOutcomeError({
         kind: 'recovery_required', message: 'Resolved tool result could not be committed to the Pi session',
@@ -267,10 +278,12 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
   private async *iterate(signal?: AbortSignal): AsyncGenerator<AgentRunEvent> {
     this.ensureOpen();
     if (this.activeRun) throw new Error('Pi agent session already has an active continue');
-    if (!this.pendingMessage) throw new Error('Pi agent session has no pending input');
+    if (!this.pendingMessage && !this.nativeContinuationPending) throw new Error('Pi agent session has no pending input');
     if (signal?.aborted) throw abortReason(signal);
     const initialMessage = this.pendingMessage;
     this.pendingMessage = undefined;
+    const nativeContinuation = this.nativeContinuationPending;
+    this.nativeContinuationPending = false;
     const events: AgentRunEvent[] = [];
     let wake: (() => void) | undefined;
     let finished = false;
@@ -281,17 +294,27 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
       wake?.();
       wake = undefined;
     };
-    const unsubscribe = this.harness.subscribe((event) => {
-      if (event.type === 'save_point' || event.type === 'settled') {
-        return this.flushPendingCustomEntries().then(() => { forwardEvent(event); });
-      }
-      forwardEvent(event);
-    });
+    const continuationAgent = nativeContinuation ? await this.createContinuationAgent(forwardEvent) : undefined;
+    this.activeContinuationAgent = continuationAgent;
+    const unsubscribe = continuationAgent
+      ? continuationAgent.subscribe(async (event) => this.handleContinuationEvent(event, forwardEvent))
+      : this.harness.subscribe((event) => {
+          if (event.type === 'save_point' || event.type === 'settled') {
+            return this.flushPendingCustomEntries().then(() => { forwardEvent(event); });
+          }
+          forwardEvent(event);
+        });
     let cancelPromise: Promise<void> | undefined;
     const cancel = () => cancelPromise ??= (async () => {
       const errors: unknown[] = [];
-      try { await this.harness.abort(); } catch (error) { errors.push(error); }
-      try { await this.harness.waitForIdle(); } catch (error) { errors.push(error); }
+      try {
+        if (continuationAgent) continuationAgent.abort();
+        else await this.harness.abort();
+      } catch (error) { errors.push(error); }
+      try {
+        if (continuationAgent) await continuationAgent.waitForIdle();
+        else await this.harness.waitForIdle();
+      } catch (error) { errors.push(error); }
       throwCollected(errors, 'Pi agent cancellation failed');
     })();
     let removeSignalListener = () => {};
@@ -310,6 +333,7 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
           forceDone = true;
           events.length = 0;
           if (this.activeRun === active) this.activeRun = undefined;
+          if (this.activeContinuationAgent === continuationAgent) this.activeContinuationAgent = undefined;
           try { await this.flushPendingCustomEntries(); } catch (error) { errors.push(error); }
           wake?.();
           wake = undefined;
@@ -324,8 +348,10 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     };
     signal?.addEventListener('abort', abort, { once: true });
     removeSignalListener = () => signal?.removeEventListener('abort', abort);
-    const { text, images } = promptParts(initialMessage);
-    const run = this.harness.prompt(text, images.length ? { images } : undefined).then(
+    const runPromise = continuationAgent
+      ? continuationAgent.continue()
+      : this.promptHarness(initialMessage!);
+    const run = runPromise.then(
       () => { finished = true; wake?.(); },
       (error) => { failure ??= error; finished = true; wake?.(); },
     );
@@ -351,12 +377,20 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
 
   async steer(message: AgentInputMessage): Promise<void> {
     this.ensureOpen();
+    if (this.activeContinuationAgent) {
+      this.activeContinuationAgent.steer(toPiUserMessage(message));
+      return;
+    }
     const { text, images } = promptParts(message);
     await this.harness.steer(text, images.length ? { images } : undefined);
   }
 
   followUp(message: AgentInputMessage): Promise<void> {
     this.ensureOpen();
+    if (this.activeContinuationAgent) {
+      this.activeContinuationAgent.followUp(toPiUserMessage(message));
+      return Promise.resolve();
+    }
     const { text, images } = promptParts(message);
     return this.harness.followUp(text, images.length ? { images } : undefined);
   }
@@ -447,6 +481,64 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     };
   }
 
+  private promptHarness(message: AgentInputMessage): Promise<AssistantMessage> {
+    const { text, images } = promptParts(message);
+    return this.harness.prompt(text, images.length ? { images } : undefined);
+  }
+
+  private async createContinuationAgent(forwardEvent: (event: AgentHarnessEvent) => void): Promise<Agent> {
+    const context = await this.session.buildContext();
+    const metadata = await this.session.getMetadata();
+    const streamOptions = this.harness.getStreamOptions();
+    return new Agent({
+      initialState: {
+        messages: context.messages,
+        model: this.harness.getModel(),
+        thinkingLevel: this.harness.getThinkingLevel(),
+        systemPrompt: this.systemPrompt ?? 'You are a helpful assistant.',
+        tools: this.harness.getActiveTools().map((tool) => ({
+          ...tool,
+          execute: (toolCallId, params, signal, onUpdate) =>
+            tool.execute(toolCallId, params, signal, onUpdate, undefined),
+        })),
+      },
+      convertToLlm,
+      sessionId: metadata.id,
+      transport: streamOptions.transport,
+      maxRetryDelayMs: streamOptions.maxRetryDelayMs,
+      streamFn: (model, providerContext, options) => this.models.streamSimple(model, providerContext, {
+        ...streamOptions,
+        ...options,
+      }),
+      afterToolCall: async ({ toolCall, args, result, isError }) => {
+        this.governedToolScope.patch({
+          type: 'tool_result', toolCallId: toolCall.id, toolName: toolCall.name,
+          input: args as Record<string, unknown>,
+          content: result.content, details: result.details, usage: result.usage, isError,
+        });
+      },
+    });
+  }
+
+  private async handleContinuationEvent(
+    event: AgentEvent,
+    forwardEvent: (event: AgentHarnessEvent) => void,
+  ): Promise<void> {
+    if (event.type === 'message_end') await this.session.appendMessage(event.message);
+    if (event.type === 'agent_end') {
+      await this.flushPendingCustomEntries();
+      forwardEvent(event);
+      forwardEvent({ type: 'settled', nextTurnCount: 0 });
+      return;
+    }
+    forwardEvent(event);
+    if (event.type === 'turn_end') {
+      const hadPendingMutations = this.pendingCustomEntries.length > 0;
+      await this.flushPendingCustomEntries();
+      forwardEvent({ type: 'save_point', hadPendingMutations });
+    }
+  }
+
   private flushPendingCustomEntries(): Promise<void> {
     const flush = async () => {
       while (this.pendingCustomEntries.length) {
@@ -484,6 +576,15 @@ function promptParts(message: AgentInputMessage): { text: string; images: ImageC
   const images = content.filter((block): block is Extract<typeof block, { type: 'image' }> => block.type === 'image')
     .map((block) => ({ type: 'image' as const, data: block.data, mimeType: block.mimeType }));
   return { text, images };
+}
+
+function toPiUserMessage(message: AgentInputMessage) {
+  const { text, images } = promptParts(message);
+  return {
+    role: 'user' as const,
+    content: [{ type: 'text' as const, text }, ...images],
+    timestamp: Date.now(),
+  };
 }
 
 function waitingInteractionBinding(

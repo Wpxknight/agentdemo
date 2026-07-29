@@ -707,6 +707,7 @@ describe('HTTP server', () => {
           detail: { message: { usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } } },
         };
       },
+      async replayInteraction() {},
       async entries() { return []; },
       async leafId() { return null; },
       async metadata() { return { id: 'sse-detach-session', tenantId: 'default', createdAt: new Date().toISOString() }; },

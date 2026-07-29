@@ -30,11 +30,24 @@ const identity = { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] } as
 
 describe('durable Pi interaction replay', () => {
   it.each([
-    { kind: 'approval' as const, value: true, expectedContent: 'deployment completed', executesHandler: true },
-    { kind: 'question' as const, value: { answer: ['yes'] }, expectedContent: 'question resolved: {"answer":["yes"]}', executesHandler: false },
-    { kind: 'plan' as const, value: true, expectedContent: 'plan resolved: true', executesHandler: false },
+    {
+      kind: 'approval' as const, value: true, expectedContent: 'deployment completed',
+      expectedError: false, executesHandler: true,
+    },
+    {
+      kind: 'approval' as const, value: false, expectedContent: 'approval denied',
+      expectedError: true, executesHandler: false,
+    },
+    {
+      kind: 'question' as const, value: { answer: ['yes'] },
+      expectedContent: 'question resolved: {"answer":["yes"]}', expectedError: false, executesHandler: false,
+    },
+    {
+      kind: 'plan' as const, value: true, expectedContent: 'plan resolved: true',
+      expectedError: false, executesHandler: false,
+    },
   ])('settles the exact pending governed $kind call before the resumed provider turn', async ({
-    kind, value, expectedContent, executesHandler,
+    kind, value, expectedContent, expectedError, executesHandler,
   }) => {
     const runId = 'interaction-replay-run';
     const sessionId = 'interaction-replay-session';
@@ -61,9 +74,11 @@ describe('durable Pi interaction replay', () => {
           && message.toolCallId === toolCallId);
         expect(order).toEqual(expectsHandlerOrder(executesHandler));
         expect(resolvedResults).toEqual([expect.objectContaining({
-          role: 'toolResult', toolCallId, toolName: 'deploy', isError: false,
+          role: 'toolResult', toolCallId, toolName: 'deploy', isError: expectedError,
           content: [{ type: 'text', text: expectedContent }],
         })]);
+        expect(context.messages.map((message) => message.role)).toEqual(['user', 'assistant', 'toolResult']);
+        expect(JSON.stringify(context.messages)).not.toContain('Continue from the last committed state.');
         expect(JSON.stringify(context.messages)).not.toContain(interactionId);
         finish(output, [{ type: 'text', text: 'continued after deployment' }], 'stop');
       }
@@ -148,7 +163,7 @@ describe('durable Pi interaction replay', () => {
     expect(await store.toolLedger.get({ tenantId: identity.tenantId, runId, logicalCallId }))
       .toMatchObject({
         status: 'completed', toolCallId,
-        result: { callId: toolCallId, content: expectedContent },
+        result: { callId: toolCallId, content: expectedContent, ...(expectedError ? { isError: true } : {}) },
       });
     expect(resumed).toMatchObject({ status: 'succeeded', text: 'continued after deployment' });
   });

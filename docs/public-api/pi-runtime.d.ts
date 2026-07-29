@@ -126,15 +126,19 @@ export declare class PiAgentSession<TMetadata extends SessionMetadata = SessionM
     private readonly session;
     private readonly harness;
     private readonly eventCodec;
+    private readonly models;
+    private readonly systemPrompt?;
     private closed;
     private closePromise?;
     private pendingMessage?;
+    private nativeContinuationPending;
+    private activeContinuationAgent?;
     private activeRun?;
     private governedToolScope;
     private removeGovernedToolHook;
     private readonly pendingCustomEntries;
     private customFlushTail;
-    constructor(session: Session<TMetadata>, harness: AgentHarness, initialMessage: AgentInputMessage, eventCodec: EventCodec);
+    constructor(session: Session<TMetadata>, harness: AgentHarness, initialMessage: AgentInputMessage, eventCodec: EventCodec, models?: Models, systemPrompt?: string | undefined);
     continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent>;
     replayInteraction(resolution: ResolvedInteraction, signal?: AbortSignal, guard?: () => Promise<void>): Promise<void>;
     private iterate;
@@ -153,6 +157,9 @@ export declare class PiAgentSession<TMetadata extends SessionMetadata = SessionM
     appendCustomEntry(customType: string, data?: unknown): Promise<string>;
     close(): Promise<void>;
     private installGovernedToolHook;
+    private promptHarness;
+    private createContinuationAgent;
+    private handleContinuationEvent;
     private flushPendingCustomEntries;
     private ensureOpen;
 }
@@ -466,7 +473,7 @@ import { type InboxCapableSession } from './inbox.js';
 import type { DurableRunStore } from '../store/types.js';
 export interface ManagedPiSession extends InboxCapableSession {
     continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent>;
-    replayInteraction?(resolution: ResolvedInteraction, signal?: AbortSignal, guard?: () => Promise<void>): Promise<void>;
+    replayInteraction(resolution: ResolvedInteraction, signal?: AbortSignal, guard?: () => Promise<void>): Promise<void>;
     abort(): Promise<void>;
     close(): Promise<void>;
     metadata(): Promise<SessionMetadata & {
@@ -1376,6 +1383,7 @@ export interface ToolApprovalClaim extends ToolLedgerIdentity {
     started: DurableToolLedgerUpdate;
 }
 export declare function digestToolValue(value: JsonValue | string): string;
+export declare function equalJsonValue(left: JsonValue | undefined, right: JsonValue | undefined): boolean;
 
 // file: tools/policy.d.ts
 import type { ToolCall, ToolExecutionContext } from '@aiop/control-contracts';

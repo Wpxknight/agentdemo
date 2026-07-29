@@ -40,6 +40,7 @@ describe('fault recovery boundaries', () => {
           signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
         });
       },
+      async replayInteraction() {},
       async abort() { aborted(); }, async close() {}, async steer() {}, async followUp() {},
       async appendCustomEntry() { return 'custom'; }, async entries() { return []; }, async leafId() { return null; },
       async metadata() { return { id: 'session-stalled', tenantId: 'tenant-a', createdAt: new Date().toISOString() }; },
@@ -91,6 +92,7 @@ describe('fault recovery boundaries', () => {
     const wait = new Promise<void>((resolve) => { release = resolve; });
     const session: ManagedPiSession = {
       async *continue() { await wait; }, async abort() { release(); }, async close() {}, async steer() {}, async followUp() {},
+      async replayInteraction() {},
       async appendCustomEntry() { return 'custom'; }, async entries() { return []; }, async leafId() { return null; },
       async metadata() { return { id: 'session-duplicate', tenantId: 'tenant-a', createdAt: now.toISOString() }; },
     };
@@ -112,6 +114,7 @@ describe('fault recovery boundaries', () => {
     const error = Object.assign(new Error('external result unknown'), { code: 'TOOL_RESULT_UNKNOWN' });
     const session: ManagedPiSession = {
       async *continue() { throw error; }, async abort() {}, async close() {}, async steer() {}, async followUp() {},
+      async replayInteraction() {},
       async appendCustomEntry() { return 'custom'; }, async entries() { return []; }, async leafId() { return null; },
       async metadata() { return { id: 'session-unknown', tenantId: 'tenant-a', createdAt: new Date().toISOString() }; },
     };
