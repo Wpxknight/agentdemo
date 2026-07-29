@@ -1132,6 +1132,61 @@ describe('DurableRunManager', () => {
     });
   });
 
+  it('lets cancellation win when an aborted governed tool reports an uncertain result', async () => {
+    const base = new MemoryRunStore();
+    let committed: Record<string, unknown> | undefined;
+    const store = new Proxy(base, {
+      get(target, property) {
+        if (property === 'commitTurn') return async (input: Record<string, unknown>) => {
+          committed = input;
+          return target.commitTurn(input as never);
+        };
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const ledgerUpdate = {
+      tenantId: identity.tenantId, runId: 'cancel-governed-run', attemptId: 'tool-attempt', turnNo: 1,
+      logicalCallId: 'logical-cancel', toolCallId: 'call-cancel', toolName: 'sandbox_run_command',
+      argsDigest: 'digest', capability: 'non_idempotent_write' as const, idempotencyKey: 'cancel-key',
+      status: 'recovery_required' as const,
+      createdAt: new Date(), updatedAt: new Date(),
+    };
+    let started!: () => void;
+    const toolStarted = new Promise<void>((resolve) => { started = resolve; });
+    const session: ManagedPiSession = {
+      ...emptySession('cancel-governed-session'),
+      async *continue(signal) {
+        started();
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) resolve();
+          else signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+        throw new GovernedToolOutcomeError({
+          kind: 'recovery_required', correlationId: 'external-cancel', message: 'external result is uncertain',
+        });
+      },
+      takeToolExecutionFacts: () => ({ ledgerUpdates: [ledgerUpdate], interactionUpdates: [] }),
+    };
+    const manager = new DurableRunManager({
+      store: store as never, heartbeatMs: 0,
+      sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+    const handle = await manager.run({
+      runId: 'cancel-governed-run', identity, sessionId: 'cancel-governed-session',
+      input: [{ role: 'user', text: 'run a non-idempotent tool' }],
+    });
+
+    await toolStarted;
+    await manager.cancel({ identity, runId: handle.runId, reason: 'stop' });
+
+    await expect(handle.result()).resolves.toMatchObject({ status: 'cancelled' });
+    expect(await base.get({ tenantId: identity.tenantId, runId: handle.runId })).toMatchObject({
+      status: 'cancelled', leaseOwner: undefined, leaseExpiresAt: undefined,
+    });
+    expect(committed).toMatchObject({ status: 'cancelled', ledgerUpdates: [ledgerUpdate] });
+  });
+
   it('commits governed ledger and interaction facts through the fenced turn transaction', async () => {
     const base = new MemoryRunStore();
     let committed: Record<string, unknown> | undefined;

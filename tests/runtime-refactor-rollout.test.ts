@@ -50,6 +50,7 @@ describe('runtime refactor staging rollout source boundary', () => {
   it('uses the injected MySQL root password for readiness without exposing it in arguments', async () => {
     const manifest = await readFile(new URL('deploy/dev-k8s/mysql.yaml', root), 'utf8');
 
+    expect(manifest).toMatch(/kind: Deployment[\s\S]*?strategy:\s*\n\s+type: Recreate/);
     expect(manifest).toContain('name: MYSQL_ROOT_PASSWORD');
     expect(manifest).toContain(
       'command: ["sh", "-c", "MYSQL_PWD=\\\"$MYSQL_ROOT_PASSWORD\\\" exec mysqladmin ping -h 127.0.0.1 -uroot --silent"]',

@@ -268,7 +268,8 @@ export class DurableRunManager implements DurableRunRuntime {
       return { runId, status: 'succeeded', text: assistantText(entries, leafId), usage: actualUsage };
     } catch (error) {
       const actualUsage = await terminalUsage(session, claimed.record.usage, baselineUsage, observedUsage, hasObservedUsage);
-      if (error instanceof GovernedToolOutcomeError) {
+      const cancellation = await this.options.store.isCancellationRequested({ tenantId: identity.tenantId, runId });
+      if (error instanceof GovernedToolOutcomeError && !cancellation) {
         const entries = await session?.entries() ?? [];
         if (session) await this.syncEntries(identity.tenantId, piSessionId, entries);
         const leafId = await session?.leafId() ?? null;
@@ -323,9 +324,8 @@ export class DurableRunManager implements DurableRunRuntime {
           });
         }
       };
-      if (abort.signal.aborted) {
+      if (abort.signal.aborted || cancellation) {
         await session?.abort().catch(() => {});
-        const cancellation = await this.options.store.isCancellationRequested({ tenantId: identity.tenantId, runId });
         const limitError = abort.signal.reason instanceof AgentPlatformError && abort.signal.reason.code === 'RUN_LIMIT_EXCEEDED'
           ? abort.signal.reason : undefined;
         const status = cancellation ? 'cancelled' : limitError ? 'failed' : 'recovery_required';
