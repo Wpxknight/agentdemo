@@ -332,6 +332,62 @@ describe('embedded scheduler deployment', () => {
     });
   });
 
+  it('observes an authoritative queued lease and resumes it with the scheduler signal after expiry', async () => {
+    const fireTime = new Date('2026-07-29T01:00:00.000Z');
+    const observedAt = new Date(fireTime.getTime() + 10);
+    const schedulerStore = new MemorySchedulerStore([{
+      taskId: 'task-queued', tenantId: 'tenant-a', actorId: 'user-a', sessionId: 'session-a',
+      cron: '0 * * * *', input: [{ role: 'user', text: 'deploy' }], nextFireAt: fireTime,
+    }]);
+    const [fire] = await schedulerStore.claimDue({ now: fireTime, limit: 1, workerId: 'dead', leaseMs: 10 });
+    await schedulerStore.bindRun({
+      fireId: fire!.fireId, claimToken: fire!.claimToken, runId: fire!.fireId, boundAt: fireTime,
+    });
+    const binding = {
+      tenantId: 'tenant-a', userId: 'user-a', sessionId: 'session-a', runId: fire!.fireId,
+      kernel: 'pi' as const, graphName: 'pi', graphVersion: '0.82.1', createdAt: fireTime,
+    };
+    const record = {
+      ...binding, status: 'queued' as const, stepCount: 0,
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      updatedAt: fireTime, leaseToken: 1, leaseOwner: 'durable-a',
+      leaseExpiresAt: new Date(observedAt.getTime() + 100),
+    };
+    const run = vi.fn();
+    const resume = vi.fn(async () => ({
+      runId: fire!.fireId, status: 'running' as const,
+      events: { async *[Symbol.asyncIterator]() {} },
+      result: async () => ({
+        runId: fire!.fireId, status: 'succeeded' as const,
+        usage: record.usage,
+      }),
+    }));
+    const runtimeStore = {
+      getAgentRunBinding: vi.fn(async () => binding),
+      getAgentRun: vi.fn(async () => record),
+    };
+    const scheduler = createRuntimeScheduler({
+      store: runtimeStore, durableRunRuntime: { run, resume },
+    } as unknown as Runtime, {
+      store: schedulerStore, workerId: 'observer', leaseMs: 10, batch: 1,
+    });
+
+    expect(await scheduler.tick(observedAt)).toBe(0);
+    expect(run).not.toHaveBeenCalled();
+    expect(resume).not.toHaveBeenCalled();
+    record.leaseExpiresAt = observedAt;
+    expect(await scheduler.tick(new Date(observedAt.getTime() + 1))).toBe(1);
+    expect(run).not.toHaveBeenCalled();
+    expect(resume).toHaveBeenCalledWith({
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+      runId: fire!.fireId,
+      signal: expect.any(AbortSignal),
+    });
+    expect((await schedulerStore.listFires())[0]).toMatchObject({
+      state: 'started', result: { status: 'succeeded' },
+    });
+  });
+
   it('awaits scheduler shutdown before disposing the runtime in production entrypoints', async () => {
     const source = await readFile('src/index.ts', 'utf8');
     expect(source).toContain('await scheduler?.stop()');

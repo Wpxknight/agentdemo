@@ -1,5 +1,6 @@
-import type { DurableRunRuntime } from '@aiop/control-contracts';
+import type { AgentRunResult, DurableRunRuntime } from '@aiop/control-contracts';
 import type {
+  BoundRunInspection,
   BoundRunRecovery,
   ClaimedScheduledFire,
   RunDispatcher,
@@ -68,7 +69,19 @@ export class SchedulerRunner {
     let recovered = 0;
     for (const fire of bound) {
       if (signal?.aborted) return recovered;
-      const inspection = await this.options.boundRecovery.inspect(fire, now);
+      let inspection: BoundRunInspection;
+      try {
+        inspection = await this.options.boundRecovery.inspect(fire, now);
+      } catch (error) {
+        await this.options.store.deferBound({
+          fireId: fire.fireId,
+          claimToken: fire.claimToken,
+          retryAt: new Date(now.getTime() + this.retryDelayMs),
+          error: String(error),
+        }).catch(() => undefined); // Keep a single observation failure isolated if its exact fence already advanced.
+        recovered += 1;
+        continue;
+      }
       if (inspection.kind === 'active') continue;
       if (inspection.kind === 'terminal') {
         await this.options.store.completeFire({
@@ -77,6 +90,13 @@ export class SchedulerRunner {
           runId: fire.runId,
           result: inspection.result,
           completedAt: now,
+        }).catch(async (error) => {
+          await this.options.store.deferBound({
+            fireId: fire.fireId,
+            claimToken: fire.claimToken,
+            retryAt: new Date(now.getTime() + this.retryDelayMs),
+            error: String(error),
+          }).catch(() => undefined);
         });
         recovered += 1;
         continue;
@@ -89,25 +109,28 @@ export class SchedulerRunner {
         leaseMs: this.leaseMs,
       });
       if (!claimed) continue;
+      let result: AgentRunResult;
       try {
         if (signal?.aborted) throw signal.reason ?? new Error('scheduler stopped');
-        const result = await this.options.boundRecovery.resume(claimed, signal);
+        result = await this.options.boundRecovery.resume(claimed, signal);
         if (signal?.aborted) throw signal.reason ?? new Error('scheduler stopped');
-        await this.options.store.completeFire({
-          fireId: claimed.fireId,
-          claimToken: claimed.claimToken,
-          runId: claimed.runId,
-          result,
-          completedAt: now,
-        });
       } catch (error) {
         await this.options.store.releaseBound({
           fireId: claimed.fireId,
           claimToken: claimed.claimToken,
           retryAt: new Date(now.getTime() + this.retryDelayMs),
           error: String(error),
-        });
+        }).catch(() => undefined); // Losing the scheduler fence must not replace the Durable resume failure.
+        recovered += 1;
+        continue;
       }
+      await this.options.store.completeFire({
+        fireId: claimed.fireId,
+        claimToken: claimed.claimToken,
+        runId: claimed.runId,
+        result,
+        completedAt: now,
+      }).catch(() => undefined); // The Durable result remains authoritative if another scheduler won completion.
       recovered += 1;
     }
     if (signal?.aborted) return recovered;

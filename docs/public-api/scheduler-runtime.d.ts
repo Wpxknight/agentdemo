@@ -94,7 +94,7 @@ export * from './mysql.js';
 // file: mysql.d.ts
 import type { Generated, Kysely } from 'kysely';
 import type { BoundScheduledFire, ClaimedScheduledFire, RecoveringScheduledFire } from './domain.js';
-import { type BindRunInput, type ClaimBoundInput, type ClaimDueInput, type CompleteFireInput, type ListBoundInput, type ReleaseBoundInput, type ReleaseFireInput, type SchedulerStore } from './store.js';
+import { type BindRunInput, type ClaimBoundInput, type ClaimDueInput, type CompleteFireInput, type DeferBoundInput, type ListBoundInput, type ReleaseBoundInput, type ReleaseFireInput, type SchedulerStore } from './store.js';
 export interface SchedulerMysqlDatabase {
     scheduled_tasks: {
         id: Generated<number>;
@@ -155,6 +155,7 @@ export declare class MysqlSchedulerStore implements SchedulerStore {
     listBound(input: ListBoundInput): Promise<BoundScheduledFire[]>;
     claimBound(input: ClaimBoundInput): Promise<RecoveringScheduledFire | undefined>;
     releaseBound(input: ReleaseBoundInput): Promise<void>;
+    deferBound(input: DeferBoundInput): Promise<void>;
     releaseFire(input: ReleaseFireInput): Promise<void>;
     recoverExpired(now: Date): Promise<number>;
 }
@@ -234,11 +235,18 @@ export interface ReleaseBoundInput {
     retryAt: Date;
     error: string;
 }
+export interface DeferBoundInput {
+    fireId: string;
+    claimToken: string;
+    retryAt: Date;
+    error: string;
+}
 export interface SchedulerStore {
     claimDue(input: ClaimDueInput): Promise<ClaimedScheduledFire[]>;
     listBound(input: ListBoundInput): Promise<BoundScheduledFire[]>;
     claimBound(input: ClaimBoundInput): Promise<RecoveringScheduledFire | undefined>;
     releaseBound(input: ReleaseBoundInput): Promise<void>;
+    deferBound(input: DeferBoundInput): Promise<void>;
     bindRun(input: BindRunInput): Promise<void>;
     completeFire(input: CompleteFireInput): Promise<void>;
     releaseFire(input: ReleaseFireInput): Promise<void>;
@@ -256,6 +264,7 @@ export declare class MemorySchedulerStore implements SchedulerStore {
     listBound(input: ListBoundInput): Promise<BoundScheduledFire[]>;
     claimBound(input: ClaimBoundInput): Promise<RecoveringScheduledFire | undefined>;
     releaseBound(input: ReleaseBoundInput): Promise<void>;
+    deferBound(input: DeferBoundInput): Promise<void>;
     releaseFire(input: ReleaseFireInput): Promise<void>;
     recoverExpired(now: Date): Promise<number>;
     listFires(): Promise<ScheduledFire[]>;

@@ -4,7 +4,7 @@ import { nextFireAt } from './cron.js';
 import type { BoundScheduledFire, ClaimedScheduledFire, RecoveringScheduledFire } from './domain.js';
 import {
   scheduledFireId, type BindRunInput, type ClaimBoundInput, type ClaimDueInput, type CompleteFireInput,
-  type ListBoundInput, type ReleaseBoundInput, type ReleaseFireInput, type SchedulerStore,
+  type DeferBoundInput, type ListBoundInput, type ReleaseBoundInput, type ReleaseFireInput, type SchedulerStore,
 } from './store.js';
 
 export interface SchedulerMysqlDatabase {
@@ -195,6 +195,15 @@ export class MysqlSchedulerStore implements SchedulerStore {
       state: 'bound', claim_owner: null, lease_expires_at: input.retryAt,
       retry_at: input.retryAt, last_error: input.error, updated_at: input.retryAt,
     }).where('fire_id', '=', input.fireId).where('state', '=', 'recovering')
+      .where('claim_token', '=', input.claimToken).executeTakeFirst();
+    if (Number(result.numUpdatedRows) !== 1) throw new Error(`stale scheduler claim: ${input.fireId}`);
+  }
+
+  async deferBound(input: DeferBoundInput): Promise<void> {
+    const result = await this.db.updateTable('scheduler_fires').set({
+      lease_expires_at: input.retryAt, retry_at: input.retryAt,
+      last_error: input.error, updated_at: input.retryAt,
+    }).where('fire_id', '=', input.fireId).where('state', '=', 'bound')
       .where('claim_token', '=', input.claimToken).executeTakeFirst();
     if (Number(result.numUpdatedRows) !== 1) throw new Error(`stale scheduler claim: ${input.fireId}`);
   }

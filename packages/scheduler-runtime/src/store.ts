@@ -57,11 +57,19 @@ export interface ReleaseBoundInput {
   error: string;
 }
 
+export interface DeferBoundInput {
+  fireId: string;
+  claimToken: string;
+  retryAt: Date;
+  error: string;
+}
+
 export interface SchedulerStore {
   claimDue(input: ClaimDueInput): Promise<ClaimedScheduledFire[]>;
   listBound(input: ListBoundInput): Promise<BoundScheduledFire[]>;
   claimBound(input: ClaimBoundInput): Promise<RecoveringScheduledFire | undefined>;
   releaseBound(input: ReleaseBoundInput): Promise<void>;
+  deferBound(input: DeferBoundInput): Promise<void>;
   bindRun(input: BindRunInput): Promise<void>;
   completeFire(input: CompleteFireInput): Promise<void>;
   releaseFire(input: ReleaseFireInput): Promise<void>;
@@ -178,6 +186,18 @@ export class MemorySchedulerStore implements SchedulerStore {
     Object.assign(fire, {
       state: 'bound' as const,
       claimedBy: undefined,
+      leaseExpiresAt: new Date(input.retryAt),
+      retryAt: new Date(input.retryAt),
+      lastError: input.error,
+    });
+  }
+
+  async deferBound(input: DeferBoundInput): Promise<void> {
+    const fire = this.fires.get(input.fireId);
+    if (!fire || fire.state !== 'bound' || fire.claimToken !== input.claimToken) {
+      throw new Error(`stale scheduler claim: ${input.fireId}`);
+    }
+    Object.assign(fire, {
       leaseExpiresAt: new Date(input.retryAt),
       retryAt: new Date(input.retryAt),
       lastError: input.error,
