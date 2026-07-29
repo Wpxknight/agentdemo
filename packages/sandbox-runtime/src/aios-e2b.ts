@@ -10,6 +10,7 @@ import type {
   OutputSink,
   RunCodeOpts,
   RunCommandOpts,
+  SandboxCommand,
   SandboxHandle,
   SandboxProvider,
   SandboxSpec,
@@ -103,6 +104,13 @@ class AiosE2bHandle implements SandboxHandle {
     return result;
   }
 
+  async executeCommand(command: SandboxCommand, opts?: RunCommandOpts): Promise<ExecResult> {
+    return this.runCommand(structuredCommand(command), {
+      timeoutMs: command.timeoutMs ?? opts?.timeoutMs,
+      onOutput: opts?.onOutput,
+    });
+  }
+
   async readFile(path: string): Promise<Uint8Array> {
     const response = await this.provider.request<FileReadResponse>(
       `/sandboxes/${encodeURIComponent(this.sandboxId)}/filesystem/read`,
@@ -187,6 +195,13 @@ export class AiosE2bProvider implements SandboxProvider {
         ...(timeout === undefined ? {} : { timeout }),
         ...(spec.envs === undefined ? {} : { env: spec.envs }),
         ...(spec.metadata === undefined ? {} : { metadata: spec.metadata }),
+        ...(spec.cpu === undefined && spec.memoryMb === undefined ? {} : {
+          resources: {
+            ...(spec.cpu === undefined ? {} : { cpu: spec.cpu }),
+            ...(spec.memoryMb === undefined ? {} : { memoryMb: spec.memoryMb }),
+          },
+        }),
+        ...(spec.network === undefined ? {} : { network: spec.network }),
         placement: this.opts.placement,
       },
     });
@@ -258,4 +273,15 @@ export class AiosE2bProvider implements SandboxProvider {
     throw new Error(`AIOS sandbox did not become ready: ${String(lastError)}`);
   }
 
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function structuredCommand(command: SandboxCommand): string {
+  const invocation = [command.program, ...(command.args ?? [])].map(shellQuote).join(' ');
+  const env = Object.entries(command.env ?? {}).map(([key, value]) => `${key}=${shellQuote(value)}`).join(' ');
+  const withEnv = env ? `env ${env} ${invocation}` : invocation;
+  return command.cwd ? `cd ${shellQuote(command.cwd)} && ${withEnv}` : withEnv;
 }

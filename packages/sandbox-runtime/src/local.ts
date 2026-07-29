@@ -10,6 +10,7 @@ import type {
   OutputSink,
   RunCodeOpts,
   RunCommandOpts,
+  SandboxCommand,
   SandboxHandle,
   SandboxProvider,
   SandboxSpec,
@@ -33,12 +34,12 @@ interface LocalSandboxLimits {
 function runProcess(
   command: string,
   args: string[],
-  opts: { cwd: string; timeoutMs?: number; onOutput?: OutputSink },
+  opts: { cwd: string; timeoutMs?: number; onOutput?: OutputSink; env?: Readonly<Record<string, string>> },
 ): Promise<ExecResult> {
   return new Promise((resolve) => {
     const child = spawn(command, args, {
       cwd: opts.cwd,
-      env: process.env,
+      env: { ...process.env, ...opts.env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -109,6 +110,18 @@ class LocalSandboxHandle implements SandboxHandle {
   async runCommand(command: string, opts?: RunCommandOpts): Promise<ExecResult> {
     if (this.killed) return { stdout: '', stderr: '', exitCode: 1, error: 'sandbox already killed' };
     return runProcess('bash', ['-lc', command], { cwd: this.dir, timeoutMs: opts?.timeoutMs, onOutput: opts?.onOutput });
+  }
+
+  async executeCommand(command: SandboxCommand, opts?: RunCommandOpts): Promise<ExecResult> {
+    if (this.killed) return { stdout: '', stderr: '', exitCode: 1, error: 'sandbox already killed' };
+    const cwd = command.cwd ? path.resolve(this.dir, command.cwd) : this.dir;
+    const relative = path.relative(this.dir, cwd);
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error('sandbox cwd escapes sandbox root');
+    }
+    return runProcess(command.program, [...(command.args ?? [])], {
+      cwd, env: command.env, timeoutMs: command.timeoutMs ?? opts?.timeoutMs, onOutput: opts?.onOutput,
+    });
   }
 
   async readFile(p: string): Promise<Uint8Array> {

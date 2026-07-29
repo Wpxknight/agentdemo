@@ -157,6 +157,27 @@ describe('AiosE2bProvider', () => {
     ]);
   });
 
+  it('preserves resource/network acquisition and structured command fields', async () => {
+    const { fetch, requests } = queuedFetch([
+      jsonResponse(201, { id: 'sb-structured' }),
+      jsonResponse(200, { stdout: '', stderr: '', exitCode: 0 }),
+      jsonResponse(200, { stdout: 'ok', stderr: '', exitCode: 0 }),
+    ]);
+    const handle = await provider(fetch).create({
+      key: 'structured', template: 'code-id', cpu: 2, memoryMb: 2048, network: 'restricted',
+    });
+    await handle.executeCommand!({
+      program: 'node', args: ['a b'], cwd: '/workspace', env: { TOKEN: 'x' }, timeoutMs: 1234,
+    });
+
+    expect(requests[0].body).toMatchObject({
+      resources: { cpu: 2, memoryMb: 2048 }, network: 'restricted',
+    });
+    expect(requests[2].body).toEqual({
+      command: "cd '/workspace' && env TOKEN='x' 'node' 'a b'", timeout: 2,
+    });
+  });
+
   it('keeps the transport request alive for the caller command timeout plus grace', async () => {
     vi.useFakeTimers();
     try {

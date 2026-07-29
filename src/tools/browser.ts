@@ -1,6 +1,8 @@
 import type { JsonValue, ToolResult } from '../model/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
-import type { DesktopHandle } from '@aiop/sandbox-runtime';
+import { SandboxDesktopRuntime, type DesktopHandle } from '@aiop/sandbox-runtime';
+
+const desktopRuntime = new SandboxDesktopRuntime();
 
 /** 按上下文取（必要时创建）一个浏览器会话。 */
 export type DesktopResolver = (ctx: ToolContext) => Promise<DesktopHandle>;
@@ -35,7 +37,7 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
         inputSchema: { type: 'object', properties: {} },
       async execute(_args, ctx): Promise<ToolResult> {
         const d = await resolve(ctx);
-        const url = await d.startStream();
+        const url = await desktopRuntime.execute(d, () => d.startStream(), ctx.signal);
         return { id: '', content: `浏览器预览地址：${url}` };
       },
     }),
@@ -53,7 +55,7 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
         const url = typeof o.url === 'string' ? o.url : '';
         if (!url) return { id: '', content: 'url 必填', isError: true };
         const d = await resolve(ctx);
-        await d.launch('google-chrome', url);
+        await desktopRuntime.execute(d, () => d.launch('google-chrome', url), ctx.signal);
         return { id: '', content: `已在浏览器打开：${url}` };
       },
     }),
@@ -74,7 +76,7 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
         const x = reqNumber(o, 'x');
         const y = reqNumber(o, 'y');
         const d = await resolve(ctx);
-        await d.leftClick(x, y);
+        await desktopRuntime.execute(d, () => d.leftClick(x, y), ctx.signal);
         return { id: '', content: `已点击 (${x}, ${y})` };
       },
     }),
@@ -91,7 +93,7 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
         const o = asObject(args);
         const text = typeof o.text === 'string' ? o.text : '';
         const d = await resolve(ctx);
-        await d.write(text);
+        await desktopRuntime.execute(d, () => d.write(text), ctx.signal);
         return { id: '', content: `已输入 ${text.length} 个字符` };
       },
     }),
@@ -103,7 +105,7 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
       async execute(_args, ctx): Promise<ToolResult> {
         const d = await resolve(ctx);
         if (!d.currentUrl) return { id: '', content: '当前沙箱后端不支持获取页面地址', isError: true };
-        const url = await d.currentUrl();
+        const url = await desktopRuntime.execute(d, () => d.currentUrl!(), ctx.signal);
         // chrome://intro、about:blank 等内部页对用户无意义，只放行 http(s)。
         if (!url || !/^https?:\/\//i.test(url)) return { id: '', content: '浏览器尚未打开任何页面' };
         return { id: '', content: `当前页面：${url}` };
@@ -116,7 +118,7 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
         inputSchema: { type: 'object', properties: {} },
       async execute(_args, ctx): Promise<ToolResult> {
         const d = await resolve(ctx);
-        const img = await d.screenshot();
+        const img = await desktopRuntime.execute(d, () => d.screenshot(), ctx.signal);
         const text = `截图已捕获（${img.byteLength} 字节）。浏览器预览：${d.streamUrl()}`;
         return {
           id: '',

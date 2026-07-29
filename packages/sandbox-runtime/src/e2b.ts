@@ -7,6 +7,7 @@ import type {
   ExecResult,
   RunCodeOpts,
   RunCommandOpts,
+  SandboxCommand,
   SandboxHandle,
   SandboxProvider,
   SandboxSpec,
@@ -29,6 +30,9 @@ type E2bCreateOptions = {
   timeoutMs?: number;
   envs?: Record<string, string>;
   metadata?: Record<string, string>;
+  allowInternetAccess?: boolean;
+  cpu?: number;
+  memoryMb?: number;
 };
 
 /** 把 E2B Sandbox 实例适配为统一的 SandboxHandle。 */
@@ -72,6 +76,18 @@ class E2bHandle implements SandboxHandle {
       exitCode: res.exitCode,
       error: res.error,
     };
+  }
+
+  async executeCommand(command: SandboxCommand, opts?: RunCommandOpts): Promise<ExecResult> {
+    const onOutput = opts?.onOutput;
+    const res = await this.sbx.commands.run(shellInvocation(command.program, command.args), {
+      cwd: command.cwd,
+      envs: command.env ? { ...command.env } : undefined,
+      timeoutMs: command.timeoutMs ?? opts?.timeoutMs,
+      onStdout: onOutput ? (data: string) => onOutput({ stream: 'stdout', text: data }) : undefined,
+      onStderr: onOutput ? (data: string) => onOutput({ stream: 'stderr', text: data }) : undefined,
+    });
+    return { stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode, error: res.error };
   }
 
   async readFile(path: string): Promise<Uint8Array> {
@@ -136,6 +152,9 @@ export class E2bProvider implements SandboxProvider {
       template: spec.template,
       timeoutMs: spec.timeoutMs,
       envs: spec.envs,
+      allowInternetAccess: spec.network === undefined ? undefined : spec.network === 'full',
+      cpu: spec.cpu,
+      memoryMb: spec.memoryMb,
       ...(Object.keys(metadata).length ? { metadata } : {}),
     };
     const sbx = await Sandbox.create(opts);
@@ -148,4 +167,8 @@ export class E2bProvider implements SandboxProvider {
     if (spec.timeoutMs) await sbx.setTimeout(spec.timeoutMs); // 续命防回收
     return new E2bHandle(sbx);
   }
+}
+
+function shellInvocation(program: string, args: readonly string[] = []): string {
+  return [program, ...args].map((part) => `'${part.replaceAll("'", "'\\''")}'`).join(' ');
 }

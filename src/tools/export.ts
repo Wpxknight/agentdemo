@@ -3,6 +3,7 @@ import type { JsonValue, ToolResult } from '../model/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import type { SandboxManagerLike } from '@aiop/sandbox-runtime';
 import { isSandboxAcquirer } from '@aiop/sandbox-runtime';
+import { downloadAcquiredSandbox } from '@aiop/sandbox-runtime';
 import type { ExportSink } from '../server/downloads.js';
 import { resolveSandboxSpec, type SpecResolver } from './builtin.js';
 
@@ -103,12 +104,15 @@ export function buildExportTool(
       const name = safeDownloadName(typeof o.filename === 'string' && o.filename ? o.filename : path);
       const mime = typeof o.mime === 'string' && o.mime ? o.mime : guessMime(name);
 
-      const sbx = isSandboxAcquirer(manager)
-        ? (await manager.acquire(ctx)).handle
-        : await manager.get(await resolveSandboxSpec(resolve, ctx));
+      const acquired = isSandboxAcquirer(manager)
+        ? await manager.acquire(ctx)
+        : await (async () => {
+            const spec = await resolveSandboxSpec(resolve, ctx);
+            return { handle: await manager.get(spec), spec };
+          })();
       let bytes: Uint8Array;
       try {
-        bytes = await sbx.readFile(path);
+        bytes = (await downloadAcquiredSandbox(acquired, { path, signal: ctx.signal })).content;
       } catch (err) {
         return { id: '', content: `读取文件失败：${path}（${String(err)}）。请确认文件已在沙箱中生成。`, isError: true };
       }

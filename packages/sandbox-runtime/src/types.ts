@@ -43,6 +43,10 @@ export interface SandboxSpec {
   metadata?: Record<string, string>;
   /** 沙箱存活超时(ms)，到期被 E2B 回收。 */
   timeoutMs?: number;
+  /** Provider-neutral resource requests retained from the former sandbox packages. */
+  cpu?: number;
+  memoryMb?: number;
+  network?: 'none' | 'restricted' | 'full';
   /** 覆盖 E2B 控制面域名（多集群：每集群一个控制面）。 */
   domain?: string;
   /** 注入沙箱的环境变量（如 in-cluster 标记）。 */
@@ -72,6 +76,17 @@ export interface RunCommandOpts {
   onOutput?: OutputSink;
 }
 
+export interface SandboxCommand {
+  program: string;
+  args?: readonly string[];
+  cwd?: string;
+  env?: Readonly<Record<string, string>>;
+  timeoutMs?: number;
+}
+
+export interface UploadFile { path: string; content: Uint8Array }
+export interface DownloadFile { path: string; content: Uint8Array }
+
 /** 一个已就绪沙箱的统一句柄。 */
 export interface SandboxHandle {
   readonly sandboxId: string;
@@ -83,6 +98,8 @@ export interface SandboxHandle {
   runCode(code: string, opts?: RunCodeOpts): Promise<ExecResult>;
   /** 在沙箱里执行 shell 命令。 */
   runCommand(command: string, opts?: RunCommandOpts): Promise<ExecResult>;
+  /** Executes without shell parsing when the provider supports structured commands. */
+  executeCommand?(command: SandboxCommand, opts?: RunCommandOpts): Promise<ExecResult>;
   /** 读取沙箱内文件的原始字节（用于导出 / 下载）。文件不存在或不可读时抛错。 */
   readFile(path: string): Promise<Uint8Array>;
   /** Writes bytes without placing file contents in a shell command or command log. */

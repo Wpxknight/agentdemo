@@ -1,6 +1,8 @@
+import { readFile } from 'node:fs/promises';
 import { describe, expect, it, vi } from 'vitest';
 import {
   SandboxRuntime,
+  type SandboxCommand,
   type ExecResult,
   type SandboxHandle,
   type SandboxProvider,
@@ -11,6 +13,13 @@ interface ContractHarness {
   runtime: SandboxRuntime;
   killed: ReturnType<typeof vi.fn>;
 }
+
+it('runs the contract through each concrete provider adapter', async () => {
+  const source = await readFile(new URL('./real-provider-contract.test.ts', import.meta.url), 'utf8');
+  for (const provider of ['LocalSandboxProvider', 'E2bProvider', 'OpenSandboxProvider', 'AiosE2bProvider']) {
+    expect(source).toContain(`new ${provider}`);
+  }
+});
 
 function contractHarness(providerName: string): ContractHarness {
   const killed = vi.fn(async (_sandboxId: string) => undefined);
@@ -50,7 +59,8 @@ function contractHarness(providerName: string): ContractHarness {
   return { runtime: new SandboxRuntime({ provider, providerName }), killed };
 }
 
-describe.each(['local', 'e2b', 'opensandbox', 'aios'])('%s SandboxRuntime contract', (providerName) => {
+describe('SandboxRuntime provider-neutral core contract', () => {
+  const providerName = 'fake';
   it('acquires, executes, normalizes output, stops and releases leases', async () => {
     const { runtime, killed } = contractHarness(providerName);
     const lease = await runtime.acquire({ spec: { key: 'session-a', profile: 'code' } });
@@ -103,5 +113,42 @@ describe.each(['local', 'e2b', 'opensandbox', 'aios'])('%s SandboxRuntime contra
       activeLeaseIds: [keep.id],
       releasedLeaseIds: [stale.id],
     });
+  });
+
+  it('preserves resource requests, structured execution, and runtime file transfer', async () => {
+    const executeCommand = vi.fn(async (command: SandboxCommand) => ({
+      stdout: `${command.program}:${command.args?.join(',')}:${command.cwd}:${command.env?.TOKEN}`,
+      stderr: '', exitCode: 0,
+    }));
+    const writeFile = vi.fn(async () => undefined);
+    const readFile = vi.fn(async () => new Uint8Array([7, 8, 9]));
+    const create = vi.fn(async (spec: SandboxSpec): Promise<SandboxHandle> => ({
+      sandboxId: 'structured', executeCommand, runCode: async () => ({ stdout: '', stderr: '' }),
+      runCommand: async () => ({ stdout: '', stderr: '' }), readFile, writeFile,
+      setTimeout: async () => undefined, kill: async () => undefined,
+    }));
+    const runtime = new SandboxRuntime({
+      providerName,
+      provider: { create, connect: async (_id, spec) => create(spec) },
+    });
+    const lease = await runtime.acquire({
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+      profile: 'ops', cpu: 2, memoryMb: 4096, network: 'restricted', timeoutMs: 5000,
+    });
+
+    await expect(runtime.execute({ lease, command: {
+      program: 'node', args: ['script.js', 'two words'], cwd: 'workspace', env: { TOKEN: 'secret' },
+    } })).resolves.toMatchObject({ stdout: 'node:script.js,two words:workspace:secret', exitCode: 0 });
+    await runtime.upload({ lease, file: { path: 'input.bin', content: new Uint8Array([1, 2]) } });
+    await expect(runtime.download({ lease, path: 'output.bin' }))
+      .resolves.toEqual({ path: 'output.bin', content: new Uint8Array([7, 8, 9]) });
+
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      cpu: 2, memoryMb: 4096, network: 'restricted', timeoutMs: 5000,
+    }));
+    expect(executeCommand).toHaveBeenCalledWith(expect.objectContaining({
+      program: 'node', args: ['script.js', 'two words'], cwd: 'workspace', env: { TOKEN: 'secret' },
+    }), expect.any(Object));
+    expect(writeFile).toHaveBeenCalledWith('input.bin', new Uint8Array([1, 2]));
   });
 });

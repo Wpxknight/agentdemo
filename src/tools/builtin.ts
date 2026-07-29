@@ -3,7 +3,7 @@ import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.j
 import type { SandboxManagerLike } from '@aiop/sandbox-runtime';
 import { isSandboxAcquirer, type SpecResolver } from '@aiop/sandbox-runtime';
 import { sandboxIdentityKey, sandboxIdentityMetadata } from '@aiop/sandbox-runtime';
-import { createSandboxToolDefinitions } from '@aiop/sandbox-runtime';
+import { createSandboxToolDefinitions, downloadAcquiredSandbox, executeAcquiredSandbox, uploadAcquiredSandbox } from '@aiop/sandbox-runtime';
 import type { SandboxSpec } from '@aiop/sandbox-runtime';
 
 export type { SpecResolver } from '@aiop/sandbox-runtime';
@@ -48,18 +48,12 @@ export function buildSandboxTools(
     args: JsonValue,
     ctx: ToolContext,
   ): Promise<ToolResult> => {
-    const sandbox = (await acquire(ctx)).handle;
+    const acquired = await acquire(ctx);
     const definitions = createSandboxToolDefinitions({
-      runCode: (code, options) => sandbox.runCode(code, {
-        language: options.language,
-        onOutput: ctx.onOutput,
-      }),
-      runCommand: (command) => sandbox.runCommand(command, { onOutput: ctx.onOutput }),
-      readFile: (path) => sandbox.readFile(path),
-      writeFile: async (path, content) => {
-        if (!sandbox.writeFile) throw new Error('sandbox does not support file writes');
-        await sandbox.writeFile(path, content);
-      },
+      runCode: (code, options) => executeAcquiredSandbox(acquired, { code, language: options.language, signal: options.signal, onOutput: ctx.onOutput }),
+      runCommand: (command, options) => executeAcquiredSandbox(acquired, { command, signal: options.signal, onOutput: ctx.onOutput }),
+      readFile: async (path, options) => (await downloadAcquiredSandbox(acquired, { path, signal: options.signal })).content,
+      writeFile: (path, content, options) => uploadAcquiredSandbox(acquired, { file: { path, content }, signal: options.signal }),
       desktop: async () => { throw new Error('desktop calls require the desktop runtime'); },
     });
     const definition = definitions.find((candidate) => candidate.name === name)!;

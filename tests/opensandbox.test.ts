@@ -76,6 +76,21 @@ describe('OpenSandboxProvider', () => {
     expect(opts.connectionConfig.domain).toBe('host:8080');
   });
 
+  it('preserves resource/network acquisition and structured command options', async () => {
+    h.run.mockResolvedValue(exec('ok'));
+    const handle = await new OpenSandboxProvider().create({
+      key: 'structured', cpu: 2, memoryMb: 2048, network: 'restricted',
+    });
+    await handle.executeCommand!({ program: 'node', args: ['a b'], cwd: '/workspace', env: { TOKEN: 'x' }, timeoutMs: 1234 });
+
+    expect(h.created[0]).toMatchObject({
+      resource: { cpu: '2', memory: '2048Mi' }, networkPolicy: { defaultAction: 'deny' },
+    });
+    expect(h.run).toHaveBeenCalledWith("'node' 'a b'", expect.objectContaining({
+      workingDirectory: '/workspace', envs: { TOKEN: 'x' }, timeoutSeconds: 2,
+    }), undefined);
+  });
+
   it('sanitizes metadata values before passing them to Kubernetes-backed OpenSandbox', async () => {
     const p = new OpenSandboxProvider({ defaultImage: 'def:latest' });
 

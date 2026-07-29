@@ -646,9 +646,17 @@ export declare class SandboxRuntimeController implements SandboxAcquirer {
 }
 
 // file: runtime.d.ts
-import type { ExecResult, OutputSink, SandboxProvider, SandboxSpec } from './types.js';
+import type { DownloadFile, ExecResult, OutputSink, SandboxCommand, SandboxHandle, SandboxProvider, SandboxSpec, UploadFile } from './types.js';
+import type { IdentityContext } from '@aiop/control-contracts';
+import type { SandboxAcquisition } from './acquisition.js';
 export interface AcquireSandboxRuntimeInput {
-    spec: SandboxSpec;
+    spec?: SandboxSpec;
+    identity?: IdentityContext;
+    profile?: string;
+    cpu?: number;
+    memoryMb?: number;
+    network?: 'none' | 'restricted' | 'full';
+    timeoutMs?: number;
     signal?: AbortSignal;
 }
 export interface SandboxLease {
@@ -659,7 +667,7 @@ export interface SandboxLease {
 }
 export interface ExecuteSandboxInput {
     lease: SandboxLease;
-    command?: string;
+    command?: string | SandboxCommand;
     code?: string;
     language?: string;
     timeoutMs?: number;
@@ -671,6 +679,16 @@ export interface SandboxExecutionResult extends ExecResult {
 }
 export interface ReleaseSandboxInput {
     lease: SandboxLease;
+}
+export interface UploadSandboxInput {
+    lease: SandboxLease;
+    file: UploadFile;
+    signal?: AbortSignal;
+}
+export interface DownloadSandboxInput {
+    lease: SandboxLease;
+    path: string;
+    signal?: AbortSignal;
 }
 export interface ReconcileSandboxInput {
     activeLeaseIds: readonly string[];
@@ -688,13 +706,25 @@ export declare class SandboxRuntime {
     private readonly leases;
     constructor(options: SandboxRuntimeOptions);
     acquire(input: AcquireSandboxRuntimeInput): Promise<SandboxLease>;
+    adopt(input: {
+        handle: SandboxHandle;
+        spec: SandboxSpec;
+        signal?: AbortSignal;
+    }): Promise<SandboxLease>;
+    private register;
     execute(input: ExecuteSandboxInput): Promise<SandboxExecutionResult>;
+    upload(input: UploadSandboxInput): Promise<void>;
+    download(input: DownloadSandboxInput): Promise<DownloadFile>;
     stop(input: ReleaseSandboxInput): Promise<void>;
     release(input: ReleaseSandboxInput): Promise<void>;
     reconcile(input: ReconcileSandboxInput): Promise<ReconcileSandboxResult>;
     private requireActive;
     private raceControls;
+    private raceVoid;
 }
+export declare function executeAcquiredSandbox(acquired: Pick<SandboxAcquisition, 'handle' | 'spec'>, input: Omit<ExecuteSandboxInput, 'lease'>): Promise<SandboxExecutionResult>;
+export declare function downloadAcquiredSandbox(acquired: Pick<SandboxAcquisition, 'handle' | 'spec'>, input: Omit<DownloadSandboxInput, 'lease'>): Promise<DownloadFile>;
+export declare function uploadAcquiredSandbox(acquired: Pick<SandboxAcquisition, 'handle' | 'spec'>, input: Omit<UploadSandboxInput, 'lease'>): Promise<void>;
 
 // file: settings.d.ts
 import { z } from 'zod';
@@ -765,6 +795,7 @@ export declare class SandboxSettingsPersistence {
 import type { JsonValue } from '@aiop/control-contracts';
 import type { GovernedToolDefinition } from '@aiop/pi-runtime';
 import type { ExecResult } from './types.js';
+import type { DesktopHandle } from './desktop.js';
 interface OperationOptions {
     signal?: AbortSignal;
 }
@@ -776,6 +807,9 @@ export interface SandboxToolOperations {
     readFile(path: string, options: OperationOptions): Promise<Uint8Array>;
     writeFile(path: string, content: Uint8Array, options: OperationOptions): Promise<void>;
     desktop(input: Record<string, JsonValue>, options: OperationOptions): Promise<string>;
+}
+export declare class SandboxDesktopRuntime {
+    execute<T>(handle: DesktopHandle, operation: () => Promise<T>, signal?: AbortSignal): Promise<T>;
 }
 export declare function createSandboxToolDefinitions(operations: SandboxToolOperations): GovernedToolDefinition[];
 export {};
@@ -823,6 +857,10 @@ export interface SandboxSpec {
     metadata?: Record<string, string>;
     /** 沙箱存活超时(ms)，到期被 E2B 回收。 */
     timeoutMs?: number;
+    /** Provider-neutral resource requests retained from the former sandbox packages. */
+    cpu?: number;
+    memoryMb?: number;
+    network?: 'none' | 'restricted' | 'full';
     /** 覆盖 E2B 控制面域名（多集群：每集群一个控制面）。 */
     domain?: string;
     /** 注入沙箱的环境变量（如 in-cluster 标记）。 */
@@ -847,6 +885,21 @@ export interface RunCommandOpts {
     /** 提供时逐段回传 stdout/stderr（流式预览）；不影响最终 ExecResult。 */
     onOutput?: OutputSink;
 }
+export interface SandboxCommand {
+    program: string;
+    args?: readonly string[];
+    cwd?: string;
+    env?: Readonly<Record<string, string>>;
+    timeoutMs?: number;
+}
+export interface UploadFile {
+    path: string;
+    content: Uint8Array;
+}
+export interface DownloadFile {
+    path: string;
+    content: Uint8Array;
+}
 /** 一个已就绪沙箱的统一句柄。 */
 export interface SandboxHandle {
     readonly sandboxId: string;
@@ -858,6 +911,8 @@ export interface SandboxHandle {
     runCode(code: string, opts?: RunCodeOpts): Promise<ExecResult>;
     /** 在沙箱里执行 shell 命令。 */
     runCommand(command: string, opts?: RunCommandOpts): Promise<ExecResult>;
+    /** Executes without shell parsing when the provider supports structured commands. */
+    executeCommand?(command: SandboxCommand, opts?: RunCommandOpts): Promise<ExecResult>;
     /** 读取沙箱内文件的原始字节（用于导出 / 下载）。文件不存在或不可读时抛错。 */
     readFile(path: string): Promise<Uint8Array>;
     /** Writes bytes without placing file contents in a shell command or command log. */

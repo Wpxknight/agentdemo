@@ -1,6 +1,7 @@
 import type { JsonValue } from '@aiop/control-contracts';
 import type { GovernedToolDefinition } from '@aiop/pi-runtime';
 import type { ExecResult } from './types.js';
+import type { DesktopHandle } from './desktop.js';
 
 interface OperationOptions { signal?: AbortSignal }
 
@@ -10,6 +11,31 @@ export interface SandboxToolOperations {
   readFile(path: string, options: OperationOptions): Promise<Uint8Array>;
   writeFile(path: string, content: Uint8Array, options: OperationOptions): Promise<void>;
   desktop(input: Record<string, JsonValue>, options: OperationOptions): Promise<string>;
+}
+
+export class SandboxDesktopRuntime {
+  async execute<T>(handle: DesktopHandle, operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (signal?.aborted) {
+      await handle.kill().catch(() => undefined);
+      throw desktopAbortError();
+    }
+    if (!signal) return operation();
+    let onAbort: (() => void) | undefined;
+    try {
+      return await Promise.race([
+        operation(),
+        new Promise<never>((_resolve, reject) => {
+          onAbort = () => {
+            void handle.kill().catch(() => undefined);
+            reject(desktopAbortError());
+          };
+          signal.addEventListener('abort', onAbort, { once: true });
+        }),
+      ]);
+    } finally {
+      if (onAbort) signal.removeEventListener('abort', onAbort);
+    }
+  }
 }
 
 export function createSandboxToolDefinitions(operations: SandboxToolOperations): GovernedToolDefinition[] {
@@ -87,4 +113,8 @@ function formatExec(result: ExecResult): { content: string; isError: boolean } {
     content: parts.join('\n\n') || '(no output)',
     isError,
   };
+}
+
+function desktopAbortError(): DOMException {
+  return new DOMException('The sandbox desktop operation was aborted', 'AbortError');
 }

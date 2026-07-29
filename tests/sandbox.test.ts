@@ -373,6 +373,53 @@ describe('SandboxManager', () => {
   });
 });
 
+describe('production sandbox tools', () => {
+  it('executes through SandboxRuntime controls and aborts the managed handle', async () => {
+    const abort = new AbortController();
+    const kill = vi.fn(async () => undefined);
+    const handle: SandboxHandle = {
+      sandboxId: 'managed',
+      runCode: vi.fn(async () => new Promise<ExecResult>(() => undefined)),
+      runCommand: vi.fn(async () => new Promise<ExecResult>(() => undefined)),
+      readFile: vi.fn(async () => new Uint8Array()),
+      setTimeout: vi.fn(async () => undefined),
+      kill,
+    };
+    const acquisition = { handle, spec: { key: 'tenant:user:session' }, markCredentialInjected() {} };
+    const manager = {
+      acquire: vi.fn(async () => acquisition), acquireSpec: vi.fn(async () => acquisition),
+      get: vi.fn(async () => handle), has: vi.fn(() => true), touch: vi.fn(() => true),
+      use: vi.fn(async (_key, action) => action()), markCredentialInjected: vi.fn(), size: vi.fn(() => 1),
+      list: vi.fn(() => []), dispose: vi.fn(async () => undefined),
+      disposeSession: vi.fn(async () => []), disposeAll: vi.fn(async () => undefined),
+    } as unknown as Parameters<typeof buildSandboxTools>[0];
+    const runCommand = buildSandboxTools(manager).find((tool) => tool.def.name === 'sbx__run_command')!;
+
+    const execution = runCommand.run({ command: 'wait' }, {
+      sessionId: 'session', tenantId: 'tenant', userId: 'user', role: 'user', signal: abort.signal,
+    });
+    abort.abort();
+
+    await expect(Promise.race([
+      execution,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('runtime abort missing')), 100)),
+    ])).rejects.toMatchObject({ name: 'AbortError' });
+    expect(kill).toHaveBeenCalledOnce();
+  });
+});
+
+describe('LocalSandboxProvider structured execution', () => {
+  it('keeps argv, cwd, and env separate from shell parsing', async () => {
+    const provider = new LocalSandboxProvider();
+    const handle = await provider.create({ key: 'structured-local' });
+    await handle.writeFile?.('workspace/script.js', new TextEncoder().encode('process.stdout.write(process.argv[2]+":"+process.env.TOKEN)'));
+    await expect(handle.executeCommand!({
+      program: process.execPath, args: ['script.js', 'two words'], cwd: 'workspace', env: { TOKEN: 'secret' },
+    })).resolves.toMatchObject({ stdout: 'two words:secret', exitCode: 0 });
+    await handle.kill();
+  });
+});
+
 describe('sandbox tools', () => {
   const ctx = { sessionId: 'sess-1' };
 

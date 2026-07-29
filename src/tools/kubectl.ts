@@ -3,6 +3,7 @@ import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.j
 import type { ClusterRegistry, ClusterInfo } from '../config/clusters.js';
 import type { SandboxManagerLike } from '@aiop/sandbox-runtime';
 import { isSandboxAcquirer } from '@aiop/sandbox-runtime';
+import { executeAcquiredSandbox } from '@aiop/sandbox-runtime';
 import { sandboxIdentityMetadata, sandboxScopedKey, type SandboxIdentity } from '@aiop/sandbox-runtime';
 import type { SandboxSpec } from '@aiop/sandbox-runtime';
 import type { AuditSink } from '../audit/sink.js';
@@ -85,10 +86,10 @@ export function buildKubectlTool(opts: KubectlToolOptions): ToolHandler {
       const command = `kubectl ${finalArgs.map(shellQuote).join(' ')}`;
 
       const spec = specFor(ctx, info);
-      const sbx = isSandboxAcquirer(opts.sandboxes)
-        ? (await opts.sandboxes.acquireSpec(ctx, spec)).handle
-        : await opts.sandboxes.get(spec);
-      const res = await sbx.runCommand(command, { onOutput: ctx.onOutput });
+      const acquired = isSandboxAcquirer(opts.sandboxes)
+        ? await opts.sandboxes.acquireSpec(ctx, spec)
+        : { handle: await opts.sandboxes.get(spec), spec };
+      const res = await executeAcquiredSandbox(acquired, { command, signal: ctx.signal, onOutput: ctx.onOutput });
 
       await audit.record({
         kind: 'kubectl',

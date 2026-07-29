@@ -8,6 +8,7 @@ import type {
   OutputSink,
   RunCodeOpts,
   RunCommandOpts,
+  SandboxCommand,
   SandboxHandle,
   SandboxProvider,
   SandboxSpec,
@@ -116,6 +117,21 @@ class OpenSandboxHandle implements SandboxHandle {
     return toExecResult(exec);
   }
 
+  async executeCommand(command: SandboxCommand, opts?: RunCommandOpts): Promise<ExecResult> {
+    const exec = await this.sbx.commands.run(
+      shellInvocation(command.program, command.args),
+      {
+        workingDirectory: command.cwd,
+        timeoutSeconds: command.timeoutMs ?? opts?.timeoutMs
+          ? Math.ceil((command.timeoutMs ?? opts?.timeoutMs)! / 1000)
+          : undefined,
+        envs: command.env ? { ...command.env } : undefined,
+      },
+      streamHandlers(opts?.onOutput),
+    );
+    return toExecResult(exec);
+  }
+
   async readFile(path: string): Promise<Uint8Array> {
     return this.sbx.files.readBytes(path);
   }
@@ -177,6 +193,13 @@ export class OpenSandboxProvider implements SandboxProvider {
       image: spec.template ?? this.opts.defaultImage ?? DEFAULT_IMAGE,
       timeoutSeconds: spec.timeoutMs ? Math.ceil(spec.timeoutMs / 1000) : undefined,
       env: spec.envs,
+      resource: spec.cpu === undefined && spec.memoryMb === undefined ? undefined : {
+        ...(spec.cpu === undefined ? {} : { cpu: String(spec.cpu) }),
+        ...(spec.memoryMb === undefined ? {} : { memory: `${spec.memoryMb}Mi` }),
+      },
+      networkPolicy: spec.network === undefined ? undefined : {
+        defaultAction: spec.network === 'full' ? 'allow' : 'deny',
+      },
       metadata: Object.keys(metadata).length ? metadata : undefined,
       volumes: spec.volumes?.length
         ? spec.volumes.map((v) => ({
@@ -195,4 +218,8 @@ export class OpenSandboxProvider implements SandboxProvider {
     if (spec.timeoutMs) await sbx.renew(Math.ceil(spec.timeoutMs / 1000));
     return new OpenSandboxHandle(sbx);
   }
+}
+
+function shellInvocation(program: string, args: readonly string[] = []): string {
+  return [program, ...args].map((part) => `'${part.replaceAll("'", "'\\''")}'`).join(' ');
 }

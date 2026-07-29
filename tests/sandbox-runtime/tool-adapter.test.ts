@@ -1,6 +1,7 @@
+import { readFile } from 'node:fs/promises';
 import { describe, expect, it, vi } from 'vitest';
 import type { JsonValue } from '@aiop/control-contracts';
-import { createSandboxToolDefinitions } from '../../packages/sandbox-runtime/src/index.js';
+import { SandboxDesktopRuntime, createSandboxToolDefinitions } from '../../packages/sandbox-runtime/src/index.js';
 
 describe('Sandbox Pi Tool adapter', () => {
   it('converts command, file and desktop calls without taking over lease lifecycle', async () => {
@@ -40,5 +41,31 @@ describe('Sandbox Pi Tool adapter', () => {
     expect(desktop).toHaveBeenCalledWith({ action: 'screenshot' }, { signal });
     expect(acquire).not.toHaveBeenCalled();
     expect(release).not.toHaveBeenCalled();
+  });
+});
+
+describe('SandboxDesktopRuntime', () => {
+  it('kills a desktop operation when the governed call is aborted', async () => {
+    const abort = new AbortController();
+    const kill = vi.fn(async () => undefined);
+    const runtime = new SandboxDesktopRuntime();
+    const operation = runtime.execute({ kill } as never, () => new Promise<string>(() => undefined), abort.signal);
+    abort.abort();
+    await expect(operation).rejects.toMatchObject({ name: 'AbortError' });
+    expect(kill).toHaveBeenCalledOnce();
+  });
+
+  it('keeps production file and desktop tools on sandbox runtime adapters and governance source', async () => {
+    const root = new URL('../../', import.meta.url);
+    const [runtimeSource, exportSource, browserSource] = await Promise.all([
+      readFile(new URL('src/runtime.ts', root), 'utf8'),
+      readFile(new URL('src/tools/export.ts', root), 'utf8'),
+      readFile(new URL('src/tools/browser.ts', root), 'utf8'),
+    ]);
+    expect(runtimeSource).toContain("tools.register(buildExportTool(sandboxController, async () => ({}), downloads), 'sandbox')");
+    expect(runtimeSource).toContain("tools.register(tool, 'sandbox')");
+    expect(exportSource).toContain('downloadAcquiredSandbox');
+    expect(exportSource).not.toContain('.readFile(path)');
+    expect(browserSource).toContain('SandboxDesktopRuntime');
   });
 });

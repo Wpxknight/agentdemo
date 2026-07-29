@@ -1,6 +1,7 @@
 import type { JsonValue, ToolResult } from '../model/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import type { SandboxManagerLike } from '@aiop/sandbox-runtime';
+import { executeAcquiredSandbox } from '@aiop/sandbox-runtime';
 import { isSandboxAcquirer } from '@aiop/sandbox-runtime';
 import type { SandboxProfile } from '@aiop/sandbox-runtime';
 import { findSandboxProfile, publicSandboxProfiles, sandboxSpecForProfile } from '@aiop/sandbox-runtime';
@@ -108,8 +109,8 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
         const o = asObject(args);
         const code = reqString(o, 'code');
         const language = optString(o, 'language');
-        const sbx = (await acquire(ctx, optString(o, 'profile'))).handle;
-        return formatExec(await sbx.runCode(code, { language, onOutput: ctx.onOutput }));
+        const acquired = await acquire(ctx, optString(o, 'profile'));
+        return formatExec(await executeAcquiredSandbox(acquired, { code, language, signal: ctx.signal, onOutput: ctx.onOutput }));
       },
     }),
     defineTool({
@@ -127,8 +128,8 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
       async execute(args, ctx: ToolContext): Promise<ToolResult> {
         const o = asObject(args);
         const command = reqString(o, 'command');
-        const sbx = (await acquire(ctx, optString(o, 'profile'))).handle;
-        return formatExec(await sbx.runCommand(command, { onOutput: ctx.onOutput }));
+        const acquired = await acquire(ctx, optString(o, 'profile'));
+        return formatExec(await executeAcquiredSandbox(acquired, { command, signal: ctx.signal, onOutput: ctx.onOutput }));
       },
     }),
   ];

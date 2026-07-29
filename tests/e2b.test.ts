@@ -84,6 +84,19 @@ describe('E2bProvider standard SDK mode', () => {
     expect(h.created[0]).not.toHaveProperty('lifecycleUrl');
   });
 
+  it('preserves network acquisition and structured command options', async () => {
+    h.runCommand.mockResolvedValue({ stdout: 'ok', stderr: '', exitCode: 0 });
+    const handle = await new E2bProvider({ apiKey: 'key' }).create({
+      key: 'structured', network: 'none', cpu: 2, memoryMb: 2048,
+    });
+    await handle.executeCommand!({ program: 'node', args: ['a b'], cwd: '/workspace', env: { TOKEN: 'x' }, timeoutMs: 1234 });
+
+    expect(h.created[0]).toMatchObject({ allowInternetAccess: false, cpu: 2, memoryMb: 2048 });
+    expect(h.runCommand).toHaveBeenCalledWith("'node' 'a b'", expect.objectContaining({
+      cwd: '/workspace', envs: { TOKEN: 'x' }, timeoutMs: 1234,
+    }));
+  });
+
   it('passes the outer apiKey into explicit AIOS mode', async () => {
     const requests: Array<{ headers: Headers; body?: unknown }> = [];
     const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
