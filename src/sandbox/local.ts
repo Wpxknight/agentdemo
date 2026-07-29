@@ -1,5 +1,6 @@
 import { constants } from 'node:fs';
-import { lstat, mkdir, mkdtemp, open, rm, type FileHandle } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { access, lstat, mkdir, mkdtemp, open, rename, rm, unlink, type FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -13,6 +14,21 @@ import type {
   SandboxProvider,
   SandboxSpec,
 } from './types.js';
+
+export const LOCAL_SYNC_MAX_GENERATIONS = 16;
+export const LOCAL_SYNC_MAX_BYTES = 256 * 1024 * 1024;
+
+export interface LocalSandboxProviderOptions {
+  platform?: NodeJS.Platform;
+  procFdAvailable?: () => Promise<boolean>;
+  maxSyncGenerations?: number;
+  maxSyncBytes?: number;
+}
+
+interface LocalSandboxLimits {
+  maxSyncGenerations: number;
+  maxSyncBytes: number;
+}
 
 function runProcess(
   command: string,
@@ -71,8 +87,10 @@ class LocalSandboxHandle implements SandboxHandle {
   readonly sandboxId: string;
   readonly supportsSecretFiles = false;
   private killed = false;
+  private syncGenerations = 0;
+  private syncBytes = 0;
 
-  constructor(private readonly dir: string, key: string) {
+  constructor(private readonly dir: string, key: string, private readonly limits: LocalSandboxLimits) {
     this.sandboxId = `local-${key.replace(/[^a-zA-Z0-9_.-]/g, '-')}-${Date.now().toString(36)}`;
   }
 
@@ -109,19 +127,43 @@ class LocalSandboxHandle implements SandboxHandle {
     if (this.killed) throw new Error('sandbox already killed');
     await this.withSandboxParent(p, true, async (parent, name) => {
       const mode = options?.mode ?? 0o666;
-      const file = await this.openFileAt(
-        parent,
-        name,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
-        mode,
-      );
+      const tempName = `.aiop-write-${randomUUID()}.tmp`;
+      const tempPath = this.pathAt(parent, tempName);
       try {
-        await file.writeFile(content);
-        if (options?.mode !== undefined) await file.chmod(options.mode);
+        const file = await open(
+          tempPath,
+          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+          mode,
+        );
+        try {
+          await file.writeFile(content);
+          if (options?.mode !== undefined) await file.chmod(options.mode);
+          await file.sync();
+        } finally {
+          await file.close();
+        }
+        await this.throwIfSymlink(this.pathAt(parent, name));
+        await rename(tempPath, this.pathAt(parent, name));
+        await parent.sync();
       } finally {
-        await file.close();
+        await unlink(tempPath).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== 'ENOENT') throw error;
+        });
       }
     });
+  }
+
+  async reserveSyncGeneration(bytes: number): Promise<void> {
+    if (this.killed) throw new Error('sandbox already killed');
+    if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error('local sandbox sync bytes must be non-negative');
+    if (this.syncGenerations >= this.limits.maxSyncGenerations) {
+      throw new Error(`local sandbox sync generation quota exceeded (${this.limits.maxSyncGenerations})`);
+    }
+    if (bytes > this.limits.maxSyncBytes - this.syncBytes) {
+      throw new Error(`local sandbox sync byte quota exceeded (${this.limits.maxSyncBytes} bytes)`);
+    }
+    this.syncGenerations += 1;
+    this.syncBytes += bytes;
   }
 
   async setTimeout(_ms: number): Promise<void> {
@@ -230,12 +272,48 @@ class LocalSandboxHandle implements SandboxHandle {
 
 /** 本地开发用沙箱：在临时目录中执行命令/代码，不提供强隔离。 */
 export class LocalSandboxProvider implements SandboxProvider {
+  private readonly platform: NodeJS.Platform;
+  private readonly procFdAvailable: () => Promise<boolean>;
+  private readonly limits: LocalSandboxLimits;
+
+  constructor(options: LocalSandboxProviderOptions = {}) {
+    this.platform = options.platform ?? process.platform;
+    this.procFdAvailable = options.procFdAvailable ?? (async () => {
+      try {
+        await access('/proc/self/fd');
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    this.limits = {
+      maxSyncGenerations: options.maxSyncGenerations ?? LOCAL_SYNC_MAX_GENERATIONS,
+      maxSyncBytes: options.maxSyncBytes ?? LOCAL_SYNC_MAX_BYTES,
+    };
+    if (!Number.isSafeInteger(this.limits.maxSyncGenerations) || this.limits.maxSyncGenerations < 1) {
+      throw new Error('local sandbox maxSyncGenerations must be a positive integer');
+    }
+    if (!Number.isSafeInteger(this.limits.maxSyncBytes) || this.limits.maxSyncBytes < 1) {
+      throw new Error('local sandbox maxSyncBytes must be a positive integer');
+    }
+  }
+
   async create(spec: SandboxSpec): Promise<SandboxHandle> {
+    await this.requireSupportedPlatform();
     const dir = await mkdtemp(path.join(tmpdir(), 'aiop-local-sandbox-'));
-    return new LocalSandboxHandle(dir, spec.key);
+    return new LocalSandboxHandle(dir, spec.key, this.limits);
   }
 
   async connect(_sandboxId: string, spec: SandboxSpec): Promise<SandboxHandle> {
     return this.create(spec);
+  }
+
+  private async requireSupportedPlatform(): Promise<void> {
+    if (this.platform !== 'linux') {
+      throw new Error('LocalSandboxProvider 仅支持启用 procfs 的 Linux 平台');
+    }
+    if (!await this.procFdAvailable()) {
+      throw new Error('LocalSandboxProvider 需要可用的 procfs 路径 /proc/self/fd');
+    }
   }
 }

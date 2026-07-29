@@ -87,6 +87,8 @@ export interface SandboxHandle {
   readFile(path: string): Promise<Uint8Array>;
   /** Writes bytes without placing file contents in a shell command or command log. */
   writeFile?(path: string, content: Uint8Array, options?: { mode?: number }): Promise<void>;
+  /** Reserves one local skill-sync generation before any files are written. */
+  reserveSyncGeneration?(bytes: number): Promise<void>;
   /** 续命，防止被回收。 */
   setTimeout(ms: number): Promise<void>;
   /** 销毁沙箱。 */

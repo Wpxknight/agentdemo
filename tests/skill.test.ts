@@ -565,6 +565,159 @@ describe('SkillRegistry', () => {
     await expect(stat(legacy)).rejects.toThrow();
   });
 
+  it('writes the legacy marker only after mixed current and absent-builtin inventory is resolved', async () => {
+    const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-mixed-inventory-source-'));
+    const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-mixed-inventory-product-'));
+    const backupRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-mixed-inventory-backup-'));
+    const currentName = 'legacy-current-a';
+    const absentName = 'legacy-absent-b';
+    for (const name of [currentName, absentName]) {
+      const builtin = join(builtinRoot, name);
+      await mkdir(builtin, { recursive: true });
+      await writeFile(join(builtin, 'SKILL.md'), `---\nname: ${name}\ndescription: mixed\n---\nbody`);
+      await writeProduct(builtin, {
+        name, version: '1', enabled: true, reviewed: true,
+        tenantId: 'default', visibility: 'public',
+      });
+    }
+    await new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] }).scan();
+    await cp(join(builtinRoot, absentName), join(backupRoot, absentName), { recursive: true });
+    await rm(legacyMigrationMarker(productRoot));
+
+    const currentLegacy = join(productRoot, currentName);
+    await cp(join(builtinRoot, currentName), currentLegacy, { recursive: true });
+    await writeProduct(currentLegacy, {
+      name: currentName, version: '1', enabled: false, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+    });
+    const absentTombstone = join(productRoot, '.aiop-tombstones', `old-${absentName}`);
+    await mkdir(join(productRoot, '.aiop-tombstones'), { recursive: true });
+    await cp(join(builtinRoot, absentName), absentTombstone, { recursive: true });
+    await rm(join(builtinRoot, absentName), { recursive: true });
+
+    const unrelated = join(productRoot, 'unrelated-large-product');
+    await mkdir(unrelated);
+    const unrelatedSkill = join(unrelated, 'SKILL.md');
+    await writeFile(unrelatedSkill, `---\nname: unrelated-large-product\ndescription: unrelated\n---\n${'x'.repeat(4 * 1024 * 1024)}`);
+    await writeProduct(unrelated, {
+      name: 'unrelated-large-product', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+    });
+    const old = new Date('2001-01-01T00:00:00.000Z');
+    const recent = new Date('2026-01-01T00:00:00.000Z');
+    await utimes(unrelatedSkill, old, recent);
+    const initialAtime = (await stat(unrelatedSkill)).atimeMs;
+
+    const first = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    await first.scan();
+
+    await expect(stat(currentLegacy)).rejects.toThrow();
+    expect(first.list().find((skill) => skill.name === currentName)?.enabled).toBe(false);
+    await expect(stat(absentTombstone)).resolves.toBeDefined();
+    await expect(stat(legacyMigrationMarker(productRoot))).rejects.toThrow();
+    expect((await stat(unrelatedSkill)).atimeMs).toBe(initialAtime);
+    await first.scan();
+    await expect(stat(absentTombstone)).resolves.toBeDefined();
+    await expect(stat(legacyMigrationMarker(productRoot))).rejects.toThrow();
+    expect(first.list().find((skill) => skill.name === currentName)?.enabled).toBe(false);
+    expect((await stat(unrelatedSkill)).atimeMs).toBe(initialAtime);
+
+    await cp(join(backupRoot, absentName), join(builtinRoot, absentName), { recursive: true });
+    const second = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    await second.scan();
+    await second.scan();
+
+    await expect(second.loadFor(absentName, {
+      tenantId: 'default', userId: 'admin', role: 'tenant_admin',
+    })).resolves.toBeUndefined();
+    await expect(stat(absentTombstone)).rejects.toThrow();
+    await expect(stat(legacyMigrationMarker(productRoot))).resolves.toBeDefined();
+    expect((await stat(unrelatedSkill)).atimeMs).toBe(initialAtime);
+  });
+
+  it('resolves a tombstone against the unique matching historical catalog digest', async () => {
+    const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-history-digest-source-'));
+    const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-history-digest-product-'));
+    const backupRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-history-digest-backup-'));
+    const name = 'history-digest-deleted';
+    const builtin = join(builtinRoot, name);
+    await mkdir(builtin);
+    await writeFile(join(builtin, 'SKILL.md'), `---\nname: ${name}\ndescription: old\n---\nold`);
+    await writeProduct(builtin, {
+      name, version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+    });
+    await cp(builtin, join(backupRoot, name), { recursive: true });
+    await new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] }).scan();
+    await writeFile(join(builtin, 'SKILL.md'), `---\nname: ${name}\ndescription: new\n---\nnew`);
+    await new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] }).scan();
+    await rm(legacyMigrationMarker(productRoot));
+    const tombstone = join(productRoot, '.aiop-tombstones', `old-${name}`);
+    await mkdir(join(productRoot, '.aiop-tombstones'), { recursive: true });
+    await cp(join(backupRoot, name), tombstone, { recursive: true });
+
+    const registry = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    await registry.scan();
+
+    await expect(registry.loadFor(name, {
+      tenantId: 'default', userId: 'admin', role: 'tenant_admin',
+    })).resolves.toBeUndefined();
+    await expect(stat(tombstone)).rejects.toThrow();
+    await expect(stat(legacyMigrationMarker(productRoot))).resolves.toBeDefined();
+  });
+
+  it('keeps a deleted tombstone unresolved until a missing builtin can upgrade a non-deleted overlay', async () => {
+    const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-overlay-upgrade-source-'));
+    const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-overlay-upgrade-product-'));
+    const backupRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-overlay-upgrade-backup-'));
+    const name = 'overlay-upgrade-deleted';
+    const helperName = 'overlay-upgrade-helper';
+    const relative = join('users', 'admin', name);
+    const builtin = join(builtinRoot, relative);
+    await mkdir(builtin, { recursive: true });
+    await writeFile(join(builtin, 'SKILL.md'), `---\nname: ${name}\ndescription: overlay\n---\nbody`);
+    await writeProduct(builtin, {
+      name, version: '1', enabled: true, reviewed: true, ownerUserId: 'admin',
+      tenantId: 'default', visibility: 'shared',
+    });
+    const helper = join(builtinRoot, helperName);
+    await mkdir(helper);
+    await writeFile(join(helper, 'SKILL.md'), `---\nname: ${helperName}\ndescription: overlay\n---\nbody`);
+    await writeProduct(helper, {
+      name: helperName, version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+    });
+    await cp(builtin, join(backupRoot, name), { recursive: true });
+    const legacy = join(productRoot, relative);
+    await mkdir(join(productRoot, 'users', 'admin'), { recursive: true });
+    await cp(builtin, legacy, { recursive: true });
+    await writeProduct(legacy, {
+      name, version: '1', enabled: true, reviewed: true, ownerUserId: 'admin',
+      tenantId: 'default', visibility: 'private',
+    });
+    await new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] }).scan();
+    await rm(legacyMigrationMarker(productRoot));
+    await rm(builtin, { recursive: true });
+    const tombstone = join(productRoot, '.aiop-tombstones', 'users', 'admin', `old-${name}`);
+    await mkdir(join(productRoot, '.aiop-tombstones', 'users', 'admin'), { recursive: true });
+    await cp(join(backupRoot, name), tombstone, { recursive: true });
+
+    const absent = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    await absent.scan();
+    await expect(stat(tombstone)).rejects.toThrow();
+    await expect(stat(legacyMigrationMarker(productRoot))).resolves.toBeDefined();
+
+    await cp(join(backupRoot, name), builtin, { recursive: true });
+    const restored = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    await restored.scan();
+
+    await expect(restored.loadFor(name, {
+      tenantId: 'default', userId: 'admin', role: 'tenant_admin',
+    })).resolves.toBeUndefined();
+    await expect(stat(tombstone)).rejects.toThrow();
+    await expect(stat(legacyMigrationMarker(productRoot))).resolves.toBeDefined();
+  });
+
   it('keeps a legacy seed when an existing governance overlay is incomplete', async () => {
     const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-partial-overlay-source-'));
     const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-partial-overlay-product-'));

@@ -81,6 +81,11 @@ interface BuiltinGovernanceOverlay {
   deleted: boolean;
 }
 
+interface LegacySeedMigrationOutcome {
+  resolved: number;
+  unresolved: number;
+}
+
 interface BuiltinCatalogEntry {
   identity: string;
   name: string;
@@ -933,8 +938,9 @@ export class SkillRegistry {
   private async migrateLegacySeedGovernance(
     rawBuiltinRecords: readonly SkillProductRecord[],
     catalog: readonly BuiltinCatalogEntry[],
-  ): Promise<void> {
-    if (!rawBuiltinRecords.length || !catalog.length) return;
+  ): Promise<LegacySeedMigrationOutcome> {
+    const outcome: LegacySeedMigrationOutcome = { resolved: 0, unresolved: 0 };
+    if (!rawBuiltinRecords.length || !catalog.length) return outcome;
     const rawByIdentity = new Map<string, SkillProductRecord>();
     for (const record of rawBuiltinRecords) {
       rawByIdentity.set(this.builtinLocation(record).identity, record);
@@ -945,7 +951,8 @@ export class SkillRegistry {
       if (!legacy) continue;
       const digest = await contentDigest(legacy.path);
       if (digest !== source.sourceDigest) continue;
-      await this.migrateLegacySeedRecord(legacy, source, rawByIdentity, false);
+      if (await this.migrateLegacySeedRecord(legacy, source, rawByIdentity, false)) outcome.resolved += 1;
+      else outcome.unresolved += 1;
     }
 
     const tombstoneRoot = join(resolve(this.dir), SKILL_TOMBSTONES_DIR);
@@ -955,11 +962,21 @@ export class SkillRegistry {
         && entry.tenantId === legacy.tenantId
         && entry.sourceVersion === legacy.version
         && legacyRelativePathCandidates(legacy).includes(entry.relativePath));
-      if (candidates.length !== 1) continue;
+      if (!candidates.length) continue;
       const digest = await contentDigest(legacy.path);
-      if (digest !== candidates[0]!.sourceDigest) continue;
-      await this.migrateLegacySeedRecord(legacy, candidates[0]!, rawByIdentity, true);
+      const exactByIdentity = new Map(
+        candidates.filter((entry) => entry.sourceDigest === digest).map((entry) => [entry.identity, entry]),
+      );
+      if (!exactByIdentity.size) continue;
+      if (exactByIdentity.size !== 1) {
+        outcome.unresolved += 1;
+        continue;
+      }
+      const source = exactByIdentity.values().next().value!;
+      if (await this.migrateLegacySeedRecord(legacy, source, rawByIdentity, true)) outcome.resolved += 1;
+      else outcome.unresolved += 1;
     }
+    return outcome;
   }
 
   private async ensureLegacySeedMigration(
@@ -967,10 +984,13 @@ export class SkillRegistry {
     catalog: readonly BuiltinCatalogEntry[],
   ): Promise<void> {
     if (!rawBuiltinRecords.length || !catalog.length || await readLegacySeedMigrationMarker(this.dir)) return;
-    await this.withDistributedLocks([LEGACY_SEED_MIGRATION_LOCK_KEY], async () => {
+    await this.withDistributedLocks([
+      LEGACY_SEED_MIGRATION_LOCK_KEY,
+      ...catalog.map((entry) => `skill-name:${entry.name}`),
+    ], async () => {
       if (await readLegacySeedMigrationMarker(this.dir)) return;
-      await this.migrateLegacySeedGovernance(rawBuiltinRecords, catalog);
-      await writeLegacySeedMigrationMarker(this.dir);
+      const outcome = await this.migrateLegacySeedGovernance(rawBuiltinRecords, catalog);
+      if (outcome.unresolved === 0) await writeLegacySeedMigrationMarker(this.dir);
     });
   }
 
@@ -979,9 +999,25 @@ export class SkillRegistry {
     source: BuiltinCatalogEntry,
     rawByIdentity: ReadonlyMap<string, SkillProductRecord>,
     deleted: boolean,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const raw = rawByIdentity.get(source.identity);
-    if (!raw) return;
+    const existing = await readBuiltinGovernanceOverlay(this.dir, source.identity);
+    if (existing) {
+      if (deleted && !existing.deleted) {
+        await writeBuiltinGovernanceOverlay(this.dir, {
+          ...existing,
+          sourceDigest: source.sourceDigest,
+          sourceVersion: source.sourceVersion,
+          sourceVisibility: raw?.visibility ?? existing.sourceVisibility,
+          revision: existing.revision + 1,
+          deleted: true,
+        });
+      }
+      await rm(legacy.path, { recursive: true, force: true });
+      await fsyncParent(legacy.path).catch(() => undefined);
+      return true;
+    }
+    if (!raw) return false;
     await writeBuiltinGovernanceOverlayIfAbsent(this.dir, {
       schemaVersion: 1,
       identity: source.identity,
@@ -996,8 +1032,20 @@ export class SkillRegistry {
       visibility: legacy.visibility,
       deleted,
     });
+    const written = await readBuiltinGovernanceOverlay(this.dir, source.identity);
+    if (deleted && written && !written.deleted) {
+      await writeBuiltinGovernanceOverlay(this.dir, {
+        ...written,
+        sourceDigest: source.sourceDigest,
+        sourceVersion: source.sourceVersion,
+        sourceVisibility: raw.visibility,
+        revision: written.revision + 1,
+        deleted: true,
+      });
+    }
     await rm(legacy.path, { recursive: true, force: true });
     await fsyncParent(legacy.path).catch(() => undefined);
+    return true;
   }
 
   private async applyBuiltinGovernance(

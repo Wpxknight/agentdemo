@@ -34,14 +34,11 @@ export async function syncSkillToSandbox(input: {
   const dest = input.sbx.workspacePath?.(`${SANDBOX_SKILLS_ROOT}/${safe}`)
     ?? `/workspace/${SANDBOX_SKILLS_ROOT}/${safe}`;
   const result = { dest, kept, skipped, total };
+  if (input.sbx.supportsSecretFiles === false && input.sbx.writeFile) {
+    return syncLocalSkillFiles(input, result);
+  }
   if (!kept.length) return { ...result, error: '没有可同步的文件（可能全部被大小过滤跳过）' };
   if (total > SYNC_TOTAL_BYTES) return { ...result, error: '待同步文件总量超过上限；请用 paths 参数缩小同步范围' };
-  if (input.sbx.supportsSecretFiles === false && input.sbx.writeFile) {
-    return syncLocalSkillFiles(input, {
-      ...result,
-      dest: posix.join(dest, randomUUID()),
-    });
-  }
 
   const { stdout: archive } = await execFileAsync(
     'tar', ['-C', input.dir, '-czf', '-', ...kept.map((file) => file.path)],
@@ -85,18 +82,56 @@ async function syncLocalSkillFiles(
   const writeSandboxFile = input.sbx.writeFile;
   if (!writeSandboxFile) return { ...result, error: '本地沙箱不支持安全文件上传' };
   try {
+    const prepared: Array<{ file: SkillFileEntry; content: Uint8Array }> = [];
+    const actualSkipped = [...result.skipped];
+    let actualTotal = 0;
     for (const file of result.kept) {
       const source = resolve(input.dir, file.path);
       const relativeSource = relative(resolve(input.dir), source);
       if (relativeSource === '..' || relativeSource.startsWith(`..${sep}`) || relativeSource === '') {
         throw new Error('技能同步源路径越界');
       }
-      await writeSandboxFile.call(input.sbx, posix.join(result.dest, file.path), await readFile(source));
+      const content = await readFile(source);
+      const actualFile = { ...file, size: content.byteLength };
+      if (!input.partial && content.byteLength > SYNC_SKIP_FILE_BYTES) {
+        actualSkipped.push(actualFile);
+        continue;
+      }
+      actualTotal += content.byteLength;
+      if (actualTotal > SYNC_TOTAL_BYTES) {
+        return { ...result, kept: prepared.map((item) => item.file), skipped: actualSkipped,
+          total: actualTotal, error: '待同步文件总量超过上限；请用 paths 参数缩小同步范围' };
+      }
+      prepared.push({ file: actualFile, content });
     }
+    if (!prepared.length) {
+      return { ...result, kept: [], skipped: actualSkipped, total: 0,
+        error: '没有可同步的文件（可能全部被大小过滤跳过）' };
+    }
+    if (!input.sbx.reserveSyncGeneration) {
+      return { ...result, kept: prepared.map((item) => item.file), skipped: actualSkipped,
+        total: actualTotal, error: '本地沙箱不支持同步配额预留' };
+    }
+    try {
+      await input.sbx.reserveSyncGeneration(actualTotal);
+    } catch (error) {
+      return { ...result, kept: prepared.map((item) => item.file), skipped: actualSkipped,
+        total: actualTotal, error: `本地沙箱同步配额不足：${String(error)}` };
+    }
+    const actualResult = {
+      ...result,
+      dest: posix.join(result.dest, randomUUID()),
+      kept: prepared.map((item) => item.file),
+      skipped: actualSkipped,
+      total: actualTotal,
+    };
+    for (const item of prepared) {
+      await writeSandboxFile.call(input.sbx, posix.join(actualResult.dest, item.file.path), item.content);
+    }
+    return actualResult;
   } catch (error) {
     return { ...result, error: `沙箱文件写入失败：${String(error)}` };
   }
-  return result;
 }
 
 async function pushChunk(sbx: SandboxHandle, path: string, chunk: string): Promise<void> {

@@ -23,6 +23,8 @@ AIoP 是一个面向智能运维与平台工程场景的 Agent 应用平台。�
 - 可用的 Anthropic、OpenAI 或兼容模型服务
 - MySQL（可选；未配置时使用进程内 Memory Store）
 
+内置 `LocalSandboxProvider` 仅用于本地开发，要求 Linux 且已挂载可访问的 procfs（`/proc/self/fd`）。其他平台请使用 E2B 或 OpenSandbox 后端。
+
 ### 安装依赖
 
 ```bash

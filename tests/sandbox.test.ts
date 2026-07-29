@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { constants } from 'node:fs';
-import { access, mkdir, mkdtemp, readFile, rename, stat, symlink, writeFile } from 'node:fs/promises';
+import { access, link, mkdir, mkdtemp, readFile, rename, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SandboxManager } from '../src/sandbox/lifecycle.js';
@@ -585,8 +585,8 @@ describe('LocalSandboxProvider', () => {
         ...actual,
         open: async (...args: Parameters<typeof actual.open>) => {
           const [target, flags] = args;
-          if (!swapped && String(target).endsWith('/victim.txt')
-            && typeof flags === 'number' && (flags & constants.O_TRUNC) !== 0) {
+          if (!swapped && String(target).includes('/.aiop-write-')
+            && typeof flags === 'number' && (flags & constants.O_EXCL) !== 0) {
             swapped = true;
             await actual.rename(sandboxParent, `${sandboxParent}-checked`);
             await actual.symlink(hostRoot, sandboxParent);
@@ -613,6 +613,64 @@ describe('LocalSandboxProvider', () => {
       await handle.kill();
     }
     await expect(readFile(hostFile, 'utf8')).resolves.toBe('host-original');
+  });
+
+  it('atomically replaces a sandbox hardlink without truncating the host inode', async () => {
+    const hostRoot = await mkdtemp(join(tmpdir(), 'aiop-local-hardlink-host-'));
+    const hostFile = join(hostRoot, 'host.txt');
+    await writeFile(hostFile, 'host-original');
+    const handle = await new LocalSandboxProvider().create({ key: 'local-hardlink-write' });
+    const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
+    const sandboxFile = join(sandboxRoot, 'workspace', 'hard.txt');
+    await mkdir(join(sandboxRoot, 'workspace'), { recursive: true });
+    await link(hostFile, sandboxFile);
+    const originalInode = (await stat(hostFile)).ino;
+    try {
+      await handle.writeFile?.('workspace/hard.txt', Buffer.from('sandbox-new'));
+
+      await expect(readFile(hostFile, 'utf8')).resolves.toBe('host-original');
+      await expect(readFile(sandboxFile, 'utf8')).resolves.toBe('sandbox-new');
+      expect((await stat(sandboxFile)).ino).not.toBe(originalInode);
+    } finally {
+      await handle.kill();
+    }
+  });
+
+  it('runCode replaces a hardlinked code entry without modifying the host file', async () => {
+    const hostRoot = await mkdtemp(join(tmpdir(), 'aiop-local-hardlink-code-host-'));
+    const hostFile = join(hostRoot, 'main.py');
+    await writeFile(hostFile, 'print("host-original")\n');
+    const handle = await new LocalSandboxProvider().create({ key: 'local-hardlink-code' });
+    const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
+    await link(hostFile, join(sandboxRoot, 'main.py'));
+    const originalInode = (await stat(hostFile)).ino;
+    try {
+      const result = await handle.runCode('print("sandbox-new")', { language: 'python' });
+
+      expect(result).toMatchObject({ stdout: 'sandbox-new\n', exitCode: 0 });
+      await expect(readFile(hostFile, 'utf8')).resolves.toBe('print("host-original")\n');
+      await expect(readFile(join(sandboxRoot, 'main.py'), 'utf8')).resolves.toBe('print("sandbox-new")');
+      expect((await stat(join(sandboxRoot, 'main.py'))).ino).not.toBe(originalInode);
+    } finally {
+      await handle.kill();
+    }
+  });
+
+  it('rejects unsupported platforms and missing procfs before creating a local sandbox', async () => {
+    type TestOptions = {
+      platform: NodeJS.Platform;
+      procFdAvailable: () => Promise<boolean>;
+    };
+    const Provider = LocalSandboxProvider as unknown as new (options: TestOptions) => LocalSandboxProvider;
+    const createAndCleanup = async (options: TestOptions) => {
+      const handle = await new Provider(options).create({ key: 'local-platform-check' });
+      await handle.kill();
+    };
+
+    await expect(createAndCleanup({ platform: 'darwin', procFdAvailable: async () => true }))
+      .rejects.toThrow(/Linux.*procfs|支持.*Linux/i);
+    await expect(createAndCleanup({ platform: 'linux', procFdAvailable: async () => false }))
+      .rejects.toThrow(/procfs|\/proc\/self\/fd/i);
   });
 });
 

@@ -1,4 +1,4 @@
-import { access, mkdtemp, mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, mkdir, readFile, readdir, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
@@ -8,6 +8,7 @@ import { buildSkillTools } from '../src/tools/skill/index.js';
 import type { SandboxManager } from '../src/sandbox/lifecycle.js';
 import type { ExecResult, SandboxHandle } from '../src/sandbox/types.js';
 import { LocalSandboxProvider } from '../src/sandbox/local.js';
+import { syncSkillToSandbox, SYNC_TOTAL_BYTES } from '../src/skill/sandbox-sync.js';
 
 /** 记录 runCommand 调用并按脚本约定返回成功的假沙箱。 */
 class FakeSandbox implements SandboxHandle {
@@ -291,6 +292,132 @@ describe('buildSkillTools', () => {
     await expect(access(sandboxRoot)).rejects.toThrow();
     await expect(access(join(sandboxRoot, firstDest!))).rejects.toThrow();
     await expect(access(join(sandboxRoot, secondDest!))).rejects.toThrow();
+  });
+
+  it('enforces local sync generation and byte quotas and resets them for a new handle', async () => {
+    type TestOptions = {
+      maxSyncGenerations: number;
+      maxSyncBytes: number;
+    };
+    const Provider = LocalSandboxProvider as unknown as new (options: TestOptions) => LocalSandboxProvider;
+    const syncTool = (handle: Awaited<ReturnType<LocalSandboxProvider['create']>>) => buildSkillTools(registry, {
+      get: async () => handle,
+      markCredentialInjected: () => {},
+    } as unknown as SandboxManager).find((tool) => tool.def.name === 'skill__sync_to_sandbox')!;
+    const context = {
+      sessionId: 'local-sync-quota', tenantId: 'default', userId: 'u', role: 'user' as const,
+    };
+
+    const countProvider = new Provider({ maxSyncGenerations: 2, maxSyncBytes: 1_000_000 });
+    const firstHandle = await countProvider.create({ key: 'local-sync-count-quota' });
+    const firstRoot = (await firstHandle.runCommand('pwd')).stdout.trim();
+    try {
+      const sync = syncTool(firstHandle);
+      expect((await sync.run({ name: 'demo' }, context)).isError).toBeFalsy();
+      expect((await sync.run({ name: 'demo' }, context)).isError).toBeFalsy();
+      const denied = await sync.run({ name: 'demo' }, context);
+      expect(denied.isError).toBe(true);
+      expect(denied.content).toMatch(/generation|次数|配额/i);
+      await expect(readdir(join(firstRoot, 'workspace', 'skills', 'demo'))).resolves.toHaveLength(2);
+    } finally {
+      await firstHandle.kill();
+    }
+    const resetHandle = await countProvider.create({ key: 'local-sync-count-reset' });
+    try {
+      expect((await syncTool(resetHandle).run({ name: 'demo' }, context)).isError).toBeFalsy();
+    } finally {
+      await resetHandle.kill();
+    }
+
+    const byteProvider = new Provider({ maxSyncGenerations: 10, maxSyncBytes: 150 });
+    const byteHandle = await byteProvider.create({ key: 'local-sync-byte-quota' });
+    const byteRoot = (await byteHandle.runCommand('pwd')).stdout.trim();
+    try {
+      const sync = syncTool(byteHandle);
+      expect((await sync.run({ name: 'demo' }, context)).isError).toBeFalsy();
+      const denied = await sync.run({ name: 'demo' }, context);
+      expect(denied.isError).toBe(true);
+      expect(denied.content).toMatch(/bytes|字节|配额/i);
+      await expect(readdir(join(byteRoot, 'workspace', 'skills', 'demo'))).resolves.toHaveLength(1);
+    } finally {
+      await byteHandle.kill();
+    }
+  });
+
+  it('uses actual local file bytes for the single-sync limit and handle byte reservation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-local-sync-actual-bytes-'));
+    const oversized = join(root, 'oversized.bin');
+    await writeFile(oversized, Buffer.alloc(SYNC_TOTAL_BYTES + 1, 1));
+    const totalHandle = await new LocalSandboxProvider({ maxSyncBytes: SYNC_TOTAL_BYTES * 2 })
+      .create({ key: 'local-sync-actual-total' });
+    try {
+      const result = await syncSkillToSandbox({
+        name: 'actual-total', dir: root, partial: true, sbx: totalHandle,
+        files: [{
+          name: 'oversized.bin',
+          path: 'oversized.bin',
+          size: 1,
+          isDirectory: false,
+          updatedAt: new Date().toISOString(),
+        }],
+      });
+      expect(result.error).toMatch(/总量超过上限/);
+      const sandboxRoot = (await totalHandle.runCommand('pwd')).stdout.trim();
+      await expect(access(join(sandboxRoot, 'workspace', 'skills', 'actual-total'))).rejects.toThrow();
+    } finally {
+      await totalHandle.kill();
+    }
+
+    const quotaFile = join(root, 'quota.bin');
+    await writeFile(quotaFile, Buffer.alloc(1_200, 2));
+    const quotaHandle = await new LocalSandboxProvider({ maxSyncBytes: 1_000 })
+      .create({ key: 'local-sync-actual-quota' });
+    try {
+      const result = await syncSkillToSandbox({
+        name: 'actual-quota', dir: root, partial: true, sbx: quotaHandle,
+        files: [{
+          name: 'quota.bin',
+          path: 'quota.bin',
+          size: 1,
+          isDirectory: false,
+          updatedAt: new Date().toISOString(),
+        }],
+      });
+      expect(result.error).toMatch(/byte quota|字节|配额/i);
+      const sandboxRoot = (await quotaHandle.runCommand('pwd')).stdout.trim();
+      await expect(access(join(sandboxRoot, 'workspace', 'skills', 'actual-quota'))).rejects.toThrow();
+    } finally {
+      await quotaHandle.kill();
+    }
+
+    const fixedFile = join(root, 'fixed.txt');
+    await writeFile(fixedFile, 'before');
+    const fixedHandle = await new LocalSandboxProvider({ maxSyncBytes: 6 })
+      .create({ key: 'local-sync-fixed-buffer' });
+    const reserve = fixedHandle.reserveSyncGeneration!.bind(fixedHandle);
+    let reservedBytes = 0;
+    fixedHandle.reserveSyncGeneration = async (bytes: number) => {
+      reservedBytes = bytes;
+      await writeFile(fixedFile, 'after-expanded');
+      await reserve(bytes);
+    };
+    try {
+      const result = await syncSkillToSandbox({
+        name: 'fixed-buffer', dir: root, partial: true, sbx: fixedHandle,
+        files: [{
+          name: 'fixed.txt',
+          path: 'fixed.txt',
+          size: 6,
+          isDirectory: false,
+          updatedAt: new Date().toISOString(),
+        }],
+      });
+      expect(result.error).toBeUndefined();
+      expect(reservedBytes).toBe(6);
+      await expect(fixedHandle.readFile(`${result.dest}/fixed.txt`)).resolves.toEqual(Buffer.from('before'));
+    } finally {
+      await fixedHandle.kill();
+    }
   });
 
   it('keeps the multi-provider schema when only some credentials are available', async () => {
