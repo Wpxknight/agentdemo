@@ -4,6 +4,7 @@ import { MemoryStore } from '../../src/db/memory.js';
 import {
   PiSessionProjection,
   projectCommittedPiSession,
+  projectPiSessionStats,
   projectPiUsage,
 } from '../../src/agent/projections.js';
 import type { RequestContext } from '../../src/auth/types.js';
@@ -111,6 +112,20 @@ describe('Pi session projection', () => {
       cacheReadTokens: 3,
       cacheCreationTokens: 2,
       costUsd: 0.28,
+    });
+  });
+
+  it('projects Pi SessionStats into the existing session usage APIs', () => {
+    expect(projectPiSessionStats({
+      messageCount: 4,
+      cachedTokens: 30,
+      uncachedTokens: 70,
+      totalTokens: 125,
+      costTotal: 0.42,
+    }, 200)).toEqual({
+      context: { usedTokens: 100, maxTokens: 200, estimated: false },
+      usage: { totalTokens: 125 },
+      costUsd: 0.42,
     });
   });
 

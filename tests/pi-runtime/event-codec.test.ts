@@ -15,9 +15,23 @@ describe('Pi EventCodec', () => {
       tenantId: 'tenant-1', runId: 'run-1', attemptId: 'attempt-1', turnNo: 2,
       kernel: 'pi', kernelVersion: '0.82.1', correlationId: 'correlation-1', sequence: 9n,
       type: 'tool_call',
-      detail: { version: 1, toolCallId: 'call-1', toolName: 'lookup', inputKeys: ['key'] },
+      detail: { version: 1, toolCallId: 'call-1', toolName: 'lookup', input: { key: 'value' }, inputKeys: ['key'] },
       createdAt: new Date('2026-07-28T00:00:00.000Z'),
     });
+  });
+
+  it('retains bounded user-visible tool output while redacting governed input credentials', () => {
+    const codec = new EventCodec({ tenantId: 't', runId: 'r', attemptId: 'a', turnNo: 1,
+      correlationId: 'c', sequence: () => 1n });
+
+    expect(codec.fromPi({
+      type: 'tool_execution_update', toolCallId: 'call-1', toolName: 'shell', args: {},
+      partialResult: { content: [{ type: 'text', text: 'live output' }] },
+    } as never).detail).toMatchObject({ outputText: 'live output' });
+    expect(codec.fromPi({
+      type: 'tool_call', toolCallId: 'call-2', toolName: 'lookup',
+      input: { query: 'visible', apiKey: 'must-not-leak' },
+    } as never).detail).toMatchObject({ input: { query: 'visible', apiKey: '[REDACTED]' } });
   });
 
   it('keeps unknown Harness events as safely ignorable versioned detail', () => {

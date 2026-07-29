@@ -65,7 +65,7 @@ function projectKnown(event: AgentHarnessEvent): Record<string, unknown> {
     };
     case 'tool_execution_update': return {
       version: 1, toolCallId: limited(event.toolCallId, MAX_NAME), toolName: limited(event.toolName, MAX_NAME),
-      inputKeys: objectKeys(event.args), partial: valueShape(event.partialResult),
+      inputKeys: objectKeys(event.args), partial: valueShape(event.partialResult), outputText: displayText(event.partialResult),
     };
     case 'tool_execution_end': return {
       version: 1, toolCallId: limited(event.toolCallId, MAX_NAME), toolName: limited(event.toolName, MAX_NAME),
@@ -73,7 +73,7 @@ function projectKnown(event: AgentHarnessEvent): Record<string, unknown> {
     };
     case 'tool_call': return {
       version: 1, toolCallId: limited(event.toolCallId, MAX_NAME), toolName: limited(event.toolName, MAX_NAME),
-      inputKeys: objectKeys(event.input),
+      input: safeObject(event.input), inputKeys: objectKeys(event.input),
     };
     case 'tool_result': return {
       version: 1, toolCallId: limited(event.toolCallId, MAX_NAME), toolName: limited(event.toolName, MAX_NAME),
@@ -202,6 +202,25 @@ function names(values: readonly { name: string }[] | undefined): string[] {
 
 function valueShape(value: unknown): Record<string, unknown> {
   return { type: valueType(value), keys: objectKeys(value), estimatedBytes: estimateBytes(value) };
+}
+
+function safeObject(value: unknown): JsonValue {
+  const safe = toDurableJsonValue(value);
+  return safe && typeof safe === 'object' && !Array.isArray(safe) ? safe : {};
+}
+
+function displayText(value: unknown): string | undefined {
+  if (typeof value === 'string') return limited(value, MAX_STRING);
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.text === 'string') return limited(record.text, MAX_STRING);
+  if (!Array.isArray(record.content)) return undefined;
+  const text = record.content.flatMap((block) => {
+    if (!block || typeof block !== 'object') return [];
+    const item = block as Record<string, unknown>;
+    return item.type === 'text' && typeof item.text === 'string' ? [item.text] : [];
+  }).join('');
+  return text ? limited(text, MAX_STRING) : undefined;
 }
 
 function objectKeys(value: unknown): string[] | typeof UNSERIALIZABLE {

@@ -2,7 +2,7 @@ import type {
   AgentInputMessage, AgentRunEvent, AgentRunResult, ClaimRunInput, ClaimedRun, CommitTurnInput,
   CompleteRunInput, CreateRunRecord, RenewLeaseInput, RequestCancellationInput, RunRecord, RunStore,
 } from '@aiop/control-contracts';
-import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
+import type { SessionStats, SessionTreeEntry } from '@earendil-works/pi-agent-core';
 
 export interface StoredRun extends RunRecord {
   cancelRequestedAt?: Date;
@@ -95,6 +95,7 @@ export interface PiSessionStore {
   get(tenantId: string, sessionId: string): Promise<PiSessionRecord | undefined>;
   appendEntry(tenantId: string, sessionId: string, entry: SessionTreeEntry): Promise<SessionEntryRecord>;
   listEntries(tenantId: string, sessionId: string, options?: { afterSequence?: bigint; committedOnly?: boolean }): Promise<SessionEntryRecord[]>;
+  getSessionStats(tenantId: string, sessionId: string): Promise<SessionStats>;
   setCurrentLeaf(tenantId: string, sessionId: string, leafId: string | null): Promise<void>;
 }
 

@@ -21,6 +21,7 @@ export * from './store/types.js';
 export * from './store/memory.js';
 export * from './store/mysql.js';
 export * from './store/pi-session-mysql.js';
+export * from './store/session-stats.js';
 export * from './run/attempt.js';
 export * from './run/cancellation.js';
 export * from './run/event-stream.js';
@@ -534,6 +535,7 @@ export declare class MemoryRunStore implements DurableRunStore {
             afterSequence?: bigint;
             committedOnly?: boolean;
         }) => Promise<SessionEntryRecord[]>;
+        getSessionStats: (tenantId: string, sessionId: string) => Promise<import("@earendil-works/pi-agent-core").SessionStats>;
         setCurrentLeaf: (tenantId: string, sessionId: string, leafId: string | null) => Promise<void>;
     };
     readonly inbox: {
@@ -598,6 +600,7 @@ export declare class MysqlRunStore implements DurableRunStore {
             afterSequence?: bigint;
             committedOnly?: boolean;
         }) => Promise<SessionEntryRecord[]>;
+        getSessionStats: (tenantId: string, sessionId: string) => Promise<import("@earendil-works/pi-agent-core").SessionStats>;
         setCurrentLeaf: (tenantId: string, sessionId: string, leafId: string | null) => Promise<void>;
     };
     readonly inbox: {
@@ -695,9 +698,13 @@ export declare class PiMysqlSessionRepo implements SessionRepo<PiMysqlSessionMet
 }
 export {};
 
+// file: store/session-stats.d.ts
+import type { SessionStats, SessionTreeEntry } from '@earendil-works/pi-agent-core';
+export declare function sessionStats(entries: readonly SessionTreeEntry[]): SessionStats;
+
 // file: store/types.d.ts
 import type { AgentInputMessage, AgentRunEvent, AgentRunResult, ClaimRunInput, ClaimedRun, CommitTurnInput, CompleteRunInput, CreateRunRecord, RenewLeaseInput, RequestCancellationInput, RunRecord, RunStore } from '@aiop/control-contracts';
-import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
+import type { SessionStats, SessionTreeEntry } from '@earendil-works/pi-agent-core';
 export interface StoredRun extends RunRecord {
     cancelRequestedAt?: Date;
     cancelReason?: string;
@@ -789,6 +796,7 @@ export interface PiSessionStore {
         afterSequence?: bigint;
         committedOnly?: boolean;
     }): Promise<SessionEntryRecord[]>;
+    getSessionStats(tenantId: string, sessionId: string): Promise<SessionStats>;
     setCurrentLeaf(tenantId: string, sessionId: string, leafId: string | null): Promise<void>;
 }
 export interface RunInboxStore {

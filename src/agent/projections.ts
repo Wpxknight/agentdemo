@@ -1,7 +1,6 @@
-import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
-import type { Usage } from '@earendil-works/pi-ai';
+import type { SessionStats, SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import type { RequestContext } from '../auth/types.js';
-import type { AgentRunUsage, Store } from '../db/store.js';
+import type { AgentRunUsage, SessionContextUsage, SessionTokenUsage, Store } from '../db/store.js';
 import type { JsonValue, Msg, ToolContentBlock } from '../model/types.js';
 import type { PiSessionStore } from '@aiop/pi-runtime';
 
@@ -49,7 +48,13 @@ export async function projectCommittedPiSession(input: {
   return true;
 }
 
-export function projectPiUsage(usage: Pick<Usage, 'input' | 'output' | 'cacheRead' | 'cacheWrite' | 'cost'>): AgentRunUsage {
+export function projectPiUsage(usage: {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost?: { total?: number };
+}): AgentRunUsage {
   const costUsd = finite(usage.cost?.total);
   return {
     inputTokens: finite(usage.input) ?? 0,
@@ -57,6 +62,21 @@ export function projectPiUsage(usage: Pick<Usage, 'input' | 'output' | 'cacheRea
     cacheReadTokens: finite(usage.cacheRead) ?? 0,
     cacheCreationTokens: finite(usage.cacheWrite) ?? 0,
     ...(costUsd === undefined ? {} : { costUsd }),
+  };
+}
+
+export function projectPiSessionStats(
+  stats: SessionStats,
+  maxTokens: number,
+): { context: SessionContextUsage; usage: SessionTokenUsage; costUsd: number } {
+  return {
+    context: {
+      usedTokens: Math.max(0, finite(stats.cachedTokens) ?? 0) + Math.max(0, finite(stats.uncachedTokens) ?? 0),
+      maxTokens: Math.max(0, finite(maxTokens) ?? 0),
+      estimated: false,
+    },
+    usage: { totalTokens: Math.max(0, finite(stats.totalTokens) ?? 0) },
+    costUsd: Math.max(0, finite(stats.costTotal) ?? 0),
   };
 }
 

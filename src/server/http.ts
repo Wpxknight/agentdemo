@@ -41,7 +41,7 @@ import {
   type SandboxApiKeyUpdate,
 } from '../sandbox/settings.js';
 import { SessionCommitter } from '../agent/services/session-committer.js';
-import { projectCommittedPiSession } from '../agent/projections.js';
+import { projectCommittedPiSession, projectPiSessionStats, projectPiUsage } from '../agent/projections.js';
 import { DurableToolLedger } from '../agent/tool-ledger/store.js';
 import { DurableInteractionService } from '../agent/interactions/store.js';
 import {
@@ -49,7 +49,8 @@ import {
   RunCenterNotFoundError,
   RunCenterService,
 } from '../agent/run-center.js';
-import type { AgentRunRecord, AgentRunStatus } from '../db/store.js';
+import type { AgentRunRecord, AgentRunStatus, SessionContextUsage } from '../db/store.js';
+import type { AgentRunResult } from '@aiop/control-contracts';
 
 const log = logger.child({ mod: 'http' });
 
@@ -1743,7 +1744,7 @@ async function handle(
   if (method === 'GET' && sessionContextMatch) {
     const ctx = await requireAuth(rt, req);
     const sessionId = decodeURIComponent(sessionContextMatch[1]!);
-    const usage = await rt.store.getSessionContextUsage(ctx, sessionId, contextWindowTokens(currentModelConfig(rt)));
+    const usage = await readSessionContextProjection(rt, ctx, sessionId, contextWindowTokens(currentModelConfig(rt)));
     return sendJson(res, 200, { sessionId, ...usage });
   }
 
@@ -1753,7 +1754,7 @@ async function handle(
     const sessionId = decodeURIComponent(sessionUsageMatch[1]!);
     const owned = (await rt.store.listSessions(ctx)).some((session) => session.sessionId === sessionId);
     if (!owned) throw new HttpError(404, '会话不存在');
-    const usage = await rt.store.getSessionTokenUsage(ctx, sessionId);
+    const usage = await readSessionUsageProjection(rt, ctx, sessionId);
     return sendJson(res, 200, { sessionId, ...usage });
   }
 
@@ -2775,13 +2776,13 @@ async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req:
   res.on('close', onClose);
   try {
     let emittedText = false;
+    let steps = 0;
     for await (const event of handle.events) {
+      steps = Math.max(steps, Number.isInteger(event.turnNo) && event.turnNo > 0 ? event.turnNo : 0);
       const projected = projectDurableHttpEvent(event);
       if (projected) {
         sse(projected.event, projected.data);
         emittedText ||= projected.event === 'text_delta';
-      } else {
-        sse(event.type, event.detail ?? {});
       }
     }
     const result = await handle.result();
@@ -2798,7 +2799,12 @@ async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req:
       sse('error', { error: result.error?.message ?? '运行失败', runId: result.runId, status: result.status });
     } else {
       if (result.status === 'succeeded' && result.text && !emittedText) sse('text_delta', { text: result.text });
-      sse('done', { sessionId, ...result });
+      sse('done', projectDurableHttpDone({
+        sessionId,
+        result,
+        steps,
+        context: await durableContextUsage(rt, ctx, sessionId, result),
+      }));
     }
   } catch (error) {
     sse('error', { error: error instanceof Error ? error.message : '运行失败', runId: handle.runId });
@@ -2811,8 +2817,9 @@ async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req:
 
 export function projectDurableHttpEvent(event: { type: string; detail?: unknown }): { event: string; data: unknown } | undefined {
   if (!event.detail || typeof event.detail !== 'object') return undefined;
+  const detail = event.detail as Record<string, unknown>;
   if (event.type === 'message_update') {
-    const update = (event.detail as { update?: unknown }).update;
+    const update = detail.update;
     if (!update || typeof update !== 'object') return undefined;
     const value = update as { type?: unknown; delta?: unknown };
     if ((value.type === 'text_delta' || value.type === 'thinking_delta') && typeof value.delta === 'string') {
@@ -2820,24 +2827,152 @@ export function projectDurableHttpEvent(event: { type: string; detail?: unknown 
     }
     return undefined;
   }
+  if (event.type === 'tool_call') {
+    const id = stringValue(detail.toolCallId);
+    const name = stringValue(detail.toolName);
+    if (!id || !name) return undefined;
+    return { event: 'tool_call', data: { call: { id, name, args: objectValue(detail.input) ?? redactedArgs(detail.inputKeys) } } };
+  }
+  if (event.type === 'tool_execution_update') {
+    const toolId = stringValue(detail.toolCallId);
+    if (!toolId) return undefined;
+    const text = stringValue(detail.outputText);
+    if (!text) return undefined;
+    return { event: 'tool_output', data: { toolId, stream: 'stdout', text } };
+  }
+  if (event.type === 'tool_execution_end' || event.type === 'tool_result') {
+    const toolId = stringValue(detail.toolCallId);
+    const name = stringValue(detail.toolName);
+    if (!toolId || !name) return undefined;
+    return { event: 'tool_result', data: { toolId, name, isError: detail.isError === true } };
+  }
+  if (event.type === 'session_compact') {
+    const summarizedMessages = finiteOptional(detail.summarizedMessages);
+    const beforeTokens = finiteOptional(detail.tokensBefore);
+    const afterTokens = finiteOptional(detail.tokensAfter);
+    if (summarizedMessages === undefined || beforeTokens === undefined || afterTokens === undefined) return undefined;
+    return { event: 'context_compacted', data: {
+      summarizedMessages,
+      beforeTokens,
+      afterTokens,
+    } };
+  }
+  if (event.type === 'todo_updated') {
+    const todos = Array.isArray(detail.todos) ? detail.todos.flatMap(projectTodo) : [];
+    return { event: 'todo_updated', data: { todos } };
+  }
+  if (event.type === 'file_exported') {
+    const name = stringValue(detail.name);
+    const url = stringValue(detail.url);
+    const mime = stringValue(detail.mime);
+    const expiresAt = stringValue(detail.expiresAt);
+    if (!name || !url || !mime || !expiresAt) return undefined;
+    return { event: 'file_exported', data: { name, url, size: finiteNumber(detail.size), mime, expiresAt } };
+  }
+  if (event.type === 'abort') {
+    return { event: 'stop', data: { reason: stringValue(detail.reason) ?? 'aborted' } };
+  }
   if (event.type !== 'message_end') return undefined;
-  const message = (event.detail as { message?: unknown }).message;
+  const message = detail.message;
   if (!message || typeof message !== 'object' || (message as { role?: unknown }).role !== 'assistant') return undefined;
   const usage = (message as { usage?: unknown }).usage;
   if (!usage || typeof usage !== 'object') return undefined;
   const value = usage as Record<string, unknown>;
+  const projected = projectPiUsage({
+    input: finiteNumber(value.input),
+    output: finiteNumber(value.output),
+    cacheRead: finiteNumber(value.cacheRead),
+    cacheWrite: finiteNumber(value.cacheWrite),
+    cost: { total: finiteNumber(value.costTotal) },
+  });
   return {
     event: 'usage',
     data: {
-      inputTokens: finiteNumber(value.input),
-      outputTokens: finiteNumber(value.output),
-      cacheReadTokens: finiteNumber(value.cacheRead),
-      cacheCreationTokens: finiteNumber(value.cacheWrite),
-      ...(typeof value.costTotal === 'number' && Number.isFinite(value.costTotal) ? { cost: value.costTotal } : {}),
+      inputTokens: projected.inputTokens,
+      outputTokens: projected.outputTokens,
+      cacheReadTokens: projected.cacheReadTokens,
+      cacheCreationTokens: projected.cacheCreationTokens,
+      ...(typeof value.costTotal === 'number' && Number.isFinite(value.costTotal) ? { cost: projected.costUsd } : {}),
     },
   };
 }
 
+export function projectDurableHttpDone(input: {
+  sessionId: string;
+  result: AgentRunResult;
+  steps: number;
+  context: SessionContextUsage;
+}): Record<string, unknown> {
+  const cost = finiteCost(input.result.usage.costUsd);
+  return {
+    sessionId: input.sessionId,
+    runId: input.result.runId,
+    steps: input.steps,
+    text: input.result.text ?? '',
+    usage: { ...input.result.usage, context: input.context, cost },
+    context: input.context,
+    cost,
+  };
+}
+
+function redactedArgs(keys: unknown): Record<string, string> {
+  if (!Array.isArray(keys)) return {};
+  return Object.fromEntries(keys.filter((key): key is string => typeof key === 'string').map((key) => [key, '[redacted]']));
+}
+
+function projectTodo(value: unknown): Array<{ content: string; status: 'pending' | 'in_progress' | 'completed' }> {
+  if (!value || typeof value !== 'object') return [];
+  const todo = value as Record<string, unknown>;
+  const content = stringValue(todo.content);
+  const status = todo.status;
+  if (!content || (status !== 'pending' && status !== 'in_progress' && status !== 'completed')) return [];
+  return [{ content, status }];
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function objectValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function finiteCost(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+async function durableContextUsage(
+  rt: Runtime,
+  ctx: RequestContext,
+  sessionId: string,
+  _result: AgentRunResult,
+): Promise<SessionContextUsage> {
+  return readSessionContextProjection(rt, ctx, sessionId, contextWindowTokens(currentModelConfig(rt)));
+}
+
+export async function readSessionContextProjection(
+  rt: Pick<Runtime, 'piSessionStore' | 'store'>,
+  ctx: RequestContext,
+  sessionId: string,
+  maxTokens: number,
+): Promise<SessionContextUsage> {
+  if (!rt.piSessionStore) return rt.store.getSessionContextUsage(ctx, sessionId, maxTokens);
+  return projectPiSessionStats(await rt.piSessionStore.getSessionStats(ctx.tenantId, sessionId), maxTokens).context;
+}
+
+export async function readSessionUsageProjection(
+  rt: Pick<Runtime, 'piSessionStore' | 'store'>,
+  ctx: RequestContext,
+  sessionId: string,
+): Promise<{ totalTokens: number }> {
+  if (!rt.piSessionStore) return rt.store.getSessionTokenUsage(ctx, sessionId);
+  return projectPiSessionStats(await rt.piSessionStore.getSessionStats(ctx.tenantId, sessionId), 0).usage;
+}
+
 function finiteNumber(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function finiteOptional(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }

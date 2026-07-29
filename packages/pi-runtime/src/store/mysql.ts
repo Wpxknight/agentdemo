@@ -10,6 +10,7 @@ import type {
   SessionEntryRecord, StoredRun,
 } from './types.js';
 import { assertAttemptAllowed, assertTurnAllowed } from '../run/limits.js';
+import { sessionStats } from './session-stats.js';
 
 type Db = Kysely<any> | Transaction<any>;
 
@@ -262,6 +263,9 @@ export class MysqlRunStore implements DurableRunStore {
       }
       return records;
     },
+    getSessionStats: async (tenantId: string, sessionId: string) => sessionStats(
+      (await this.sessions.listEntries(tenantId, sessionId, { committedOnly: true })).map((record) => record.entry),
+    ),
     setCurrentLeaf: async (tenantId: string, sessionId: string, leafId: string | null): Promise<void> => {
       if (leafId) {
         const entry = await this.db.selectFrom('pi_session_entries').select('entry_id').where('tenant_id', '=', tenantId)

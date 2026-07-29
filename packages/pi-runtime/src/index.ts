@@ -20,6 +20,7 @@ export * from './store/types.js';
 export * from './store/memory.js';
 export * from './store/mysql.js';
 export * from './store/pi-session-mysql.js';
+export * from './store/session-stats.js';
 export * from './run/attempt.js';
 export * from './run/cancellation.js';
 export * from './run/event-stream.js';

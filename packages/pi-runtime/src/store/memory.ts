@@ -6,6 +6,7 @@ import type {
   SessionEntryRecord, StoredRun,
 } from './types.js';
 import { assertAttemptAllowed, assertTurnAllowed } from '../run/limits.js';
+import { sessionStats } from './session-stats.js';
 
 const clone = <T>(value: T): T => structuredClone(value);
 const key = (tenantId: string, id: string): string => `${tenantId}\0${id}`;
@@ -201,6 +202,9 @@ export class MemoryRunStore implements DurableRunStore {
       }
       return clone(entries);
     },
+    getSessionStats: async (tenantId: string, sessionId: string) => sessionStats(
+      (await this.sessions.listEntries(tenantId, sessionId, { committedOnly: true })).map((record) => record.entry),
+    ),
     setCurrentLeaf: async (tenantId: string, sessionId: string, leafId: string | null): Promise<void> => {
       const session = this.sessionRecords.get(key(tenantId, sessionId));
       if (!session) throw new Error('Pi session not found');
