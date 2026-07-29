@@ -113,7 +113,15 @@ export interface SandboxHandle {
 }
 
 /** 沙箱后端：负责新建 / 连接。 */
+export interface SandboxProviderOperationOptions {
+  signal?: AbortSignal;
+}
+
 export interface SandboxProvider {
-  create(spec: SandboxSpec): Promise<SandboxHandle>;
-  connect(sandboxId: string, spec: SandboxSpec): Promise<SandboxHandle>;
+  create(spec: SandboxSpec, options?: SandboxProviderOperationOptions): Promise<SandboxHandle>;
+  connect(
+    sandboxId: string,
+    spec: SandboxSpec,
+    options?: SandboxProviderOperationOptions,
+  ): Promise<SandboxHandle>;
 }

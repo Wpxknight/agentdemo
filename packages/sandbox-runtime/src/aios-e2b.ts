@@ -13,6 +13,7 @@ import type {
   SandboxCommand,
   SandboxHandle,
   SandboxProvider,
+  SandboxProviderOperationOptions,
   SandboxSpec,
 } from './types.js';
 
@@ -184,7 +185,7 @@ export class AiosE2bProvider implements SandboxProvider {
     this.sleep = opts.sleep ?? defaultSleep;
   }
 
-  async create(spec: SandboxSpec): Promise<SandboxHandle> {
+  async create(spec: SandboxSpec, options: SandboxProviderOperationOptions = {}): Promise<SandboxHandle> {
     const template = this.assertTemplateAllowed(spec);
     if (spec.volumes?.length) throw new Error('AIOS Lifecycle mode does not support sandbox volumes');
     const timeout = timeoutSeconds(spec.timeoutMs);
@@ -204,12 +205,12 @@ export class AiosE2bProvider implements SandboxProvider {
         ...(spec.network === undefined ? {} : { network: spec.network }),
         placement: this.opts.placement,
       },
-    });
+    }, { signal: options.signal });
     const sandboxId = response.sandboxID ?? response.id;
     if (!sandboxId) throw new Error('AIOS Lifecycle create response did not contain a sandbox ID');
     const handle = new AiosE2bHandle(sandboxId, this);
     try {
-      await this.waitUntilReady(handle);
+      await this.waitUntilReady(handle, options.signal);
       return handle;
     } catch (err) {
       await handle.kill().catch(() => {});
@@ -217,26 +218,35 @@ export class AiosE2bProvider implements SandboxProvider {
     }
   }
 
-  async connect(sandboxId: string, spec: SandboxSpec): Promise<SandboxHandle> {
+  async connect(
+    sandboxId: string,
+    spec: SandboxSpec,
+    options: SandboxProviderOperationOptions = {},
+  ): Promise<SandboxHandle> {
     this.assertTemplateAllowed(spec);
     if (spec.volumes?.length) throw new Error('AIOS Lifecycle mode does not support sandbox volumes');
     const timeout = timeoutSeconds(spec.timeoutMs);
     await this.request<SandboxResponse>(`/sandboxes/${encodeURIComponent(sandboxId)}/connect`, {
       method: 'POST',
       body: timeout === undefined ? {} : { timeout },
-    });
+    }, { signal: options.signal });
     const handle = new AiosE2bHandle(sandboxId, this);
-    await this.waitUntilReady(handle);
+    await this.waitUntilReady(handle, options.signal);
     return handle;
   }
 
-  async command(sandboxId: string, command: string, timeoutMs?: number): Promise<CommandResponse> {
+  async command(
+    sandboxId: string,
+    command: string,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<CommandResponse> {
     const timeout = timeoutSeconds(timeoutMs);
     const response = await this.http.requestJson<CommandResponse>(
       `/sandboxes/${encodeURIComponent(sandboxId)}/commands`,
       { method: 'POST', body: { command, ...(timeout === undefined ? {} : { timeout }) } },
       [408],
-      { timeoutMs: (timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS) + COMMAND_TRANSPORT_GRACE_MS },
+      { timeoutMs: (timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS) + COMMAND_TRANSPORT_GRACE_MS, signal },
     );
     return response.status === 408 ? { ...response.body, timedOut: true } : response.body;
   }
@@ -244,7 +254,7 @@ export class AiosE2bProvider implements SandboxProvider {
   async request<T = unknown>(
     path: string,
     init: { method: string; body?: unknown },
-    requestOptions: { timeoutMs?: number; maxResponseBytes?: number } = {},
+    requestOptions: { timeoutMs?: number; maxResponseBytes?: number; signal?: AbortSignal } = {},
   ): Promise<T> {
     return (await this.http.requestJson<T>(path, init, [], requestOptions)).body;
   }
@@ -257,11 +267,11 @@ export class AiosE2bProvider implements SandboxProvider {
     return template;
   }
 
-  private async waitUntilReady(handle: AiosE2bHandle): Promise<void> {
+  private async waitUntilReady(handle: AiosE2bHandle, signal?: AbortSignal): Promise<void> {
     let lastError: unknown;
     for (let attempt = 0; attempt < this.readinessAttempts; attempt += 1) {
       try {
-        const result = await handle.runCommand(READY_PROBE);
+        const result = await this.command(handle.sandboxId, READY_PROBE, undefined, signal);
         if (result.exitCode === undefined || result.exitCode === 0) return;
         lastError = new Error(`AIOS sandbox readiness probe exited with code ${result.exitCode}`);
       } catch (err) {

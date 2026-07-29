@@ -69,6 +69,8 @@ interface LeaseEntry {
   lease: SandboxLease;
   handle: SandboxHandle;
   active: boolean;
+  invalidate?: () => void;
+  invalidated?: boolean;
 }
 
 export class SandboxRuntime {
@@ -79,38 +81,45 @@ export class SandboxRuntime {
   async acquire(input: AcquireSandboxRuntimeInput): Promise<SandboxLease> {
     throwIfAborted(input.signal);
     const spec = acquireSpec(input);
-    const handle = spec.sandboxId
-      ? await this.options.provider.connect(spec.sandboxId, spec)
-      : await this.options.provider.create(spec);
-    if (input.signal?.aborted) {
-      await handle.kill().catch(() => undefined);
-      throw abortError();
-    }
+    const task = spec.sandboxId
+      ? input.signal
+        ? this.options.provider.connect(spec.sandboxId, spec, { signal: input.signal })
+        : this.options.provider.connect(spec.sandboxId, spec)
+      : input.signal
+        ? this.options.provider.create(spec, { signal: input.signal })
+        : this.options.provider.create(spec);
+    const handle = await acquireHandle(task, input.signal);
     return this.register(handle, spec);
   }
 
-  async adopt(input: { handle: SandboxHandle; spec: SandboxSpec; signal?: AbortSignal }): Promise<SandboxLease> {
+  async adopt(input: {
+    handle: SandboxHandle;
+    spec: SandboxSpec;
+    signal?: AbortSignal;
+    invalidate?: () => void;
+  }): Promise<SandboxLease> {
     if (input.signal?.aborted) {
+      input.invalidate?.();
       await input.handle.kill().catch(() => undefined);
       throw abortError();
     }
-    return this.register(input.handle, input.spec);
+    return this.register(input.handle, input.spec, input.invalidate);
   }
 
-  private register(handle: SandboxHandle, spec: SandboxSpec): SandboxLease {
+  private register(handle: SandboxHandle, spec: SandboxSpec, invalidate?: () => void): SandboxLease {
     const lease: SandboxLease = {
       id: randomUUID(),
       sandboxId: handle.sandboxId,
       provider: this.options.providerName,
       ...(spec.profile ? { profile: spec.profile } : {}),
     };
-    this.leases.set(lease.id, { lease, handle, active: true });
+    this.leases.set(lease.id, { lease, handle, active: true, invalidate });
     return { ...lease };
   }
 
   async execute(input: ExecuteSandboxInput): Promise<SandboxExecutionResult> {
     const entry = this.requireActive(input.lease);
-    throwIfAborted(input.signal);
+    if (input.signal?.aborted) await this.abortEntry(entry);
     if ((input.command === undefined) === (input.code === undefined)) {
       throw new Error('exactly one of command or code is required');
     }
@@ -131,14 +140,14 @@ export class SandboxRuntime {
 
   async upload(input: UploadSandboxInput): Promise<void> {
     const entry = this.requireActive(input.lease);
-    throwIfAborted(input.signal);
+    if (input.signal?.aborted) await this.abortEntry(entry);
     if (!entry.handle.writeFile) throw new Error('sandbox does not support file uploads');
     await this.raceVoid(entry.handle.writeFile(input.file.path, input.file.content), input.signal, entry);
   }
 
   async download(input: DownloadSandboxInput): Promise<DownloadFile> {
     const entry = this.requireActive(input.lease);
-    throwIfAborted(input.signal);
+    if (input.signal?.aborted) await this.abortEntry(entry);
     const content = await this.raceControls(entry.handle.readFile(input.path).then((bytes) => ({
       stdout: '', stderr: '', bytes,
     }) as ExecResult & { bytes: Uint8Array }), input.signal, undefined, entry) as ExecResult & { bytes: Uint8Array };
@@ -190,6 +199,7 @@ export class SandboxRuntime {
     timeoutMs: number | undefined,
     entry: LeaseEntry,
   ): Promise<ExecResult> {
+    if (signal?.aborted) await this.abortEntry(entry);
     let onAbort: (() => void) | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const controls: Array<Promise<ExecResult>> = [task];
@@ -197,6 +207,7 @@ export class SandboxRuntime {
       controls.push(new Promise<never>((_resolve, reject) => {
         onAbort = () => {
           entry.active = false;
+          this.invalidate(entry);
           void entry.handle.kill().catch(() => undefined);
           reject(abortError());
         };
@@ -207,6 +218,7 @@ export class SandboxRuntime {
       controls.push(new Promise<ExecResult>((resolve) => {
         timer = setTimeout(() => {
           entry.active = false;
+          this.invalidate(entry);
           void entry.handle.kill().catch(() => undefined).finally(() => resolve({
             stdout: '',
             stderr: '',
@@ -228,31 +240,44 @@ export class SandboxRuntime {
   private async raceVoid(task: Promise<void>, signal: AbortSignal | undefined, entry: LeaseEntry): Promise<void> {
     await this.raceControls(task.then(() => ({ stdout: '', stderr: '' })), signal, undefined, entry);
   }
+
+  private invalidate(entry: LeaseEntry): void {
+    if (entry.invalidated) return;
+    entry.invalidated = true;
+    entry.invalidate?.();
+  }
+
+  private async abortEntry(entry: LeaseEntry): Promise<never> {
+    entry.active = false;
+    this.invalidate(entry);
+    await entry.handle.kill().catch(() => undefined);
+    throw abortError();
+  }
 }
 
 export async function executeAcquiredSandbox(
-  acquired: Pick<SandboxAcquisition, 'handle' | 'spec'>,
+  acquired: Pick<SandboxAcquisition, 'handle' | 'spec' | 'invalidate'>,
   input: Omit<ExecuteSandboxInput, 'lease'>,
 ): Promise<SandboxExecutionResult> {
   return withAcquiredRuntime(acquired, input.signal, (runtime, lease) => runtime.execute({ ...input, lease }));
 }
 
 export async function downloadAcquiredSandbox(
-  acquired: Pick<SandboxAcquisition, 'handle' | 'spec'>,
+  acquired: Pick<SandboxAcquisition, 'handle' | 'spec' | 'invalidate'>,
   input: Omit<DownloadSandboxInput, 'lease'>,
 ): Promise<DownloadFile> {
   return withAcquiredRuntime(acquired, input.signal, (runtime, lease) => runtime.download({ ...input, lease }));
 }
 
 export async function uploadAcquiredSandbox(
-  acquired: Pick<SandboxAcquisition, 'handle' | 'spec'>,
+  acquired: Pick<SandboxAcquisition, 'handle' | 'spec' | 'invalidate'>,
   input: Omit<UploadSandboxInput, 'lease'>,
 ): Promise<void> {
   return withAcquiredRuntime(acquired, input.signal, (runtime, lease) => runtime.upload({ ...input, lease }));
 }
 
 async function withAcquiredRuntime<T>(
-  acquired: Pick<SandboxAcquisition, 'handle' | 'spec'>,
+  acquired: Pick<SandboxAcquisition, 'handle' | 'spec' | 'invalidate'>,
   signal: AbortSignal | undefined,
   operation: (runtime: SandboxRuntime, lease: SandboxLease) => Promise<T>,
 ): Promise<T> {
@@ -306,4 +331,32 @@ function abortError(): DOMException {
 
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw abortError();
+}
+
+function acquireHandle(task: Promise<SandboxHandle>, signal?: AbortSignal): Promise<SandboxHandle> {
+  if (!signal) return task;
+  if (signal.aborted) {
+    void task.then((handle) => handle.kill().catch(() => undefined), () => undefined);
+    return Promise.reject(abortError());
+  }
+  return new Promise<SandboxHandle>((resolve, reject) => {
+    let aborted = false;
+    const onAbort = () => {
+      aborted = true;
+      reject(abortError());
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    task.then(async (handle) => {
+      signal.removeEventListener('abort', onAbort);
+      if (aborted || signal.aborted) {
+        await handle.kill().catch(() => undefined);
+        if (!aborted) reject(abortError());
+        return;
+      }
+      resolve(handle);
+    }, (error) => {
+      signal.removeEventListener('abort', onAbort);
+      if (!aborted) reject(error);
+    });
+  });
 }

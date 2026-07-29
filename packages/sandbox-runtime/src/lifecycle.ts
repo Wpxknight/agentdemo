@@ -45,7 +45,8 @@ export interface SandboxSummary {
 }
 
 export interface SandboxManagerLike {
-  get(spec: SandboxSpec): Promise<SandboxHandle>;
+  get(spec: SandboxSpec, options?: { signal?: AbortSignal }): Promise<SandboxHandle>;
+  evict?(key: string, expectedHandle: SandboxHandle): boolean;
   has(key: string): boolean;
   touch(key: string): boolean;
   use<T>(key: string, action: () => Promise<T>): Promise<T>;
@@ -123,7 +124,8 @@ export class SandboxManager implements SandboxManagerLike {
   }
 
   /** 取得（必要时创建 / 连接）一个沙箱句柄，并刷新其活跃时间。 */
-  async get(spec: SandboxSpec): Promise<SandboxHandle> {
+  async get(spec: SandboxSpec, options: { signal?: AbortSignal } = {}): Promise<SandboxHandle> {
+    throwIfAborted(options.signal);
     if (this.disposed) throw new Error('sandbox manager is disposed');
     if (this.draining) throw new Error('sandbox generation is draining');
     const cached = this.entries.get(spec.key);
@@ -138,7 +140,7 @@ export class SandboxManager implements SandboxManagerLike {
     }
 
     const existing = this.inflight.get(spec.key);
-    if (existing) return existing.task;
+    if (existing) return raceAbort(existing.task, options.signal);
 
     const effectiveTimeout = spec.timeoutMs ?? this.timeoutMs;
     const full: SandboxSpec = { ...spec, timeoutMs: effectiveTimeout };
@@ -148,12 +150,17 @@ export class SandboxManager implements SandboxManagerLike {
       try {
         // 带卷的沙箱不走预热池：卷挂载只能在创建时生效，池中沙箱没有该用户的挂载。
         const handle = full.sandboxId
-          ? await this.provider.connect(full.sandboxId, full)
+          ? options.signal
+            ? await this.provider.connect(full.sandboxId, full, options)
+            : await this.provider.connect(full.sandboxId, full)
           : this.warmPool && !full.volumes?.length
             ? await this.warmPool.acquire()
-            : await this.provider.create(full);
-        if (this.disposed || (this.keyEpochs.get(spec.key) ?? 0) !== epoch) {
+            : options.signal
+              ? await this.provider.create(full, options)
+              : await this.provider.create(full);
+        if (options.signal?.aborted || this.disposed || (this.keyEpochs.get(spec.key) ?? 0) !== epoch) {
           await this.kill(handle);
+          if (options.signal?.aborted) throw abortError();
           throw new Error(this.disposed ? 'sandbox manager is disposed' : 'sandbox session is disposed');
         }
         const readyAt = this.now();
@@ -175,7 +182,9 @@ export class SandboxManager implements SandboxManagerLike {
     const inflight: InflightEntry = { task, spec: full, epoch };
     this.inflight.set(spec.key, inflight);
     try {
-      return await task;
+      return await raceAbort(task, options.signal, () => {
+        if (this.inflight.get(spec.key) === inflight) this.invalidate(spec.key);
+      });
     } finally {
       if (this.inflight.get(spec.key) === inflight) this.inflight.delete(spec.key);
     }
@@ -183,6 +192,14 @@ export class SandboxManager implements SandboxManagerLike {
 
   has(key: string): boolean {
     return this.entries.has(key);
+  }
+
+  /** 仅当缓存仍指向预期句柄时淘汰，避免旧执行误删同 key 的新句柄。 */
+  evict(key: string, expectedHandle: SandboxHandle): boolean {
+    const entry = this.entries.get(key);
+    if (!entry || entry.handle !== expectedHandle) return false;
+    this.entries.delete(key);
+    return true;
   }
 
   /** 刷新缓存沙箱的本地活跃时间；用于已缓存 Desktop 的后续浏览器操作。 */
@@ -362,4 +379,37 @@ export class SandboxManager implements SandboxManagerLike {
       this.cleanupActivity--;
     }
   }
+}
+
+function abortError(): DOMException {
+  return new DOMException('The sandbox acquisition was aborted', 'AbortError');
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError();
+}
+
+function raceAbort<T>(task: Promise<T>, signal?: AbortSignal, onAbort?: () => void): Promise<T> {
+  if (!signal) return task;
+  if (signal.aborted) {
+    onAbort?.();
+    return Promise.reject(abortError());
+  }
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => {
+      onAbort?.();
+      reject(abortError());
+    };
+    signal.addEventListener('abort', abort, { once: true });
+    task.then(
+      (value) => {
+        signal.removeEventListener('abort', abort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', abort);
+        reject(error);
+      },
+    );
+  });
 }

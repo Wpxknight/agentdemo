@@ -48,6 +48,34 @@ function provider(fetch: typeof globalThis.fetch, overrides: Record<string, unkn
 }
 
 describe('AiosE2bProvider', () => {
+  it.each([
+    ['create', '/sandboxes'],
+    ['connect', '/sandboxes/remote/connect'],
+  ] as const)('propagates an external abort signal through %s lifecycle requests', async (mode, suffix) => {
+    let transportSignal: AbortSignal | undefined;
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      expect(String(input)).toContain(suffix);
+      transportSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+      });
+    }) as unknown as typeof globalThis.fetch;
+    const p = provider(fetch);
+    const abort = new AbortController();
+    const acquisition = mode === 'create'
+      ? p.create({ key: 'abort-create', template: 'code-id' }, { signal: abort.signal })
+      : p.connect('remote', { key: 'abort-connect', template: 'code-id' }, { signal: abort.signal });
+
+    await vi.waitFor(() => expect(transportSignal).toBeInstanceOf(AbortSignal));
+    expect(transportSignal?.aborted).toBe(false);
+    abort.abort();
+    await expect(Promise.race([
+      acquisition,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('AIOS acquisition abort was not prompt')), 100)),
+    ])).rejects.toMatchObject({ name: 'AbortError' });
+    expect(transportSignal?.aborted).toBe(true);
+  });
+
   it('rejects invalid readiness retry settings', () => {
     const fetch = vi.fn() as unknown as typeof globalThis.fetch;
     expect(() => provider(fetch, { readinessAttempts: 0 })).toThrow(/readinessAttempts/);

@@ -7,6 +7,8 @@ export type SpecResolver = (ctx: ToolContext, profile?: string) => Partial<Sandb
 export interface SandboxAcquisition {
     handle: SandboxHandle;
     spec: SandboxSpec;
+    /** 淘汰本次取得的精确缓存句柄；句柄已被控制面 kill 时调用。 */
+    invalidate?(): void;
     /** 将凭据污染标记写回本次实际使用的 generation/entry。 */
     markCredentialInjected(): void;
 }
@@ -18,7 +20,7 @@ export declare function isSandboxAcquirer(manager: SandboxManagerLike): manager 
 
 // file: aios-e2b.d.ts
 import type { AiosLifecycleHttpOptions } from './aios-http.js';
-import type { SandboxHandle, SandboxProvider, SandboxSpec } from './types.js';
+import type { SandboxHandle, SandboxProvider, SandboxProviderOperationOptions, SandboxSpec } from './types.js';
 /** AIOS Lifecycle REST API 所需的固定调度位置。 */
 export interface AiosSandboxPlacement {
     clusterId: string;
@@ -50,15 +52,16 @@ export declare class AiosE2bProvider implements SandboxProvider {
     private readonly readinessDelayMs;
     private readonly sleep;
     constructor(opts: AiosE2bProviderOptions);
-    create(spec: SandboxSpec): Promise<SandboxHandle>;
-    connect(sandboxId: string, spec: SandboxSpec): Promise<SandboxHandle>;
-    command(sandboxId: string, command: string, timeoutMs?: number): Promise<CommandResponse>;
+    create(spec: SandboxSpec, options?: SandboxProviderOperationOptions): Promise<SandboxHandle>;
+    connect(sandboxId: string, spec: SandboxSpec, options?: SandboxProviderOperationOptions): Promise<SandboxHandle>;
+    command(sandboxId: string, command: string, timeoutMs?: number, signal?: AbortSignal): Promise<CommandResponse>;
     request<T = unknown>(path: string, init: {
         method: string;
         body?: unknown;
     }, requestOptions?: {
         timeoutMs?: number;
         maxResponseBytes?: number;
+        signal?: AbortSignal;
     }): Promise<T>;
     private assertTemplateAllowed;
     private waitUntilReady;
@@ -84,6 +87,7 @@ interface AiosLifecycleRequestInit {
 export interface AiosLifecycleRequestOptions {
     timeoutMs?: number;
     maxResponseBytes?: number;
+    signal?: AbortSignal;
 }
 export declare class AiosLifecycleHttpClient {
     private readonly apiKey;
@@ -280,7 +284,7 @@ export declare class E2bDesktopProvider implements DesktopProvider {
 
 // file: e2b.d.ts
 import type { AiosE2bProviderOptions } from './aios-e2b.js';
-import type { SandboxHandle, SandboxProvider, SandboxSpec } from './types.js';
+import type { SandboxHandle, SandboxProvider, SandboxProviderOperationOptions, SandboxSpec } from './types.js';
 export interface E2bProviderOptions {
     /** E2B API key；缺省读 E2B_API_KEY 环境变量。 */
     apiKey?: string;
@@ -295,8 +299,8 @@ export declare class E2bProvider implements SandboxProvider {
     private readonly aios?;
     constructor(opts?: E2bProviderOptions);
     private connectOpts;
-    create(spec: SandboxSpec): Promise<SandboxHandle>;
-    connect(sandboxId: string, spec: SandboxSpec): Promise<SandboxHandle>;
+    create(spec: SandboxSpec, options?: SandboxProviderOperationOptions): Promise<SandboxHandle>;
+    connect(sandboxId: string, spec: SandboxSpec, options?: SandboxProviderOperationOptions): Promise<SandboxHandle>;
 }
 
 // file: index.d.ts
@@ -362,7 +366,10 @@ export interface SandboxSummary {
     metadata?: Record<string, string>;
 }
 export interface SandboxManagerLike {
-    get(spec: SandboxSpec): Promise<SandboxHandle>;
+    get(spec: SandboxSpec, options?: {
+        signal?: AbortSignal;
+    }): Promise<SandboxHandle>;
+    evict?(key: string, expectedHandle: SandboxHandle): boolean;
     has(key: string): boolean;
     touch(key: string): boolean;
     use<T>(key: string, action: () => Promise<T>): Promise<T>;
@@ -416,8 +423,12 @@ export declare class SandboxManager implements SandboxManagerLike {
         cleanup: number;
     };
     /** 取得（必要时创建 / 连接）一个沙箱句柄，并刷新其活跃时间。 */
-    get(spec: SandboxSpec): Promise<SandboxHandle>;
+    get(spec: SandboxSpec, options?: {
+        signal?: AbortSignal;
+    }): Promise<SandboxHandle>;
     has(key: string): boolean;
+    /** 仅当缓存仍指向预期句柄时淘汰，避免旧执行误删同 key 的新句柄。 */
+    evict(key: string, expectedHandle: SandboxHandle): boolean;
     /** 刷新缓存沙箱的本地活跃时间；用于已缓存 Desktop 的后续浏览器操作。 */
     touch(key: string): boolean;
     /** 在一次外部操作期间固定缓存 entry，避免 idle sweep 回收仍在执行的浏览器命令。 */
@@ -473,6 +484,7 @@ export declare class LocalSandboxProvider implements SandboxProvider {
     constructor(options?: LocalSandboxProviderOptions);
     create(spec: SandboxSpec): Promise<SandboxHandle>;
     connect(_sandboxId: string, spec: SandboxSpec): Promise<SandboxHandle>;
+    private rejectUnsupportedResources;
     private requireSupportedPlatform;
 }
 
@@ -710,6 +722,7 @@ export declare class SandboxRuntime {
         handle: SandboxHandle;
         spec: SandboxSpec;
         signal?: AbortSignal;
+        invalidate?: () => void;
     }): Promise<SandboxLease>;
     private register;
     execute(input: ExecuteSandboxInput): Promise<SandboxExecutionResult>;
@@ -721,10 +734,12 @@ export declare class SandboxRuntime {
     private requireActive;
     private raceControls;
     private raceVoid;
+    private invalidate;
+    private abortEntry;
 }
-export declare function executeAcquiredSandbox(acquired: Pick<SandboxAcquisition, 'handle' | 'spec'>, input: Omit<ExecuteSandboxInput, 'lease'>): Promise<SandboxExecutionResult>;
-export declare function downloadAcquiredSandbox(acquired: Pick<SandboxAcquisition, 'handle' | 'spec'>, input: Omit<DownloadSandboxInput, 'lease'>): Promise<DownloadFile>;
-export declare function uploadAcquiredSandbox(acquired: Pick<SandboxAcquisition, 'handle' | 'spec'>, input: Omit<UploadSandboxInput, 'lease'>): Promise<void>;
+export declare function executeAcquiredSandbox(acquired: Pick<SandboxAcquisition, 'handle' | 'spec' | 'invalidate'>, input: Omit<ExecuteSandboxInput, 'lease'>): Promise<SandboxExecutionResult>;
+export declare function downloadAcquiredSandbox(acquired: Pick<SandboxAcquisition, 'handle' | 'spec' | 'invalidate'>, input: Omit<DownloadSandboxInput, 'lease'>): Promise<DownloadFile>;
+export declare function uploadAcquiredSandbox(acquired: Pick<SandboxAcquisition, 'handle' | 'spec' | 'invalidate'>, input: Omit<UploadSandboxInput, 'lease'>): Promise<void>;
 
 // file: settings.d.ts
 import { z } from 'zod';
@@ -927,9 +942,12 @@ export interface SandboxHandle {
     kill(): Promise<void>;
 }
 /** 沙箱后端：负责新建 / 连接。 */
+export interface SandboxProviderOperationOptions {
+    signal?: AbortSignal;
+}
 export interface SandboxProvider {
-    create(spec: SandboxSpec): Promise<SandboxHandle>;
-    connect(sandboxId: string, spec: SandboxSpec): Promise<SandboxHandle>;
+    create(spec: SandboxSpec, options?: SandboxProviderOperationOptions): Promise<SandboxHandle>;
+    connect(sandboxId: string, spec: SandboxSpec, options?: SandboxProviderOperationOptions): Promise<SandboxHandle>;
 }
 
 // file: userhome.d.ts

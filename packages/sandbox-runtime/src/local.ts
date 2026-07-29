@@ -312,6 +312,7 @@ export class LocalSandboxProvider implements SandboxProvider {
   }
 
   async create(spec: SandboxSpec): Promise<SandboxHandle> {
+    this.rejectUnsupportedResources(spec);
     await this.requireSupportedPlatform();
     const dir = await mkdtemp(path.join(tmpdir(), 'aiop-local-sandbox-'));
     return new LocalSandboxHandle(dir, spec.key, this.limits);
@@ -319,6 +320,14 @@ export class LocalSandboxProvider implements SandboxProvider {
 
   async connect(_sandboxId: string, spec: SandboxSpec): Promise<SandboxHandle> {
     return this.create(spec);
+  }
+
+  private rejectUnsupportedResources(spec: SandboxSpec): void {
+    for (const field of ['cpu', 'memoryMb', 'network'] as const) {
+      if (spec[field] !== undefined) {
+        throw new Error(`LocalSandboxProvider ${field} isolation is not supported`);
+      }
+    }
   }
 
   private async requireSupportedPlatform(): Promise<void> {

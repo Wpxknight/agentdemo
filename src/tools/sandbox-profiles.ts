@@ -56,7 +56,8 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
     if (isSandboxAcquirer(manager)) return manager.acquire(ctx, profileName);
     const profile = findSandboxProfile(profiles(ctx), profileName, ctx.role);
     const spec = sandboxSpecForProfile(profile, ctx);
-    return { handle: await manager.get(spec), spec };
+    const handle = await manager.get(spec, { signal: ctx.signal });
+    return { handle, spec, invalidate: () => manager.evict?.(spec.key, handle) };
   };
   return [
     defineTool({

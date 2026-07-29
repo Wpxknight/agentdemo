@@ -108,7 +108,8 @@ export function buildExportTool(
         ? await manager.acquire(ctx)
         : await (async () => {
             const spec = await resolveSandboxSpec(resolve, ctx);
-            return { handle: await manager.get(spec), spec };
+            const handle = await manager.get(spec, { signal: ctx.signal });
+            return { handle, spec, invalidate: () => manager.evict?.(spec.key, handle) };
           })();
       let bytes: Uint8Array;
       try {

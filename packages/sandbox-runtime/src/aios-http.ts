@@ -27,6 +27,7 @@ interface AiosLifecycleRequestInit {
 export interface AiosLifecycleRequestOptions {
   timeoutMs?: number;
   maxResponseBytes?: number;
+  signal?: AbortSignal;
 }
 
 function positiveNumber(value: number, name: string): number {
@@ -102,6 +103,7 @@ export class AiosLifecycleHttpClient {
     allowedStatuses: readonly number[] = [],
     requestOptions: AiosLifecycleRequestOptions = {},
   ): Promise<{ body: T; status: number }> {
+    if (requestOptions.signal?.aborted) throw abortError();
     const timeoutMs = requestOptions.timeoutMs === undefined
       ? this.timeoutMs
       : positiveNumber(requestOptions.timeoutMs, 'request timeoutMs');
@@ -111,9 +113,12 @@ export class AiosLifecycleHttpClient {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     timer.unref?.();
+    const signal = requestOptions.signal
+      ? AbortSignal.any([controller.signal, requestOptions.signal])
+      : controller.signal;
 
     try {
-      const response = await this.fetchResponse(path, init, controller.signal);
+      const response = await this.fetchResponse(path, init, signal);
       if (!response.ok && !allowedStatuses.includes(response.status)) {
         throw new AiosLifecycleHttpError(response.status);
       }
@@ -126,6 +131,9 @@ export class AiosLifecycleHttpClient {
       } catch {
         throw new Error(`AIOS Lifecycle returned an invalid JSON response (HTTP ${response.status})`);
       }
+    } catch (error) {
+      if (requestOptions.signal?.aborted) throw abortError();
+      throw error;
     } finally {
       clearTimeout(timer);
     }
@@ -150,4 +158,8 @@ export class AiosLifecycleHttpClient {
       throw new Error(REQUEST_FAILED_MESSAGE);
     }
   }
+}
+
+function abortError(): DOMException {
+  return new DOMException('The AIOS lifecycle request was aborted', 'AbortError');
 }

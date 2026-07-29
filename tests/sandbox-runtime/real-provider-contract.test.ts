@@ -1,42 +1,54 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { SandboxCommand, SandboxProvider } from '../../packages/sandbox-runtime/src/types.js';
 
-const e2b = vi.hoisted(() => ({ killed: vi.fn(), files: new Map<string, Uint8Array>() }));
+const e2b = vi.hoisted(() => ({ killed: vi.fn() }));
 vi.mock('@e2b/code-interpreter', () => {
   class Sandbox {
-    readonly sandboxId = 'e2b-real-adapter';
-    readonly commands = { run: async (command: string, options?: { onStdout?: (text: string) => void }) => {
-      options?.onStdout?.(command);
-      return { stdout: command, stderr: '', exitCode: 0 };
-    } };
-    readonly files = {
-      write: async (path: string, content: ArrayBuffer) => { e2b.files.set(path, new Uint8Array(content)); },
-      read: async (path: string) => e2b.files.get(path) ?? new Uint8Array(),
+    readonly sandboxId = `e2b-real-adapter-${Math.random()}`;
+    readonly commands = {
+      run: async (command: string, options?: {
+        onStdout?: (text: string) => void;
+        onStderr?: (text: string) => void;
+      }) => {
+        if (command === 'wait') return new Promise(() => undefined);
+        options?.onStdout?.('provider-out');
+        options?.onStderr?.('provider-err');
+        return { stdout: 'provider-out', stderr: 'provider-err', exitCode: 0 };
+      },
     };
-    async runCode(code: string) { return { logs: { stdout: [code], stderr: [] } }; }
+    readonly files = { read: async () => new Uint8Array(), write: async () => undefined };
+    async runCode() { return { logs: { stdout: [], stderr: [] } }; }
     async setTimeout() {}
-    async kill() { e2b.killed(); }
+    async kill() { e2b.killed(this.sandboxId); }
     static async create() { return new Sandbox(); }
     static async connect() { return new Sandbox(); }
   }
   return { Sandbox };
 });
 
-const open = vi.hoisted(() => ({ killed: vi.fn(), closed: vi.fn(), files: new Map<string, Uint8Array>() }));
+const open = vi.hoisted(() => ({ killed: vi.fn(), closed: vi.fn() }));
 vi.mock('@alibaba-group/opensandbox', () => {
   class Sandbox {
-    readonly id = 'open-real-adapter';
-    readonly commands = { run: async (command: string) => ({
-      logs: { stdout: [{ text: command }], stderr: [] }, exitCode: 0,
-    }) };
-    readonly files = {
-      writeFiles: async (files: Array<{ path: string; data: Uint8Array }>) => {
-        for (const file of files) open.files.set(file.path, file.data);
+    readonly id = `open-real-adapter-${Math.random()}`;
+    readonly commands = {
+      run: async (
+        command: string,
+        _options?: unknown,
+        handlers?: { onStdout?: (chunk: { text: string }) => void; onStderr?: (chunk: { text: string }) => void },
+      ) => {
+        if (command === 'wait') return new Promise(() => undefined);
+        handlers?.onStdout?.({ text: 'provider-out' });
+        handlers?.onStderr?.({ text: 'provider-err' });
+        return {
+          logs: { stdout: [{ text: 'provider-out' }], stderr: [{ text: 'provider-err' }] },
+          exitCode: 0,
+        };
       },
-      readBytes: async (path: string) => open.files.get(path) ?? new Uint8Array(),
     };
+    readonly files = { readBytes: async () => new Uint8Array(), writeFiles: async () => undefined };
     async renew() {}
-    async kill() { open.killed(); }
-    async close() { open.closed(); }
+    async kill() { open.killed(this.id); }
+    async close() { open.closed(this.id); }
     static async create() { return new Sandbox(); }
     static async connect() { return new Sandbox(); }
   }
@@ -49,69 +61,132 @@ const { E2bProvider } = await import('../../packages/sandbox-runtime/src/e2b.js'
 const { OpenSandboxProvider } = await import('../../packages/sandbox-runtime/src/opensandbox.js');
 const { AiosE2bProvider } = await import('../../packages/sandbox-runtime/src/aios-e2b.js');
 
-describe('concrete sandbox provider contract', () => {
-  it('runs LocalSandboxProvider lifecycle', async () => {
-    const runtime = new SandboxRuntime({ providerName: 'local', provider: new LocalSandboxProvider() });
-    const lease = await runtime.acquire({ spec: { key: 'local-real' } });
-    await expect(runtime.execute({ lease, command: { program: process.execPath, args: ['-e', "process.stdout.write('ok')"] } }))
-      .resolves.toMatchObject({ stdout: 'ok', exitCode: 0 });
-    await runtime.release({ lease });
-  });
+interface RealProviderHarness {
+  name: string;
+  provider: SandboxProvider;
+  spec: { key: string; template?: string };
+  outputCommand: string | SandboxCommand;
+  waitCommand: string | SandboxCommand;
+  /** SDK/HTTP fakes expose kill calls; the real Local handle is verified through lease invalidation. */
+  killCount?: () => number;
+}
 
-  it('runs E2bProvider lifecycle through its SDK adapter', async () => {
-    const runtime = new SandboxRuntime({ providerName: 'e2b', provider: new E2bProvider({ apiKey: 'key' }) });
-    await exerciseFiles(runtime, 'e2b');
-    expect(e2b.killed).toHaveBeenCalled();
-  });
+function localHarness(): RealProviderHarness {
+  return {
+    name: 'local',
+    provider: new LocalSandboxProvider(),
+    spec: { key: 'local-real' },
+    outputCommand: {
+      program: process.execPath,
+      args: ['-e', "process.stdout.write('provider-out');process.stderr.write('provider-err')"],
+    },
+    waitCommand: { program: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'] },
+  };
+}
 
-  it('runs OpenSandboxProvider lifecycle through its SDK adapter', async () => {
-    const runtime = new SandboxRuntime({ providerName: 'opensandbox', provider: new OpenSandboxProvider() });
-    await exerciseFiles(runtime, 'opensandbox');
-    expect(open.killed).toHaveBeenCalled();
-    expect(open.closed).toHaveBeenCalled();
-  });
+function e2bHarness(): RealProviderHarness {
+  return {
+    name: 'e2b', provider: new E2bProvider({ apiKey: 'key' }), spec: { key: 'e2b-real' },
+    outputCommand: 'emit-output', waitCommand: 'wait', killCount: () => e2b.killed.mock.calls.length,
+  };
+}
 
-  it('runs AiosE2bProvider lifecycle through its HTTP adapter', async () => {
-    const requests: Array<{ url: string; body?: unknown }> = [];
-    const files = new Map<string, Uint8Array>();
-    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      const url = String(input);
-      const body = typeof init?.body === 'string' ? JSON.parse(init.body) : undefined;
-      requests.push({ url, body });
-      if (url.endsWith('/sandboxes') && init?.method === 'POST') return json({ id: 'aios-real-adapter' }, 201);
-      if (url.endsWith('/commands')) return json({ stdout: '', stderr: '', exitCode: 0 });
-      if (url.endsWith('/filesystem/write')) {
-        const value = body as { path: string; content: string };
-        files.set(value.path, Uint8Array.from(Buffer.from(value.content, 'base64')));
-        return json({});
-      }
-      if (url.endsWith('/filesystem/read')) {
-        const value = body as { path: string };
-        return json({ encoding: 'base64', content: Buffer.from(files.get(value.path) ?? []).toString('base64') });
-      }
-      return new Response(undefined, { status: 204 });
-    }) as unknown as typeof globalThis.fetch;
-    const provider = new AiosE2bProvider({
+function openHarness(): RealProviderHarness {
+  return {
+    name: 'opensandbox', provider: new OpenSandboxProvider(), spec: { key: 'open-real' },
+    outputCommand: 'emit-output', waitCommand: 'wait', killCount: () => open.killed.mock.calls.length,
+  };
+}
+
+function aiosHarness(): RealProviderHarness {
+  let sequence = 0;
+  let kills = 0;
+  const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    const body = typeof init?.body === 'string' ? JSON.parse(init.body) as { command?: string } : undefined;
+    if (url.endsWith('/sandboxes') && init?.method === 'POST') return json({ id: `aios-real-${++sequence}` }, 201);
+    if (url.endsWith('/commands')) {
+      if (body?.command === 'wait') return new Promise<Response>(() => undefined);
+      if (body?.command === 'true') return json({ stdout: '', stderr: '', exitCode: 0 });
+      return json({ stdout: 'provider-out', stderr: 'provider-err', exitCode: 0 });
+    }
+    if (init?.method === 'DELETE') kills += 1;
+    return new Response(undefined, { status: 204 });
+  }) as unknown as typeof globalThis.fetch;
+  return {
+    name: 'aios',
+    provider: new AiosE2bProvider({
       lifecycleUrl: 'http://aios.local', apiKey: 'key', placement: { clusterId: 'local' },
       allowedTemplateIds: new Set(['code']), fetch, readinessDelayMs: 0,
-    });
-    const runtime = new SandboxRuntime({ providerName: 'aios', provider });
-    const lease = await runtime.acquire({ spec: { key: 'aios', template: 'code' } });
-    await runtime.upload({ lease, file: { path: '/workspace/a', content: new Uint8Array([4, 5]) } });
-    await expect(runtime.download({ lease, path: '/workspace/a' }))
-      .resolves.toEqual({ path: '/workspace/a', content: new Uint8Array([4, 5]) });
+    }),
+    spec: { key: 'aios-real', template: 'code' }, outputCommand: 'emit-output', waitCommand: 'wait',
+    killCount: () => kills,
+  };
+}
+
+describe.each([
+  ['LocalSandboxProvider', localHarness],
+  ['E2bProvider', e2bHarness],
+  ['OpenSandboxProvider', openHarness],
+  ['AiosE2bProvider', aiosHarness],
+] as const)('%s real-provider runtime contract', (_providerClass, makeHarness) => {
+  it('covers acquire, execute, output, stop, and release', async () => {
+    const harness = makeHarness();
+    const runtime = new SandboxRuntime({ providerName: harness.name, provider: harness.provider });
+    const before = harness.killCount?.();
+    const lease = await runtime.acquire({ spec: harness.spec });
+    const chunks: Array<{ stream: string; text: string }> = [];
+
+    await expect(runtime.execute({ lease, command: harness.outputCommand, onOutput: (chunk) => chunks.push(chunk) }))
+      .resolves.toMatchObject({ stdout: 'provider-out', stderr: 'provider-err', exitCode: 0 });
+    expect(chunks).toEqual([
+      { stream: 'stdout', text: 'provider-out' },
+      { stream: 'stderr', text: 'provider-err' },
+    ]);
+    await runtime.stop({ lease });
+    await expect(runtime.execute({ lease, command: harness.outputCommand }))
+      .rejects.toThrow('lease is not active');
     await runtime.release({ lease });
-    expect(requests.some((request) => request.url.endsWith('/filesystem/read'))).toBe(true);
+    if (harness.killCount) expect(harness.killCount()).toBe(before! + 1);
+
+    const released = await runtime.acquire({ spec: { ...harness.spec, key: `${harness.spec.key}-release` } });
+    await runtime.release({ lease: released });
+    await expect(runtime.execute({ lease: released, command: harness.outputCommand }))
+      .rejects.toThrow('lease is not active');
+    if (harness.killCount) expect(harness.killCount()).toBe(before! + 2);
+  });
+
+  it('kills the acquired handle on timeout', async () => {
+    const harness = makeHarness();
+    const runtime = new SandboxRuntime({ providerName: harness.name, provider: harness.provider });
+    const before = harness.killCount?.();
+    const lease = await runtime.acquire({ spec: { ...harness.spec, key: `${harness.spec.key}-timeout` } });
+
+    await expect(runtime.execute({ lease, command: harness.waitCommand, timeoutMs: 5 })).resolves.toEqual({
+      stdout: '', stderr: '', exitCode: 124, error: 'command timed out', timedOut: true,
+    });
+    await expect(runtime.execute({ lease, command: harness.outputCommand }))
+      .rejects.toThrow('lease is not active');
+    if (harness.killCount) expect(harness.killCount()).toBe(before! + 1);
+  });
+
+  it('kills the acquired handle on abort', async () => {
+    const harness = makeHarness();
+    const runtime = new SandboxRuntime({ providerName: harness.name, provider: harness.provider });
+    const before = harness.killCount?.();
+    const lease = await runtime.acquire({ spec: { ...harness.spec, key: `${harness.spec.key}-abort` } });
+    const abort = new AbortController();
+    const execution = runtime.execute({ lease, command: harness.waitCommand, signal: abort.signal });
+    abort.abort();
+
+    await expect(execution).rejects.toMatchObject({ name: 'AbortError' });
+    await expect(runtime.execute({ lease, command: harness.outputCommand }))
+      .rejects.toThrow('lease is not active');
+    if (harness.killCount) {
+      await vi.waitFor(() => expect(harness.killCount!()).toBe(before! + 1));
+    }
   });
 });
-
-async function exerciseFiles(runtime: InstanceType<typeof SandboxRuntime>, providerName: string): Promise<void> {
-  const lease = await runtime.acquire({ spec: { key: providerName } });
-  await runtime.upload({ lease, file: { path: '/workspace/a', content: new Uint8Array([1, 2, 3]) } });
-  await expect(runtime.download({ lease, path: '/workspace/a' }))
-    .resolves.toEqual({ path: '/workspace/a', content: new Uint8Array([1, 2, 3]) });
-  await runtime.release({ lease });
-}
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });

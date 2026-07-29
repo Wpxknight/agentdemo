@@ -14,6 +14,25 @@ interface ContractHarness {
   killed: ReturnType<typeof vi.fn>;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
+}
+
+function acquisitionHandle(id: string) {
+  const kill = vi.fn(async () => undefined);
+  const handle: SandboxHandle = {
+    sandboxId: id,
+    runCode: async () => ({ stdout: '', stderr: '' }),
+    runCommand: async () => ({ stdout: '', stderr: '' }),
+    readFile: async () => new Uint8Array(),
+    setTimeout: async () => undefined,
+    kill,
+  };
+  return { handle, kill };
+}
+
 it('runs the contract through each concrete provider adapter', async () => {
   const source = await readFile(new URL('./real-provider-contract.test.ts', import.meta.url), 'utf8');
   for (const provider of ['LocalSandboxProvider', 'E2bProvider', 'OpenSandboxProvider', 'AiosE2bProvider']) {
@@ -150,5 +169,38 @@ describe('SandboxRuntime provider-neutral core contract', () => {
       program: 'node', args: ['script.js', 'two words'], cwd: 'workspace', env: { TOKEN: 'secret' },
     }), expect.any(Object));
     expect(writeFile).toHaveBeenCalledWith('input.bin', new Uint8Array([1, 2]));
+  });
+
+  it.each([
+    { mode: 'create' as const, spec: { key: 'abort-create' } },
+    { mode: 'connect' as const, spec: { key: 'abort-connect', sandboxId: 'remote-id' } },
+  ])('aborts a pending $mode promptly, forwards the signal, and kills a late handle', async ({ mode, spec }) => {
+    const pending = deferred<SandboxHandle>();
+    const late = acquisitionHandle(`late-${mode}`);
+    let receivedSignal: AbortSignal | undefined;
+    const provider = {
+      create: vi.fn(async (_spec: SandboxSpec, options?: { signal?: AbortSignal }) => {
+        receivedSignal = options?.signal;
+        return pending.promise;
+      }),
+      connect: vi.fn(async (_id: string, _spec: SandboxSpec, options?: { signal?: AbortSignal }) => {
+        receivedSignal = options?.signal;
+        return pending.promise;
+      }),
+    } as SandboxProvider;
+    const runtime = new SandboxRuntime({ providerName: 'abortable', provider });
+    const abort = new AbortController();
+    const acquisition = runtime.acquire({ spec, signal: abort.signal });
+
+    abort.abort();
+    await expect(Promise.race([
+      acquisition,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('acquisition abort was not prompt')), 100)),
+    ])).rejects.toMatchObject({ name: 'AbortError' });
+    expect(receivedSignal).toBe(abort.signal);
+    expect(mode === 'create' ? provider.create : provider.connect).toHaveBeenCalledOnce();
+
+    pending.resolve(late.handle);
+    await vi.waitFor(() => expect(late.kill).toHaveBeenCalledOnce());
   });
 });

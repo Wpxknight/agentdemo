@@ -10,6 +10,7 @@ import type {
   SandboxCommand,
   SandboxHandle,
   SandboxProvider,
+  SandboxProviderOperationOptions,
   SandboxSpec,
 } from './types.js';
 import { joinLogText } from './output.js';
@@ -140,8 +141,8 @@ export class E2bProvider implements SandboxProvider {
     };
   }
 
-  async create(spec: SandboxSpec): Promise<SandboxHandle> {
-    if (this.aios) return this.aios.create(spec);
+  async create(spec: SandboxSpec, options: SandboxProviderOperationOptions = {}): Promise<SandboxHandle> {
+    if (this.aios) return this.aios.create(spec, options);
     const metadata = {
       ...spec.metadata,
       ...(spec.namespace ? { namespace: spec.namespace } : {}),
@@ -161,8 +162,12 @@ export class E2bProvider implements SandboxProvider {
     return new E2bHandle(sbx);
   }
 
-  async connect(sandboxId: string, spec: SandboxSpec): Promise<SandboxHandle> {
-    if (this.aios) return this.aios.connect(sandboxId, spec);
+  async connect(
+    sandboxId: string,
+    spec: SandboxSpec,
+    options: SandboxProviderOperationOptions = {},
+  ): Promise<SandboxHandle> {
+    if (this.aios) return this.aios.connect(sandboxId, spec, options);
     const sbx = await Sandbox.connect(sandboxId, this.connectOpts(spec));
     if (spec.timeoutMs) await sbx.setTimeout(spec.timeoutMs); // 续命防回收
     return new E2bHandle(sbx);

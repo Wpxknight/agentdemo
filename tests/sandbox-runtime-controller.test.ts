@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { sandboxIdentityKey } from '../packages/sandbox-runtime/src/keys.js';
 import { SandboxRuntimeController } from '../packages/sandbox-runtime/src/runtime-controller.js';
+import { executeAcquiredSandbox } from '../packages/sandbox-runtime/src/runtime.js';
 import type { DesktopHandle } from '../packages/sandbox-runtime/src/desktop.js';
 import { buildSandboxProfileTools } from '../src/tools/sandbox-profiles.js';
 import type { SandboxProfile } from '../packages/sandbox-runtime/src/profiles.js';
@@ -82,6 +83,116 @@ const spec = (sessionId: string) => ({
 });
 
 describe('SandboxRuntimeController', () => {
+  it.each(['timeout', 'abort'] as const)('evicts a managed handle killed by execution %s', async (control) => {
+    const backend = provider('controlled');
+    vi.mocked(backend.instance.create).mockImplementation(async (sandboxSpec) => {
+      const handle = await provider('handle').instance.create(sandboxSpec);
+      vi.mocked(handle.runCommand).mockImplementation(async () => new Promise(() => undefined));
+      return handle;
+    });
+    const controller = new SandboxRuntimeController();
+    await controller.commit({ manager: { provider: backend.instance }, profiles: [] });
+    const sandboxSpec = spec(`killed-${control}`);
+    const acquired = await controller.acquireSpec({ ...userA, sessionId: `killed-${control}` }, sandboxSpec);
+    const abort = new AbortController();
+    const execution = executeAcquiredSandbox(acquired, {
+      command: 'wait',
+      ...(control === 'timeout' ? { timeoutMs: 5 } : { signal: abort.signal }),
+    });
+    if (control === 'abort') abort.abort();
+
+    if (control === 'timeout') {
+      await expect(execution).resolves.toMatchObject({ exitCode: 124, timedOut: true });
+    } else {
+      await expect(execution).rejects.toMatchObject({ name: 'AbortError' });
+    }
+    await vi.waitFor(() => expect(acquired.handle.kill).toHaveBeenCalledOnce());
+
+    const replacement = await controller.acquireSpec(
+      { ...userA, sessionId: `killed-${control}` },
+      sandboxSpec,
+    );
+    expect(replacement.handle).not.toBe(acquired.handle);
+    expect(backend.instance.create).toHaveBeenCalledTimes(2);
+    acquired.invalidate?.();
+    await expect(controller.acquireSpec(
+      { ...userA, sessionId: `killed-${control}` },
+      sandboxSpec,
+    )).resolves.toMatchObject({ handle: replacement.handle });
+    expect(backend.instance.create).toHaveBeenCalledTimes(2);
+    await controller.disposeAll();
+  });
+
+  it.each(['acquire', 'acquireSpec'] as const)('propagates ToolContext.signal through %s acquisition', async (method) => {
+    const pending = deferred<SandboxHandle>();
+    let receivedSignal: AbortSignal | undefined;
+    let attempts = 0;
+    const fresh = await provider('fresh').instance.create({ key: 'fresh' });
+    const backend: SandboxProvider = {
+      create: vi.fn(async (_spec: SandboxSpec, options?: { signal?: AbortSignal }) => {
+        receivedSignal = options?.signal;
+        attempts += 1;
+        return attempts === 1 ? pending.promise : fresh;
+      }),
+      connect: vi.fn(async () => pending.promise),
+    } as SandboxProvider;
+    const controller = new SandboxRuntimeController();
+    await controller.commit({
+      manager: { provider: backend },
+      profiles: [],
+      resolveSpec: () => spec('signal'),
+    });
+    const abort = new AbortController();
+    const ctx = { ...userA, sessionId: 'signal', signal: abort.signal };
+    const acquisition = method === 'acquire'
+      ? controller.acquire(ctx)
+      : controller.acquireSpec(ctx, spec('signal'));
+
+    await vi.waitFor(() => expect(receivedSignal).toBe(abort.signal));
+    abort.abort();
+    await expect(Promise.race([
+      acquisition,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('controller abort was not prompt')), 100)),
+    ])).rejects.toMatchObject({ name: 'AbortError' });
+    const late = await provider('late').instance.create({ key: 'late' });
+    pending.resolve(late);
+    await vi.waitFor(() => expect(late.kill).toHaveBeenCalledOnce());
+    await expect(controller.acquireSpec(
+      { ...userA, sessionId: 'signal' },
+      spec('signal'),
+    )).resolves.toMatchObject({ handle: fresh });
+    expect(backend.create).toHaveBeenCalledTimes(2);
+    await controller.disposeAll();
+  });
+
+  it.each(['acquire', 'acquireSpec'] as const)('aborts %s while its spec source is still pending', async (method) => {
+    const resolving = deferred<Partial<SandboxSpec>>();
+    const backend = provider('unreached');
+    const controller = new SandboxRuntimeController();
+    await controller.commit({
+      manager: { provider: backend.instance },
+      profiles: [],
+      resolveSpec: () => resolving.promise,
+    });
+    const abort = new AbortController();
+    const ctx = { ...userA, sessionId: 'pending-spec', signal: abort.signal };
+    const acquisition = method === 'acquire'
+      ? controller.acquire(ctx)
+      : controller.acquireSpec(ctx, () => resolving.promise as Promise<SandboxSpec>);
+
+    abort.abort();
+    await expect(Promise.race([
+      acquisition,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('spec resolution abort was not prompt')), 100)),
+    ])).rejects.toMatchObject({ name: 'AbortError' });
+    expect(backend.instance.create).not.toHaveBeenCalled();
+
+    resolving.resolve(spec('pending-spec'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(backend.instance.create).not.toHaveBeenCalled();
+    await controller.disposeAll();
+  });
+
   it('routes new sessions to the new generation while retaining old handles for disposal', async () => {
     const first = provider('first');
     const second = provider('second');

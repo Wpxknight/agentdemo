@@ -41,7 +41,8 @@ export function buildSandboxTools(
   const acquire = async (ctx: ToolContext) => {
     if (isSandboxAcquirer(manager)) return manager.acquire(ctx);
     const spec = await resolveSandboxSpec(resolve, ctx);
-    return { handle: await manager.get(spec), spec };
+    const handle = await manager.get(spec, { signal: ctx.signal });
+    return { handle, spec, invalidate: () => manager.evict?.(spec.key, handle) };
   };
   const executeAdapter = async (
     name: 'sbx__run_code' | 'sbx__run_command',

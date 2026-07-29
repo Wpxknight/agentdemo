@@ -11,6 +11,8 @@ export type SpecResolver = (
 export interface SandboxAcquisition {
   handle: SandboxHandle;
   spec: SandboxSpec;
+  /** 淘汰本次取得的精确缓存句柄；句柄已被控制面 kill 时调用。 */
+  invalidate?(): void;
   /** 将凭据污染标记写回本次实际使用的 generation/entry。 */
   markCredentialInjected(): void;
 }

@@ -534,6 +534,19 @@ describe('sandbox tools', () => {
 });
 
 describe('LocalSandboxProvider', () => {
+  it.each([
+    ['cpu', { cpu: 1 }],
+    ['memoryMb', { memoryMb: 512 }],
+    ['network', { network: 'none' as const }],
+  ])('explicitly rejects unsupported %s isolation for create and connect', async (field, resource) => {
+    const provider = new LocalSandboxProvider();
+    const spec = { key: `local-unsupported-${field}`, ...resource };
+
+    await expect(provider.create(spec)).rejects.toThrow(new RegExp(`LocalSandboxProvider.*${field}.*not support`, 'i'));
+    await expect(provider.connect('local-existing', spec))
+      .rejects.toThrow(new RegExp(`LocalSandboxProvider.*${field}.*not support`, 'i'));
+  });
+
   it('executes shell commands in a disposable local sandbox', async () => {
     const provider = new LocalSandboxProvider();
     const handle = await provider.create({ key: 'local-test' });

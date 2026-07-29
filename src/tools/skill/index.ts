@@ -141,9 +141,11 @@ export function buildSkillTools(
           ? await manager.acquire(ctx)
           : await (async () => {
               const spec = await resolveSpec(ctx);
+              const handle = await manager.get(spec, { signal: ctx.signal });
               return {
-                handle: await manager.get(spec),
+                handle,
                 spec,
+                invalidate: () => manager.evict?.(spec.key, handle),
                 markCredentialInjected: () => manager.markCredentialInjected(spec.key),
               };
             })();

@@ -149,7 +149,7 @@ export class SandboxRuntimeController implements SandboxAcquirer {
     try {
       const role = ctx.role ?? 'user';
       if (profile) findSandboxProfile(generation.profiles, profile, role);
-      const spec = await this.resolveSpec(generation, ctx, profile);
+      const spec = await raceAbort(this.resolveSpec(generation, ctx, profile), ctx.signal);
       const resolvedProfile = spec.profile
         ? findSandboxProfile(generation.profiles, spec.profile, role)
         : undefined;
@@ -157,7 +157,7 @@ export class SandboxRuntimeController implements SandboxAcquirer {
         throw new Error('当前身份无权使用该沙箱模板；sandbox-diag 仅 platform_admin 可用');
       }
       this.assertOperationValid(generation, sessionEpochs);
-      const handle = await generation.manager.get(spec);
+      const handle = await generation.manager.get(spec, { signal: ctx.signal });
       if (!this.operationValid(generation, sessionEpochs)) {
         await generation.manager.dispose(spec.key).catch(() => {});
         throw new Error('sandbox session is disposed');
@@ -165,6 +165,7 @@ export class SandboxRuntimeController implements SandboxAcquirer {
       return {
         handle,
         spec,
+        invalidate: () => generation.manager.evict(spec.key, handle),
         markCredentialInjected: () => generation.manager.markCredentialInjected(spec.key),
       };
     } finally {
@@ -180,9 +181,11 @@ export class SandboxRuntimeController implements SandboxAcquirer {
     const sessionKeys = this.sessionKeys(ctx, ctx.sessionId);
     const sessionEpochs = this.captureSessionEpochs(generation, sessionKeys);
     try {
-      const spec = typeof source === 'function' ? await source() : source;
+      const spec = typeof source === 'function'
+        ? await raceAbort(Promise.resolve().then(source), ctx.signal)
+        : source;
       this.assertOperationValid(generation, sessionEpochs);
-      const handle = await generation.manager.get(spec);
+      const handle = await generation.manager.get(spec, { signal: ctx.signal });
       if (!this.operationValid(generation, sessionEpochs)) {
         await generation.manager.dispose(spec.key).catch(() => {});
         throw new Error('sandbox session is disposed');
@@ -190,6 +193,7 @@ export class SandboxRuntimeController implements SandboxAcquirer {
       return {
         handle,
         spec,
+        invalidate: () => generation.manager.evict(spec.key, handle),
         markCredentialInjected: () => generation.manager.markCredentialInjected(spec.key),
       };
     } finally {
@@ -443,4 +447,27 @@ export class SandboxRuntimeController implements SandboxAcquirer {
     generation.cleanupPromise = cleanup;
     await cleanup;
   }
+}
+
+function abortError(): DOMException {
+  return new DOMException('The sandbox acquisition was aborted', 'AbortError');
+}
+
+function raceAbort<T>(task: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return task;
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(abortError());
+    signal.addEventListener('abort', abort, { once: true });
+    task.then(
+      (value) => {
+        signal.removeEventListener('abort', abort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', abort);
+        reject(error);
+      },
+    );
+  });
 }
