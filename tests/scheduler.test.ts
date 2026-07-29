@@ -296,6 +296,42 @@ describe('embedded scheduler deployment', () => {
     });
   });
 
+  it('preserves TOOL_RESULT_UNKNOWN when reconciling a recovery-required bound Run', async () => {
+    const fireTime = new Date('2026-07-29T01:00:00.000Z');
+    const schedulerStore = new MemorySchedulerStore([{
+      taskId: 'task-recovery', tenantId: 'tenant-a', actorId: 'user-a', sessionId: 'session-a',
+      cron: '0 * * * *', input: [{ role: 'user', text: 'deploy' }], nextFireAt: fireTime,
+    }]);
+    const [fire] = await schedulerStore.claimDue({ now: fireTime, limit: 1, workerId: 'dead', leaseMs: 10 });
+    await schedulerStore.bindRun({
+      fireId: fire!.fireId, claimToken: fire!.claimToken, runId: fire!.fireId, boundAt: fireTime,
+    });
+    const store = new MemoryStore();
+    await store.putAgentRunBindingIfAbsent({
+      tenantId: 'tenant-a', userId: 'user-a', sessionId: 'session-a', runId: fire!.fireId,
+      kernel: 'pi', graphName: 'pi', graphVersion: '0.82.1', createdAt: fireTime,
+    });
+    await store.updateAgentRun('tenant-a', fire!.fireId, {
+      status: 'recovery_required', errorMessage: 'tool result is unknown',
+      usage: { inputTokens: 1, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      updatedAt: fireTime, clearLease: true,
+    });
+    const scheduler = createRuntimeScheduler({
+      store, durableRunRuntime: { run: vi.fn(), resume: vi.fn() },
+    } as unknown as Runtime, {
+      store: schedulerStore, workerId: 'observer', leaseMs: 10, batch: 1,
+    });
+
+    expect(await scheduler.tick(new Date(fireTime.getTime() + 10))).toBe(1);
+    expect((await schedulerStore.listFires())[0]).toMatchObject({
+      state: 'started',
+      result: {
+        status: 'recovery_required',
+        error: { code: 'TOOL_RESULT_UNKNOWN', message: 'tool result is unknown', retryable: false },
+      },
+    });
+  });
+
   it('awaits scheduler shutdown before disposing the runtime in production entrypoints', async () => {
     const source = await readFile('src/index.ts', 'utf8');
     expect(source).toContain('await scheduler?.stop()');

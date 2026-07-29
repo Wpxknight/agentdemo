@@ -241,7 +241,11 @@ function persistedRunResult(record: AgentRunRecord) {
     status: record.status as 'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'recovery_required',
     usage: record.usage,
     ...(record.errorMessage ? {
-      error: { code: 'MODEL_PROVIDER_ERROR' as const, message: record.errorMessage, retryable: false },
+      error: {
+        code: record.status === 'recovery_required' ? 'TOOL_RESULT_UNKNOWN' as const : 'MODEL_PROVIDER_ERROR' as const,
+        message: record.errorMessage,
+        retryable: false,
+      },
     } : {}),
   };
 }

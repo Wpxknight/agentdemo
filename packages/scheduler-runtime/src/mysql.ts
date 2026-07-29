@@ -240,7 +240,8 @@ function compatibilityStatus(result: import('@aiop/control-contracts').AgentRunR
 
 function compatibilityDetail(result: import('@aiop/control-contracts').AgentRunResult): string {
   return JSON.stringify({
-    runId: result.runId, status: result.status, text: result.text, error: result.error, usage: result.usage,
+    runId: result.runId, status: result.status, durableStatus: result.status,
+    text: result.text, error: result.error, usage: result.usage,
   });
 }
 

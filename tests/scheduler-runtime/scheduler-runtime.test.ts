@@ -764,6 +764,10 @@ describe('scheduler runtime boundaries', () => {
     expect(completeFire).toContain('compatibilityStatus(input.result)');
     expect(completeFire).toContain('compatibilityDetail(input.result)');
     expect(completeFire).not.toContain("status: 'success', detail: input.runId");
+    const compatibilityDetail = source.slice(
+      source.indexOf('function compatibilityDetail'), source.indexOf('function parsePayload'),
+    );
+    expect(compatibilityDetail).toContain('durableStatus: result.status');
   });
 
   it('MySQL persists bound Runs with exact-token recovery fencing', async () => {
