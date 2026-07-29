@@ -130,7 +130,7 @@ export class SchedulerRunner {
         runId: claimed.runId,
         result,
         completedAt: now,
-      }).catch(() => undefined); // The Durable result remains authoritative if another scheduler won completion.
+      }).catch(() => undefined);
       recovered += 1;
     }
     if (signal?.aborted) return recovered;

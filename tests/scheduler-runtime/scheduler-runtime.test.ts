@@ -424,15 +424,49 @@ describe('SchedulerRunner', () => {
     expect(inspect).toHaveBeenCalledTimes(2);
   });
 
-  it('does not release a recovered Run when completion loses its scheduler fence', async () => {
+  it('defers a recovered Run when completion fails with the recovery fence still current', async () => {
     const base = new MemorySchedulerStore([task]);
     const [fire] = await base.claimDue({ now: fireTime, limit: 1, workerId: 'dead', leaseMs: 10 });
     await base.bindRun({ fireId: fire!.fireId, claimToken: fire!.claimToken, runId: fire!.fireId, boundAt: fireTime });
     const completeFire = vi.spyOn(base, 'completeFire').mockRejectedValueOnce(new Error('stale scheduler claim'));
     const releaseBound = vi.spyOn(base, 'releaseBound');
+    const inspect = vi.fn(async () => ({ kind: 'recoverable' as const }));
+    const resume = vi.fn(async () => succeeded(fire!.fireId).result);
     const runner = new SchedulerRunner({
       store: base,
       dispatcher: { startScheduledRun: vi.fn() },
+      boundRecovery: { inspect, resume },
+      workerId: 'recovery', leaseMs: 10,
+    });
+
+    await expect(runner.tick(new Date(fireTime.getTime() + 10), 1)).resolves.toBe(1);
+    expect(completeFire).toHaveBeenCalledOnce();
+    expect(releaseBound).toHaveBeenCalledWith(expect.objectContaining({
+      fireId: fire!.fireId,
+      retryAt: new Date(fireTime.getTime() + 30_010),
+      error: 'Error: stale scheduler claim',
+    }));
+    expect((await base.listFires())[0]).toMatchObject({
+      state: 'bound',
+      attempts: 1,
+      retryAt: new Date(fireTime.getTime() + 30_010),
+      lastError: 'Error: stale scheduler claim',
+    });
+    expect(await runner.tick(new Date(fireTime.getTime() + 30_009), 1)).toBe(0);
+    expect(inspect).toHaveBeenCalledOnce();
+    expect(resume).toHaveBeenCalledOnce();
+  });
+
+  it('isolates a stale completion release fence and continues later ordinary work', async () => {
+    const base = new MemorySchedulerStore([task, { ...task, taskId: 'task-b' }]);
+    const [fire] = await base.claimDue({ now: fireTime, limit: 1, workerId: 'dead', leaseMs: 10 });
+    await base.bindRun({ fireId: fire!.fireId, claimToken: fire!.claimToken, runId: fire!.fireId, boundAt: fireTime });
+    vi.spyOn(base, 'completeFire').mockRejectedValueOnce(new Error('transient completion failure'));
+    vi.spyOn(base, 'releaseBound').mockRejectedValueOnce(new Error('stale scheduler claim'));
+    const startScheduledRun = vi.fn(async (input, onStarted) => dispatchSucceeded(input.fireId, onStarted));
+    const runner = new SchedulerRunner({
+      store: base,
+      dispatcher: { startScheduledRun },
       boundRecovery: {
         inspect: async () => ({ kind: 'recoverable' }),
         resume: async () => succeeded(fire!.fireId).result,
@@ -440,9 +474,12 @@ describe('SchedulerRunner', () => {
       workerId: 'recovery', leaseMs: 10,
     });
 
-    await expect(runner.tick(new Date(fireTime.getTime() + 10), 1)).resolves.toBe(1);
-    expect(completeFire).toHaveBeenCalledOnce();
-    expect(releaseBound).not.toHaveBeenCalled();
+    await expect(runner.tick(new Date(fireTime.getTime() + 10), 2)).resolves.toBe(2);
+    expect(startScheduledRun).toHaveBeenCalledOnce();
+    expect((await base.listFires()).find((candidate) => candidate.fireId === fire!.fireId))
+      .toMatchObject({ state: 'recovering', attempts: 1 });
+    expect((await base.listFires()).find((candidate) => candidate.fireId.startsWith('task-b:')))
+      .toMatchObject({ state: 'started', attempts: 1 });
   });
 
   it('keeps a resume failure primary when releasing the recovery fence is stale', async () => {
