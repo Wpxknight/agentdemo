@@ -52,6 +52,8 @@ import {
 } from '../agent/run-center.js';
 import type { AgentRunRecord, AgentRunStatus, SessionContextUsage } from '../db/store.js';
 import type { AgentRunResult, IdentityContext } from '@aiop/control-contracts';
+import { createAIOPToolRuntime } from '../agent/pi/tool-runtime.js';
+import { ResourceConcurrencyController } from '@aiop/pi-runtime';
 
 const log = logger.child({ mod: 'http' });
 
@@ -296,7 +298,7 @@ function parseCookies(header: string | undefined): Record<string, string> {
 
 /** 业务错误：携带 HTTP 状态码。 */
 class HttpError extends Error {
-  constructor(public status: number, message: string) {
+  constructor(public status: number, message: string, readonly body?: Record<string, unknown>) {
     super(message);
   }
 }
@@ -765,11 +767,14 @@ async function dispatchDirectTool(
     const identity = mcpIdentity(ctx);
     const definition = (await rt.mcp.tools(identity)).find((tool) => tool.name === name);
     if (!definition) throw new HttpError(409, `工具未启用：${name}`);
-    const decision = await rt.policy.check(call, toolCtx);
-    if (decision.blocked) throw new HttpError(403, decision.reason ?? '策略阻止了该操作');
-    if (decision.needApproval) throw new HttpError(409, decision.reason ?? '该操作需要审批，无法直接执行');
     const logicalCallId = call.id;
-    const result = await definition.execute({
+    const outcome = await createAIOPToolRuntime({
+      model: rt.model,
+      tools: rt.tools,
+      governedTools: [definition],
+      policy: rt.policy,
+      ctx: toolCtx,
+    }, rt.store.agentRuntimeStore().toolLedger, new ResourceConcurrencyController(), undefined, true).execute({
       id: call.id,
       logicalCallId,
       name,
@@ -780,9 +785,25 @@ async function dispatchDirectTool(
       attemptId: call.id,
       turnNo: 1,
       sessionId,
-      idempotencyKey: `${identity.tenantId}:direct:${sessionId}:${logicalCallId}`,
     });
-    return { ok: !result.isError, sessionId, result: { id: call.id, ...result } };
+    if (outcome.kind === 'recovery_required') {
+      throw new HttpError(409, outcome.message, {
+        error: outcome.message,
+        recoveryRequired: true,
+        correlationId: outcome.correlationId,
+      });
+    }
+    if (outcome.kind === 'waiting') {
+      throw new HttpError(409, `工具等待${outcome.reason}`, {
+        error: `工具等待${outcome.reason}`,
+        interactionId: outcome.interactionId,
+      });
+    }
+    if (outcome.result.isError) {
+      const denied = outcome.result.content.startsWith('blocked by policy:');
+      throw new HttpError(denied ? 403 : 409, outcome.result.content);
+    }
+    return { ok: true, sessionId, result: { id: call.id, content: outcome.result.content } };
   }
   if (!rt.tools.has(name)) throw new HttpError(409, `工具未启用：${name}`);
   const decision = await rt.policy.check(call, toolCtx);
@@ -866,7 +887,7 @@ export function createHttpServer(rt: Runtime): http.Server {
 
   return http.createServer((req, res) => {
     handle(rt, secret, approvals, questions, interactions, runCenter, activeRuns, compactionWatermarks, req, res).catch((err) => {
-      if (err instanceof HttpError) return sendJson(res, err.status, { error: err.message });
+      if (err instanceof HttpError) return sendJson(res, err.status, err.body ?? { error: err.message });
       if (err instanceof RunCenterNotFoundError) return sendJson(res, 404, { error: err.message });
       if (err instanceof RunCenterConflictError) return sendJson(res, 409, { error: err.message });
       if (err instanceof AuthzError) return sendJson(res, 403, { error: err.message });

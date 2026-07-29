@@ -1,9 +1,49 @@
 import { describe, expect, it, vi } from 'vitest';
 import { McpRuntime, type McpAuditEvent } from '../../packages/mcp-runtime/src/index.js';
+import { GovernedToolFactory, type ToolLedgerStore } from '../../packages/pi-runtime/src/index.js';
 
 const tenant = { tenantId: 'tenant-a', actorId: 'user-a', roles: ['operator'] };
 
 describe('MCP governed tool adapter', () => {
+  it('routes direct invoke through governed idempotency instead of executing the definition twice', async () => {
+    const callTool = vi.fn(async () => ({ content: [{ type: 'text', text: 'once' }] }));
+    const records = new Map<string, Parameters<ToolLedgerStore['putIfAbsent']>[0]>();
+    const ledger: ToolLedgerStore = {
+      putIfAbsent: async (record) => {
+        if (records.has(record.logicalCallId)) return false;
+        records.set(record.logicalCallId, structuredClone(record));
+        return true;
+      },
+      get: async ({ logicalCallId }) => structuredClone(records.get(logicalCallId)),
+      update: async (record) => { records.set(record.logicalCallId, structuredClone(record)); },
+      claimPendingApproval: async () => false,
+    };
+    const runtime = new McpRuntime({
+      connect: async () => ({
+        listTools: async () => ({ tools: [{ name: 'read', inputSchema: {} }] }),
+        callTool,
+        close: async () => undefined,
+      }),
+      governance: (definitions) => {
+        const governed = new GovernedToolFactory({ ledger }).create(definitions);
+        return {
+          execute: async (call, context) => {
+            const outcome = await governed.execute(call, context);
+            for (const update of outcome.ledgerUpdates ?? []) await ledger.update(update);
+            return outcome;
+          },
+        };
+      },
+    });
+    await runtime.configure(tenant, {
+      ops: { transport: 'http', url: 'https://mcp.example', toolCapabilities: { read: 'read' } },
+    });
+
+    await expect(runtime.invoke('mcp__ops__read', {}, tenant)).resolves.toEqual({ content: 'once' });
+    await expect(runtime.invoke('mcp__ops__read', {}, tenant)).resolves.toEqual({ content: 'once' });
+    expect(callTool).toHaveBeenCalledOnce();
+  });
+
   it('redacts transport details from failed-call audit events', async () => {
     const events: McpAuditEvent[] = [];
     const runtime = new McpRuntime({

@@ -88,13 +88,20 @@ export class McpRuntime {
     const tools = await this.discover(identity);
     const tool = tools.find((candidate) => candidate.name === name);
     if (!tool) throw new Error('MCP tool is not visible');
-    const result = await tool.execute({
+    if (!this.options.governance) throw new Error('MCP invoke requires an injected governance runtime');
+    const call = {
       id: name, logicalCallId: name, name, arguments: argumentsValue,
-    }, {
-      identity, runId: 'mcp-direct', attemptId: 'mcp-direct', turnNo: 0,
-      idempotencyKey: `${identity.tenantId}:mcp-direct:${name}`,
-    });
-    return { content: result.content };
+    };
+    const outcome = await this.options.governance(tools).execute(call, {
+        identity, runId: `mcp-direct:${identity.actorId}`, attemptId: 'mcp-direct', turnNo: 0,
+      });
+    if (outcome.kind === 'result') {
+      if (outcome.result.isError) throw new Error(outcome.result.content);
+      return { content: outcome.result.content };
+    }
+    throw new Error(outcome.kind === 'waiting'
+      ? `MCP tool is waiting for ${outcome.reason}`
+      : outcome.message);
   }
 
   async reconnect(identity: IdentityContext, server: string): Promise<McpServerInfo> {

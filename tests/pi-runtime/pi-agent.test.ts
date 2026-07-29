@@ -64,6 +64,31 @@ function testModels() {
 }
 
 describe('PiAgentSessionFactory', () => {
+  it('resolves governed tools from the durable run identity when creating a session', async () => {
+    const repository = new InMemorySessionRepo();
+    const controlled = testModels();
+    const seen: unknown[] = [];
+    const factory = new PiAgentSessionFactory({
+      repository, models: controlled.models, model,
+      resolveTools: async (input) => {
+        seen.push(input.identity);
+        return bridgeGovernedTools([{
+          definition: { name: 'tenant_tool', description: 'tenant', inputSchema: {}, capability: 'read' },
+          execute: async (call) => ({ callId: call.id, content: input.identity?.tenantId ?? 'missing' }),
+        }]);
+      },
+    });
+    const identity = { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] } as const;
+    const session = await factory.create({
+      id: 'identity-tools', identity,
+      initialMessage: { role: 'user', text: 'start' }, events: eventContext('run-identity-tools'),
+    });
+
+    expect(session.tools().map((tool) => tool.name)).toEqual(['tenant_tool']);
+    expect(seen).toEqual([identity]);
+    await session.close();
+  });
+
   it('does not start a prompt when continue receives an already-aborted signal', async () => {
     const repository = new InMemorySessionRepo();
     const controlled = testModels();

@@ -33,7 +33,7 @@ export * from './run/mysql-assembly.js';
 export * from './run/recovery.js';
 
 // file: pi/agent.d.ts
-import type { AgentInputMessage, AgentRunEvent } from '@aiop/control-contracts';
+import type { AgentInputMessage, AgentRunEvent, IdentityContext } from '@aiop/control-contracts';
 import { AgentHarness, type AgentHarnessResources, type AgentHarnessTool, type Session, type SessionCreateOptions, type SessionMetadata, type SessionRepo, type SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import type { Model, Models } from '@earendil-works/pi-ai';
 import { EventCodec, type EventCodecOptions } from './event-codec.js';
@@ -43,6 +43,11 @@ export interface PiAgentSessionFactoryOptions<TMetadata extends SessionMetadata,
     model: Model<any>;
     systemPrompt?: string;
     tools?: AgentHarnessTool<undefined>[];
+    resolveTools?(input: {
+        identity?: IdentityContext;
+        sessionId?: string;
+        events: EventCodecOptions;
+    }): Promise<AgentHarnessTool<undefined>[]>;
     resources?: AgentHarnessResources;
 }
 type RequiredKeys<T> = {
@@ -57,11 +62,13 @@ type SessionCreateField<TCreateOptions extends SessionCreateOptions> = [
 };
 export type CreatePiAgentSessionInput<TCreateOptions extends SessionCreateOptions = SessionCreateOptions> = {
     id?: string;
+    identity?: IdentityContext;
     initialMessage: AgentInputMessage;
     events: EventCodecOptions;
 } & SessionCreateField<TCreateOptions>;
 export interface LoadPiAgentSessionInput<TMetadata extends SessionMetadata = SessionMetadata> {
     metadata: TMetadata;
+    identity?: IdentityContext;
     initialMessage: AgentInputMessage;
     events: EventCodecOptions;
 }
@@ -70,6 +77,7 @@ export declare class PiAgentSessionFactory<TMetadata extends SessionMetadata = S
     constructor(options: PiAgentSessionFactoryOptions<TMetadata, TCreateOptions, TListOptions>);
     create(input: CreatePiAgentSessionInput<TCreateOptions>): Promise<PiAgentSession<TMetadata>>;
     load(input: LoadPiAgentSessionInput<TMetadata>): Promise<PiAgentSession<TMetadata>>;
+    private resolveTools;
     private wrap;
 }
 export declare class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata> {
@@ -395,6 +403,7 @@ export interface ManagedPiSession extends InboxCapableSession {
 export interface DurableRunSessionFactory {
     create(input: {
         id?: string;
+        identity: StartRunInput['identity'];
         initialMessage: AgentInputMessage;
         events: unknown;
         session?: Record<string, unknown>;
@@ -403,6 +412,7 @@ export interface DurableRunSessionFactory {
         metadata: SessionMetadata & {
             tenantId?: string;
         };
+        identity: StartRunInput['identity'];
         initialMessage: AgentInputMessage;
         events: unknown;
     }): Promise<ManagedPiSession>;
@@ -447,7 +457,7 @@ export declare class DurableRunManager implements DurableRunRuntime {
 import type { AgentHarnessResources, AgentHarnessTool } from '@earendil-works/pi-agent-core';
 import type { Model, Models } from '@earendil-works/pi-ai';
 import type { Kysely } from 'kysely';
-import { PiAgentSessionFactory } from '../pi/agent.js';
+import { PiAgentSessionFactory, type PiAgentSessionFactoryOptions } from '../pi/agent.js';
 import { MysqlRunStore } from '../store/mysql.js';
 import { PiMysqlSessionRepo } from '../store/pi-session-mysql.js';
 import { DurableRunManager } from './manager.js';
@@ -457,6 +467,7 @@ export interface MysqlDurablePiRuntimeOptions {
     model: Model<any>;
     systemPrompt?: string;
     tools?: AgentHarnessTool<undefined>[];
+    resolveTools?: PiAgentSessionFactoryOptions<any, any, any>['resolveTools'];
     resources?: AgentHarnessResources;
     workerId?: string;
     leaseTtlMs?: number;

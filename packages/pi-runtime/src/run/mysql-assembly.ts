@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { AgentHarnessResources, AgentHarnessTool } from '@earendil-works/pi-agent-core';
 import type { Model, Models } from '@earendil-works/pi-ai';
 import type { Kysely } from 'kysely';
-import { PiAgentSessionFactory } from '../pi/agent.js';
+import { PiAgentSessionFactory, type PiAgentSessionFactoryOptions } from '../pi/agent.js';
 import type { EventCodecOptions } from '../pi/event-codec.js';
 import { MysqlRunStore } from '../store/mysql.js';
 import { PiMysqlSessionRepo } from '../store/pi-session-mysql.js';
@@ -14,6 +14,7 @@ export interface MysqlDurablePiRuntimeOptions {
   model: Model<any>;
   systemPrompt?: string;
   tools?: AgentHarnessTool<undefined>[];
+  resolveTools?: PiAgentSessionFactoryOptions<any, any, any>['resolveTools'];
   resources?: AgentHarnessResources;
   workerId?: string;
   leaseTtlMs?: number;
@@ -28,7 +29,7 @@ export function createMysqlDurablePiRuntime(options: MysqlDurablePiRuntimeOption
   const sessions = new PiMysqlSessionRepo(options.db, true);
   const factory = new PiAgentSessionFactory({
     repository: sessions, models: options.models, model: options.model,
-    systemPrompt: options.systemPrompt, tools: options.tools, resources: options.resources,
+    systemPrompt: options.systemPrompt, tools: options.tools, resolveTools: options.resolveTools, resources: options.resources,
   });
   const sequences = new Map<string, bigint>();
   const eventOptions: DurableRunManagerOptions['eventOptions'] = (input): EventCodecOptions => {

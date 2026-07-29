@@ -1,4 +1,4 @@
-import type { AgentInputMessage, AgentRunEvent } from '@aiop/control-contracts';
+import type { AgentInputMessage, AgentRunEvent, IdentityContext } from '@aiop/control-contracts';
 import {
   AgentHarness,
   type AgentHarnessEvent,
@@ -28,6 +28,7 @@ export interface PiAgentSessionFactoryOptions<
   model: Model<any>;
   systemPrompt?: string;
   tools?: AgentHarnessTool<undefined>[];
+  resolveTools?(input: { identity?: IdentityContext; sessionId?: string; events: EventCodecOptions }): Promise<AgentHarnessTool<undefined>[]>;
   resources?: AgentHarnessResources;
 }
 
@@ -39,12 +40,14 @@ type SessionCreateField<TCreateOptions extends SessionCreateOptions> =
 
 export type CreatePiAgentSessionInput<TCreateOptions extends SessionCreateOptions = SessionCreateOptions> = {
   id?: string;
+  identity?: IdentityContext;
   initialMessage: AgentInputMessage;
   events: EventCodecOptions;
 } & SessionCreateField<TCreateOptions>;
 
 export interface LoadPiAgentSessionInput<TMetadata extends SessionMetadata = SessionMetadata> {
   metadata: TMetadata;
+  identity?: IdentityContext;
   initialMessage: AgentInputMessage;
   events: EventCodecOptions;
 }
@@ -58,15 +61,24 @@ export class PiAgentSessionFactory<
 
   async create(input: CreatePiAgentSessionInput<TCreateOptions>): Promise<PiAgentSession<TMetadata>> {
     const createOptions = { ...input.session, ...(input.id ? { id: input.id } : {}) } as TCreateOptions;
-    return this.wrap(await this.options.repository.create(createOptions), input.initialMessage, input.events);
+    const tools = await this.resolveTools(input.identity, input.id, input.events);
+    return this.wrap(await this.options.repository.create(createOptions), input.initialMessage, input.events, tools);
   }
 
   async load(input: LoadPiAgentSessionInput<TMetadata>): Promise<PiAgentSession<TMetadata>> {
-    return this.wrap(await this.options.repository.open(input.metadata), input.initialMessage, input.events);
+    const tools = await this.resolveTools(input.identity, input.metadata.id, input.events);
+    return this.wrap(await this.options.repository.open(input.metadata), input.initialMessage, input.events, tools);
   }
 
-  private wrap(session: Session<TMetadata>, initialMessage: AgentInputMessage, events: EventCodecOptions): PiAgentSession<TMetadata> {
-    const governedTools = scopeGovernedTools(this.options.tools ?? []);
+  private async resolveTools(identity: IdentityContext | undefined, sessionId: string | undefined, events: EventCodecOptions) {
+    return this.options.resolveTools?.({ identity, sessionId, events }) ?? this.options.tools ?? [];
+  }
+
+  private wrap(
+    session: Session<TMetadata>, initialMessage: AgentInputMessage, events: EventCodecOptions,
+    tools: AgentHarnessTool<undefined>[],
+  ): PiAgentSession<TMetadata> {
+    const governedTools = scopeGovernedTools(tools);
     const harness = new AgentHarness({
       session,
       models: this.options.models,

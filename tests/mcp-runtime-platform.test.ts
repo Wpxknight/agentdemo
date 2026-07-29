@@ -1,9 +1,21 @@
 import { describe, expect, it, vi } from 'vitest';
 import { McpRuntime } from '../packages/mcp-runtime/src/index.js';
+import { GovernedToolFactory, type ToolLedgerStore } from '../packages/pi-runtime/src/index.js';
 
 describe('McpRuntime', () => {
   it('discovers tenant-visible tools and invokes them through an injected client', async () => {
     const audit = vi.fn();
+    const records = new Map<string, Parameters<ToolLedgerStore['putIfAbsent']>[0]>();
+    const ledger: ToolLedgerStore = {
+      putIfAbsent: async (record) => {
+        if (records.has(record.logicalCallId)) return false;
+        records.set(record.logicalCallId, structuredClone(record));
+        return true;
+      },
+      get: async ({ logicalCallId }) => structuredClone(records.get(logicalCallId)),
+      update: async (record) => { records.set(record.logicalCallId, structuredClone(record)); },
+      claimPendingApproval: async () => false,
+    };
     const runtime = new McpRuntime({
       connect: async () => ({
         listTools: async () => ({
@@ -19,6 +31,7 @@ describe('McpRuntime', () => {
       }),
       visible: (identity) => identity.tenantId === 'tenant-a',
       audit: { record: audit },
+      governance: (definitions) => new GovernedToolFactory({ ledger }).create(definitions),
     });
     const identity = { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] };
     runtime.configure(identity, {

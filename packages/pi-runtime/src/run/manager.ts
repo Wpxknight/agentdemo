@@ -26,8 +26,8 @@ export interface ManagedPiSession extends InboxCapableSession {
 }
 
 export interface DurableRunSessionFactory {
-  create(input: { id?: string; initialMessage: AgentInputMessage; events: unknown; session?: Record<string, unknown> }): Promise<ManagedPiSession>;
-  load(input: { metadata: SessionMetadata & { tenantId?: string }; initialMessage: AgentInputMessage; events: unknown }): Promise<ManagedPiSession>;
+  create(input: { id?: string; identity: StartRunInput['identity']; initialMessage: AgentInputMessage; events: unknown; session?: Record<string, unknown> }): Promise<ManagedPiSession>;
+  load(input: { metadata: SessionMetadata & { tenantId?: string }; identity: StartRunInput['identity']; initialMessage: AgentInputMessage; events: unknown }): Promise<ManagedPiSession>;
 }
 
 export interface DurableRunManagerOptions {
@@ -146,8 +146,8 @@ export class DurableRunManager implements DurableRunRuntime {
         createdAt: (sessionRecord?.createdAt ?? claimed.record.createdAt).toISOString(), metadata: sessionRecord?.metadata,
       };
       session = loadCommittedSession
-        ? await this.options.sessions.load({ metadata, initialMessage, events })
-        : await this.options.sessions.create({ id: piSessionId, initialMessage, events, session: { tenantId: identity.tenantId } });
+        ? await this.options.sessions.load({ metadata, identity, initialMessage, events })
+        : await this.options.sessions.create({ id: piSessionId, identity, initialMessage, events, session: { tenantId: identity.tenantId } });
       this.active.set(activeKey, { abort, session });
       baselineUsage = usageFromEntries(await session.entries());
       let stopInboxPump = false;

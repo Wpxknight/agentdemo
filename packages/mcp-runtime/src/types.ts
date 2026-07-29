@@ -1,4 +1,5 @@
-import type { IdentityContext, ToolCapability } from '@aiop/control-contracts';
+import type { IdentityContext, ToolCapability, ToolRuntime } from '@aiop/control-contracts';
+import type { GovernedToolDefinition } from '@aiop/pi-runtime';
 
 export interface McpToolInfo {
   name: string;
@@ -92,4 +93,6 @@ export interface McpRuntimeOptions {
   credentials?: McpCredentialProvider;
   audit?: McpAuditSink;
   visible?: (identity: IdentityContext, server: string, tool: McpToolInfo) => boolean;
+  /** Required by invoke(); production callers inject their fully configured governance runtime. */
+  governance?: (definitions: readonly GovernedToolDefinition[]) => ToolRuntime;
 }

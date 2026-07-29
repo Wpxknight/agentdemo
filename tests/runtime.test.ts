@@ -4,9 +4,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MemoryStore } from '../src/db/memory.js';
 import { MysqlStore } from '../src/db/mysql.js';
-import { buildRuntime, createDefaultDurableRunRuntime, resolveRuntimeModelConfig, resolveRuntimeSandboxConfig } from '../src/runtime.js';
+import {
+  buildRuntime,
+  createDefaultDurableRunRuntime,
+  createMcpCredentialProvider,
+  resolveMcpBootstrapConfigs,
+  resolveRuntimeModelConfig,
+  resolveRuntimeSandboxConfig,
+} from '../src/runtime.js';
 import { ConfigSchema, SandboxConfigSchema, type Config } from '../src/config/schema.js';
 import { DurableRunManager } from '@aiop/pi-runtime';
+import { McpManager } from '@aiop/mcp-runtime';
+import { AllowAllPolicy } from '../src/agent/policy.js';
 
 const config: Config = {
   models: {
@@ -42,6 +51,23 @@ describe('resolveRuntimeModelConfig', () => {
 });
 
 describe('production durable runtime assembly', () => {
+  it('limits startup MCP config fallback to the default tenant', () => {
+    const startup = { shared: { transport: 'http' as const, url: 'https://mcp.example', headers: { authorization: 'secret' } } };
+    expect(resolveMcpBootstrapConfigs('default', startup, undefined)).toEqual(startup);
+    expect(resolveMcpBootstrapConfigs('tenant-b', startup, undefined)).toEqual({});
+    expect(resolveMcpBootstrapConfigs('tenant-b', startup, {
+      own: { transport: 'http', url: 'https://tenant-b.example' },
+    })).toEqual({ own: { transport: 'http', url: 'https://tenant-b.example' } });
+  });
+
+  it('resolves MCP credentials from the requesting tenant and actor', async () => {
+    const get = vi.fn(async () => ({ headers: { authorization: 'Bearer tenant-a' } }));
+    const provider = createMcpCredentialProvider({ get } as never);
+    await expect(provider.resolve({ tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] }, 'ops'))
+      .resolves.toEqual({ headers: { authorization: 'Bearer tenant-a' } });
+    expect(get).toHaveBeenCalledWith('tenant-a', 'user-a', 'mcp:ops');
+  });
+
   it('clears the download sweep timer when runtime initialization fails', async () => {
     vi.useFakeTimers();
     try {
@@ -115,6 +141,35 @@ describe('production durable runtime assembly', () => {
     );
 
     expect(runtime).toBeInstanceOf(DurableRunManager);
+  });
+
+  it('assembles identity-resolved MCP tools into durable Pi sessions through the governed adapter', async () => {
+    const mcp = new McpManager({
+      ops: { transport: 'http', url: 'https://ops.example', toolCapabilities: { inspect: 'read' } },
+    }, async () => ({
+      listTools: async () => ({ tools: [{ name: 'inspect', inputSchema: {} }] }),
+      callTool: async () => ({ content: [{ type: 'text', text: 'ok' }] }),
+      close: async () => undefined,
+    }));
+    const runtime = await createDefaultDurableRunRuntime(
+      new MysqlStore({} as never),
+      { id: 'configured', protocol: 'openai', baseURL: 'http://model.local/v1', apiKey: 'secret', model: 'custom-model' },
+      'system prompt',
+      true,
+      mcp,
+      new AllowAllPolicy(),
+    ) as DurableRunManager;
+    const sessionFactory = (runtime as unknown as { options: { sessions: { options: {
+      resolveTools(input: unknown): Promise<Array<{ name: string }>>;
+    } } } }).options.sessions;
+
+    const tools = await sessionFactory.options.resolveTools({
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+      sessionId: 'session-a',
+      events: { tenantId: 'tenant-a', runId: 'run-a', attemptId: 'attempt-a', turnNo: 1 },
+    });
+    expect(tools.map((tool) => tool.name)).toEqual(['mcp__ops__inspect']);
+    await mcp.close();
   });
 
   it('preserves an explicitly injected durable runtime without enabling automatic assembly', async () => {

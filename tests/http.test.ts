@@ -2340,6 +2340,43 @@ describe('HTTP server MCP 管理', () => {
     }
   });
 
+  it('reports non-idempotent direct MCP failures as governed recovery instead of raw execution errors', async () => {
+    const directStore = new MemoryStore();
+    await directStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: directStore, secret: 'mcp-recovery-secret' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const directMcp = new McpManager({
+      ops: { transport: 'http', url: 'https://ops.example' },
+    }, async () => ({
+      listTools: async () => ({ tools: [{ name: 'deploy', inputSchema: {} }] }),
+      callTool: async () => { throw new Error('write outcome unknown'); },
+      close: async () => undefined,
+    }));
+    const rt = {
+      model, tools: new ToolRegistry(), mcp: directMcp, store: directStore,
+      audit: { record: async () => undefined }, policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth, jwtSecret: 'mcp-recovery-secret', systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+    const directServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => directServer.listen(0, '127.0.0.1', resolve));
+    const directBase = `http://127.0.0.1:${(directServer.address() as AddressInfo).port}`;
+    const directToken = (await auth.login('default', 'admin', 'pw'))!;
+
+    try {
+      const response = await fetch(`${directBase}/v1/tools/call`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${directToken}` },
+        body: JSON.stringify({ sessionId: 'direct-recovery', name: 'mcp__ops__deploy', args: {} }),
+      });
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ recoveryRequired: true });
+    } finally {
+      await directMcp.close();
+      await new Promise<void>((resolve) => directServer.close(() => resolve()));
+    }
+  });
+
   it('lists servers with status and tools', async () => {
     const admin = await login('admin');
     const r = await fetch(`${base}/v1/mcp/servers`, { headers: { authorization: `Bearer ${admin}` } });
