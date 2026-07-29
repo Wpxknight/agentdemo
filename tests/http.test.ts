@@ -197,7 +197,7 @@ beforeAll(async () => {
     defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
   } as unknown as Runtime;
 
-  server = createHttpServer(rt);
+  server = createHttpServer(runtime);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
@@ -2569,7 +2569,19 @@ describe('HTTP server 定时任务管理', () => {
     const token = await adminToken();
     const id = await createTask(token);
     runtime.durableRunRuntime = {
-      run: async (input: { runId?: string }) => ({ runId: input.runId ?? 'scheduled-run' }),
+      run: async (input: { runId?: string }) => {
+        const runId = input.runId ?? 'scheduled-run';
+        return {
+          runId,
+          status: 'running',
+          events: { async *[Symbol.asyncIterator]() {} },
+          result: async () => ({
+            runId,
+            status: 'succeeded',
+            usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+          }),
+        };
+      },
     } as unknown as DurableRunRuntime;
 
     try {

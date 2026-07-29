@@ -187,10 +187,40 @@ describe('Scheduler', () => {
 });
 
 describe('createScheduledTaskRunner', () => {
+  it.each(['failed', 'cancelled', 'recovery_required', 'waiting'] as const)(
+    'records final durable %s state as a compatible error detail',
+    async (status) => {
+      const store = new MemoryStore();
+      await store.setSchedulerSettings({ tenantId: 't1' }, { maxRunMs: 5 * 60_000 });
+      const run = vi.fn(async () => ({
+        runId: `scheduled-${status}`, status: 'running' as const,
+        events: { async *[Symbol.asyncIterator]() {} },
+        result: async () => ({
+          runId: `scheduled-${status}`, status,
+          usage: { inputTokens: 1, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+        }),
+      }));
+      const result = await createScheduledTaskRunner({ store, durableRunRuntime: { run } } as unknown as Runtime)({
+        id: 1, tenantId: 't1', userId: 'u1', sessionId: 'cron-sess', cron: '* * * * *',
+        title: '巡检', task: '巡检', preApproved: false, enabled: true, nextRunAt: new Date(),
+      });
+
+      expect(result.status).toBe('error');
+      expect(JSON.parse(result.detail ?? '{}')).toMatchObject({ runId: `scheduled-${status}`, status });
+    },
+  );
+
   it('creates a product Run through DurableRunRuntime.run', async () => {
     const store = new MemoryStore();
     await store.setSchedulerSettings({ tenantId: 't1' }, { maxRunMs: 5 * 60_000 });
-    const run = vi.fn(async () => ({ runId: 'scheduled-run' }));
+    const run = vi.fn(async () => ({
+      runId: 'scheduled-run', status: 'running' as const,
+      events: { async *[Symbol.asyncIterator]() {} },
+      result: async () => ({
+        runId: 'scheduled-run', status: 'succeeded' as const,
+        usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      }),
+    }));
     const rt = {
       store,
       durableRunRuntime: { run },
@@ -210,7 +240,7 @@ describe('createScheduledTaskRunner', () => {
     }
 
     expect(result.status).toBe('success');
-    expect(result.detail).toBe('scheduled-run');
+    expect(JSON.parse(result.detail ?? '{}')).toMatchObject({ runId: 'scheduled-run', status: 'succeeded' });
     expect(run).toHaveBeenCalledWith(expect.objectContaining({
       identity: { tenantId: 't1', actorId: 'u1', roles: ['user'] },
       sessionId: 'cron-sess',
@@ -230,6 +260,49 @@ describe('createScheduledTaskRunner', () => {
 });
 
 describe('embedded scheduler deployment', () => {
+  it('awaits scheduler shutdown before disposing the runtime in production entrypoints', async () => {
+    const source = await readFile('src/index.ts', 'utf8');
+    expect(source).toContain('await scheduler?.stop()');
+    expect(source).toContain('await scheduler.stop()');
+  });
+
+  it('aborts and awaits an in-flight tick before stopping permanently', async () => {
+    const fireTime = new Date('2026-07-29T01:00:00.000Z');
+    const store = new MemorySchedulerStore([{
+      taskId: 'task-stop', tenantId: 'tenant-a', actorId: 'user-a', sessionId: 'session-a',
+      cron: '0 * * * *', input: [{ role: 'user', text: 'diagnose' }], nextFireAt: fireTime,
+    }]);
+    const claimDue = vi.spyOn(store, 'claimDue');
+    let rejectRun!: (error: Error) => void;
+    let receivedSignal: AbortSignal | undefined;
+    let runCalls = 0;
+    let started!: () => void;
+    const runStarted = new Promise<void>((resolve) => { started = resolve; });
+    const run = vi.fn(async (input: { signal?: AbortSignal }) => {
+      runCalls += 1;
+      if (runCalls > 1) throw new Error('must not dispatch after stop');
+      receivedSignal = input.signal;
+      started();
+      return new Promise((_resolve, reject) => { rejectRun = reject; });
+    });
+    const runtimeStore = new MemoryStore();
+    await runtimeStore.setSchedulerSettings({ tenantId: 'tenant-a' }, { maxRunMs: 5 * 60_000 });
+    const scheduler = createRuntimeScheduler({
+      store: runtimeStore, durableRunRuntime: { run },
+    } as unknown as Runtime, { store, workerId: 'stop-worker' });
+
+    const tick = scheduler.tick(fireTime);
+    await runStarted;
+    const stopping = Promise.resolve(scheduler.stop());
+    const abortedWhenStopped = receivedSignal?.aborted === true;
+    rejectRun(new Error('scheduler stopped'));
+    await tick;
+    await stopping;
+    expect(abortedWhenStopped).toBe(true);
+    expect(await scheduler.tick(new Date(fireTime.getTime() + 60_000))).toBe(0);
+    expect(claimDue).toHaveBeenCalledOnce();
+  });
+
   it('uses an explicitly injected MemorySchedulerStore only for tests', async () => {
     const fireTime = new Date('2026-07-29T01:00:00.000Z');
     const store = new MemorySchedulerStore([{
@@ -237,7 +310,14 @@ describe('embedded scheduler deployment', () => {
       cron: '0 * * * *', input: [{ role: 'user', text: 'diagnose' }], nextFireAt: fireTime,
       preApproved: true,
     }]);
-    const run = vi.fn(async () => ({ runId: 'task-a:2026-07-29T01:00:00.000Z' }));
+    const run = vi.fn(async () => ({
+      runId: 'task-a:2026-07-29T01:00:00.000Z', status: 'running' as const,
+      events: { async *[Symbol.asyncIterator]() {} },
+      result: async () => ({
+        runId: 'task-a:2026-07-29T01:00:00.000Z', status: 'succeeded' as const,
+        usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      }),
+    }));
     const runtimeStore = new MemoryStore();
     await runtimeStore.setSchedulerSettings({ tenantId: 'tenant-a' }, { maxRunMs: 5 * 60_000 });
     const scheduler = createRuntimeScheduler({

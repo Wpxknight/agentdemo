@@ -22,7 +22,7 @@ export function createRunDispatcher(
   lookup?: ScheduledRunLookup,
 ): RunDispatcher {
   return {
-    async startScheduledRun(input) {
+    async startScheduledRun(input, onStarted) {
       try {
         const handle = await runtime.run({
           runId: input.fireId,
@@ -33,13 +33,17 @@ export function createRunDispatcher(
           limits: input.limits,
           signal: input.signal,
         });
-        return { runId: handle.runId };
+        await onStarted?.(handle.runId);
+        return { runId: handle.runId, result: await handle.result() };
       } catch (error) {
         // A worker may die after Run creation but before marking the fire started.
         // The stable fire ID is the Run ID. Compensate only after an explicit lookup proves
         // that the deterministic Run exists; exception text is not a domain contract.
         const existing = await lookup?.findScheduledRun(input);
-        if (existing?.runId === input.fireId) return existing;
+        if (existing?.runId === input.fireId) {
+          await onStarted?.(existing.runId);
+          return existing;
+        }
         throw error;
       }
     },
@@ -55,8 +59,10 @@ export class SchedulerRunner {
     this.retryDelayMs = options.retryDelayMs ?? 30_000;
   }
 
-  async tick(now: Date, limit: number): Promise<number> {
+  async tick(now: Date, limit: number, signal?: AbortSignal): Promise<number> {
+    if (signal?.aborted) return 0;
     await new SchedulerRecovery(this.options.store).recover(now);
+    if (signal?.aborted) return 0;
     const fires = await this.options.store.claimDue({
       now,
       limit,
@@ -65,8 +71,13 @@ export class SchedulerRunner {
     });
     for (const fire of fires) {
       try {
+        if (signal?.aborted) throw signal.reason ?? new Error('scheduler stopped');
         const prepared = await this.options.prepareRun?.(fire, now);
-        const { runId } = await this.options.dispatcher.startScheduledRun({
+        const runSignal = signal && prepared?.signal
+          ? AbortSignal.any([signal, prepared.signal])
+          : signal ?? prepared?.signal;
+        if (runSignal?.aborted) throw runSignal.reason ?? new Error('scheduler stopped');
+        const { runId, result } = await this.options.dispatcher.startScheduledRun({
           taskId: fire.taskId,
           fireId: fire.fireId,
           fireTime: fire.fireTime,
@@ -75,8 +86,14 @@ export class SchedulerRunner {
           input: fire.input,
           execution: fire.execution,
           ...prepared,
+          signal: runSignal,
+        }, (runId) => this.options.store.bindRun({
+          fireId: fire.fireId, claimToken: fire.claimToken, runId, boundAt: now,
+        }));
+        if (signal?.aborted) throw signal.reason ?? new Error('scheduler stopped');
+        await this.options.store.completeFire({
+          fireId: fire.fireId, claimToken: fire.claimToken, runId, result, completedAt: now,
         });
-        await this.options.store.completeFire({ fireId: fire.fireId, claimToken: fire.claimToken, runId, completedAt: now });
       } catch (error) {
         await this.options.store.releaseFire({
           fireId: fire.fireId,

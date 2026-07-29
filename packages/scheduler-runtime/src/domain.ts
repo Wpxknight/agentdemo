@@ -1,4 +1,5 @@
 import type {
+  AgentRunResult,
   AgentInputMessage,
   IdentityContext,
   RunExecutionProfile,
@@ -31,11 +32,14 @@ export interface ScheduledRunInput {
 }
 
 export interface RunDispatcher {
-  startScheduledRun(input: ScheduledRunInput): Promise<{ runId: string }>;
+  startScheduledRun(
+    input: ScheduledRunInput,
+    onStarted?: (runId: string) => Promise<void>,
+  ): Promise<{ runId: string; result: AgentRunResult }>;
 }
 
 export interface ScheduledRunLookup {
-  findScheduledRun(input: ScheduledRunInput): Promise<{ runId: string } | undefined>;
+  findScheduledRun(input: ScheduledRunInput): Promise<{ runId: string; result: AgentRunResult } | undefined>;
 }
 
 export type ScheduledFireState = 'pending' | 'claimed' | 'started';
@@ -44,6 +48,7 @@ export interface ScheduledFire extends ScheduledRunInput {
   state: ScheduledFireState;
   attempts: number;
   runId?: string;
+  result?: AgentRunResult;
   claimToken?: string;
   claimedBy?: string;
   leaseExpiresAt?: Date;

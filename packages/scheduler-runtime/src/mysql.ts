@@ -2,7 +2,10 @@ import { randomUUID } from 'node:crypto';
 import type { Generated, Kysely } from 'kysely';
 import { nextFireAt } from './cron.js';
 import type { ClaimedScheduledFire } from './domain.js';
-import { scheduledFireId, type ClaimDueInput, type CompleteFireInput, type ReleaseFireInput, type SchedulerStore } from './store.js';
+import {
+  scheduledFireId, type BindRunInput, type ClaimDueInput, type CompleteFireInput, type ReleaseFireInput,
+  type SchedulerStore,
+} from './store.js';
 
 export interface SchedulerMysqlDatabase {
   scheduled_tasks: {
@@ -106,6 +109,21 @@ export class MysqlSchedulerStore implements SchedulerStore {
     });
   }
 
+  async bindRun(input: BindRunInput): Promise<void> {
+    await this.db.transaction().execute(async (tx) => {
+      const row = await tx.selectFrom('scheduler_fires').select(['task_id', 'tenant_id', 'run_id'])
+        .where('fire_id', '=', input.fireId).where('state', '=', 'claimed')
+        .where('claim_token', '=', input.claimToken).forUpdate().executeTakeFirst();
+      if (!row) throw new Error(`stale scheduler claim: ${input.fireId}`);
+      if (row.run_id && row.run_id !== input.runId) throw new Error(`scheduled fire Run mismatch: ${input.fireId}`);
+      await tx.updateTable('scheduler_fires').set({ run_id: input.runId, updated_at: input.boundAt })
+        .where('fire_id', '=', input.fireId).execute();
+      await tx.insertInto('task_agent_runs').values({
+        tenant_id: row.tenant_id, task_id: row.task_id, run_id: input.runId, created_at: input.boundAt,
+      }).onDuplicateKeyUpdate({ run_id: input.runId }).execute();
+    });
+  }
+
   async completeFire(input: CompleteFireInput): Promise<void> {
     await this.db.transaction().execute(async (tx) => {
       const row = await tx.selectFrom('scheduler_fires').select(['task_id', 'tenant_id'])
@@ -118,11 +136,10 @@ export class MysqlSchedulerStore implements SchedulerStore {
       }).where('fire_id', '=', input.fireId).execute();
       await tx.insertInto('task_runs').values({
         task_id: row.task_id, fire_id: input.fireId, run_id: input.runId,
-        status: 'success', detail: input.runId, steps: null,
-      }).onDuplicateKeyUpdate({ run_id: input.runId, detail: input.runId }).execute();
-      await tx.insertInto('task_agent_runs').values({
-        tenant_id: row.tenant_id, task_id: row.task_id, run_id: input.runId, created_at: input.completedAt,
-      }).onDuplicateKeyUpdate({ run_id: input.runId }).execute();
+        status: compatibilityStatus(input.result), detail: compatibilityDetail(input.result), steps: null,
+      }).onDuplicateKeyUpdate({
+        run_id: input.runId, status: compatibilityStatus(input.result), detail: compatibilityDetail(input.result),
+      }).execute();
     });
   }
 
@@ -142,6 +159,16 @@ export class MysqlSchedulerStore implements SchedulerStore {
     }).where('state', '=', 'claimed').where('lease_expires_at', '<=', now).executeTakeFirst();
     return Number(result.numUpdatedRows);
   }
+}
+
+function compatibilityStatus(result: import('@aiop/control-contracts').AgentRunResult): 'success' | 'error' {
+  return result.status === 'succeeded' ? 'success' : 'error';
+}
+
+function compatibilityDetail(result: import('@aiop/control-contracts').AgentRunResult): string {
+  return JSON.stringify({
+    runId: result.runId, status: result.status, text: result.text, error: result.error, usage: result.usage,
+  });
 }
 
 function parsePayload(value: string): Pick<ClaimedScheduledFire, 'input' | 'execution'> {

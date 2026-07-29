@@ -1,4 +1,5 @@
 import { nextFireAt } from './cron.js';
+import type { AgentRunResult } from '@aiop/control-contracts';
 import type { ClaimedScheduledFire, ScheduledFire, ScheduledTask } from './domain.js';
 
 export interface ClaimDueInput {
@@ -12,7 +13,15 @@ export interface CompleteFireInput {
   fireId: string;
   claimToken: string;
   runId: string;
+  result: AgentRunResult;
   completedAt: Date;
+}
+
+export interface BindRunInput {
+  fireId: string;
+  claimToken: string;
+  runId: string;
+  boundAt: Date;
 }
 
 export interface ReleaseFireInput {
@@ -24,6 +33,7 @@ export interface ReleaseFireInput {
 
 export interface SchedulerStore {
   claimDue(input: ClaimDueInput): Promise<ClaimedScheduledFire[]>;
+  bindRun(input: BindRunInput): Promise<void>;
   completeFire(input: CompleteFireInput): Promise<void>;
   releaseFire(input: ReleaseFireInput): Promise<void>;
   recoverExpired(now: Date): Promise<number>;
@@ -68,12 +78,19 @@ export class MemorySchedulerStore implements SchedulerStore {
     Object.assign(fire, {
       state: 'started' as const,
       runId: input.runId,
+      result: structuredClone(input.result),
       claimToken: undefined,
       claimedBy: undefined,
       leaseExpiresAt: undefined,
       retryAt: undefined,
       lastError: undefined,
     });
+  }
+
+  async bindRun(input: BindRunInput): Promise<void> {
+    const fire = this.requireClaim(input.fireId, input.claimToken);
+    if (fire.runId && fire.runId !== input.runId) throw new Error(`scheduled fire Run mismatch: ${input.fireId}`);
+    fire.runId = input.runId;
   }
 
   async releaseFire(input: ReleaseFireInput): Promise<void> {
@@ -154,6 +171,7 @@ function cloneFire(fire: ScheduledFire): ScheduledFire {
     identity: { ...fire.identity, roles: [...fire.identity.roles] },
     input: fire.input.map((message) => ({ ...message })),
     execution: fire.execution ? { ...fire.execution } : undefined,
+    result: fire.result ? structuredClone(fire.result) : undefined,
     limits: fire.limits ? {
       ...fire.limits,
       deadlineAt: fire.limits.deadlineAt ? new Date(fire.limits.deadlineAt) : undefined,

@@ -52,6 +52,7 @@ export interface PiAgentSessionFactoryOptions<TMetadata extends SessionMetadata,
         sessionId?: string;
         events: EventCodecOptions;
         interactionResolution?: InteractionResolution;
+        execution?: RunExecutionProfile;
     }): Promise<AgentHarnessTool<undefined>[]>;
     resources?: AgentHarnessResources;
 }

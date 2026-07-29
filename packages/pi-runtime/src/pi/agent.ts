@@ -37,6 +37,7 @@ export interface PiAgentSessionFactoryOptions<
     sessionId?: string;
     events: EventCodecOptions;
     interactionResolution?: InteractionResolution;
+    execution?: RunExecutionProfile;
   }): Promise<AgentHarnessTool<undefined>[]>;
   resources?: AgentHarnessResources;
 }
@@ -74,14 +75,18 @@ export class PiAgentSessionFactory<
 
   async create(input: CreatePiAgentSessionInput<TCreateOptions>): Promise<PiAgentSession<TMetadata>> {
     const createOptions = { ...input.session, ...(input.id ? { id: input.id } : {}) } as TCreateOptions;
-    const tools = await this.resolveTools(input.identity, input.id, input.events, input.interactionResolution);
+    const tools = await this.resolveTools(
+      input.identity, input.id, input.events, input.interactionResolution, input.execution,
+    );
     return this.wrap(
       await this.options.repository.create(createOptions), input.initialMessage, input.events, tools, input.execution,
     );
   }
 
   async load(input: LoadPiAgentSessionInput<TMetadata>): Promise<PiAgentSession<TMetadata>> {
-    const tools = await this.resolveTools(input.identity, input.metadata.id, input.events, input.interactionResolution);
+    const tools = await this.resolveTools(
+      input.identity, input.metadata.id, input.events, input.interactionResolution, input.execution,
+    );
     return this.wrap(
       await this.options.repository.open(input.metadata), input.initialMessage, input.events, tools, input.execution,
     );
@@ -89,9 +94,10 @@ export class PiAgentSessionFactory<
 
   private async resolveTools(
     identity: IdentityContext | undefined, sessionId: string | undefined, events: EventCodecOptions,
-    interactionResolution?: InteractionResolution,
+    interactionResolution?: InteractionResolution, execution?: RunExecutionProfile,
   ) {
-    return this.options.resolveTools?.({ identity, sessionId, events, interactionResolution }) ?? this.options.tools ?? [];
+    return this.options.resolveTools?.({ identity, sessionId, events, interactionResolution, execution })
+      ?? this.options.tools ?? [];
   }
 
   private wrap(

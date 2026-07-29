@@ -3,7 +3,7 @@ export declare function nextFireAt(cron: string, after: Date): Date;
 export declare function isValidCron(cron: string): boolean;
 
 // file: domain.d.ts
-import type { AgentInputMessage, IdentityContext, RunExecutionProfile, RunLimits } from '@aiop/control-contracts';
+import type { AgentRunResult, AgentInputMessage, IdentityContext, RunExecutionProfile, RunLimits } from '@aiop/control-contracts';
 export interface ScheduledTask {
     taskId: string;
     tenantId: string;
@@ -28,13 +28,15 @@ export interface ScheduledRunInput {
     signal?: AbortSignal;
 }
 export interface RunDispatcher {
-    startScheduledRun(input: ScheduledRunInput): Promise<{
+    startScheduledRun(input: ScheduledRunInput, onStarted?: (runId: string) => Promise<void>): Promise<{
         runId: string;
+        result: AgentRunResult;
     }>;
 }
 export interface ScheduledRunLookup {
     findScheduledRun(input: ScheduledRunInput): Promise<{
         runId: string;
+        result: AgentRunResult;
     } | undefined>;
 }
 export type ScheduledFireState = 'pending' | 'claimed' | 'started';
@@ -42,6 +44,7 @@ export interface ScheduledFire extends ScheduledRunInput {
     state: ScheduledFireState;
     attempts: number;
     runId?: string;
+    result?: AgentRunResult;
     claimToken?: string;
     claimedBy?: string;
     leaseExpiresAt?: Date;
@@ -66,7 +69,7 @@ export * from './mysql.js';
 // file: mysql.d.ts
 import type { Generated, Kysely } from 'kysely';
 import type { ClaimedScheduledFire } from './domain.js';
-import { type ClaimDueInput, type CompleteFireInput, type ReleaseFireInput, type SchedulerStore } from './store.js';
+import { type BindRunInput, type ClaimDueInput, type CompleteFireInput, type ReleaseFireInput, type SchedulerStore } from './store.js';
 export interface SchedulerMysqlDatabase {
     scheduled_tasks: {
         id: Generated<number>;
@@ -122,6 +125,7 @@ export declare class MysqlSchedulerStore implements SchedulerStore {
     private readonly db;
     constructor(db: Kysely<SchedulerMysqlDatabase>);
     claimDue(input: ClaimDueInput): Promise<ClaimedScheduledFire[]>;
+    bindRun(input: BindRunInput): Promise<void>;
     completeFire(input: CompleteFireInput): Promise<void>;
     releaseFire(input: ReleaseFireInput): Promise<void>;
     recoverExpired(now: Date): Promise<number>;
@@ -153,10 +157,11 @@ export declare class SchedulerRunner {
     private readonly leaseMs;
     private readonly retryDelayMs;
     constructor(options: SchedulerRunnerOptions);
-    tick(now: Date, limit: number): Promise<number>;
+    tick(now: Date, limit: number, signal?: AbortSignal): Promise<number>;
 }
 
 // file: store.d.ts
+import type { AgentRunResult } from '@aiop/control-contracts';
 import type { ClaimedScheduledFire, ScheduledFire, ScheduledTask } from './domain.js';
 export interface ClaimDueInput {
     now: Date;
@@ -168,7 +173,14 @@ export interface CompleteFireInput {
     fireId: string;
     claimToken: string;
     runId: string;
+    result: AgentRunResult;
     completedAt: Date;
+}
+export interface BindRunInput {
+    fireId: string;
+    claimToken: string;
+    runId: string;
+    boundAt: Date;
 }
 export interface ReleaseFireInput {
     fireId: string;
@@ -178,6 +190,7 @@ export interface ReleaseFireInput {
 }
 export interface SchedulerStore {
     claimDue(input: ClaimDueInput): Promise<ClaimedScheduledFire[]>;
+    bindRun(input: BindRunInput): Promise<void>;
     completeFire(input: CompleteFireInput): Promise<void>;
     releaseFire(input: ReleaseFireInput): Promise<void>;
     recoverExpired(now: Date): Promise<number>;
@@ -190,6 +203,7 @@ export declare class MemorySchedulerStore implements SchedulerStore {
     upsertTask(task: ScheduledTask): void;
     claimDue(input: ClaimDueInput): Promise<ClaimedScheduledFire[]>;
     completeFire(input: CompleteFireInput): Promise<void>;
+    bindRun(input: BindRunInput): Promise<void>;
     releaseFire(input: ReleaseFireInput): Promise<void>;
     recoverExpired(now: Date): Promise<number>;
     listFires(): Promise<ScheduledFire[]>;

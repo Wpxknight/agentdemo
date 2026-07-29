@@ -42,7 +42,7 @@ async function runServer(config: Config) {
   const shutdown = async () => {
     logger.info('正在关闭 HTTP 服务…');
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    scheduler?.stop();
+    await scheduler?.stop();
     await rt.dispose();
     process.exit(0);
   };
@@ -103,7 +103,7 @@ async function runScheduler(config: Config) {
   logger.info('scheduler running; Ctrl-C to stop');
 
   const shutdown = async () => {
-    scheduler.stop();
+    await scheduler.stop();
     await rt.dispose();
     process.exit(0);
   };

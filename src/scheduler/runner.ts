@@ -46,7 +46,13 @@ export function createScheduledTaskRunner(rt: Runtime): TaskRunner {
         )),
       },
     });
-    return { status: 'success', detail: result.runId };
+    return {
+      status: result.result.status === 'succeeded' ? 'success' : 'error',
+      detail: JSON.stringify({
+        runId: result.runId, status: result.result.status, text: result.result.text,
+        error: result.result.error, usage: result.result.usage,
+      }),
+    };
   };
 }
 
@@ -64,7 +70,7 @@ export interface RuntimeSchedulerOptions {
 export interface RuntimeScheduler {
   tick(now?: Date): Promise<number>;
   start(): void;
-  stop(): void;
+  stop(): Promise<void>;
 }
 
 export function createRuntimeScheduler(
@@ -107,6 +113,9 @@ class RuntimeSchedulerLoop implements RuntimeScheduler {
   private readonly now: () => Date;
   private timer?: ReturnType<typeof setInterval>;
   private running = false;
+  private stopped = false;
+  private readonly lifecycle = new AbortController();
+  private inFlight?: Promise<number>;
 
   constructor(
     private readonly runner: SchedulerRunner,
@@ -118,11 +127,18 @@ class RuntimeSchedulerLoop implements RuntimeScheduler {
   }
 
   tick(now = this.now()): Promise<number> {
-    return this.runner.tick(now, this.batch);
+    if (this.stopped) return Promise.resolve(0);
+    if (this.inFlight) return this.inFlight;
+    const execution = this.runner.tick(now, this.batch, this.lifecycle.signal)
+      .finally(() => {
+        if (this.inFlight === execution) this.inFlight = undefined;
+      });
+    this.inFlight = execution;
+    return execution;
   }
 
   start(): void {
-    if (this.timer) return;
+    if (this.timer || this.stopped) return;
     this.timer = setInterval(() => {
       if (this.running) return;
       this.running = true;
@@ -134,9 +150,16 @@ class RuntimeSchedulerLoop implements RuntimeScheduler {
     log.info({ intervalMs: this.intervalMs }, 'scheduler started');
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
+    if (this.stopped) {
+      await this.inFlight?.catch(() => undefined);
+      return;
+    }
+    this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+    this.lifecycle.abort(new Error('scheduler stopped'));
+    await this.inFlight?.catch(() => undefined);
   }
 }
 
@@ -156,7 +179,19 @@ function scheduledRunLookup(rt: Runtime) {
       if (!binding || binding.userId !== input.identity.actorId || binding.sessionId !== input.sessionId) {
         return undefined;
       }
-      return { runId: binding.runId };
+      const record = await rt.store.getAgentRun({
+        tenantId: input.identity.tenantId, userId: input.identity.actorId, role: 'user',
+      }, input.fireId);
+      if (!record || record.status === 'queued' || record.status === 'running') return undefined;
+      return {
+        runId: record.runId,
+        result: {
+          runId: record.runId, status: record.status, usage: record.usage,
+          ...(record.errorMessage ? {
+            error: { code: 'MODEL_PROVIDER_ERROR' as const, message: record.errorMessage, retryable: false },
+          } : {}),
+        },
+      };
     },
   };
 }

@@ -276,20 +276,26 @@ export async function createDefaultDurableRunRuntime(
   store: Store,
   modelConfig: RuntimeModelConfig,
   systemPrompt?: string,
-  enabled = false,
+  enabled = true,
   mcp?: McpManager,
   policy?: PolicyMiddleware,
+  tools = new ToolRegistry(),
+  policyPreApproved = policy,
 ): Promise<DurableRunRuntime | undefined> {
-  return (await createDefaultDurableRunAssembly(store, modelConfig, systemPrompt, enabled, mcp, policy))?.runtime;
+  return (await createDefaultDurableRunAssembly(
+    store, modelConfig, systemPrompt, enabled, mcp, policy, tools, policyPreApproved,
+  ))?.runtime;
 }
 
 async function createDefaultDurableRunAssembly(
   store: Store,
   modelConfig: RuntimeModelConfig,
   systemPrompt?: string,
-  enabled = false,
+  enabled = true,
   mcp?: McpManager,
   policy?: PolicyMiddleware,
+  tools = new ToolRegistry(),
+  policyPreApproved = policy,
 ) {
   if (!enabled || !(store instanceof MysqlStore)) return undefined;
   const targetApi = modelConfig.protocol === 'anthropic' ? 'anthropic-messages' : 'openai-completions';
@@ -329,22 +335,26 @@ async function createDefaultDurableRunAssembly(
     resolveSystemPrompt: ({ execution }) => execution?.unattended
       ? buildSystemPrompt(systemPrompt, true)
       : systemPrompt,
-    resolveTools: mcp ? async ({ identity, sessionId, events, interactionResolution }) => {
+    resolveTools: async ({ identity, sessionId, events, interactionResolution, execution }) => {
       if (!identity) return [];
-      const definitions = await mcp.tools(identity);
+      const definitions = mcp ? await mcp.tools(identity) : [];
+      const toolContext = {
+        tenantId: identity.tenantId,
+        userId: identity.actorId,
+        role: identity.roles.includes('platform_admin') ? 'platform_admin' as const
+          : identity.roles.includes('tenant_admin') ? 'tenant_admin' as const
+            : 'user' as const,
+        sessionId: sessionId ?? events.runId,
+      };
+      const productDefinitions = tools.unified(toolContext).definitions();
       const governed = createAIOPToolRuntime({
         model: createModel(modelConfig.id, modelConfig),
-        tools: new ToolRegistry(),
+        tools,
         governedTools: definitions,
-        policy: policy ?? new AllowAllPolicy(),
-        ctx: {
-          tenantId: identity.tenantId,
-          userId: identity.actorId,
-          role: identity.roles.includes('platform_admin') ? 'platform_admin'
-            : identity.roles.includes('tenant_admin') ? 'tenant_admin'
-              : 'user',
-          sessionId: sessionId ?? events.runId,
-        },
+        policy: execution?.preApproved
+          ? policyPreApproved ?? policy ?? new AllowAllPolicy()
+          : policy ?? new AllowAllPolicy(),
+        ctx: toolContext,
       }, createFencedToolLedger(runtimeStore, {
         tenantId: identity.tenantId, runId: events.runId, attemptId: events.attemptId,
       }), new ResourceConcurrencyController(), runtimeStore.interactions, false);
@@ -355,7 +365,7 @@ async function createDefaultDurableRunAssembly(
           })
         : undefined;
       return bridgeDurableGovernedTools({
-        definitions,
+        definitions: [...productDefinitions, ...definitions],
         runtime: governed,
         context: {
           identity,
@@ -373,7 +383,7 @@ async function createDefaultDurableRunAssembly(
             : undefined,
         },
       });
-    } : undefined,
+    },
   });
 }
 
@@ -834,6 +844,8 @@ export async function buildRuntime(
       options.enableDefaultDurableRuntime,
       mcp,
       policy,
+      tools,
+      policyPreApproved,
     );
   const durableRunRuntime = options.durableRunRuntime ?? defaultDurableAssembly?.runtime;
   const piSessionStore = options.piSessionStore ?? defaultDurableAssembly?.store.sessions;

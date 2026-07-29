@@ -15,6 +15,24 @@ import { readMysqlConfig } from '../../src/config/mysql.js';
 import { createKysely, createMysqlPool, runMigrations } from '../../src/db/index.js';
 
 const fireTime = new Date('2026-07-29T01:00:00.000Z');
+const succeeded = (runId: string) => ({
+  runId,
+  result: {
+    runId, status: 'succeeded' as const,
+    usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+  },
+});
+const dispatchSucceeded = async (
+  runId: string,
+  onStarted?: (runId: string) => Promise<void>,
+) => {
+  await onStarted?.(runId);
+  return succeeded(runId);
+};
+const succeededHandle = (runId: string) => ({
+  runId, status: 'running' as const, events: { async *[Symbol.asyncIterator]() {} },
+  result: async () => succeeded(runId).result,
+});
 const task: ScheduledTask = {
   taskId: 'task-a',
   tenantId: 'tenant-a',
@@ -27,9 +45,40 @@ const task: ScheduledTask = {
 };
 
 describe('SchedulerRunner', () => {
+  it('binds the durable Run before waiting for its final result', async () => {
+    const base = new MemorySchedulerStore([task]);
+    const bindRun = vi.fn(async () => undefined);
+    const completeFire = vi.spyOn(base, 'completeFire');
+    const store = new Proxy(base, {
+      get(target, property) {
+        if (property === 'bindRun') return bindRun;
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    let resolveResult!: (value: import('@aiop/control-contracts').AgentRunResult) => void;
+    const result = new Promise<import('@aiop/control-contracts').AgentRunResult>((resolve) => { resolveResult = resolve; });
+    const dispatcher = createRunDispatcher({
+      run: async () => ({
+        runId: 'run-bound', status: 'running', events: { async *[Symbol.asyncIterator]() {} }, result: () => result,
+      }),
+    } as unknown as DurableRunRuntime);
+    const tick = new SchedulerRunner({ store: store as never, dispatcher, workerId: 'worker-a' }).tick(fireTime, 1);
+    await vi.waitFor(() => expect(bindRun).toHaveBeenCalledWith(expect.objectContaining({
+      fireId: 'task-a:2026-07-29T01:00:00.000Z', runId: 'run-bound',
+    })));
+    expect(completeFire).not.toHaveBeenCalled();
+    resolveResult({
+      runId: 'run-bound', status: 'succeeded',
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+    });
+    await tick;
+    expect(completeFire).toHaveBeenCalledOnce();
+  });
+
   it('dispatches a due fire once when two workers scan concurrently', async () => {
     const store = new MemorySchedulerStore([task]);
-    const startScheduledRun = vi.fn(async () => ({ runId: 'run-a' }));
+    const startScheduledRun = vi.fn(async (_input, onStarted) => dispatchSucceeded('run-a', onStarted));
     const options = { store, dispatcher: { startScheduledRun }, leaseMs: 1_000 };
 
     const [left, right] = await Promise.all([
@@ -39,7 +88,7 @@ describe('SchedulerRunner', () => {
 
     expect(left + right).toBe(1);
     expect(startScheduledRun).toHaveBeenCalledOnce();
-    expect(startScheduledRun).toHaveBeenCalledWith({
+    expect(startScheduledRun).toHaveBeenCalledWith(expect.objectContaining({
       taskId: 'task-a',
       fireId: 'task-a:2026-07-29T01:00:00.000Z',
       fireTime,
@@ -47,12 +96,12 @@ describe('SchedulerRunner', () => {
       sessionId: 'session-a',
       input: [{ role: 'user', text: 'diagnose' }],
       execution: { unattended: true, preApproved: false },
-    });
+    }), expect.any(Function));
   });
 
   it('does not dispatch the same fire time twice', async () => {
     const store = new MemorySchedulerStore([task]);
-    const startScheduledRun = vi.fn(async () => ({ runId: 'run-a' }));
+    const startScheduledRun = vi.fn(async (_input, onStarted) => dispatchSucceeded('run-a', onStarted));
     const runner = new SchedulerRunner({ store, dispatcher: { startScheduledRun }, workerId: 'worker-a' });
 
     expect(await runner.tick(fireTime, 10)).toBe(1);
@@ -64,7 +113,7 @@ describe('SchedulerRunner', () => {
     const store = new MemorySchedulerStore([task]);
     const startScheduledRun = vi.fn()
       .mockRejectedValueOnce(new Error('run store unavailable'))
-      .mockResolvedValueOnce({ runId: 'run-b' });
+      .mockImplementationOnce(async (_input, onStarted) => dispatchSucceeded('run-b', onStarted));
     const runner = new SchedulerRunner({
       store,
       dispatcher: { startScheduledRun },
@@ -85,24 +134,101 @@ describe('SchedulerRunner', () => {
     expect(abandoned?.state).toBe('claimed');
 
     const recoveredAt = new Date(fireTime.getTime() + 1_001);
-    const startScheduledRun = vi.fn(async () => ({ runId: 'run-recovered' }));
+    const startScheduledRun = vi.fn(async (_input, onStarted) => dispatchSucceeded('run-recovered', onStarted));
     const runner = new SchedulerRunner({ store, dispatcher: { startScheduledRun }, workerId: 'worker-b' });
     expect(await runner.tick(recoveredAt, 10)).toBe(1);
     expect(startScheduledRun).toHaveBeenCalledOnce();
     expect((await store.listFires())[0]).toMatchObject({ state: 'started', runId: 'run-recovered', attempts: 2 });
   });
+
+  it('recovers a durable Run bound before the worker crashed and stores its final result', async () => {
+    const store = new MemorySchedulerStore([task]);
+    const [abandoned] = await store.claimDue({
+      now: fireTime, limit: 1, workerId: 'dead-worker', leaseMs: 1_000,
+    });
+    const runId = abandoned!.fireId;
+    await store.bindRun({
+      fireId: abandoned!.fireId,
+      claimToken: abandoned!.claimToken,
+      runId,
+      boundAt: fireTime,
+    });
+    expect((await store.listFires())[0]).toMatchObject({
+      state: 'claimed', runId, attempts: 1,
+    });
+
+    const run = vi.fn(async () => { throw new Error('Run creation result unknown'); });
+    const findScheduledRun = vi.fn(async () => succeeded(runId));
+    const runner = new SchedulerRunner({
+      store,
+      dispatcher: createRunDispatcher(
+        { run } as unknown as DurableRunRuntime,
+        { findScheduledRun },
+      ),
+      workerId: 'recovery-worker',
+      leaseMs: 1_000,
+    });
+
+    expect(await runner.tick(new Date(fireTime.getTime() + 1_001), 1)).toBe(1);
+    expect(run).toHaveBeenCalledOnce();
+    expect(findScheduledRun).toHaveBeenCalledOnce();
+    expect((await store.listFires())[0]).toMatchObject({
+      state: 'started', runId, result: { runId, status: 'succeeded' }, attempts: 2,
+    });
+  });
+
+  it('returns isolated copies of stored durable Run results', async () => {
+    const store = new MemorySchedulerStore([task]);
+    const runner = new SchedulerRunner({
+      store,
+      dispatcher: { startScheduledRun: async (_input, onStarted) => dispatchSucceeded('run-isolated', onStarted) },
+      workerId: 'worker-a',
+    });
+    await runner.tick(fireTime, 1);
+
+    const [listed] = await store.listFires();
+    listed!.result!.usage.inputTokens = 99;
+
+    expect((await store.listFires())[0]!.result!.usage.inputTokens).toBe(0);
+  });
 });
 
 describe('scheduler runtime boundaries', () => {
+  it('waits for the durable Run result before returning its final status', async () => {
+    let resolveResult!: (value: import('@aiop/control-contracts').AgentRunResult) => void;
+    const finalResult = new Promise<import('@aiop/control-contracts').AgentRunResult>((resolve) => { resolveResult = resolve; });
+    const run = vi.fn(async () => ({
+      runId: 'fire-a', status: 'running' as const,
+      events: { async *[Symbol.asyncIterator]() {} },
+      result: () => finalResult,
+    }));
+    const dispatcher = createRunDispatcher({ run } as unknown as DurableRunRuntime);
+    let settled = false;
+    const dispatched = dispatcher.startScheduledRun({
+      taskId: 'task-a', fireId: 'fire-a', fireTime,
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+      sessionId: 'session-a', input: [{ role: 'user', text: 'diagnose' }],
+    }).then((value) => { settled = true; return value; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    resolveResult({
+      runId: 'fire-a', status: 'failed',
+      usage: { inputTokens: 1, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      error: { code: 'MODEL_PROVIDER_ERROR', message: 'provider failed', retryable: false },
+    });
+    await expect(dispatched).resolves.toMatchObject({ runId: 'fire-a', result: { status: 'failed' } });
+  });
+
   it('adapts DurableRunRuntime.run into product Run dispatch', async () => {
-    const run = vi.fn(async (_input: StartRunInput) => ({ runId: 'run-a' }));
+    const run = vi.fn(async (_input: StartRunInput) => succeededHandle('run-a'));
     const dispatcher = createRunDispatcher({ run } as unknown as DurableRunRuntime);
 
     expect(await dispatcher.startScheduledRun({
       taskId: 'task-a', fireId: 'fire-a', fireTime,
       identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
       sessionId: 'session-a', input: [{ role: 'user', text: 'diagnose' }],
-    })).toEqual({ runId: 'run-a' });
+    })).toEqual(succeeded('run-a'));
     expect(run).toHaveBeenCalledWith({
       runId: 'fire-a',
       identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
@@ -112,7 +238,7 @@ describe('scheduler runtime boundaries', () => {
   });
 
   it('preserves unattended policy selection, deadline, and cancellation when dispatching a scheduled Run', async () => {
-    const run = vi.fn(async (_input: StartRunInput) => ({ runId: 'run-a' }));
+    const run = vi.fn(async (_input: StartRunInput) => succeededHandle('run-a'));
     const dispatcher = createRunDispatcher({ run } as unknown as DurableRunRuntime);
     const abort = new AbortController();
     const deadlineAt = new Date('2026-07-29T01:05:00.000Z');
@@ -141,7 +267,7 @@ describe('scheduler runtime boundaries', () => {
 
   it('treats an existing deterministic Run as successful crash compensation', async () => {
     const run = vi.fn(async () => { throw new Error('数据库写入结果未知'); });
-    const findScheduledRun = vi.fn(async () => ({ runId: 'fire-a' }));
+    const findScheduledRun = vi.fn(async () => succeeded('fire-a'));
     const dispatcher = createRunDispatcher(
       { run } as unknown as DurableRunRuntime,
       { findScheduledRun },
@@ -151,7 +277,7 @@ describe('scheduler runtime boundaries', () => {
       taskId: 'task-a', fireId: 'fire-a', fireTime,
       identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
       sessionId: 'session-a', input: [{ role: 'user', text: 'diagnose' }],
-    })).resolves.toEqual({ runId: 'fire-a' });
+    })).resolves.toEqual(succeeded('fire-a'));
     expect(findScheduledRun).toHaveBeenCalledWith({
       taskId: 'task-a', fireId: 'fire-a', fireTime,
       identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
@@ -175,15 +301,22 @@ describe('scheduler runtime boundaries', () => {
     expect(MysqlSchedulerStore).toBeTypeOf('function');
   });
 
-  it('keeps fire completion, durable Run association, and legacy task history in one MySQL transaction', async () => {
+  it('binds the durable Run and completes legacy history in separate MySQL transactions', async () => {
     const source = await readFile(new URL('../../packages/scheduler-runtime/src/mysql.ts', import.meta.url), 'utf8');
+    const bindRun = source.slice(source.indexOf('async bindRun'), source.indexOf('async completeFire'));
     const completeFire = source.slice(source.indexOf('async completeFire'), source.indexOf('async releaseFire'));
 
+    expect(bindRun).toContain('transaction().execute');
+    expect(bindRun).toContain("insertInto('task_agent_runs')");
+    expect(bindRun).toContain("updateTable('scheduler_fires')");
     expect(completeFire).toContain('transaction().execute');
     expect(completeFire).toContain("insertInto('task_runs')");
-    expect(completeFire).toContain("insertInto('task_agent_runs')");
     expect(completeFire).toContain("updateTable('scheduler_fires')");
+    expect(completeFire).not.toContain("insertInto('task_agent_runs')");
     expect(completeFire).toContain('onDuplicateKeyUpdate');
+    expect(completeFire).toContain('compatibilityStatus(input.result)');
+    expect(completeFire).toContain('compatibilityDetail(input.result)');
+    expect(completeFire).not.toContain("status: 'success', detail: input.runId");
   });
 
   it('dispatches product Runs without importing or entering the Pi loop', async () => {
@@ -220,7 +353,7 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlSchedulerStore production 
 
     try {
       const firstTaskId = await insertTask('competing');
-      const startScheduledRun = vi.fn(async (input: { fireId: string }) => ({ runId: input.fireId }));
+      const startScheduledRun = vi.fn(async (input: { fireId: string }, onStarted) => dispatchSucceeded(input.fireId, onStarted));
       const shared = { dispatcher: { startScheduledRun }, leaseMs: 1000 };
       const [left, right] = await Promise.all([
         new SchedulerRunner({ store: new MysqlSchedulerStore(schedulerDb), workerId: 'worker-a', ...shared }).tick(fireAt, 1),
@@ -238,7 +371,7 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlSchedulerStore production 
       const failedTaskId = await insertTask('retry');
       const retryDispatcher = vi.fn()
         .mockRejectedValueOnce(new Error('Run creation failed'))
-        .mockImplementation(async (input: { fireId: string }) => ({ runId: input.fireId }));
+        .mockImplementation(async (input: { fireId: string }, onStarted) => dispatchSucceeded(input.fireId, onStarted));
       const retryRunner = new SchedulerRunner({
         store: new MysqlSchedulerStore(schedulerDb), dispatcher: { startScheduledRun: retryDispatcher },
         workerId: 'worker-retry', retryDelayMs: 10,
@@ -253,7 +386,7 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlSchedulerStore production 
       const abandonedStore = new MysqlSchedulerStore(schedulerDb);
       const [abandoned] = await abandonedStore.claimDue({ now: fireAt, limit: 1, workerId: 'dead', leaseMs: 10 });
       expect(abandoned?.taskId).toBe(String(recoveredTaskId));
-      const recoveredDispatcher = vi.fn(async (input: { fireId: string }) => ({ runId: input.fireId }));
+      const recoveredDispatcher = vi.fn(async (input: { fireId: string }, onStarted) => dispatchSucceeded(input.fireId, onStarted));
       const recoveryRunner = new SchedulerRunner({
         store: new MysqlSchedulerStore(schedulerDb), dispatcher: { startScheduledRun: recoveredDispatcher }, workerId: 'recovery',
       });

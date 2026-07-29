@@ -19,6 +19,7 @@ import { DurableRunManager } from '@aiop/pi-runtime';
 import { GovernedToolOutcomeError } from '@aiop/pi-runtime';
 import { McpManager } from '@aiop/mcp-runtime';
 import { AllowAllPolicy } from '../src/agent/policy.js';
+import { defineTool, ToolRegistry } from '../src/agent/tools.js';
 
 const config: Config = {
   models: {
@@ -198,14 +199,14 @@ describe('production durable runtime assembly', () => {
       .rejects.toThrow('distributed mutation lock');
   });
 
-  it('keeps the MysqlStore durable primary path disabled by default', async () => {
+  it('constructs the MysqlStore durable primary path by default', async () => {
     const runtime = await createDefaultDurableRunRuntime(
       new MysqlStore({} as never),
       { id: 'configured', protocol: 'openai', baseURL: 'http://model.local/v1', apiKey: 'secret', model: 'custom-model' },
       'system prompt',
     );
 
-    expect(runtime).toBeUndefined();
+    expect(runtime).toBeInstanceOf(DurableRunManager);
   });
 
   it('constructs the shared durable Pi runtime only when explicitly enabled', async () => {
@@ -245,6 +246,52 @@ describe('production durable runtime assembly', () => {
       events: { tenantId: 'tenant-a', runId: 'run-a', attemptId: 'attempt-a', turnNo: 1 },
     });
     expect(tools.map((tool) => tool.name)).toEqual(['mcp__ops__inspect']);
+    await mcp.close();
+  });
+
+  it('selects the pre-approved policy for MCP, Sandbox, and built-in durable tools', async () => {
+    const mcp = new McpManager({
+      ops: { transport: 'http', url: 'https://ops.example', toolCapabilities: { inspect: 'read' } },
+    }, async () => ({
+      listTools: async () => ({ tools: [{ name: 'inspect', inputSchema: {} }] }),
+      callTool: async () => ({ content: [{ type: 'text', text: 'mcp' }] }), close: async () => undefined,
+    }));
+    const products = new ToolRegistry()
+      .register(defineTool({
+        name: 'builtin_probe', description: 'builtin', inputSchema: {}, capability: 'read',
+        execute: async () => ({ id: '', content: 'builtin' }),
+      }), 'aiop')
+      .register(defineTool({
+        name: 'sandbox_probe', description: 'sandbox', inputSchema: {}, capability: 'read',
+        execute: async () => ({ id: '', content: 'sandbox' }),
+      }), 'sandbox');
+    const standard = { check: vi.fn(async () => ({ blocked: true, reason: 'standard' })) };
+    const preApproved = { check: vi.fn(async () => ({ blocked: true, reason: 'pre-approved' })) };
+    const factory = createDefaultDurableRunRuntime as unknown as (...args: unknown[]) => Promise<DurableRunManager>;
+    const runtime = await factory(
+      new MysqlStore({} as never),
+      { id: 'configured', protocol: 'openai', baseURL: 'http://model.local/v1', apiKey: 'secret', model: 'custom-model' },
+      'system prompt', true, mcp, standard, products, preApproved,
+    );
+    const sessionFactory = (runtime as unknown as { options: { sessions: { options: {
+      resolveTools(input: unknown): Promise<Array<{ name: string; execute(...args: unknown[]): Promise<unknown> }>>;
+    } } } }).options.sessions;
+    const context = {
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+      sessionId: 'session-a', execution: { unattended: true, preApproved: true },
+      events: { tenantId: 'tenant-a', runId: 'run-a', attemptId: 'attempt-a', turnNo: 1 },
+    };
+    const tools = await sessionFactory.options.resolveTools(context);
+    expect(tools.map((tool) => tool.name).sort()).toEqual(['builtin_probe', 'mcp__ops__inspect', 'sandbox_probe']);
+    for (const [index, tool] of tools.entries()) {
+      await tool.execute(`call-${index}`, {}, new AbortController().signal, () => undefined, undefined).catch(() => undefined);
+    }
+    expect(preApproved.check).toHaveBeenCalledTimes(3);
+    expect(standard.check).not.toHaveBeenCalled();
+
+    const ordinary = await sessionFactory.options.resolveTools({ ...context, execution: { unattended: true } });
+    await ordinary[0]!.execute('ordinary', {}, new AbortController().signal, () => undefined, undefined).catch(() => undefined);
+    expect(standard.check).toHaveBeenCalledOnce();
     await mcp.close();
   });
 
