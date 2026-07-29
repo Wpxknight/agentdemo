@@ -894,19 +894,96 @@ async function superviseDurableRecovery(
   runId: string,
   resolution?: { interactionId: string; value: JsonValue },
 ): Promise<void> {
+  const identity = { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] };
+  let expectedLease: { ownerId: string; token: bigint } | undefined;
+  const observeLease = async (): Promise<void> => {
+    const run = await rt.store.durableRunStore().get({ tenantId: ctx.tenantId, runId });
+    if (run?.leaseOwner && run.leaseExpiresAt && run.leaseExpiresAt > new Date()) {
+      expectedLease = { ownerId: run.leaseOwner, token: run.leaseToken };
+    }
+  };
   try {
+    await bestEffortAppendRecoveryEvent(rt, ctx, runId, 'started');
     const handle = await rt.durableRunRuntime.resume({
-      identity: { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] },
+      identity,
       runId,
       ...(resolution ? { resolution } : {}),
     });
+    await observeLease();
     for await (const _event of handle.events) {
       // Recovery is detached from an HTTP response, but its event stream still needs a consumer.
+      if (!expectedLease) await observeLease();
     }
-    await handle.result();
+    const result = await handle.result();
+    if (result.status === 'succeeded' || result.status === 'waiting') {
+      await bestEffortAppendRecoveryEvent(rt, ctx, runId, 'succeeded', { status: result.status });
+      return;
+    }
+    await persistRecoveryFailure(rt, ctx, runId, result.error?.message ?? `Recovery ended with ${result.status}`, expectedLease);
   } catch (err) {
-    log.error({ err, runId }, 'durable run recovery failed');
+    await observeLease().catch(() => {});
+    await persistRecoveryFailure(rt, ctx, runId, safeRecoveryError(err), expectedLease).catch((persistError) => {
+      log.error({ error: safeRecoveryError(persistError), runId }, 'durable recovery failure persistence failed');
+    });
+    log.error({ error: safeRecoveryError(err), runId }, 'durable run recovery failed');
   }
+}
+
+async function bestEffortAppendRecoveryEvent(
+  rt: Runtime,
+  ctx: RequestContext,
+  runId: string,
+  status: 'started' | 'succeeded' | 'failed',
+  detail?: Record<string, unknown>,
+): Promise<void> {
+  await appendRecoveryEvent(rt, ctx, runId, status, detail).catch((error) => {
+    log.warn({ error: safeRecoveryError(error), runId, status }, 'durable recovery event persistence failed');
+  });
+}
+
+async function appendRecoveryEvent(
+  rt: Runtime,
+  ctx: RequestContext,
+  runId: string,
+  status: 'started' | 'succeeded' | 'failed',
+  detail?: Record<string, unknown>,
+): Promise<void> {
+  await rt.store.appendAgentRunEvent({
+    tenantId: ctx.tenantId, runId, type: 'recovery', status,
+    detail: { ...detail, actorId: ctx.userId }, createdAt: new Date(),
+  });
+}
+
+async function persistRecoveryFailure(
+  rt: Runtime,
+  ctx: RequestContext,
+  runId: string,
+  error: string,
+  expectedLease?: { ownerId: string; token: bigint },
+): Promise<void> {
+  const message = safeRecoveryError(error);
+  const failedAt = new Date();
+  const identity = { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] };
+  const durable = await rt.store.durableRunStore().markRecoveryRequired({
+    identity, runId, errorMessage: message, failedAt, expectedLease,
+  });
+  if (!durable) {
+    const current = await rt.store.getAgentRun(ctx, runId);
+    const leaseActive = Boolean(current?.leaseOwner && current.leaseExpiresAt && current.leaseExpiresAt > failedAt);
+    if (current && !leaseActive && current.status !== 'succeeded' && current.status !== 'cancelled') {
+      await rt.store.updateAgentRun(ctx.tenantId, runId, {
+        status: 'recovery_required', errorMessage: message, completedAt: failedAt, updatedAt: failedAt, clearLease: true,
+      });
+    }
+  }
+  await bestEffortAppendRecoveryEvent(rt, ctx, runId, 'failed', { error: message });
+}
+
+function safeRecoveryError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error ?? 'Recovery failed');
+  return raw
+    .replace(/(api[-_ ]?key|authorization|password|secret[-_ ]?token|token)\s*[:=]?\s*\S+/gi, '[redacted]')
+    .slice(0, 1_024);
 }
 
 async function handle(
@@ -1802,9 +1879,14 @@ async function handle(
     const ctx = await requireAuth(rt, req);
     const sessionId = decodeURIComponent(sessionTerminateMatch[1]!);
     const activeKey = activeRunKey(ctx, sessionId);
-    const runIds = [...(activeRuns.get(activeKey) ?? [])]
+    const localRunIds = [...(activeRuns.get(activeKey) ?? [])]
       .filter((run) => !run.abort.signal.aborted)
       .map((run) => run.runId);
+    const ownerCtx: RequestContext = { ...ctx, role: 'user' };
+    const durableRunIds = (await rt.store.listAgentRuns(ownerCtx, { sessionId, limit: 1_000 }))
+      .filter((run) => run.status === 'queued' || run.status === 'running' || run.status === 'waiting')
+      .map((run) => run.runId);
+    const runIds = [...new Set([...localRunIds, ...durableRunIds])];
     const aborted = abortActiveRuns(activeRuns, activeKey);
     await Promise.all(runIds.map((runId) => rt.durableRunRuntime.cancel({
       identity: { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] },
@@ -2267,16 +2349,6 @@ async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req:
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
   sse('session', { sessionId, runId: handle.runId });
-  const onClose = () => {
-    if (abort.signal.aborted) return;
-    abort.abort(new Error('客户端连接已关闭'));
-    void runtime.cancel({
-      identity: { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] },
-      runId: handle.runId,
-      reason: '客户端连接已关闭',
-    }).catch(() => {});
-  };
-  res.on('close', onClose);
   try {
     let emittedText = false;
     let steps = 0;
@@ -2319,7 +2391,6 @@ async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req:
     sse('error', { error: error instanceof Error ? error.message : '运行失败', runId: handle.runId });
   } finally {
     removeActiveRun(activeRuns, activeKey, activeRun);
-    res.off('close', onClose);
     if (!res.destroyed && !res.writableEnded) res.end();
   }
 }

@@ -50,21 +50,24 @@ beforeAll(async () => {
   const user = await authProvider.createUser('default', 'alice', 'pw', 'user');
   userId = user.id;
   const createdAt = new Date('2026-07-22T00:00:00.000Z');
-  await store.putAgentRunBindingIfAbsent({
-    tenantId: 'default', userId: user.id, sessionId: 'session-user', runId: 'run-user',
-    kernel: 'pi', kernelVersion: '0.82.1', graphName: '', graphVersion: '', createdAt,
-  });
+  await store.durableRunStore().create({ record: {
+    tenantId: 'default', actorId: user.id, sessionId: 'session-user', runId: 'run-user',
+    kernel: 'pi', kernelVersion: '0.82.1', status: 'queued', leaseToken: 0n,
+    usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+    createdAt, updatedAt: createdAt,
+  } });
   await store.updateAgentRun('default', 'run-user', {
     status: 'failed', errorMessage: 'upstream failed', completedAt: createdAt, updatedAt: createdAt,
   });
   await store.appendAgentRunEvent({
     tenantId: 'default', runId: 'run-user', type: 'node', node: 'model', status: 'failed', createdAt,
   });
-  await store.putAgentRunBindingIfAbsent({
-    tenantId: 'default', userId: admin.id, sessionId: 'session-admin', runId: 'run-admin',
-    kernel: 'pi', kernelVersion: '0.82.1', graphName: '', graphVersion: '',
-    createdAt: new Date(createdAt.getTime() + 1),
-  });
+  await store.durableRunStore().create({ record: {
+    tenantId: 'default', actorId: admin.id, sessionId: 'session-admin', runId: 'run-admin',
+    kernel: 'pi', kernelVersion: '0.82.1', status: 'queued', leaseToken: 0n,
+    usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+    createdAt: new Date(createdAt.getTime() + 1), updatedAt: new Date(createdAt.getTime() + 1),
+  } });
   const rt = {
     durableRunRuntime: {
       run: vi.fn(async () => completedHandle('unused')),
@@ -162,6 +165,14 @@ describe('mandatory durable Run Center HTTP API', () => {
     await vi.waitFor(() => expect(resume).toHaveBeenCalledWith({
       identity: { tenantId: 'default', actorId: userId, roles: ['user'] }, runId: 'run-user',
     }));
+    await vi.waitFor(async () => {
+      const recovery = (await store.listAgentRunEvents({ tenantId: 'default', userId, role: 'user' }, 'run-user'))
+        .filter((event) => event.type === 'recovery');
+      expect(recovery.slice(-3).map((event) => event.status)).toEqual(['requested', 'started', 'succeeded']);
+      expect((await store.durableRunStore().events.list({ tenantId: 'default', runId: 'run-user' }))
+        .slice(-3).map((event) => (event.detail as { recoveryStatus?: string }).recoveryStatus))
+        .toEqual(['requested', 'started', 'succeeded']);
+    });
   });
 
   it('automatically recovers a resolved interaction once and rejects conflicting races', async () => {
@@ -197,15 +208,24 @@ describe('mandatory durable Run Center HTTP API', () => {
 
   it('supervises immediate recovery failures and drains returned handles', async () => {
     await store.updateAgentRun('default', 'run-user', { status: 'failed', waitingReason: null });
-    resume.mockRejectedValueOnce(new Error('immediate failure'));
+    resume.mockRejectedValueOnce(new Error('authorization=Bearer-secret token=top-secret immediate failure'));
     const first = await fetch(`${base}/v1/agent/runs/run-user/resume`, {
       method: 'POST', headers: auth(userToken), body: '{}',
     });
     expect(first.status).toBe(202);
-    await vi.waitFor(() => expect(resume).toHaveBeenCalledOnce());
+    await vi.waitFor(async () => {
+      expect(resume).toHaveBeenCalledOnce();
+      expect(await store.getAgentRun({ tenantId: 'default', userId, role: 'user' }, 'run-user')).toMatchObject({
+        status: 'recovery_required', errorMessage: expect.stringContaining('[redacted]'),
+      });
+      const recovery = (await store.listAgentRunEvents({ tenantId: 'default', userId, role: 'user' }, 'run-user'))
+        .filter((event) => event.type === 'recovery');
+      expect(recovery.slice(-3).map((event) => event.status)).toEqual(['requested', 'started', 'failed']);
+      expect(JSON.stringify(recovery.at(-1))).not.toContain('top-secret');
+    });
 
     const drained = vi.fn();
-    const result = vi.fn(async () => { throw new Error('handle failure'); });
+    const result = vi.fn(async () => { throw new Error('password=hunter2 handle failure'); });
     resume.mockResolvedValueOnce({
       runId: 'run-user', status: 'running',
       events: { async *[Symbol.asyncIterator]() { drained(); } }, result,
@@ -217,6 +237,15 @@ describe('mandatory durable Run Center HTTP API', () => {
     await vi.waitFor(() => {
       expect(drained).toHaveBeenCalledOnce();
       expect(result).toHaveBeenCalledOnce();
+    });
+    await vi.waitFor(async () => {
+      expect(await store.getAgentRun({ tenantId: 'default', userId, role: 'user' }, 'run-user')).toMatchObject({
+        status: 'recovery_required', errorMessage: expect.stringContaining('[redacted]'),
+      });
+      const recovery = (await store.listAgentRunEvents({ tenantId: 'default', userId, role: 'user' }, 'run-user'))
+        .filter((event) => event.type === 'recovery');
+      expect(recovery.slice(-3).map((event) => event.status)).toEqual(['requested', 'started', 'failed']);
+      expect(JSON.stringify(recovery.at(-1))).not.toContain('hunter2');
     });
   });
 

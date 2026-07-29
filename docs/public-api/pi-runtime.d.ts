@@ -57,6 +57,8 @@ export declare class FifoModelConcurrencyController implements ModelConcurrencyC
     private readonly semaphores;
     private readonly limit;
     constructor(options?: FifoModelConcurrencyControllerOptions);
+    /** Diagnostic count used to verify semaphore lifecycle without exposing queue contents. */
+    get activeKeyCount(): number;
     acquire(input: ModelConcurrencyInput): Promise<() => void>;
 }
 export declare function createConcurrentModels(models: Models, controller: ModelConcurrencyController, identity: IdentityContext): Models;
@@ -620,6 +622,7 @@ export declare class MemoryRunStore implements DurableProductRunStore {
     private readonly interactionRecords;
     private readonly toolLedgerRecords;
     private transactionTail;
+    private readonly mutationContext;
     constructor(now?: () => Date);
     create(input: Parameters<DurableRunStore['create']>[0]): Promise<StoredRun & {
         sessionCreated: boolean;
@@ -633,6 +636,16 @@ export declare class MemoryRunStore implements DurableProductRunStore {
         tenantId: string;
         runId: string;
     }, patch: Partial<StoredRun>): Promise<boolean>;
+    markRecoveryRequired(input: {
+        identity: Parameters<DurableRunStore['claim']>[0]['identity'];
+        runId: string;
+        errorMessage: string;
+        failedAt: Date;
+        expectedLease?: {
+            ownerId: string;
+            token: bigint;
+        };
+    }): Promise<boolean>;
     claim(input: Parameters<DurableRunStore['claim']>[0]): Promise<Awaited<ReturnType<DurableRunStore['claim']>>>;
     renewLease(input: Parameters<DurableRunStore['renewLease']>[0]): Promise<void>;
     commitTurn(input: Parameters<DurableRunStore['commitTurn']>[0]): Promise<void>;
@@ -767,6 +780,16 @@ export declare class MysqlRunStore implements DurableProductRunStore {
         tenantId: string;
         runId: string;
     }, patch: Partial<StoredRun>): Promise<boolean>;
+    markRecoveryRequired(input: {
+        identity: Parameters<DurableRunStore['claim']>[0]['identity'];
+        runId: string;
+        errorMessage: string;
+        failedAt: Date;
+        expectedLease?: {
+            ownerId: string;
+            token: bigint;
+        };
+    }): Promise<boolean>;
     claim(input: Parameters<DurableRunStore['claim']>[0]): Promise<Awaited<ReturnType<DurableRunStore['claim']>>>;
     renewLease(input: Parameters<DurableRunStore['renewLease']>[0]): Promise<void>;
     commitTurn(input: Parameters<DurableRunStore['commitTurn']>[0]): Promise<void>;
@@ -1055,6 +1078,16 @@ export interface DurableProductRunStore extends DurableRunStore {
         tenantId: string;
         runId: string;
     }, patch: Partial<StoredRun>): Promise<boolean>;
+    markRecoveryRequired(input: {
+        identity: ClaimRunInput['identity'];
+        runId: string;
+        errorMessage: string;
+        failedAt: Date;
+        expectedLease?: {
+            ownerId: string;
+            token: bigint;
+        };
+    }): Promise<boolean>;
     runs: {
         assertLease(identity: {
             tenantId: string;

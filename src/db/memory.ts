@@ -369,6 +369,26 @@ export class MemoryStore implements Store {
   }
 
   async appendAgentRunEvent(event: AgentRunEvent): Promise<void> {
+    const durableRun = await this.durableStore.get({ tenantId: event.tenantId, runId: event.runId });
+    if (durableRun) {
+      const detail = event.detail && typeof event.detail === 'object' && !Array.isArray(event.detail)
+        ? structuredClone(event.detail as Record<string, unknown>)
+        : event.detail === undefined ? {} : { value: structuredClone(event.detail) };
+      await this.durableStore.events.append({
+        tenantId: event.tenantId, runId: event.runId, type: event.type,
+        attemptId: event.attemptId ?? 'product', turnNo: event.turnNo ?? durableRun.lastTurnNo,
+        kernel: 'pi', kernelVersion: event.kernelVersion ?? durableRun.kernelVersion,
+        correlationId: event.correlationId ?? `product:${event.type}`,
+        detail: {
+          ...detail,
+          ...(event.status ? { productStatus: event.status } : {}),
+          ...(event.type === 'recovery' && event.status ? { recoveryStatus: event.status } : {}),
+          ...(event.node ? { productNode: event.node } : {}),
+        },
+        createdAt: event.createdAt,
+      });
+      return;
+    }
     const sequence = event.sequence ?? this.agentRunEvents
       .filter((item) => item.tenantId === event.tenantId && item.runId === event.runId)
       .reduce((max, item) => Math.max(max, item.sequence ?? 0), 0) + 1;
@@ -379,6 +399,14 @@ export class MemoryStore implements Store {
     if (!await this.getAgentRun(ctx, runId)) return [];
     const durable = await this.durableStore.events.list({ tenantId: ctx.tenantId, runId });
     if (durable.length) return durable.map((event) => ({
+      ...(() => {
+        const detail = event.detail && typeof event.detail === 'object' && !Array.isArray(event.detail)
+          ? event.detail as Record<string, unknown> : {};
+        return {
+          status: typeof detail.productStatus === 'string' ? detail.productStatus : undefined,
+          node: typeof detail.productNode === 'string' ? detail.productNode : undefined,
+        };
+      })(),
       tenantId: event.tenantId,
       runId: event.runId,
       sequence: Number(event.sequence),

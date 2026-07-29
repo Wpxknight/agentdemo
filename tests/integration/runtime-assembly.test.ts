@@ -124,6 +124,51 @@ describe('final runtime assembly boundary', () => {
     expect(statements).toEqual(['SELECT GET_LOCK(?, ?) AS acquired', 'connection.release()']);
   });
 
+  it.each([0, null])(
+    'destroys the migration connection when RELEASE_LOCK returns %s',
+    async (released) => {
+      const lifecycle: string[] = [];
+      const connection = {
+        query: async (sql: string) => {
+          if (sql.includes('GET_LOCK')) return [[{ acquired: 1 }], []];
+          if (sql.includes('RELEASE_LOCK')) return [[{ released }], []];
+          if (sql === 'SELECT version FROM schema_migrations') {
+            return [[...Array.from({ length: 26 }, (_, index) => ({ version: index + 1 }))], []];
+          }
+          return [[], []];
+        },
+        release: () => lifecycle.push('release'),
+        destroy: () => lifecycle.push('destroy'),
+      };
+      const pool = { promise: () => ({ getConnection: async () => connection }) };
+
+      await runMigrations(pool as never);
+
+      expect(lifecycle).toEqual(['destroy']);
+    },
+  );
+
+  it('destroys the migration connection when RELEASE_LOCK throws', async () => {
+    const lifecycle: string[] = [];
+    const connection = {
+      query: async (sql: string) => {
+        if (sql.includes('GET_LOCK')) return [[{ acquired: 1 }], []];
+        if (sql.includes('RELEASE_LOCK')) throw new Error('release query failed');
+        if (sql === 'SELECT version FROM schema_migrations') {
+          return [[...Array.from({ length: 26 }, (_, index) => ({ version: index + 1 }))], []];
+        }
+        return [[], []];
+      },
+      release: () => lifecycle.push('release'),
+      destroy: () => lifecycle.push('destroy'),
+    };
+    const pool = { promise: () => ({ getConnection: async () => connection }) };
+
+    await runMigrations(pool as never);
+
+    expect(lifecycle).toEqual(['destroy']);
+  });
+
   it('assembles one mandatory durable runtime for non-MySQL application modes', async () => {
     const config: Config = {
       models: {

@@ -1,10 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
+import { once } from 'node:events';
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Server } from 'node:http';
+import { request as httpRequest, type IncomingMessage, type Server } from 'node:http';
 import { createHttpServer } from '../src/server/http.js';
 import { MemoryStore } from '../src/db/memory.js';
 import type { SandboxSettings } from '../src/db/store.js';
@@ -30,6 +31,7 @@ import type {
 } from '@aiop/control-contracts';
 import { loadSourcedSkills } from '@earendil-works/pi-agent-core';
 import { EventCodec } from '../packages/pi-runtime/src/index.js';
+import { DurableRunManager, type ManagedPiSession } from '../packages/pi-runtime/src/index.js';
 
 /** 纯文本回答的 mock 模型（不发起工具调用）。 */
 const model: ChatModel = {
@@ -624,6 +626,143 @@ describe('HTTP server', () => {
       expect(messages.at(-1)?.text).toContain('已终止当前运行。');
     } finally {
       await new Promise<void>((resolve) => terminateServer.close(() => resolve()));
+    }
+  });
+
+  it.each(['queued', 'waiting'] as const)(
+    'terminates a durable %s run discovered after the server-local active map is lost',
+    async (status) => {
+      const localStore = new MemoryStore();
+      await localStore.createTenant({ id: 'default', name: 'Default' });
+      const auth = new LocalAuthProvider({ store: localStore, secret: `remote-${status}-secret` });
+      const owner = await auth.createUser('default', `owner-${status}`, 'pw', 'user');
+      const ownerToken = (await auth.login('default', `owner-${status}`, 'pw'))!;
+      const now = new Date('2026-07-29T11:00:00.000Z');
+      const runId = `remote-${status}-run`;
+      await localStore.durableRunStore().create({ record: {
+        tenantId: 'default', runId, actorId: owner.id, sessionId: 'remote-session', kernel: 'pi',
+        kernelVersion: '0.82.1', status, waitingReason: status === 'waiting' ? 'approval' : undefined,
+        leaseToken: 0n, usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+        createdAt: now, updatedAt: now,
+      } });
+      const durableRunRuntime = new DurableRunManager({
+        store: localStore.durableRunStore(), heartbeatMs: 0,
+        sessions: {
+          create: async () => { throw new Error('terminate must not create a session'); },
+          load: async () => { throw new Error('terminate must not load a session'); },
+        },
+        eventOptions: () => ({}), now: () => new Date(now.getTime() + 1),
+      });
+      const rt = {
+        model, tools: new ToolRegistry(), store: localStore,
+        policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(),
+        authProvider: auth, jwtSecret: `remote-${status}-secret`, systemExtra: '', durableRunRuntime,
+        defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+      } as unknown as Runtime;
+      const remoteServer = createHttpServer(rt);
+      await new Promise<void>((resolve) => remoteServer.listen(0, '127.0.0.1', resolve));
+      const remoteBase = `http://127.0.0.1:${(remoteServer.address() as AddressInfo).port}`;
+
+      try {
+        const response = await fetch(`${remoteBase}/v1/sessions/remote-session/terminate`, {
+          method: 'POST', headers: { authorization: `Bearer ${ownerToken}` },
+        });
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({ ok: true, sessionId: 'remote-session', aborted: 0 });
+        expect(await localStore.durableRunStore().get({ tenantId: 'default', runId })).toMatchObject({
+          status: 'cancelled', cancelRequestedAt: expect.any(Date),
+        });
+      } finally {
+        await new Promise<void>((resolve) => remoteServer.close(() => resolve()));
+      }
+    },
+  );
+
+  it('detaches a closed SSE response while the durable run continues and remains replayable', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'sse-detach-secret' });
+    const owner = await auth.createUser('default', 'sse-owner', 'pw', 'user');
+    const ownerToken = (await auth.login('default', 'sse-owner', 'pw'))!;
+    let sessionStarted!: () => void;
+    const started = new Promise<void>((resolve) => { sessionStarted = resolve; });
+    let finishSession!: () => void;
+    const finish = new Promise<void>((resolve) => { finishSession = resolve; });
+    const session: ManagedPiSession = {
+      async *continue(signal): AsyncIterable<AgentRunEvent> {
+        sessionStarted();
+        yield {
+          tenantId: '', runId: '', sequence: 1n, type: 'message_update', attemptId: '', turnNo: 0,
+          kernel: 'pi', kernelVersion: '0.82.1', correlationId: 'before-disconnect', createdAt: new Date(),
+          detail: { update: { type: 'text_delta', delta: 'before disconnect' } },
+        };
+        await finish;
+        signal?.throwIfAborted();
+        yield {
+          tenantId: '', runId: '', sequence: 2n, type: 'message_end', attemptId: '', turnNo: 0,
+          kernel: 'pi', kernelVersion: '0.82.1', correlationId: 'after-disconnect', createdAt: new Date(),
+          detail: { message: { usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } } },
+        };
+      },
+      async entries() { return []; },
+      async leafId() { return null; },
+      async metadata() { return { id: 'sse-detach-session', tenantId: 'default', createdAt: new Date().toISOString() }; },
+      async abort() {}, async close() {}, async steer() {}, async followUp() {},
+      async appendCustomEntry() { return 'marker'; },
+    };
+    const durableRunRuntime = new DurableRunManager({
+      store: localStore.durableRunStore(), heartbeatMs: 0,
+      sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+    const rt = {
+      model, tools: new ToolRegistry(), store: localStore,
+      policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(), authProvider: auth,
+      jwtSecret: 'sse-detach-secret', systemExtra: '', durableRunRuntime,
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+    const detachServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => detachServer.listen(0, '127.0.0.1', resolve));
+    const detachBase = `http://127.0.0.1:${(detachServer.address() as AddressInfo).port}`;
+
+    try {
+      let clientResponse!: IncomingMessage;
+      const firstChunkPromise = new Promise<string>((resolve, reject) => {
+        const request = httpRequest(`${detachBase}/v1/agent`, {
+          method: 'POST', headers: { authorization: `Bearer ${ownerToken}`, 'content-type': 'application/json' },
+        }, (response) => {
+          clientResponse = response;
+          response.once('data', (chunk) => resolve(String(chunk)));
+          response.once('error', reject);
+        });
+        request.once('error', reject);
+        request.end(JSON.stringify({ sessionId: 'sse-detach-session', task: 'continue after disconnect' }));
+      });
+      const firstChunk = await firstChunkPromise;
+      const runId = /"runId":"([^"]+)"/.exec(firstChunk)?.[1];
+      expect(runId).toBeTruthy();
+      await started;
+      const closed = once(clientResponse, 'close');
+      clientResponse.destroy();
+      await closed;
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      expect(await localStore.durableRunStore().isCancellationRequested({ tenantId: 'default', runId: runId! }))
+        .toBe(false);
+      finishSession();
+
+      await vi.waitFor(async () => {
+        expect(await localStore.durableRunStore().get({ tenantId: 'default', runId: runId! }))
+          .toMatchObject({ status: 'succeeded' });
+      });
+      const replay = await fetch(`${detachBase}/v1/agent/runs/${runId}/events`, {
+        headers: { authorization: `Bearer ${ownerToken}`, 'last-event-id': '1' },
+      });
+      expect(replay.status).toBe(200);
+      const replayBody = await replay.text();
+      expect(replayBody).toContain('after-disconnect');
+      expect(replayBody).not.toContain('before-disconnect');
+    } finally {
+      finishSession();
+      await new Promise<void>((resolve) => detachServer.close(() => resolve()));
     }
   });
 

@@ -73,12 +73,18 @@ export async function runMigrations(pool: Pool): Promise<void> {
     }
     log.info({ applied: count, total: files.length }, 'migrations up to date');
   } finally {
+    let reusable = !lockAcquired;
     if (lockAcquired) {
-      await conn.query('SELECT RELEASE_LOCK(?) AS released', [lockName]).catch((error) => {
+      try {
+        const [releaseRows] = await conn.query('SELECT RELEASE_LOCK(?) AS released', [lockName]);
+        reusable = Number((releaseRows as Array<{ released: number | null }>)[0]?.released) === 1;
+        if (!reusable) log.warn('schema migration lock release was not confirmed; destroying connection');
+      } catch (error) {
         log.warn({ err: String(error) }, 'failed to release schema migration lock');
-      });
+      }
     }
-    conn.release();
+    if (reusable) conn.release();
+    else conn.destroy();
   }
 }
 

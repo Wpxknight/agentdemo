@@ -31,6 +31,11 @@ export class FifoModelConcurrencyController implements ModelConcurrencyControlle
     this.limit = positiveLimit(options.maxConcurrentPerTenantModel ?? 4);
   }
 
+  /** Diagnostic count used to verify semaphore lifecycle without exposing queue contents. */
+  get activeKeyCount(): number {
+    return this.semaphores.size;
+  }
+
   async acquire(input: ModelConcurrencyInput): Promise<() => void> {
     const key = JSON.stringify([
       input.identity.tenantId,
@@ -40,10 +45,16 @@ export class FifoModelConcurrencyController implements ModelConcurrencyControlle
     ]);
     const semaphore = this.semaphores.get(key) ?? new FifoSemaphore(this.limit);
     this.semaphores.set(key, semaphore);
-    const release = await semaphore.acquire(input.signal);
+    let release: () => void;
+    try {
+      release = await semaphore.acquire(input.signal);
+    } catch (error) {
+      if (semaphore.idle && this.semaphores.get(key) === semaphore) this.semaphores.delete(key);
+      throw error;
+    }
     return () => {
       release();
-      if (semaphore.idle) this.semaphores.delete(key);
+      if (semaphore.idle && this.semaphores.get(key) === semaphore) this.semaphores.delete(key);
     };
   }
 }

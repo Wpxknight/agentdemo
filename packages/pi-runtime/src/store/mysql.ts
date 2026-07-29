@@ -83,6 +83,30 @@ export class MysqlRunStore implements DurableProductRunStore {
     return affected(result);
   }
 
+  async markRecoveryRequired(input: {
+    identity: Parameters<DurableRunStore['claim']>[0]['identity']; runId: string; errorMessage: string; failedAt: Date;
+    expectedLease?: { ownerId: string; token: bigint };
+  }): Promise<boolean> {
+    return this.transaction(async (store) => {
+      const row = await store.db.selectFrom('agent_runs').selectAll().where('tenant_id', '=', input.identity.tenantId)
+        .where('run_id', '=', input.runId).forUpdate().executeTakeFirst();
+      if (!row || !canManageRun(input.identity, row.user_id) || ['succeeded', 'cancelled'].includes(row.status)) return false;
+      const activeLease = Boolean(row.lease_owner && row.lease_expires_at && row.lease_expires_at > input.failedAt);
+      if (activeLease && (!input.expectedLease || row.lease_owner !== input.expectedLease.ownerId
+        || BigInt(row.lease_token) !== input.expectedLease.token)) return false;
+      await store.db.updateTable('agent_runs').set({
+        status: 'recovery_required', waiting_reason: null, error_message: input.errorMessage,
+        completed_at: input.failedAt, append_closed_at: row.append_closed_at ?? input.failedAt,
+        updated_at: input.failedAt, lease_owner: null, lease_expires_at: null,
+      }).where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId).execute();
+      await store.db.updateTable('agent_run_attempts').set({
+        status: 'failed', error_message: input.errorMessage, completed_at: input.failedAt,
+      }).where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId)
+        .where('status', '=', 'running').execute();
+      return true;
+    });
+  }
+
   async claim(input: Parameters<DurableRunStore['claim']>[0]): Promise<Awaited<ReturnType<DurableRunStore['claim']>>> {
     return this.transaction(async (store) => {
       const candidate = await store.db.selectFrom('agent_runs').select(['session_id', 'user_id'])
@@ -241,8 +265,23 @@ export class MysqlRunStore implements DurableProductRunStore {
       const row = await store.db.selectFrom('agent_runs').selectAll().where('tenant_id', '=', input.identity.tenantId)
         .where('run_id', '=', input.runId).forUpdate().executeTakeFirst();
       if (!row || !canManageRun(input.identity, row.user_id)) throw new RunNotFoundError();
-      await store.db.updateTable('agent_runs').set({ cancel_requested_at: input.requestedAt, updated_at: input.requestedAt })
+      const inactive = !row.lease_owner || !row.lease_expires_at || row.lease_expires_at <= input.requestedAt;
+      const cancelled = inactive && (row.status === 'queued' || row.status === 'waiting');
+      await store.db.updateTable('agent_runs').set({
+        cancel_requested_at: row.cancel_requested_at ?? input.requestedAt,
+        updated_at: input.requestedAt,
+        ...(cancelled ? {
+          status: 'cancelled', waiting_reason: null, error_message: input.reason ?? null,
+          completed_at: row.completed_at ?? input.requestedAt, append_closed_at: row.append_closed_at ?? input.requestedAt,
+          lease_owner: null, lease_expires_at: null,
+        } : {}),
+      })
         .where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId).execute();
+      if (cancelled) {
+        await store.db.updateTable('agent_run_attempts').set({ status: 'cancelled', completed_at: input.requestedAt })
+          .where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId)
+          .where('status', '=', 'running').execute();
+      }
     });
   }
 

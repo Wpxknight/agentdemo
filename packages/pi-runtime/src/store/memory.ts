@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import {
   AgentPlatformError, LeaseLostError, RunNotFoundError, type AgentRunEvent, type DurableInteractionUpdate,
   type DurableToolLedgerUpdate,
@@ -26,6 +27,7 @@ export class MemoryRunStore implements DurableProductRunStore {
   private readonly interactionRecords = new Map<string, DurableInteractionUpdate>();
   private readonly toolLedgerRecords = new Map<string, DurableToolLedgerUpdate>();
   private transactionTail: Promise<void> = Promise.resolve();
+  private readonly mutationContext = new AsyncLocalStorage<boolean>();
 
   constructor(private readonly now: () => Date = () => new Date()) {}
 
@@ -61,10 +63,39 @@ export class MemoryRunStore implements DurableProductRunStore {
   }
 
   async updateProductRun(identity: { tenantId: string; runId: string }, patch: Partial<StoredRun>): Promise<boolean> {
-    const run = this.runRecords.get(key(identity.tenantId, identity.runId));
-    if (!run) return false;
-    Object.assign(run, clone(patch), identity);
-    return true;
+    return this.lock(async () => {
+      const run = this.runRecords.get(key(identity.tenantId, identity.runId));
+      if (!run) return false;
+      Object.assign(run, clone(patch), identity);
+      return true;
+    });
+  }
+
+  async markRecoveryRequired(input: {
+    identity: Parameters<DurableRunStore['claim']>[0]['identity']; runId: string; errorMessage: string; failedAt: Date;
+    expectedLease?: { ownerId: string; token: bigint };
+  }): Promise<boolean> {
+    return this.lock(async () => {
+      const run = this.runRecords.get(key(input.identity.tenantId, input.runId));
+      if (!run || !canManageRun(input.identity, run.actorId) || ['succeeded', 'cancelled'].includes(run.status)) return false;
+      const activeLease = Boolean(run.leaseOwner && run.leaseExpiresAt && run.leaseExpiresAt > input.failedAt);
+      if (activeLease && (!input.expectedLease || run.leaseOwner !== input.expectedLease.ownerId
+        || run.leaseToken !== input.expectedLease.token)) return false;
+      run.status = 'recovery_required';
+      run.waitingReason = undefined;
+      run.errorMessage = input.errorMessage;
+      run.completedAt = input.failedAt;
+      run.appendClosedAt ??= input.failedAt;
+      run.updatedAt = input.failedAt;
+      run.leaseOwner = undefined;
+      run.leaseExpiresAt = undefined;
+      for (const attempt of this.attemptsState.values()) {
+        if (attempt.tenantId === run.tenantId && attempt.runId === run.runId && attempt.status === 'running') {
+          Object.assign(attempt, { status: 'failed', errorMessage: input.errorMessage, completedAt: input.failedAt });
+        }
+      }
+      return true;
+    });
   }
 
   async claim(input: Parameters<DurableRunStore['claim']>[0]): Promise<Awaited<ReturnType<DurableRunStore['claim']>>> {
@@ -115,9 +146,11 @@ export class MemoryRunStore implements DurableProductRunStore {
   }
 
   async renewLease(input: Parameters<DurableRunStore['renewLease']>[0]): Promise<void> {
-    const run = this.requireLease(input, input.now);
-    run.leaseExpiresAt = new Date(input.now.getTime() + input.leaseTtlMs);
-    run.updatedAt = input.now;
+    await this.lock(async () => {
+      const run = this.requireLease(input, input.now);
+      run.leaseExpiresAt = new Date(input.now.getTime() + input.leaseTtlMs);
+      run.updatedAt = input.now;
+    });
   }
 
   async commitTurn(input: Parameters<DurableRunStore['commitTurn']>[0]): Promise<void> {
@@ -184,6 +217,21 @@ export class MemoryRunStore implements DurableProductRunStore {
       run.cancelRequestedAt ??= input.requestedAt;
       run.cancelReason ??= input.reason;
       run.updatedAt = input.requestedAt;
+      const inactive = !run.leaseOwner || !run.leaseExpiresAt || run.leaseExpiresAt <= input.requestedAt;
+      if (inactive && (run.status === 'queued' || run.status === 'waiting')) {
+        run.status = 'cancelled';
+        run.waitingReason = undefined;
+        run.result = { runId: run.runId, status: 'cancelled', usage: clone(run.usage) };
+        run.appendClosedAt ??= input.requestedAt;
+        run.completedAt ??= input.requestedAt;
+        run.leaseOwner = undefined;
+        run.leaseExpiresAt = undefined;
+        for (const attempt of this.attemptsState.values()) {
+          if (attempt.tenantId === run.tenantId && attempt.runId === run.runId && attempt.status === 'running') {
+            Object.assign(attempt, { status: 'cancelled', completedAt: input.requestedAt });
+          }
+        }
+      }
     });
   }
 
@@ -272,9 +320,9 @@ export class MemoryRunStore implements DurableProductRunStore {
   };
 
   readonly interactions = {
-    put: async (record: DurableInteractionUpdate): Promise<void> => {
+    put: async (record: DurableInteractionUpdate): Promise<void> => this.lock(async () => {
       this.interactionsState().set(key(key(record.tenantId, record.runId), record.id), clone(record));
-    },
+    }),
     get: async (identity: { tenantId: string; runId: string; interactionId: string }) =>
       clone(this.interactionsState().get(key(key(identity.tenantId, identity.runId), identity.interactionId))),
     getById: async (tenantId: string, interactionId: string) => clone(
@@ -293,20 +341,20 @@ export class MemoryRunStore implements DurableProductRunStore {
   };
 
   readonly toolLedger = {
-    putIfAbsent: async (record: DurableToolLedgerUpdate): Promise<boolean> => {
+    putIfAbsent: async (record: DurableToolLedgerUpdate): Promise<boolean> => this.lock(async () => {
       const ledgerKey = key(key(record.tenantId, record.runId), record.logicalCallId);
       if (this.toolLedgerState().has(ledgerKey)) return false;
       this.toolLedgerState().set(ledgerKey, clone(record));
       return true;
-    },
+    }),
     get: async (identity: { tenantId: string; runId: string; logicalCallId: string }) =>
       clone(this.toolLedgerState().get(key(key(identity.tenantId, identity.runId), identity.logicalCallId))),
-    update: async (record: DurableToolLedgerUpdate): Promise<void> => {
+    update: async (record: DurableToolLedgerUpdate): Promise<void> => this.lock(async () => {
       const ledgerKey = key(key(record.tenantId, record.runId), record.logicalCallId);
       if (!this.toolLedgerState().has(ledgerKey)) throw new Error('Tool ledger record not found');
       this.toolLedgerState().set(ledgerKey, clone(record));
-    },
-    claimPendingApproval: async (input: import('./types.js').ToolLedgerApprovalClaim): Promise<boolean> => {
+    }),
+    claimPendingApproval: async (input: import('./types.js').ToolLedgerApprovalClaim): Promise<boolean> => this.lock(async () => {
       const ledgerKey = key(key(input.tenantId, input.runId), input.logicalCallId);
       const current = this.toolLedgerState().get(ledgerKey);
       if (!current || current.status !== 'pending_approval' || current.attemptId !== input.attemptId
@@ -315,7 +363,7 @@ export class MemoryRunStore implements DurableProductRunStore {
         || current.approvedInteractionId !== input.approvedInteractionId) return false;
       this.toolLedgerState().set(ledgerKey, clone(input.started));
       return true;
-    },
+    }),
     list: async (identity: { tenantId: string; runId: string }) => clone(
       [...this.toolLedgerRecords.values()]
         .filter((record) => record.tenantId === identity.tenantId && record.runId === identity.runId)
@@ -324,12 +372,12 @@ export class MemoryRunStore implements DurableProductRunStore {
   };
 
   readonly events = {
-    append: async (event: Omit<AgentRunEvent, 'sequence'>): Promise<AgentRunEvent> => {
+    append: async (event: Omit<AgentRunEvent, 'sequence'>): Promise<AgentRunEvent> => this.lock(async () => {
       const events = this.eventsState(event);
       const stored = clone({ ...event, sequence: BigInt(events.length + 1) });
       events.push(stored);
       return clone(stored);
-    },
+    }),
     list: (identity: { tenantId: string; runId: string }, after = 0n) => this.listEvents(identity, after),
   };
 
@@ -364,7 +412,7 @@ export class MemoryRunStore implements DurableProductRunStore {
   }
 
   readonly sessions = {
-    create: async (input: { tenantId: string; sessionId: string; createdAt: Date; metadata?: Record<string, unknown> }): Promise<PiSessionRecord> => {
+    create: async (input: { tenantId: string; sessionId: string; createdAt: Date; metadata?: Record<string, unknown> }): Promise<PiSessionRecord> => this.lock(async () => {
       const sessionKey = key(input.tenantId, input.sessionId);
       const existing = this.sessionRecords.get(sessionKey);
       if (existing) return clone(existing);
@@ -373,10 +421,10 @@ export class MemoryRunStore implements DurableProductRunStore {
       };
       this.sessionRecords.set(sessionKey, record);
       return clone(record);
-    },
+    }),
     get: async (tenantId: string, sessionId: string): Promise<PiSessionRecord | undefined> =>
       clone(this.sessionRecords.get(key(tenantId, sessionId))),
-    appendEntry: async (tenantId: string, sessionId: string, entry: SessionTreeEntry): Promise<SessionEntryRecord> => {
+    appendEntry: async (tenantId: string, sessionId: string, entry: SessionTreeEntry): Promise<SessionEntryRecord> => this.lock(async () => {
       const sessionKey = key(tenantId, sessionId);
       const session = this.sessionRecords.get(sessionKey);
       if (!session) throw new Error('Pi session not found');
@@ -389,7 +437,7 @@ export class MemoryRunStore implements DurableProductRunStore {
       session.currentLeafId = entry.type === 'leaf' ? entry.targetId : entry.id;
       session.updatedAt = new Date(entry.timestamp);
       return clone(stored);
-    },
+    }),
     listEntries: async (tenantId: string, sessionId: string, options: { afterSequence?: bigint; committedOnly?: boolean } = {}) => {
       let entries = this.sessionEntries.get(key(tenantId, sessionId)) ?? [];
       entries = entries.filter((entry) => entry.sequence > (options.afterSequence ?? 0n));
@@ -403,13 +451,13 @@ export class MemoryRunStore implements DurableProductRunStore {
     getSessionStats: async (tenantId: string, sessionId: string) => sessionStats(
       (await this.sessions.listEntries(tenantId, sessionId, { committedOnly: true })).map((record) => record.entry),
     ),
-    setCurrentLeaf: async (tenantId: string, sessionId: string, leafId: string | null): Promise<void> => {
+    setCurrentLeaf: async (tenantId: string, sessionId: string, leafId: string | null): Promise<void> => this.lock(async () => {
       const session = this.sessionRecords.get(key(tenantId, sessionId));
       if (!session) throw new Error('Pi session not found');
       if (leafId && !this.hasSessionEntry(tenantId, sessionId, leafId)) throw conflict('Pi leaf is outside session');
       session.currentLeafId = leafId;
       session.updatedAt = this.now();
-    },
+    }),
   };
 
   readonly inbox = {
@@ -502,11 +550,12 @@ export class MemoryRunStore implements DurableProductRunStore {
   }
 
   private async lock<T>(work: () => Promise<T>): Promise<T> {
+    if (this.mutationContext.getStore()) return work();
     let release!: () => void;
     const prior = this.transactionTail;
     this.transactionTail = new Promise<void>((resolve) => { release = resolve; });
     await prior;
-    try { return await work(); } finally { release(); }
+    try { return await this.mutationContext.run(true, work); } finally { release(); }
   }
 }
 

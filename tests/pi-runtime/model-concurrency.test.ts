@@ -115,4 +115,16 @@ describe('FifoModelConcurrencyController', () => {
     const next = await controller.acquire({ identity, model: { provider: 'p', model: 'm' } });
     next();
   });
+
+  it('removes the semaphore key when the first acquisition is already aborted', async () => {
+    const controller = new FifoModelConcurrencyController({ maxConcurrentPerTenantModel: 1 });
+    const abort = new AbortController();
+    abort.abort(new Error('cancel before acquire'));
+
+    await expect(controller.acquire({
+      identity, model: { provider: 'p', model: 'm', route: 'route-a' }, signal: abort.signal,
+    })).rejects.toThrow('cancel before acquire');
+
+    expect((controller as unknown as { activeKeyCount: number }).activeKeyCount).toBe(0);
+  });
 });

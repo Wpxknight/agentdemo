@@ -82,6 +82,10 @@ export interface ToolLedgerRepository {
 export interface DurableProductRunStore extends DurableRunStore {
   listRuns(tenantId: string): Promise<StoredRun[]>;
   updateProductRun(identity: { tenantId: string; runId: string }, patch: Partial<StoredRun>): Promise<boolean>;
+  markRecoveryRequired(input: {
+    identity: ClaimRunInput['identity']; runId: string; errorMessage: string; failedAt: Date;
+    expectedLease?: { ownerId: string; token: bigint };
+  }): Promise<boolean>;
   runs: {
     assertLease(identity: { tenantId: string; runId: string }, ownerId: string, token: bigint, now: Date): Promise<void>;
   };
