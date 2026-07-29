@@ -1,16 +1,17 @@
 import type { DurableRunRuntime } from '@aiop/control-contracts';
 import type {
+  BoundRunRecovery,
   ClaimedScheduledFire,
   RunDispatcher,
   ScheduledRunInput,
   ScheduledRunLookup,
 } from './domain.js';
-import { SchedulerRecovery } from './recovery.js';
 import type { SchedulerStore } from './store.js';
 
 export interface SchedulerRunnerOptions {
   store: SchedulerStore;
   dispatcher: RunDispatcher;
+  boundRecovery: BoundRunRecovery;
   workerId: string;
   leaseMs?: number;
   retryDelayMs?: number;
@@ -61,11 +62,59 @@ export class SchedulerRunner {
 
   async tick(now: Date, limit: number, signal?: AbortSignal): Promise<number> {
     if (signal?.aborted) return 0;
-    await new SchedulerRecovery(this.options.store).recover(now);
+    await this.options.store.recoverExpired(now);
     if (signal?.aborted) return 0;
+    const bound = await this.options.store.listBound({ now, limit });
+    let recovered = 0;
+    for (const fire of bound) {
+      if (signal?.aborted) return recovered;
+      const inspection = await this.options.boundRecovery.inspect(fire, now);
+      if (inspection.kind === 'active') continue;
+      if (inspection.kind === 'terminal') {
+        await this.options.store.completeFire({
+          fireId: fire.fireId,
+          claimToken: fire.claimToken,
+          runId: fire.runId,
+          result: inspection.result,
+          completedAt: now,
+        });
+        recovered += 1;
+        continue;
+      }
+      const claimed = await this.options.store.claimBound({
+        fireId: fire.fireId,
+        expectedClaimToken: fire.claimToken,
+        now,
+        workerId: this.options.workerId,
+        leaseMs: this.leaseMs,
+      });
+      if (!claimed) continue;
+      try {
+        if (signal?.aborted) throw signal.reason ?? new Error('scheduler stopped');
+        const result = await this.options.boundRecovery.resume(claimed, signal);
+        if (signal?.aborted) throw signal.reason ?? new Error('scheduler stopped');
+        await this.options.store.completeFire({
+          fireId: claimed.fireId,
+          claimToken: claimed.claimToken,
+          runId: claimed.runId,
+          result,
+          completedAt: now,
+        });
+      } catch (error) {
+        await this.options.store.releaseBound({
+          fireId: claimed.fireId,
+          claimToken: claimed.claimToken,
+          retryAt: new Date(now.getTime() + this.retryDelayMs),
+          error: String(error),
+        });
+      }
+      recovered += 1;
+    }
+    if (signal?.aborted) return recovered;
+    const remaining = Math.max(0, limit - recovered);
     const fires = await this.options.store.claimDue({
       now,
-      limit,
+      limit: remaining,
       workerId: this.options.workerId,
       leaseMs: this.leaseMs,
     });
@@ -103,6 +152,6 @@ export class SchedulerRunner {
         });
       }
     }
-    return fires.length;
+    return recovered + fires.length;
   }
 }

@@ -77,3 +77,13 @@ export interface RecoveringScheduledFire extends ScheduledFire {
   claimedBy: string;
   leaseExpiresAt: Date;
 }
+
+export type BoundRunInspection =
+  | { kind: 'active' }
+  | { kind: 'terminal'; result: AgentRunResult }
+  | { kind: 'recoverable' };
+
+export interface BoundRunRecovery {
+  inspect(fire: BoundScheduledFire, now: Date): Promise<BoundRunInspection>;
+  resume(fire: RecoveringScheduledFire, signal?: AbortSignal): Promise<AgentRunResult>;
+}

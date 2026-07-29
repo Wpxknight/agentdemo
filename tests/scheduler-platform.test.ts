@@ -18,7 +18,15 @@ describe('Scheduler runtime package', () => {
         },
       };
     });
-    const scheduler = new SchedulerRunner({ store, dispatcher: { startScheduledRun }, workerId: 'worker-a' });
+    const scheduler = new SchedulerRunner({
+      store,
+      dispatcher: { startScheduledRun },
+      boundRecovery: {
+        inspect: async () => ({ kind: 'active' }),
+        resume: async () => { throw new Error('bound recovery must not run'); },
+      },
+      workerId: 'worker-a',
+    });
 
     expect(await scheduler.tick(fireTime, 10)).toBe(1);
     expect(startScheduledRun).toHaveBeenCalledWith(expect.objectContaining({

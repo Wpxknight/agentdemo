@@ -260,6 +260,42 @@ describe('createScheduledTaskRunner', () => {
 });
 
 describe('embedded scheduler deployment', () => {
+  it('maps a waiting bound Durable Run to compatibility error detail without run or resume', async () => {
+    const fireTime = new Date('2026-07-29T01:00:00.000Z');
+    const schedulerStore = new MemorySchedulerStore([{
+      taskId: 'task-waiting', tenantId: 'tenant-a', actorId: 'user-a', sessionId: 'session-a',
+      cron: '0 * * * *', input: [{ role: 'user', text: 'diagnose' }], nextFireAt: fireTime,
+    }]);
+    const [fire] = await schedulerStore.claimDue({ now: fireTime, limit: 1, workerId: 'dead', leaseMs: 10 });
+    await schedulerStore.bindRun({
+      fireId: fire!.fireId, claimToken: fire!.claimToken, runId: fire!.fireId, boundAt: fireTime,
+    });
+    const store = new MemoryStore();
+    await store.putAgentRunBindingIfAbsent({
+      tenantId: 'tenant-a', userId: 'user-a', sessionId: 'session-a', runId: fire!.fireId,
+      kernel: 'pi', graphName: 'pi', graphVersion: '0.82.1', createdAt: fireTime,
+    });
+    await store.updateAgentRun('tenant-a', fire!.fireId, {
+      status: 'waiting', usage: { inputTokens: 3, outputTokens: 2, cacheReadTokens: 1, cacheCreationTokens: 0 },
+      updatedAt: fireTime, clearLease: true,
+    });
+    const run = vi.fn();
+    const resume = vi.fn();
+    const scheduler = createRuntimeScheduler({
+      store, durableRunRuntime: { run, resume },
+    } as unknown as Runtime, {
+      store: schedulerStore, workerId: 'observer', leaseMs: 10, batch: 1,
+    });
+
+    expect(await scheduler.tick(new Date(fireTime.getTime() + 10))).toBe(1);
+    expect(run).not.toHaveBeenCalled();
+    expect(resume).not.toHaveBeenCalled();
+    expect((await schedulerStore.listFires())[0]).toMatchObject({
+      state: 'started', runId: fire!.fireId,
+      result: { runId: fire!.fireId, status: 'waiting', usage: { inputTokens: 3, outputTokens: 2 } },
+    });
+  });
+
   it('awaits scheduler shutdown before disposing the runtime in production entrypoints', async () => {
     const source = await readFile('src/index.ts', 'utf8');
     expect(source).toContain('await scheduler?.stop()');

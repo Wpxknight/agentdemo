@@ -2,6 +2,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  type BoundRunRecovery,
   MemorySchedulerStore,
   MysqlSchedulerStore,
   SchedulerRunner,
@@ -10,6 +11,11 @@ import {
   type ScheduledTask,
 } from '../../packages/scheduler-runtime/src/index.js';
 import type { DurableRunRuntime, StartRunInput } from '@aiop/control-contracts';
+import {
+  DurableRunManager,
+  MemoryRunStore,
+  type ManagedPiSession,
+} from '../../packages/pi-runtime/src/index.js';
 import type { Kysely } from 'kysely';
 import { readMysqlConfig } from '../../src/config/mysql.js';
 import { createKysely, createMysqlPool, runMigrations } from '../../src/db/index.js';
@@ -43,6 +49,29 @@ const task: ScheduledTask = {
   input: [{ role: 'user', text: 'diagnose' }],
   nextFireAt: fireTime,
 };
+const taskIdentity = () => ({ tenantId: task.tenantId, actorId: task.actorId, roles: ['user'] as const });
+
+const activeBoundRecovery: BoundRunRecovery = {
+  inspect: async () => ({ kind: 'active' }),
+  resume: async () => { throw new Error('bound recovery must not run'); },
+};
+
+function managedSession(
+  id: string,
+  continueRun: ManagedPiSession['continue'],
+): ManagedPiSession {
+  return {
+    continue: continueRun,
+    async abort() {},
+    async close() {},
+    async steer() {},
+    async followUp() {},
+    async appendCustomEntry() { return 'custom'; },
+    async entries() { return []; },
+    async leafId() { return null; },
+    async metadata() { return { id, tenantId: 'tenant-a', createdAt: fireTime.toISOString() }; },
+  };
+}
 
 describe('SchedulerRunner', () => {
   it('binds the durable Run before waiting for its final result', async () => {
@@ -64,7 +93,9 @@ describe('SchedulerRunner', () => {
         runId: 'run-bound', status: 'running', events: { async *[Symbol.asyncIterator]() {} }, result: () => result,
       }),
     } as unknown as DurableRunRuntime);
-    const tick = new SchedulerRunner({ store: store as never, dispatcher, workerId: 'worker-a' }).tick(fireTime, 1);
+    const tick = new SchedulerRunner({
+      store: store as never, dispatcher, boundRecovery: activeBoundRecovery, workerId: 'worker-a',
+    }).tick(fireTime, 1);
     await vi.waitFor(() => expect(bindRun).toHaveBeenCalledWith(expect.objectContaining({
       fireId: 'task-a:2026-07-29T01:00:00.000Z', runId: 'run-bound',
     })));
@@ -83,7 +114,7 @@ describe('SchedulerRunner', () => {
   it('dispatches a due fire once when two workers scan concurrently', async () => {
     const store = new MemorySchedulerStore([task]);
     const startScheduledRun = vi.fn(async (_input, onStarted) => dispatchSucceeded('run-a', onStarted));
-    const options = { store, dispatcher: { startScheduledRun }, leaseMs: 1_000 };
+    const options = { store, dispatcher: { startScheduledRun }, boundRecovery: activeBoundRecovery, leaseMs: 1_000 };
 
     const [left, right] = await Promise.all([
       new SchedulerRunner({ ...options, workerId: 'worker-a' }).tick(fireTime, 10),
@@ -106,7 +137,9 @@ describe('SchedulerRunner', () => {
   it('does not dispatch the same fire time twice', async () => {
     const store = new MemorySchedulerStore([task]);
     const startScheduledRun = vi.fn(async (_input, onStarted) => dispatchSucceeded('run-a', onStarted));
-    const runner = new SchedulerRunner({ store, dispatcher: { startScheduledRun }, workerId: 'worker-a' });
+    const runner = new SchedulerRunner({
+      store, dispatcher: { startScheduledRun }, boundRecovery: activeBoundRecovery, workerId: 'worker-a',
+    });
 
     expect(await runner.tick(fireTime, 10)).toBe(1);
     expect(await runner.tick(fireTime, 10)).toBe(0);
@@ -121,6 +154,7 @@ describe('SchedulerRunner', () => {
     const runner = new SchedulerRunner({
       store,
       dispatcher: { startScheduledRun },
+      boundRecovery: activeBoundRecovery,
       workerId: 'worker-a',
       retryDelayMs: 1_000,
     });
@@ -139,7 +173,9 @@ describe('SchedulerRunner', () => {
 
     const recoveredAt = new Date(fireTime.getTime() + 1_001);
     const startScheduledRun = vi.fn(async (_input, onStarted) => dispatchSucceeded('run-recovered', onStarted));
-    const runner = new SchedulerRunner({ store, dispatcher: { startScheduledRun }, workerId: 'worker-b' });
+    const runner = new SchedulerRunner({
+      store, dispatcher: { startScheduledRun }, boundRecovery: activeBoundRecovery, workerId: 'worker-b',
+    });
     expect(await runner.tick(recoveredAt, 10)).toBe(1);
     expect(startScheduledRun).toHaveBeenCalledOnce();
     expect((await store.listFires())[0]).toMatchObject({ state: 'started', runId: 'run-recovered', attempts: 2 });
@@ -169,6 +205,7 @@ describe('SchedulerRunner', () => {
         { run } as unknown as DurableRunRuntime,
         { findScheduledRun },
       ),
+      boundRecovery: activeBoundRecovery,
       workerId: 'recovery-worker',
       leaseMs: 1_000,
     });
@@ -179,6 +216,178 @@ describe('SchedulerRunner', () => {
     expect((await store.listFires())[0]).toMatchObject({
       state: 'bound', runId, attempts: 1,
     });
+  });
+
+  it('keeps a bound Durable Run active after only the scheduler observation lease expires', async () => {
+    let current = fireTime;
+    const durableStore = new MemoryRunStore(() => current);
+    let unblock!: () => void;
+    const blocked = new Promise<void>((resolve) => { unblock = resolve; });
+    const session = managedSession('session-a', async function* () { await blocked; });
+    const durable = new DurableRunManager({
+      store: durableStore, workerId: 'durable-a', leaseTtlMs: 10_000, heartbeatMs: 0, now: () => current,
+      sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+    const run = vi.spyOn(durable, 'run');
+    const resume = vi.spyOn(durable, 'resume');
+    const schedulerStore = new MemorySchedulerStore([task]);
+    const boundRecovery: BoundRunRecovery = {
+      inspect: async (fire, now) => {
+        const record = await durableStore.get({ tenantId: fire.identity.tenantId, runId: fire.runId });
+        return record?.leaseExpiresAt && record.leaseExpiresAt > now ? { kind: 'active' } : { kind: 'recoverable' };
+      },
+      resume: async () => { throw new Error('active Durable Run must not resume'); },
+    };
+    const abort = new AbortController();
+    const firstTick = new SchedulerRunner({
+      store: schedulerStore, dispatcher: createRunDispatcher(durable), boundRecovery,
+      workerId: 'scheduler-a', leaseMs: 1_000,
+    }).tick(current, 1, abort.signal);
+    await vi.waitFor(async () => expect((await schedulerStore.listFires())[0]).toMatchObject({
+      state: 'bound', runId: task.taskId + ':' + fireTime.toISOString(), attempts: 1,
+    }));
+    await vi.waitFor(async () => expect((await durableStore.get({
+      tenantId: task.tenantId, runId: task.taskId + ':' + fireTime.toISOString(),
+    }))?.status).toBe('running'));
+
+    current = new Date(fireTime.getTime() + 1_001);
+    const secondTick = await new SchedulerRunner({
+      store: schedulerStore, dispatcher: createRunDispatcher(durable), boundRecovery,
+      workerId: 'scheduler-b', leaseMs: 1_000,
+    }).tick(current, 1);
+
+    expect(secondTick).toBe(0);
+    expect(run).toHaveBeenCalledOnce();
+    expect(resume).not.toHaveBeenCalled();
+    expect((await schedulerStore.listFires())[0]).toMatchObject({ state: 'bound', attempts: 1 });
+    abort.abort(new Error('test cleanup'));
+    unblock();
+    await firstTick.catch(() => undefined);
+  });
+
+  it('resumes an expired Durable Run with the same deterministic Run ID and committed session', async () => {
+    let current = fireTime;
+    const durableStore = new MemoryRunStore(() => current);
+    let unblock!: () => void;
+    const blocked = new Promise<void>((resolve) => { unblock = resolve; });
+    const firstSession = managedSession('session-a', async function* () { await blocked; });
+    const firstManager = new DurableRunManager({
+      store: durableStore, workerId: 'durable-a', leaseTtlMs: 1_000, heartbeatMs: 0, now: () => current,
+      sessions: { create: async () => firstSession, load: async () => firstSession }, eventOptions: () => ({}),
+    });
+    const secondSession = managedSession('session-a', async function* () {});
+    const load = vi.fn(async () => secondSession);
+    const secondManager = new DurableRunManager({
+      store: durableStore, workerId: 'durable-b', leaseTtlMs: 1_000, heartbeatMs: 0, now: () => current,
+      sessions: { create: async () => { throw new Error('recovery must not create a session'); }, load },
+      eventOptions: () => ({}),
+    });
+    const firstRun = vi.spyOn(firstManager, 'run');
+    const secondRun = vi.spyOn(secondManager, 'run');
+    const secondResume = vi.spyOn(secondManager, 'resume');
+    const schedulerStore = new MemorySchedulerStore([task]);
+    const runId = task.taskId + ':' + fireTime.toISOString();
+    const boundRecovery: BoundRunRecovery = {
+      inspect: async (fire, now) => {
+        const record = await durableStore.get({ tenantId: fire.identity.tenantId, runId: fire.runId });
+        if (record?.result) return { kind: 'terminal', result: record.result };
+        return record?.leaseExpiresAt && record.leaseExpiresAt > now ? { kind: 'active' } : { kind: 'recoverable' };
+      },
+      resume: async (fire, signal) => {
+        const handle = await secondManager.resume({ identity: fire.identity, runId: fire.runId, signal });
+        return handle.result();
+      },
+    };
+    const abort = new AbortController();
+    const firstTick = new SchedulerRunner({
+      store: schedulerStore, dispatcher: createRunDispatcher(firstManager), boundRecovery,
+      workerId: 'scheduler-a', leaseMs: 1_000,
+    }).tick(current, 1, abort.signal);
+    await vi.waitFor(async () => expect((await durableStore.get({ tenantId: task.tenantId, runId }))?.status).toBe('running'));
+    await vi.waitFor(async () => expect((await schedulerStore.listFires())[0]).toMatchObject({ state: 'bound', runId }));
+
+    current = new Date(fireTime.getTime() + 1_001);
+    expect(await new SchedulerRunner({
+      store: schedulerStore, dispatcher: createRunDispatcher(secondManager), boundRecovery,
+      workerId: 'scheduler-b', leaseMs: 1_000,
+    }).tick(current, 1)).toBe(1);
+
+    expect(firstRun).toHaveBeenCalledOnce();
+    expect(secondRun).not.toHaveBeenCalled();
+    expect(secondResume).toHaveBeenCalledWith({
+      identity: taskIdentity(), runId, signal: undefined,
+    });
+    expect(load).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({ tenantId: task.tenantId }), identity: taskIdentity(),
+    }));
+    expect(await durableStore.countAttempts({ tenantId: task.tenantId, runId })).toBe(2);
+    expect((await schedulerStore.listFires())[0]).toMatchObject({
+      state: 'started', runId, attempts: 1, result: { runId, status: 'succeeded' },
+    });
+    abort.abort(new Error('test cleanup'));
+    unblock();
+    await firstTick.catch(() => undefined);
+  });
+
+  it.each(['succeeded', 'failed', 'cancelled', 'recovery_required', 'waiting'] as const)(
+    'completes a terminal bound Durable %s fire without dispatch or resume',
+    async (status) => {
+      const store = new MemorySchedulerStore([task]);
+      const [fire] = await store.claimDue({ now: fireTime, limit: 1, workerId: 'dead', leaseMs: 10 });
+      await store.bindRun({ fireId: fire!.fireId, claimToken: fire!.claimToken, runId: fire!.fireId, boundAt: fireTime });
+      const startScheduledRun = vi.fn();
+      const resume = vi.fn();
+      const result = { ...succeeded(fire!.fireId).result, status };
+      const runner = new SchedulerRunner({
+        store, dispatcher: { startScheduledRun }, workerId: 'recovery', leaseMs: 10,
+        boundRecovery: { inspect: async () => ({ kind: 'terminal', result }), resume },
+      });
+
+      expect(await runner.tick(new Date(fireTime.getTime() + 10), 1)).toBe(1);
+      expect(startScheduledRun).not.toHaveBeenCalled();
+      expect(resume).not.toHaveBeenCalled();
+      expect((await store.listFires())[0]).toMatchObject({ state: 'started', attempts: 1, result: { status } });
+    },
+  );
+
+  it('releases a bound resume race into a future observation window without a busy loop', async () => {
+    const store = new MemorySchedulerStore([task]);
+    const [fire] = await store.claimDue({ now: fireTime, limit: 1, workerId: 'dead', leaseMs: 10 });
+    await store.bindRun({ fireId: fire!.fireId, claimToken: fire!.claimToken, runId: fire!.fireId, boundAt: fireTime });
+    const startScheduledRun = vi.fn();
+    const resume = vi.fn(async () => { throw new Error('Durable lease race'); });
+    const inspect = vi.fn(async () => ({ kind: 'recoverable' as const }));
+    const runner = new SchedulerRunner({
+      store, dispatcher: { startScheduledRun }, boundRecovery: { inspect, resume },
+      workerId: 'recovery', leaseMs: 10, retryDelayMs: 100,
+    });
+    const expiredAt = new Date(fireTime.getTime() + 10);
+
+    expect(await runner.tick(expiredAt, 1)).toBe(1);
+    expect(await runner.tick(new Date(expiredAt.getTime() + 99), 1)).toBe(0);
+    expect(resume).toHaveBeenCalledOnce();
+    expect(inspect).toHaveBeenCalledOnce();
+    expect(startScheduledRun).not.toHaveBeenCalled();
+    expect((await store.listFires())[0]).toMatchObject({
+      state: 'bound', runId: fire!.fireId, attempts: 1,
+      retryAt: new Date(expiredAt.getTime() + 100), lastError: 'Error: Durable lease race',
+    });
+  });
+
+  it('uses the bind-time observation lease before inspecting a queued startup gap', async () => {
+    const store = new MemorySchedulerStore([task]);
+    const [fire] = await store.claimDue({ now: fireTime, limit: 1, workerId: 'dead', leaseMs: 777 });
+    await store.bindRun({ fireId: fire!.fireId, claimToken: fire!.claimToken, runId: fire!.fireId, boundAt: fireTime });
+    const inspect = vi.fn(async () => ({ kind: 'active' as const }));
+    const runner = new SchedulerRunner({
+      store, dispatcher: { startScheduledRun: vi.fn() }, boundRecovery: { inspect, resume: vi.fn() },
+      workerId: 'observer', leaseMs: 777,
+    });
+
+    expect(await runner.tick(new Date(fireTime.getTime() + 776), 1)).toBe(0);
+    expect(inspect).not.toHaveBeenCalled();
+    expect(await runner.tick(new Date(fireTime.getTime() + 777), 1)).toBe(0);
+    expect(inspect).toHaveBeenCalledOnce();
   });
 
   it('fences a bound Run from ordinary claim recovery and allows token-fenced recovery', async () => {
@@ -419,6 +628,7 @@ describe('SchedulerRunner', () => {
     const runner = new SchedulerRunner({
       store,
       dispatcher: { startScheduledRun: async (_input, onStarted) => dispatchSucceeded('run-isolated', onStarted) },
+      boundRecovery: activeBoundRecovery,
       workerId: 'worker-a',
     });
     await runner.tick(fireTime, 1);
@@ -628,7 +838,7 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlSchedulerStore production 
     try {
       const firstTaskId = await insertTask('competing');
       const startScheduledRun = vi.fn(async (input: { fireId: string }, onStarted) => dispatchSucceeded(input.fireId, onStarted));
-      const shared = { dispatcher: { startScheduledRun }, leaseMs: 1000 };
+      const shared = { dispatcher: { startScheduledRun }, boundRecovery: activeBoundRecovery, leaseMs: 1000 };
       const [left, right] = await Promise.all([
         new SchedulerRunner({ store: new MysqlSchedulerStore(schedulerDb), workerId: 'worker-a', ...shared }).tick(fireAt, 1),
         new SchedulerRunner({ store: new MysqlSchedulerStore(schedulerDb), workerId: 'worker-b', ...shared }).tick(fireAt, 1),
@@ -648,6 +858,7 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlSchedulerStore production 
         .mockImplementation(async (input: { fireId: string }, onStarted) => dispatchSucceeded(input.fireId, onStarted));
       const retryRunner = new SchedulerRunner({
         store: new MysqlSchedulerStore(schedulerDb), dispatcher: { startScheduledRun: retryDispatcher },
+        boundRecovery: activeBoundRecovery,
         workerId: 'worker-retry', retryDelayMs: 10,
       });
       expect(await retryRunner.tick(fireAt, 1)).toBe(1);
@@ -663,6 +874,7 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlSchedulerStore production 
       const recoveredDispatcher = vi.fn(async (input: { fireId: string }, onStarted) => dispatchSucceeded(input.fireId, onStarted));
       const recoveryRunner = new SchedulerRunner({
         store: new MysqlSchedulerStore(schedulerDb), dispatcher: { startScheduledRun: recoveredDispatcher }, workerId: 'recovery',
+        boundRecovery: activeBoundRecovery,
       });
       expect(await recoveryRunner.tick(new Date(fireAt.getTime() + 11), 1)).toBe(1);
       expect(recoveredDispatcher).toHaveBeenCalledOnce();

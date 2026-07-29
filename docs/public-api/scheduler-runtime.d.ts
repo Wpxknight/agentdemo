@@ -70,6 +70,18 @@ export interface RecoveringScheduledFire extends ScheduledFire {
     claimedBy: string;
     leaseExpiresAt: Date;
 }
+export type BoundRunInspection = {
+    kind: 'active';
+} | {
+    kind: 'terminal';
+    result: AgentRunResult;
+} | {
+    kind: 'recoverable';
+};
+export interface BoundRunRecovery {
+    inspect(fire: BoundScheduledFire, now: Date): Promise<BoundRunInspection>;
+    resume(fire: RecoveringScheduledFire, signal?: AbortSignal): Promise<AgentRunResult>;
+}
 
 // file: index.d.ts
 export * from './domain.js';
@@ -157,11 +169,12 @@ export declare class SchedulerRecovery {
 
 // file: runner.d.ts
 import type { DurableRunRuntime } from '@aiop/control-contracts';
-import type { ClaimedScheduledFire, RunDispatcher, ScheduledRunInput, ScheduledRunLookup } from './domain.js';
+import type { BoundRunRecovery, ClaimedScheduledFire, RunDispatcher, ScheduledRunInput, ScheduledRunLookup } from './domain.js';
 import type { SchedulerStore } from './store.js';
 export interface SchedulerRunnerOptions {
     store: SchedulerStore;
     dispatcher: RunDispatcher;
+    boundRecovery: BoundRunRecovery;
     workerId: string;
     leaseMs?: number;
     retryDelayMs?: number;

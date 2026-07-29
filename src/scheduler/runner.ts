@@ -5,13 +5,14 @@ import {
   MysqlSchedulerStore,
   SchedulerRunner,
   scheduledFireId,
+  type BoundRunRecovery,
   type SchedulerMysqlDatabase,
   type SchedulerStore,
   type ScheduledRunInput,
 } from '../../packages/scheduler-runtime/src/index.js';
 import { logger } from '../logger.js';
 import type { Runtime } from '../runtime.js';
-import { DEFAULT_TASK_MAX_RUN_MS, type ScheduledTask } from '../db/store.js';
+import { DEFAULT_TASK_MAX_RUN_MS, type AgentRunRecord, type ScheduledTask } from '../db/store.js';
 import { MysqlStore } from '../db/mysql.js';
 import type { TaskRunner } from './ticker.js';
 
@@ -84,6 +85,7 @@ export function createRuntimeScheduler(
   const runner = new SchedulerRunner({
     store,
     dispatcher: createRunDispatcher(rt.durableRunRuntime, scheduledRunLookup(rt)),
+    boundRecovery: durableBoundRunRecovery(rt),
     workerId: options.workerId ?? `scheduler-${randomUUID()}`,
     leaseMs: options.leaseMs,
     retryDelayMs: options.retryDelayMs,
@@ -183,15 +185,63 @@ function scheduledRunLookup(rt: Runtime) {
         tenantId: input.identity.tenantId, userId: input.identity.actorId, role: 'user',
       }, input.fireId);
       if (!record || record.status === 'queued' || record.status === 'running') return undefined;
-      return {
-        runId: record.runId,
-        result: {
-          runId: record.runId, status: record.status, usage: record.usage,
-          ...(record.errorMessage ? {
-            error: { code: 'MODEL_PROVIDER_ERROR' as const, message: record.errorMessage, retryable: false },
-          } : {}),
-        },
-      };
+      return { runId: record.runId, result: persistedRunResult(record) };
     },
+  };
+}
+
+function durableBoundRunRecovery(rt: Runtime): BoundRunRecovery {
+  return {
+    async inspect(fire, now) {
+      if (fire.fireId !== fire.runId) {
+        throw new Error(`scheduled fire deterministic Run mismatch: ${fire.fireId}`);
+      }
+      const binding = await rt.store.getAgentRunBinding(fire.identity.tenantId, fire.runId);
+      if (
+        !binding
+        || binding.tenantId !== fire.identity.tenantId
+        || binding.userId !== fire.identity.actorId
+        || binding.sessionId !== fire.sessionId
+        || binding.runId !== fire.runId
+      ) {
+        throw new Error(`scheduled fire Durable Run binding mismatch: ${fire.fireId}`);
+      }
+      const record = await rt.store.getAgentRun({
+        tenantId: fire.identity.tenantId, userId: fire.identity.actorId, role: 'user',
+      }, fire.runId);
+      if (!record) throw new Error(`scheduled fire Durable Run not found: ${fire.fireId}`);
+      if (
+        record.status === 'waiting'
+        || record.status === 'succeeded'
+        || record.status === 'failed'
+        || record.status === 'cancelled'
+        || record.status === 'recovery_required'
+      ) {
+        return { kind: 'terminal', result: persistedRunResult(record) };
+      }
+      if (record.leaseExpiresAt && record.leaseExpiresAt.getTime() > now.getTime()) {
+        return { kind: 'active' };
+      }
+      return { kind: 'recoverable' };
+    },
+    async resume(fire, signal) {
+      const handle = await rt.durableRunRuntime!.resume({
+        identity: fire.identity,
+        runId: fire.runId,
+        signal,
+      });
+      return handle.result();
+    },
+  };
+}
+
+function persistedRunResult(record: AgentRunRecord) {
+  return {
+    runId: record.runId,
+    status: record.status as 'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'recovery_required',
+    usage: record.usage,
+    ...(record.errorMessage ? {
+      error: { code: 'MODEL_PROVIDER_ERROR' as const, message: record.errorMessage, retryable: false },
+    } : {}),
   };
 }
