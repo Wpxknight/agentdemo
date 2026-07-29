@@ -62,7 +62,13 @@ describe('runtime refactor staging rollout source boundary', () => {
   it('rolls back the aiop-dev server deployment and waits for readiness', async () => {
     const makefile = await readFile(new URL('Makefile', root), 'utf8');
 
-    expect(makefile).toContain('$(KUBECTL) -n aiop-dev rollout undo deployment/aiop-server');
+    expect(makefile).toContain('ROLLBACK_REVISION ?=');
+    expect(makefile).toContain(
+      'ROLLBACK_TO_REVISION = $(if $(strip $(ROLLBACK_REVISION)),--to-revision=$(ROLLBACK_REVISION),)',
+    );
+    expect(makefile).toContain(
+      '$(KUBECTL) -n aiop-dev rollout undo deployment/aiop-server $(ROLLBACK_TO_REVISION)',
+    );
     expect(makefile).toContain(
       '$(KUBECTL) -n aiop-dev rollout status deployment/aiop-server --timeout=180s',
     );

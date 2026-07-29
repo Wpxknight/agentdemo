@@ -2,6 +2,8 @@ IMAGE_TAG ?= $(shell git rev-parse --short HEAD)
 IMAGE ?= aiop:$(IMAGE_TAG)
 WEB_IMAGE ?= aiop-web:$(IMAGE_TAG)
 KUBECTL ?= kubectl
+ROLLBACK_REVISION ?=
+ROLLBACK_TO_REVISION = $(if $(strip $(ROLLBACK_REVISION)),--to-revision=$(ROLLBACK_REVISION),)
 
 .PHONY: verify-node test-agent-platform test-runtime-refactor verify-runtime-refactor image deploy-staging rollback-staging
 
@@ -38,5 +40,5 @@ deploy-staging:
 	$(KUBECTL) -n aiop-dev rollout status deployment/aiop-server --timeout=180s
 
 rollback-staging:
-	$(KUBECTL) -n aiop-dev rollout undo deployment/aiop-server
+	$(KUBECTL) -n aiop-dev rollout undo deployment/aiop-server $(ROLLBACK_TO_REVISION)
 	$(KUBECTL) -n aiop-dev rollout status deployment/aiop-server --timeout=180s
