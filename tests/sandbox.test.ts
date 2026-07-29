@@ -515,17 +515,17 @@ describe('LocalSandboxProvider', () => {
     const handle = await provider.create({ key: 'local-workspace-test' });
     const sandboxPath = `/workspace/${handle.sandboxId}/credentials/token.json`;
     const workspaceFile = handle.workspacePath?.(`${handle.sandboxId}/credentials/token.json`);
-    expect(workspaceFile).toBeTruthy();
-    expect(workspaceFile).not.toBe('/workspace/credentials/token.json');
+    const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
+    expect(workspaceFile).toBe(`workspace/${handle.sandboxId}/credentials/token.json`);
     await handle.writeFile?.(sandboxPath, Buffer.from('secret'), { mode: 0o600 });
 
-    expect(await readFile(workspaceFile!, 'utf8')).toBe('secret');
-    expect((await stat(workspaceFile!)).mode & 0o777).toBe(0o600);
+    const hostFile = join(sandboxRoot, workspaceFile!);
+    expect(await readFile(hostFile, 'utf8')).toBe('secret');
+    expect((await stat(hostFile)).mode & 0o777).toBe(0o600);
     const command = await handle.runCommand(`test -f '${workspaceFile}' && printf mapped`);
     expect(command).toMatchObject({ stdout: 'mapped', exitCode: 0 });
     await expect(access(sandboxPath)).rejects.toThrow();
 
-    const sandboxRoot = join(handle.workspacePath!(), '..');
     await handle.kill();
     await expect(access(sandboxRoot)).rejects.toThrow();
   });

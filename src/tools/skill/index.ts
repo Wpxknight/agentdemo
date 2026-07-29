@@ -115,7 +115,7 @@ export function buildSkillTools(
         name: 'skill__sync_to_sandbox',
         capability: 'retryable_write',
         description:
-          '把技能目录同步进当前会话沙箱（目标 /workspace/skills/<技能名>/），之后可在沙箱内执行其脚本。'
+          '把技能目录同步进当前会话沙箱，之后可在工具返回的目标目录内执行其脚本。'
           + '默认跳过超过 2MB 的单个文件；需要大文件时用 paths 显式指定子路径（单次同步总量上限 16MB）。',
         inputSchema: {
           type: 'object',

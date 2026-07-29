@@ -7,3 +7,11 @@ export function remoteWorkspacePath(relativePath = ''): string {
   }
   return normalized ? posix.join('/workspace', normalized) : '/workspace';
 }
+
+export function localWorkspacePath(relativePath = ''): string {
+  const normalized = relativePath.replace(/\\/g, '/');
+  if (posix.isAbsolute(normalized) || normalized.split('/').includes('..')) {
+    throw new Error('sandbox path escapes sandbox root');
+  }
+  return normalized ? posix.join('workspace', normalized) : 'workspace';
+}

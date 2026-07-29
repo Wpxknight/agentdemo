@@ -2,6 +2,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { localWorkspacePath } from './workspace-path.js';
 import type {
   ExecResult,
   OutputSink,
@@ -74,10 +75,7 @@ class LocalSandboxHandle implements SandboxHandle {
   }
 
   workspacePath(relativePath = ''): string {
-    if (relativePath.replace(/\\/g, '/').split('/').includes('..')) {
-      throw new Error('sandbox path escapes sandbox root');
-    }
-    return this.resolveSandboxPath(relativePath ? `/workspace/${relativePath}` : '/workspace');
+    return localWorkspacePath(relativePath);
   }
 
   async runCode(code: string, opts?: RunCodeOpts): Promise<ExecResult> {

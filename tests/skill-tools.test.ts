@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
@@ -7,6 +7,7 @@ import { SkillRegistry } from '../src/skill/registry.js';
 import { buildSkillTools } from '../src/tools/skill/index.js';
 import type { SandboxManager } from '../src/sandbox/lifecycle.js';
 import type { ExecResult, SandboxHandle } from '../src/sandbox/types.js';
+import { LocalSandboxProvider } from '../src/sandbox/local.js';
 
 /** 记录 runCommand 调用并按脚本约定返回成功的假沙箱。 */
 class FakeSandbox implements SandboxHandle {
@@ -72,11 +73,13 @@ describe('buildSkillTools', () => {
   });
 
   it('load_skill guidance mentions read_file, and sync only when sandbox available', async () => {
-    const [loadWithSync] = buildSkillTools(registry, fakeManager(new FakeSandbox()));
+    const [loadWithSync, , syncTool] = buildSkillTools(registry, fakeManager(new FakeSandbox()));
     const withSync = await loadWithSync!.run({ name: 'demo' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
     expect(withSync.content).toContain('skill__read_file');
     expect(withSync.content).toContain('skill__sync_to_sandbox');
     expect(withSync.content).not.toContain(dir); // 不再暴露服务端本地路径
+    expect(syncTool!.def.description).not.toContain('/workspace/skills');
+    expect(syncTool!.def.description).toContain('返回的目标目录');
 
     const [loadNoSync, ...rest] = buildSkillTools(registry);
     expect(rest.map((t) => t.def.name)).toEqual(['skill__read_file']);
@@ -151,6 +154,62 @@ describe('buildSkillTools', () => {
     expect(sbx.commands.join('\n')).not.toContain('aios-secret');
     expect(sbx.commands.join('\n')).not.toContain('gitlab-secret');
     expect(sbx.commands.join('\n')).not.toContain(Buffer.from('aios-secret').toString('base64'));
+  });
+
+  it('syncs multi-provider credentials into a real local sandbox workspace path', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-skill-local-sync-'));
+    const name = `local-credential-sync-${process.pid}`;
+    const skillDir = join(root, name);
+    await mkdir(skillDir);
+    await writeFile(join(skillDir, 'SKILL.md'), `---\nname: ${name}\ndescription: local credential sync\n---\nbody`);
+    await writeFile(join(skillDir, '.product.json'), JSON.stringify({
+      name, version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+      credentials: ['aios', 'gitlab'], credentialFile: 'sub/token.json',
+    }));
+    const localRegistry = new SkillRegistry(root);
+    await localRegistry.scan();
+    const handle = await new LocalSandboxProvider().create({ key: 'local-credential-sync' });
+    const manager = {
+      get: async () => handle,
+      markCredentialInjected: () => {},
+    } as unknown as SandboxManager;
+    const sync = buildSkillTools(localRegistry, manager, undefined, {
+      credentials: {
+        get: async (_tenant: string, _user: string, provider: string) => ({ token: `${provider}-secret` }),
+      } as never,
+    }).find((tool) => tool.def.name === 'skill__sync_to_sandbox')!;
+    const hostWorkspaceFile = `/workspace/skills/${name}/sub/token.json`;
+    const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
+
+    await expect(access(hostWorkspaceFile)).rejects.toThrow();
+    try {
+      const result = await sync.run({ name }, {
+        sessionId: 'local-sync', tenantId: 'default', userId: 'u', role: 'user',
+      });
+      const dest = handle.workspacePath?.(`skills/${name}`);
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content).toContain('已按当前用户注入 aios 凭据');
+      expect(result.content).toContain('已按当前用户注入 gitlab 凭据');
+      expect(dest).toBe(`workspace/skills/${name}`);
+      expect(JSON.parse(Buffer.from(await handle.readFile(`${dest}/sub/token.json`)).toString('utf8'))).toEqual({
+        providers: {
+          aios: { token: 'aios-secret' },
+          gitlab: { token: 'gitlab-secret' },
+        },
+      });
+      expect(await readFile(join(sandboxRoot, 'workspace', 'skills', name, 'sub', 'token.json'), 'utf8'))
+        .toContain('aios-secret');
+      const command = await handle.runCommand(`cat '${dest}/sub/token.json'`);
+      expect(command).toMatchObject({ exitCode: 0 });
+      expect(command.stdout).toContain('gitlab-secret');
+      await expect(access(hostWorkspaceFile)).rejects.toThrow();
+    } finally {
+      await handle.kill();
+    }
+    await expect(access(sandboxRoot)).rejects.toThrow();
+    await expect(access(hostWorkspaceFile)).rejects.toThrow();
   });
 
   it('keeps the multi-provider schema when only some credentials are available', async () => {

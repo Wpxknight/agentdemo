@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { posix } from 'node:path';
 import { promisify } from 'node:util';
 import type { SandboxHandle } from '../sandbox/types.js';
 import type { SkillFileEntry } from './product.js';
@@ -41,10 +42,11 @@ export async function syncSkillToSandbox(input: {
   const b64 = archive.toString('base64');
   const tmp = input.sbx.workspacePath?.(`.aiop-tmp/aiop-skill-${safe}`)
     ?? `/tmp/aiop-skill-${safe}`;
+  const tmpDir = posix.dirname(tmp);
   const prep = await input.sbx.runCommand(
     `command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 || { echo AIOP_MISSING_TOOLS; exit 9; }; `
       + (input.partial ? '' : `rm -rf '${dest}'; `)
-      + `mkdir -p '${dest}' && rm -f '${tmp}.b64' '${tmp}.tgz'`,
+      + `mkdir -p '${dest}' '${tmpDir}' && rm -f '${tmp}.b64' '${tmp}.tgz'`,
   );
   if (failed(prep) || prep.stdout.includes('AIOP_MISSING_TOOLS')) {
     return { ...result, error: prep.stdout.includes('AIOP_MISSING_TOOLS')
