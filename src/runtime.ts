@@ -14,7 +14,7 @@ import {
   InMemoryCredentialStore, createModels, type Api, type Model as PiModel, type Provider as PiProvider,
 } from '@earendil-works/pi-ai';
 import { builtinProviders } from '@earendil-works/pi-ai/providers/all';
-import { createMysqlDurablePiRuntime } from '@aiop/pi-runtime';
+import { createMysqlDurablePiRuntime, type PiSessionStore } from '@aiop/pi-runtime';
 import { SandboxManager, type SandboxManagerLike } from './sandbox/lifecycle.js';
 import {
   SandboxRuntimeController,
@@ -122,6 +122,8 @@ export interface Runtime {
   agentRuntime: AgentRuntime;
   /** Pi-first durable control plane; deployments enable it while legacy callers migrate. */
   durableRunRuntime?: DurableRunRuntime;
+  /** Committed Pi session entries used to rebuild legacy product message projections. */
+  piSessionStore?: PiSessionStore;
   model: ChatModel;
   modelConfig?: RuntimeModelConfig;
   modelOptions?: RuntimeModelConfig[];
@@ -207,6 +209,15 @@ export async function createDefaultDurableRunRuntime(
   systemPrompt?: string,
   enabled = false,
 ): Promise<DurableRunRuntime | undefined> {
+  return (await createDefaultDurableRunAssembly(store, modelConfig, systemPrompt, enabled))?.runtime;
+}
+
+async function createDefaultDurableRunAssembly(
+  store: Store,
+  modelConfig: RuntimeModelConfig,
+  systemPrompt?: string,
+  enabled = false,
+) {
   if (!enabled || !(store instanceof MysqlStore)) return undefined;
   const targetApi = modelConfig.protocol === 'anthropic' ? 'anthropic-messages' : 'openai-completions';
   const provider = builtinProviders().find((candidate) => candidate.getModels().some((model) => model.api === targetApi));
@@ -241,7 +252,7 @@ export async function createDefaultDurableRunRuntime(
   models.setProvider(configuredProvider);
   return createMysqlDurablePiRuntime({
     db: store.database(), models, model, systemPrompt,
-  }).runtime;
+  });
 }
 
 /** 数据库页面设置优先；config.sandbox 仅在数据库尚无记录时作为启动 bootstrap。 */
@@ -260,6 +271,7 @@ export async function buildRuntime(
     store?: Store;
     settingsSecretBox?: ReturnType<typeof createSettingsSecretBox>;
     durableRunRuntime?: DurableRunRuntime;
+    piSessionStore?: PiSessionStore;
     enableDefaultDurableRuntime?: boolean;
   } = {},
 ): Promise<Runtime> {
@@ -643,8 +655,11 @@ export async function buildRuntime(
   };
   modelConfig = await resolveRuntimeModelConfig(config, store, DEFAULT_TENANT);
   const model = createModel(modelConfig.id, modelConfig);
-  const durableRunRuntime = options.durableRunRuntime
-    ?? await createDefaultDurableRunRuntime(store, modelConfig, systemExtra, options.enableDefaultDurableRuntime);
+  const defaultDurableAssembly = options.durableRunRuntime
+    ? undefined
+    : await createDefaultDurableRunAssembly(store, modelConfig, systemExtra, options.enableDefaultDurableRuntime);
+  const durableRunRuntime = options.durableRunRuntime ?? defaultDurableAssembly?.runtime;
+  const piSessionStore = options.piSessionStore ?? defaultDurableAssembly?.store.sessions;
   const publicSandboxState = (): SandboxSettingsState => {
     const catalog = sandboxController.catalogInfo();
     return {
@@ -752,6 +767,7 @@ export async function buildRuntime(
       runtimeStore: store.agentRuntimeStore(),
     }),
     durableRunRuntime,
+    piSessionStore,
     model,
     modelConfig,
     modelOptions,

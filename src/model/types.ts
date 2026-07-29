@@ -77,19 +77,6 @@ export type StreamEvent =
   | { type: 'tool_output'; toolId: string; stream: 'stdout' | 'stderr'; text: string }
   /** 单个工具调用执行完成（成功/失败），供前端实时标记任务进度。 */
   | { type: 'tool_result'; toolId: string; name: string; isError: boolean }
-  /**
-   * 模型调用失败（网络异常 / 上游报错，含中途断流），agent 即将发起第 attempt/maxAttempts 次重试。
-   * 重试会整轮重放：discard* 标记失败尝试已流式发出的部分输出量，供前端回滚展示。
-   */
-  | {
-      type: 'model_retry';
-      attempt: number;
-      maxAttempts: number;
-      error: string;
-      discardTextChars: number;
-      discardThinkingChars: number;
-      discardToolIds: string[];
-    }
   | {
       type: 'usage';
       inputTokens: number;

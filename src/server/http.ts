@@ -41,6 +41,7 @@ import {
   type SandboxApiKeyUpdate,
 } from '../sandbox/settings.js';
 import { SessionCommitter } from '../agent/services/session-committer.js';
+import { PiSessionProjection } from '../agent/projections.js';
 import { DurableToolLedger } from '../agent/tool-ledger/store.js';
 import { DurableInteractionService } from '../agent/interactions/store.js';
 import {
@@ -2668,10 +2669,6 @@ async function runAgentSse(
       onEvent: (e) => {
         if (e.type === 'text_delta') streamedText += e.text;
         else if (e.type === 'thinking_delta') streamedThinking += e.text;
-        else if (e.type === 'model_retry') {
-          if (e.discardTextChars > 0) streamedText = streamedText.slice(0, -e.discardTextChars);
-          if (e.discardThinkingChars > 0) streamedThinking = streamedThinking.slice(0, -e.discardThinkingChars);
-        }
         if (e.type === 'context_compacted') {
           // 摘要后仍超触发线：记跨请求水位，历史没涨够前的下一次运行不再白跑摘要。
           if (e.afterTokens > triggerTokens) compactionWatermarks.set(activeKey, e.afterTokens + COMPACTION_RETRY_GROWTH_TOKENS);
@@ -2778,7 +2775,7 @@ async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req:
   try {
     let emittedText = false;
     for await (const event of handle.events) {
-      const projected = durableHttpEvent(event);
+      const projected = projectDurableHttpEvent(event);
       if (projected) {
         sse(projected.event, projected.data);
         emittedText ||= projected.event === 'text_delta';
@@ -2787,6 +2784,18 @@ async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req:
       }
     }
     const result = await handle.result();
+    if (rt.piSessionStore) {
+      const session = await rt.piSessionStore.get(ctx.tenantId, sessionId);
+      if (session) {
+        const records = await rt.piSessionStore.listEntries(ctx.tenantId, sessionId, { committedOnly: true });
+        await new PiSessionProjection(rt.store).project({
+          ctx,
+          sessionId,
+          entries: records.map((record) => record.entry),
+          committedLeafId: session.committedLeafId,
+        });
+      }
+    }
     if (result.status === 'cancelled') {
       sse('terminated', { sessionId, runId: result.runId, reason: result.error?.message });
     } else if (result.status === 'failed' || result.status === 'recovery_required') {
@@ -2804,13 +2813,35 @@ async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req:
   }
 }
 
-function durableHttpEvent(event: { type: string; detail?: unknown }): { event: string; data: unknown } | undefined {
-  if (event.type !== 'message_update' || !event.detail || typeof event.detail !== 'object') return undefined;
-  const update = (event.detail as { update?: unknown }).update;
-  if (!update || typeof update !== 'object') return undefined;
-  const value = update as { type?: unknown; delta?: unknown };
-  if ((value.type === 'text_delta' || value.type === 'thinking_delta') && typeof value.delta === 'string') {
-    return { event: value.type, data: { text: value.delta } };
+export function projectDurableHttpEvent(event: { type: string; detail?: unknown }): { event: string; data: unknown } | undefined {
+  if (!event.detail || typeof event.detail !== 'object') return undefined;
+  if (event.type === 'message_update') {
+    const update = (event.detail as { update?: unknown }).update;
+    if (!update || typeof update !== 'object') return undefined;
+    const value = update as { type?: unknown; delta?: unknown };
+    if ((value.type === 'text_delta' || value.type === 'thinking_delta') && typeof value.delta === 'string') {
+      return { event: value.type, data: { text: value.delta } };
+    }
+    return undefined;
   }
-  return undefined;
+  if (event.type !== 'message_end') return undefined;
+  const message = (event.detail as { message?: unknown }).message;
+  if (!message || typeof message !== 'object' || (message as { role?: unknown }).role !== 'assistant') return undefined;
+  const usage = (message as { usage?: unknown }).usage;
+  if (!usage || typeof usage !== 'object') return undefined;
+  const value = usage as Record<string, unknown>;
+  return {
+    event: 'usage',
+    data: {
+      inputTokens: finiteNumber(value.input),
+      outputTokens: finiteNumber(value.output),
+      cacheReadTokens: finiteNumber(value.cacheRead),
+      cacheCreationTokens: finiteNumber(value.cacheWrite),
+      ...(typeof value.costTotal === 'number' && Number.isFinite(value.costTotal) ? { cost: value.costTotal } : {}),
+    },
+  };
+}
+
+function finiteNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }

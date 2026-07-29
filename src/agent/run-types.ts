@@ -7,9 +7,9 @@ import type { QuestionAnswers, QuestionSpec } from './question.js';
 import type { ChangePlan } from './plan.js';
 import type { DurableToolLedger } from './tool-ledger/store.js';
 import type { AgentRunLifecycleObserver } from './run-coordinator.js';
+import type { AgentRunUsage } from '@aiop/control-contracts';
 
-export type { Usage } from './services/model-gateway.js';
-import type { Usage } from './services/model-gateway.js';
+export type Usage = AgentRunUsage;
 
 export interface RunAgentOptions {
   runId?: string;
@@ -59,12 +59,12 @@ export interface RunAgentResult {
   messages: Msg[];
   text: string;
   steps: number;
-  usage: Usage;
+  usage: AgentRunUsage;
   compacted: boolean;
   rollout?: {
     mode: 'dry-run' | 'replay';
     sourceRunId?: string;
-    sourceUsage?: Usage;
-    usageDelta?: Usage;
+    sourceUsage?: AgentRunUsage;
+    usageDelta?: AgentRunUsage;
   };
 }
