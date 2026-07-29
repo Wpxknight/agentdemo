@@ -489,6 +489,45 @@ describe('SandboxRuntimeController', () => {
     await controller.disposeAll();
   });
 
+  it('does not evict a replacement handle when a stale acquire continuation observes a disposed epoch', async () => {
+    const backend = provider('epoch');
+    const controller = new SandboxRuntimeController();
+    await controller.commit({
+      manager: { provider: backend.instance },
+      profiles: [],
+      resolveSpec: (ctx) => ({ key: sandboxIdentityKey(ctx) }),
+    });
+    const generation = controller as unknown as {
+      current: { manager: { get: (spec: SandboxSpec, options?: { signal?: AbortSignal }) => Promise<SandboxHandle> } };
+    };
+    const originalGet = generation.current.manager.get.bind(generation.current.manager);
+    const staleReturned = deferred<void>();
+    const resumeStale = deferred<void>();
+    let calls = 0;
+    generation.current.manager.get = async (spec, options) => {
+      const handle = await originalGet(spec, options);
+      calls += 1;
+      if (calls === 1) {
+        staleReturned.resolve();
+        await resumeStale.promise;
+      }
+      return handle;
+    };
+
+    const ctx = { ...userA, sessionId: 'epoch-race' };
+    const stale = controller.acquire(ctx);
+    await staleReturned.promise;
+    await controller.disposeSession(userA, ctx.sessionId);
+    const replacement = await controller.acquire(ctx);
+    resumeStale.resolve();
+
+    await expect(stale).rejects.toThrow(/disposed/);
+    expect(replacement.handle.sandboxId).not.toBe('epoch-1');
+    expect(controller.has(replacement.spec.key)).toBe(true);
+    expect(backend.killed).not.toContain(replacement.handle.sandboxId);
+    await controller.disposeAll();
+  });
+
   it('does not block hard shutdown on a hung desktop create and kills a late result', async () => {
     const backend = provider('desktop');
     const creating = deferred<DesktopHandle>();

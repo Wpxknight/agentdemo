@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { access, lstat, mkdir, mkdtemp, open, rename, rm, unlink, type FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { localWorkspacePath } from './workspace-path.js';
 import type {
   ExecResult,
@@ -34,7 +34,13 @@ interface LocalSandboxLimits {
 function runProcess(
   command: string,
   args: string[],
-  opts: { cwd: string; timeoutMs?: number; onOutput?: OutputSink; env?: Readonly<Record<string, string>> },
+  opts: {
+    cwd: string;
+    timeoutMs?: number;
+    onOutput?: OutputSink;
+    env?: Readonly<Record<string, string>>;
+    activeChildren?: Set<ChildProcess>;
+  },
 ): Promise<ExecResult> {
   return new Promise((resolve) => {
     const child = spawn(command, args, {
@@ -42,6 +48,7 @@ function runProcess(
       env: { ...process.env, ...opts.env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    opts.activeChildren?.add(child);
     let stdout = '';
     let stderr = '';
     let timedOut = false;
@@ -56,10 +63,12 @@ function runProcess(
     child.stderr.on('data', (chunk) => { stderr += chunk; opts.onOutput?.({ stream: 'stderr', text: String(chunk) }); });
     child.on('error', (err) => {
       clearTimeout(timer);
+      opts.activeChildren?.delete(child);
       resolve({ stdout, stderr, exitCode: 127, error: String(err) });
     });
     child.on('close', (code) => {
       clearTimeout(timer);
+      opts.activeChildren?.delete(child);
       resolve({
         stdout,
         stderr,
@@ -88,6 +97,7 @@ class LocalSandboxHandle implements SandboxHandle {
   readonly sandboxId: string;
   readonly supportsSecretFiles = false;
   private killed = false;
+  private readonly activeChildren = new Set<ChildProcess>();
   private syncGenerations = 0;
   private syncBytes = 0;
 
@@ -104,12 +114,16 @@ class LocalSandboxHandle implements SandboxHandle {
     const fileName = codeFile(opts?.language);
     await this.writeFile(fileName, Buffer.from(code, 'utf8'));
     const cmd = codeCommand(opts?.language, fileName);
-    return runProcess(cmd.command, cmd.args, { cwd: this.dir, onOutput: opts?.onOutput });
+    return runProcess(cmd.command, cmd.args, {
+      cwd: this.dir, onOutput: opts?.onOutput, activeChildren: this.activeChildren,
+    });
   }
 
   async runCommand(command: string, opts?: RunCommandOpts): Promise<ExecResult> {
     if (this.killed) return { stdout: '', stderr: '', exitCode: 1, error: 'sandbox already killed' };
-    return runProcess('bash', ['-lc', command], { cwd: this.dir, timeoutMs: opts?.timeoutMs, onOutput: opts?.onOutput });
+    return runProcess('bash', ['-lc', command], {
+      cwd: this.dir, timeoutMs: opts?.timeoutMs, onOutput: opts?.onOutput, activeChildren: this.activeChildren,
+    });
   }
 
   async executeCommand(command: SandboxCommand, opts?: RunCommandOpts): Promise<ExecResult> {
@@ -121,6 +135,7 @@ class LocalSandboxHandle implements SandboxHandle {
     }
     return runProcess(command.program, [...(command.args ?? [])], {
       cwd, env: command.env, timeoutMs: command.timeoutMs ?? opts?.timeoutMs, onOutput: opts?.onOutput,
+      activeChildren: this.activeChildren,
     });
   }
 
@@ -186,6 +201,12 @@ class LocalSandboxHandle implements SandboxHandle {
   async kill(): Promise<void> {
     if (this.killed) return;
     this.killed = true;
+    const active = [...this.activeChildren];
+    const exits = active.map(waitForProcessExit);
+    for (const child of active) {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }
+    await Promise.all(exits);
     await rm(this.dir, { recursive: true, force: true });
   }
 
@@ -281,6 +302,15 @@ class LocalSandboxHandle implements SandboxHandle {
       throw error;
     }
   }
+}
+
+function waitForProcessExit(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const settled = () => resolve();
+    child.once('exit', settled);
+    child.once('error', settled);
+  });
 }
 
 /** 本地开发用沙箱：在临时目录中执行命令/代码，不提供强隔离。 */

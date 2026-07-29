@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { AiosE2bProvider } from '../packages/sandbox-runtime/src/aios-e2b.js';
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
+}
+
 interface RecordedRequest {
   url: string;
   method: string;
@@ -16,7 +22,7 @@ function jsonResponse(status: number, body?: unknown): Response {
   });
 }
 
-function queuedFetch(responses: Response[]) {
+function queuedFetch(responses: Array<Response | Promise<Response>>) {
   const requests: RecordedRequest[] = [];
   const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const headers = Object.fromEntries(new Headers(init?.headers).entries());
@@ -125,6 +131,41 @@ describe('AiosE2bProvider', () => {
       { command: 'true' },
     ]);
     expect(sleep).toHaveBeenCalledOnce();
+  });
+
+  it('aborts a 409 readiness retry sleep promptly and completes late sandbox cleanup', async () => {
+    const cleanup = deferred<Response>();
+    const cleanupFinished = vi.fn();
+    const { fetch, requests } = queuedFetch([
+      jsonResponse(201, { sandboxID: 'sb-abort-sleep' }),
+      jsonResponse(409, { code: 'sandbox_not_ready' }),
+      cleanup.promise.then((response) => {
+        cleanupFinished();
+        return response;
+      }),
+    ]);
+    const sleeping = deferred<void>();
+    const sleep = vi.fn(() => sleeping.promise);
+    const p = provider(fetch, { sleep, readinessAttempts: 3 });
+    const abort = new AbortController();
+    const acquisition = p.create(
+      { key: 'abort-readiness-sleep', template: 'code-id' },
+      { signal: abort.signal },
+    );
+    await vi.waitFor(() => expect(sleep).toHaveBeenCalledOnce());
+
+    abort.abort();
+
+    await expect(Promise.race([
+      acquisition,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('readiness sleep abort was not prompt')), 100)),
+    ])).rejects.toMatchObject({ name: 'AbortError' });
+    expect(requests.at(-1)).toMatchObject({
+      url: 'http://aios.local:8080/sandboxes/sb-abort-sleep',
+      method: 'DELETE',
+    });
+    cleanup.resolve(jsonResponse(204));
+    await vi.waitFor(() => expect(cleanupFinished).toHaveBeenCalledOnce());
   });
 
   it('deletes a newly-created sandbox when readiness never completes', async () => {

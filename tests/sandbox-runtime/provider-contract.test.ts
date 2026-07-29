@@ -123,6 +123,22 @@ describe('SandboxRuntime provider-neutral core contract', () => {
     expect(killed).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['stop', 'release'] as const)('%s invalidates an adopted manager handle exactly once', async (action) => {
+    const adopted = acquisitionHandle(`adopted-${action}`);
+    const invalidate = vi.fn();
+    const runtime = new SandboxRuntime({
+      providerName: 'managed',
+      provider: { create: async () => adopted.handle, connect: async () => adopted.handle },
+    });
+    const lease = await runtime.adopt({ handle: adopted.handle, spec: { key: `adopted-${action}` }, invalidate });
+
+    await runtime[action]({ lease });
+    await runtime.release({ lease });
+
+    expect(invalidate).toHaveBeenCalledOnce();
+    expect(adopted.kill).toHaveBeenCalledOnce();
+  });
+
   it('reconciles leases that are no longer desired', async () => {
     const { runtime } = contractHarness(providerName);
     const keep = await runtime.acquire({ spec: { key: 'keep' } });

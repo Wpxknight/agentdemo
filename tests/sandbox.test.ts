@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SandboxManager } from '../packages/sandbox-runtime/src/lifecycle.js';
 import { LocalSandboxProvider } from '../packages/sandbox-runtime/src/local.js';
+import { SandboxRuntime } from '../packages/sandbox-runtime/src/runtime.js';
 import { OpenSandboxDesktopProvider } from '../packages/sandbox-runtime/src/opensandbox-desktop.js';
 import { buildSandboxTools } from '../src/tools/builtin.js';
 import { buildSandboxProfileTools } from '../src/tools/sandbox-profiles.js';
@@ -24,6 +25,12 @@ function deferredHandle() {
 function deferredVoid() {
   let resolve!: () => void;
   const promise = new Promise<void>((res) => { resolve = res; });
+  return { promise, resolve };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
   return { promise, resolve };
 }
 
@@ -418,7 +425,44 @@ describe('LocalSandboxProvider structured execution', () => {
     })).resolves.toMatchObject({ stdout: 'two words:secret', exitCode: 0 });
     await handle.kill();
   });
+
+  it.each(['abort', 'timeout', 'stop'] as const)('%s terminates the active local child process', async (mode) => {
+    const runtime = new SandboxRuntime({ providerName: 'local', provider: new LocalSandboxProvider() });
+    const lease = await runtime.acquire({ spec: { key: `local-child-${mode}` } });
+    const started = deferred<number>();
+    let output = '';
+    const abort = new AbortController();
+    const execution = runtime.execute({
+      lease,
+      command: 'echo $$; exec sleep 60',
+      ...(mode === 'abort' ? { signal: abort.signal } : {}),
+      ...(mode === 'timeout' ? { timeoutMs: 1000 } : {}),
+      onOutput: ({ text }) => {
+        output += text;
+        const pid = Number.parseInt(output.trim(), 10);
+        if (Number.isInteger(pid)) started.resolve(pid);
+      },
+    });
+    const pid = await started.promise;
+
+    if (mode === 'abort') abort.abort();
+    if (mode === 'stop') await runtime.stop({ lease });
+    if (mode === 'abort') await expect(execution).rejects.toMatchObject({ name: 'AbortError' });
+    else await execution;
+
+    await vi.waitFor(() => expect(processExists(pid)).toBe(false));
+    await runtime.release({ lease });
+  });
 });
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
 
 describe('sandbox tools', () => {
   const ctx = { sessionId: 'sess-1' };

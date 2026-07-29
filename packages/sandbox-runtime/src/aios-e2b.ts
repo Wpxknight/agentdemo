@@ -213,7 +213,9 @@ export class AiosE2bProvider implements SandboxProvider {
       await this.waitUntilReady(handle, options.signal);
       return handle;
     } catch (err) {
-      await handle.kill().catch(() => {});
+      const cleanup = handle.kill().catch(() => {});
+      if (options.signal?.aborted) void cleanup;
+      else await cleanup;
       throw err;
     }
   }
@@ -278,11 +280,36 @@ export class AiosE2bProvider implements SandboxProvider {
         lastError = err;
         if (!(err instanceof AiosLifecycleHttpError) || err.status !== 409) throw err;
       }
-      if (attempt + 1 < this.readinessAttempts) await this.sleep(this.readinessDelayMs);
+      if (attempt + 1 < this.readinessAttempts) {
+        await raceAbort(this.sleep(this.readinessDelayMs), signal);
+      }
     }
     throw new Error(`AIOS sandbox did not become ready: ${String(lastError)}`);
   }
 
+}
+
+function raceAbort(task: Promise<void>, signal?: AbortSignal): Promise<void> {
+  if (!signal) return task;
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<void>((resolve, reject) => {
+    const abort = () => reject(abortError());
+    signal.addEventListener('abort', abort, { once: true });
+    task.then(
+      () => {
+        signal.removeEventListener('abort', abort);
+        resolve();
+      },
+      (error) => {
+        signal.removeEventListener('abort', abort);
+        reject(error);
+      },
+    );
+  });
+}
+
+function abortError(): DOMException {
+  return new DOMException('The AIOS sandbox readiness wait was aborted', 'AbortError');
 }
 
 function shellQuote(value: string): string {

@@ -159,7 +159,8 @@ export class SandboxRuntimeController implements SandboxAcquirer {
       this.assertOperationValid(generation, sessionEpochs);
       const handle = await generation.manager.get(spec, { signal: ctx.signal });
       if (!this.operationValid(generation, sessionEpochs)) {
-        await generation.manager.dispose(spec.key).catch(() => {});
+        generation.manager.evict(spec.key, handle);
+        await handle.kill().catch(() => {});
         throw new Error('sandbox session is disposed');
       }
       return {
@@ -187,7 +188,8 @@ export class SandboxRuntimeController implements SandboxAcquirer {
       this.assertOperationValid(generation, sessionEpochs);
       const handle = await generation.manager.get(spec, { signal: ctx.signal });
       if (!this.operationValid(generation, sessionEpochs)) {
-        await generation.manager.dispose(spec.key).catch(() => {});
+        generation.manager.evict(spec.key, handle);
+        await handle.kill().catch(() => {});
         throw new Error('sandbox session is disposed');
       }
       return {

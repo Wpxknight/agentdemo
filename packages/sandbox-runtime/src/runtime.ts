@@ -158,6 +158,7 @@ export class SandboxRuntime {
     const entry = this.leases.get(input.lease.id);
     if (!entry || !entry.active) return;
     entry.active = false;
+    this.invalidate(entry);
     await entry.handle.kill();
   }
 
