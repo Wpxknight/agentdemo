@@ -39,7 +39,7 @@ export interface ScheduledRunLookup {
         result: AgentRunResult;
     } | undefined>;
 }
-export type ScheduledFireState = 'pending' | 'claimed' | 'started';
+export type ScheduledFireState = 'pending' | 'claimed' | 'bound' | 'recovering' | 'started';
 export interface ScheduledFire extends ScheduledRunInput {
     state: ScheduledFireState;
     attempts: number;
@@ -57,6 +57,19 @@ export interface ClaimedScheduledFire extends ScheduledFire {
     claimedBy: string;
     leaseExpiresAt: Date;
 }
+export interface BoundScheduledFire extends ScheduledFire {
+    state: 'bound';
+    runId: string;
+    claimToken: string;
+    leaseExpiresAt: Date;
+}
+export interface RecoveringScheduledFire extends ScheduledFire {
+    state: 'recovering';
+    runId: string;
+    claimToken: string;
+    claimedBy: string;
+    leaseExpiresAt: Date;
+}
 
 // file: index.d.ts
 export * from './domain.js';
@@ -68,8 +81,8 @@ export * from './mysql.js';
 
 // file: mysql.d.ts
 import type { Generated, Kysely } from 'kysely';
-import type { ClaimedScheduledFire } from './domain.js';
-import { type BindRunInput, type ClaimDueInput, type CompleteFireInput, type ReleaseFireInput, type SchedulerStore } from './store.js';
+import type { BoundScheduledFire, ClaimedScheduledFire, RecoveringScheduledFire } from './domain.js';
+import { type BindRunInput, type ClaimBoundInput, type ClaimDueInput, type CompleteFireInput, type ListBoundInput, type ReleaseBoundInput, type ReleaseFireInput, type SchedulerStore } from './store.js';
 export interface SchedulerMysqlDatabase {
     scheduled_tasks: {
         id: Generated<number>;
@@ -127,6 +140,9 @@ export declare class MysqlSchedulerStore implements SchedulerStore {
     claimDue(input: ClaimDueInput): Promise<ClaimedScheduledFire[]>;
     bindRun(input: BindRunInput): Promise<void>;
     completeFire(input: CompleteFireInput): Promise<void>;
+    listBound(input: ListBoundInput): Promise<BoundScheduledFire[]>;
+    claimBound(input: ClaimBoundInput): Promise<RecoveringScheduledFire | undefined>;
+    releaseBound(input: ReleaseBoundInput): Promise<void>;
     releaseFire(input: ReleaseFireInput): Promise<void>;
     recoverExpired(now: Date): Promise<number>;
 }
@@ -162,7 +178,7 @@ export declare class SchedulerRunner {
 
 // file: store.d.ts
 import type { AgentRunResult } from '@aiop/control-contracts';
-import type { ClaimedScheduledFire, ScheduledFire, ScheduledTask } from './domain.js';
+import type { BoundScheduledFire, ClaimedScheduledFire, RecoveringScheduledFire, ScheduledFire, ScheduledTask } from './domain.js';
 export interface ClaimDueInput {
     now: Date;
     limit: number;
@@ -188,8 +204,28 @@ export interface ReleaseFireInput {
     retryAt: Date;
     error: string;
 }
+export interface ListBoundInput {
+    now: Date;
+    limit: number;
+}
+export interface ClaimBoundInput {
+    fireId: string;
+    expectedClaimToken: string;
+    now: Date;
+    workerId: string;
+    leaseMs: number;
+}
+export interface ReleaseBoundInput {
+    fireId: string;
+    claimToken: string;
+    retryAt: Date;
+    error: string;
+}
 export interface SchedulerStore {
     claimDue(input: ClaimDueInput): Promise<ClaimedScheduledFire[]>;
+    listBound(input: ListBoundInput): Promise<BoundScheduledFire[]>;
+    claimBound(input: ClaimBoundInput): Promise<RecoveringScheduledFire | undefined>;
+    releaseBound(input: ReleaseBoundInput): Promise<void>;
     bindRun(input: BindRunInput): Promise<void>;
     completeFire(input: CompleteFireInput): Promise<void>;
     releaseFire(input: ReleaseFireInput): Promise<void>;
@@ -204,6 +240,9 @@ export declare class MemorySchedulerStore implements SchedulerStore {
     claimDue(input: ClaimDueInput): Promise<ClaimedScheduledFire[]>;
     completeFire(input: CompleteFireInput): Promise<void>;
     bindRun(input: BindRunInput): Promise<void>;
+    listBound(input: ListBoundInput): Promise<BoundScheduledFire[]>;
+    claimBound(input: ClaimBoundInput): Promise<RecoveringScheduledFire | undefined>;
+    releaseBound(input: ReleaseBoundInput): Promise<void>;
     releaseFire(input: ReleaseFireInput): Promise<void>;
     recoverExpired(now: Date): Promise<number>;
     listFires(): Promise<ScheduledFire[]>;
