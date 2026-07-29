@@ -55,6 +55,22 @@ describe('resolveRuntimeModelConfig', () => {
 });
 
 describe('production durable runtime assembly', () => {
+  it('applies chat guardrails to interactive and unattended durable runs', async () => {
+    const runtimeModule = await import('../src/runtime.js') as typeof import('../src/runtime.js') & {
+      resolveRuntimeSystemPrompt(systemPrompt?: string, execution?: { unattended?: boolean }): string;
+    };
+
+    const interactive = runtimeModule.resolveRuntimeSystemPrompt('skill summary', {});
+    const unattended = runtimeModule.resolveRuntimeSystemPrompt('skill summary', { unattended: true });
+
+    expect(interactive).toContain('聊天执行规则：');
+    expect(interactive).toContain('skill summary');
+    expect(interactive).not.toContain('无人值守运行说明');
+    expect(unattended).toContain('聊天执行规则：');
+    expect(unattended).toContain('无人值守运行说明');
+    expect(unattended).toContain('skill summary');
+  });
+
   it('fences pre-execution ledger mutations with the active durable attempt lease', async () => {
     const calls: string[] = [];
     const ledger = {

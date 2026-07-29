@@ -44,7 +44,7 @@ import type { McpServerConfig } from '@aiop/mcp-runtime';
 import { nextRunAt } from '../scheduler/cron.js';
 import { estimateTokens } from '../llm/context.js';
 import { parseStoredSandboxSettings } from '@aiop/sandbox-runtime';
-import { MysqlRuntimeStore, type RuntimeMysqlDatabase } from '@aiop/pi-runtime';
+import { MysqlRunStore } from '@aiop/pi-runtime';
 
 interface TaskRow {
   id: number;
@@ -219,14 +219,18 @@ function parseSchedulerSettings(value: unknown): SchedulerSettings | undefined {
 
 /** 基于 Kysely + mysql2 的持久化实现（租户由 ctx 强制过滤）。 */
 export class MysqlStore implements Store {
-  constructor(private readonly db: Kysely<Database>) {}
+  private readonly durableStore: MysqlRunStore;
+
+  constructor(private readonly db: Kysely<Database>) {
+    this.durableStore = new MysqlRunStore(db);
+  }
 
   database(): Kysely<Database> {
     return this.db;
   }
 
-  agentRuntimeStore() {
-    return new MysqlRuntimeStore(this.db as unknown as Kysely<RuntimeMysqlDatabase>);
+  durableRunStore() {
+    return this.durableStore;
   }
 
   async createSession(ctx: RequestContext, input: SessionInput): Promise<SessionSummary> {

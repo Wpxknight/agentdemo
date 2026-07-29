@@ -56,7 +56,7 @@ describe('final runtime assembly boundary', () => {
   it('does not reference retired packages or duplicate root runtimes', async () => {
     const source = await sourceBundle();
     for (const name of retiredPackages) expect(source).not.toContain(`@aiop/${name}`);
-    expect(source).not.toMatch(/src\/model\//);
+    expect(source).not.toContain('// src/model/');
     expect(source).not.toContain('SessionCommitter');
     expect(source).not.toContain('createConfiguredAgentRuntime');
   });
@@ -106,6 +106,22 @@ describe('final runtime assembly boundary', () => {
     expect(statements[0]?.values?.[0]).toBe('aiop:schema-migrations');
     expect(statements.at(-2)).toMatchObject({ sql: 'SELECT RELEASE_LOCK(?) AS released' });
     expect(statements.at(-1)).toEqual({ sql: 'connection.release()' });
+  });
+
+  it('releases the connection without running migrations when the advisory lock is not acquired', async () => {
+    const statements: string[] = [];
+    const connection = {
+      query: async (sql: string) => {
+        statements.push(sql);
+        return sql.includes('GET_LOCK') ? [[{ acquired: 0 }], []] : [[], []];
+      },
+      release: () => statements.push('connection.release()'),
+    };
+    const pool = { promise: () => ({ getConnection: async () => connection }) };
+
+    await expect(runMigrations(pool as never)).rejects.toThrow('Timed out waiting for the schema migration lock');
+
+    expect(statements).toEqual(['SELECT GET_LOCK(?, ?) AS acquired', 'connection.release()']);
   });
 
   it('assembles one mandatory durable runtime for non-MySQL application modes', async () => {

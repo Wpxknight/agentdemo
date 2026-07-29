@@ -13,7 +13,7 @@ const owner: RequestContext = {
 describe('DurableInteractionService', () => {
   it('shares one interaction record with the Runtime repository and its transaction boundary', async () => {
     const store = new MemoryStore();
-    const runtimeStore = store.agentRuntimeStore();
+    const runtimeStore = store.durableRunStore();
     const createdAt = new Date('2026-07-27T00:00:00.000Z');
     const expiresAt = new Date('2026-07-28T00:00:00.000Z');
     await runtimeStore.interactions.put({

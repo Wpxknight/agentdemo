@@ -7,7 +7,7 @@ import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import type { Kysely, Transaction } from 'kysely';
 import type {
   ClaimInboxInput, ConsumeInboxInput, DurableRunStore, EnqueueInboxInput, PiSessionRecord, RunInboxMessage,
-  SessionEntryRecord, StoredRun,
+  SessionEntryRecord, StoredRun, DurableProductRunStore, ProductAttemptRecord, ProductTurnCommit,
 } from './types.js';
 import { assertAttemptAllowed, assertTurnAllowed } from '../run/limits.js';
 import { sessionStats } from './session-stats.js';
@@ -15,7 +15,7 @@ import { piSessionStorageId } from './session-id.js';
 
 type Db = Kysely<any> | Transaction<any>;
 
-export class MysqlRunStore implements DurableRunStore {
+export class MysqlRunStore implements DurableProductRunStore {
   constructor(private readonly db: Db, private readonly transactionalView = false, private readonly now: () => Date = () => new Date()) {}
 
   async create(input: Parameters<DurableRunStore['create']>[0]): Promise<RunRecord & { sessionCreated: boolean }> {
@@ -56,6 +56,31 @@ export class MysqlRunStore implements DurableRunStore {
     const last = await this.db.selectFrom('agent_turn_commits').selectAll().where('tenant_id', '=', identity.tenantId)
       .where('run_id', '=', identity.runId).orderBy('turn_no', 'desc').executeTakeFirst();
     return mapRun(row, last);
+  }
+
+  async listRuns(tenantId: string): Promise<StoredRun[]> {
+    const rows = await this.db.selectFrom('agent_runs').selectAll().where('tenant_id', '=', tenantId).execute();
+    return Promise.all(rows.map(async (row: any) => {
+      const commit = await this.db.selectFrom('agent_turn_commits').selectAll()
+        .where('tenant_id', '=', tenantId).where('run_id', '=', row.run_id)
+        .orderBy('turn_no', 'desc').executeTakeFirst();
+      return mapRun(row, commit);
+    }));
+  }
+
+  async updateProductRun(identity: { tenantId: string; runId: string }, patch: Partial<StoredRun>): Promise<boolean> {
+    const result = await this.db.updateTable('agent_runs').set({
+      status: patch.status, waiting_reason: patch.waitingReason,
+      current_node: patch.currentNode, step_count: patch.stepCount,
+      input_tokens: patch.usage?.inputTokens, output_tokens: patch.usage?.outputTokens,
+      cache_read_tokens: patch.usage?.cacheReadTokens, cache_creation_tokens: patch.usage?.cacheCreationTokens,
+      cost_usd: patch.usage?.costUsd, error_message: patch.errorMessage,
+      started_at: patch.startedAt, updated_at: patch.updatedAt,
+      completed_at: patch.completedAt, cancel_requested_at: patch.cancelRequestedAt,
+      lease_owner: patch.leaseOwner, lease_token: patch.leaseToken === undefined ? undefined : Number(patch.leaseToken),
+      lease_expires_at: patch.leaseExpiresAt,
+    }).where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId).executeTakeFirst();
+    return affected(result);
   }
 
   async claim(input: Parameters<DurableRunStore['claim']>[0]): Promise<Awaited<ReturnType<DurableRunStore['claim']>>> {
@@ -291,6 +316,114 @@ export class MysqlRunStore implements DurableRunStore {
     });
   }
 
+  readonly runs = {
+    assertLease: async (
+      identity: { tenantId: string; runId: string }, ownerId: string, token: bigint, now: Date,
+    ): Promise<void> => {
+      await this.assertLease(identity.tenantId, identity.runId, token, false, ownerId, now);
+    },
+  };
+
+  readonly attempts = {
+    list: async (identity: { tenantId: string; runId: string }): Promise<ProductAttemptRecord[]> =>
+      (await this.db.selectFrom('agent_run_attempts').selectAll()
+        .where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId)
+        .orderBy('started_at', 'asc').execute()).map((row: any) => ({
+          tenantId: row.tenant_id, runId: row.run_id, attemptId: row.attempt_id,
+          workerId: row.worker_id, leaseToken: BigInt(row.lease_token), kernel: row.kernel,
+          kernelVersion: row.kernel_version, status: row.status, errorCode: row.error_code ?? undefined,
+          errorMessage: row.error_message ?? undefined, startedAt: row.started_at,
+          completedAt: row.completed_at ?? undefined,
+        })),
+  };
+
+  readonly turns = {
+    listCommitted: async (identity: { tenantId: string; runId: string }): Promise<ProductTurnCommit[]> =>
+      (await this.db.selectFrom('agent_turn_commits').selectAll()
+        .where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId)
+        .orderBy('transcript_version', 'asc').execute()).map((row: any) => ({
+          tenantId: row.tenant_id, runId: row.run_id, attemptId: row.attempt_id, turnNo: row.turn_no,
+          commitId: row.commit_id, transcriptVersion: BigInt(row.transcript_version),
+          stopReason: row.stop_reason ?? undefined, usage: parse(row.usage_json),
+          eventSequenceEnd: BigInt(row.event_sequence_end), committedAt: row.committed_at,
+        })),
+  };
+
+  readonly interactions = {
+    put: async (record: DurableInteractionUpdate): Promise<void> => {
+      await this.db.insertInto('agent_interactions').values(interactionValues(record)).onDuplicateKeyUpdate({
+        status: record.status,
+        resolution: record.resolution === undefined ? null : JSON.stringify(record.resolution),
+        resolved_by: record.resolvedBy ?? null, resolved_at: record.resolvedAt ?? null,
+      }).execute();
+    },
+    get: (identity: { tenantId: string; runId: string; interactionId: string }) => this.getInteraction(identity),
+    getById: async (tenantId: string, interactionId: string) => {
+      const row = await this.db.selectFrom('agent_interactions').selectAll()
+        .where('tenant_id', '=', tenantId).where('id', '=', interactionId).executeTakeFirst();
+      return row ? mapInteraction(row) : undefined;
+    },
+    list: async (identity: { tenantId: string; runId: string }) =>
+      (await this.db.selectFrom('agent_interactions').selectAll()
+        .where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId)
+        .orderBy('created_at', 'asc').execute()).map(mapInteraction),
+    listByTenant: async (tenantId: string) =>
+      (await this.db.selectFrom('agent_interactions').selectAll().where('tenant_id', '=', tenantId)
+        .orderBy('created_at', 'asc').execute()).map(mapInteraction),
+  };
+
+  readonly toolLedger = {
+    putIfAbsent: async (record: DurableToolLedgerUpdate): Promise<boolean> => {
+      const result = await this.db.insertInto('agent_tool_executions').values(ledgerValues(record)).ignore().executeTakeFirst();
+      return Number(result.numInsertedOrUpdatedRows ?? 0) > 0;
+    },
+    get: async (identity: { tenantId: string; runId: string; logicalCallId: string }) => {
+      const row = await this.db.selectFrom('agent_tool_executions').selectAll()
+        .where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId)
+        .where('logical_call_id', '=', identity.logicalCallId).executeTakeFirst();
+      return row ? mapLedger(row) : undefined;
+    },
+    update: async (record: DurableToolLedgerUpdate): Promise<void> => {
+      await this.db.updateTable('agent_tool_executions').set({
+        attempt_id: record.attemptId, turn_no: record.turnNo, tool_call_id: record.toolCallId,
+        idempotency_key: record.idempotencyKey, capability: record.capability,
+        external_correlation_id: record.externalCorrelationId ?? null, result_digest: record.resultDigest ?? null,
+        approved_interaction_id: record.approvedInteractionId ?? null, status: record.status,
+        result: record.result === undefined ? null : JSON.stringify(record.result),
+        completed_at: record.status === 'completed' ? record.updatedAt : null, updated_at: record.updatedAt,
+      }).where('tenant_id', '=', record.tenantId).where('run_id', '=', record.runId)
+        .where('logical_call_id', '=', record.logicalCallId).execute();
+    },
+    claimPendingApproval: async (input: import('./types.js').ToolLedgerApprovalClaim): Promise<boolean> => {
+      const result = await this.db.updateTable('agent_tool_executions').set({
+        attempt_id: input.started.attemptId, turn_no: input.started.turnNo,
+        tool_call_id: input.started.toolCallId, idempotency_key: input.started.idempotencyKey,
+        capability: input.started.capability, approved_interaction_id: input.started.approvedInteractionId ?? null,
+        status: input.started.status, updated_at: input.started.updatedAt,
+      }).where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId)
+        .where('logical_call_id', '=', input.logicalCallId).where('status', '=', 'pending_approval')
+        .where('attempt_id', '=', input.attemptId).where('turn_no', '=', input.turnNo)
+        .where('tool_call_id', '=', input.toolCallId).where('tool_name', '=', input.toolName)
+        .where('args_digest', '=', input.argsDigest)
+        .where('approved_interaction_id', '=', input.approvedInteractionId).executeTakeFirst();
+      return Number(result.numUpdatedRows ?? 0) === 1;
+    },
+    list: async (identity: { tenantId: string; runId: string }) =>
+      (await this.db.selectFrom('agent_tool_executions').selectAll()
+        .where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId)
+        .orderBy('started_at', 'asc').execute()).map(mapLedger),
+  };
+
+  readonly events = {
+    append: async (event: Omit<AgentRunEvent, 'sequence'>): Promise<AgentRunEvent> => {
+      const sequence = this.transactionalView
+        ? await this.appendEvent(event)
+        : await this.transaction((store) => store.appendEvent(event));
+      return { ...event, sequence: BigInt(sequence) };
+    },
+    list: (identity: { tenantId: string; runId: string }, after = 0n) => this.listEvents(identity, after),
+  };
+
   readonly sessions = {
     create: async (input: { tenantId: string; sessionId: string; createdAt: Date; metadata?: Record<string, unknown> }): Promise<PiSessionRecord> => {
       await this.db.insertInto('pi_sessions').values({
@@ -398,7 +531,7 @@ export class MysqlRunStore implements DurableRunStore {
         .where('run_id', '=', runId).orderBy('sequence', 'asc').execute()).map(mapInbox),
   };
 
-  private async transaction<T>(work: (store: MysqlRunStore) => Promise<T>): Promise<T> {
+  async transaction<T>(work: (store: DurableProductRunStore & MysqlRunStore) => Promise<T>): Promise<T> {
     if (this.transactionalView) return work(this);
     return (this.db as Kysely<any>).transaction().execute((tx) => work(new MysqlRunStore(tx, true, this.now)));
   }
@@ -438,6 +571,10 @@ function mapRun(row: any, commit?: any): StoredRun {
     usage: usage(row), createdAt: row.created_at, updatedAt: row.updated_at,
     cancelRequestedAt: row.cancel_requested_at ?? undefined, lastTurnNo: Number(commit?.turn_no ?? 0),
     checkpoint: commit ? parse(commit.messages_json) : undefined, appendClosedAt: row.append_closed_at ?? undefined,
+    runtimeVersion: row.runtime_version, graphName: row.graph_name, graphVersion: row.graph_version,
+    currentNode: row.current_node ?? undefined, stepCount: Number(row.step_count ?? 0),
+    errorMessage: row.error_message ?? undefined, startedAt: row.started_at ?? undefined,
+    completedAt: row.completed_at ?? undefined,
   };
 }
 function mapSession(row: any): PiSessionRecord { return {
@@ -489,6 +626,14 @@ function mapInteraction(row: any): DurableInteractionUpdate { return {
   resolvedBy: row.resolved_by ?? undefined, expiresAt: row.expires_at, createdAt: row.created_at,
   resolvedAt: row.resolved_at ?? undefined,
 }; }
+function mapLedger(row: any): DurableToolLedgerUpdate { return {
+  tenantId: row.tenant_id, runId: row.run_id, attemptId: row.attempt_id ?? '', turnNo: row.turn_no ?? 0,
+  logicalCallId: row.logical_call_id, toolCallId: row.tool_call_id, toolName: row.tool_name,
+  argsDigest: row.args_digest, capability: row.capability, idempotencyKey: row.idempotency_key, status: row.status,
+  externalCorrelationId: row.external_correlation_id ?? undefined, resultDigest: row.result_digest ?? undefined,
+  approvedInteractionId: row.approved_interaction_id ?? undefined,
+  result: row.result === null ? undefined : parse(row.result), createdAt: row.started_at, updatedAt: row.updated_at,
+} as DurableToolLedgerUpdate; }
 function reachable(records: SessionEntryRecord[], leaf: string | null): Set<string> {
   const byId = new Map(records.map((record) => [record.entry.id, record.entry]));
   const ids = new Set<string>();

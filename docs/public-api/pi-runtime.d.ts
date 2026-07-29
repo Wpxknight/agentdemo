@@ -9,6 +9,7 @@ export * from './pi/models.js';
 export * from './pi/session.js';
 export * from './pi/skills.js';
 export * from './pi/tool-bridge.js';
+export * from './model/concurrency.js';
 export * from './tools/adapter.js';
 export * from './tools/approval.js';
 export * from './tools/audit.js';
@@ -23,10 +24,6 @@ export * from './store/mysql.js';
 export * from './store/pi-session-mysql.js';
 export * from './store/session-stats.js';
 export * from './store/session-id.js';
-export type { InteractionRepository, InteractionRecord, RuntimeStore, RuntimeTransaction, ToolLedgerApprovalClaim, ToolLedgerRepository, } from './store/runtime-spi.js';
-export type { RunRecord as RuntimeRunRecord, TurnSnapshot as RuntimeTurnSnapshot, } from './store/runtime-spi.js';
-export * from './store/runtime-memory.js';
-export * from './store/runtime-mysql.js';
 export * from './run/attempt.js';
 export * from './run/cancellation.js';
 export * from './run/event-stream.js';
@@ -38,15 +35,43 @@ export * from './run/mysql-assembly.js';
 export * from './run/memory-assembly.js';
 export * from './run/recovery.js';
 
+// file: model/concurrency.d.ts
+import { type Models } from '@earendil-works/pi-ai';
+import type { IdentityContext } from '@aiop/control-contracts';
+export interface ModelConcurrencyInput {
+    identity: IdentityContext;
+    model: {
+        provider: string;
+        model: string;
+        route?: string;
+    };
+    signal?: AbortSignal;
+}
+export interface ModelConcurrencyController {
+    acquire(input: ModelConcurrencyInput): Promise<() => void>;
+}
+export interface FifoModelConcurrencyControllerOptions {
+    maxConcurrentPerTenantModel?: number;
+}
+export declare class FifoModelConcurrencyController implements ModelConcurrencyController {
+    private readonly semaphores;
+    private readonly limit;
+    constructor(options?: FifoModelConcurrencyControllerOptions);
+    acquire(input: ModelConcurrencyInput): Promise<() => void>;
+}
+export declare function createConcurrentModels(models: Models, controller: ModelConcurrencyController, identity: IdentityContext): Models;
+
 // file: pi/agent.d.ts
 import type { AgentInputMessage, AgentRunEvent, DurableInteractionUpdate, DurableToolLedgerUpdate, IdentityContext, InteractionResolution, RunExecutionProfile } from '@aiop/control-contracts';
 import { AgentHarness, type AgentHarnessResources, type AgentHarnessTool, type Session, type SessionCreateOptions, type SessionMetadata, type SessionRepo, type SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import type { Model, Models } from '@earendil-works/pi-ai';
 import { EventCodec, type EventCodecOptions } from './event-codec.js';
+import { type ModelConcurrencyController } from '../model/concurrency.js';
 export interface PiAgentSessionFactoryOptions<TMetadata extends SessionMetadata, TCreateOptions extends SessionCreateOptions, TListOptions> {
     repository: SessionRepo<TMetadata, TCreateOptions, TListOptions>;
     models: Models;
     model: Model<any>;
+    modelConcurrency?: ModelConcurrencyController;
     systemPrompt?: string;
     resolveSystemPrompt?(input: {
         execution?: RunExecutionProfile;
@@ -515,6 +540,8 @@ import { DurableRunManager } from './manager.js';
 export interface MemoryDurablePiRuntimeOptions {
     models: Models;
     model: Model<any>;
+    store?: MemoryRunStore;
+    modelConcurrency?: PiAgentSessionFactoryOptions<any, any, any>['modelConcurrency'];
     systemPrompt?: string;
     resolveSystemPrompt?: PiAgentSessionFactoryOptions<any, any, any>['resolveSystemPrompt'];
     tools?: AgentHarnessTool<undefined>[];
@@ -544,8 +571,10 @@ import { PiMysqlSessionRepo } from '../store/pi-session-mysql.js';
 import { DurableRunManager } from './manager.js';
 export interface MysqlDurablePiRuntimeOptions {
     db: Kysely<any>;
+    store?: MysqlRunStore;
     models: Models;
     model: Model<any>;
+    modelConcurrency?: PiAgentSessionFactoryOptions<any, any, any>['modelConcurrency'];
     systemPrompt?: string;
     resolveSystemPrompt?: PiAgentSessionFactoryOptions<any, any, any>['resolveSystemPrompt'];
     tools?: AgentHarnessTool<undefined>[];
@@ -576,19 +605,20 @@ import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
 export declare function committedInboxIds(entries: readonly SessionTreeEntry[]): Set<string>;
 
 // file: store/memory.d.ts
-import { type AgentRunEvent, type DurableInteractionUpdate } from '@aiop/control-contracts';
+import { type AgentRunEvent, type DurableInteractionUpdate, type DurableToolLedgerUpdate } from '@aiop/control-contracts';
 import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
-import type { ClaimInboxInput, ConsumeInboxInput, DurableRunStore, EnqueueInboxInput, PiSessionRecord, RunInboxMessage, SessionEntryRecord, StoredRun } from './types.js';
-export declare class MemoryRunStore implements DurableRunStore {
+import type { ClaimInboxInput, ConsumeInboxInput, DurableRunStore, EnqueueInboxInput, PiSessionRecord, RunInboxMessage, SessionEntryRecord, StoredRun, DurableProductRunStore, ProductAttemptRecord, ProductTurnCommit } from './types.js';
+export declare class MemoryRunStore implements DurableProductRunStore {
     private readonly now;
-    private readonly runs;
-    private readonly attempts;
-    private readonly events;
+    private readonly runRecords;
+    private readonly attemptsState;
+    private readonly commits;
+    private readonly eventRecords;
     private readonly sessionRecords;
     private readonly sessionEntries;
     private readonly inboxMessages;
-    private readonly interactions;
-    private readonly toolLedger;
+    private readonly interactionRecords;
+    private readonly toolLedgerRecords;
     private transactionTail;
     constructor(now?: () => Date);
     create(input: Parameters<DurableRunStore['create']>[0]): Promise<StoredRun & {
@@ -598,6 +628,11 @@ export declare class MemoryRunStore implements DurableRunStore {
         tenantId: string;
         runId: string;
     }): Promise<StoredRun | undefined>;
+    listRuns(tenantId: string): Promise<StoredRun[]>;
+    updateProductRun(identity: {
+        tenantId: string;
+        runId: string;
+    }, patch: Partial<StoredRun>): Promise<boolean>;
     claim(input: Parameters<DurableRunStore['claim']>[0]): Promise<Awaited<ReturnType<DurableRunStore['claim']>>>;
     renewLease(input: Parameters<DurableRunStore['renewLease']>[0]): Promise<void>;
     commitTurn(input: Parameters<DurableRunStore['commitTurn']>[0]): Promise<void>;
@@ -623,6 +658,60 @@ export declare class MemoryRunStore implements DurableRunStore {
     }): Promise<DurableInteractionUpdate | undefined>;
     resolveInteraction(record: DurableInteractionUpdate): Promise<boolean>;
     closeInbox(input: Parameters<DurableRunStore['closeInbox']>[0]): Promise<void>;
+    readonly runs: {
+        assertLease: (identity: {
+            tenantId: string;
+            runId: string;
+        }, ownerId: string, token: bigint, now: Date) => Promise<void>;
+    };
+    readonly attempts: {
+        list: (identity: {
+            tenantId: string;
+            runId: string;
+        }) => Promise<ProductAttemptRecord[]>;
+    };
+    readonly turns: {
+        listCommitted: (identity: {
+            tenantId: string;
+            runId: string;
+        }) => Promise<ProductTurnCommit[]>;
+    };
+    readonly interactions: {
+        put: (record: DurableInteractionUpdate) => Promise<void>;
+        get: (identity: {
+            tenantId: string;
+            runId: string;
+            interactionId: string;
+        }) => Promise<DurableInteractionUpdate | undefined>;
+        getById: (tenantId: string, interactionId: string) => Promise<DurableInteractionUpdate | undefined>;
+        list: (identity: {
+            tenantId: string;
+            runId: string;
+        }) => Promise<DurableInteractionUpdate[]>;
+        listByTenant: (tenantId: string) => Promise<DurableInteractionUpdate[]>;
+    };
+    readonly toolLedger: {
+        putIfAbsent: (record: DurableToolLedgerUpdate) => Promise<boolean>;
+        get: (identity: {
+            tenantId: string;
+            runId: string;
+            logicalCallId: string;
+        }) => Promise<DurableToolLedgerUpdate | undefined>;
+        update: (record: DurableToolLedgerUpdate) => Promise<void>;
+        claimPendingApproval: (input: import("./types.js").ToolLedgerApprovalClaim) => Promise<boolean>;
+        list: (identity: {
+            tenantId: string;
+            runId: string;
+        }) => Promise<DurableToolLedgerUpdate[]>;
+    };
+    readonly events: {
+        append: (event: Omit<AgentRunEvent, "sequence">) => Promise<AgentRunEvent>;
+        list: (identity: {
+            tenantId: string;
+            runId: string;
+        }, after?: bigint) => Promise<AgentRunEvent[]>;
+    };
+    transaction<T>(work: (tx: DurableProductRunStore) => Promise<T>): Promise<T>;
     readonly sessions: {
         create: (input: {
             tenantId: string;
@@ -646,18 +735,22 @@ export declare class MemoryRunStore implements DurableRunStore {
         list: (tenantId: string, runId: string) => Promise<RunInboxMessage[]>;
     };
     private requireLease;
+    private runsState;
+    private interactionsState;
+    private toolLedgerState;
+    private eventsState;
     private hasSessionEntry;
     private reachableEntryIds;
     private lock;
 }
 
 // file: store/mysql.d.ts
-import { type AgentRunEvent, type DurableInteractionUpdate, type RunRecord } from '@aiop/control-contracts';
+import { type AgentRunEvent, type DurableInteractionUpdate, type DurableToolLedgerUpdate, type RunRecord } from '@aiop/control-contracts';
 import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import type { Kysely, Transaction } from 'kysely';
-import type { ClaimInboxInput, ConsumeInboxInput, DurableRunStore, EnqueueInboxInput, PiSessionRecord, RunInboxMessage, SessionEntryRecord, StoredRun } from './types.js';
+import type { ClaimInboxInput, ConsumeInboxInput, DurableRunStore, EnqueueInboxInput, PiSessionRecord, RunInboxMessage, SessionEntryRecord, StoredRun, DurableProductRunStore, ProductAttemptRecord, ProductTurnCommit } from './types.js';
 type Db = Kysely<any> | Transaction<any>;
-export declare class MysqlRunStore implements DurableRunStore {
+export declare class MysqlRunStore implements DurableProductRunStore {
     private readonly db;
     private readonly transactionalView;
     private readonly now;
@@ -669,6 +762,11 @@ export declare class MysqlRunStore implements DurableRunStore {
         tenantId: string;
         runId: string;
     }): Promise<StoredRun | undefined>;
+    listRuns(tenantId: string): Promise<StoredRun[]>;
+    updateProductRun(identity: {
+        tenantId: string;
+        runId: string;
+    }, patch: Partial<StoredRun>): Promise<boolean>;
     claim(input: Parameters<DurableRunStore['claim']>[0]): Promise<Awaited<ReturnType<DurableRunStore['claim']>>>;
     renewLease(input: Parameters<DurableRunStore['renewLease']>[0]): Promise<void>;
     commitTurn(input: Parameters<DurableRunStore['commitTurn']>[0]): Promise<void>;
@@ -694,6 +792,59 @@ export declare class MysqlRunStore implements DurableRunStore {
     }): Promise<DurableInteractionUpdate | undefined>;
     resolveInteraction(record: DurableInteractionUpdate): Promise<boolean>;
     closeInbox(input: Parameters<DurableRunStore['closeInbox']>[0]): Promise<void>;
+    readonly runs: {
+        assertLease: (identity: {
+            tenantId: string;
+            runId: string;
+        }, ownerId: string, token: bigint, now: Date) => Promise<void>;
+    };
+    readonly attempts: {
+        list: (identity: {
+            tenantId: string;
+            runId: string;
+        }) => Promise<ProductAttemptRecord[]>;
+    };
+    readonly turns: {
+        listCommitted: (identity: {
+            tenantId: string;
+            runId: string;
+        }) => Promise<ProductTurnCommit[]>;
+    };
+    readonly interactions: {
+        put: (record: DurableInteractionUpdate) => Promise<void>;
+        get: (identity: {
+            tenantId: string;
+            runId: string;
+            interactionId: string;
+        }) => Promise<DurableInteractionUpdate | undefined>;
+        getById: (tenantId: string, interactionId: string) => Promise<DurableInteractionUpdate | undefined>;
+        list: (identity: {
+            tenantId: string;
+            runId: string;
+        }) => Promise<DurableInteractionUpdate[]>;
+        listByTenant: (tenantId: string) => Promise<DurableInteractionUpdate[]>;
+    };
+    readonly toolLedger: {
+        putIfAbsent: (record: DurableToolLedgerUpdate) => Promise<boolean>;
+        get: (identity: {
+            tenantId: string;
+            runId: string;
+            logicalCallId: string;
+        }) => Promise<DurableToolLedgerUpdate | undefined>;
+        update: (record: DurableToolLedgerUpdate) => Promise<void>;
+        claimPendingApproval: (input: import("./types.js").ToolLedgerApprovalClaim) => Promise<boolean>;
+        list: (identity: {
+            tenantId: string;
+            runId: string;
+        }) => Promise<DurableToolLedgerUpdate[]>;
+    };
+    readonly events: {
+        append: (event: Omit<AgentRunEvent, "sequence">) => Promise<AgentRunEvent>;
+        list: (identity: {
+            tenantId: string;
+            runId: string;
+        }, after?: bigint) => Promise<AgentRunEvent[]>;
+    };
     readonly sessions: {
         create: (input: {
             tenantId: string;
@@ -716,7 +867,7 @@ export declare class MysqlRunStore implements DurableRunStore {
         markConsumed: (input: ConsumeInboxInput) => Promise<void>;
         list: (tenantId: string, runId: string) => Promise<RunInboxMessage[]>;
     };
-    private transaction;
+    transaction<T>(work: (store: DurableProductRunStore & MysqlRunStore) => Promise<T>): Promise<T>;
     private assertLease;
     private appendEvent;
 }
@@ -805,401 +956,36 @@ export declare class PiMysqlSessionRepo implements SessionRepo<PiMysqlSessionMet
 }
 export {};
 
-// file: store/runtime-kernel.d.ts
-import type { AgentContentBlock, AgentKernelName, AgentPlatformErrorData, AgentRunUsage, DurableInteractionUpdate, DurableToolLedgerUpdate, IdentityContext, ResolvedInteraction, RunLimits, ToolCall, ToolDefinition, ToolResult, WaitingReason } from '@aiop/control-contracts';
-export interface KernelDescriptor {
-    name: AgentKernelName;
-    version: string;
-    protocolVersion: string;
-}
-export type KernelMessage = {
-    role: 'user';
-    content: readonly AgentContentBlock[];
-} | {
-    role: 'assistant';
-    content: readonly AgentContentBlock[];
-    thinking?: string;
-    toolCalls?: readonly ToolCall[];
-} | {
-    role: 'tool';
-    results: readonly ToolResult[];
-};
-export interface ModelBinding {
-    provider: string;
-    model: string;
-    route?: string;
-    thinking?: string;
-    contextWindowTokens?: number;
-    rolloutMode?: 'read-only' | 'dry-run' | 'replay' | 'full';
-    comparisonRunId?: string;
-}
-export interface KernelRunInput {
-    runId: string;
-    attemptId: string;
-    turnNo: number;
-    sessionId?: string;
-    identity: IdentityContext;
-    messages: readonly KernelMessage[];
-    model: ModelBinding;
-    tools: readonly ToolDefinition[];
-    limits?: RunLimits;
-    continuation?: boolean;
-    interactionResolution?: ResolvedInteraction;
-    signal?: AbortSignal;
-}
-export interface KernelTurnResult {
-    turnNo: number;
-    stopReason?: string;
-    usage: AgentRunUsage;
-    messages: readonly KernelMessage[];
-    waitingReason?: WaitingReason;
-}
-export interface KernelExit extends KernelTurnResult {
-    outcome: 'continue' | 'waiting' | 'completed' | 'failed' | 'recovery_required';
-    error?: AgentPlatformErrorData;
-    ledgerUpdates?: readonly DurableToolLedgerUpdate[];
-    interactionUpdates?: readonly DurableInteractionUpdate[];
-}
-export type KernelEvent = {
-    type: 'text_delta';
-    text: string;
-} | {
-    type: 'thinking_delta';
-    text: string;
-} | {
-    type: 'context_compacted';
-    tokensBefore: number;
-    tokensAfter: number;
-    summarizedMessages: number;
-    version: number;
-} | {
-    type: 'tool_call';
-    call: ToolCall;
-} | {
-    type: 'tool_result';
-    result: ToolResult;
-} | {
-    type: 'usage';
-    usage: AgentRunUsage;
-} | {
-    type: 'turn_end';
-    result: KernelTurnResult;
-};
-export interface KernelControl {
-    emit(event: KernelEvent): Promise<void>;
-    shouldStopAfterTurn(turn: KernelTurnResult): Promise<boolean>;
-    guard(): Promise<void>;
-}
-export interface AgentKernel {
-    readonly descriptor: KernelDescriptor;
-    run(input: KernelRunInput, control: KernelControl): Promise<KernelExit>;
-}
-export interface ModelProvider {
-    stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent>;
-}
-export interface ModelConcurrencyInput {
-    identity: IdentityContext;
-    model: ModelBinding;
-    signal?: AbortSignal;
-}
-export interface ModelConcurrencyController {
-    acquire(input: ModelConcurrencyInput): Promise<() => void>;
-}
-export interface ModelStreamInput {
-    model: ModelBinding;
-    system: string;
-    messages: readonly KernelMessage[];
-    tools: readonly ToolDefinition[];
-    signal?: AbortSignal;
-}
-export type ModelStreamEvent = KernelEvent | {
-    type: 'stop';
-    reason: string;
-};
+// file: store/session-id.d.ts
+/** Keeps the product session id stable while isolating Pi's internal session tree by owner. */
+export declare function piSessionStorageId(actorId: string, sessionId: string): string;
 
-// file: store/runtime-memory.d.ts
-import { type AgentRunEvent } from '@aiop/control-contracts';
-import type { AttemptRecord, CommitTurnInput, InteractionRecord, LeaseRecord, RunIdentity, RunRecord, RuntimeStore, RuntimeTransaction, ToolLedgerRecord, TurnCommit, TurnSnapshot } from './runtime-spi.js';
-interface MemoryState {
-    runs: Map<string, RunRecord>;
-    attempts: Map<string, AttemptRecord>;
-    snapshots: Map<string, TurnSnapshot>;
-    commits: Map<string, TurnCommit>;
-    interactions: Map<string, InteractionRecord>;
-    ledger: Map<string, ToolLedgerRecord>;
-    events: Map<string, AgentRunEvent[]>;
-}
-export declare class MemoryRuntimeStore implements RuntimeStore {
-    private readonly transactionalView;
-    private state;
-    private transactionTail;
-    constructor(state?: MemoryState, transactionalView?: boolean);
-    readonly runs: {
-        create: (record: RunRecord) => Promise<void>;
-        get: (identity: RunIdentity) => Promise<RunRecord | undefined>;
-        update: (identity: RunIdentity, patch: Partial<RunRecord>) => Promise<void>;
-        acquireLease: (identity: RunIdentity, ownerId: string, now: Date, ttlMs: number) => Promise<LeaseRecord | undefined>;
-        renewLease: (identity: RunIdentity, ownerId: string, token: bigint, now: Date, ttlMs: number) => Promise<boolean>;
-        assertLease: (identity: RunIdentity, ownerId: string, token: bigint, now: Date) => Promise<void>;
-    };
-    readonly attempts: {
-        create: (record: AttemptRecord) => Promise<void>;
-        update: (identity: RunIdentity & {
-            attemptId: string;
-        }, patch: Partial<AttemptRecord>) => Promise<void>;
-        list: (identity: RunIdentity) => Promise<AttemptRecord[]>;
-    };
-    readonly turns: {
-        createSnapshot: (snapshot: TurnSnapshot) => Promise<void>;
-        getSnapshot: (identity: RunIdentity & {
-            attemptId: string;
-            turnNo: number;
-        }) => Promise<TurnSnapshot | undefined>;
-        getLastCommitted: (identity: RunIdentity) => Promise<TurnCommit | undefined>;
-        listCommitted: (identity: RunIdentity) => Promise<TurnCommit[]>;
-        commit: (input: CommitTurnInput) => Promise<TurnCommit>;
-    };
-    readonly interactions: {
-        put: (record: InteractionRecord) => Promise<void>;
-        get: (identity: RunIdentity & {
-            interactionId: string;
-        }) => Promise<InteractionRecord | undefined>;
-        getById: (tenantId: string, interactionId: string) => Promise<InteractionRecord | undefined>;
-        list: (identity: RunIdentity) => Promise<InteractionRecord[]>;
-        listByTenant: (tenantId: string) => Promise<InteractionRecord[]>;
-    };
-    readonly toolLedger: {
-        putIfAbsent: (record: ToolLedgerRecord) => Promise<boolean>;
-        get: (identity: RunIdentity & {
-            logicalCallId: string;
-        }) => Promise<ToolLedgerRecord | undefined>;
-        update: (record: ToolLedgerRecord) => Promise<void>;
-        claimPendingApproval: (input: import("./runtime-spi.js").ToolLedgerApprovalClaim) => Promise<boolean>;
-    };
-    readonly events: {
-        append: (event: Omit<AgentRunEvent, "sequence">) => Promise<AgentRunEvent>;
-        list: (identity: RunIdentity, after?: bigint) => Promise<AgentRunEvent[]>;
-    };
-    transaction<T>(work: (tx: RuntimeTransaction) => Promise<T>): Promise<T>;
-    private lastEventSequence;
-}
-export {};
+// file: store/session-stats.d.ts
+import type { SessionStats, SessionTreeEntry } from '@earendil-works/pi-agent-core';
+export declare function sessionStats(entries: readonly SessionTreeEntry[]): SessionStats;
 
-// file: store/runtime-mysql.d.ts
-import { type AgentRunEvent } from '@aiop/control-contracts';
-import type { AttemptRecord, CommitTurnInput, InteractionRecord, LeaseRecord, RunIdentity, RunRecord, RuntimeStore, RuntimeTransaction, ToolLedgerRecord, TurnCommit, TurnSnapshot } from './runtime-spi.js';
-import type { ColumnType, Generated, Kysely, Transaction } from 'kysely';
-type JsonColumn = ColumnType<unknown, string, string>;
-type NullableJsonColumn = ColumnType<unknown, string | null, string | null>;
-export interface RuntimeMysqlDatabase {
-    agent_runs: {
-        tenant_id: string;
-        run_id: string;
-        user_id: string;
-        session_id: string;
-        kernel: string;
-        kernel_version: string;
-        graph_name: string;
-        graph_version: string;
-        runtime_version: string;
-        status: string;
-        waiting_reason: string | null;
-        current_node: string | null;
-        step_count: number;
-        input_tokens: number;
-        output_tokens: number;
-        cache_read_tokens: number;
-        cache_creation_tokens: number;
-        error_message: string | null;
-        started_at: Date | null;
-        updated_at: Date;
-        completed_at: Date | null;
-        cancel_requested_at: Date | null;
-        lease_owner: string | null;
-        lease_token: number;
-        lease_expires_at: Date | null;
-        created_at: Date;
-    };
-    agent_run_attempts: {
-        tenant_id: string;
-        run_id: string;
-        attempt_id: string;
-        worker_id: string;
-        lease_token: number;
-        kernel: string;
-        kernel_version: string;
-        status: string;
-        error_code: string | null;
-        error_message: string | null;
-        started_at: Date;
-        completed_at: Date | null;
-    };
-    agent_turn_snapshots: {
-        tenant_id: string;
-        run_id: string;
-        attempt_id: string;
-        turn_no: number;
-        session_version: number;
-        parent_commit_id: string | null;
-        identity_json: JsonColumn;
-        model_binding_json: JsonColumn;
-        prompt_version: string;
-        skill_set_version: string | null;
-        tool_set_version: string;
-        policy_version: string;
-        limits_json: NullableJsonColumn;
-        messages_json: JsonColumn;
-        deadline_at: Date | null;
-        created_at: Date;
-    };
-    agent_turn_commits: {
-        tenant_id: string;
-        run_id: string;
-        attempt_id: string;
-        turn_no: number;
-        commit_id: string;
-        transcript_version: number;
-        stop_reason: string | null;
-        usage_json: JsonColumn;
-        messages_json: JsonColumn;
-        event_sequence_end: number;
-        committed_at: Date;
-    };
-    agent_interactions: {
-        id: string;
-        tenant_id: string;
-        user_id: string;
-        session_id: string;
-        run_id: string;
-        attempt_id: string | null;
-        turn_no: number | null;
-        kind: string;
-        tool_call_id: string | null;
-        payload: JsonColumn;
-        status: string;
-        resolution: ColumnType<unknown, string | null, string | null>;
-        resolved_by: string | null;
-        expires_at: Date;
-        created_at: Date;
-        resolved_at: Date | null;
-    };
-    agent_tool_executions: {
-        tenant_id: string;
-        run_id: string;
-        attempt_id: string | null;
-        turn_no: number | null;
-        session_id: string;
-        tool_call_id: string;
-        logical_call_id: string;
-        idempotency_key: string;
-        capability: string;
-        external_correlation_id: string | null;
-        result_digest: string | null;
-        approved_interaction_id: string | null;
-        tool_name: string;
-        args_digest: string;
-        status: string;
-        result: ColumnType<unknown, string | null, string | null>;
-        started_at: Date;
-        completed_at: Date | null;
-        updated_at: Date;
-    };
-    agent_run_events: {
-        id: Generated<number>;
-        tenant_id: string;
-        run_id: string;
-        sequence: number;
-        event_type: string;
-        attempt_id: string | null;
-        turn_no: number | null;
-        kernel: string | null;
-        kernel_version: string | null;
-        correlation_id: string | null;
-        node_name: string | null;
-        status: string | null;
-        detail: ColumnType<unknown, string | null, string | null>;
-        created_at: Date;
-    };
+// file: store/types.d.ts
+import type { AgentInputMessage, AgentKernelName, AgentRunEvent, AgentRunResult, AgentRunUsage, AttemptStatus, ClaimRunInput, ClaimedRun, CommitTurnInput, CompleteRunInput, CreateRunRecord, DurableInteractionUpdate, RenewLeaseInput, RequestCancellationInput, RunRecord, RunStore } from '@aiop/control-contracts';
+import type { SessionStats, SessionTreeEntry } from '@earendil-works/pi-agent-core';
+export interface StoredRun extends RunRecord {
+    cancelRequestedAt?: Date;
+    cancelReason?: string;
+    result?: AgentRunResult;
+    lastTurnNo: number;
+    checkpoint?: unknown;
+    appendClosedAt?: Date;
+    runtimeVersion?: string;
+    graphName?: string;
+    graphVersion?: string;
+    currentNode?: string;
+    stepCount?: number;
+    errorMessage?: string;
+    startedAt?: Date;
+    completedAt?: Date;
 }
-type RuntimeDb = Kysely<RuntimeMysqlDatabase> | Transaction<RuntimeMysqlDatabase>;
-export declare class MysqlRuntimeStore implements RuntimeStore {
-    private readonly db;
-    private readonly transactionalView;
-    constructor(db: RuntimeDb, transactionalView?: boolean);
-    readonly runs: {
-        create: (record: RunRecord) => Promise<void>;
-        get: (identity: RunIdentity) => Promise<RunRecord | undefined>;
-        update: (identity: RunIdentity, patch: Partial<RunRecord>) => Promise<void>;
-        acquireLease: (identity: RunIdentity, ownerId: string, now: Date, ttlMs: number) => Promise<LeaseRecord | undefined>;
-        renewLease: (identity: RunIdentity, ownerId: string, token: bigint, now: Date, ttlMs: number) => Promise<boolean>;
-        assertLease: (identity: RunIdentity, ownerId: string, token: bigint, now: Date) => Promise<void>;
-    };
-    readonly attempts: {
-        create: (record: AttemptRecord) => Promise<void>;
-        update: (identity: RunIdentity & {
-            attemptId: string;
-        }, patch: Partial<AttemptRecord>) => Promise<void>;
-        list: (identity: RunIdentity) => Promise<AttemptRecord[]>;
-    };
-    readonly turns: {
-        createSnapshot: (snapshot: TurnSnapshot) => Promise<void>;
-        getSnapshot: (identity: RunIdentity & {
-            attemptId: string;
-            turnNo: number;
-        }) => Promise<TurnSnapshot | undefined>;
-        getLastCommitted: (identity: RunIdentity) => Promise<TurnCommit | undefined>;
-        listCommitted: (identity: RunIdentity) => Promise<TurnCommit[]>;
-        commit: (input: CommitTurnInput) => Promise<TurnCommit>;
-    };
-    readonly interactions: {
-        put: (record: InteractionRecord) => Promise<void>;
-        get: (identity: RunIdentity & {
-            interactionId: string;
-        }) => Promise<InteractionRecord | undefined>;
-        list: (identity: RunIdentity) => Promise<InteractionRecord[]>;
-    };
-    readonly toolLedger: {
-        putIfAbsent: (record: ToolLedgerRecord) => Promise<boolean>;
-        get: (identity: RunIdentity & {
-            logicalCallId: string;
-        }) => Promise<ToolLedgerRecord | undefined>;
-        update: (record: ToolLedgerRecord) => Promise<void>;
-        claimPendingApproval: (input: import("./runtime-spi.js").ToolLedgerApprovalClaim) => Promise<boolean>;
-    };
-    readonly events: {
-        append: (event: Omit<AgentRunEvent, "sequence">) => Promise<AgentRunEvent>;
-        list: (identity: RunIdentity, after?: bigint) => Promise<AgentRunEvent[]>;
-    };
-    transaction<T>(work: (tx: RuntimeTransaction) => Promise<T>): Promise<T>;
-    private withTransaction;
-    private assertCommitLease;
-}
-export {};
-
-// file: store/runtime-spi.d.ts
-import type { AgentKernelName, AgentRunEvent, AgentRunStatus, AgentRunUsage, AttemptStatus, DurableInteractionUpdate, DurableToolLedgerUpdate, IdentityContext, RunLimits, WaitingReason } from '@aiop/control-contracts';
-import type { KernelMessage, ModelBinding } from './runtime-kernel.js';
-export interface RunIdentity {
+export interface ProductAttemptRecord {
     tenantId: string;
     runId: string;
-}
-export interface RunRecord extends RunIdentity {
-    actorId: string;
-    sessionId: string;
-    kernel: AgentKernelName;
-    kernelVersion: string;
-    runtimeVersion: string;
-    status: AgentRunStatus;
-    waitingReason?: WaitingReason;
-    leaseOwner?: string;
-    leaseToken: bigint;
-    leaseExpiresAt?: Date;
-    cancelRequestedAt?: Date;
-    usage: AgentRunUsage;
-    createdAt: Date;
-    updatedAt: Date;
-}
-export interface AttemptRecord extends RunIdentity {
     attemptId: string;
     workerId: string;
     leaseToken: bigint;
@@ -1211,23 +997,9 @@ export interface AttemptRecord extends RunIdentity {
     startedAt: Date;
     completedAt?: Date;
 }
-export interface TurnSnapshot extends RunIdentity {
-    attemptId: string;
-    turnNo: number;
-    sessionVersion: bigint;
-    parentCommitId?: string;
-    identity: IdentityContext;
-    modelBinding: ModelBinding;
-    promptVersion: string;
-    skillSetVersion?: string;
-    toolSetVersion: string;
-    policyVersion: string;
-    limits?: RunLimits;
-    deadlineAt?: Date;
-    messages: readonly KernelMessage[];
-    createdAt: Date;
-}
-export interface TurnCommit extends RunIdentity {
+export interface ProductTurnCommit {
+    tenantId: string;
+    runId: string;
     attemptId: string;
     turnNo: number;
     commitId: string;
@@ -1235,68 +1007,11 @@ export interface TurnCommit extends RunIdentity {
     stopReason?: string;
     usage: AgentRunUsage;
     eventSequenceEnd: bigint;
-    messages: readonly KernelMessage[];
     committedAt: Date;
 }
-export interface CommitTurnInput {
-    leaseOwner: string;
-    leaseToken: bigint;
-    snapshot: TurnSnapshot;
-    commit: Omit<TurnCommit, 'eventSequenceEnd'>;
-    events: readonly Omit<AgentRunEvent, 'sequence'>[];
-    runStatus: AgentRunStatus;
-    waitingReason?: WaitingReason;
-    ledgerUpdates?: readonly ToolLedgerRecord[];
-    interactionUpdates?: readonly InteractionRecord[];
-}
-export type InteractionRecord = DurableInteractionUpdate;
-export type ToolLedgerRecord = DurableToolLedgerUpdate;
-export interface LeaseRecord {
-    ownerId: string;
-    token: bigint;
-    expiresAt: Date;
-}
-export interface RunRepository {
-    create(record: RunRecord): Promise<void>;
-    get(identity: RunIdentity): Promise<RunRecord | undefined>;
-    update(identity: RunIdentity, patch: Partial<RunRecord>): Promise<void>;
-    acquireLease(identity: RunIdentity, ownerId: string, now: Date, ttlMs: number): Promise<LeaseRecord | undefined>;
-    renewLease(identity: RunIdentity, ownerId: string, token: bigint, now: Date, ttlMs: number): Promise<boolean>;
-    assertLease(identity: RunIdentity, ownerId: string, token: bigint, now: Date): Promise<void>;
-}
-export interface AttemptRepository {
-    create(record: AttemptRecord): Promise<void>;
-    update(identity: RunIdentity & {
-        attemptId: string;
-    }, patch: Partial<AttemptRecord>): Promise<void>;
-    list(identity: RunIdentity): Promise<AttemptRecord[]>;
-}
-export interface TurnRepository {
-    createSnapshot(snapshot: TurnSnapshot): Promise<void>;
-    getSnapshot(identity: RunIdentity & {
-        attemptId: string;
-        turnNo: number;
-    }): Promise<TurnSnapshot | undefined>;
-    getLastCommitted(identity: RunIdentity): Promise<TurnCommit | undefined>;
-    listCommitted(identity: RunIdentity): Promise<TurnCommit[]>;
-    commit(input: CommitTurnInput): Promise<TurnCommit>;
-}
-export interface InteractionRepository {
-    put(record: InteractionRecord): Promise<void>;
-    get(identity: RunIdentity & {
-        interactionId: string;
-    }): Promise<InteractionRecord | undefined>;
-    list(identity: RunIdentity): Promise<InteractionRecord[]>;
-}
-export interface ToolLedgerRepository {
-    putIfAbsent(record: ToolLedgerRecord): Promise<boolean>;
-    get(identity: RunIdentity & {
-        logicalCallId: string;
-    }): Promise<ToolLedgerRecord | undefined>;
-    update(record: ToolLedgerRecord): Promise<void>;
-    claimPendingApproval(input: ToolLedgerApprovalClaim): Promise<boolean>;
-}
-export interface ToolLedgerApprovalClaim extends RunIdentity {
+export interface ToolLedgerApprovalClaim {
+    tenantId: string;
+    runId: string;
     logicalCallId: string;
     attemptId: string;
     turnNo: number;
@@ -1304,43 +1019,70 @@ export interface ToolLedgerApprovalClaim extends RunIdentity {
     toolName: string;
     argsDigest: string;
     approvedInteractionId: string;
-    started: ToolLedgerRecord;
+    started: import('@aiop/control-contracts').DurableToolLedgerUpdate;
 }
-export interface RunEventRepository {
-    append(event: Omit<AgentRunEvent, 'sequence'>): Promise<AgentRunEvent>;
-    list(identity: RunIdentity, after?: bigint): Promise<AgentRunEvent[]>;
+export interface InteractionRepository {
+    put(record: DurableInteractionUpdate): Promise<void>;
+    get(identity: {
+        tenantId: string;
+        runId: string;
+        interactionId: string;
+    }): Promise<DurableInteractionUpdate | undefined>;
+    getById(tenantId: string, interactionId: string): Promise<DurableInteractionUpdate | undefined>;
+    list(identity: {
+        tenantId: string;
+        runId: string;
+    }): Promise<DurableInteractionUpdate[]>;
+    listByTenant(tenantId: string): Promise<DurableInteractionUpdate[]>;
 }
-export interface RuntimeTransaction {
-    runs: RunRepository;
-    attempts: AttemptRepository;
-    turns: TurnRepository;
+export interface ToolLedgerRepository {
+    putIfAbsent(record: import('@aiop/control-contracts').DurableToolLedgerUpdate): Promise<boolean>;
+    get(identity: {
+        tenantId: string;
+        runId: string;
+        logicalCallId: string;
+    }): Promise<import('@aiop/control-contracts').DurableToolLedgerUpdate | undefined>;
+    update(record: import('@aiop/control-contracts').DurableToolLedgerUpdate): Promise<void>;
+    claimPendingApproval(input: ToolLedgerApprovalClaim): Promise<boolean>;
+    list(identity: {
+        tenantId: string;
+        runId: string;
+    }): Promise<import('@aiop/control-contracts').DurableToolLedgerUpdate[]>;
+}
+export interface DurableProductRunStore extends DurableRunStore {
+    listRuns(tenantId: string): Promise<StoredRun[]>;
+    updateProductRun(identity: {
+        tenantId: string;
+        runId: string;
+    }, patch: Partial<StoredRun>): Promise<boolean>;
+    runs: {
+        assertLease(identity: {
+            tenantId: string;
+            runId: string;
+        }, ownerId: string, token: bigint, now: Date): Promise<void>;
+    };
+    attempts: {
+        list(identity: {
+            tenantId: string;
+            runId: string;
+        }): Promise<ProductAttemptRecord[]>;
+    };
+    turns: {
+        listCommitted(identity: {
+            tenantId: string;
+            runId: string;
+        }): Promise<ProductTurnCommit[]>;
+    };
     interactions: InteractionRepository;
     toolLedger: ToolLedgerRepository;
-    events: RunEventRepository;
-}
-/** Migration-era internal runtime SPI; it is not the control-contracts RunStore target port. */
-export interface RuntimeStore extends RuntimeTransaction {
-    transaction<T>(work: (tx: RuntimeTransaction) => Promise<T>): Promise<T>;
-}
-
-// file: store/session-id.d.ts
-/** Keeps the product session id stable while isolating Pi's internal session tree by owner. */
-export declare function piSessionStorageId(actorId: string, sessionId: string): string;
-
-// file: store/session-stats.d.ts
-import type { SessionStats, SessionTreeEntry } from '@earendil-works/pi-agent-core';
-export declare function sessionStats(entries: readonly SessionTreeEntry[]): SessionStats;
-
-// file: store/types.d.ts
-import type { AgentInputMessage, AgentRunEvent, AgentRunResult, ClaimRunInput, ClaimedRun, CommitTurnInput, CompleteRunInput, CreateRunRecord, DurableInteractionUpdate, RenewLeaseInput, RequestCancellationInput, RunRecord, RunStore } from '@aiop/control-contracts';
-import type { SessionStats, SessionTreeEntry } from '@earendil-works/pi-agent-core';
-export interface StoredRun extends RunRecord {
-    cancelRequestedAt?: Date;
-    cancelReason?: string;
-    result?: AgentRunResult;
-    lastTurnNo: number;
-    checkpoint?: unknown;
-    appendClosedAt?: Date;
+    events: {
+        append(event: Omit<AgentRunEvent, 'sequence'>): Promise<AgentRunEvent>;
+        list(identity: {
+            tenantId: string;
+            runId: string;
+        }, after?: bigint): Promise<AgentRunEvent[]>;
+    };
+    transaction<T>(work: (tx: DurableProductRunStore) => Promise<T>): Promise<T>;
 }
 export type DurableRunCreateResult = RunRecord & {
     sessionCreated: boolean;

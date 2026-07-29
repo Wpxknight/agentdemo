@@ -10,8 +10,10 @@ import { DurableRunManager, type DurableRunManagerOptions, type DurableRunSessio
 
 export interface MysqlDurablePiRuntimeOptions {
   db: Kysely<any>;
+  store?: MysqlRunStore;
   models: Models;
   model: Model<any>;
+  modelConcurrency?: PiAgentSessionFactoryOptions<any, any, any>['modelConcurrency'];
   systemPrompt?: string;
   resolveSystemPrompt?: PiAgentSessionFactoryOptions<any, any, any>['resolveSystemPrompt'];
   tools?: AgentHarnessTool<undefined>[];
@@ -26,10 +28,10 @@ export interface MysqlDurablePiRuntimeOptions {
 }
 
 export function createMysqlDurablePiRuntime(options: MysqlDurablePiRuntimeOptions) {
-  const store = new MysqlRunStore(options.db, false, options.now);
+  const store = options.store ?? new MysqlRunStore(options.db, false, options.now);
   const sessions = new PiMysqlSessionRepo(options.db, true);
   const factory = new PiAgentSessionFactory({
-    repository: sessions, models: options.models, model: options.model,
+    repository: sessions, models: options.models, model: options.model, modelConcurrency: options.modelConcurrency,
     systemPrompt: options.systemPrompt, resolveSystemPrompt: options.resolveSystemPrompt,
     tools: options.tools, resolveTools: options.resolveTools, resources: options.resources,
   });

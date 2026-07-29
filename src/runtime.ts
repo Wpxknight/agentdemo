@@ -16,7 +16,7 @@ import type {
   RunExecutionProfile,
   ToolRuntime,
 } from '@aiop/control-contracts';
-import type { RuntimeStore, ToolLedgerApprovalClaim, ToolLedgerRepository } from '@aiop/pi-runtime';
+import type { DurableProductRunStore, ToolLedgerApprovalClaim, ToolLedgerRepository } from '@aiop/pi-runtime';
 import {
   InMemoryCredentialStore, createModels, type Api, type Model as PiModel, type Provider as PiProvider,
 } from '@earendil-works/pi-ai';
@@ -27,6 +27,7 @@ import {
   createMemoryDurablePiRuntime,
   createMysqlDurablePiRuntime,
   GovernedToolOutcomeError,
+  FifoModelConcurrencyController,
   ResourceConcurrencyController,
   type PiSessionStore,
   type GovernedToolDefinition,
@@ -144,6 +145,8 @@ export interface SandboxSettingsUpdate {
 export interface Runtime {
   /** 唯一 Agent 执行入口；HTTP、CLI 与 Scheduler 共享同一个 durable Pi runtime。 */
   durableRunRuntime: DurableRunRuntime;
+  /** Root-lifecycle controller shared by durable and direct governed tool calls. */
+  toolConcurrency: ResourceConcurrencyController;
   /** Committed Pi session entries used to rebuild legacy product message projections. */
   piSessionStore?: PiSessionStore;
   model: ChatModel;
@@ -256,7 +259,7 @@ export function bridgeDurableGovernedTools(input: {
 }
 
 export function createFencedToolLedger(
-  store: RuntimeStore,
+  store: DurableProductRunStore,
   current: { tenantId: string; runId: string; attemptId: string },
 ): ToolLedgerRepository {
   const mutate = <T>(work: (ledger: ToolLedgerRepository) => Promise<T>): Promise<T> => store.transaction(async (tx) => {
@@ -267,6 +270,7 @@ export function createFencedToolLedger(
   });
   return {
     get: (identity) => store.toolLedger.get(identity),
+    list: (identity) => store.toolLedger.list(identity),
     putIfAbsent: (record) => mutate((ledger) => ledger.putIfAbsent(record)),
     update: (record) => mutate((ledger) => ledger.update(record)),
     claimPendingApproval: (input: ToolLedgerApprovalClaim) => mutate((ledger) => ledger.claimPendingApproval(input)),
@@ -286,6 +290,13 @@ export async function createDefaultDurableRunRuntime(
   return (await createDefaultDurableRunAssembly(
     store, modelConfig, systemPrompt, enabled, mcp, policy, tools, policyPreApproved,
   )).runtime;
+}
+
+export function resolveRuntimeSystemPrompt(
+  systemPrompt?: string,
+  execution?: RunExecutionProfile,
+): string {
+  return buildSystemPrompt(systemPrompt, execution?.unattended ?? false);
 }
 
 async function createDefaultDurableRunAssembly(
@@ -330,12 +341,23 @@ async function createDefaultDurableRunAssembly(
     getModels: () => [model],
   };
   models.setProvider(configuredProvider);
-  const runtimeStore = store.agentRuntimeStore();
+  const modelConcurrency = new FifoModelConcurrencyController({
+    maxConcurrentPerTenantModel: positiveIntegerEnv(
+      process.env.AIOP_PI_MAX_CONCURRENT_MODEL_CALLS,
+      'AIOP_PI_MAX_CONCURRENT_MODEL_CALLS',
+      4,
+    ),
+  });
+  const toolConcurrency = new ResourceConcurrencyController(positiveIntegerEnv(
+    process.env.AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE,
+    'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE',
+    1,
+  ));
+  const runtimeStore = store.durableRunStore();
   const assemblyOptions = {
-    models, model, systemPrompt,
-    resolveSystemPrompt: ({ execution }: { execution?: RunExecutionProfile }) => execution?.unattended
-      ? buildSystemPrompt(systemPrompt, true)
-      : systemPrompt,
+    models, model, modelConcurrency, systemPrompt,
+    resolveSystemPrompt: ({ execution }: { execution?: RunExecutionProfile }) =>
+      resolveRuntimeSystemPrompt(systemPrompt, execution),
     resolveTools: async ({ identity, sessionId, events, interactionResolution, execution }: {
       identity?: IdentityContext;
       sessionId?: string;
@@ -364,7 +386,7 @@ async function createDefaultDurableRunAssembly(
         ctx: toolContext,
       }, createFencedToolLedger(runtimeStore, {
         tenantId: identity.tenantId, runId: events.runId, attemptId: events.attemptId,
-      }), new ResourceConcurrencyController(), runtimeStore.interactions, false);
+      }), toolConcurrency, runtimeStore.interactions, false);
       const resolvedInteraction = interactionResolution
         ? await runtimeStore.interactions.get({
             tenantId: identity.tenantId, runId: events.runId,
@@ -392,9 +414,17 @@ async function createDefaultDurableRunAssembly(
       });
     },
   };
-  return store instanceof MysqlStore
-    ? createMysqlDurablePiRuntime({ db: store.database(), ...assemblyOptions })
-    : createMemoryDurablePiRuntime(assemblyOptions);
+  const assembly = store instanceof MysqlStore
+    ? createMysqlDurablePiRuntime({ db: store.database(), store: runtimeStore as import('@aiop/pi-runtime').MysqlRunStore, ...assemblyOptions })
+    : createMemoryDurablePiRuntime({ store: runtimeStore as import('@aiop/pi-runtime').MemoryRunStore, ...assemblyOptions });
+  return { ...assembly, modelConcurrency, toolConcurrency };
+}
+
+function positiveIntegerEnv(value: string | undefined, name: string, fallback: number): number {
+  if (value === undefined || value.trim() === '') return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) throw new Error(`${name} must be a positive integer: ${value}`);
+  return parsed;
 }
 
 export function resolveMcpBootstrapConfigs(
@@ -858,6 +888,11 @@ export async function buildRuntime(
     );
   const durableRunRuntime = options.durableRunRuntime ?? defaultDurableAssembly!.runtime;
   const piSessionStore = options.piSessionStore ?? defaultDurableAssembly?.store.sessions;
+  const toolConcurrency = defaultDurableAssembly?.toolConcurrency ?? new ResourceConcurrencyController(positiveIntegerEnv(
+    process.env.AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE,
+    'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE',
+    1,
+  ));
   const publicSandboxState = (): SandboxSettingsState => {
     const catalog = sandboxController.catalogInfo();
     return {
@@ -960,6 +995,7 @@ export async function buildRuntime(
 
   const runtime: Runtime = {
     durableRunRuntime,
+    toolConcurrency,
     piSessionStore,
     model,
     modelConfig,

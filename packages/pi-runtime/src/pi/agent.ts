@@ -15,6 +15,7 @@ import {
 } from '@earendil-works/pi-agent-core';
 import type { ImageContent, Model, Models } from '@earendil-works/pi-ai';
 import { EventCodec, type EventCodecOptions } from './event-codec.js';
+import { createConcurrentModels, type ModelConcurrencyController } from '../model/concurrency.js';
 import {
   adoptGovernedToolScope,
   scopeGovernedTools,
@@ -29,6 +30,7 @@ export interface PiAgentSessionFactoryOptions<
   repository: SessionRepo<TMetadata, TCreateOptions, TListOptions>;
   models: Models;
   model: Model<any>;
+  modelConcurrency?: ModelConcurrencyController;
   systemPrompt?: string;
   resolveSystemPrompt?(input: { execution?: RunExecutionProfile }): string | undefined;
   tools?: AgentHarnessTool<undefined>[];
@@ -79,7 +81,8 @@ export class PiAgentSessionFactory<
       input.identity, input.id, input.events, input.interactionResolution, input.execution,
     );
     return this.wrap(
-      await this.options.repository.create(createOptions), input.initialMessage, input.events, tools, input.execution,
+      await this.options.repository.create(createOptions), input.initialMessage, input.events, tools, input.identity,
+      input.execution,
     );
   }
 
@@ -88,7 +91,8 @@ export class PiAgentSessionFactory<
       input.identity, input.metadata.id, input.events, input.interactionResolution, input.execution,
     );
     return this.wrap(
-      await this.options.repository.open(input.metadata), input.initialMessage, input.events, tools, input.execution,
+      await this.options.repository.open(input.metadata), input.initialMessage, input.events, tools, input.identity,
+      input.execution,
     );
   }
 
@@ -103,12 +107,15 @@ export class PiAgentSessionFactory<
   private wrap(
     session: Session<TMetadata>, initialMessage: AgentInputMessage, events: EventCodecOptions,
     tools: AgentHarnessTool<undefined>[],
+    identity?: IdentityContext,
     execution?: RunExecutionProfile,
   ): PiAgentSession<TMetadata> {
     const governedTools = scopeGovernedTools(tools);
     const harness = new AgentHarness({
       session,
-      models: this.options.models,
+      models: identity && this.options.modelConcurrency
+        ? createConcurrentModels(this.options.models, this.options.modelConcurrency, identity)
+        : this.options.models,
       model: this.options.model,
       systemPrompt: this.options.resolveSystemPrompt?.({ execution }) ?? this.options.systemPrompt,
       tools: governedTools.tools,

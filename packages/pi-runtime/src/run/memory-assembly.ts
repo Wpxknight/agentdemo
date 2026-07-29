@@ -10,6 +10,8 @@ import { DurableRunManager, type DurableRunManagerOptions, type DurableRunSessio
 export interface MemoryDurablePiRuntimeOptions {
   models: Models;
   model: Model<any>;
+  store?: MemoryRunStore;
+  modelConcurrency?: PiAgentSessionFactoryOptions<any, any, any>['modelConcurrency'];
   systemPrompt?: string;
   resolveSystemPrompt?: PiAgentSessionFactoryOptions<any, any, any>['resolveSystemPrompt'];
   tools?: AgentHarnessTool<undefined>[];
@@ -24,10 +26,10 @@ export interface MemoryDurablePiRuntimeOptions {
 }
 
 export function createMemoryDurablePiRuntime(options: MemoryDurablePiRuntimeOptions) {
-  const store = new MemoryRunStore(options.now);
+  const store = options.store ?? new MemoryRunStore(options.now);
   const sessions = new InMemorySessionRepo();
   const factory = new PiAgentSessionFactory({
-    repository: sessions, models: options.models, model: options.model,
+    repository: sessions, models: options.models, model: options.model, modelConcurrency: options.modelConcurrency,
     systemPrompt: options.systemPrompt, resolveSystemPrompt: options.resolveSystemPrompt,
     tools: options.tools, resolveTools: options.resolveTools, resources: options.resources,
   });

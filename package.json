@@ -23,8 +23,8 @@
     "check:public-api": "tsx scripts/check-public-api.ts",
     "verify:package-tarballs": "tsx scripts/verify-package-tarballs.ts",
     "verify:packages": "npm run build:packages && npm run check:public-api && npm run verify:package-tarballs",
-    "test:agent-platform": "npm run build:packages && vitest run tests/pi-*.test.ts tests/agent-runtime.test.ts tests/*runtime-store*.test.ts tests/durable-runtime.test.ts && npm run verify:packages",
-    "test:runtime-refactor": "npm run build:packages && npm run typecheck && vitest run tests/contracts tests/pi-runtime tests/integration --exclude 'dist/**' && npm run verify:packages"
+    "test:agent-platform": "npm run test:runtime-refactor",
+    "test:runtime-refactor": "npm run build:packages && npm run typecheck && vitest run --exclude 'dist/**' && npm run verify:packages"
   },
   "dependencies": {
     "@alibaba-group/opensandbox": "^0.1.9",

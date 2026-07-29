@@ -6,7 +6,7 @@ import {
 import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import type {
   ClaimInboxInput, ConsumeInboxInput, DurableRunStore, EnqueueInboxInput, PiSessionRecord, RunInboxMessage,
-  SessionEntryRecord, StoredRun,
+  SessionEntryRecord, StoredRun, DurableProductRunStore, ProductAttemptRecord, ProductTurnCommit,
 } from './types.js';
 import { assertAttemptAllowed, assertTurnAllowed } from '../run/limits.js';
 import { sessionStats } from './session-stats.js';
@@ -15,27 +15,28 @@ import { piSessionStorageId } from './session-id.js';
 const clone = <T>(value: T): T => structuredClone(value);
 const key = (tenantId: string, id: string): string => `${tenantId}\0${id}`;
 
-export class MemoryRunStore implements DurableRunStore {
-  private readonly runs = new Map<string, StoredRun>();
-  private readonly attempts = new Map<string, {
-    tenantId: string; runId: string; attemptId: string; status: string; completedAt?: Date;
-  }>();
-  private readonly events = new Map<string, AgentRunEvent[]>();
+export class MemoryRunStore implements DurableProductRunStore {
+  private readonly runRecords = new Map<string, StoredRun>();
+  private readonly attemptsState = new Map<string, ProductAttemptRecord>();
+  private readonly commits = new Map<string, ProductTurnCommit[]>();
+  private readonly eventRecords = new Map<string, AgentRunEvent[]>();
   private readonly sessionRecords = new Map<string, PiSessionRecord>();
   private readonly sessionEntries = new Map<string, SessionEntryRecord[]>();
   private readonly inboxMessages = new Map<string, RunInboxMessage[]>();
-  private readonly interactions = new Map<string, DurableInteractionUpdate>();
-  private readonly toolLedger = new Map<string, DurableToolLedgerUpdate>();
+  private readonly interactionRecords = new Map<string, DurableInteractionUpdate>();
+  private readonly toolLedgerRecords = new Map<string, DurableToolLedgerUpdate>();
   private transactionTail: Promise<void> = Promise.resolve();
 
   constructor(private readonly now: () => Date = () => new Date()) {}
 
   async create(input: Parameters<DurableRunStore['create']>[0]): Promise<StoredRun & { sessionCreated: boolean }> {
     return this.lock(async () => {
-      const record: StoredRun = { ...clone(input.record), lastTurnNo: 0 };
+      const record: StoredRun = {
+        ...clone(input.record), lastTurnNo: 0, runtimeVersion: 'pi-durable-v1', graphName: '', graphVersion: '', stepCount: 0,
+      };
       const runKey = key(record.tenantId, record.runId);
-      if (this.runs.has(runKey)) throw conflict('Run already exists');
-      const active = [...this.runs.values()].some((run) => run.tenantId === record.tenantId
+      if (this.runRecords.has(runKey)) throw conflict('Run already exists');
+      const active = [...this.runRecords.values()].some((run) => run.tenantId === record.tenantId
         && run.actorId === record.actorId && run.sessionId === record.sessionId
         && ['queued', 'running', 'waiting'].includes(run.status));
       if (active) throw conflict('Session already has an active run');
@@ -46,19 +47,30 @@ export class MemoryRunStore implements DurableRunStore {
         tenantId: record.tenantId, sessionId, createdAt: record.createdAt, updatedAt: record.createdAt,
         currentLeafId: null, committedLeafId: null,
       });
-      this.runs.set(runKey, record);
+      this.runRecords.set(runKey, record);
       return clone({ ...record, sessionCreated });
     });
   }
 
   async get(identity: { tenantId: string; runId: string }): Promise<StoredRun | undefined> {
-    return clone(this.runs.get(key(identity.tenantId, identity.runId)));
+    return clone(this.runRecords.get(key(identity.tenantId, identity.runId)));
+  }
+
+  async listRuns(tenantId: string): Promise<StoredRun[]> {
+    return clone([...this.runRecords.values()].filter((run) => run.tenantId === tenantId));
+  }
+
+  async updateProductRun(identity: { tenantId: string; runId: string }, patch: Partial<StoredRun>): Promise<boolean> {
+    const run = this.runRecords.get(key(identity.tenantId, identity.runId));
+    if (!run) return false;
+    Object.assign(run, clone(patch), identity);
+    return true;
   }
 
   async claim(input: Parameters<DurableRunStore['claim']>[0]): Promise<Awaited<ReturnType<DurableRunStore['claim']>>> {
     return this.lock(async () => {
       const runKey = key(input.identity.tenantId, input.runId);
-      const run = this.runs.get(runKey);
+      const run = this.runRecords.get(runKey);
       if (!run) throw new RunNotFoundError();
       if (!canManageRun(input.identity, run.actorId)) return null;
       if (['succeeded', 'cancelled'].includes(run.status)) return null;
@@ -67,7 +79,7 @@ export class MemoryRunStore implements DurableRunStore {
         throw conflict('Waiting run requires an interaction resolution');
       }
       if (input.resolution) {
-        const interaction = this.interactions.get(key(runKey, input.resolution.interactionId));
+        const interaction = this.interactionRecords.get(key(runKey, input.resolution.interactionId));
         if (!interaction || interaction.status !== 'resolved' || !interaction.toolCallId
           || interaction.runId !== run.runId || interaction.tenantId !== run.tenantId
           || (run.status === 'waiting' && interaction.kind !== run.waitingReason)
@@ -75,12 +87,12 @@ export class MemoryRunStore implements DurableRunStore {
           throw conflict('Interaction resolution does not match the waiting run');
         }
       }
-      if (input.resume && [...this.runs.values()].some((candidate) => candidate.tenantId === run.tenantId
+      if (input.resume && [...this.runRecords.values()].some((candidate) => candidate.tenantId === run.tenantId
         && candidate.actorId === run.actorId && candidate.sessionId === run.sessionId && candidate.runId !== run.runId
         && ['queued', 'running', 'waiting'].includes(candidate.status))) {
         throw conflict('Session already has an active run');
       }
-      assertAttemptAllowed(run.limits, [...this.attempts.values()].filter((attempt) =>
+      assertAttemptAllowed(run.limits, [...this.attemptsState.values()].filter((attempt) =>
         attempt.tenantId === run.tenantId && attempt.runId === run.runId).length, input.now);
       assertTurnAllowed(run.limits, run.lastTurnNo + 1);
       if (run.leaseOwner && run.leaseExpiresAt && run.leaseExpiresAt > input.now && run.leaseOwner !== input.workerId) return null;
@@ -93,7 +105,11 @@ export class MemoryRunStore implements DurableRunStore {
         waitingReason: undefined,
         ...(input.resume && ['waiting', 'failed', 'recovery_required'].includes(run.status) ? { appendClosedAt: undefined } : {}),
       });
-      this.attempts.set(key(runKey, attemptId), { tenantId: run.tenantId, runId: run.runId, attemptId, status: 'running' });
+      this.attemptsState.set(key(runKey, attemptId), {
+        tenantId: run.tenantId, runId: run.runId, attemptId, workerId: input.workerId,
+        leaseToken: fencingToken, kernel: run.kernel, kernelVersion: run.kernelVersion,
+        status: 'running', startedAt: input.now,
+      });
       return { record: clone(run), attemptId, fencingToken };
     });
   }
@@ -122,9 +138,16 @@ export class MemoryRunStore implements DurableRunStore {
         session.committedLeafId = piLeafId;
         session.updatedAt = input.committedAt;
       }
-      const storedEvents = this.events.get(key(input.tenantId, input.runId)) ?? [];
+      const storedEvents = this.eventRecords.get(key(input.tenantId, input.runId)) ?? [];
       for (const event of input.events) storedEvents.push(clone({ ...event, sequence: BigInt(storedEvents.length + 1) }));
-      this.events.set(key(input.tenantId, input.runId), storedEvents);
+      this.eventRecords.set(key(input.tenantId, input.runId), storedEvents);
+      const commits = this.commits.get(key(input.tenantId, input.runId)) ?? [];
+      commits.push({
+        tenantId: input.tenantId, runId: input.runId, attemptId: input.attemptId, turnNo: input.turnNo,
+        commitId: randomUUID(), transcriptVersion: BigInt(commits.length + 1), usage: clone(input.usage),
+        eventSequenceEnd: BigInt(storedEvents.length), committedAt: input.committedAt,
+      });
+      this.commits.set(key(input.tenantId, input.runId), commits);
       run.lastTurnNo = input.turnNo;
       run.checkpoint = clone(input.checkpoint);
       run.status = input.status;
@@ -132,15 +155,15 @@ export class MemoryRunStore implements DurableRunStore {
       run.usage = clone(input.usage);
       run.updatedAt = input.committedAt;
       for (const interaction of input.interactionUpdates ?? []) {
-        this.interactions.set(key(key(interaction.tenantId, interaction.runId), interaction.id), clone(interaction));
+        this.interactionRecords.set(key(key(interaction.tenantId, interaction.runId), interaction.id), clone(interaction));
       }
       for (const ledger of input.ledgerUpdates ?? []) {
-        this.toolLedger.set(key(key(ledger.tenantId, ledger.runId), ledger.logicalCallId), clone(ledger));
+        this.toolLedgerRecords.set(key(key(ledger.tenantId, ledger.runId), ledger.logicalCallId), clone(ledger));
       }
       if (input.status === 'waiting') {
         run.leaseOwner = undefined;
         run.leaseExpiresAt = undefined;
-        const attempt = this.attempts.get(key(key(input.tenantId, input.runId), input.attemptId));
+        const attempt = this.attemptsState.get(key(key(input.tenantId, input.runId), input.attemptId));
         if (attempt) Object.assign(attempt, { status: 'succeeded', completedAt: input.committedAt });
       }
       if (input.status === 'recovery_required') {
@@ -148,7 +171,7 @@ export class MemoryRunStore implements DurableRunStore {
         run.appendClosedAt ??= input.committedAt;
         run.leaseOwner = undefined;
         run.leaseExpiresAt = undefined;
-        const attempt = this.attempts.get(key(key(input.tenantId, input.runId), input.attemptId));
+        const attempt = this.attemptsState.get(key(key(input.tenantId, input.runId), input.attemptId));
         if (attempt) Object.assign(attempt, { status: 'failed', completedAt: input.committedAt });
       }
     });
@@ -156,7 +179,7 @@ export class MemoryRunStore implements DurableRunStore {
 
   async requestCancellation(input: Parameters<DurableRunStore['requestCancellation']>[0]): Promise<void> {
     await this.lock(async () => {
-      const run = this.runs.get(key(input.identity.tenantId, input.runId));
+      const run = this.runRecords.get(key(input.identity.tenantId, input.runId));
       if (!run || !canManageRun(input.identity, run.actorId)) throw new RunNotFoundError();
       run.cancelRequestedAt ??= input.requestedAt;
       run.cancelReason ??= input.reason;
@@ -176,44 +199,44 @@ export class MemoryRunStore implements DurableRunStore {
       run.leaseOwner = undefined;
       run.leaseExpiresAt = undefined;
       run.updatedAt = input.completedAt;
-      const attempt = this.attempts.get(key(key(input.tenantId, input.runId), input.attemptId));
+      const attempt = this.attemptsState.get(key(key(input.tenantId, input.runId), input.attemptId));
       if (attempt) Object.assign(attempt, { status, completedAt: input.completedAt });
     });
   }
 
   async listEvents(identity: { tenantId: string; runId: string }, after = 0n): Promise<AgentRunEvent[]> {
-    return clone((this.events.get(key(identity.tenantId, identity.runId)) ?? []).filter((event) => event.sequence > after));
+    return clone((this.eventRecords.get(key(identity.tenantId, identity.runId)) ?? []).filter((event) => event.sequence > after));
   }
 
   async appendEvents(input: Parameters<DurableRunStore['appendEvents']>[0]): Promise<void> {
     await this.lock(async () => {
       this.requireLease(input, input.appendedAt);
-      const storedEvents = this.events.get(key(input.tenantId, input.runId)) ?? [];
+      const storedEvents = this.eventRecords.get(key(input.tenantId, input.runId)) ?? [];
       for (const event of input.events) storedEvents.push(clone({ ...event, sequence: BigInt(storedEvents.length + 1) }));
-      this.events.set(key(input.tenantId, input.runId), storedEvents);
+      this.eventRecords.set(key(input.tenantId, input.runId), storedEvents);
     });
   }
 
   async isCancellationRequested(identity: { tenantId: string; runId: string }): Promise<boolean> {
-    return Boolean(this.runs.get(key(identity.tenantId, identity.runId))?.cancelRequestedAt);
+    return Boolean(this.runRecords.get(key(identity.tenantId, identity.runId))?.cancelRequestedAt);
   }
 
   async countAttempts(identity: { tenantId: string; runId: string }): Promise<number> {
-    return [...this.attempts.values()].filter((attempt) => attempt.tenantId === identity.tenantId && attempt.runId === identity.runId).length;
+    return [...this.attemptsState.values()].filter((attempt) => attempt.tenantId === identity.tenantId && attempt.runId === identity.runId).length;
   }
 
   async getInteraction(
     identity: { tenantId: string; runId: string; interactionId: string },
   ): Promise<DurableInteractionUpdate | undefined> {
-    return clone(this.interactions.get(key(key(identity.tenantId, identity.runId), identity.interactionId)));
+    return clone(this.interactionRecords.get(key(key(identity.tenantId, identity.runId), identity.interactionId)));
   }
 
   async resolveInteraction(record: DurableInteractionUpdate): Promise<boolean> {
     return this.lock(async () => {
       const interactionKey = key(key(record.tenantId, record.runId), record.id);
-      const current = this.interactions.get(interactionKey);
+      const current = this.interactionRecords.get(interactionKey);
       if (!current || current.status !== 'pending' || record.status !== 'resolved') return false;
-      this.interactions.set(interactionKey, clone(record));
+      this.interactionRecords.set(interactionKey, clone(record));
       return true;
     });
   }
@@ -223,6 +246,120 @@ export class MemoryRunStore implements DurableRunStore {
       const run = this.requireLease(input, input.now);
       run.appendClosedAt ??= input.now;
       run.updatedAt = input.now;
+    });
+  }
+
+  readonly runs = {
+    assertLease: async (
+      identity: { tenantId: string; runId: string }, ownerId: string, token: bigint, now: Date,
+    ): Promise<void> => {
+      const run = this.runsState(identity);
+      if (!run || run.leaseOwner !== ownerId || run.leaseToken !== token
+        || !run.leaseExpiresAt || run.leaseExpiresAt <= now) throw new LeaseLostError();
+    },
+  };
+
+  readonly attempts = {
+    list: async (identity: { tenantId: string; runId: string }): Promise<ProductAttemptRecord[]> =>
+      clone([...this.attemptsState.values()]
+        .filter((attempt) => attempt.tenantId === identity.tenantId && attempt.runId === identity.runId)
+        .sort((left, right) => left.startedAt.getTime() - right.startedAt.getTime())),
+  };
+
+  readonly turns = {
+    listCommitted: async (identity: { tenantId: string; runId: string }): Promise<ProductTurnCommit[]> =>
+      clone(this.commits.get(key(identity.tenantId, identity.runId)) ?? []),
+  };
+
+  readonly interactions = {
+    put: async (record: DurableInteractionUpdate): Promise<void> => {
+      this.interactionsState().set(key(key(record.tenantId, record.runId), record.id), clone(record));
+    },
+    get: async (identity: { tenantId: string; runId: string; interactionId: string }) =>
+      clone(this.interactionsState().get(key(key(identity.tenantId, identity.runId), identity.interactionId))),
+    getById: async (tenantId: string, interactionId: string) => clone(
+      [...this.interactionsState().values()].find((record) => record.tenantId === tenantId && record.id === interactionId),
+    ),
+    list: async (identity: { tenantId: string; runId: string }) => clone(
+      [...this.interactionsState().values()]
+        .filter((record) => record.tenantId === identity.tenantId && record.runId === identity.runId)
+        .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime()),
+    ),
+    listByTenant: async (tenantId: string) => clone(
+      [...this.interactionsState().values()]
+        .filter((record) => record.tenantId === tenantId)
+        .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime()),
+    ),
+  };
+
+  readonly toolLedger = {
+    putIfAbsent: async (record: DurableToolLedgerUpdate): Promise<boolean> => {
+      const ledgerKey = key(key(record.tenantId, record.runId), record.logicalCallId);
+      if (this.toolLedgerState().has(ledgerKey)) return false;
+      this.toolLedgerState().set(ledgerKey, clone(record));
+      return true;
+    },
+    get: async (identity: { tenantId: string; runId: string; logicalCallId: string }) =>
+      clone(this.toolLedgerState().get(key(key(identity.tenantId, identity.runId), identity.logicalCallId))),
+    update: async (record: DurableToolLedgerUpdate): Promise<void> => {
+      const ledgerKey = key(key(record.tenantId, record.runId), record.logicalCallId);
+      if (!this.toolLedgerState().has(ledgerKey)) throw new Error('Tool ledger record not found');
+      this.toolLedgerState().set(ledgerKey, clone(record));
+    },
+    claimPendingApproval: async (input: import('./types.js').ToolLedgerApprovalClaim): Promise<boolean> => {
+      const ledgerKey = key(key(input.tenantId, input.runId), input.logicalCallId);
+      const current = this.toolLedgerState().get(ledgerKey);
+      if (!current || current.status !== 'pending_approval' || current.attemptId !== input.attemptId
+        || current.turnNo !== input.turnNo || current.toolCallId !== input.toolCallId
+        || current.toolName !== input.toolName || current.argsDigest !== input.argsDigest
+        || current.approvedInteractionId !== input.approvedInteractionId) return false;
+      this.toolLedgerState().set(ledgerKey, clone(input.started));
+      return true;
+    },
+    list: async (identity: { tenantId: string; runId: string }) => clone(
+      [...this.toolLedgerRecords.values()]
+        .filter((record) => record.tenantId === identity.tenantId && record.runId === identity.runId)
+        .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime()),
+    ),
+  };
+
+  readonly events = {
+    append: async (event: Omit<AgentRunEvent, 'sequence'>): Promise<AgentRunEvent> => {
+      const events = this.eventsState(event);
+      const stored = clone({ ...event, sequence: BigInt(events.length + 1) });
+      events.push(stored);
+      return clone(stored);
+    },
+    list: (identity: { tenantId: string; runId: string }, after = 0n) => this.listEvents(identity, after),
+  };
+
+  async transaction<T>(work: (tx: DurableProductRunStore) => Promise<T>): Promise<T> {
+    return this.lock(async () => {
+      const snapshot = clone({
+        runRecords: this.runRecords,
+        attemptsState: this.attemptsState,
+        commits: this.commits,
+        eventRecords: this.eventRecords,
+        sessionRecords: this.sessionRecords,
+        sessionEntries: this.sessionEntries,
+        inboxMessages: this.inboxMessages,
+        interactionRecords: this.interactionRecords,
+        toolLedgerRecords: this.toolLedgerRecords,
+      });
+      try {
+        return await work(this);
+      } catch (error) {
+        restoreMap(this.runRecords, snapshot.runRecords);
+        restoreMap(this.attemptsState, snapshot.attemptsState);
+        restoreMap(this.commits, snapshot.commits);
+        restoreMap(this.eventRecords, snapshot.eventRecords);
+        restoreMap(this.sessionRecords, snapshot.sessionRecords);
+        restoreMap(this.sessionEntries, snapshot.sessionEntries);
+        restoreMap(this.inboxMessages, snapshot.inboxMessages);
+        restoreMap(this.interactionRecords, snapshot.interactionRecords);
+        restoreMap(this.toolLedgerRecords, snapshot.toolLedgerRecords);
+        throw error;
+      }
     });
   }
 
@@ -277,7 +414,7 @@ export class MemoryRunStore implements DurableRunStore {
 
   readonly inbox = {
     enqueue: async (input: EnqueueInboxInput): Promise<RunInboxMessage> => this.lock(async () => {
-      const run = this.runs.get(key(input.tenantId, input.runId));
+      const run = this.runRecords.get(key(input.tenantId, input.runId));
       if (!run || !canManageRun(input.identity, run.actorId)) throw new RunNotFoundError();
       if (run.appendClosedAt || !['queued', 'running', 'waiting', 'recovery_required'].includes(run.status)) {
         throw conflict('Run no longer accepts appended messages');
@@ -294,7 +431,7 @@ export class MemoryRunStore implements DurableRunStore {
       return clone(message);
     }),
     claimNext: async (input: ClaimInboxInput): Promise<RunInboxMessage | undefined> => this.lock(async () => {
-      const run = this.runs.get(key(input.tenantId, input.runId));
+      const run = this.runRecords.get(key(input.tenantId, input.runId));
       if (!run || run.leaseOwner !== input.workerId || run.leaseToken !== input.fencingToken
         || !run.leaseExpiresAt || run.leaseExpiresAt <= input.now) throw new LeaseLostError();
       const message = (this.inboxMessages.get(key(input.tenantId, input.runId)) ?? [])
@@ -319,12 +456,32 @@ export class MemoryRunStore implements DurableRunStore {
   };
 
   private requireLease(input: { tenantId: string; runId: string; fencingToken: bigint; workerId?: string }, now: Date, checkExpiry = true): StoredRun {
-    const run = this.runs.get(key(input.tenantId, input.runId));
+    const run = this.runRecords.get(key(input.tenantId, input.runId));
     const ownerMismatch = input.workerId !== undefined && run?.leaseOwner !== input.workerId;
     if (!run || ownerMismatch || run.leaseToken !== input.fencingToken || (checkExpiry && (!run.leaseExpiresAt || run.leaseExpiresAt <= now))) {
       throw new LeaseLostError();
     }
     return run;
+  }
+
+  private runsState(identity: { tenantId: string; runId: string }): StoredRun | undefined {
+    return this.runRecords.get(key(identity.tenantId, identity.runId));
+  }
+
+  private interactionsState(): Map<string, DurableInteractionUpdate> {
+    return this.interactionRecords as unknown as Map<string, DurableInteractionUpdate>;
+  }
+
+  private toolLedgerState(): Map<string, DurableToolLedgerUpdate> {
+    return this.toolLedgerRecords as unknown as Map<string, DurableToolLedgerUpdate>;
+  }
+
+  private eventsState(identity: { tenantId: string; runId: string }): AgentRunEvent[] {
+    const eventKey = key(identity.tenantId, identity.runId);
+    const events = this.eventRecords as unknown as Map<string, AgentRunEvent[]>;
+    const stored = events.get(eventKey) ?? [];
+    events.set(eventKey, stored);
+    return stored;
   }
 
   private hasSessionEntry(tenantId: string, sessionId: string, entryId: string): boolean {
@@ -363,4 +520,9 @@ function conflict(message: string): AgentPlatformError {
 
 function canManageRun(identity: { actorId: string; roles: readonly string[] }, actorId: string): boolean {
   return identity.actorId === actorId || identity.roles.includes('tenant_admin') || identity.roles.includes('platform_admin');
+}
+
+function restoreMap<K, V>(target: Map<K, V>, snapshot: Map<K, V>): void {
+  target.clear();
+  for (const [key, value] of snapshot) target.set(key, value);
 }

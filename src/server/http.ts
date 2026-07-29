@@ -768,7 +768,8 @@ async function dispatchDirectTool(
       governedTools: [definition],
       policy: rt.policy,
       ctx: toolCtx,
-    }, rt.store.agentRuntimeStore().toolLedger, new ResourceConcurrencyController(), undefined, true).execute({
+    }, rt.store.durableRunStore().toolLedger,
+    rt.toolConcurrency ?? new ResourceConcurrencyController(), undefined, true).execute({
       id: call.id,
       logicalCallId,
       name,

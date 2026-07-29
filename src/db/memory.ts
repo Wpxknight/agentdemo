@@ -35,9 +35,11 @@ import type {
 } from './store.js';
 import { DEFAULT_SESSION_TITLE } from './store.js';
 import { nextRunAt } from '../scheduler/cron.js';
-import { MemoryRuntimeStore } from '@aiop/pi-runtime';
-import type { InteractionRecord as RuntimeInteractionRecord } from '@aiop/pi-runtime';
-import type { JsonValue } from '@aiop/control-contracts';
+import { MemoryRunStore } from '@aiop/pi-runtime';
+import type { StoredRun } from '@aiop/pi-runtime';
+import type {
+  DurableInteractionUpdate as RuntimeInteractionRecord, DurableToolLedgerUpdate, JsonValue,
+} from '@aiop/control-contracts';
 
 interface MsgRow {
   tenantId: string;
@@ -65,10 +67,10 @@ function summarize(text: string | undefined, max = 48): string {
 
 /** 内存 Store：未配置 MySQL 时的回落实现，亦用于测试。租户隔离同样强制生效。 */
 export class MemoryStore implements Store {
-  private durableRuntimeStore = new MemoryRuntimeStore();
+  private durableStore = new MemoryRunStore();
 
-  agentRuntimeStore() {
-    return this.durableRuntimeStore;
+  durableRunStore() {
+    return this.durableStore;
   }
   private messages: MsgRow[] = [];
   private sessions = new Map<string, SessionRow>();
@@ -249,22 +251,22 @@ export class MemoryStore implements Store {
   }
 
   async putInteraction(record: InteractionRecord): Promise<void> {
-    await this.durableRuntimeStore.interactions.put(toRuntimeInteraction(record));
+    await this.durableStore.interactions.put(toRuntimeInteraction(record));
   }
 
   async getInteraction(tenantId: string, id: string): Promise<InteractionRecord | undefined> {
-    const record = await this.durableRuntimeStore.interactions.getById(tenantId, id);
+    const record = await this.durableStore.interactions.getById(tenantId, id);
     return record ? fromRuntimeInteraction(record) : undefined;
   }
 
   async listPendingInteractions(ctx: RequestContext): Promise<InteractionRecord[]> {
-    return (await this.durableRuntimeStore.interactions.listByTenant(ctx.tenantId))
+    return (await this.durableStore.interactions.listByTenant(ctx.tenantId))
       .filter((record) => record.tenantId === ctx.tenantId && record.status === 'pending')
       .map(fromRuntimeInteraction);
   }
 
   async resolveInteraction(record: InteractionRecord): Promise<boolean> {
-    return this.durableRuntimeStore.transaction(async (tx) => {
+    return this.durableStore.transaction(async (tx) => {
       const current = await tx.interactions.get({
         tenantId: record.tenantId, runId: record.runId, interactionId: record.id,
       });
@@ -314,13 +316,17 @@ export class MemoryStore implements Store {
 
   async getAgentRun(ctx: RequestContext, runId: string): Promise<AgentRunRecord | undefined> {
     const record = this.agentRunBindings.get(`${ctx.tenantId}/${runId}`);
-    return record && canReadAgentRun(ctx, record) ? structuredClone(record) : undefined;
+    if (record && canReadAgentRun(ctx, record)) return structuredClone(record);
+    const durable = await this.durableStore.get({ tenantId: ctx.tenantId, runId });
+    const projected = durable ? fromStoredRun(durable) : undefined;
+    return projected && canReadAgentRun(ctx, projected) ? projected : undefined;
   }
 
   async listAgentRuns(ctx: RequestContext, filter: AgentRunFilter = {}): Promise<AgentRunRecord[]> {
     const limit = Math.max(0, filter.limit ?? 50);
     const offset = Math.max(0, filter.offset ?? 0);
-    return [...this.agentRunBindings.values()]
+    const records = await this.allAgentRuns(ctx.tenantId);
+    return records
       .filter((record) => canReadAgentRun(ctx, record))
       .filter((record) => !filter.status || record.status === filter.status)
       .filter((record) => !filter.sessionId || record.sessionId === filter.sessionId)
@@ -330,7 +336,7 @@ export class MemoryStore implements Store {
   }
 
   async countAgentRuns(ctx: RequestContext, filter: AgentRunFilter = {}): Promise<number> {
-    return [...this.agentRunBindings.values()]
+    return (await this.allAgentRuns(ctx.tenantId))
       .filter((record) => canReadAgentRun(ctx, record))
       .filter((record) => !filter.status || record.status === filter.status)
       .filter((record) => !filter.sessionId || record.sessionId === filter.sessionId)
@@ -340,10 +346,11 @@ export class MemoryStore implements Store {
   async updateAgentRun(tenantId: string, runId: string, patch: AgentRunPatch): Promise<boolean> {
     const key = `${tenantId}/${runId}`;
     const current = this.agentRunBindings.get(key);
-    if (!current) return false;
+    if (!current) return this.durableStore.updateProductRun({ tenantId, runId }, productPatch(patch));
     const next: AgentRunRecord = {
       ...current,
       ...(patch.status ? { status: patch.status } : {}),
+      ...(patch.waitingReason !== undefined ? { waitingReason: patch.waitingReason ?? undefined } : {}),
       ...(patch.currentNode !== undefined ? { currentNode: patch.currentNode ?? undefined } : {}),
       ...(patch.stepCount !== undefined ? { stepCount: patch.stepCount } : {}),
       ...(patch.usage ? { usage: structuredClone(patch.usage) } : {}),
@@ -370,7 +377,7 @@ export class MemoryStore implements Store {
 
   async listAgentRunEvents(ctx: RequestContext, runId: string): Promise<AgentRunEvent[]> {
     if (!await this.getAgentRun(ctx, runId)) return [];
-    const durable = await this.durableRuntimeStore.events.list({ tenantId: ctx.tenantId, runId });
+    const durable = await this.durableStore.events.list({ tenantId: ctx.tenantId, runId });
     if (durable.length) return durable.map((event) => ({
       tenantId: event.tenantId,
       runId: event.runId,
@@ -392,7 +399,7 @@ export class MemoryStore implements Store {
 
   async listAgentRunAttempts(ctx: RequestContext, runId: string) {
     if (!await this.getAgentRun(ctx, runId)) return [];
-    return (await this.durableRuntimeStore.attempts.list({ tenantId: ctx.tenantId, runId })).map((attempt) => ({
+    return (await this.durableStore.attempts.list({ tenantId: ctx.tenantId, runId })).map((attempt) => ({
       attemptId: attempt.attemptId,
       kernel: attempt.kernel,
       kernelVersion: attempt.kernelVersion,
@@ -405,7 +412,7 @@ export class MemoryStore implements Store {
 
   async listAgentRunTurns(ctx: RequestContext, runId: string) {
     if (!await this.getAgentRun(ctx, runId)) return [];
-    return (await this.durableRuntimeStore.turns.listCommitted({ tenantId: ctx.tenantId, runId })).map((turn) => ({
+    return (await this.durableStore.turns.listCommitted({ tenantId: ctx.tenantId, runId })).map((turn) => ({
       attemptId: turn.attemptId,
       turnNo: turn.turnNo,
       commitId: turn.commitId,
@@ -419,16 +426,21 @@ export class MemoryStore implements Store {
 
   async listAgentRunInteractions(ctx: RequestContext, runId: string): Promise<InteractionRecord[]> {
     if (!await this.getAgentRun(ctx, runId)) return [];
-    return (await this.durableRuntimeStore.interactions.list({ tenantId: ctx.tenantId, runId }))
+    return (await this.durableStore.interactions.list({ tenantId: ctx.tenantId, runId }))
       .map(fromRuntimeInteraction);
   }
 
   async listAgentRunToolExecutions(ctx: RequestContext, runId: string): Promise<ToolExecutionRecord[]> {
     if (!await this.getAgentRun(ctx, runId)) return [];
-    return [...this.toolExecutions.values()]
+    const compatibility = [...this.toolExecutions.values()]
       .filter((record) => record.tenantId === ctx.tenantId && record.runId === runId)
       .sort((a, b) => a.startedAt.getTime() - b.startedAt.getTime())
       .map(cloneToolExecution);
+    const durable = (await this.durableStore.toolLedger.list({ tenantId: ctx.tenantId, runId }))
+      .map(fromDurableToolLedger);
+    const durableCalls = new Set(durable.map((record) => record.toolCallId));
+    return [...compatibility.filter((record) => !durableCalls.has(record.toolCallId)), ...durable]
+      .sort((left, right) => left.startedAt.getTime() - right.startedAt.getTime());
   }
 
   async acquireAgentRunLease(
@@ -486,7 +498,15 @@ export class MemoryStore implements Store {
   }
 
   async isAgentRunCancellationRequested(tenantId: string, runId: string): Promise<boolean> {
-    return Boolean(this.agentRunBindings.get(`${tenantId}/${runId}`)?.cancelRequestedAt);
+    return Boolean(this.agentRunBindings.get(`${tenantId}/${runId}`)?.cancelRequestedAt)
+      || this.durableStore.isCancellationRequested({ tenantId, runId });
+  }
+
+  private async allAgentRuns(tenantId: string): Promise<AgentRunRecord[]> {
+    const durable = (await this.durableStore.listRuns(tenantId)).map(fromStoredRun);
+    const compatibilityIds = new Set(this.agentRunBindings.keys());
+    return [...this.agentRunBindings.values(), ...durable.filter((record) =>
+      !compatibilityIds.has(`${record.tenantId}/${record.runId}`))];
   }
 
   async record(event: AuditEvent): Promise<void> {
@@ -760,7 +780,7 @@ export class MemoryStore implements Store {
     this.schedulerSettings.clear();
     this.sandboxSettings.clear();
     this.mcpServers.clear();
-    this.durableRuntimeStore = new MemoryRuntimeStore();
+    this.durableStore = new MemoryRunStore();
     this.toolExecutions.clear();
     this.agentRunBindings.clear();
     this.agentRunEvents = [];
@@ -800,4 +820,50 @@ function toolExecutionKey(tenantId: string, runId: string, toolCallId: string): 
 
 function cloneToolExecution(record: ToolExecutionRecord): ToolExecutionRecord {
   return structuredClone(record);
+}
+
+function fromStoredRun(run: StoredRun): AgentRunRecord {
+  return {
+    tenantId: run.tenantId, runId: run.runId, userId: run.actorId, sessionId: run.sessionId,
+    kernel: 'pi', kernelVersion: run.kernelVersion, runtimeVersion: run.runtimeVersion,
+    graphName: run.graphName ?? '', graphVersion: run.graphVersion ?? '', status: run.status,
+    waitingReason: run.waitingReason, currentNode: run.currentNode, stepCount: run.stepCount ?? run.lastTurnNo,
+    usage: structuredClone(run.usage), errorMessage: run.errorMessage, startedAt: run.startedAt,
+    updatedAt: new Date(run.updatedAt), completedAt: run.completedAt,
+    cancelRequestedAt: run.cancelRequestedAt, leaseOwner: run.leaseOwner,
+    leaseToken: Number(run.leaseToken), leaseExpiresAt: run.leaseExpiresAt, createdAt: new Date(run.createdAt),
+  };
+}
+
+function productPatch(patch: AgentRunPatch): Partial<StoredRun> {
+  return {
+    ...(patch.status ? { status: patch.status } : {}),
+    ...(patch.waitingReason !== undefined ? { waitingReason: patch.waitingReason ?? undefined } : {}),
+    ...(patch.currentNode !== undefined ? { currentNode: patch.currentNode ?? undefined } : {}),
+    ...(patch.stepCount !== undefined ? { stepCount: patch.stepCount } : {}),
+    ...(patch.usage ? { usage: structuredClone(patch.usage) } : {}),
+    ...(patch.errorMessage !== undefined ? { errorMessage: patch.errorMessage ?? undefined } : {}),
+    ...(patch.startedAt !== undefined ? { startedAt: patch.startedAt ?? undefined } : {}),
+    updatedAt: patch.updatedAt ?? new Date(),
+    ...(patch.completedAt !== undefined ? { completedAt: patch.completedAt ?? undefined } : {}),
+    ...(patch.cancelRequestedAt !== undefined ? { cancelRequestedAt: patch.cancelRequestedAt ?? undefined } : {}),
+    ...(patch.clearLease ? { leaseOwner: undefined, leaseExpiresAt: undefined } : {}),
+  };
+}
+
+function fromDurableToolLedger(record: DurableToolLedgerUpdate): ToolExecutionRecord {
+  return {
+    tenantId: record.tenantId, runId: record.runId, sessionId: '', attemptId: record.attemptId,
+    turnNo: record.turnNo, toolCallId: record.toolCallId, logicalCallId: record.logicalCallId,
+    idempotencyKey: record.idempotencyKey, capability: record.capability,
+    externalCorrelationId: record.externalCorrelationId, resultDigest: record.resultDigest,
+    approvedInteractionId: record.approvedInteractionId, toolName: record.toolName,
+    argsDigest: record.argsDigest, status: record.status === 'pending_approval' ? 'started' : record.status,
+    result: record.result ? {
+      id: record.result.callId, content: record.result.content, isError: record.result.isError,
+    } : undefined,
+    startedAt: record.createdAt,
+    completedAt: record.status === 'completed' ? record.updatedAt : undefined,
+    updatedAt: record.updatedAt,
+  };
 }

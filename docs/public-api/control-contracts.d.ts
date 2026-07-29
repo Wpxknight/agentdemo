@@ -316,8 +316,8 @@ export interface CompleteRunInput {
     completedAt: Date;
 }
 /**
- * Target persistence port for durable run orchestration and fencing.
- * The migration-era runtime-core RuntimeStore is an internal SPI with different snapshot semantics.
+ * Minimal persistence port for durable run orchestration and fencing.
+ * Product queries and repositories belong to runtime-internal extensions, not this control contract.
  */
 export interface RunStore {
     create(input: CreateRunRecord): Promise<RunRecord>;

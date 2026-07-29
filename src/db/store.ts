@@ -3,7 +3,7 @@ import type { AuditEvent, AuditSink } from '../audit/sink.js';
 import type { AuthProviderKind, Role, RequestContext, Tenant, User, UserStatus } from '../auth/types.js';
 import type { McpServerConfig } from '@aiop/mcp-runtime';
 import type { ToolResult } from '../llm/types.js';
-import type { RuntimeStore } from '@aiop/pi-runtime';
+import type { DurableProductRunStore } from '@aiop/pi-runtime';
 
 export interface LlmSettings {
   id: string;
@@ -329,7 +329,7 @@ export interface UserCredentialRecord {
  * 业务读写均需 RequestContext 并按 tenantId 强制过滤，实现租户隔离。
  */
 export interface Store extends AuditSink {
-  agentRuntimeStore(): RuntimeStore;
+  durableRunStore(): DurableProductRunStore;
   // —— 会话消息 ——
   createSession(ctx: RequestContext, input: SessionInput): Promise<SessionSummary>;
   touchSession(ctx: RequestContext, sessionId: string, input?: SessionTouchInput): Promise<void>;

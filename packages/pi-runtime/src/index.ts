@@ -8,6 +8,7 @@ export * from './pi/models.js';
 export * from './pi/session.js';
 export * from './pi/skills.js';
 export * from './pi/tool-bridge.js';
+export * from './model/concurrency.js';
 export * from './tools/adapter.js';
 export * from './tools/approval.js';
 export * from './tools/audit.js';
@@ -22,20 +23,6 @@ export * from './store/mysql.js';
 export * from './store/pi-session-mysql.js';
 export * from './store/session-stats.js';
 export * from './store/session-id.js';
-export type {
-  InteractionRepository,
-  InteractionRecord,
-  RuntimeStore,
-  RuntimeTransaction,
-  ToolLedgerApprovalClaim,
-  ToolLedgerRepository,
-} from './store/runtime-spi.js';
-export type {
-  RunRecord as RuntimeRunRecord,
-  TurnSnapshot as RuntimeTurnSnapshot,
-} from './store/runtime-spi.js';
-export * from './store/runtime-memory.js';
-export * from './store/runtime-mysql.js';
 export * from './run/attempt.js';
 export * from './run/cancellation.js';
 export * from './run/event-stream.js';
