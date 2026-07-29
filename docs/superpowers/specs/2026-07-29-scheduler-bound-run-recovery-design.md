@@ -18,17 +18,17 @@ Prevent a scheduled fire that is already bound to a durable Run from returning t
 
 `bindRun` runs under the original claimed token. It records `run_id`, inserts `task_agent_runs`, changes the fire to `bound`, clears the scheduler owner, and preserves the existing scheduler lease deadline as the observation window.
 
-The original worker may complete the fire using the preserved binding token. Terminal reconciliation also uses that token. `completeFire` accepts a correctly fenced `bound` or `recovering` fire and is idempotent when the same Run was already completed.
+The original worker may complete the fire using the preserved binding token. Terminal reconciliation also uses that token. A successful recovery claim replaces the binding token; returning an expired recovery to `bound` preserves that replacement token for the next fenced transition. `completeFire` accepts a correctly fenced `bound` or `recovering` fire and is idempotent when the same Run was already completed.
 
 ## Bound reconciliation
 
-Each tick inspects bound fires whose observation window has expired. Inspection reads the authoritative durable Run record and returns one of three explicit outcomes:
+Each tick inspects a bounded batch of bound fires whose observation window and `retry_at` have expired. Inspection reads the authoritative durable Run record and returns one of three explicit outcomes:
 
 - `active`: a queued/running Run still has an effective durable lease. Keep the fire bound. Do not dispatch, claim recovery, or increment attempts.
-- `terminal`: the durable record contains a final status and usage. Complete the fire with the existing binding token and write compatibility `task_runs`.
+- `terminal`: the durable record contains `succeeded`, `failed`, `cancelled`, or `recovery_required`, or it is `waiting`. For Scheduler compatibility, `waiting` ends this fire as an error while preserving `durableStatus: "waiting"` in detail; it is not automatically resumed without an explicit interaction resolution. Complete the fire with the existing binding token and write compatibility `task_runs`.
 - `recoverable`: the queued/running Run has no effective durable lease. Compare-and-swap the fire from `bound` to `recovering`, replace its scheduler token and lease, then call the supported `DurableRunRuntime.resume()` API for the same Run ID. Await the returned handle result before completing.
 
-If the durable resume loses a lease race or fails, release `recovering` back to `bound` with a bounded retry window. Never send it to `pending` and never call `run()` for a bound fire.
+If the durable resume loses a lease race or fails, release `recovering` back to `bound` with a bounded `retry_at` window and the current recovery token. Never send it to `pending`, never call `run()` for a bound fire, and never poll in an unbounded busy loop.
 
 The bind-time scheduler lease is the queued startup observation window. No additional timing constant is introduced.
 
@@ -44,4 +44,4 @@ No recovery decision depends on exception text.
 2. MySQL source/production contract: bind changes state/token/owner/lease correctly; ordinary recovery excludes bound; recovery claim uses state, Run ID, token, and expired lease compare-and-swap.
 3. Real durable test with `DurableRunManager` and `MemoryRunStore`: valid durable lease remains bound without a second run/resume; after the durable lease expires, a second manager formally resumes the same Run and the scheduler stores its final result.
 4. Recovery failure returns the fire to bound with a retry window and never creates a second deterministic Run.
-
+5. A recovered `waiting` Run writes one compatibility error result with durable status preserved and is not resumed without an interaction resolution.
