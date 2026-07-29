@@ -124,13 +124,22 @@ export class SchedulerRunner {
         recovered += 1;
         continue;
       }
-      await this.options.store.completeFire({
-        fireId: claimed.fireId,
-        claimToken: claimed.claimToken,
-        runId: claimed.runId,
-        result,
-        completedAt: now,
-      }).catch(() => undefined);
+      try {
+        await this.options.store.completeFire({
+          fireId: claimed.fireId,
+          claimToken: claimed.claimToken,
+          runId: claimed.runId,
+          result,
+          completedAt: now,
+        });
+      } catch (error) {
+        await this.options.store.releaseBound({
+          fireId: claimed.fireId,
+          claimToken: claimed.claimToken,
+          retryAt: new Date(now.getTime() + this.retryDelayMs),
+          error: String(error),
+        }).catch(() => undefined); // A stale fence means another scheduler already advanced the fire.
+      }
       recovered += 1;
     }
     if (signal?.aborted) return recovered;
