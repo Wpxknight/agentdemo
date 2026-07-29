@@ -40,8 +40,7 @@ import { DownloadStore } from './server/downloads.js';
 import { buildSkillTools } from './tools/skill/index.js';
 import { buildSandboxProfileTools } from './tools/sandbox-profiles.js';
 import { buildBrowserTools } from './tools/browser.js';
-import { McpManager } from './mcp/manager.js';
-import { connectMcp } from './mcp/client.js';
+import { McpManager, connectMcp } from '@aiop/mcp-runtime';
 import { SkillRegistry } from './skill/registry.js';
 import { MysqlSkillMutationLock, skillImportPermitPoolSize } from './skill/lock.js';
 import { ClusterRegistry } from './config/clusters.js';
@@ -578,7 +577,18 @@ export async function buildRuntime(
 
   // MCP：持久化配置（UI 增删的结果）优先于 config.jsonc；常驻 manager 以支持运行期管理。
   const persistedMcp = await store.getMcpServers({ tenantId: DEFAULT_TENANT }).catch(() => undefined);
-  const mcp = new McpManager(persistedMcp ?? config.mcpServers ?? {}, connectMcp);
+  const mcp = new McpManager(persistedMcp ?? config.mcpServers ?? {}, connectMcp, {
+    audit: {
+      record: (event) => audit.record({
+        kind: 'mcp', action: 'tool-execute', tenantId: event.tenantId,
+        tool: `mcp__${event.server}__${event.tool}`,
+        detail: {
+          actorId: event.actorId, server: event.server, ok: event.ok,
+          durationMs: event.durationMs, ...(event.error ? { error: event.error } : {}),
+        },
+      }),
+    },
+  });
   initializationCleanups.push(() => mcp.close());
   await mcp.start();
   for (const t of mcp.tools()) tools.register(t, 'mcp');

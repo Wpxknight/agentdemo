@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
-import { McpManager, mcpToolName } from '../src/mcp/manager.js';
-import { connectMcp } from '../src/mcp/client.js';
-import type { McpClientLike, McpServerConfig, McpToolInfo } from '../src/mcp/types.js';
+import {
+  McpManager,
+  connectMcp,
+  mcpToolName,
+  type McpClientLike,
+  type McpServerConfig,
+  type McpToolInfo,
+} from '../packages/mcp-runtime/src/index.js';
 
 function fakeClient(tools: Array<Pick<McpToolInfo, 'name' | 'description' | 'annotations'>>): McpClientLike {
   return {

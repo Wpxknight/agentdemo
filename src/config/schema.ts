@@ -27,6 +27,14 @@ export const McpServerSchema = z.object({
   args: z.array(z.string()).optional(),
   url: z.string().optional(),
   headers: z.record(z.string(), z.string()).optional(),
+  env: z.record(z.string(), z.string()).optional(),
+  timeoutMs: z.number().int().positive().optional(),
+  reconnect: z.object({
+    maxAttempts: z.number().int().nonnegative().optional(),
+    backoffMs: z.number().int().nonnegative().optional(),
+    retryOnTimeout: z.boolean().optional(),
+    retryOnDisconnect: z.boolean().optional(),
+  }).optional(),
   toolCapabilities: z.record(z.string(), z.enum(['read', 'retryable_write', 'non_idempotent_write'])).optional(),
 });
 

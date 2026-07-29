@@ -40,7 +40,7 @@ import type {
 } from './store.js';
 import { DEFAULT_SESSION_TITLE } from './store.js';
 import { McpServerSchema } from '../config/schema.js';
-import type { McpServerConfig } from '../mcp/types.js';
+import type { McpServerConfig } from '@aiop/mcp-runtime';
 import { nextRunAt } from '../scheduler/cron.js';
 import { estimateTokens } from '../agent/context.js';
 import { parseStoredSandboxSettings } from '@aiop/sandbox-runtime';

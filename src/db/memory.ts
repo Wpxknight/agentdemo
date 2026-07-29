@@ -2,7 +2,7 @@ import type { Msg } from '../model/types.js';
 import { estimateTokens } from '../agent/context.js';
 import type { AuditEvent } from '../audit/sink.js';
 import type { RequestContext, Tenant, User } from '../auth/types.js';
-import type { McpServerConfig } from '../mcp/types.js';
+import type { McpServerConfig } from '@aiop/mcp-runtime';
 import type {
   AuditFilter,
   NewUser,
