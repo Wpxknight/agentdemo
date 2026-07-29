@@ -137,7 +137,7 @@ export interface Runtime {
   updateSandbox?(update: SandboxSettingsUpdate): Promise<SandboxSettingsState>;
   tools: ToolRegistry;
   skillRegistry?: SkillRegistry;
-  /** MCP server 管理器（运行期增删/重连，工具同步进 tools）。 */
+  /** MCP server 管理器（按请求身份解析租户隔离的 governed tools）。 */
   mcp?: McpManager;
   /** 稳定的会话 Sandbox facade；禁用时保留 facade 以继续回收 draining generations。 */
   sandboxes?: SandboxManagerLike;
@@ -575,9 +575,11 @@ export async function buildRuntime(
   }
   syncSandboxTools();
 
-  // MCP：持久化配置（UI 增删的结果）优先于 config.jsonc；常驻 manager 以支持运行期管理。
-  const persistedMcp = await store.getMcpServers({ tenantId: DEFAULT_TENANT }).catch(() => undefined);
-  const mcp = new McpManager(persistedMcp ?? config.mcpServers ?? {}, connectMcp, {
+  // MCP：每个租户按身份加载持久化配置；未持久化时回退 config.jsonc。
+  const mcp = new McpManager(config.mcpServers ?? {}, connectMcp, {
+    loadConfigs: async (identity) => (
+      await store.getMcpServers({ tenantId: identity.tenantId }).catch(() => undefined)
+    ) ?? config.mcpServers ?? {},
     audit: {
       record: (event) => audit.record({
         kind: 'mcp', action: 'tool-execute', tenantId: event.tenantId,
@@ -590,8 +592,6 @@ export async function buildRuntime(
     },
   });
   initializationCleanups.push(() => mcp.close());
-  await mcp.start();
-  for (const t of mcp.tools()) tools.register(t, 'mcp');
 
   for (const t of buildScheduleTools(store)) tools.register(t);
   tools.register(buildTodoTool());

@@ -6,6 +6,7 @@ import {
   type ToolLedgerStore,
 } from '../../packages/pi-runtime/src/index.js';
 import { ToolRegistry, defineTool } from '../../src/agent/tools.js';
+import { createCompatibilityAIOPToolRuntime } from '../../src/agent/pi/tool-runtime.js';
 import { McpManager } from '../../packages/mcp-runtime/src/index.js';
 import { buildAskUserTool } from '../../src/tools/ask-user.js';
 import { buildSandboxTools } from '../../src/tools/builtin.js';
@@ -43,6 +44,35 @@ const piRead = (): AgentTool => ({
 } as AgentTool);
 
 describe('real unified tool sources', () => {
+  it('consumes MCP governed definitions without registering a legacy def/run shim', async () => {
+    const executeMcp = vi.fn(async () => ({ content: [{ type: 'text', text: 'tenant-a' }] }));
+    const mcp = new McpManager({
+      demo: {
+        transport: 'http', url: 'https://mcp.example',
+        toolCapabilities: { whoami: 'read' },
+      },
+    }, async () => ({
+      listTools: async () => ({ tools: [{ name: 'whoami', inputSchema: {} }] }),
+      callTool: executeMcp,
+      close: async () => undefined,
+    }));
+    const governedTools = await mcp.tools(context.identity);
+    const runtime = createCompatibilityAIOPToolRuntime({
+      model: {} as never,
+      tools: new ToolRegistry(),
+      governedTools,
+      policy: { check: async () => ({ blocked: false, needApproval: false }) },
+      ctx: { sessionId: 'session-a', tenantId: 'tenant-a', userId: 'user-a', role: 'user' },
+    } as never);
+
+    await expect(runtime.execute({
+      id: 'call-mcp', logicalCallId: 'logical-mcp', name: 'mcp__demo__whoami', arguments: {},
+    }, context)).resolves.toMatchObject({
+      kind: 'result', result: { content: 'tenant-a', isError: false },
+    });
+    expect(executeMcp).toHaveBeenCalledOnce();
+  });
+
   it('product builders expose governed/Pi-compatible definitions as their source of truth', () => {
     expect(buildAskUserTool()).toMatchObject({
       name: 'ask_user', capability: 'read', inputSchema: expect.any(Object), execute: expect.any(Function),
@@ -71,7 +101,7 @@ describe('real unified tool sources', () => {
       callTool: mcpCall,
       close: async () => undefined,
     }));
-    await mcp.start();
+    await mcp.start(context.identity);
     const sandboxRun = vi.fn(async () => ({ stdout: 'sandbox-ok', exitCode: 0 }));
     const sandboxTools = buildSandboxTools({
       get: async () => ({ runCode: sandboxRun, runCommand: sandboxRun }),
@@ -79,9 +109,9 @@ describe('real unified tool sources', () => {
     const answers = vi.fn(async () => ({ Continue: ['Yes'] }));
     const products = new ToolRegistry()
       .register(buildAskUserTool(), 'aiop')
-      .register(mcp.tools()[0]!, 'mcp')
       .register(sandboxTools[0]!, 'sandbox');
     const registry = products.unified({ sessionId: 'session-a', askUser: answers })
+      .register('mcp', (await mcp.tools(context.identity))[0]!)
       .registerPi(piRead(), 'read');
     const runtime = new GovernedToolFactory({ ledger: ledger() }).create(registry.definitions());
 
@@ -117,8 +147,8 @@ describe('real unified tool sources', () => {
       ] }),
       callTool: async () => ({ content: [] }), close: async () => undefined,
     }));
-    await mcp.start();
-    expect(mcp.tools().map((tool) => [tool.name, tool.capability])).toEqual([
+    await mcp.start(context.identity);
+    expect((await mcp.tools(context.identity)).map((tool) => [tool.name, tool.capability])).toEqual([
       ['mcp__demo__read', 'read'], ['mcp__demo__mutate', 'retryable_write'],
     ]);
     const registry = new ToolRegistry().register(buildAskUserTool());

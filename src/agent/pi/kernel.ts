@@ -114,7 +114,13 @@ export function createPiPlatformKernel(
 }
 
 export function piToolDefinitions(options: RunAgentOptions) {
-  const defs = options.filterToolDefs?.(options.tools.defs()) ?? options.tools.defs();
+  const sources = [
+    ...options.tools.defs(),
+    ...(options.governedTools ?? []).map(({ name, description, inputSchema, capability }) => ({
+      name, description, inputSchema, capability,
+    })),
+  ];
+  const defs = options.filterToolDefs?.(sources) ?? sources;
   return defs.map((tool) => ({
     ...tool,
     capability: tool.capability ?? 'non_idempotent_write',

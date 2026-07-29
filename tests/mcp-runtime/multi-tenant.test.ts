@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  McpManager,
   McpRuntime,
   type McpClientLike,
   type McpConnectFn,
@@ -18,6 +19,39 @@ function client(label: string): McpClientLike {
 }
 
 describe('MCP multi-tenant isolation', () => {
+  it('resolves manager tools with the request identity and returns governed definitions only', async () => {
+    const connections: string[] = [];
+    const manager = new McpManager({
+      shared: { transport: 'http', url: 'https://mcp.example', toolCapabilities: { whoami: 'read' } },
+    }, async (_name, _config, context) => {
+      connections.push(context.identity.tenantId);
+      return client(context.identity.tenantId);
+    });
+    const tenantA = identity('tenant-a');
+    const tenantB = identity('tenant-b');
+
+    await manager.start(tenantA);
+    const [toolA] = await manager.tools(tenantA);
+    await manager.start(tenantB);
+    const [toolB] = await manager.tools(tenantB);
+
+    expect(connections).toEqual(['tenant-a', 'tenant-b']);
+    expect(toolA).not.toHaveProperty('def');
+    expect(toolA).not.toHaveProperty('run');
+    await expect(toolA!.execute({
+      id: 'a', logicalCallId: 'a', name: toolA!.name, arguments: {},
+    }, {
+      identity: tenantA, runId: 'run-a', attemptId: 'attempt-a', turnNo: 1,
+      idempotencyKey: 'a',
+    })).resolves.toMatchObject({ content: 'tenant-a' });
+    await expect(toolB!.execute({
+      id: 'b', logicalCallId: 'b', name: toolB!.name, arguments: {},
+    }, {
+      identity: tenantB, runId: 'run-b', attemptId: 'attempt-b', turnNo: 1,
+      idempotencyKey: 'b',
+    })).resolves.toMatchObject({ content: 'tenant-b' });
+  });
+
   it('never shares credentials, clients, or resolved tools across tenants', async () => {
     const connections: Array<{ tenantId: string; authorization?: string }> = [];
     const connect: McpConnectFn = vi.fn(async (_name, _config, context) => {

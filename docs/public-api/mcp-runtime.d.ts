@@ -9,20 +9,28 @@ export * from './runtime.js';
 export * from './manager.js';
 
 // file: manager.d.ts
-import type { McpConnectFn, McpLegacyTool, McpRuntimeOptions, McpServerConfig, McpServerInfo } from './types.js';
+import type { IdentityContext } from '@aiop/control-contracts';
+import type { GovernedToolDefinition } from '@aiop/pi-runtime';
+import type { McpConnectFn, McpRuntimeOptions, McpServerConfig, McpServerInfo } from './types.js';
+export interface McpManagerOptions extends Omit<McpRuntimeOptions, 'connect'> {
+    loadConfigs?(identity: IdentityContext): Promise<Record<string, McpServerConfig> | undefined>;
+}
 export declare class McpManager {
+    private readonly initial;
+    private readonly options;
     private readonly runtime;
-    private definitions;
-    constructor(initial: Record<string, McpServerConfig>, connect: McpConnectFn, options?: Omit<McpRuntimeOptions, 'connect'>);
-    start(): Promise<void>;
-    add(name: string, config: McpServerConfig): Promise<McpServerInfo>;
-    remove(name: string): Promise<boolean>;
-    reconnect(name: string): Promise<McpServerInfo>;
-    info(name: string): McpServerInfo | undefined;
-    list(): McpServerInfo[];
-    configs(): Record<string, McpServerConfig>;
-    tools(): McpLegacyTool[];
+    private readonly initialized;
+    constructor(initial: Record<string, McpServerConfig>, connect: McpConnectFn, options?: McpManagerOptions);
+    start(identity: IdentityContext): Promise<void>;
+    tools(identity: IdentityContext): Promise<GovernedToolDefinition[]>;
+    add(identity: IdentityContext, name: string, config: McpServerConfig): Promise<McpServerInfo>;
+    remove(identity: IdentityContext, name: string): Promise<boolean>;
+    reconnect(identity: IdentityContext, name: string): Promise<McpServerInfo>;
+    info(identity: IdentityContext, name: string): Promise<McpServerInfo | undefined>;
+    list(identity: IdentityContext): Promise<McpServerInfo[]>;
+    configs(identity: IdentityContext): Promise<Record<string, McpServerConfig>>;
     close(): Promise<void>;
+    private ensureConfigured;
 }
 
 // file: runtime.d.ts
@@ -61,7 +69,7 @@ export declare class McpRuntime {
 export declare function mcpToolName(server: string, tool: string): string;
 
 // file: types.d.ts
-import type { IdentityContext, JsonValue, ToolCapability } from '@aiop/control-contracts';
+import type { IdentityContext, ToolCapability } from '@aiop/control-contracts';
 export interface McpToolInfo {
     name: string;
     description?: string;
@@ -147,38 +155,4 @@ export interface McpRuntimeOptions {
     credentials?: McpCredentialProvider;
     audit?: McpAuditSink;
     visible?: (identity: IdentityContext, server: string, tool: McpToolInfo) => boolean;
-}
-export interface McpLegacyTool {
-    name: string;
-    description: string;
-    inputSchema: Record<string, unknown>;
-    capability: ToolCapability;
-    execute(argumentsValue: JsonValue, context: {
-        tenantId?: string;
-        userId?: string;
-        role?: string;
-        signal?: AbortSignal;
-        [key: string]: unknown;
-    }): Promise<{
-        id: string;
-        content: string;
-        isError?: boolean;
-    }>;
-    def: {
-        name: string;
-        description: string;
-        inputSchema: Record<string, unknown>;
-        capability: ToolCapability;
-    };
-    run(argumentsValue: JsonValue, context: {
-        tenantId?: string;
-        userId?: string;
-        role?: string;
-        signal?: AbortSignal;
-        [key: string]: unknown;
-    }): Promise<{
-        id: string;
-        content: string;
-        isError?: boolean;
-    }>;
 }

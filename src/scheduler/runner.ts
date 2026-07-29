@@ -56,6 +56,11 @@ async function runScheduledTask(
     runId,
     model: rt.model,
     tools: rt.tools,
+    governedTools: rt.mcp ? await rt.mcp.tools({
+      tenantId: taskCtx.tenantId,
+      actorId: taskCtx.userId,
+      roles: [taskCtx.role],
+    }) : [],
     policy: t.preApproved ? rt.policyPreApproved : rt.policy,
     filterToolDefs: (defs) => rt.permissionRules?.filterToolDefs(defs) ?? defs,
     hooks: rt.hooks,

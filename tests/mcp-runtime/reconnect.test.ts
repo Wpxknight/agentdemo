@@ -17,6 +17,20 @@ function readyClient(text = 'ok'): McpClientLike {
 }
 
 describe('MCP reconnect policy', () => {
+  it('closes a late client after a connection timeout when retries are disabled', async () => {
+    let resolveConnection!: (client: McpClientLike) => void;
+    const connection = new Promise<McpClientLike>((resolve) => { resolveConnection = resolve; });
+    const late = readyClient();
+    const runtime = new McpRuntime({ connect: async () => connection });
+    runtime.configure(tenant, {
+      late: { transport: 'http', url: 'https://mcp.example', timeoutMs: 5 },
+    });
+
+    await expect(runtime.discover(tenant)).resolves.toEqual([]);
+    resolveConnection(late);
+    await vi.waitFor(() => expect(late.close).toHaveBeenCalledOnce());
+  });
+
   it('closes a client that finishes connecting after runtime shutdown', async () => {
     let resolveConnection!: (client: McpClientLike) => void;
     const connection = new Promise<McpClientLike>((resolve) => { resolveConnection = resolve; });

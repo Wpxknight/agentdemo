@@ -27,8 +27,16 @@ export function createAIOPToolRuntime(
     } : {}),
     ...(options.askUser ? { askUser: options.askUser } : {}),
     ...(options.requestPlanApproval ? { requestPlanApproval: options.requestPlanApproval } : {}),
-  }), options.filterToolDefs);
-  const definitions: GovernedToolDefinition[] = unified.definitions().map((definition) => ({
+  }));
+  const sources = [...unified.definitions(), ...(options.governedTools ?? [])];
+  const allowed = new Set((options.filterToolDefs
+    ? options.filterToolDefs(sources.map(({ name, description, inputSchema, capability }) => ({
+        name, description, inputSchema, capability,
+      })))
+    : sources).map((definition) => definition.name));
+  const definitions: GovernedToolDefinition[] = sources
+    .filter((definition) => allowed.has(definition.name))
+    .map((definition) => ({
     ...definition,
     interactionKind: durableGovernance ? interactionKind(definition.name) : undefined,
     execute: async (call, context) => {
@@ -37,7 +45,7 @@ export function createAIOPToolRuntime(
       await options.runGuard?.();
       return { content: result.content, isError: result.isError };
     },
-  }));
+    }));
   const runtime = new GovernedToolFactory({
     ledger,
     concurrency,

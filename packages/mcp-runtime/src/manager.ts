@@ -1,100 +1,90 @@
-import type { IdentityContext, JsonValue, ToolCall, ToolExecutionContext } from '@aiop/control-contracts';
+import type { IdentityContext } from '@aiop/control-contracts';
+import type { GovernedToolDefinition } from '@aiop/pi-runtime';
 import { McpRuntime } from './runtime.js';
 import type {
   McpConnectFn,
-  McpLegacyTool,
   McpRuntimeOptions,
   McpServerConfig,
   McpServerInfo,
 } from './types.js';
 
-const DEFAULT_IDENTITY: IdentityContext = {
-  tenantId: 'default', actorId: 'mcp-manager', roles: ['platform'],
-};
+export interface McpManagerOptions extends Omit<McpRuntimeOptions, 'connect'> {
+  loadConfigs?(identity: IdentityContext): Promise<Record<string, McpServerConfig> | undefined>;
+}
 
 export class McpManager {
   private readonly runtime: McpRuntime;
-  private definitions: Awaited<ReturnType<McpRuntime['discover']>> = [];
+  private readonly initialized = new Map<string, Promise<void>>();
 
   constructor(
-    initial: Record<string, McpServerConfig>,
+    private readonly initial: Record<string, McpServerConfig>,
     connect: McpConnectFn,
-    options: Omit<McpRuntimeOptions, 'connect'> = {},
+    private readonly options: McpManagerOptions = {},
   ) {
     this.runtime = new McpRuntime({ ...options, connect });
-    void this.runtime.configure(DEFAULT_IDENTITY, initial);
   }
 
-  async start(): Promise<void> {
-    this.definitions = await this.runtime.discover(DEFAULT_IDENTITY);
+  async start(identity: IdentityContext): Promise<void> {
+    await this.tools(identity);
   }
 
-  async add(name: string, config: McpServerConfig): Promise<McpServerInfo> {
-    const info = await this.runtime.add(DEFAULT_IDENTITY, name, config);
-    this.definitions = await this.runtime.discover(DEFAULT_IDENTITY);
-    return info;
+  async tools(identity: IdentityContext): Promise<GovernedToolDefinition[]> {
+    await this.ensureConfigured(identity);
+    return this.runtime.discover(identity);
   }
 
-  async remove(name: string): Promise<boolean> {
-    const removed = await this.runtime.remove(DEFAULT_IDENTITY, name);
-    if (removed) this.definitions = await this.runtime.discover(DEFAULT_IDENTITY);
-    return removed;
+  async add(
+    identity: IdentityContext,
+    name: string,
+    config: McpServerConfig,
+  ): Promise<McpServerInfo> {
+    await this.ensureConfigured(identity);
+    return this.runtime.add(identity, name, config);
   }
 
-  async reconnect(name: string): Promise<McpServerInfo> {
-    const info = await this.runtime.reconnect(DEFAULT_IDENTITY, name);
-    this.definitions = await this.runtime.discover(DEFAULT_IDENTITY);
-    return info;
+  async remove(identity: IdentityContext, name: string): Promise<boolean> {
+    await this.ensureConfigured(identity);
+    return this.runtime.remove(identity, name);
   }
 
-  info(name: string): McpServerInfo | undefined {
-    return this.runtime.info(DEFAULT_IDENTITY, name);
+  async reconnect(identity: IdentityContext, name: string): Promise<McpServerInfo> {
+    await this.ensureConfigured(identity);
+    return this.runtime.reconnect(identity, name);
   }
 
-  list(): McpServerInfo[] {
-    return this.runtime.list(DEFAULT_IDENTITY);
+  async info(identity: IdentityContext, name: string): Promise<McpServerInfo | undefined> {
+    await this.ensureConfigured(identity);
+    return this.runtime.info(identity, name);
   }
 
-  configs(): Record<string, McpServerConfig> {
-    return this.runtime.configs(DEFAULT_IDENTITY);
+  async list(identity: IdentityContext): Promise<McpServerInfo[]> {
+    await this.ensureConfigured(identity);
+    return this.runtime.list(identity);
   }
 
-  tools(): McpLegacyTool[] {
-    return this.definitions.map((definition) => {
-      const def = {
-        name: definition.name,
-        description: definition.description,
-        inputSchema: definition.inputSchema,
-        capability: definition.capability,
-      };
-      const run = async (
-        argumentsValue: JsonValue,
-        context: {
-          tenantId?: string; userId?: string; role?: string; signal?: AbortSignal;
-          [key: string]: unknown;
-        },
-      ) => {
-        const call: ToolCall = {
-          id: '', logicalCallId: '', name: definition.name, arguments: argumentsValue,
-        };
-        const executionContext: ToolExecutionContext & { idempotencyKey: string } = {
-          identity: {
-            tenantId: DEFAULT_IDENTITY.tenantId,
-            actorId: context.userId ?? DEFAULT_IDENTITY.actorId,
-            roles: [context.role ?? 'user'],
-          },
-          runId: 'legacy-mcp', attemptId: 'legacy-mcp', turnNo: 0,
-          signal: context.signal, idempotencyKey: 'legacy-mcp',
-        };
-        const result = await definition.execute(call, executionContext);
-        return { id: '', ...result };
-      };
-      return { ...def, execute: run, def, run };
-    });
+  async configs(identity: IdentityContext): Promise<Record<string, McpServerConfig>> {
+    await this.ensureConfigured(identity);
+    return this.runtime.configs(identity);
   }
 
   async close(): Promise<void> {
+    this.initialized.clear();
     await this.runtime.close();
-    this.definitions = [];
+  }
+
+  private ensureConfigured(identity: IdentityContext): Promise<void> {
+    const existing = this.initialized.get(identity.tenantId);
+    if (existing) return existing;
+    const configuring = (async () => {
+      const loaded = await this.options.loadConfigs?.(identity);
+      await this.runtime.configure(identity, loaded ?? this.initial);
+    })();
+    this.initialized.set(identity.tenantId, configuring);
+    void configuring.catch(() => {
+      if (this.initialized.get(identity.tenantId) === configuring) {
+        this.initialized.delete(identity.tenantId);
+      }
+    });
+    return configuring;
   }
 }

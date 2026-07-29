@@ -135,7 +135,7 @@ beforeAll(async () => {
     };
   };
   const mcp = new McpManager({ fs: { transport: 'stdio', command: 'fake' } }, mcpConnect);
-  await mcp.start();
+  await mcp.start({ tenantId: 'default', actorId: 'admin', roles: ['platform_admin'] });
 
   let activeModel = model;
   let activeModelConfig: NonNullable<Runtime['modelConfig']> = {
@@ -195,8 +195,6 @@ beforeAll(async () => {
     systemExtra: '',
     defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
   } as unknown as Runtime;
-
-  for (const t of mcp.tools()) rt.tools.register(t);
 
   server = createHttpServer(rt);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -2268,6 +2266,79 @@ describe('HTTP server MCP 管理', () => {
     });
     return ((await r.json()) as { token: string }).token;
   }
+
+  it('resolves listed and directly called MCP tools from the authenticated tenant', async () => {
+    const tenantStore = new MemoryStore();
+    await tenantStore.createTenant({ id: 'tenant-a', name: 'Tenant A' });
+    await tenantStore.createTenant({ id: 'tenant-b', name: 'Tenant B' });
+    const auth = new LocalAuthProvider({ store: tenantStore, secret: 'mcp-tenant-secret' });
+    await auth.createUser('tenant-a', 'admin-a', 'pw', 'tenant_admin');
+    await auth.createUser('tenant-b', 'admin-b', 'pw', 'tenant_admin');
+    await tenantStore.setMcpServers({ tenantId: 'tenant-a' }, {
+      alpha: { transport: 'http', url: 'https://alpha.example' },
+    });
+    await tenantStore.setMcpServers({ tenantId: 'tenant-b' }, {
+      beta: { transport: 'http', url: 'https://beta.example' },
+    });
+    const connectedTenants: string[] = [];
+    const tenantMcp = new McpManager({}, async (_name, _config, connectContext) => {
+      connectedTenants.push(connectContext.identity.tenantId);
+      return {
+        listTools: async () => ({ tools: [{ name: 'whoami', inputSchema: { type: 'object' } }] }),
+        callTool: async () => ({
+          content: [{ type: 'text', text: connectContext.identity.tenantId }],
+        }),
+        close: async () => undefined,
+      };
+    }, {
+      loadConfigs: (identity) => tenantStore.getMcpServers({ tenantId: identity.tenantId }),
+    });
+    const rt = {
+      model,
+      tools: new ToolRegistry(),
+      mcp: tenantMcp,
+      store: tenantStore,
+      audit: { record: async () => undefined },
+      policy: new AllowAllPolicy(),
+      policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth,
+      jwtSecret: 'mcp-tenant-secret',
+      systemExtra: '',
+      defaultContext: { tenantId: 'tenant-a', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+    const tenantServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => tenantServer.listen(0, '127.0.0.1', resolve));
+    const tenantBase = `http://127.0.0.1:${(tenantServer.address() as AddressInfo).port}`;
+    const tokenA = (await auth.login('tenant-a', 'admin-a', 'pw'))!;
+    const tokenB = (await auth.login('tenant-b', 'admin-b', 'pw'))!;
+
+    try {
+      const toolsA = await fetch(`${tenantBase}/v1/tools`, {
+        headers: { authorization: `Bearer ${tokenA}` },
+      });
+      const toolsB = await fetch(`${tenantBase}/v1/tools`, {
+        headers: { authorization: `Bearer ${tokenB}` },
+      });
+      expect((await toolsA.json()) as { tools: Array<{ name: string }> }).toMatchObject({
+        tools: [{ name: 'mcp__alpha__whoami' }],
+      });
+      expect((await toolsB.json()) as { tools: Array<{ name: string }> }).toMatchObject({
+        tools: [{ name: 'mcp__beta__whoami' }],
+      });
+
+      const call = await fetch(`${tenantBase}/v1/tools/call`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${tokenB}` },
+        body: JSON.stringify({ sessionId: 'tenant-session', name: 'mcp__beta__whoami', args: {} }),
+      });
+      expect(call.status).toBe(200);
+      expect(await call.json()).toMatchObject({ ok: true, result: { content: 'tenant-b' } });
+      expect(connectedTenants).toEqual(['tenant-a', 'tenant-b']);
+    } finally {
+      await tenantMcp.close();
+      await new Promise<void>((resolve) => tenantServer.close(() => resolve()));
+    }
+  });
 
   it('lists servers with status and tools', async () => {
     const admin = await login('admin');

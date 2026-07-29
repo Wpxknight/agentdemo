@@ -8,6 +8,7 @@ import type { ChangePlan } from './plan.js';
 import type { DurableToolLedger } from './tool-ledger/store.js';
 import type { AgentRunLifecycleObserver } from './run-coordinator.js';
 import type { AgentRunUsage } from '@aiop/control-contracts';
+import type { GovernedToolDefinition } from '@aiop/pi-runtime';
 
 export type Usage = AgentRunUsage;
 
@@ -17,6 +18,8 @@ export interface RunAgentOptions {
   comparisonRunId?: string;
   model: ChatModel;
   tools: ToolRegistry;
+  /** Identity-resolved package tools that already implement the governance adapter contract. */
+  governedTools?: readonly GovernedToolDefinition[];
   policy: PolicyMiddleware;
   system?: string;
   task?: string;

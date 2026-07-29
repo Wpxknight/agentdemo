@@ -31,7 +31,10 @@ function deferred<T>() {
 }
 
 describe('McpManager', () => {
-  const ctx = { sessionId: 's1' };
+  const identity = { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] } as const;
+  const executionContext = {
+    identity, runId: 'run-a', attemptId: 'attempt-a', turnNo: 1, idempotencyKey: 'key-a',
+  } as const;
 
   it('connects servers and namespaces tools as mcp__server__tool', async () => {
     const servers: Record<string, McpServerConfig> = {
@@ -40,12 +43,12 @@ describe('McpManager', () => {
     const client = fakeClient([{ name: 'read', description: 'read file' }]);
     const mgr = new McpManager(servers, async () => client);
 
-    await mgr.start();
-    const tools = mgr.tools();
+    await mgr.start(identity);
+    const tools = await mgr.tools(identity);
 
     expect(tools).toHaveLength(1);
-    expect(tools[0]!.def.name).toBe('mcp__fs__read');
-    expect(tools[0]!.def.name).toBe(mcpToolName('fs', 'read'));
+    expect(tools[0]!.name).toBe('mcp__fs__read');
+    expect(tools[0]!.name).toBe(mcpToolName('fs', 'read'));
   });
 
   it('does not trust a server read-only annotation to downgrade the default capability', async () => {
@@ -55,9 +58,9 @@ describe('McpManager', () => {
       async () => client,
     );
 
-    await mgr.start();
+    await mgr.start(identity);
 
-    expect(mgr.tools()[0]!.capability).toBe('non_idempotent_write');
+    expect((await mgr.tools(identity))[0]!.capability).toBe('non_idempotent_write');
   });
 
   it('allows trusted configuration to explicitly downgrade a tool capability', async () => {
@@ -73,17 +76,20 @@ describe('McpManager', () => {
       async () => client,
     );
 
-    await mgr.start();
+    await mgr.start(identity);
 
-    expect(mgr.tools()[0]!.capability).toBe('read');
+    expect((await mgr.tools(identity))[0]!.capability).toBe('read');
   });
 
   it('dispatch forwards to callTool and extracts text', async () => {
     const client = fakeClient([{ name: 'read' }]);
     const mgr = new McpManager({ fs: { transport: 'stdio', command: 'x' } }, async () => client);
-    await mgr.start();
+    await mgr.start(identity);
 
-    const res = await mgr.tools()[0]!.run({ path: '/etc/hosts' }, ctx);
+    const tool = (await mgr.tools(identity))[0]!;
+    const res = await tool.execute({
+      id: 'call-a', logicalCallId: 'logical-a', name: tool.name, arguments: { path: '/etc/hosts' },
+    }, executionContext);
 
     expect(client.callTool).toHaveBeenCalledWith({
       name: 'read',
@@ -105,32 +111,32 @@ describe('McpManager', () => {
       },
     );
 
-    await mgr.start();
+    await mgr.start(identity);
 
-    expect(mgr.tools().map((t) => t.def.name)).toEqual(['mcp__good__ping']);
+    expect((await mgr.tools(identity)).map((t) => t.name)).toEqual(['mcp__good__ping']);
     // 失败的 server 保留 error 状态，供 UI 展示与重连
-    const bad = mgr.list().find((s) => s.name === 'bad');
+    const bad = (await mgr.list(identity)).find((s) => s.name === 'bad');
     expect(bad?.status).toBe('error');
     expect(bad?.error).toContain('boom');
   });
 
   it('add connects a new server and exposes its tools', async () => {
     const mgr = new McpManager({}, async () => fakeClient([{ name: 'echo' }]));
-    await mgr.start();
+    await mgr.start(identity);
 
-    const info = await mgr.add('extra', { transport: 'stdio', command: 'x' });
+    const info = await mgr.add(identity, 'extra', { transport: 'stdio', command: 'x' });
 
     expect(info.status).toBe('connected');
     expect(info.tools).toEqual(['mcp__extra__echo']);
-    expect(mgr.tools().map((t) => t.def.name)).toEqual(['mcp__extra__echo']);
-    expect(mgr.configs()).toEqual({ extra: { transport: 'stdio', command: 'x' } });
+    expect((await mgr.tools(identity)).map((t) => t.name)).toEqual(['mcp__extra__echo']);
+    expect(await mgr.configs(identity)).toEqual({ extra: { transport: 'stdio', command: 'x' } });
   });
 
   it('add rejects duplicate names', async () => {
     const mgr = new McpManager({}, async () => fakeClient([{ name: 'echo' }]));
-    await mgr.add('a', { transport: 'stdio', command: 'x' });
+    await mgr.add(identity, 'a', { transport: 'stdio', command: 'x' });
 
-    await expect(mgr.add('a', { transport: 'stdio', command: 'y' })).rejects.toThrow('已存在');
+    await expect(mgr.add(identity, 'a', { transport: 'stdio', command: 'y' })).rejects.toThrow('已存在');
   });
 
   it('add keeps error state on connect failure; reconnect recovers', async () => {
@@ -140,33 +146,33 @@ describe('McpManager', () => {
       return fakeClient([{ name: 'ping' }]);
     });
 
-    const info = await mgr.add('flaky', { transport: 'http', url: 'http://x' });
+    const info = await mgr.add(identity, 'flaky', { transport: 'http', url: 'http://x' });
     expect(info.status).toBe('error');
     expect(info.error).toContain('down');
-    expect(mgr.tools()).toHaveLength(0);
+    expect(await mgr.tools(identity)).toHaveLength(0);
 
     fail = false;
-    const recovered = await mgr.reconnect('flaky');
+    const recovered = await mgr.reconnect(identity, 'flaky');
     expect(recovered.status).toBe('connected');
-    expect(mgr.tools().map((t) => t.def.name)).toEqual(['mcp__flaky__ping']);
+    expect((await mgr.tools(identity)).map((t) => t.name)).toEqual(['mcp__flaky__ping']);
   });
 
   it('remove closes the client and drops its tools', async () => {
     const client = fakeClient([{ name: 'echo' }]);
     const mgr = new McpManager({ a: { transport: 'stdio', command: 'x' } }, async () => client);
-    await mgr.start();
+    await mgr.start(identity);
 
-    expect(await mgr.remove('a')).toBe(true);
+    expect(await mgr.remove(identity, 'a')).toBe(true);
 
     expect(client.close).toHaveBeenCalled();
-    expect(mgr.tools()).toHaveLength(0);
-    expect(mgr.list()).toHaveLength(0);
-    expect(await mgr.remove('a')).toBe(false);
+    expect(await mgr.tools(identity)).toHaveLength(0);
+    expect(await mgr.list(identity)).toHaveLength(0);
+    expect(await mgr.remove(identity, 'a')).toBe(false);
   });
 
   it('reconnect on unknown server throws', async () => {
     const mgr = new McpManager({}, async () => fakeClient([]));
-    await expect(mgr.reconnect('nope')).rejects.toThrow('不存在');
+    await expect(mgr.reconnect(identity, 'nope')).rejects.toThrow('不存在');
   });
 
   it('keeps the newer reconnect when an older initial connection finishes last', async () => {
@@ -180,14 +186,14 @@ describe('McpManager', () => {
       async () => (++calls === 1 ? firstConnection.promise : secondConnection.promise),
     );
 
-    const starting = mgr.start();
-    const reconnecting = mgr.reconnect('racing');
+    const starting = mgr.start(identity);
+    const reconnecting = mgr.reconnect(identity, 'racing');
     secondConnection.resolve(newClient);
     await reconnecting;
     firstConnection.resolve(oldClient);
     await starting;
 
-    expect(mgr.info('racing')?.tools).toEqual(['mcp__racing__new']);
+    expect((await mgr.info(identity, 'racing'))?.tools).toEqual(['mcp__racing__new']);
     expect(oldClient.close).toHaveBeenCalledOnce();
     expect(newClient.close).not.toHaveBeenCalled();
   });
@@ -200,14 +206,14 @@ describe('McpManager', () => {
       async () => connection.promise,
     );
 
-    const starting = mgr.start();
-    await expect(mgr.remove('removed')).resolves.toBe(true);
+    const starting = mgr.start(identity);
+    await expect(mgr.remove(identity, 'removed')).resolves.toBe(true);
     connection.resolve(client);
     await starting;
 
     expect(client.close).toHaveBeenCalledOnce();
-    expect(mgr.info('removed')).toBeUndefined();
-    expect(mgr.tools()).toEqual([]);
+    expect(await mgr.info(identity, 'removed')).toBeUndefined();
+    expect(await mgr.tools(identity)).toEqual([]);
   });
 });
 

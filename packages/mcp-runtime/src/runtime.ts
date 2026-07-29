@@ -281,11 +281,12 @@ export class McpRuntime {
     if (state.client) return state.client;
     if (state.connecting) return state.connecting;
     const generation = ++state.generation;
+    let valid = true;
     const connecting = (async () => {
       const credentials: McpCredentials = await this.options.credentials?.resolve(identity, server) ?? {};
       const pendingClient = this.connect(server, state.config, { identity, credentials });
       const guardedClient = pendingClient.then(async (client) => {
-        if (state.generation !== generation) {
+        if (!valid || state.generation !== generation) {
           await closeQuietly(client);
           throw new McpDisconnectedError(`MCP ${server} connection superseded`);
         }
@@ -304,6 +305,10 @@ export class McpRuntime {
     try {
       return await connecting;
     } catch (error) {
+      valid = false;
+      if (error instanceof McpTimeoutError && state.generation === generation) {
+        state.generation += 1;
+      }
       state.status = 'error';
       state.error = safeMessage(error);
       throw error;

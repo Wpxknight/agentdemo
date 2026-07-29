@@ -63,6 +63,11 @@ async function runOnce(config: Config, task: string) {
     runId: randomUUID(),
     model: rt.model,
     tools: rt.tools,
+    governedTools: rt.mcp ? await rt.mcp.tools({
+      tenantId,
+      actorId: userId,
+      roles: [role],
+    }) : [],
     policy: rt.policy,
     approval: new AutoApproveGate(),
     toolLedger: new DurableToolLedger(rt.store),

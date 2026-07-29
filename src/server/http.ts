@@ -51,7 +51,7 @@ import {
   RunCenterService,
 } from '../agent/run-center.js';
 import type { AgentRunRecord, AgentRunStatus, SessionContextUsage } from '../db/store.js';
-import type { AgentRunResult } from '@aiop/control-contracts';
+import type { AgentRunResult, IdentityContext } from '@aiop/control-contracts';
 
 const log = logger.child({ mod: 'http' });
 
@@ -759,9 +759,32 @@ async function dispatchDirectTool(
   name: string,
   args: JsonValue,
 ): Promise<Record<string, unknown>> {
-  if (!rt.tools.has(name)) throw new HttpError(409, `工具未启用：${name}`);
   const call: ToolCall = { id: randomUUID(), name, args };
   const toolCtx = { sessionId, tenantId: ctx.tenantId, userId: ctx.userId, role: ctx.role };
+  if (name.startsWith('mcp__') && rt.mcp) {
+    const identity = mcpIdentity(ctx);
+    const definition = (await rt.mcp.tools(identity)).find((tool) => tool.name === name);
+    if (!definition) throw new HttpError(409, `工具未启用：${name}`);
+    const decision = await rt.policy.check(call, toolCtx);
+    if (decision.blocked) throw new HttpError(403, decision.reason ?? '策略阻止了该操作');
+    if (decision.needApproval) throw new HttpError(409, decision.reason ?? '该操作需要审批，无法直接执行');
+    const logicalCallId = call.id;
+    const result = await definition.execute({
+      id: call.id,
+      logicalCallId,
+      name,
+      arguments: args,
+    }, {
+      identity,
+      runId: `direct:${sessionId}`,
+      attemptId: call.id,
+      turnNo: 1,
+      sessionId,
+      idempotencyKey: `${identity.tenantId}:direct:${sessionId}:${logicalCallId}`,
+    });
+    return { ok: !result.isError, sessionId, result: { id: call.id, ...result } };
+  }
+  if (!rt.tools.has(name)) throw new HttpError(409, `工具未启用：${name}`);
   const decision = await rt.policy.check(call, toolCtx);
   if (decision.blocked) throw new HttpError(403, decision.reason ?? '策略阻止了该操作');
   if (decision.needApproval) throw new HttpError(409, decision.reason ?? '该操作需要审批，无法直接执行');
@@ -769,22 +792,20 @@ async function dispatchDirectTool(
   return { ok: !result.isError, sessionId, result };
 }
 
-/** MCP server 增删/重连后，把注册表里的 mcp__ 工具与 manager 当前状态对齐。 */
-function syncMcpTools(rt: Runtime): void {
-  if (!rt.mcp) return;
-  for (const def of rt.tools.defs()) {
-    if (def.name.startsWith('mcp__')) rt.tools.unregister(def.name);
-  }
-  for (const t of rt.mcp.tools()) rt.tools.register(t, 'mcp');
+function mcpIdentity(ctx: RequestContext): IdentityContext {
+  return { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] };
 }
 
-/** 持久化当前 MCP server 配置（平台级，落 default 租户设置；失败仅记日志不阻塞请求）。 */
-async function persistMcpServers(rt: Runtime): Promise<void> {
+/** 持久化当前请求租户的 MCP server 配置；失败仅记日志不阻塞请求。 */
+async function persistMcpServers(rt: Runtime, identity: IdentityContext): Promise<void> {
   if (!rt.mcp) return;
   try {
-    await rt.store.setMcpServers({ tenantId: rt.defaultContext.tenantId }, rt.mcp.configs());
+    await rt.store.setMcpServers(
+      { tenantId: identity.tenantId },
+      await rt.mcp.configs(identity),
+    );
   } catch (err) {
-    log.error({ err: String(err) }, 'MCP 配置持久化失败');
+    log.error({ err: String(err), tenantId: identity.tenantId }, 'MCP 配置持久化失败');
   }
 }
 
@@ -1144,6 +1165,7 @@ async function handle(
 
   if (route === 'GET /v1/tools') {
     const ctx = await requireAuth(rt, req);
+    const mcpTools = rt.mcp ? await rt.mcp.tools(mcpIdentity(ctx)) : [];
     const tools = [
       ...rt.tools.defs()
         .filter((def) => !(rt.skillRegistry && (def.name === 'load_skill' || def.name.startsWith('skill__'))))
@@ -1153,6 +1175,12 @@ async function handle(
           category: toolCategory(def.name),
           inputSchema: def.inputSchema,
         })),
+      ...mcpTools.map((def) => ({
+        name: def.name,
+        description: def.description,
+        category: toolCategory(def.name),
+        inputSchema: def.inputSchema,
+      })),
       // 技能按查看者过滤：public ∪ 自己的 ∪ shared（服务端过滤，不信前端）。
       ...(rt.skillRegistry
         ? (await rt.skillRegistry.listLoadedFor(ctx)).map((skill) => publicSkill(skill, rt.skillRegistry!, ctx))
@@ -1333,9 +1361,9 @@ async function handle(
 
   // —— MCP server 管理 ——
   if (route === 'GET /v1/mcp/servers') {
-    await requireAuth(rt, req);
+    const ctx = await requireAuth(rt, req);
     if (!rt.mcp) throw new HttpError(409, '未启用 MCP');
-    return sendJson(res, 200, { servers: rt.mcp.list() });
+    return sendJson(res, 200, { servers: await rt.mcp.list(mcpIdentity(ctx)) });
   }
 
   if (route === 'POST /v1/mcp/servers') {
@@ -1352,10 +1380,10 @@ async function handle(
     const cfg = parsed.data;
     if (cfg.transport === 'stdio' && !cfg.command) throw new HttpError(400, 'stdio 需要 command');
     if (cfg.transport !== 'stdio' && !cfg.url) throw new HttpError(400, `${cfg.transport} 需要 url`);
-    if (rt.mcp.list().some((s) => s.name === name)) throw new HttpError(409, `MCP server 已存在: ${name}`);
-    const info = await rt.mcp.add(name, cfg);
-    syncMcpTools(rt);
-    await persistMcpServers(rt);
+    const identity = mcpIdentity(ctx);
+    if ((await rt.mcp.list(identity)).some((s) => s.name === name)) throw new HttpError(409, `MCP server 已存在: ${name}`);
+    const info = await rt.mcp.add(identity, name, cfg);
+    await persistMcpServers(rt, identity);
     return sendJson(res, 201, { server: info });
   }
 
@@ -1365,9 +1393,9 @@ async function handle(
     requirePermission(ctx, 'tenant:manage');
     if (!rt.mcp) throw new HttpError(409, '未启用 MCP');
     const name = decodeURIComponent(mcpReconnectMatch[1]!);
-    if (!rt.mcp.list().some((s) => s.name === name)) throw new HttpError(404, `MCP server 不存在: ${name}`);
-    const info = await rt.mcp.reconnect(name);
-    syncMcpTools(rt);
+    const identity = mcpIdentity(ctx);
+    if (!(await rt.mcp.list(identity)).some((s) => s.name === name)) throw new HttpError(404, `MCP server 不存在: ${name}`);
+    const info = await rt.mcp.reconnect(identity, name);
     return sendJson(res, 200, { server: info });
   }
 
@@ -1377,10 +1405,10 @@ async function handle(
     requirePermission(ctx, 'tenant:manage');
     if (!rt.mcp) throw new HttpError(409, '未启用 MCP');
     const name = decodeURIComponent(mcpDeleteMatch[1]!);
-    const removed = await rt.mcp.remove(name);
+    const identity = mcpIdentity(ctx);
+    const removed = await rt.mcp.remove(identity, name);
     if (!removed) throw new HttpError(404, `MCP server 不存在: ${name}`);
-    syncMcpTools(rt);
-    await persistMcpServers(rt);
+    await persistMcpServers(rt, identity);
     return sendJson(res, 200, { ok: true });
   }
 
@@ -2316,6 +2344,7 @@ async function recoverAgentRun(
       interactionResolution,
       model: rt.model,
       tools: rt.tools,
+      governedTools: rt.mcp ? await rt.mcp.tools(mcpIdentity(ctx)) : [],
       policy: rt.policy,
       filterToolDefs: (defs) => rt.permissionRules?.filterToolDefs(defs) ?? defs,
       hooks: rt.hooks,
@@ -2546,6 +2575,7 @@ async function runAgentSse(
       runId,
       model: rt.model,
       tools: rt.tools,
+      governedTools: rt.mcp ? await rt.mcp.tools(mcpIdentity(ctx)) : [],
       policy: rt.policy,
       filterToolDefs: (defs) => rt.permissionRules?.filterToolDefs(defs) ?? defs,
       hooks: rt.hooks,

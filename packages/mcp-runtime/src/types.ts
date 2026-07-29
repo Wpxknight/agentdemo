@@ -1,4 +1,4 @@
-import type { IdentityContext, JsonValue, ToolCapability } from '@aiop/control-contracts';
+import type { IdentityContext, ToolCapability } from '@aiop/control-contracts';
 
 export interface McpToolInfo {
   name: string;
@@ -92,31 +92,4 @@ export interface McpRuntimeOptions {
   credentials?: McpCredentialProvider;
   audit?: McpAuditSink;
   visible?: (identity: IdentityContext, server: string, tool: McpToolInfo) => boolean;
-}
-
-export interface McpLegacyTool {
-  name: string;
-  description: string;
-  inputSchema: Record<string, unknown>;
-  capability: ToolCapability;
-  execute(
-    argumentsValue: JsonValue,
-    context: {
-      tenantId?: string; userId?: string; role?: string; signal?: AbortSignal;
-      [key: string]: unknown;
-    },
-  ): Promise<{ id: string; content: string; isError?: boolean }>;
-  def: {
-    name: string;
-    description: string;
-    inputSchema: Record<string, unknown>;
-    capability: ToolCapability;
-  };
-  run(
-    argumentsValue: JsonValue,
-    context: {
-      tenantId?: string; userId?: string; role?: string; signal?: AbortSignal;
-      [key: string]: unknown;
-    },
-  ): Promise<{ id: string; content: string; isError?: boolean }>;
 }
