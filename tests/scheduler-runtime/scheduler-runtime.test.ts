@@ -47,7 +47,8 @@ const task: ScheduledTask = {
 describe('SchedulerRunner', () => {
   it('binds the durable Run before waiting for its final result', async () => {
     const base = new MemorySchedulerStore([task]);
-    const bindRun = vi.fn(async () => undefined);
+    const realBindRun = base.bindRun.bind(base);
+    const bindRun = vi.fn((input: Parameters<typeof base.bindRun>[0]) => realBindRun(input));
     const completeFire = vi.spyOn(base, 'completeFire');
     const store = new Proxy(base, {
       get(target, property) {
@@ -74,6 +75,9 @@ describe('SchedulerRunner', () => {
     });
     await tick;
     expect(completeFire).toHaveBeenCalledOnce();
+    expect((await base.listFires())[0]).toMatchObject({
+      state: 'started', runId: 'run-bound', result: { runId: 'run-bound', status: 'succeeded' },
+    });
   });
 
   it('dispatches a due fire once when two workers scan concurrently', async () => {
@@ -210,6 +214,39 @@ describe('SchedulerRunner', () => {
     expect(recovering?.claimToken).not.toBe(originalToken);
   });
 
+  it('requires an expired observation lease and due retry window when claiming a bound Run', async () => {
+    const store = new MemorySchedulerStore([task]);
+    const [fire] = await store.claimDue({ now: fireTime, limit: 1, workerId: 'worker-a', leaseMs: 1_000 });
+    await store.bindRun({
+      fireId: fire!.fireId, claimToken: fire!.claimToken, runId: fire!.fireId, boundAt: fireTime,
+    });
+
+    expect(await store.claimBound({
+      fireId: fire!.fireId, expectedClaimToken: fire!.claimToken,
+      now: new Date(fireTime.getTime() + 999), workerId: 'worker-b', leaseMs: 1_000,
+    })).toBeUndefined();
+    expect((await store.listFires())[0]).toMatchObject({
+      state: 'bound', claimToken: fire!.claimToken, attempts: 1,
+    });
+
+    const recovering = await store.claimBound({
+      fireId: fire!.fireId, expectedClaimToken: fire!.claimToken,
+      now: new Date(fireTime.getTime() + 1_001), workerId: 'worker-b', leaseMs: 1_000,
+    });
+    const retryAt = new Date(fireTime.getTime() + 5_000);
+    await store.releaseBound({
+      fireId: fire!.fireId, claimToken: recovering!.claimToken, retryAt, error: 'retry later',
+    });
+
+    expect(await store.claimBound({
+      fireId: fire!.fireId, expectedClaimToken: recovering!.claimToken,
+      now: new Date(retryAt.getTime() - 1), workerId: 'worker-c', leaseMs: 1_000,
+    })).toBeUndefined();
+    expect((await store.listFires())[0]).toMatchObject({
+      state: 'bound', claimToken: recovering!.claimToken, retryAt, attempts: 1,
+    });
+  });
+
   it('releases a recovering bound Run without changing its token or attempts', async () => {
     const store = new MemorySchedulerStore([task]);
     const [fire] = await store.claimDue({ now: fireTime, limit: 1, workerId: 'worker-a', leaseMs: 1_000 });
@@ -229,6 +266,101 @@ describe('SchedulerRunner', () => {
     expect((await store.listFires())[0]).toMatchObject({
       state: 'bound', runId: fire!.fireId, claimToken: recovering!.claimToken,
       claimedBy: undefined, leaseExpiresAt: retryAt, retryAt, attempts: 1, lastError: 'result unavailable',
+    });
+  });
+
+  it('returns an expired recovering Run to bound without changing its token or attempts', async () => {
+    const store = new MemorySchedulerStore([task]);
+    const [fire] = await store.claimDue({ now: fireTime, limit: 1, workerId: 'worker-a', leaseMs: 1_000 });
+    await store.bindRun({
+      fireId: fire!.fireId, claimToken: fire!.claimToken, runId: fire!.fireId, boundAt: fireTime,
+    });
+    const recovering = await store.claimBound({
+      fireId: fire!.fireId, expectedClaimToken: fire!.claimToken,
+      now: new Date(fireTime.getTime() + 1_001), workerId: 'worker-b', leaseMs: 1_000,
+    });
+    const recoveryExpiredAt = new Date(fireTime.getTime() + 2_002);
+
+    expect(await store.recoverExpired(recoveryExpiredAt)).toBe(1);
+    expect((await store.listFires())[0]).toMatchObject({
+      state: 'bound', claimToken: recovering!.claimToken, claimedBy: undefined,
+      attempts: 1, retryAt: recoveryExpiredAt,
+    });
+  });
+
+  it('rejects completion Run mismatches for bound and recovering fires', async () => {
+    const boundStore = new MemorySchedulerStore([task]);
+    const [boundFire] = await boundStore.claimDue({ now: fireTime, limit: 1, workerId: 'worker-a', leaseMs: 1_000 });
+    await boundStore.bindRun({
+      fireId: boundFire!.fireId, claimToken: boundFire!.claimToken, runId: boundFire!.fireId, boundAt: fireTime,
+    });
+    await expect(boundStore.completeFire({
+      fireId: boundFire!.fireId, claimToken: boundFire!.claimToken,
+      runId: 'different-run', result: succeeded('different-run').result, completedAt: fireTime,
+    })).rejects.toThrow();
+    expect((await boundStore.listFires())[0]).toMatchObject({
+      state: 'bound', runId: boundFire!.fireId, claimToken: boundFire!.claimToken, attempts: 1,
+    });
+
+    const recoveringStore = new MemorySchedulerStore([task]);
+    const [recoveringFire] = await recoveringStore.claimDue({ now: fireTime, limit: 1, workerId: 'worker-a', leaseMs: 1_000 });
+    await recoveringStore.bindRun({
+      fireId: recoveringFire!.fireId, claimToken: recoveringFire!.claimToken,
+      runId: recoveringFire!.fireId, boundAt: fireTime,
+    });
+    const recovering = await recoveringStore.claimBound({
+      fireId: recoveringFire!.fireId, expectedClaimToken: recoveringFire!.claimToken,
+      now: new Date(fireTime.getTime() + 1_001), workerId: 'worker-b', leaseMs: 1_000,
+    });
+    await expect(recoveringStore.completeFire({
+      fireId: recovering!.fireId, claimToken: recovering!.claimToken,
+      runId: recovering!.runId, result: succeeded('different-result-run').result, completedAt: fireTime,
+    })).rejects.toThrow();
+    expect((await recoveringStore.listFires())[0]).toMatchObject({
+      state: 'recovering', runId: recovering!.runId, claimToken: recovering!.claimToken, attempts: 1,
+    });
+  });
+
+  it('completes bound and recovering fires and fences started replays by Run identity', async () => {
+    const boundStore = new MemorySchedulerStore([task]);
+    const [boundFire] = await boundStore.claimDue({ now: fireTime, limit: 1, workerId: 'worker-a', leaseMs: 1_000 });
+    await boundStore.bindRun({
+      fireId: boundFire!.fireId, claimToken: boundFire!.claimToken, runId: boundFire!.fireId, boundAt: fireTime,
+    });
+    const completion = {
+      fireId: boundFire!.fireId, claimToken: boundFire!.claimToken, runId: boundFire!.fireId,
+      result: succeeded(boundFire!.fireId).result, completedAt: fireTime,
+    };
+    await boundStore.completeFire(completion);
+    await expect(boundStore.completeFire(completion)).resolves.toBeUndefined();
+    await expect(boundStore.completeFire({
+      ...completion, runId: 'different-run', result: succeeded('different-run').result,
+    })).rejects.toThrow();
+    await expect(boundStore.completeFire({
+      ...completion, result: succeeded('different-result-run').result,
+    })).rejects.toThrow();
+    expect((await boundStore.listFires())[0]).toMatchObject({
+      state: 'started', runId: boundFire!.fireId,
+      result: { runId: boundFire!.fireId, status: 'succeeded' }, attempts: 1,
+    });
+
+    const recoveringStore = new MemorySchedulerStore([task]);
+    const [recoveringFire] = await recoveringStore.claimDue({ now: fireTime, limit: 1, workerId: 'worker-a', leaseMs: 1_000 });
+    await recoveringStore.bindRun({
+      fireId: recoveringFire!.fireId, claimToken: recoveringFire!.claimToken,
+      runId: recoveringFire!.fireId, boundAt: fireTime,
+    });
+    const recovering = await recoveringStore.claimBound({
+      fireId: recoveringFire!.fireId, expectedClaimToken: recoveringFire!.claimToken,
+      now: new Date(fireTime.getTime() + 1_001), workerId: 'worker-b', leaseMs: 1_000,
+    });
+    await recoveringStore.completeFire({
+      fireId: recovering!.fireId, claimToken: recovering!.claimToken, runId: recovering!.runId,
+      result: succeeded(recovering!.runId).result, completedAt: fireTime,
+    });
+    expect((await recoveringStore.listFires())[0]).toMatchObject({
+      state: 'started', runId: recovering!.runId,
+      result: { runId: recovering!.runId, status: 'succeeded' }, attempts: 1,
     });
   });
 

@@ -104,9 +104,15 @@ export class MemorySchedulerStore implements SchedulerStore {
 
   async completeFire(input: CompleteFireInput): Promise<void> {
     const fire = this.fires.get(input.fireId);
-    if (fire?.state === 'started' && fire.runId === input.runId) return;
+    if (fire?.state === 'started') {
+      if (fire.runId === input.runId && input.result.runId === input.runId) return;
+      throw new Error(`scheduled fire Run mismatch: ${input.fireId}`);
+    }
     if (!fire || (fire.state !== 'bound' && fire.state !== 'recovering') || fire.claimToken !== input.claimToken) {
       throw new Error(`stale scheduler claim: ${input.fireId}`);
+    }
+    if (fire.runId !== input.runId || input.result.runId !== input.runId) {
+      throw new Error(`scheduled fire Run mismatch: ${input.fireId}`);
     }
     Object.assign(fire, {
       state: 'started' as const,
@@ -145,7 +151,15 @@ export class MemorySchedulerStore implements SchedulerStore {
 
   async claimBound(input: ClaimBoundInput): Promise<RecoveringScheduledFire | undefined> {
     const fire = this.fires.get(input.fireId);
-    if (!fire || fire.state !== 'bound' || fire.claimToken !== input.expectedClaimToken) return undefined;
+    if (
+      !fire
+      || fire.state !== 'bound'
+      || fire.claimToken !== input.expectedClaimToken
+      || !fire.runId
+      || !fire.leaseExpiresAt
+      || fire.leaseExpiresAt.getTime() > input.now.getTime()
+      || (fire.retryAt !== undefined && fire.retryAt.getTime() > input.now.getTime())
+    ) return undefined;
     const claimToken = `${input.workerId}:${++this.claimSequence}`;
     Object.assign(fire, {
       state: 'recovering' as const,
