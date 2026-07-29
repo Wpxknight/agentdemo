@@ -250,6 +250,62 @@ describe('SkillRegistry', () => {
     await expect(stat(builtin)).resolves.toBeDefined();
   });
 
+  it('inherits only restrictive built-in visibility changes across image updates', async () => {
+    const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-overlay-visibility-source-'));
+    const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-overlay-visibility-product-'));
+    const restricted = join(builtinRoot, 'users', 'admin', 'restricted-builtin');
+    const expanded = join(builtinRoot, 'users', 'admin', 'expanded-builtin');
+    await mkdir(restricted, { recursive: true });
+    await mkdir(expanded, { recursive: true });
+    await writeFile(join(restricted, 'SKILL.md'), '---\nname: restricted-builtin\ndescription: v1\n---\nv1');
+    await writeFile(join(expanded, 'SKILL.md'), '---\nname: expanded-builtin\ndescription: v1\n---\nv1');
+    await writeProduct(restricted, {
+      name: 'restricted-builtin', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', ownerUserId: 'admin', visibility: 'shared',
+    });
+    await writeProduct(expanded, {
+      name: 'expanded-builtin', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', ownerUserId: 'admin', visibility: 'private',
+    });
+    const registry = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    const admin = { tenantId: 'default', userId: 'admin', role: 'tenant_admin' as const };
+    const viewer = { tenantId: 'default', userId: 'viewer', role: 'user' as const };
+    await registry.scan();
+
+    await registry.setShared('restricted-builtin', false, admin);
+    await registry.setEnabled('restricted-builtin', false, admin);
+    await registry.setEnabled('restricted-builtin', true, admin);
+    await registry.setShared('expanded-builtin', true, admin);
+    await expect(registry.loadFor('expanded-builtin', viewer)).resolves.toMatchObject({ body: 'v1' });
+
+    await writeFile(join(restricted, 'SKILL.md'), '---\nname: restricted-builtin\ndescription: v2\n---\nv2');
+    await writeFile(join(expanded, 'SKILL.md'), '---\nname: expanded-builtin\ndescription: v2\n---\nv2');
+    await writeProduct(restricted, {
+      name: 'restricted-builtin', version: '2', enabled: true, reviewed: true,
+      tenantId: 'default', ownerUserId: 'admin', visibility: 'shared',
+    });
+    await writeProduct(expanded, {
+      name: 'expanded-builtin', version: '2', enabled: true, reviewed: true,
+      tenantId: 'default', ownerUserId: 'admin', visibility: 'private',
+    });
+
+    await expect(registry.loadFor('restricted-builtin', viewer)).resolves.toBeUndefined();
+    await expect(registry.loadFor('expanded-builtin', viewer)).resolves.toBeUndefined();
+    expect(registry.listFor(admin).find((skill) => skill.name === 'restricted-builtin')?.visibility).toBe('private');
+    expect(registry.listFor(admin).find((skill) => skill.name === 'expanded-builtin')?.visibility).toBe('private');
+
+    await registry.setEnabled('restricted-builtin', false, admin);
+    await registry.setEnabled('restricted-builtin', true, admin);
+    await writeFile(join(restricted, 'SKILL.md'), '---\nname: restricted-builtin\ndescription: v3\n---\nv3');
+    await writeProduct(restricted, {
+      name: 'restricted-builtin', version: '3', enabled: true, reviewed: true,
+      tenantId: 'default', ownerUserId: 'admin', visibility: 'shared',
+    });
+
+    await expect(registry.loadFor('restricted-builtin', viewer)).resolves.toBeUndefined();
+    expect(registry.listFor(admin).find((skill) => skill.name === 'restricted-builtin')?.visibility).toBe('private');
+  });
+
   it('reviews an unreviewed read-only built-in through the writable governance overlay', async () => {
     const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-overlay-review-source-'));
     const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-overlay-review-product-'));

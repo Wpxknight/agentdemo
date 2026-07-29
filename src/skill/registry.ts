@@ -21,6 +21,7 @@ import {
   PRODUCT_RECORD_FILE,
   PUBLISHED_COMMIT_FILE,
   normalizeSkillProductRecord,
+  parseSkillProductMetadata,
   type SkillProductRecord,
 } from './product.js';
 import { canManageSkill, isSkillVisibleTo } from './visibility.js';
@@ -59,6 +60,7 @@ interface BuiltinGovernanceOverlay {
   tenantId: string;
   sourceDigest: string;
   sourceVersion: string;
+  sourceVisibility?: SkillVisibility;
   revision: number;
   enabled: boolean;
   reviewed: boolean;
@@ -812,6 +814,7 @@ export class SkillRegistry {
           ...record,
           enabled: overlay.enabled === false ? false : record.enabled,
           reviewed: overlay.reviewed === false ? false : record.reviewed,
+          visibility: restrictiveOverlayVisibility(overlay, record.visibility),
           revision: overlay.revision,
         });
       }
@@ -834,6 +837,9 @@ export class SkillRegistry {
     deleted = false,
   ): Promise<void> {
     const source = await this.builtinSource(sourceRecord);
+    const sourceMetadata = parseSkillProductMetadata(JSON.parse(
+      await readFile(join(sourceRecord.path, PRODUCT_RECORD_FILE), 'utf8'),
+    ));
     const current = await readBuiltinGovernanceOverlay(this.dir, source.identity);
     await writeBuiltinGovernanceOverlay(this.dir, {
       schemaVersion: 1,
@@ -842,6 +848,7 @@ export class SkillRegistry {
       tenantId: sourceRecord.tenantId,
       sourceDigest: source.digest,
       sourceVersion: sourceRecord.version,
+      sourceVisibility: sourceMetadata.visibility,
       revision: (current?.revision ?? 0) + 1,
       enabled: next.enabled,
       reviewed: next.reviewed,
@@ -903,6 +910,8 @@ async function readBuiltinGovernanceOverlay(
     || typeof value.name !== 'string' || typeof value.tenantId !== 'string'
     || typeof value.sourceDigest !== 'string' || !/^[a-f0-9]{64}$/.test(value.sourceDigest)
     || typeof value.sourceVersion !== 'string'
+    || (value.sourceVisibility !== undefined
+      && !['public', 'private', 'shared'].includes(String(value.sourceVisibility)))
     || !Number.isInteger(value.revision) || (value.revision ?? 0) < 1
     || typeof value.enabled !== 'boolean' || typeof value.reviewed !== 'boolean'
     || !['public', 'private', 'shared'].includes(String(value.visibility))
@@ -910,6 +919,20 @@ async function readBuiltinGovernanceOverlay(
     throw new Error(`内置技能治理 overlay 无效：${identity}`);
   }
   return value as BuiltinGovernanceOverlay;
+}
+
+function restrictiveOverlayVisibility(
+  overlay: BuiltinGovernanceOverlay,
+  sourceVisibility: SkillVisibility,
+): SkillVisibility {
+  const visibilityRank: Record<SkillVisibility, number> = { private: 0, shared: 1, public: 2 };
+  const wasRestrictive = overlay.sourceVisibility === undefined
+    ? overlay.visibility === 'private'
+    : visibilityRank[overlay.visibility] < visibilityRank[overlay.sourceVisibility];
+  if (!wasRestrictive || visibilityRank[overlay.visibility] >= visibilityRank[sourceVisibility]) {
+    return sourceVisibility;
+  }
+  return overlay.visibility;
 }
 
 async function readBuiltinCatalogEntries(root: string): Promise<BuiltinCatalogEntry[]> {
