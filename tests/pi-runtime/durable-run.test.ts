@@ -335,6 +335,59 @@ describe('MemoryRunStore durable contract', () => {
     })).resolves.toBeUndefined();
   });
 
+  it('rejects an escaped nested transaction that succeeds after its parent is invalidated', async () => {
+    const store = new MemoryRunStore();
+    let nestedEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { nestedEntered = resolve; });
+    let releaseNested!: () => void;
+    const nestedGate = new Promise<void>((resolve) => { releaseNested = resolve; });
+    const record = (id: string) => ({
+      id, tenantId: identity.tenantId, runId: 'nested-success-run', attemptId: 'attempt-a', turnNo: 1,
+      kind: 'approval' as const, status: 'pending' as const, payload: {}, createdAt: new Date(),
+    });
+    let nested!: Promise<string>;
+
+    await store.transaction(async () => {
+      nested = store.transaction(async (tx) => {
+        nestedEntered();
+        await nestedGate;
+        await tx.interactions.put(record('nested-write'));
+        return 'ok';
+      });
+      await entered;
+    });
+
+    await store.interactions.put(record('later-success'));
+    releaseNested();
+
+    await expect(nested).rejects.toMatchObject({
+      code: 'RUN_STATE_CONFLICT', message: 'Transaction context is no longer active',
+    });
+    await expect(store.interactions.get({
+      tenantId: identity.tenantId, runId: 'nested-success-run', interactionId: 'later-success',
+    })).resolves.toMatchObject({ id: 'later-success' });
+    await expect(store.interactions.get({
+      tenantId: identity.tenantId, runId: 'nested-success-run', interactionId: 'nested-write',
+    })).resolves.toBeUndefined();
+  });
+
+  it('commits a successful nested transaction awaited by its active parent', async () => {
+    const store = new MemoryRunStore();
+    const record = {
+      id: 'awaited-nested-write', tenantId: identity.tenantId, runId: 'awaited-nested-run',
+      attemptId: 'attempt-a', turnNo: 1, kind: 'approval' as const, status: 'pending' as const,
+      payload: {}, createdAt: new Date(),
+    };
+
+    await expect(store.transaction(async (tx) => tx.transaction(async (nested) => {
+      await nested.interactions.put(record);
+      return 'ok';
+    }))).resolves.toBe('ok');
+    await expect(store.interactions.get({
+      tenantId: identity.tenantId, runId: 'awaited-nested-run', interactionId: 'awaited-nested-write',
+    })).resolves.toMatchObject({ id: 'awaited-nested-write' });
+  });
+
   it('does not expose a stale transaction overlay through an escaped read context', async () => {
     const store = new MemoryRunStore();
     let releaseRead!: () => void;

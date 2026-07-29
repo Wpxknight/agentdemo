@@ -409,7 +409,8 @@ export class MemoryRunStore implements DurableProductRunStore {
       const transactionContext: MutationContext = { active: true, state: clone(parentState) };
       try {
         const result = await this.mutationContext.run(transactionContext, () => work(this));
-        if (parentContext?.active) restoreState(parentState, transactionContext.state!);
+        if (!parentContext?.active) throw conflict('Transaction context is no longer active');
+        restoreState(parentState, transactionContext.state!);
         return result;
       } finally {
         transactionContext.active = false;
