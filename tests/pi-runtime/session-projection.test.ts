@@ -151,4 +151,32 @@ describe('Pi session projection', () => {
       role: 'assistant', text: 'done', durationMs: 42,
     });
   });
+
+  it('leaves the product view unchanged until Pi has a committed leaf', async () => {
+    const store = new MemoryStore();
+    await store.appendMessage(ctx, 'session-a', { role: 'user', text: 'legacy history' });
+    const source = {
+      async get() {
+        return {
+          tenantId: ctx.tenantId,
+          sessionId: 'session-a',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          currentLeafId: 'uncommitted',
+          committedLeafId: null,
+        };
+      },
+      async listEntries() {
+        throw new Error('uncommitted entries must not be loaded for projection');
+      },
+    };
+
+    expect(await projectCommittedPiSession({
+      store,
+      sessions: source as never,
+      ctx,
+      sessionId: 'session-a',
+    })).toBe(false);
+    expect(await store.listMessages(ctx, 'session-a')).toEqual([{ role: 'user', text: 'legacy history' }]);
+  });
 });

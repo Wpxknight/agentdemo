@@ -33,7 +33,7 @@ export async function projectCommittedPiSession(input: {
   durationMs?: number;
 }): Promise<boolean> {
   const session = await input.sessions.get(input.ctx.tenantId, input.sessionId);
-  if (!session) return false;
+  if (!session?.committedLeafId) return false;
   const records = await input.sessions.listEntries(input.ctx.tenantId, input.sessionId, { committedOnly: true });
   const entries = records.map((record) => record.entry);
   const finalAssistant = entries.findLast((entry) => entry.type === 'message' && entry.message.role === 'assistant');
