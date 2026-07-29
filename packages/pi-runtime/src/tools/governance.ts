@@ -1,4 +1,5 @@
 import type {
+  DurableInteractionUpdate,
   DurableToolLedgerUpdate,
   JsonValue,
   ToolCall,
@@ -13,6 +14,9 @@ import type { ToolAudit, ToolAuditEvent, ToolAuditStatus } from './audit.js';
 import { ResourceConcurrencyController, type ResourceConcurrency } from './concurrency.js';
 import { digestToolValue, type ToolLedgerStore } from './ledger.js';
 import type { ToolPolicy, ToolPolicyDecision } from './policy.js';
+
+const GOVERNED_INPUT_BINDING = '__aiopGovernedInput';
+const PRODUCT_INTERACTION_BASE_KEYS = ['id', 'tenantId', 'userId', 'sessionId', 'runId', 'createdAt'] as const;
 
 export interface GovernedToolFactoryOptions {
   ledger: ToolLedgerStore;
@@ -305,7 +309,8 @@ class GovernedToolRuntime implements ToolRuntime {
       return { kind: 'recovery_required', message: 'interaction resolution is not bound to the pending interaction' };
     }
     const callArgsDigest = digestToolValue(call.arguments);
-    if (digestToolValue(interaction.payload) !== callArgsDigest || existing.argsDigest !== callArgsDigest) {
+    if (!productInteractionPayloadMatches(interaction, kind, call.arguments)
+      || existing.argsDigest !== callArgsDigest) {
       return { kind: 'recovery_required', message: 'interaction payload is not bound to the pending tool call' };
     }
     const toolResult: ToolResult = {
@@ -453,6 +458,39 @@ function approvalPayloadIdentity(payload: JsonValue): {
   }
   if (toolCallIds.length === 0) return undefined;
   return { name: pendingCall.name, argsDigest: digestToolValue(pendingCall.args), toolCallIds };
+}
+
+function productInteractionPayloadMatches(
+  interaction: DurableInteractionUpdate,
+  kind: 'question' | 'plan',
+  argumentsValue: JsonValue,
+): boolean {
+  if (digestToolValue(interaction.payload) === digestToolValue(argumentsValue)) return true;
+  if (!isJsonObject(interaction.payload)) return false;
+  const payload = interaction.payload;
+  if (payload.id !== interaction.id || payload.tenantId !== interaction.tenantId
+    || payload.userId !== (interaction.userId ?? null) || payload.sessionId !== (interaction.sessionId ?? '')
+    || payload.runId !== interaction.runId || payload.createdAt !== interaction.createdAt.toISOString()) return false;
+  const binding = Object.hasOwn(payload, GOVERNED_INPUT_BINDING)
+    ? payload[GOVERNED_INPUT_BINDING] : undefined;
+  if (binding !== undefined && digestToolValue(binding) !== digestToolValue(argumentsValue)) return false;
+  if (kind === 'plan') {
+    const expectedKeys = [...PRODUCT_INTERACTION_BASE_KEYS, 'questions', 'plan',
+      ...(binding === undefined ? [] : [GOVERNED_INPUT_BINDING])];
+    const summary = isJsonObject(argumentsValue) ? argumentsValue.summary : undefined;
+    const expectedQuestions: JsonValue = [{
+      question: `请审批变更方案：${typeof summary === 'string' ? summary : ''}`,
+      header: '变更审批', options: [{ label: '批准' }, { label: '拒绝' }],
+    }];
+    return Object.keys(payload).length === expectedKeys.length
+      && expectedKeys.every((key) => Object.hasOwn(payload, key))
+      && digestToolValue(payload.plan) === digestToolValue(argumentsValue)
+      && digestToolValue(payload.questions) === digestToolValue(expectedQuestions);
+  }
+  const rawQuestion = Object.fromEntries(Object.entries(payload).filter(([key]) =>
+    !PRODUCT_INTERACTION_BASE_KEYS.includes(key as typeof PRODUCT_INTERACTION_BASE_KEYS[number])
+      && key !== GOVERNED_INPUT_BINDING)) as JsonValue;
+  return digestToolValue(rawQuestion) === digestToolValue(argumentsValue);
 }
 
 function isJsonObject(value: JsonValue | undefined): value is Record<string, JsonValue> {

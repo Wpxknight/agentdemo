@@ -31,6 +31,9 @@ import {
 import { GovernedToolExecutionError, GovernedToolOutcomeError } from './tool-bridge.js';
 import { digestToolValue } from '../tools/ledger.js';
 
+const GOVERNED_INPUT_BINDING = '__aiopGovernedInput';
+const PRODUCT_INTERACTION_BASE_KEYS = ['id', 'tenantId', 'userId', 'sessionId', 'runId', 'createdAt'] as const;
+
 export interface PiAgentSessionFactoryOptions<
   TMetadata extends SessionMetadata,
   TCreateOptions extends SessionCreateOptions,
@@ -673,15 +676,19 @@ function waitingInteractionBinding(
     || ledgers.length !== 1 || interactions.length !== 1
     || interactions[0]!.tenantId !== ledgers[0]!.tenantId || interactions[0]!.runId !== ledgers[0]!.runId
     || interactions[0]!.attemptId !== ledgers[0]!.attemptId || interactions[0]!.turnNo !== ledgers[0]!.turnNo
-    || !waitingPayloadMatches(interactions[0]!.payload, resolution.kind, call)) return undefined;
+    || !waitingPayloadMatches(interactions[0]!, resolution.kind, call)) return undefined;
   return { ledger: ledgers[0]!, interaction: interactions[0]! };
 }
 
 function waitingPayloadMatches(
-  payload: JsonValue,
+  interaction: DurableInteractionUpdate,
   kind: ResolvedInteraction['kind'],
   call: Extract<AssistantMessage['content'][number], { type: 'toolCall' }>,
 ): boolean {
+  const payload = interaction.payload;
+  if (kind === 'question' || kind === 'plan') {
+    return productInteractionPayloadMatches(interaction, kind, call.arguments);
+  }
   if (kind !== 'approval') return digestToolValue(payload) === digestToolValue(call.arguments);
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)
     || !payload.call || typeof payload.call !== 'object' || Array.isArray(payload.call)) return false;
@@ -691,6 +698,59 @@ function waitingPayloadMatches(
   return toolCallIds.length > 0 && toolCallIds.every((toolCallId) => toolCallId === call.id)
     && pendingCall.name === call.name && Object.hasOwn(pendingCall, 'args')
     && digestToolValue(pendingCall.args) === digestToolValue(call.arguments);
+}
+
+function productInteractionPayloadMatches(
+  interaction: DurableInteractionUpdate,
+  kind: 'question' | 'plan',
+  argumentsValue: JsonValue,
+): boolean {
+  if (digestToolValue(interaction.payload) === digestToolValue(argumentsValue)) return true;
+  const payload = asJsonObject(interaction.payload);
+  if (!payload || !productInteractionBaseMatches(payload, interaction)) return false;
+  const binding = Object.hasOwn(payload, GOVERNED_INPUT_BINDING)
+    ? payload[GOVERNED_INPUT_BINDING] : undefined;
+  if (binding !== undefined && digestToolValue(binding) !== digestToolValue(argumentsValue)) return false;
+  if (kind === 'plan') {
+    const expectedKeys = [...PRODUCT_INTERACTION_BASE_KEYS, 'questions', 'plan',
+      ...(binding === undefined ? [] : [GOVERNED_INPUT_BINDING])];
+    return hasExactKeys(payload, expectedKeys)
+      && digestToolValue(payload.plan) === digestToolValue(argumentsValue)
+      && productPlanQuestionsMatch(payload.questions, argumentsValue);
+  }
+  const rawQuestion = Object.fromEntries(Object.entries(payload).filter(([key]) =>
+    !PRODUCT_INTERACTION_BASE_KEYS.includes(key as typeof PRODUCT_INTERACTION_BASE_KEYS[number])
+      && key !== GOVERNED_INPUT_BINDING)) as JsonValue;
+  return digestToolValue(rawQuestion) === digestToolValue(argumentsValue);
+}
+
+function productInteractionBaseMatches(
+  payload: Record<string, JsonValue>,
+  interaction: DurableInteractionUpdate,
+): boolean {
+  return payload.id === interaction.id
+    && payload.tenantId === interaction.tenantId
+    && payload.userId === (interaction.userId ?? null)
+    && payload.sessionId === (interaction.sessionId ?? '')
+    && payload.runId === interaction.runId
+    && payload.createdAt === interaction.createdAt.toISOString();
+}
+
+function productPlanQuestionsMatch(questions: JsonValue, plan: JsonValue): boolean {
+  const summary = asJsonObject(plan)?.summary;
+  return digestToolValue(questions) === digestToolValue([{
+    question: `请审批变更方案：${typeof summary === 'string' ? summary : ''}`,
+    header: '变更审批', options: [{ label: '批准' }, { label: '拒绝' }],
+  }]);
+}
+
+function hasExactKeys(value: Record<string, JsonValue>, expected: readonly string[]): boolean {
+  const keys = Object.keys(value);
+  return keys.length === expected.length && expected.every((key) => Object.hasOwn(value, key));
+}
+
+function asJsonObject(value: JsonValue): Record<string, JsonValue> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : undefined;
 }
 
 function replayToolResultEvent(

@@ -12,6 +12,8 @@ import {
 import type { RunAgentOptions } from '../agent/run-types.js';
 import { logger } from '../logger.js';
 
+const GOVERNED_INPUT_BINDING = '__aiopGovernedInput';
+
 export function createAIOPToolRuntime(
   options: RunAgentOptions,
   ledger: ToolLedgerStore,
@@ -143,8 +145,13 @@ export function createAIOPToolRuntime(
                   options: [{ label: '批准' }, { label: '拒绝' }],
                 }],
                 plan: interaction.payload,
+                [GOVERNED_INPUT_BINDING]: interaction.payload,
               }
-            : { ...base, ...asObject(interaction.payload) };
+            : {
+                ...asObject(interaction.payload),
+                ...base,
+                [GOVERNED_INPUT_BINDING]: interaction.payload,
+              };
           return {
             ...interaction,
             userId: interaction.userId ?? context.identity.actorId,
