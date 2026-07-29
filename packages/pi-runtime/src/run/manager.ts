@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { AgentPlatformError } from '@aiop/control-contracts';
 import type {
   AgentInputMessage, AgentRunEvent, AgentRunResult, AgentRunUsage, AppendRunMessageInput, CancelRunInput,
-  AgentPlatformErrorData, ClaimedRun, DurableInteractionUpdate, DurableRunRuntime, DurableToolLedgerUpdate, RunHandle,
+  AgentPlatformErrorData, ClaimedRun, CommitTurnInput, DurableInteractionUpdate, DurableRunRuntime,
+  DurableToolLedgerUpdate, RunHandle,
   StartRunInput, ResumeRunInput,
 } from '@aiop/control-contracts';
 import type { SessionMetadata, SessionTreeEntry } from '@earendil-works/pi-agent-core';
@@ -275,7 +276,7 @@ export class DurableRunManager implements DurableRunRuntime {
         const leafId = await session?.leafId() ?? null;
         const outcome = error.outcome;
         const facts = session?.takeToolExecutionFacts?.();
-        await this.options.store.commitTurn({
+        const governedCommit: CommitTurnInput = {
           tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, turnNo,
           fencingToken: claimed.fencingToken,
           checkpoint: { piSessionId, piLeafId: leafId },
@@ -287,7 +288,23 @@ export class DurableRunManager implements DurableRunRuntime {
             ? { code: 'TOOL_RESULT_UNKNOWN', message: error.message, retryable: false }
             : undefined,
           usage: actualUsage, committedAt: this.now(),
-        });
+        };
+        try {
+          await this.options.store.commitTurn(governedCommit);
+        } catch (commitError) {
+          const cancellationWon = hasErrorCode(commitError, 'RUN_STATE_CONFLICT')
+            && await this.options.store.isCancellationRequested({ tenantId: identity.tenantId, runId });
+          if (!cancellationWon) throw commitError;
+          await this.options.store.commitTurn({
+            ...governedCommit, status: 'cancelled', waitingReason: undefined, error: undefined,
+          });
+          eventsPersisted = true;
+          await this.options.store.complete({
+            tenantId: identity.tenantId, runId, attemptId: claimed.attemptId,
+            fencingToken: claimed.fencingToken, status: 'cancelled', usage: actualUsage, completedAt: this.now(),
+          });
+          return { runId, status: 'cancelled', usage: actualUsage };
+        }
         eventsPersisted = true;
         if (outcome.kind === 'waiting') return { runId, status: 'waiting', usage: actualUsage };
         const errorData = { code: 'TOOL_RESULT_UNKNOWN' as const, message: error.message, retryable: false };

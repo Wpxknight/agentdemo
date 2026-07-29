@@ -1132,13 +1132,20 @@ describe('DurableRunManager', () => {
     });
   });
 
-  it('lets cancellation win when an aborted governed tool reports an uncertain result', async () => {
+  it('lets cancellation win when it lands between governed outcome arbitration and commit', async () => {
     const base = new MemoryRunStore();
     let committed: Record<string, unknown> | undefined;
+    let cancellationInjected = false;
     const store = new Proxy(base, {
       get(target, property) {
         if (property === 'commitTurn') return async (input: Record<string, unknown>) => {
           committed = input;
+          if (input.status === 'recovery_required' && !cancellationInjected) {
+            cancellationInjected = true;
+            await target.requestCancellation({
+              identity, runId: 'cancel-governed-run', requestedAt: new Date(), reason: 'stop',
+            });
+          }
           return target.commitTurn(input as never);
         };
         const value = Reflect.get(target, property);
@@ -1152,16 +1159,9 @@ describe('DurableRunManager', () => {
       status: 'recovery_required' as const,
       createdAt: new Date(), updatedAt: new Date(),
     };
-    let started!: () => void;
-    const toolStarted = new Promise<void>((resolve) => { started = resolve; });
     const session: ManagedPiSession = {
       ...emptySession('cancel-governed-session'),
-      async *continue(signal) {
-        started();
-        await new Promise<void>((resolve) => {
-          if (signal?.aborted) resolve();
-          else signal?.addEventListener('abort', () => resolve(), { once: true });
-        });
+      async *continue() {
         throw new GovernedToolOutcomeError({
           kind: 'recovery_required', correlationId: 'external-cancel', message: 'external result is uncertain',
         });
@@ -1177,13 +1177,16 @@ describe('DurableRunManager', () => {
       input: [{ role: 'user', text: 'run a non-idempotent tool' }],
     });
 
-    await toolStarted;
-    await manager.cancel({ identity, runId: handle.runId, reason: 'stop' });
-
     await expect(handle.result()).resolves.toMatchObject({ status: 'cancelled' });
     expect(await base.get({ tenantId: identity.tenantId, runId: handle.runId })).toMatchObject({
       status: 'cancelled', leaseOwner: undefined, leaseExpiresAt: undefined,
     });
+    expect(await base.attempts.list({ tenantId: identity.tenantId, runId: handle.runId })).toEqual([
+      expect.objectContaining({ status: 'cancelled', completedAt: expect.any(Date) }),
+    ]);
+    expect(await base.toolLedger.get({
+      tenantId: identity.tenantId, runId: handle.runId, logicalCallId: ledgerUpdate.logicalCallId,
+    })).toEqual(ledgerUpdate);
     expect(committed).toMatchObject({ status: 'cancelled', ledgerUpdates: [ledgerUpdate] });
   });
 
