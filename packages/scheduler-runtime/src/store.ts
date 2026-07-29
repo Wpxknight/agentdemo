@@ -1,6 +1,12 @@
 import { nextFireAt } from './cron.js';
 import type { AgentRunResult } from '@aiop/control-contracts';
-import type { ClaimedScheduledFire, ScheduledFire, ScheduledTask } from './domain.js';
+import type {
+  BoundScheduledFire,
+  ClaimedScheduledFire,
+  RecoveringScheduledFire,
+  ScheduledFire,
+  ScheduledTask,
+} from './domain.js';
 
 export interface ClaimDueInput {
   now: Date;
@@ -31,8 +37,31 @@ export interface ReleaseFireInput {
   error: string;
 }
 
+export interface ListBoundInput {
+  now: Date;
+  limit: number;
+}
+
+export interface ClaimBoundInput {
+  fireId: string;
+  expectedClaimToken: string;
+  now: Date;
+  workerId: string;
+  leaseMs: number;
+}
+
+export interface ReleaseBoundInput {
+  fireId: string;
+  claimToken: string;
+  retryAt: Date;
+  error: string;
+}
+
 export interface SchedulerStore {
   claimDue(input: ClaimDueInput): Promise<ClaimedScheduledFire[]>;
+  listBound(input: ListBoundInput): Promise<BoundScheduledFire[]>;
+  claimBound(input: ClaimBoundInput): Promise<RecoveringScheduledFire | undefined>;
+  releaseBound(input: ReleaseBoundInput): Promise<void>;
   bindRun(input: BindRunInput): Promise<void>;
   completeFire(input: CompleteFireInput): Promise<void>;
   releaseFire(input: ReleaseFireInput): Promise<void>;
@@ -74,7 +103,11 @@ export class MemorySchedulerStore implements SchedulerStore {
   }
 
   async completeFire(input: CompleteFireInput): Promise<void> {
-    const fire = this.requireClaim(input.fireId, input.claimToken);
+    const fire = this.fires.get(input.fireId);
+    if (fire?.state === 'started' && fire.runId === input.runId) return;
+    if (!fire || (fire.state !== 'bound' && fire.state !== 'recovering') || fire.claimToken !== input.claimToken) {
+      throw new Error(`stale scheduler claim: ${input.fireId}`);
+    }
     Object.assign(fire, {
       state: 'started' as const,
       runId: input.runId,
@@ -90,7 +123,51 @@ export class MemorySchedulerStore implements SchedulerStore {
   async bindRun(input: BindRunInput): Promise<void> {
     const fire = this.requireClaim(input.fireId, input.claimToken);
     if (fire.runId && fire.runId !== input.runId) throw new Error(`scheduled fire Run mismatch: ${input.fireId}`);
-    fire.runId = input.runId;
+    Object.assign(fire, {
+      state: 'bound' as const,
+      runId: input.runId,
+      claimedBy: undefined,
+    });
+  }
+
+  async listBound(input: ListBoundInput): Promise<BoundScheduledFire[]> {
+    return [...this.fires.values()]
+      .filter((fire): fire is BoundScheduledFire => (
+        fire.state === 'bound'
+        && fire.leaseExpiresAt !== undefined
+        && fire.leaseExpiresAt.getTime() <= input.now.getTime()
+        && (!fire.retryAt || fire.retryAt.getTime() <= input.now.getTime())
+      ))
+      .sort((left, right) => left.fireTime.getTime() - right.fireTime.getTime())
+      .slice(0, input.limit)
+      .map((fire) => cloneFire(fire) as BoundScheduledFire);
+  }
+
+  async claimBound(input: ClaimBoundInput): Promise<RecoveringScheduledFire | undefined> {
+    const fire = this.fires.get(input.fireId);
+    if (!fire || fire.state !== 'bound' || fire.claimToken !== input.expectedClaimToken) return undefined;
+    const claimToken = `${input.workerId}:${++this.claimSequence}`;
+    Object.assign(fire, {
+      state: 'recovering' as const,
+      claimToken,
+      claimedBy: input.workerId,
+      leaseExpiresAt: new Date(input.now.getTime() + input.leaseMs),
+    });
+    return cloneFire(fire) as RecoveringScheduledFire;
+  }
+
+  async releaseBound(input: ReleaseBoundInput): Promise<void> {
+    const fire = this.fires.get(input.fireId);
+    if (!fire || fire.state !== 'recovering' || fire.claimToken !== input.claimToken) {
+      throw new Error(`stale scheduler claim: ${input.fireId}`);
+    }
+    Object.assign(fire, {
+      state: 'bound' as const,
+      claimedBy: undefined,
+      leaseExpiresAt: new Date(input.retryAt),
+      retryAt: new Date(input.retryAt),
+      lastError: input.error,
+    });
   }
 
   async releaseFire(input: ReleaseFireInput): Promise<void> {
@@ -108,16 +185,26 @@ export class MemorySchedulerStore implements SchedulerStore {
   async recoverExpired(now: Date): Promise<number> {
     let recovered = 0;
     for (const fire of this.fires.values()) {
-      if (fire.state !== 'claimed' || !fire.leaseExpiresAt || fire.leaseExpiresAt.getTime() > now.getTime()) continue;
-      Object.assign(fire, {
-        state: 'pending' as const,
-        claimToken: undefined,
-        claimedBy: undefined,
-        leaseExpiresAt: undefined,
-        retryAt: new Date(now),
-        lastError: 'scheduler worker lease expired',
-      });
-      recovered++;
+      if (!fire.leaseExpiresAt || fire.leaseExpiresAt.getTime() > now.getTime()) continue;
+      if (fire.state === 'claimed') {
+        Object.assign(fire, {
+          state: 'pending' as const,
+          claimToken: undefined,
+          claimedBy: undefined,
+          leaseExpiresAt: undefined,
+          retryAt: new Date(now),
+          lastError: 'scheduler worker lease expired',
+        });
+        recovered++;
+      } else if (fire.state === 'recovering') {
+        Object.assign(fire, {
+          state: 'bound' as const,
+          claimedBy: undefined,
+          retryAt: new Date(now),
+          lastError: 'scheduler bound Run recovery lease expired',
+        });
+        recovered++;
+      }
     }
     return recovered;
   }

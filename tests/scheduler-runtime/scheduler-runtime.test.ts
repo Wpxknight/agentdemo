@@ -141,7 +141,7 @@ describe('SchedulerRunner', () => {
     expect((await store.listFires())[0]).toMatchObject({ state: 'started', runId: 'run-recovered', attempts: 2 });
   });
 
-  it('recovers a durable Run bound before the worker crashed and stores its final result', async () => {
+  it('does not re-dispatch a durable Run bound before the worker crashed', async () => {
     const store = new MemorySchedulerStore([task]);
     const [abandoned] = await store.claimDue({
       now: fireTime, limit: 1, workerId: 'dead-worker', leaseMs: 1_000,
@@ -154,7 +154,7 @@ describe('SchedulerRunner', () => {
       boundAt: fireTime,
     });
     expect((await store.listFires())[0]).toMatchObject({
-      state: 'claimed', runId, attempts: 1,
+      state: 'bound', runId, attempts: 1,
     });
 
     const run = vi.fn(async () => { throw new Error('Run creation result unknown'); });
@@ -169,12 +169,72 @@ describe('SchedulerRunner', () => {
       leaseMs: 1_000,
     });
 
-    expect(await runner.tick(new Date(fireTime.getTime() + 1_001), 1)).toBe(1);
-    expect(run).toHaveBeenCalledOnce();
-    expect(findScheduledRun).toHaveBeenCalledOnce();
+    expect(await runner.tick(new Date(fireTime.getTime() + 1_001), 1)).toBe(0);
+    expect(run).not.toHaveBeenCalled();
+    expect(findScheduledRun).not.toHaveBeenCalled();
     expect((await store.listFires())[0]).toMatchObject({
-      state: 'started', runId, result: { runId, status: 'succeeded' }, attempts: 2,
+      state: 'bound', runId, attempts: 1,
     });
+  });
+
+  it('fences a bound Run from ordinary claim recovery and allows token-fenced recovery', async () => {
+    const store = new MemorySchedulerStore([task]);
+    const [fire] = await store.claimDue({
+      now: fireTime, limit: 1, workerId: 'worker-a', leaseMs: 1_000,
+    });
+    const originalToken = fire!.claimToken;
+    await store.bindRun({
+      fireId: fire!.fireId, claimToken: originalToken, runId: fire!.fireId, boundAt: fireTime,
+    });
+
+    const afterSchedulerLease = new Date(fireTime.getTime() + 1_001);
+    expect((await store.listFires())[0]).toMatchObject({
+      state: 'bound', runId: fire!.fireId, claimToken: originalToken, claimedBy: undefined,
+    });
+    expect(await store.recoverExpired(afterSchedulerLease)).toBe(0);
+    expect(await store.claimDue({ now: afterSchedulerLease, limit: 1, workerId: 'worker-b', leaseMs: 1_000 })).toEqual([]);
+
+    const recovering = await store.claimBound({
+      fireId: fire!.fireId, expectedClaimToken: originalToken,
+      now: afterSchedulerLease, workerId: 'worker-b', leaseMs: 1_000,
+    });
+    expect(recovering).toMatchObject({ state: 'recovering', runId: fire!.fireId, claimedBy: 'worker-b' });
+    expect(recovering?.claimToken).not.toBe(originalToken);
+  });
+
+  it('releases a recovering bound Run without changing its token or attempts', async () => {
+    const store = new MemorySchedulerStore([task]);
+    const [fire] = await store.claimDue({ now: fireTime, limit: 1, workerId: 'worker-a', leaseMs: 1_000 });
+    await store.bindRun({
+      fireId: fire!.fireId, claimToken: fire!.claimToken, runId: fire!.fireId, boundAt: fireTime,
+    });
+    const recovering = await store.claimBound({
+      fireId: fire!.fireId, expectedClaimToken: fire!.claimToken,
+      now: new Date(fireTime.getTime() + 1_001), workerId: 'worker-b', leaseMs: 1_000,
+    });
+    const retryAt = new Date(fireTime.getTime() + 5_000);
+
+    await store.releaseBound({
+      fireId: fire!.fireId, claimToken: recovering!.claimToken, retryAt, error: 'result unavailable',
+    });
+
+    expect((await store.listFires())[0]).toMatchObject({
+      state: 'bound', runId: fire!.fireId, claimToken: recovering!.claimToken,
+      claimedBy: undefined, retryAt, attempts: 1, lastError: 'result unavailable',
+    });
+  });
+
+  it('keeps a long-running bound Run isolated after the ordinary scheduler lease', async () => {
+    const store = new MemorySchedulerStore([task]);
+    const [fire] = await store.claimDue({ now: fireTime, limit: 1, workerId: 'worker-a', leaseMs: 1 });
+    await store.bindRun({
+      fireId: fire!.fireId, claimToken: fire!.claimToken, runId: fire!.fireId, boundAt: fireTime,
+    });
+
+    const longAfterLease = new Date(fireTime.getTime() + 60_000);
+    expect(await store.recoverExpired(longAfterLease)).toBe(0);
+    expect(await store.claimDue({ now: longAfterLease, limit: 1, workerId: 'worker-b', leaseMs: 1_000 })).toEqual([]);
+    expect((await store.listFires())[0]).toMatchObject({ state: 'bound', attempts: 1 });
   });
 
   it('returns isolated copies of stored durable Run results', async () => {

@@ -42,7 +42,7 @@ export interface ScheduledRunLookup {
   findScheduledRun(input: ScheduledRunInput): Promise<{ runId: string; result: AgentRunResult } | undefined>;
 }
 
-export type ScheduledFireState = 'pending' | 'claimed' | 'started';
+export type ScheduledFireState = 'pending' | 'claimed' | 'bound' | 'recovering' | 'started';
 
 export interface ScheduledFire extends ScheduledRunInput {
   state: ScheduledFireState;
@@ -58,6 +58,21 @@ export interface ScheduledFire extends ScheduledRunInput {
 
 export interface ClaimedScheduledFire extends ScheduledFire {
   state: 'claimed';
+  claimToken: string;
+  claimedBy: string;
+  leaseExpiresAt: Date;
+}
+
+export interface BoundScheduledFire extends ScheduledFire {
+  state: 'bound';
+  runId: string;
+  claimToken: string;
+  leaseExpiresAt: Date;
+}
+
+export interface RecoveringScheduledFire extends ScheduledFire {
+  state: 'recovering';
+  runId: string;
   claimToken: string;
   claimedBy: string;
   leaseExpiresAt: Date;
