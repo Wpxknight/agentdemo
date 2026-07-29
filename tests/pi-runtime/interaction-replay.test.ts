@@ -6,6 +6,7 @@ import {
   type AssistantMessage,
   type Context,
   type Model,
+  type SimpleStreamOptions,
 } from '@earendil-works/pi-ai';
 import { InMemorySessionRepo } from '@earendil-works/pi-agent-core';
 import type { DurableInteractionUpdate } from '@aiop/control-contracts';
@@ -166,6 +167,145 @@ describe('durable Pi interaction replay', () => {
         result: { callId: toolCallId, content: expectedContent, ...(expectedError ? { isError: true } : {}) },
       });
     expect(resumed).toMatchObject({ status: 'succeeded', text: 'continued after deployment' });
+  });
+
+  it('terminates a native continuation on a nested governed interaction and replays it later', async () => {
+    const runId = 'nested-interaction-run';
+    const store = new MemoryRunStore();
+    const models = createModels();
+    let providerTurns = 0;
+    const stream = () => {
+      const output = createAssistantMessageEventStream();
+      providerTurns++;
+      if (providerTurns === 1) {
+        finish(output, [{ type: 'toolCall', id: 'call-first', name: 'ask_first', arguments: { prompt: 'first' } }], 'toolUse');
+      } else if (providerTurns === 2) {
+        finish(output, [{ type: 'toolCall', id: 'call-second', name: 'ask_second', arguments: { prompt: 'second' } }], 'toolUse');
+      } else {
+        finish(output, [{ type: 'text', text: 'both interactions resolved' }], 'stop');
+      }
+      return output;
+    };
+    models.setProvider(createProvider({
+      id: model.provider,
+      auth: { apiKey: { name: 'test', resolve: async () => ({ auth: { apiKey: 'test' } }) } },
+      models: [model], api: { stream, streamSimple: stream },
+    }));
+    const { runtime } = createQuestionRuntime({ store, models, toolNames: ['ask_first', 'ask_second'] });
+
+    expect(await (await runtime.run({
+      runId, identity, sessionId: 'nested-interaction-session',
+      input: [{ role: 'user', text: 'ask twice' }],
+    })).result()).toMatchObject({ status: 'waiting' });
+    const first = (await store.interactions.list({ tenantId: identity.tenantId, runId }))[0]!;
+    await store.interactions.put({ ...first, status: 'resolved', resolution: { answer: ['one'] }, resolvedAt: new Date() });
+
+    expect(await (await runtime.resume({
+      identity, runId, resolution: { interactionId: first.id, value: { answer: ['one'] } },
+    })).result()).toMatchObject({ status: 'waiting' });
+    expect(providerTurns).toBe(2);
+    const second = (await store.interactions.list({ tenantId: identity.tenantId, runId }))
+      .find((interaction) => interaction.toolCallId === 'call-second')!;
+    await store.interactions.put({ ...second, status: 'resolved', resolution: { answer: ['two'] }, resolvedAt: new Date() });
+
+    expect(await (await runtime.resume({
+      identity, runId, resolution: { interactionId: second.id, value: { answer: ['two'] } },
+    })).result()).toMatchObject({ status: 'succeeded', text: 'both interactions resolved' });
+    expect(providerTurns).toBe(3);
+  });
+
+  it('replays a resolved interaction before delivering a pre-existing durable inbox message once', async () => {
+    const runId = 'replay-inbox-ready-run';
+    const store = new MemoryRunStore();
+    const models = createModels();
+    const contexts: Context['messages'][] = [];
+    let providerTurns = 0;
+    const stream = (_model: Model<any>, context: Context) => {
+      contexts.push(structuredClone(context.messages));
+      const output = createAssistantMessageEventStream();
+      providerTurns++;
+      if (providerTurns === 1) {
+        finish(output, [{ type: 'toolCall', id: 'call-first', name: 'ask_first', arguments: { prompt: 'first' } }], 'toolUse');
+      } else {
+        finish(output, [{ type: 'text', text: 'inbox delivered' }], 'stop');
+      }
+      return output;
+    };
+    models.setProvider(createProvider({
+      id: model.provider,
+      auth: { apiKey: { name: 'test', resolve: async () => ({ auth: { apiKey: 'test' } }) } },
+      models: [model], api: { stream, streamSimple: stream },
+    }));
+    const { runtime } = createQuestionRuntime({ store, models, toolNames: ['ask_first'] });
+
+    expect(await (await runtime.run({
+      runId, identity, sessionId: 'replay-inbox-ready-session', input: [{ role: 'user', text: 'ask then append' }],
+    })).result()).toMatchObject({ status: 'waiting' });
+    const interaction = (await store.interactions.list({ tenantId: identity.tenantId, runId }))[0]!;
+    await store.interactions.put({
+      ...interaction, status: 'resolved', resolution: { answer: ['ready'] }, resolvedAt: new Date(),
+    });
+    await store.inbox.enqueue({
+      identity, tenantId: identity.tenantId, runId, idempotencyKey: 'pre-existing-inbox', mode: 'steer',
+      message: { role: 'user', text: 'durable inbox once' }, createdAt: new Date(),
+    });
+
+    expect(await (await runtime.resume({
+      identity, runId, resolution: { interactionId: interaction.id, value: { answer: ['ready'] } },
+    })).result()).toMatchObject({ status: 'succeeded', text: 'inbox delivered' });
+    expect(providerTurns).toBe(2);
+    expect(JSON.stringify(contexts[1])).toContain('question resolved');
+    expect(JSON.stringify(contexts[1]).match(/durable inbox once/g)).toHaveLength(1);
+    expect(JSON.stringify(contexts[1]).indexOf('question resolved'))
+      .toBeLessThan(JSON.stringify(contexts[1]).indexOf('durable inbox once'));
+    expect(await store.inbox.list(identity.tenantId, runId)).toEqual([
+      expect.objectContaining({ status: 'consumed', idempotencyKey: 'pre-existing-inbox' }),
+    ]);
+  });
+
+  it('emits Harness-compatible provider lifecycle events during native continuation', async () => {
+    const runId = 'continuation-lifecycle-run';
+    const store = new MemoryRunStore();
+    const models = createModels();
+    let providerTurns = 0;
+    const stream = (_model: Model<any>, _context: Context, options?: SimpleStreamOptions) => {
+      const output = createAssistantMessageEventStream();
+      void (async () => {
+        await options?.onPayload?.({ turn: providerTurns + 1 }, model);
+        await options?.onResponse?.({ status: 200, headers: { 'x-request-id': `request-${providerTurns + 1}` } }, model);
+        providerTurns++;
+        finish(output, providerTurns === 1
+          ? [{ type: 'toolCall', id: 'call-first', name: 'ask_first', arguments: { prompt: 'first' } }]
+          : [{ type: 'text', text: 'continued with lifecycle' }], providerTurns === 1 ? 'toolUse' : 'stop');
+      })();
+      return output;
+    };
+    models.setProvider(createProvider({
+      id: model.provider,
+      auth: { apiKey: { name: 'test', resolve: async () => ({ auth: { apiKey: 'test' } }) } },
+      models: [model], api: { stream, streamSimple: stream },
+    }));
+    const { runtime } = createQuestionRuntime({ store, models, toolNames: ['ask_first'] });
+
+    expect(await (await runtime.run({
+      runId, identity, sessionId: 'continuation-lifecycle-session', input: [{ role: 'user', text: 'start' }],
+    })).result()).toMatchObject({ status: 'waiting' });
+    const interaction = (await store.interactions.list({ tenantId: identity.tenantId, runId }))[0]!;
+    await store.interactions.put({
+      ...interaction, status: 'resolved', resolution: { answer: ['ready'] }, resolvedAt: new Date(),
+    });
+    expect(await (await runtime.resume({
+      identity, runId, resolution: { interactionId: interaction.id, value: { answer: ['ready'] } },
+    })).result()).toMatchObject({ status: 'succeeded', text: 'continued with lifecycle' });
+
+    const attempts = await store.attempts.list({ tenantId: identity.tenantId, runId });
+    const continuationEvents = (await store.events.list({ tenantId: identity.tenantId, runId }))
+      .filter((event) => event.attemptId === attempts[1]!.attemptId).map((event) => event.type);
+    for (const eventType of [
+      'before_agent_start', 'before_provider_request', 'before_provider_payload', 'after_provider_response',
+    ]) {
+      expect(continuationEvents).toContain(eventType);
+    }
   });
 
   it('rejects a mismatched committed waiting interaction without executing the resolved tool', async () => {
@@ -360,6 +500,53 @@ async function runNegativeReplayCase(testCase: NegativeReplayCase) {
     identity, runId, resolution: { interactionId: resolved.id, value },
   })).result();
   return { resumed, handler, providerTurns, store, runId, logicalCallId, toolCallId };
+}
+
+function createQuestionRuntime(input: {
+  store: MemoryRunStore;
+  models: ReturnType<typeof createModels>;
+  toolNames: string[];
+}) {
+  return createMemoryDurablePiRuntime({
+    store: input.store, models: input.models, model, heartbeatMs: 0,
+    resolveTools: async ({ identity: currentIdentity, sessionId, events, interactionResolution }) => {
+      if (!currentIdentity) return [];
+      const definitions = input.toolNames.map((name) => ({
+        name, description: name, capability: 'retryable_write' as const, interactionKind: 'question' as const,
+        inputSchema: {
+          type: 'object', properties: { prompt: { type: 'string' } }, required: ['prompt'], additionalProperties: false,
+        },
+        execute: async () => ({ content: 'unused' }),
+      }));
+      const governed = new GovernedToolFactory({
+        ledger: input.store.toolLedger, interactions: input.store.interactions,
+      }).create(definitions);
+      const resolved = interactionResolution
+        ? await input.store.interactions.get({
+            tenantId: currentIdentity.tenantId, runId: events.runId,
+            interactionId: interactionResolution.interactionId,
+          })
+        : undefined;
+      return bridgeGovernedTools(definitions.map((definition) => ({
+        definition,
+        logicalCallId: (toolCallId: string) => toolCallId,
+        execute: async (call, context) => {
+          const outcome = await governed.execute(call, {
+            identity: currentIdentity, runId: events.runId, attemptId: events.attemptId, turnNo: events.turnNo,
+            sessionId: sessionId ?? events.runId, signal: context.signal,
+            interactionResolution: resolved?.status === 'resolved' && resolved.toolCallId === call.id
+              ? {
+                  interactionId: resolved.id, kind: resolved.kind, toolCallId: resolved.toolCallId,
+                  value: resolved.resolution ?? interactionResolution?.value ?? null,
+                }
+              : undefined,
+          });
+          if (outcome.kind === 'result') return attachGovernedToolFacts(outcome.result, outcome);
+          throw new GovernedToolOutcomeError(outcome);
+        },
+      })));
+    },
+  });
 }
 
 function expectsHandlerOrder(executesHandler: boolean): string[] {

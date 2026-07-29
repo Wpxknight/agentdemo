@@ -138,8 +138,12 @@ export declare class PiAgentSession<TMetadata extends SessionMetadata = SessionM
     private removeGovernedToolHook;
     private readonly pendingCustomEntries;
     private customFlushTail;
+    private readonly inboxReady;
+    private readonly inboxSynchronized;
+    private inboxDeliveryStarted?;
     constructor(session: Session<TMetadata>, harness: AgentHarness, initialMessage: AgentInputMessage, eventCodec: EventCodec, models?: Models, systemPrompt?: string | undefined);
     continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent>;
+    synchronizeInbox(deliver: () => Promise<void>, signal?: AbortSignal): Promise<void>;
     replayInteraction(resolution: ResolvedInteraction, signal?: AbortSignal, guard?: () => Promise<void>): Promise<void>;
     private iterate;
     steer(message: AgentInputMessage): Promise<void>;
@@ -473,6 +477,7 @@ import { type InboxCapableSession } from './inbox.js';
 import type { DurableRunStore } from '../store/types.js';
 export interface ManagedPiSession extends InboxCapableSession {
     continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent>;
+    synchronizeInbox?(deliver: () => Promise<void>, signal?: AbortSignal): Promise<void>;
     replayInteraction(resolution: ResolvedInteraction, signal?: AbortSignal, guard?: () => Promise<void>): Promise<void>;
     abort(): Promise<void>;
     close(): Promise<void>;

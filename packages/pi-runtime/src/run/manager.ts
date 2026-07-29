@@ -22,6 +22,7 @@ const ZERO_USAGE = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheC
 
 export interface ManagedPiSession extends InboxCapableSession {
   continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent>;
+  synchronizeInbox?(deliver: () => Promise<void>, signal?: AbortSignal): Promise<void>;
   replayInteraction(
     resolution: ResolvedInteraction,
     signal?: AbortSignal,
@@ -234,18 +235,24 @@ export class DurableRunManager implements DurableRunRuntime {
         const inboxStop = new AbortController();
         const inboxSignal = AbortSignal.any([abort.signal, inboxStop.signal]);
         const pumpInbox = async (): Promise<void> => {
-          while (!stopInboxPump && !abort.signal.aborted) {
-            try {
+          const drain = async () => drainDurableInbox({
+            store: this.options.store, session: session!, entries: await session!.entries(),
+            tenantId: identity.tenantId, runId, workerId: this.workerId, fencingToken: claimed.fencingToken,
+            now: this.now, claimTtlMs: this.inboxClaimTtlMs,
+          });
+          try {
+            if (session!.synchronizeInbox) await session!.synchronizeInbox(drain, inboxSignal);
+            else await drain();
+            while (!stopInboxPump && !abort.signal.aborted) {
               await drainDurableInbox({
                 store: this.options.store, session: session!, entries: await session!.entries(),
                 tenantId: identity.tenantId, runId, workerId: this.workerId, fencingToken: claimed.fencingToken,
                 now: this.now, claimTtlMs: this.inboxClaimTtlMs,
               });
-            } catch (error) {
-              abort.abort(error);
-              return;
+              await delay(this.inboxPollMs, inboxSignal);
             }
-            await delay(this.inboxPollMs, inboxSignal);
+          } catch (error) {
+            if (!inboxSignal.aborted) abort.abort(error);
           }
         };
         const inboxPump = pumpInbox();

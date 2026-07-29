@@ -149,6 +149,9 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     customType: string; data?: unknown; resolve(id: string): void; reject(error: unknown): void;
   }> = [];
   private customFlushTail: Promise<void> = Promise.resolve();
+  private readonly inboxReady = deferred<void>();
+  private readonly inboxSynchronized = deferred<void>();
+  private inboxDeliveryStarted?: ReturnType<typeof deferred<void>>;
 
   constructor(
     private readonly session: Session<TMetadata>,
@@ -166,6 +169,21 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
   continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent> {
     const owner = this;
     return { [Symbol.asyncIterator]: () => owner.iterate(signal) };
+  }
+
+  async synchronizeInbox(deliver: () => Promise<void>, signal?: AbortSignal): Promise<void> {
+    await withAbortSignal(this.inboxReady.promise, signal);
+    const deliveryStarted = deferred<void>();
+    this.inboxDeliveryStarted = deliveryStarted;
+    try {
+      const delivery = deliver();
+      await withAbortSignal(Promise.race([delivery, deliveryStarted.promise]), signal);
+      this.inboxSynchronized.resolve(undefined);
+      await delivery;
+    } finally {
+      this.inboxSynchronized.resolve(undefined);
+      if (this.inboxDeliveryStarted === deliveryStarted) this.inboxDeliveryStarted = undefined;
+    }
   }
 
   async replayInteraction(
@@ -348,9 +366,21 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     };
     signal?.addEventListener('abort', abort, { once: true });
     removeSignalListener = () => signal?.removeEventListener('abort', abort);
-    const runPromise = continuationAgent
-      ? continuationAgent.continue()
-      : this.promptHarness(initialMessage!);
+    if (continuationAgent) {
+      forwardEvent({
+        type: 'before_agent_start', prompt: '', systemPrompt: this.systemPrompt ?? 'You are a helpful assistant.',
+        resources: this.harness.getResources(),
+      });
+    }
+    let runPromise: Promise<void | AssistantMessage>;
+    if (continuationAgent) {
+      this.inboxReady.resolve(undefined);
+      await withAbortSignal(this.inboxSynchronized.promise, signal);
+      runPromise = continuationAgent.continue();
+    } else {
+      runPromise = this.promptHarness(initialMessage!);
+      this.inboxReady.resolve(undefined);
+    }
     const run = runPromise.then(
       () => { finished = true; wake?.(); },
       (error) => { failure ??= error; finished = true; wake?.(); },
@@ -379,6 +409,7 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     this.ensureOpen();
     if (this.activeContinuationAgent) {
       this.activeContinuationAgent.steer(toPiUserMessage(message));
+      this.inboxDeliveryStarted?.resolve(undefined);
       return;
     }
     const { text, images } = promptParts(message);
@@ -389,6 +420,7 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     this.ensureOpen();
     if (this.activeContinuationAgent) {
       this.activeContinuationAgent.followUp(toPiUserMessage(message));
+      this.inboxDeliveryStarted?.resolve(undefined);
       return Promise.resolve();
     }
     const { text, images } = promptParts(message);
@@ -506,12 +538,21 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
       sessionId: metadata.id,
       transport: streamOptions.transport,
       maxRetryDelayMs: streamOptions.maxRetryDelayMs,
-      streamFn: (model, providerContext, options) => this.models.streamSimple(model, providerContext, {
-        ...streamOptions,
-        ...options,
-      }),
+      streamFn: (model, providerContext, options) => {
+        forwardEvent({
+          type: 'before_provider_request', model, sessionId: metadata.id,
+          streamOptions: { ...streamOptions },
+        });
+        return this.models.streamSimple(model, providerContext, { ...streamOptions, ...options });
+      },
+      onPayload: async (payload, payloadModel) => {
+        forwardEvent({ type: 'before_provider_payload', model: payloadModel, payload });
+      },
+      onResponse: async (response) => {
+        forwardEvent({ type: 'after_provider_response', status: response.status, headers: { ...response.headers } });
+      },
       afterToolCall: async ({ toolCall, args, result, isError }) => {
-        this.governedToolScope.patch({
+        return this.governedToolScope.patch({
           type: 'tool_result', toolCallId: toolCall.id, toolName: toolCall.name,
           input: args as Record<string, unknown>,
           content: result.content, details: result.details, usage: result.usage, isError,
@@ -563,6 +604,25 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
 function throwCollected(errors: readonly unknown[], message: string): void {
   if (errors.length === 1) throw errors[0];
   if (errors.length > 1) throw new AggregateError(errors, message);
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => { resolve = settle; });
+  return { promise, resolve };
+}
+
+function withAbortSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(abortReason(signal));
+    signal.addEventListener('abort', abort, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener('abort', abort); resolve(value); },
+      (error) => { signal.removeEventListener('abort', abort); reject(error); },
+    );
+  });
 }
 
 function abortReason(signal: AbortSignal): unknown {
