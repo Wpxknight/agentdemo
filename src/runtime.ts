@@ -362,7 +362,7 @@ async function createDefaultDurableRunAssembly(
       identity?: IdentityContext;
       sessionId?: string;
       events: EventCodecOptions;
-      interactionResolution?: InteractionResolution;
+      interactionResolution?: ResolvedInteraction;
       execution?: RunExecutionProfile;
     }) => {
       if (!identity) return [];

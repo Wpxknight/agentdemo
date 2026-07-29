@@ -1061,7 +1061,11 @@ describe('DurableRunManager', () => {
       },
     };
     let receivedResolution: unknown;
-    const resumedSession = emptySession(sessionId);
+    let replayedResolution: unknown;
+    const resumedSession: ManagedPiSession = {
+      ...emptySession(sessionId),
+      async replayInteraction(resolution) { replayedResolution = resolution; },
+    };
     const firstManager = new DurableRunManager({
       store, workerId: 'waiting-worker-a', heartbeatMs: 0,
       sessions: { create: async () => waitingSession, load: async () => waitingSession },
@@ -1099,7 +1103,11 @@ describe('DurableRunManager', () => {
     })).resolves.toBe(true);
     const resumedResult = await (await secondManager.resume({ identity, runId, resolution })).result();
 
-    expect(receivedResolution).toEqual(resolution);
+    const trustedResolution = {
+      ...resolution, kind: 'approval', toolCallId: 'call-a',
+    };
+    expect(receivedResolution).toEqual(trustedResolution);
+    expect(replayedResolution).toEqual(trustedResolution);
     expect(resumedResult.status).toBe('succeeded');
     expect((await store.get({ tenantId: identity.tenantId, runId }))?.waitingReason).toBeUndefined();
   });

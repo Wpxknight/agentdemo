@@ -3,7 +3,7 @@ import { AgentPlatformError } from '@aiop/control-contracts';
 import type {
   AgentInputMessage, AgentRunEvent, AgentRunResult, AgentRunUsage, AppendRunMessageInput, CancelRunInput,
   AgentPlatformErrorData, ClaimedRun, CommitTurnInput, DurableInteractionUpdate, DurableRunRuntime,
-  DurableToolLedgerUpdate, RunHandle,
+  DurableToolLedgerUpdate, ResolvedInteraction, RunHandle,
   StartRunInput, ResumeRunInput,
 } from '@aiop/control-contracts';
 import type { SessionMetadata, SessionTreeEntry } from '@earendil-works/pi-agent-core';
@@ -21,6 +21,7 @@ const ZERO_USAGE = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheC
 
 export interface ManagedPiSession extends InboxCapableSession {
   continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent>;
+  replayInteraction?(resolution: ResolvedInteraction, signal?: AbortSignal): Promise<void>;
   abort(): Promise<void>;
   close(): Promise<void>;
   metadata(): Promise<SessionMetadata & { tenantId?: string }>;
@@ -33,8 +34,8 @@ export interface ManagedPiSession extends InboxCapableSession {
 }
 
 export interface DurableRunSessionFactory {
-  create(input: { id?: string; identity: StartRunInput['identity']; interactionResolution?: ResumeRunInput['resolution']; execution?: StartRunInput['execution']; initialMessage: AgentInputMessage; events: unknown; session?: Record<string, unknown> }): Promise<ManagedPiSession>;
-  load(input: { metadata: SessionMetadata & { tenantId?: string }; identity: StartRunInput['identity']; interactionResolution?: ResumeRunInput['resolution']; execution?: StartRunInput['execution']; initialMessage: AgentInputMessage; events: unknown }): Promise<ManagedPiSession>;
+  create(input: { id?: string; identity: StartRunInput['identity']; interactionResolution?: ResolvedInteraction; execution?: StartRunInput['execution']; initialMessage: AgentInputMessage; events: unknown; session?: Record<string, unknown> }): Promise<ManagedPiSession>;
+  load(input: { metadata: SessionMetadata & { tenantId?: string }; identity: StartRunInput['identity']; interactionResolution?: ResolvedInteraction; execution?: StartRunInput['execution']; initialMessage: AgentInputMessage; events: unknown }): Promise<ManagedPiSession>;
 }
 
 export interface DurableRunManagerOptions {
@@ -84,6 +85,7 @@ export class DurableRunManager implements DurableRunRuntime {
     const run = await this.options.store.get({ tenantId: input.identity.tenantId, runId: input.runId });
     if (!run) throw new Error('Run not found');
     if (run.status === 'waiting' && !input.resolution) throw conflict('Waiting run requires an interaction resolution');
+    let trustedResolution: ResolvedInteraction | undefined;
     if (input.resolution) {
       const interaction = await this.options.store.getInteraction({
         tenantId: input.identity.tenantId, runId: input.runId, interactionId: input.resolution.interactionId,
@@ -94,11 +96,13 @@ export class DurableRunManager implements DurableRunRuntime {
         || JSON.stringify(interaction.resolution) !== JSON.stringify(input.resolution.value)) {
         throw conflict('Interaction resolution does not match the waiting run');
       }
+      trustedResolution = {
+        interactionId: interaction.id, kind: interaction.kind, toolCallId: interaction.toolCallId,
+        value: interaction.resolution ?? input.resolution.value,
+      };
     }
-    const message: AgentInputMessage = input.resolution
-      ? { role: 'user', text: JSON.stringify(input.resolution) }
-      : { role: 'user', text: 'Continue from the last committed state.' };
-    return this.start(input.identity, input.runId, message, true, true, input.signal, input.resolution);
+    const message: AgentInputMessage = { role: 'user', text: 'Continue from the last committed state.' };
+    return this.start(input.identity, input.runId, message, true, true, input.signal, trustedResolution);
   }
 
   async cancel(input: CancelRunInput): Promise<void> {
@@ -114,7 +118,7 @@ export class DurableRunManager implements DurableRunRuntime {
 
   private async start(
     identity: StartRunInput['identity'], runId: string, initialMessage: AgentInputMessage, resume: boolean,
-    loadCommittedSession: boolean, signal?: AbortSignal, interactionResolution?: ResumeRunInput['resolution'],
+    loadCommittedSession: boolean, signal?: AbortSignal, interactionResolution?: ResolvedInteraction,
   ): Promise<RunHandle> {
     const key = runKey(identity.tenantId, runId);
     if (this.executions.has(key)) throw conflict('Run recovery is already active');
@@ -125,7 +129,9 @@ export class DurableRunManager implements DurableRunRuntime {
     const result = new Promise<AgentRunResult>((resolve, reject) => { resolveResult = resolve; rejectResult = reject; });
     const claim = this.options.store.claim({
       identity, runId, workerId: this.workerId, now: this.now(), leaseTtlMs: this.leaseTtlMs, resume,
-      resolution: interactionResolution,
+      resolution: interactionResolution
+        ? { interactionId: interactionResolution.interactionId, value: interactionResolution.value }
+        : undefined,
     });
     const execution = this.execute(
       identity, runId, initialMessage, loadCommittedSession, signal, stream, claim, interactionResolution,
@@ -147,7 +153,7 @@ export class DurableRunManager implements DurableRunRuntime {
     identity: StartRunInput['identity'], runId: string, initialMessage: AgentInputMessage,
     loadCommittedSession: boolean, externalSignal: AbortSignal | undefined, stream: AsyncEventStream<AgentRunEvent>,
     claim: Promise<ClaimedRun | null>,
-    interactionResolution?: ResumeRunInput['resolution'],
+    interactionResolution?: ResolvedInteraction,
   ): Promise<AgentRunResult> {
     const claimed = await claim;
     if (!claimed) throw new Error('Run is not claimable');
@@ -188,6 +194,12 @@ export class DurableRunManager implements DurableRunRuntime {
           });
       this.active.set(activeKey, { abort, session });
       baselineUsage = usageFromEntries(await session.entries());
+      if (interactionResolution) {
+        if (!session.replayInteraction) {
+          throw conflict('Loaded Pi session cannot replay the resolved interaction');
+        }
+        await session.replayInteraction(interactionResolution, abort.signal);
+      }
       let stopInboxPump = false;
       const stopControl = new AbortController();
       const controlSignal = AbortSignal.any([abort.signal, stopControl.signal]);

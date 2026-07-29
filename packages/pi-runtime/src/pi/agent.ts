@@ -1,7 +1,8 @@
 import type {
   AgentInputMessage, AgentRunEvent, DurableInteractionUpdate, DurableToolLedgerUpdate, IdentityContext,
-  InteractionResolution, RunExecutionProfile,
+  ResolvedInteraction, RunExecutionProfile,
 } from '@aiop/control-contracts';
+import { AgentPlatformError } from '@aiop/control-contracts';
 import {
   AgentHarness,
   type AgentHarnessEvent,
@@ -13,7 +14,7 @@ import {
   type SessionRepo,
   type SessionTreeEntry,
 } from '@earendil-works/pi-agent-core';
-import type { ImageContent, Model, Models } from '@earendil-works/pi-ai';
+import type { AssistantMessage, ImageContent, Model, Models, ToolResultMessage } from '@earendil-works/pi-ai';
 import { EventCodec, type EventCodecOptions } from './event-codec.js';
 import { createConcurrentModels, type ModelConcurrencyController } from '../model/concurrency.js';
 import {
@@ -21,6 +22,7 @@ import {
   scopeGovernedTools,
   type GovernedToolScope,
 } from './governed-tool-state.js';
+import { GovernedToolExecutionError, GovernedToolOutcomeError } from './tool-bridge.js';
 
 export interface PiAgentSessionFactoryOptions<
   TMetadata extends SessionMetadata,
@@ -38,7 +40,7 @@ export interface PiAgentSessionFactoryOptions<
     identity?: IdentityContext;
     sessionId?: string;
     events: EventCodecOptions;
-    interactionResolution?: InteractionResolution;
+    interactionResolution?: ResolvedInteraction;
     execution?: RunExecutionProfile;
   }): Promise<AgentHarnessTool<undefined>[]>;
   resources?: AgentHarnessResources;
@@ -53,7 +55,7 @@ type SessionCreateField<TCreateOptions extends SessionCreateOptions> =
 export type CreatePiAgentSessionInput<TCreateOptions extends SessionCreateOptions = SessionCreateOptions> = {
   id?: string;
   identity?: IdentityContext;
-  interactionResolution?: InteractionResolution;
+  interactionResolution?: ResolvedInteraction;
   execution?: RunExecutionProfile;
   initialMessage: AgentInputMessage;
   events: EventCodecOptions;
@@ -62,7 +64,7 @@ export type CreatePiAgentSessionInput<TCreateOptions extends SessionCreateOption
 export interface LoadPiAgentSessionInput<TMetadata extends SessionMetadata = SessionMetadata> {
   metadata: TMetadata;
   identity?: IdentityContext;
-  interactionResolution?: InteractionResolution;
+  interactionResolution?: ResolvedInteraction;
   execution?: RunExecutionProfile;
   initialMessage: AgentInputMessage;
   events: EventCodecOptions;
@@ -98,7 +100,7 @@ export class PiAgentSessionFactory<
 
   private async resolveTools(
     identity: IdentityContext | undefined, sessionId: string | undefined, events: EventCodecOptions,
-    interactionResolution?: InteractionResolution, execution?: RunExecutionProfile,
+    interactionResolution?: ResolvedInteraction, execution?: RunExecutionProfile,
   ) {
     return this.options.resolveTools?.({ identity, sessionId, events, interactionResolution, execution })
       ?? this.options.tools ?? [];
@@ -151,6 +153,91 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
   continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent> {
     const owner = this;
     return { [Symbol.asyncIterator]: () => owner.iterate(signal) };
+  }
+
+  async replayInteraction(resolution: ResolvedInteraction, signal?: AbortSignal): Promise<void> {
+    this.ensureOpen();
+    if (this.activeRun) throw runStateConflict('Cannot replay an interaction while a Pi run is active');
+    if (signal?.aborted) throw abortReason(signal);
+    const branch = await this.session.getBranch();
+    const calls = branch.flatMap((entry) => entry.type === 'message' && entry.message.role === 'assistant'
+      ? entry.message.content.filter((block): block is Extract<AssistantMessage['content'][number], { type: 'toolCall' }> =>
+          block.type === 'toolCall' && block.id === resolution.toolCallId)
+        .map((call) => ({ entry, call }))
+      : []);
+    if (calls.length !== 1) {
+      throw runStateConflict('Resolved interaction original tool call is missing or ambiguous');
+    }
+    const original = calls[0]!;
+    const waiting = branch.filter((entry): entry is Extract<SessionTreeEntry, { type: 'message' }> =>
+      entry.type === 'message' && entry.message.role === 'toolResult'
+      && entry.message.toolCallId === resolution.toolCallId && waitingInteraction(entry.message, resolution));
+    if (waiting.length !== 1 || waiting[0]!.parentId !== original.entry.id
+      || waiting[0]!.id !== await this.session.getLeafId()) {
+      throw runStateConflict('Resolved interaction does not match the committed waiting result');
+    }
+    const tools = this.harness.getActiveTools().filter((tool) => tool.name === original.call.name);
+    if (tools.length !== 1 || !this.governedToolScope.isGoverned(tools[0]!)) {
+      throw runStateConflict('Resolved interaction governed tool is missing or ambiguous');
+    }
+
+    let replacement: ToolResultMessage;
+    try {
+      const result = await tools[0]!.execute(
+        resolution.toolCallId, original.call.arguments, signal, undefined, undefined,
+      );
+      const resultCallId = result.details && typeof result.details === 'object'
+        ? (result.details as { callId?: unknown }).callId : undefined;
+      if (resultCallId !== resolution.toolCallId) {
+        throw new GovernedToolOutcomeError({
+          kind: 'recovery_required', message: 'Resolved interaction returned a result for a different tool call',
+        });
+      }
+      this.governedToolScope.patch(replayToolResultEvent(
+        resolution.toolCallId, original.call.name, original.call.arguments, result, false,
+      ));
+      replacement = {
+        role: 'toolResult', toolCallId: resolution.toolCallId, toolName: original.call.name,
+        content: result.content, details: result.details, usage: result.usage, isError: false,
+        timestamp: waiting[0]!.message.timestamp,
+      };
+    } catch (error) {
+      if (error instanceof GovernedToolOutcomeError) {
+        this.governedToolScope.patch(replayToolResultEvent(
+          resolution.toolCallId, original.call.name, original.call.arguments,
+          { content: [{ type: 'text', text: error.message }], details: error.outcome }, true,
+        ));
+        const outcome = this.governedToolScope.takeOutcome() ?? error;
+        if (outcome.outcome.kind === 'waiting') {
+          throw runStateConflict('Resolved interaction returned to waiting');
+        }
+        throw outcome;
+      }
+      if (!(error instanceof GovernedToolExecutionError) || error.call.id !== resolution.toolCallId
+        || error.result.callId !== resolution.toolCallId) throw error;
+      this.governedToolScope.patch(replayToolResultEvent(
+        resolution.toolCallId, original.call.name, original.call.arguments,
+        { content: [{ type: 'text', text: error.result.content }], details: error.result }, true,
+      ));
+      replacement = {
+        role: 'toolResult', toolCallId: resolution.toolCallId, toolName: original.call.name,
+        content: [{ type: 'text', text: error.result.content }], details: error.result, isError: true,
+        timestamp: waiting[0]!.message.timestamp,
+      };
+    }
+    const resultCallId = replacement.details && typeof replacement.details === 'object'
+      ? (replacement.details as { callId?: unknown }).callId : undefined;
+    if (resultCallId !== resolution.toolCallId) {
+      throw runStateConflict('Resolved interaction returned a result for a different tool call');
+    }
+    try {
+      await this.session.moveTo(original.entry.id);
+      await this.session.appendMessage(replacement);
+    } catch (error) {
+      throw new GovernedToolOutcomeError({
+        kind: 'recovery_required', message: 'Resolved tool result could not be committed to the Pi session',
+      });
+    }
   }
 
   private async *iterate(signal?: AbortSignal): AsyncGenerator<AgentRunEvent> {
@@ -373,4 +460,29 @@ function promptParts(message: AgentInputMessage): { text: string; images: ImageC
   const images = content.filter((block): block is Extract<typeof block, { type: 'image' }> => block.type === 'image')
     .map((block) => ({ type: 'image' as const, data: block.data, mimeType: block.mimeType }));
   return { text, images };
+}
+
+function waitingInteraction(message: ToolResultMessage, resolution: ResolvedInteraction): boolean {
+  if (!message.isError || !message.details || typeof message.details !== 'object') return false;
+  const details = message.details as {
+    kind?: unknown;
+    outcome?: { kind?: unknown; reason?: unknown; interactionId?: unknown };
+  };
+  return details.kind === 'governed_tool_outcome' && details.outcome?.kind === 'waiting'
+    && details.outcome.reason === resolution.kind && details.outcome.interactionId === resolution.interactionId;
+}
+
+function replayToolResultEvent(
+  toolCallId: string,
+  toolName: string,
+  input: Record<string, unknown>,
+  result: { content: Array<{ type: 'text'; text: string } | ImageContent>; details?: unknown; usage?: ToolResultMessage['usage'] },
+  isError: boolean,
+): Extract<AgentHarnessEvent, { type: 'tool_result' }> {
+  return { type: 'tool_result', toolCallId, toolName, input, content: result.content,
+    details: result.details, usage: result.usage, isError };
+}
+
+function runStateConflict(message: string): AgentPlatformError {
+  return new AgentPlatformError({ code: 'RUN_STATE_CONFLICT', message, retryable: false });
 }

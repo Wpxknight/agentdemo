@@ -24,6 +24,7 @@ export interface GovernedToolScope {
   patch(event: Extract<AgentHarnessEvent, { type: 'tool_result' }>): { details: unknown; isError: true; terminate?: boolean } | undefined;
   takeOutcome(): GovernedToolOutcomeError | undefined;
   takeFacts(): { ledgerUpdates: DurableToolLedgerUpdate[]; interactionUpdates: DurableInteractionUpdate[] };
+  isGoverned(tool: AgentHarnessTool<undefined>): boolean;
   hasPending(): boolean;
   clear(): void;
 }
@@ -127,6 +128,9 @@ export function adoptGovernedToolScope(tools: readonly AgentHarnessTool<undefine
     takeFacts() {
       const result = { ledgerUpdates: ledgerUpdates.splice(0), interactionUpdates: interactionUpdates.splice(0) };
       return result;
+    },
+    isGoverned(tool) {
+      return SCOPED_TRACKERS.has(tool);
     },
     hasPending() {
       if (pendingOutcomes.length > 0) return true;

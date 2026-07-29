@@ -64,7 +64,7 @@ export declare class FifoModelConcurrencyController implements ModelConcurrencyC
 export declare function createConcurrentModels(models: Models, controller: ModelConcurrencyController, identity: IdentityContext): Models;
 
 // file: pi/agent.d.ts
-import type { AgentInputMessage, AgentRunEvent, DurableInteractionUpdate, DurableToolLedgerUpdate, IdentityContext, InteractionResolution, RunExecutionProfile } from '@aiop/control-contracts';
+import type { AgentInputMessage, AgentRunEvent, DurableInteractionUpdate, DurableToolLedgerUpdate, IdentityContext, ResolvedInteraction, RunExecutionProfile } from '@aiop/control-contracts';
 import { AgentHarness, type AgentHarnessResources, type AgentHarnessTool, type Session, type SessionCreateOptions, type SessionMetadata, type SessionRepo, type SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import type { Model, Models } from '@earendil-works/pi-ai';
 import { EventCodec, type EventCodecOptions } from './event-codec.js';
@@ -83,7 +83,7 @@ export interface PiAgentSessionFactoryOptions<TMetadata extends SessionMetadata,
         identity?: IdentityContext;
         sessionId?: string;
         events: EventCodecOptions;
-        interactionResolution?: InteractionResolution;
+        interactionResolution?: ResolvedInteraction;
         execution?: RunExecutionProfile;
     }): Promise<AgentHarnessTool<undefined>[]>;
     resources?: AgentHarnessResources;
@@ -101,7 +101,7 @@ type SessionCreateField<TCreateOptions extends SessionCreateOptions> = [
 export type CreatePiAgentSessionInput<TCreateOptions extends SessionCreateOptions = SessionCreateOptions> = {
     id?: string;
     identity?: IdentityContext;
-    interactionResolution?: InteractionResolution;
+    interactionResolution?: ResolvedInteraction;
     execution?: RunExecutionProfile;
     initialMessage: AgentInputMessage;
     events: EventCodecOptions;
@@ -109,7 +109,7 @@ export type CreatePiAgentSessionInput<TCreateOptions extends SessionCreateOption
 export interface LoadPiAgentSessionInput<TMetadata extends SessionMetadata = SessionMetadata> {
     metadata: TMetadata;
     identity?: IdentityContext;
-    interactionResolution?: InteractionResolution;
+    interactionResolution?: ResolvedInteraction;
     execution?: RunExecutionProfile;
     initialMessage: AgentInputMessage;
     events: EventCodecOptions;
@@ -136,6 +136,7 @@ export declare class PiAgentSession<TMetadata extends SessionMetadata = SessionM
     private customFlushTail;
     constructor(session: Session<TMetadata>, harness: AgentHarness, initialMessage: AgentInputMessage, eventCodec: EventCodec);
     continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent>;
+    replayInteraction(resolution: ResolvedInteraction, signal?: AbortSignal): Promise<void>;
     private iterate;
     steer(message: AgentInputMessage): Promise<void>;
     followUp(message: AgentInputMessage): Promise<void>;
@@ -271,6 +272,7 @@ export interface GovernedToolScope {
         ledgerUpdates: DurableToolLedgerUpdate[];
         interactionUpdates: DurableInteractionUpdate[];
     };
+    isGoverned(tool: AgentHarnessTool<undefined>): boolean;
     hasPending(): boolean;
     clear(): void;
 }
@@ -457,12 +459,13 @@ export declare function assertUsageAllowed(limits: RunLimits | undefined, usage:
 export declare function assertToolCallsAllowed(limits: RunLimits | undefined, toolCalls: number): void;
 
 // file: run/manager.d.ts
-import type { AgentInputMessage, AgentRunEvent, AppendRunMessageInput, CancelRunInput, DurableInteractionUpdate, DurableRunRuntime, DurableToolLedgerUpdate, RunHandle, StartRunInput, ResumeRunInput } from '@aiop/control-contracts';
+import type { AgentInputMessage, AgentRunEvent, AppendRunMessageInput, CancelRunInput, DurableInteractionUpdate, DurableRunRuntime, DurableToolLedgerUpdate, ResolvedInteraction, RunHandle, StartRunInput, ResumeRunInput } from '@aiop/control-contracts';
 import type { SessionMetadata, SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import { type InboxCapableSession } from './inbox.js';
 import type { DurableRunStore } from '../store/types.js';
 export interface ManagedPiSession extends InboxCapableSession {
     continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent>;
+    replayInteraction?(resolution: ResolvedInteraction, signal?: AbortSignal): Promise<void>;
     abort(): Promise<void>;
     close(): Promise<void>;
     metadata(): Promise<SessionMetadata & {
@@ -479,7 +482,7 @@ export interface DurableRunSessionFactory {
     create(input: {
         id?: string;
         identity: StartRunInput['identity'];
-        interactionResolution?: ResumeRunInput['resolution'];
+        interactionResolution?: ResolvedInteraction;
         execution?: StartRunInput['execution'];
         initialMessage: AgentInputMessage;
         events: unknown;
@@ -490,7 +493,7 @@ export interface DurableRunSessionFactory {
             tenantId?: string;
         };
         identity: StartRunInput['identity'];
-        interactionResolution?: ResumeRunInput['resolution'];
+        interactionResolution?: ResolvedInteraction;
         execution?: StartRunInput['execution'];
         initialMessage: AgentInputMessage;
         events: unknown;
