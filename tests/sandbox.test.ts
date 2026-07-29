@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
+import { access, readFile, stat } from 'node:fs/promises';
+import { join } from 'node:path';
 import { SandboxManager } from '../src/sandbox/lifecycle.js';
 import { LocalSandboxProvider } from '../src/sandbox/local.js';
 import { OpenSandboxDesktopProvider } from '../src/sandbox/opensandbox-desktop.js';
@@ -503,6 +505,38 @@ describe('LocalSandboxProvider', () => {
 
       expect(res.stdout.trim()).toBe('js-ok');
       expect(res.exitCode).toBe(0);
+    } finally {
+      await handle.kill();
+    }
+  });
+
+  it('maps sandbox workspace paths inside its disposable root and removes them on kill', async () => {
+    const provider = new LocalSandboxProvider();
+    const handle = await provider.create({ key: 'local-workspace-test' });
+    const sandboxPath = `/workspace/${handle.sandboxId}/credentials/token.json`;
+    const workspaceFile = handle.workspacePath?.(`${handle.sandboxId}/credentials/token.json`);
+    expect(workspaceFile).toBeTruthy();
+    expect(workspaceFile).not.toBe('/workspace/credentials/token.json');
+    await handle.writeFile?.(sandboxPath, Buffer.from('secret'), { mode: 0o600 });
+
+    expect(await readFile(workspaceFile!, 'utf8')).toBe('secret');
+    expect((await stat(workspaceFile!)).mode & 0o777).toBe(0o600);
+    const command = await handle.runCommand(`test -f '${workspaceFile}' && printf mapped`);
+    expect(command).toMatchObject({ stdout: 'mapped', exitCode: 0 });
+    await expect(access(sandboxPath)).rejects.toThrow();
+
+    const sandboxRoot = join(handle.workspacePath!(), '..');
+    await handle.kill();
+    await expect(access(sandboxRoot)).rejects.toThrow();
+  });
+
+  it('rejects local sandbox path traversal and non-workspace host absolute paths', async () => {
+    const provider = new LocalSandboxProvider();
+    const handle = await provider.create({ key: 'local-containment-test' });
+    try {
+      expect(() => handle.workspacePath?.('../escape')).toThrow('escapes sandbox root');
+      await expect(handle.writeFile?.('/workspace/../escape', Buffer.from('no'))).rejects.toThrow('escapes sandbox root');
+      await expect(handle.readFile('/etc/passwd')).rejects.toThrow('unsupported sandbox absolute path');
     } finally {
       await handle.kill();
     }

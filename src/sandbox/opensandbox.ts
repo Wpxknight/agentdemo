@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
+import { remoteWorkspacePath } from './workspace-path.js';
 import { Sandbox } from '@alibaba-group/opensandbox';
 import type { ConnectionConfigOptions, Execution, ExecutionHandlers } from '@alibaba-group/opensandbox';
 import type {
@@ -83,6 +84,10 @@ function safeMetadataValues(metadata: Record<string, string>): Record<string, st
 /** 把 OpenSandbox Sandbox 实例适配为统一的 SandboxHandle。 */
 class OpenSandboxHandle implements SandboxHandle {
   constructor(private readonly sbx: Sandbox) {}
+
+  workspacePath(relativePath = ''): string {
+    return remoteWorkspacePath(relativePath);
+  }
 
   get sandboxId(): string {
     return this.sbx.id;

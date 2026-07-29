@@ -30,6 +30,7 @@ export interface PiSkillProduct {
   tenantId: string;
   allowedTenantIds?: readonly string[];
   ownerUserId?: string;
+  submittedByUserId?: string;
   visibility: 'public' | 'private' | 'shared';
   enabled: boolean;
   reviewed: boolean;
@@ -120,5 +121,5 @@ function isAvailableTo(product: PiSkillProduct, identity: PiSkillIdentity): bool
   return product.visibility !== 'private'
     || Boolean(identity.userId)
       && (product.ownerUserId === identity.userId
-        || (product as PiSkillProduct & { submittedByUserId?: string }).submittedByUserId === identity.userId);
+        || product.submittedByUserId === identity.userId);
 }

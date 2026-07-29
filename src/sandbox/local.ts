@@ -73,6 +73,13 @@ class LocalSandboxHandle implements SandboxHandle {
     this.sandboxId = `local-${key.replace(/[^a-zA-Z0-9_.-]/g, '-')}-${Date.now().toString(36)}`;
   }
 
+  workspacePath(relativePath = ''): string {
+    if (relativePath.replace(/\\/g, '/').split('/').includes('..')) {
+      throw new Error('sandbox path escapes sandbox root');
+    }
+    return this.resolveSandboxPath(relativePath ? `/workspace/${relativePath}` : '/workspace');
+  }
+
   async runCode(code: string, opts?: RunCodeOpts): Promise<ExecResult> {
     if (this.killed) return { stdout: '', stderr: '', exitCode: 1, error: 'sandbox already killed' };
     const fileName = codeFile(opts?.language);
@@ -89,14 +96,12 @@ class LocalSandboxHandle implements SandboxHandle {
 
   async readFile(p: string): Promise<Uint8Array> {
     if (this.killed) throw new Error('sandbox already killed');
-    // 相对路径按沙箱工作目录解析（命令默认 cwd 即此目录）；绝对路径原样读取。
-    const target = path.isAbsolute(p) ? p : path.resolve(this.dir, p);
-    return readFile(target);
+    return readFile(this.resolveSandboxPath(p));
   }
 
   async writeFile(p: string, content: Uint8Array, options?: { mode?: number }): Promise<void> {
     if (this.killed) throw new Error('sandbox already killed');
-    const target = path.isAbsolute(p) ? p : path.resolve(this.dir, p);
+    const target = this.resolveSandboxPath(p);
     await mkdir(path.dirname(target), { recursive: true });
     await writeFile(target, content, { mode: options?.mode });
     if (options?.mode !== undefined) await chmod(target, options.mode);
@@ -110,6 +115,23 @@ class LocalSandboxHandle implements SandboxHandle {
     if (this.killed) return;
     this.killed = true;
     await rm(this.dir, { recursive: true, force: true });
+  }
+
+  private resolveSandboxPath(requested: string): string {
+    const segments = requested.replace(/\\/g, '/').split('/');
+    if (segments.includes('..')) throw new Error('sandbox path escapes sandbox root');
+    let relativePath = requested;
+    if (path.isAbsolute(requested)) {
+      if (requested === '/workspace') relativePath = 'workspace';
+      else if (requested.startsWith('/workspace/')) relativePath = `workspace/${requested.slice('/workspace/'.length)}`;
+      else throw new Error('unsupported sandbox absolute path');
+    }
+    const target = path.resolve(this.dir, relativePath);
+    const relative = path.relative(this.dir, target);
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error('sandbox path escapes sandbox root');
+    }
+    return target;
   }
 }
 

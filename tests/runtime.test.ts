@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { mkdtemp } from 'node:fs/promises';
+import { describe, expect, it, vi } from 'vitest';
+import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MemoryStore } from '../src/db/memory.js';
@@ -42,6 +42,49 @@ describe('resolveRuntimeModelConfig', () => {
 });
 
 describe('production durable runtime assembly', () => {
+  it('clears the download sweep timer when runtime initialization fails', async () => {
+    vi.useFakeTimers();
+    try {
+      const root = await mkdtemp(join(tmpdir(), 'aiop-runtime-init-cleanup-'));
+      await mkdir(join(root, '.aiop-publications'), { recursive: true });
+      await writeFile(join(root, '.aiop-publications', 'broken.json'), '{');
+      const parsed = ConfigSchema.parse({
+        ...config,
+        downloads: { enabled: true, dir: join(root, 'downloads') },
+        skills: { dir: root },
+      });
+      const before = vi.getTimerCount();
+
+      await expect(buildRuntime(parsed, { store: new MemoryStore() })).rejects.toThrow();
+
+      expect(vi.getTimerCount()).toBe(before);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('accepts bounded pending quotas suitable for a 5Gi shared skill PVC', () => {
+    const parsed = ConfigSchema.parse({
+      ...config,
+      skills: {
+        dir: '/skills',
+        pendingQuota: {
+          perUserMaxCount: 20,
+          perUserMaxBytes: 256 * 1024 * 1024,
+          perTenantMaxCount: 200,
+          perTenantMaxBytes: 4 * 1024 * 1024 * 1024,
+          minFreeBytes: 512 * 1024 * 1024,
+          retentionMs: 24 * 60 * 60 * 1000,
+        },
+      },
+    });
+
+    expect(parsed.skills?.pendingQuota).toMatchObject({
+      perTenantMaxBytes: 4 * 1024 * 1024 * 1024,
+      minFreeBytes: 512 * 1024 * 1024,
+    });
+  });
+
   it('fails startup when shared skill storage requires a distributed mutation lock without MySQL', async () => {
     const skillRoot = await mkdtemp(join(tmpdir(), 'aiop-runtime-distributed-skills-'));
     const parsed = ConfigSchema.parse({

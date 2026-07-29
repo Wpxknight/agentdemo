@@ -140,6 +140,8 @@ describe('OpenSandboxProvider', () => {
     h.run.mockResolvedValue(exec('2'));
     const p = new OpenSandboxProvider();
     const handle = await p.create({ key: 'k' });
+    expect(handle.workspacePath?.('skills/demo')).toBe('/workspace/skills/demo');
+    expect(() => handle.workspacePath?.('../escape')).toThrow('escapes sandbox root');
     await handle.runCode('print(1+1)', { language: 'python' });
     const b64 = Buffer.from('print(1+1)', 'utf8').toString('base64');
     expect(h.run).toHaveBeenCalledWith(`echo ${b64} | base64 -d | python3`, undefined, undefined);

@@ -209,6 +209,8 @@ describe('AiosE2bProvider', () => {
       jsonResponse(200, { stdout: '42\n', stderr: '', exitCode: 0 }),
     ]);
     const handle = await provider(fetch).create({ key: 'session:code', template: 'code-id' });
+    expect(handle.workspacePath?.('skills/demo')).toBe('/workspace/skills/demo');
+    expect(() => handle.workspacePath?.('../escape')).toThrow('escapes sandbox root');
 
     await expect(handle.runCode('console.log(42)', { language: 'javascript' }))
       .resolves.toEqual({ stdout: '42\n', stderr: '', exitCode: 0 });

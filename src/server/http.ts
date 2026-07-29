@@ -33,6 +33,7 @@ import { createModel } from '../model/factory.js';
 import { estimateCost } from '../model/cost.js';
 import type { JsonValue, Msg, ToolCall } from '../model/types.js';
 import { importSkillZip, MAX_SKILL_ZIP_BYTES } from '../skill/import.js';
+import { SKILL_IMPORT_GLOBAL_CONCURRENCY, SKILL_IMPORT_TENANT_CONCURRENCY } from '../skill/lock.js';
 import type { Skill, SkillProductRecord, SkillRegistry } from '../skill/registry.js';
 import { McpServerSchema } from '../config/schema.js';
 import {
@@ -75,8 +76,6 @@ const GOAL_MODE_SYSTEM = [
 
 /** 10MB zip 的 base64 加 JSON 包装；该路由不继承通用大请求攻击面。 */
 const SKILL_IMPORT_MAX_BODY = Math.ceil(MAX_SKILL_ZIP_BYTES * 4 / 3) + 64_000;
-const SKILL_IMPORT_GLOBAL_CONCURRENCY = 4;
-const SKILL_IMPORT_TENANT_CONCURRENCY = 2;
 
 async function acquireSkillImport(registry: SkillRegistry, tenantId: string): Promise<() => Promise<void>> {
   const distributed = await registry.acquireImportPermit(
@@ -2059,6 +2058,9 @@ function skillHttpError(err: unknown): HttpError {
   }
   if (message.includes('已审核') || message.includes('不唯一')) return new HttpError(409, message);
   if (message.includes('名称冲突')) return new HttpError(409, message);
+  if (message.includes('待审核技能数量配额')) return new HttpError(429, message);
+  if (message.includes('待审核技能字节配额')) return new HttpError(413, message);
+  if (message.includes('技能存储可用空间不足')) return new HttpError(507, message);
   if (message.includes('Pi Skill 校验产生诊断') || message.includes('SKILL.md name')) {
     return new HttpError(422, message);
   }

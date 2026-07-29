@@ -3,6 +3,7 @@ import {
   AiosLifecycleHttpError,
 } from './aios-http.js';
 import { posix } from 'node:path';
+import { remoteWorkspacePath } from './workspace-path.js';
 import type { AiosLifecycleHttpOptions } from './aios-http.js';
 import type {
   ExecResult,
@@ -77,6 +78,10 @@ class AiosE2bHandle implements SandboxHandle {
     readonly sandboxId: string,
     private readonly provider: AiosE2bProvider,
   ) {}
+
+  workspacePath(relativePath = ''): string {
+    return remoteWorkspacePath(relativePath);
+  }
 
   async runCode(code: string, opts?: RunCodeOpts): Promise<ExecResult> {
     // Lifecycle 仅支持 buffered commands；编码后经 stdin 传入，避免引号和换行转义。

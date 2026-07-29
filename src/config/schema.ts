@@ -288,6 +288,14 @@ export const ConfigSchema = z.object({
       requireDistributedLock: z.boolean().optional(),
       /** summaries() 注入 system prompt 的总字符预算（默认 4000）。 */
       summaryBudget: z.number().int().positive().optional(),
+      pendingQuota: z.object({
+        perUserMaxCount: z.number().int().positive().optional(),
+        perUserMaxBytes: z.number().int().positive().optional(),
+        perTenantMaxCount: z.number().int().positive().optional(),
+        perTenantMaxBytes: z.number().int().positive().optional(),
+        minFreeBytes: z.number().int().nonnegative().optional(),
+        retentionMs: z.number().int().positive().optional(),
+      }).optional(),
       /** 注入会话沙箱的稳定环境信息（如 AIOS_BASE_URL）；凭据禁止走此通道。 */
       sandboxEnv: z.record(z.string(), z.string()).optional(),
     })

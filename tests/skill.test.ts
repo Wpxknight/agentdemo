@@ -1,13 +1,42 @@
-import { chmod, cp, mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdtemp, mkdir, readFile, readdir, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { deflateRawSync } from 'node:zlib';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { SkillRegistry } from '../src/skill/registry.js';
 import { importSkillZip } from '../src/skill/import.js';
 import { normalizeCredentialFile, type SkillProductRecord } from '../src/skill/product.js';
-import { MysqlSkillMutationLock } from '../src/skill/lock.js';
+import {
+  MysqlSkillMutationLock,
+  skillImportPermitPoolSize,
+  type SkillMutationLock,
+} from '../src/skill/lock.js';
+import { ImmutableDigestCache } from '../src/skill/digest-cache.js';
+
+describe('ImmutableDigestCache', () => {
+  it('evicts the least recently used artifact after reaching its bound', () => {
+    const cache = new ImmutableDigestCache(2);
+    cache.set('/a', 'identity-a', 'digest-a');
+    cache.set('/b', 'identity-b', 'digest-b');
+    expect(cache.get('/a', 'identity-a')).toBe('digest-a');
+
+    cache.set('/c', 'identity-c', 'digest-c');
+
+    expect(cache.get('/a', 'identity-a')).toBe('digest-a');
+    expect(cache.get('/b', 'identity-b')).toBeUndefined();
+    expect(cache.get('/c', 'identity-c')).toBe('digest-c');
+  });
+
+  it('does not reuse a digest when artifact identity changes', () => {
+    const cache = new ImmutableDigestCache(2);
+    cache.set('/artifact', 'old-identity', 'old-digest');
+
+    expect(cache.get('/artifact', 'new-identity')).toBeUndefined();
+    cache.set('/artifact', 'new-identity', 'new-digest');
+    expect(cache.get('/artifact', 'new-identity')).toBe('new-digest');
+  });
+});
 
 function crc32(buf: Buffer): number {
   let crc = 0xffffffff;
@@ -364,7 +393,7 @@ describe('SkillRegistry', () => {
     await expect(registry.loadFor('seeded', {
       tenantId: 'default', userId: 'viewer', role: 'user',
     })).resolves.toBeUndefined();
-    await expect(stat(join(productRoot, 'seeded'))).resolves.toBeDefined();
+    await expect(stat(join(productRoot, 'seeded'))).rejects.toThrow();
 
     await rm(join(builtinRoot, 'seeded'), { recursive: true });
     const afterImageUpdate = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
@@ -372,6 +401,95 @@ describe('SkillRegistry', () => {
     await expect(afterImageUpdate.loadFor('seeded', {
       tenantId: 'default', userId: 'viewer', role: 'user',
     })).resolves.toBeUndefined();
+  });
+
+  it('migrates restrictive legacy PVC seed governance before suppressing old copies', async () => {
+    const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-legacy-migration-source-'));
+    const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-legacy-migration-product-'));
+    const definitions = [
+      { name: 'legacy-disabled', relative: 'legacy-disabled', source: { visibility: 'public', reviewed: true }, legacy: { visibility: 'public', reviewed: true, enabled: false }, deleted: false },
+      { name: 'legacy-unreviewed', relative: 'legacy-unreviewed', source: { visibility: 'public', reviewed: true }, legacy: { visibility: 'public', reviewed: false, enabled: true }, deleted: false },
+      { name: 'legacy-private', relative: 'users/admin/legacy-private', source: { visibility: 'shared', reviewed: true, ownerUserId: 'admin' }, legacy: { visibility: 'private', reviewed: true, enabled: true, ownerUserId: 'admin' }, deleted: false },
+      { name: 'legacy-shared', relative: 'users/admin/legacy-shared', source: { visibility: 'private', reviewed: true, ownerUserId: 'admin' }, legacy: { visibility: 'shared', reviewed: true, enabled: true, ownerUserId: 'admin' }, deleted: false },
+      { name: 'legacy-deleted', relative: 'legacy-deleted', source: { visibility: 'public', reviewed: true }, legacy: { visibility: 'public', reviewed: true, enabled: true }, deleted: true },
+    ] as const;
+    for (const definition of definitions) {
+      const builtin = join(builtinRoot, definition.relative);
+      const legacy = join(productRoot, definition.relative);
+      await mkdir(builtin, { recursive: true });
+      await writeFile(join(builtin, 'SKILL.md'), `---\nname: ${definition.name}\ndescription: legacy\n---\nbody`);
+      await writeProduct(builtin, {
+        name: definition.name, version: '1', enabled: true,
+        tenantId: 'default', ...definition.source,
+      });
+      await mkdir(legacy, { recursive: true });
+      await cp(builtin, legacy, { recursive: true });
+      await writeProduct(legacy, {
+        name: definition.name, version: '1', tenantId: 'default', ...definition.legacy,
+      });
+      if (definition.deleted) {
+        const tombstone = join(productRoot, '.aiop-tombstones', `old-${definition.name}`);
+        await mkdir(dirname(tombstone), { recursive: true });
+        await rename(legacy, tombstone);
+      }
+    }
+
+    const registry = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    const admin = { tenantId: 'default', userId: 'admin', role: 'tenant_admin' as const };
+    const viewer = { tenantId: 'default', userId: 'viewer', role: 'user' as const };
+    await registry.scan();
+    await registry.scan();
+
+    expect(registry.listFor(admin).find((skill) => skill.name === 'legacy-disabled')?.enabled).toBe(false);
+    expect(registry.listFor(admin).find((skill) => skill.name === 'legacy-unreviewed')?.reviewed).toBe(false);
+    await expect(registry.loadFor('legacy-private', viewer)).resolves.toBeUndefined();
+    expect(registry.listFor(admin).find((skill) => skill.name === 'legacy-private')?.visibility).toBe('private');
+    await expect(registry.loadFor('legacy-shared', viewer)).resolves.toMatchObject({ name: 'legacy-shared' });
+    await expect(registry.loadFor('legacy-deleted', admin)).resolves.toBeUndefined();
+    for (const definition of definitions.filter((item) => !item.deleted)) {
+      await expect(stat(join(productRoot, definition.relative))).rejects.toThrow();
+    }
+    await expect(stat(join(productRoot, '.aiop-tombstones', 'old-legacy-deleted'))).rejects.toThrow();
+  });
+
+  it('keeps a legacy seed when an existing governance overlay is incomplete', async () => {
+    const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-partial-overlay-source-'));
+    const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-partial-overlay-product-'));
+    const name = 'partial-overlay';
+    for (const root of [builtinRoot, productRoot]) {
+      const skill = join(root, name);
+      await mkdir(skill, { recursive: true });
+      await writeFile(join(skill, 'SKILL.md'), `---\nname: ${name}\ndescription: partial\n---\nbody`);
+      await writeProduct(skill, {
+        name, version: '1', enabled: true, reviewed: true,
+        tenantId: 'default', visibility: 'public',
+      });
+    }
+    const identity = createHash('sha256').update(`default\0${name}\0${name}`).digest('hex');
+    await mkdir(join(productRoot, '.aiop-governance'), { recursive: true });
+    await writeFile(join(productRoot, '.aiop-governance', `${identity}.json`), '{"schemaVersion":1');
+    const registry = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+
+    await expect(registry.scan()).rejects.toThrow();
+    await expect(stat(join(productRoot, name))).resolves.toBeDefined();
+  });
+
+  it('retains unmatched legacy deletion tombstones until their builtin can be migrated', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-builtin-unmatched-tombstone-'));
+    const tombstone = join(root, '.aiop-tombstones', 'legacy-deleted-seed');
+    await mkdir(tombstone, { recursive: true });
+    await writeFile(join(tombstone, 'SKILL.md'), '---\nname: absent-builtin\ndescription: absent\n---\nbody');
+    await writeProduct(tombstone, {
+      name: 'absent-builtin', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+    });
+    const old = new Date(Date.now() - 10_000);
+    await utimes(tombstone, old, old);
+    const registry = new SkillRegistry(root, { pendingQuota: { retentionMs: 100 } });
+
+    await registry.scan();
+
+    await expect(stat(tombstone)).resolves.toBeDefined();
   });
 
   it('does not suppress an identical ownerless public product at a non-seed relative path', async () => {
@@ -634,6 +752,11 @@ describe('SkillRegistry governed Pi loading', () => {
 });
 
 describe('SkillRegistry upload review governance', () => {
+  it('keeps the import permit pool large enough when MYSQL_POOL_SIZE is one', () => {
+    expect(skillImportPermitPoolSize(1)).toBe(5);
+    expect(skillImportPermitPoolSize(8)).toBe(8);
+  });
+
   it('uses connection-scoped MySQL advisory locks and releases the dedicated connection on failure', async () => {
     const queries: Array<{ sql: string; params?: unknown[] }> = [];
     let released = false;
@@ -742,6 +865,90 @@ describe('SkillRegistry upload review governance', () => {
       'SELECT RELEASE_LOCK(?) AS released',
       'SELECT RELEASE_LOCK(?) AS released',
     ]);
+  });
+
+  it('keeps an occupied import permit pool independent from the name mutation pool', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-independent-skill-locks-'));
+    const source = join(root, '.staged-independent');
+    await mkdir(source);
+    await writeFile(join(source, 'SKILL.md'), '---\nname: independent\ndescription: independent locks\n---\nbody');
+    await writeProduct(source, { name: 'independent', version: '1' });
+    let permitReleased = false;
+    let permitCalls = 0;
+    const importPermitLock: SkillMutationLock = {
+      async tryAcquireSlots() {
+        permitCalls += 1;
+        return async () => { permitReleased = true; };
+      },
+      async withLock<T>(_key: string, _timeoutMs: number, operation: () => Promise<T>): Promise<T> {
+        return operation();
+      },
+    };
+    const mutationCalls: Array<[string, number]> = [];
+    const mutationLock: SkillMutationLock = {
+      async withLock<T>(key: string, timeoutMs: number, operation: () => Promise<T>): Promise<T> {
+        mutationCalls.push([key, timeoutMs]);
+        return operation();
+      },
+    };
+    const registry = new SkillRegistry(root, {
+      mutationLock,
+      importPermitLock,
+    });
+
+    const permit = await registry.acquireImportPermit('default', 1, 1);
+    expect(permit).toMatchObject({ supported: true });
+    await expect(registry.installUploadedProduct(source, {
+      tenantId: 'default', userId: 'uploader', role: 'user',
+    }, {
+      destinationDir: join(root, 'users', 'uploader', 'independent'),
+    })).resolves.toMatchObject({ name: 'independent' });
+    expect(permitReleased).toBe(false);
+    expect(permitCalls).toBe(1);
+    expect(mutationCalls).toEqual([[
+      'skill-mutation',
+      10_000,
+    ]]);
+    await permit.release?.();
+    expect(permitReleased).toBe(true);
+  });
+
+  it('bounds waiting for a MySQL advisory-lock pool connection', async () => {
+    const pool = {
+      promise: () => ({
+        getConnection: () => new Promise(() => undefined),
+        end: async () => undefined,
+      }),
+    };
+    const lock = new MysqlSkillMutationLock(pool as never, 20);
+
+    const result = Promise.race([
+      lock.withLock('skill-name:blocked', 1000, async () => 'unexpected'),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('test deadline exceeded')), 200)),
+    ]);
+    await expect(result).rejects.toThrow('获取技能锁连接超时');
+  });
+
+  it('releases a pool connection that arrives after the bounded acquire timeout', async () => {
+    let resolveConnection!: (connection: { release(): void }) => void;
+    let released = false;
+    const pendingConnection = new Promise<{ release(): void }>((resolvePending) => {
+      resolveConnection = resolvePending;
+    });
+    const pool = {
+      promise: () => ({
+        getConnection: () => pendingConnection,
+        end: async () => undefined,
+      }),
+    };
+    const lock = new MysqlSkillMutationLock(pool as never, 10);
+
+    await expect(lock.withLock('skill-name:late', 1000, async () => 'unexpected'))
+      .rejects.toThrow('获取技能锁连接超时');
+    resolveConnection({ release: () => { released = true; } });
+    await new Promise((resolvePending) => setTimeout(resolvePending, 0));
+
+    expect(released).toBe(true);
   });
 
   it('uses only two connections for two concurrent global and tenant permits', async () => {
@@ -929,6 +1136,160 @@ describe('SkillRegistry upload review governance', () => {
     await expect(stale.loadFor('immutable', {
       tenantId: 'default', userId: 'viewer', role: 'user',
     })).resolves.toBeUndefined();
+  });
+
+  it.each([
+    ['artifact renamed before commit', false, false],
+    ['pending tombstoned before commit', false, true],
+    ['marker committed before pending cleanup', true, false],
+    ['pending cleanup interrupted after commit', true, true],
+  ] as const)('reconciles publication crash state: %s', async (_case, committed, tombstoned) => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-publication-recovery-'));
+    const name = `recover-${committed ? 'committed' : 'pending'}-${tombstoned ? 'tombstoned' : 'source'}`;
+    const sourcePath = join(root, 'users', 'uploader', name);
+    const publishedPath = join(root, '.aiop-published', 'tenant-default', '1-deadbeef', name);
+    const stagedPath = join(root, '.aiop-published', '.staging-recovery');
+    const tombstonePath = join(root, '.aiop-tombstones', 'publication-recovery');
+    const journalPath = join(root, '.aiop-publications', 'recovery.json');
+    await mkdir(sourcePath, { recursive: true });
+    await writeFile(join(sourcePath, 'SKILL.md'), `---\nname: ${name}\ndescription: pending\n---\npending`);
+    await writeProduct(sourcePath, {
+      name, version: '1', enabled: true, reviewed: false,
+      tenantId: 'default', ownerUserId: 'uploader', visibility: 'private',
+    });
+    await writeFile(join(sourcePath, '.aiop-publication-source'), 'recovery\n');
+    await mkdir(publishedPath, { recursive: true });
+    await writeFile(join(publishedPath, 'SKILL.md'), `---\nname: ${name}\ndescription: published\n---\npublished`);
+    await writeProduct(publishedPath, {
+      name, version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', submittedByUserId: 'uploader', visibility: 'private',
+    });
+    if (committed) await writeFile(join(publishedPath, '.aiop-committed'), 'committed\n');
+    if (tombstoned) {
+      await mkdir(join(root, '.aiop-tombstones'), { recursive: true });
+      await rename(sourcePath, tombstonePath);
+    }
+    await mkdir(join(root, '.aiop-publications'), { recursive: true });
+    await writeFile(journalPath, `${JSON.stringify({
+      schemaVersion: 1,
+      publicationId: 'recovery',
+      sourceId: `default:uploader:${name}`,
+      sourceDigest: '0'.repeat(64),
+      sourceVersion: '1',
+      sourcePath,
+      stagedPath,
+      publishedPath,
+      tombstonePath,
+      createdAt: new Date().toISOString(),
+    }, null, 2)}\n`);
+
+    const restarted = new SkillRegistry(root);
+    await restarted.scan();
+    await restarted.scan();
+
+    const pathExists = async (path: string) => stat(path).then(() => true, () => false);
+    expect(await pathExists(journalPath)).toBe(false);
+    expect(await pathExists(stagedPath)).toBe(false);
+    expect(await pathExists(tombstonePath)).toBe(false);
+    expect(await pathExists(publishedPath)).toBe(committed);
+    expect(await pathExists(sourcePath)).toBe(!committed);
+    if (committed) {
+      expect(restarted.listFor({ tenantId: 'default', userId: 'uploader', role: 'user' })
+        .some((skill) => skill.name === name && skill.reviewed)).toBe(true);
+    }
+  });
+
+  it('does not let an old committed journal delete a later pending upload at the same path', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-publication-later-source-'));
+    const name = 'later-source';
+    const sourcePath = join(root, 'users', 'uploader', name);
+    const publishedPath = join(root, '.aiop-published', 'tenant-default', '1-digest', name);
+    const stagedPath = join(root, '.aiop-published', '.staging-later');
+    const tombstonePath = join(root, '.aiop-tombstones', 'publication-old');
+    await mkdir(sourcePath, { recursive: true });
+    await writeFile(join(sourcePath, 'SKILL.md'), `---\nname: ${name}\ndescription: new pending\n---\nnew`);
+    await writeProduct(sourcePath, {
+      name, version: '2', enabled: true, reviewed: false,
+      tenantId: 'default', ownerUserId: 'uploader', visibility: 'private',
+    });
+    await mkdir(publishedPath, { recursive: true });
+    await writeFile(join(publishedPath, 'SKILL.md'), `---\nname: ${name}\ndescription: published\n---\nold`);
+    await writeProduct(publishedPath, {
+      name, version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', submittedByUserId: 'uploader', visibility: 'private',
+    });
+    await writeFile(join(publishedPath, '.aiop-committed'), 'committed\n');
+    await mkdir(join(root, '.aiop-publications'), { recursive: true });
+    await writeFile(join(root, '.aiop-publications', 'old.json'), JSON.stringify({
+      schemaVersion: 1,
+      publicationId: 'old',
+      sourceId: `default:uploader:${name}`,
+      sourceDigest: 'a'.repeat(64),
+      sourceVersion: '1',
+      sourcePath,
+      stagedPath,
+      publishedPath,
+      tombstonePath,
+      createdAt: new Date(Date.now() - 10_000).toISOString(),
+    }));
+
+    const registry = new SkillRegistry(root);
+    await registry.scan();
+
+    await expect(stat(sourcePath)).resolves.toBeDefined();
+    await expect(readFile(join(sourcePath, 'SKILL.md'), 'utf8')).resolves.toContain('new pending');
+    await expect(stat(join(root, '.aiop-publications', 'old.json'))).rejects.toThrow();
+  });
+
+  it('waits for the publication lock before reconciling a live journal', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-publication-live-'));
+    const name = 'live-publication';
+    const sourcePath = join(root, 'users', 'uploader', name);
+    const stagedPath = join(root, '.aiop-published', '.staging-live');
+    const publishedPath = join(root, '.aiop-published', 'tenant-default', '1-digest', name);
+    const tombstonePath = join(root, '.aiop-tombstones', 'publication-live');
+    await mkdir(sourcePath, { recursive: true });
+    await writeFile(join(sourcePath, 'SKILL.md'), `---\nname: ${name}\ndescription: live\n---\nbody`);
+    await writeProduct(sourcePath, {
+      name, version: '1', enabled: true, reviewed: false,
+      tenantId: 'default', ownerUserId: 'uploader', visibility: 'private',
+    });
+    await mkdir(dirname(stagedPath), { recursive: true });
+    await cp(sourcePath, stagedPath, { recursive: true });
+    await mkdir(dirname(publishedPath), { recursive: true });
+    await rename(stagedPath, publishedPath);
+    await mkdir(join(root, '.aiop-publications'), { recursive: true });
+    await writeFile(join(root, '.aiop-publications', 'live.json'), JSON.stringify({
+      schemaVersion: 1,
+      publicationId: 'live',
+      sourceId: `default:uploader:${name}`,
+      sourceDigest: 'a'.repeat(64),
+      sourceVersion: '1',
+      sourcePath,
+      stagedPath,
+      publishedPath,
+      tombstonePath,
+      createdAt: new Date().toISOString(),
+    }));
+    let releaseLock!: () => void;
+    const lockGate = new Promise<void>((resolveGate) => { releaseLock = resolveGate; });
+    let lockRequested = false;
+    const registry = new SkillRegistry(root, { mutationLock: {
+      async withLock<T>(key: string, _timeoutMs: number, operation: () => Promise<T>): Promise<T> {
+        expect(key).toBe('skill-mutation');
+        lockRequested = true;
+        await lockGate;
+        return operation();
+      },
+    } });
+
+    const scan = registry.scan();
+    await vi.waitFor(() => expect(lockRequested).toBe(true));
+    await expect(stat(publishedPath)).resolves.toBeDefined();
+    releaseLock();
+    await scan;
+    await expect(stat(publishedPath)).rejects.toThrow();
+    await expect(stat(sourcePath)).resolves.toBeDefined();
   });
 
   it('rejects a published artifact whose content no longer matches its digest', async () => {
@@ -1282,6 +1643,198 @@ describe('SkillRegistry upload review governance', () => {
 
     expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
     expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+  });
+
+  it('enforces per-user pending quotas atomically across unique concurrent names', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-pending-quota-'));
+    const staged = await Promise.all(['quota-one', 'quota-two'].map(async (name) => {
+      const path = join(root, '.aiop-imports', `${name}-staged`, name);
+      await mkdir(path, { recursive: true });
+      await writeFile(join(path, 'SKILL.md'), `---\nname: ${name}\ndescription: quota\n---\nbody`);
+      await writeProduct(path, { name, version: '1' });
+      return { name, path };
+    }));
+    const pendingQuota = {
+      perUserMaxCount: 1, perUserMaxBytes: 1024 * 1024,
+      perTenantMaxCount: 10, perTenantMaxBytes: 10 * 1024 * 1024,
+      minFreeBytes: 0, retentionMs: 60_000,
+    };
+    const first = new SkillRegistry(root, { ...({ pendingQuota } as object) });
+    const second = new SkillRegistry(root, { ...({ pendingQuota } as object) });
+    const viewer = { tenantId: 'default', userId: 'quota-user', role: 'user' as const };
+
+    const results = await Promise.allSettled(staged.map((item, index) => [first, second][index]!
+      .installUploadedProduct(item.path, viewer, {
+        destinationDir: join(root, 'users', viewer.userId, item.name),
+      })));
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    expect(String((results.find((result) => result.status === 'rejected') as PromiseRejectedResult).reason))
+      .toContain('用户待审核技能数量配额');
+  });
+
+  it('isolates pending quotas by user and rejects byte and free-space exhaustion', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-pending-quota-boundaries-'));
+    const install = async (name: string, userId: string, registry: SkillRegistry, bytes = 4) => {
+      const source = join(root, '.aiop-imports', `${name}-staged`, name);
+      await mkdir(source, { recursive: true });
+      await writeFile(join(source, 'SKILL.md'), `---\nname: ${name}\ndescription: quota\n---\n${'x'.repeat(bytes)}`);
+      await writeProduct(source, { name, version: '1' });
+      return registry.installUploadedProduct(source, {
+        tenantId: 'default', userId, role: 'user',
+      }, { destinationDir: join(root, 'users', userId, name) });
+    };
+    const countRegistry = new SkillRegistry(root, { ...({ pendingQuota: {
+      perUserMaxCount: 1, perUserMaxBytes: 1024 * 1024,
+      perTenantMaxCount: 10, perTenantMaxBytes: 10 * 1024 * 1024,
+      minFreeBytes: 0, retentionMs: 60_000,
+    } } as object) });
+    await expect(install('user-a-one', 'user-a', countRegistry)).resolves.toBeDefined();
+    await expect(install('user-b-one', 'user-b', countRegistry)).resolves.toBeDefined();
+
+    const byteRegistry = new SkillRegistry(root, { ...({ pendingQuota: {
+      perUserMaxCount: 10, perUserMaxBytes: 32,
+      perTenantMaxCount: 10, perTenantMaxBytes: 64,
+      minFreeBytes: 0, retentionMs: 60_000,
+    } } as object) });
+    await expect(install('bytes-over', 'bytes-user', byteRegistry, 128))
+      .rejects.toThrow('用户待审核技能字节配额');
+
+    const diskRegistry = new SkillRegistry(root, { ...({
+      pendingQuota: {
+        perUserMaxCount: 10, perUserMaxBytes: 1024,
+        perTenantMaxCount: 10, perTenantMaxBytes: 1024,
+        minFreeBytes: 512, retentionMs: 60_000,
+      },
+      availableBytes: async () => 511,
+    } as object) });
+    await expect(install('disk-over', 'disk-user', diskRegistry)).rejects.toThrow('技能存储可用空间不足');
+  });
+
+  it('isolates pending quotas by tenant', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-pending-quota-tenants-'));
+    const registry = new SkillRegistry(root, { pendingQuota: {
+      perUserMaxCount: 10, perUserMaxBytes: 1024 * 1024,
+      perTenantMaxCount: 1, perTenantMaxBytes: 10 * 1024 * 1024,
+      minFreeBytes: 0, retentionMs: 60_000,
+    } });
+    const install = async (name: string, tenantId: string) => {
+      const viewer = { tenantId, userId: 'same-user', role: 'user' as const };
+      const source = join(root, '.aiop-imports', `${tenantId}-${name}`, name);
+      await mkdir(source, { recursive: true });
+      await writeFile(join(source, 'SKILL.md'), `---\nname: ${name}\ndescription: quota\n---\nbody`);
+      await writeProduct(source, { name, version: '1' });
+      return registry.installUploadedProduct(source, viewer, {
+        destinationDir: join(registry.uploadRootFor(viewer), name),
+      });
+    };
+
+    await expect(install('tenant-a-one', 'tenant-a')).resolves.toBeDefined();
+    await expect(install('tenant-b-one', 'tenant-b')).resolves.toBeDefined();
+    await expect(install('tenant-a-two', 'tenant-a')).rejects.toThrow('租户待审核技能数量配额');
+  });
+
+  it('serializes free-space reservations across tenants', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-pending-quota-storage-'));
+    const destinations = [
+      join(root, 'tenants', 'tenant-a', 'users', 'user-a', 'storage-a'),
+      join(root, 'tenants', 'tenant-b', 'users', 'user-b', 'storage-b'),
+    ];
+    const availableBytes = async () => {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+      const occupied = (await Promise.all(destinations.map((path) => stat(path).then(() => true, () => false))))
+        .some(Boolean);
+      return occupied ? 0 : 1024 * 1024;
+    };
+    const pendingQuota = {
+      perUserMaxCount: 10, perUserMaxBytes: 1024 * 1024,
+      perTenantMaxCount: 10, perTenantMaxBytes: 10 * 1024 * 1024,
+      minFreeBytes: 1024, retentionMs: 60_000,
+    };
+    const registries = [
+      new SkillRegistry(root, { pendingQuota, availableBytes }),
+      new SkillRegistry(root, { pendingQuota, availableBytes }),
+    ];
+    const installs = await Promise.all(['a', 'b'].map(async (suffix, index) => {
+      const name = `storage-${suffix}`;
+      const tenantId = `tenant-${suffix}`;
+      const userId = `user-${suffix}`;
+      const source = join(root, '.aiop-imports', `${name}-staged`, name);
+      await mkdir(source, { recursive: true });
+      await writeFile(join(source, 'SKILL.md'), `---\nname: ${name}\ndescription: storage\n---\nbody`);
+      await writeProduct(source, { name, version: '1' });
+      return { registry: registries[index]!, source, viewer: { tenantId, userId, role: 'user' as const } };
+    }));
+
+    const results = await Promise.allSettled(installs.map((item, index) => item.registry.installUploadedProduct(
+      item.source,
+      item.viewer,
+      { destinationDir: destinations[index]! },
+    )));
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    expect(String((results.find((result) => result.status === 'rejected') as PromiseRejectedResult).reason))
+      .toContain('技能存储可用空间不足');
+  });
+
+  it('reuses pending quota after review and deletion', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-pending-quota-release-'));
+    const registry = new SkillRegistry(root, { pendingQuota: {
+      perUserMaxCount: 1, perUserMaxBytes: 1024 * 1024,
+      perTenantMaxCount: 10, perTenantMaxBytes: 10 * 1024 * 1024,
+      minFreeBytes: 0, retentionMs: 60_000,
+    } });
+    const viewer = { tenantId: 'default', userId: 'quota-owner', role: 'user' as const };
+    const install = async (name: string) => {
+      const source = join(root, '.aiop-imports', `${name}-staged`, name);
+      await mkdir(source, { recursive: true });
+      await writeFile(join(source, 'SKILL.md'), `---\nname: ${name}\ndescription: quota\n---\nbody`);
+      await writeProduct(source, { name, version: '1' });
+      return registry.installUploadedProduct(source, viewer, {
+        destinationDir: join(registry.uploadRootFor(viewer), name),
+      });
+    };
+
+    await install('quota-reviewed');
+    await registry.review('quota-reviewed', {
+      tenantId: 'default', userId: 'reviewer', role: 'tenant_admin',
+    });
+    await expect(install('quota-deleted')).resolves.toBeDefined();
+    await registry.delete('quota-deleted', viewer);
+    await expect(install('quota-reused')).resolves.toBeDefined();
+  });
+
+  it('releases deleted pending storage immediately and garbage-collects stale staging artifacts', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-skill-retention-gc-'));
+    const pending = join(root, 'users', 'owner', 'delete-me');
+    await mkdir(pending, { recursive: true });
+    await writeFile(join(pending, 'SKILL.md'), '---\nname: delete-me\ndescription: delete\n---\nbody');
+    await writeProduct(pending, {
+      name: 'delete-me', version: '1', enabled: true, reviewed: false,
+      tenantId: 'default', ownerUserId: 'owner', visibility: 'private',
+    });
+    const staleImport = join(root, '.aiop-imports', 'stale-import');
+    const staleArtifact = join(root, '.aiop-published', '.staging-stale');
+    await mkdir(staleImport, { recursive: true });
+    await mkdir(staleArtifact, { recursive: true });
+    const old = new Date(Date.now() - 10_000);
+    await utimes(staleImport, old, old);
+    await utimes(staleArtifact, old, old);
+    const registry = new SkillRegistry(root, { ...({ pendingQuota: {
+      retentionMs: 100,
+    } } as object) });
+    await registry.scan();
+
+    await registry.delete('delete-me', {
+      tenantId: 'default', userId: 'owner', role: 'user',
+    });
+
+    await expect(stat(pending)).rejects.toThrow();
+    await expect(readdir(join(root, '.aiop-tombstones'))).resolves.toEqual([]);
+    await expect(stat(staleImport)).rejects.toThrow();
+    await expect(stat(staleArtifact)).rejects.toThrow();
   });
 
   it('uses a process-shared mutex instead of recovering filesystem lease owners', async () => {

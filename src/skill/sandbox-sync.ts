@@ -7,7 +7,7 @@ const execFileAsync = promisify(execFile);
 export const SYNC_SKIP_FILE_BYTES = 2_000_000;
 export const SYNC_TOTAL_BYTES = 16_000_000;
 const SYNC_CHUNK_CHARS = 64_000;
-const SANDBOX_SKILLS_ROOT = '/workspace/skills';
+const SANDBOX_SKILLS_ROOT = 'skills';
 
 export interface SandboxSyncResult {
   dest: string;
@@ -28,7 +28,8 @@ export async function syncSkillToSandbox(input: {
   const skipped = input.partial ? [] : input.files.filter((file) => file.size > SYNC_SKIP_FILE_BYTES);
   const total = kept.reduce((sum, file) => sum + file.size, 0);
   const safe = input.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-  const dest = `${SANDBOX_SKILLS_ROOT}/${safe}`;
+  const dest = input.sbx.workspacePath?.(`${SANDBOX_SKILLS_ROOT}/${safe}`)
+    ?? `/workspace/${SANDBOX_SKILLS_ROOT}/${safe}`;
   const result = { dest, kept, skipped, total };
   if (!kept.length) return { ...result, error: '没有可同步的文件（可能全部被大小过滤跳过）' };
   if (total > SYNC_TOTAL_BYTES) return { ...result, error: '待同步文件总量超过上限；请用 paths 参数缩小同步范围' };
@@ -38,7 +39,8 @@ export async function syncSkillToSandbox(input: {
     { maxBuffer: SYNC_TOTAL_BYTES * 2, encoding: 'buffer' },
   );
   const b64 = archive.toString('base64');
-  const tmp = `/tmp/aiop-skill-${safe}`;
+  const tmp = input.sbx.workspacePath?.(`.aiop-tmp/aiop-skill-${safe}`)
+    ?? `/tmp/aiop-skill-${safe}`;
   const prep = await input.sbx.runCommand(
     `command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 || { echo AIOP_MISSING_TOOLS; exit 9; }; `
       + (input.partial ? '' : `rm -rf '${dest}'; `)

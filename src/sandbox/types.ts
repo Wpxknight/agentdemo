@@ -75,6 +75,8 @@ export interface RunCommandOpts {
 /** 一个已就绪沙箱的统一句柄。 */
 export interface SandboxHandle {
   readonly sandboxId: string;
+  /** Returns a command-visible path beneath this sandbox's workspace root. */
+  workspacePath?(relativePath?: string): string;
   /** 在沙箱里执行代码（默认 python）。 */
   runCode(code: string, opts?: RunCodeOpts): Promise<ExecResult>;
   /** 在沙箱里执行 shell 命令。 */

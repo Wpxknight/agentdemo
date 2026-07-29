@@ -1592,6 +1592,26 @@ describe('HTTP server', () => {
     }).toString('base64');
 
     try {
+      for (const [message, status] of [
+        ['用户待审核技能数量配额已满', 429],
+        ['用户待审核技能字节配额已满', 413],
+        ['技能存储可用空间不足', 507],
+      ] as const) {
+        const quotaSpy = vi.spyOn(skills, 'installUploadedProduct').mockRejectedValueOnce(new Error(message));
+        const response = await fetch(`${importBase}/v1/skills/import`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
+          body: JSON.stringify({
+            filename: `quota-${status}.zip`,
+            data: storedZip({
+              'SKILL.md': `---\nname: quota-${status}\ndescription: Quota probe\n---\nbody`,
+            }).toString('base64'),
+          }),
+        });
+        expect(response.status).toBe(status);
+        quotaSpy.mockRestore();
+      }
+
       const originalInstall = skills.installUploadedProduct.bind(skills);
       const installSpy = vi.spyOn(skills, 'installUploadedProduct').mockImplementationOnce(async (...args) => {
         expect(args[0].startsWith(`${join(skillRoot, '.aiop-imports')}/`)).toBe(true);

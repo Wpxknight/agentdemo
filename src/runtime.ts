@@ -43,7 +43,7 @@ import { buildBrowserTools } from './tools/browser.js';
 import { McpManager } from './mcp/manager.js';
 import { connectMcp } from './mcp/client.js';
 import { SkillRegistry } from './skill/registry.js';
-import { MysqlSkillMutationLock } from './skill/lock.js';
+import { MysqlSkillMutationLock, skillImportPermitPoolSize } from './skill/lock.js';
 import { ClusterRegistry } from './config/clusters.js';
 import { buildKubectlTool } from './tools/kubectl.js';
 import { LogAuditSink } from './audit/sink.js';
@@ -277,10 +277,21 @@ export async function buildRuntime(
   const skillMutationLock = mysqlConfig && store instanceof MysqlStore
     ? new MysqlSkillMutationLock(createMysqlPool(mysqlConfig))
     : undefined;
+  const skillImportPermitLock = mysqlConfig && store instanceof MysqlStore
+    ? new MysqlSkillMutationLock(createMysqlPool({
+      ...mysqlConfig,
+      poolSize: skillImportPermitPoolSize(mysqlConfig.poolSize),
+    }))
+    : undefined;
   if (config.skills?.requireDistributedLock && !skillMutationLock) {
     if (!options.store) await store.close();
     throw new Error('skills.requireDistributedLock requires a MySQL distributed mutation lock');
   }
+  const initializationCleanups: Array<() => Promise<void>> = [];
+  if (!options.store) initializationCleanups.push(() => store.close());
+  if (skillMutationLock) initializationCleanups.push(() => skillMutationLock.close());
+  if (skillImportPermitLock) initializationCleanups.push(() => skillImportPermitLock.close());
+  try {
   const logSink = new LogAuditSink();
   const audit: AuditSink = {
     async record(e) {
@@ -303,6 +314,7 @@ export async function buildRuntime(
     : new AllowAllPolicy();
 
   const sandboxController = new SandboxRuntimeController();
+  initializationCleanups.push(() => sandboxController.disposeAll());
   const sandboxPersistence = new SandboxSettingsPersistence(store, options.settingsSecretBox ?? createSettingsSecretBox());
   let sandboxState: LoadedSandboxSettings | undefined;
   let sandboxCfg: SandboxConfig | undefined;
@@ -547,12 +559,15 @@ export async function buildRuntime(
       void downloads?.sweep().catch((err) => logger.warn({ err: String(err) }, 'download sweep failed'));
     }, 60 * 60_000);
     downloadSweepTimer.unref?.();
+    const initializedDownloadSweepTimer = downloadSweepTimer;
+    initializationCleanups.push(async () => clearInterval(initializedDownloadSweepTimer));
   }
   syncSandboxTools();
 
   // MCP：持久化配置（UI 增删的结果）优先于 config.jsonc；常驻 manager 以支持运行期管理。
   const persistedMcp = await store.getMcpServers({ tenantId: DEFAULT_TENANT }).catch(() => undefined);
   const mcp = new McpManager(persistedMcp ?? config.mcpServers ?? {}, connectMcp);
+  initializationCleanups.push(() => mcp.close());
   await mcp.start();
   for (const t of mcp.tools()) tools.register(t, 'mcp');
 
@@ -576,6 +591,8 @@ export async function buildRuntime(
       summaryBudget: config.skills.summaryBudget,
       builtinRoots: config.skills.builtinDir ? [config.skills.builtinDir] : [],
       mutationLock: skillMutationLock,
+      importPermitLock: skillImportPermitLock,
+      pendingQuota: config.skills.pendingQuota,
     });
     await skills.scan();
     const skillTools = buildSkillTools(skills, sandboxController, undefined, { credentials, audit });
@@ -838,11 +855,22 @@ export async function buildRuntime(
       await sandboxUpdateTail;
       await sandboxController.disposeAll();
       await mcp?.close();
-      await skillMutationLock?.close?.();
+      await Promise.all([
+        skillMutationLock?.close?.(),
+        skillImportPermitLock?.close?.(),
+      ]);
       if (!options.store) await store.close();
     },
   };
 
   syncSandboxCatalogRefreshTimer();
   return runtime;
+  } catch (error) {
+    for (const cleanup of initializationCleanups.reverse()) {
+      await cleanup().catch((cleanupError) => {
+        logger.warn({ err: String(cleanupError) }, 'runtime initialization cleanup failed');
+      });
+    }
+    throw error;
+  }
 }

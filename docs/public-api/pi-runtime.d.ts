@@ -250,6 +250,7 @@ export interface PiSkillProduct {
     tenantId: string;
     allowedTenantIds?: readonly string[];
     ownerUserId?: string;
+    submittedByUserId?: string;
     visibility: 'public' | 'private' | 'shared';
     enabled: boolean;
     reviewed: boolean;

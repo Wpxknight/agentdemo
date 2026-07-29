@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { cp, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { cp, link, mkdir, open, readdir, readFile, rename, rm, stat, statfs, writeFile } from 'node:fs/promises';
 import { dirname, join, posix, relative, resolve, sep } from 'node:path';
 import { logger } from '../logger.js';
 import type { JsonValue, ToolResult } from '../model/types.js';
@@ -28,6 +29,7 @@ import { canManageSkill, isSkillVisibleTo } from './visibility.js';
 import { enumerateSkillProductRecords } from './source.js';
 import { SkillProductService, type ProductSkillLoader } from './service.js';
 import type { SkillMutationLock } from './lock.js';
+import { ImmutableDigestCache } from './digest-cache.js';
 
 export {
   PUBLIC_SKILLS_DIR,
@@ -45,13 +47,20 @@ const log = logger.child({ mod: 'skill' });
 const DISABLED_MARKER = '.disabled';
 const SHARED_MARKER = '.shared';
 const OWNER_MARKER = '.owner';
+const PUBLICATION_SOURCE_MARKER = '.aiop-publication-source';
 const MARKER_FILES = new Set([
   DISABLED_MARKER, SHARED_MARKER, OWNER_MARKER, PRODUCT_RECORD_FILE, PUBLISHED_COMMIT_FILE,
+  PUBLICATION_SOURCE_MARKER,
 ]);
 const PRODUCT_SCHEMA_VERSION = 2;
 const BUILTIN_GOVERNANCE_DIR = '.aiop-governance';
 const BUILTIN_CATALOG_DIR = 'builtin-catalog';
+const PUBLICATION_JOURNAL_DIR = '.aiop-publications';
+const PUBLICATION_LOCK_KEY = 'skill-publication';
+const LEGACY_MUTATION_LOCK_KEY = 'skill-mutation';
+const STORAGE_QUOTA_LOCK_KEY = 'skill-quota:storage';
 const processNameLockTails = new Map<string, Promise<void>>();
+const immutableDigestCache = new ImmutableDigestCache(256);
 
 interface BuiltinGovernanceOverlay {
   schemaVersion: 1;
@@ -78,6 +87,19 @@ interface BuiltinCatalogEntry {
   seedEligible: boolean;
 }
 
+interface PublicationJournal {
+  schemaVersion: 1;
+  publicationId: string;
+  sourceId: string;
+  sourceDigest: string;
+  sourceVersion: string;
+  sourcePath: string;
+  stagedPath: string;
+  publishedPath: string;
+  tombstonePath: string;
+  createdAt: string;
+}
+
 export interface SkillRegistryOptions {
   /** @deprecated Pi owns prompt formatting and does not apply a product-side budget. */
   summaryBudget?: number;
@@ -89,7 +111,28 @@ export interface SkillRegistryOptions {
   /** Read-only image roots; mutations and uploads always use `dir`. */
   builtinRoots?: readonly string[];
   mutationLock?: SkillMutationLock;
+  importPermitLock?: SkillMutationLock;
+  pendingQuota?: Partial<SkillPendingQuota>;
+  availableBytes?: () => Promise<number>;
 }
+
+export interface SkillPendingQuota {
+  perUserMaxCount: number;
+  perUserMaxBytes: number;
+  perTenantMaxCount: number;
+  perTenantMaxBytes: number;
+  minFreeBytes: number;
+  retentionMs: number;
+}
+
+const DEFAULT_PENDING_QUOTA: SkillPendingQuota = {
+  perUserMaxCount: 20,
+  perUserMaxBytes: 256 * 1024 * 1024,
+  perTenantMaxCount: 200,
+  perTenantMaxBytes: 2 * 1024 * 1024 * 1024,
+  minFreeBytes: 512 * 1024 * 1024,
+  retentionMs: 24 * 60 * 60 * 1000,
+};
 
 interface UploadedProductInstallOptions {
   destinationDir?: string;
@@ -108,12 +151,22 @@ export class SkillRegistry {
   private readonly configuredRecords?: readonly SkillProductRecord[];
   private readonly builtinRoots: readonly string[];
   private readonly mutationLock?: SkillMutationLock;
+  private readonly importPermitLock?: SkillMutationLock;
+  private readonly pendingQuota: SkillPendingQuota;
+  private readonly availableBytes: () => Promise<number>;
   private mutationTail: Promise<void> = Promise.resolve();
+  private distributedLockDepth = 0;
 
   constructor(private readonly dir: string, opts: SkillRegistryOptions = {}) {
     this.configuredRecords = opts.records;
     this.builtinRoots = opts.builtinRoots ?? [];
     this.mutationLock = opts.mutationLock;
+    this.importPermitLock = opts.importPermitLock ?? opts.mutationLock;
+    this.pendingQuota = { ...DEFAULT_PENDING_QUOTA, ...opts.pendingQuota };
+    this.availableBytes = opts.availableBytes ?? (async () => {
+      const info = await statfs(resolve(this.dir));
+      return Number(info.bavail) * Number(info.bsize);
+    });
     this.service = new SkillProductService(
       opts.env ?? new NodeExecutionEnv({ cwd: dir }),
       opts.loader,
@@ -133,19 +186,19 @@ export class SkillRegistry {
     globalLimit: number,
     tenantLimit: number,
   ): Promise<{ supported: boolean; release?: () => Promise<void> }> {
-    if (this.mutationLock?.tryAcquireSlots) {
-      const release = await this.mutationLock.tryAcquireSlots([
+    if (this.importPermitLock?.tryAcquireSlots) {
+      const release = await this.importPermitLock.tryAcquireSlots([
         { keyPrefix: 'skill-import:global', limit: globalLimit },
         { keyPrefix: `skill-import:tenant:${tenantId}`, limit: tenantLimit },
       ]);
       return { supported: true, release };
     }
-    if (!this.mutationLock?.tryAcquireSlot) return { supported: false };
-    const globalRelease = await this.mutationLock.tryAcquireSlot('skill-import:global', globalLimit);
+    if (!this.importPermitLock?.tryAcquireSlot) return { supported: false };
+    const globalRelease = await this.importPermitLock.tryAcquireSlot('skill-import:global', globalLimit);
     if (!globalRelease) return { supported: true };
     let tenantRelease: (() => Promise<void>) | undefined;
     try {
-      tenantRelease = await this.mutationLock.tryAcquireSlot(`skill-import:tenant:${tenantId}`, tenantLimit);
+      tenantRelease = await this.importPermitLock.tryAcquireSlot(`skill-import:tenant:${tenantId}`, tenantLimit);
     } catch (error) {
       await globalRelease();
       throw error;
@@ -438,7 +491,12 @@ export class SkillRegistry {
         schemaVersion: PRODUCT_SCHEMA_VERSION,
         revision: 0,
       };
-      return this.withDistributedNameLock(metadata.name, async () => {
+      return this.withDistributedLocks([
+        STORAGE_QUOTA_LOCK_KEY,
+        `skill-quota:tenant:${metadata.tenantId}`,
+        `skill-quota:user:${metadata.tenantId}:${metadata.ownerUserId}`,
+        `skill-name:${metadata.name}`,
+      ], async () => {
         const record = normalizeSkillProductRecord({
           id: `${metadata.tenantId}:${metadata.ownerUserId}:${metadata.name}`,
           path: destinationDir,
@@ -449,6 +507,7 @@ export class SkillRegistry {
         await this.scanUnlocked([destinationDir]);
         this.assertNoPendingNameConflict(record);
         if (sourceDir !== destinationDir) await assertPathAbsent(destinationDir);
+        await this.assertPendingQuota(record, sourceDir);
         await writeProductRecord({ ...record, path: sourceDir });
         let moved = false;
         try {
@@ -476,7 +535,7 @@ export class SkillRegistry {
       if (options.global && viewer.role !== 'platform_admin') {
         throw new Error('仅平台管理员可全局发布技能');
       }
-      return this.withDistributedNameLock(name, async () => {
+      return this.withDistributedLocks([PUBLICATION_LOCK_KEY, `skill-name:${name}`], async () => {
         await this.scanUnlocked();
         const tenantRecords = this.records.filter((item) => item.name === name && item.tenantId === viewer.tenantId);
         const pending = tenantRecords.filter((item) => !item.reviewed && this.isUploadedRecord(item));
@@ -526,6 +585,7 @@ export class SkillRegistry {
         await mkdir(publishedRoot, { recursive: true, mode: 0o750 });
         let publishedPath = stagingPath;
         let publishedRecord: SkillProductRecord | undefined;
+        let publicationJournal: PublicationJournal | undefined;
         try {
           await cp(record.path, stagingPath, { recursive: true, errorOnExist: true, force: false });
           await rm(join(stagingPath, PRODUCT_RECORD_FILE), { force: true });
@@ -553,45 +613,38 @@ export class SkillRegistry {
           });
           publishedRecord = normalizeSkillProductRecord({ ...next, path: publishedPath });
           await writeProductRecord(next);
+          const publicationId = randomUUID();
+          publicationJournal = {
+            schemaVersion: 1,
+            publicationId,
+            sourceId: record.id,
+            sourceDigest: digest,
+            sourceVersion: record.version,
+            sourcePath: record.path,
+            stagedPath: stagingPath,
+            publishedPath,
+            tombstonePath: join(resolve(this.dir), SKILL_TOMBSTONES_DIR, `publication-${publicationId}`),
+            createdAt: new Date().toISOString(),
+          };
+          await writePublicationJournal(this.dir, publicationJournal);
+          await writePublicationSourceMarker(record.path, publicationId);
           await rename(stagingPath, publishedPath);
           await fsyncParent(publishedPath);
+          await commitPublishedArtifact(publishedPath);
         } catch (error) {
-          const rollbackError = await rollbackPublishedArtifact(stagingPath, publishedPath);
+          const rollbackError = publicationJournal
+            ? await reconcilePublicationJournal(this.dir, publicationJournal).then(() => undefined, String)
+            : await rollbackPublishedArtifact(stagingPath, publishedPath);
           if (rollbackError) {
             throw new Error(`技能发布失败且 artifact 回滚失败：${String(error)}; rollback: ${rollbackError}`);
           }
           throw error;
         }
-        let uploadTombstone: string | undefined;
         try {
-          uploadTombstone = await renameToTombstone(record.path, this.dir);
+          if (!publicationJournal) throw new Error('技能发布 journal 缺失');
+          await finishCommittedPublication(this.dir, publicationJournal);
         } catch (error) {
-          const rollbackError = await rollbackPublishedArtifact(stagingPath, publishedPath);
-          if (rollbackError) {
-            throw new Error(`技能上传目录归档失败且 artifact 回滚失败：${String(error)}; rollback: ${rollbackError}`);
-          }
-          throw error;
-        }
-        try {
-          await commitPublishedArtifact(publishedPath);
-        } catch (error) {
-          const rollbackErrors: string[] = [];
-          const artifactRollback = await rollbackPublishedArtifact(stagingPath, publishedPath);
-          if (artifactRollback) rollbackErrors.push(`artifact: ${artifactRollback}`);
-          if (uploadTombstone) {
-            try {
-              await mkdir(dirname(record.path), { recursive: true });
-              await rename(uploadTombstone, record.path);
-              await fsyncParent(uploadTombstone);
-              await fsyncParent(record.path);
-            } catch (restoreError) {
-              rollbackErrors.push(`upload: ${String(restoreError)}`);
-            }
-          }
-          if (rollbackErrors.length) {
-            throw new Error(`技能发布提交失败且回滚不完整：${String(error)}; ${rollbackErrors.join('; ')}`);
-          }
-          throw error;
+          log.warn({ skill: name, path: publishedPath, err: String(error) }, 'published skill committed; cleanup deferred to reconciliation');
         }
         try {
           await this.scanUnlocked();
@@ -655,7 +708,7 @@ export class SkillRegistry {
     const checked = await Promise.all(records.map(async (record) => {
       if (!record.contentDigest) return record;
       try {
-        const actual = await contentDigest(record.path);
+        const actual = await contentDigest(record.path, { immutable: true });
         if (actual === record.contentDigest) return record;
         log.error({ skill: record.name, expected: record.contentDigest, actual }, 'published skill digest mismatch');
       } catch (error) {
@@ -702,12 +755,65 @@ export class SkillRegistry {
   }
 
   private async withDistributedNameLock<T>(name: string, operation: () => Promise<T>): Promise<T> {
-    const key = `skill-name:${name}`;
-    if (this.mutationLock) return this.mutationLock.withLock(key, 10_000, operation);
-    return withProcessNameLock(`${resolve(this.dir)}\0${key}`, operation);
+    return this.withDistributedLocks([`skill-name:${name}`], operation);
+  }
+
+  private async withDistributedLocks<T>(keys: readonly string[], operation: () => Promise<T>): Promise<T> {
+    const ordered = [...new Set(keys)].sort();
+    const trackedOperation = async () => {
+      this.distributedLockDepth += 1;
+      try {
+        return await operation();
+      } finally {
+        this.distributedLockDepth -= 1;
+      }
+    };
+    if (this.mutationLock?.withLocks) return this.mutationLock.withLocks(ordered, 10_000, trackedOperation);
+    if (this.mutationLock) {
+      // The legacy API cannot atomically compose independent advisory keys. Serialize every
+      // mutation through one stable key so single-key and multi-key operations still interlock.
+      return this.mutationLock.withLock(LEGACY_MUTATION_LOCK_KEY, 10_000, trackedOperation);
+    }
+    const acquire = (index: number): Promise<T> => {
+      if (index >= ordered.length) return trackedOperation();
+      const key = ordered[index]!;
+      return withProcessNameLock(`${resolve(this.dir)}\0${key}`, () => acquire(index + 1));
+    };
+    return acquire(0);
+  }
+
+  private async assertPendingQuota(incoming: SkillProductRecord, sourceDir: string): Promise<void> {
+    const pending = this.records.filter((record) => !record.reviewed && this.isUploadedRecord(record));
+    const userPending = pending.filter((record) => record.tenantId === incoming.tenantId
+      && record.ownerUserId === incoming.ownerUserId);
+    const tenantPending = pending.filter((record) => record.tenantId === incoming.tenantId);
+    const incomingBytes = await directorySize(sourceDir);
+    const [userBytes, tenantBytes, freeBytes] = await Promise.all([
+      sumDirectorySizes(userPending),
+      sumDirectorySizes(tenantPending),
+      this.availableBytes(),
+    ]);
+    if (userPending.length >= this.pendingQuota.perUserMaxCount) {
+      throw new Error('用户待审核技能数量配额已满');
+    }
+    if (tenantPending.length >= this.pendingQuota.perTenantMaxCount) {
+      throw new Error('租户待审核技能数量配额已满');
+    }
+    if (userBytes + incomingBytes > this.pendingQuota.perUserMaxBytes) {
+      throw new Error('用户待审核技能字节配额已满');
+    }
+    if (tenantBytes + incomingBytes > this.pendingQuota.perTenantMaxBytes) {
+      throw new Error('租户待审核技能字节配额已满');
+    }
+    if (freeBytes - incomingBytes < this.pendingQuota.minFreeBytes) {
+      throw new Error('技能存储可用空间不足');
+    }
   }
 
   private async scanUnlocked(excludedPaths: readonly string[] = []): Promise<void> {
+    if (!this.configuredRecords && this.distributedLockDepth === 0) {
+      await this.withDistributedLocks([PUBLICATION_LOCK_KEY], () => reconcilePublicationJournals(this.dir));
+    }
     const excluded = new Set(excludedPaths.map((path) => resolve(path)));
     let records: SkillProductRecord[];
     if (this.configuredRecords) {
@@ -717,6 +823,9 @@ export class SkillRegistry {
         this.builtinRoots.map((root) => this.enumerateWithSnapshot(root)),
       )).flat();
       const builtinCatalog = await this.updateBuiltinCatalog(rawBuiltinRecords);
+      const legacyProductRecords = await this.enumerateWithSnapshot(this.dir);
+      await this.migrateLegacySeedGovernance(rawBuiltinRecords, builtinCatalog, legacyProductRecords);
+      await cleanupStaleSkillStorage(this.dir, this.pendingQuota.retentionMs);
       const builtinRecords = (await Promise.all(
         rawBuiltinRecords.map((record) => this.applyBuiltinGovernance(record)),
       )).filter((record): record is SkillProductRecord => record !== undefined);
@@ -752,7 +861,10 @@ export class SkillRegistry {
       await this.scanUnlocked();
       const record = this.requireManageableRecord(name, viewer);
       if (this.isBuiltinRecord(record)) await this.writeBuiltinGovernance(record, record, true);
-      else await renameToTombstone(record.path, this.dir);
+      else {
+        const tombstone = await renameToTombstone(record.path, this.dir);
+        if (tombstone) await rm(tombstone, { recursive: true, force: true });
+      }
       await this.scanUnlocked();
     }));
   }
@@ -798,6 +910,70 @@ export class SkillRegistry {
     }));
     await Promise.all(currentEntries.map((entry) => writeBuiltinCatalogEntry(this.dir, entry)));
     return readBuiltinCatalogEntries(this.dir);
+  }
+
+  private async migrateLegacySeedGovernance(
+    rawBuiltinRecords: readonly SkillProductRecord[],
+    catalog: readonly BuiltinCatalogEntry[],
+    legacyProductRecords: readonly SkillProductRecord[],
+  ): Promise<void> {
+    if (!rawBuiltinRecords.length || !catalog.length) return;
+    const rawByIdentity = new Map<string, SkillProductRecord>();
+    for (const record of rawBuiltinRecords) {
+      rawByIdentity.set((await this.builtinSource(record)).identity, record);
+    }
+    for (const legacy of legacyProductRecords) {
+      const relativePath = relative(resolve(this.dir), resolve(legacy.path)).split(sep).join('/');
+      const digest = await contentDigest(legacy.path).catch(() => undefined);
+      if (!digest) continue;
+      const candidates = catalog.filter((entry) => entry.name === legacy.name
+        && entry.tenantId === legacy.tenantId
+        && entry.sourceVersion === legacy.version
+        && entry.sourceDigest === digest
+        && entry.relativePath === relativePath);
+      if (candidates.length !== 1) continue;
+      await this.migrateLegacySeedRecord(legacy, candidates[0]!, rawByIdentity, false);
+    }
+
+    const tombstoneRoot = join(resolve(this.dir), SKILL_TOMBSTONES_DIR);
+    const tombstones = await enumerateSkillProductRecords(tombstoneRoot);
+    for (const legacy of tombstones) {
+      const digest = await contentDigest(legacy.path).catch(() => undefined);
+      if (!digest) continue;
+      const candidates = catalog.filter((entry) => entry.name === legacy.name
+        && entry.tenantId === legacy.tenantId
+        && entry.sourceVersion === legacy.version
+        && entry.sourceDigest === digest
+        && legacyRelativePathCandidates(legacy).includes(entry.relativePath));
+      if (candidates.length !== 1) continue;
+      await this.migrateLegacySeedRecord(legacy, candidates[0]!, rawByIdentity, true);
+    }
+  }
+
+  private async migrateLegacySeedRecord(
+    legacy: SkillProductRecord,
+    source: BuiltinCatalogEntry,
+    rawByIdentity: ReadonlyMap<string, SkillProductRecord>,
+    deleted: boolean,
+  ): Promise<void> {
+    const raw = rawByIdentity.get(source.identity);
+    if (!raw) return;
+    await writeBuiltinGovernanceOverlayIfAbsent(this.dir, {
+      schemaVersion: 1,
+      identity: source.identity,
+      name: source.name,
+      tenantId: source.tenantId,
+      sourceDigest: source.sourceDigest,
+      sourceVersion: source.sourceVersion,
+      sourceVisibility: raw.visibility,
+      revision: Math.max(1, legacy.revision ?? 1),
+      enabled: legacy.enabled,
+      reviewed: legacy.reviewed,
+      visibility: legacy.visibility,
+      deleted,
+    });
+    await rm(legacy.path, { recursive: true, force: true });
+    await fsyncParent(legacy.path).catch(() => undefined);
   }
 
   private async applyBuiltinGovernance(
@@ -1019,6 +1195,32 @@ async function writeBuiltinGovernanceOverlay(
   }
 }
 
+async function writeBuiltinGovernanceOverlayIfAbsent(
+  root: string,
+  overlay: BuiltinGovernanceOverlay,
+): Promise<void> {
+  const overlayRoot = join(resolve(root), BUILTIN_GOVERNANCE_DIR);
+  await mkdir(overlayRoot, { recursive: true, mode: 0o700 });
+  const target = join(overlayRoot, `${overlay.identity}.json`);
+  const temp = join(overlayRoot, `.${overlay.identity}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(temp, `${JSON.stringify(overlay, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+    await fsyncFile(temp);
+    try {
+      await link(temp, target);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      await readBuiltinGovernanceOverlay(root, overlay.identity);
+      return;
+    }
+    await fsyncParent(target);
+  } catch (error) {
+    throw error;
+  } finally {
+    await rm(temp, { force: true });
+  }
+}
+
 async function writeProductRecord(record: SkillProductRecord, expectedRevision?: number): Promise<void> {
   const { id: _id, path: _path, description: _description, ...metadata } = record;
   const target = join(record.path, PRODUCT_RECORD_FILE);
@@ -1099,6 +1301,19 @@ function recordVisibleInTenant(record: SkillProductRecord, tenantId: string): bo
 function isSeedEligibleBuiltin(record: SkillProductRecord): boolean {
   return record.reviewed && record.visibility === 'public'
     && !record.ownerUserId && !record.submittedByUserId;
+}
+
+function legacyRelativePathCandidates(record: SkillProductRecord): string[] {
+  const tenantPrefix = record.tenantId === 'default'
+    ? ''
+    : `${TENANT_SKILLS_DIR}/${record.tenantId}/`;
+  if (record.ownerUserId) {
+    return [`${tenantPrefix}${USER_SKILLS_DIR}/${record.ownerUserId}/${record.name}`];
+  }
+  return [
+    `${tenantPrefix}${record.name}`,
+    `${tenantPrefix}${PUBLIC_SKILLS_DIR}/${record.name}`,
+  ];
 }
 
 /** Ignore only byte-identical legacy PVC copies made by the retired seed-skills initContainer. */
@@ -1218,24 +1433,79 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-async function contentDigest(root: string): Promise<string> {
+async function contentDigest(root: string, options: { immutable?: boolean } = {}): Promise<string> {
+  const entries = await artifactEntries(root);
+  const identityHash = createHash('sha256');
+  for (const entry of entries) {
+    identityHash.update(`${entry.directory ? 'D' : 'F'}\0${entry.path}\0${entry.size}\0${entry.mtimeMs}\0${entry.ctimeMs}\0${entry.ino}\0`);
+  }
+  const identity = identityHash.digest('hex');
+  const cacheKey = resolve(root);
+  const cached = options.immutable ? immutableDigestCache.get(cacheKey, identity) : undefined;
+  if (cached) return cached;
+
   const hash = createHash('sha256');
-  const visit = async (rel: string): Promise<void> => {
-    const target = safeResolve(root, rel);
-    const entries = await readdir(target, { withFileTypes: true });
-    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-      if (entry.name === PRODUCT_RECORD_FILE || entry.name === PUBLISHED_COMMIT_FILE
-        || entry.name.startsWith(`.${PRODUCT_RECORD_FILE}.`)
-        || entry.name.startsWith(`.${PUBLISHED_COMMIT_FILE}.`)) continue;
-      const child = rel ? posix.join(rel, entry.name) : entry.name;
-      if (entry.isSymbolicLink()) throw new Error('Skill artifact 不允许符号链接');
-      hash.update(entry.isDirectory() ? `D\0${child}\0` : `F\0${child}\0`);
-      if (entry.isDirectory()) await visit(child);
-      else hash.update(await readFile(safeResolve(root, child)));
+  for (const entry of entries) {
+    hash.update(entry.directory ? `D\0${entry.path}\0` : `F\0${entry.path}\0`);
+    if (!entry.directory) {
+      for await (const chunk of createReadStream(safeResolve(root, entry.path))) hash.update(chunk as Buffer);
     }
-  };
-  await visit('');
-  return hash.digest('hex');
+  }
+  const digest = hash.digest('hex');
+  if (options.immutable) immutableDigestCache.set(cacheKey, identity, digest);
+  return digest;
+}
+
+interface ArtifactEntryIdentity {
+  path: string;
+  directory: boolean;
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+  ino: number;
+}
+
+async function artifactEntries(root: string, rel = ''): Promise<ArtifactEntryIdentity[]> {
+  const target = safeResolve(root, rel);
+  const entries = await readdir(target, { withFileTypes: true });
+  const result: ArtifactEntryIdentity[] = [];
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (entry.name === PRODUCT_RECORD_FILE || entry.name === PUBLISHED_COMMIT_FILE
+      || entry.name.startsWith(`.${PRODUCT_RECORD_FILE}.`)
+      || entry.name.startsWith(`.${PUBLISHED_COMMIT_FILE}.`)) continue;
+    if (entry.isSymbolicLink()) throw new Error('Skill artifact 不允许符号链接');
+    const child = rel ? posix.join(rel, entry.name) : entry.name;
+    const info = await stat(safeResolve(root, child));
+    result.push({
+      path: child,
+      directory: entry.isDirectory(),
+      size: info.size,
+      mtimeMs: info.mtimeMs,
+      ctimeMs: info.ctimeMs,
+      ino: Number(info.ino),
+    });
+    if (entry.isDirectory()) result.push(...await artifactEntries(root, child));
+  }
+  return result;
+}
+
+async function directorySize(root: string, rel = ''): Promise<number> {
+  const target = safeResolve(root, rel);
+  const entries = await readdir(target, { withFileTypes: true });
+  let total = 0;
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) throw new Error('Skill artifact 不允许符号链接');
+    const child = rel ? posix.join(rel, entry.name) : entry.name;
+    if (entry.isDirectory()) total += await directorySize(root, child);
+    else total += (await stat(safeResolve(root, child))).size;
+  }
+  return total;
+}
+
+async function sumDirectorySizes(records: readonly SkillProductRecord[]): Promise<number> {
+  let total = 0;
+  for (const record of records) total += await directorySize(record.path);
+  return total;
 }
 
 async function renameToTombstone(path: string, root: string): Promise<string | undefined> {
@@ -1252,6 +1522,178 @@ async function renameToTombstone(path: string, root: string): Promise<string | u
     log.warn({ path, target, err: String(error) }, 'skill tombstone directory fsync failed after rename');
   });
   return target;
+}
+
+async function writePublicationJournal(root: string, journal: PublicationJournal): Promise<void> {
+  const journalRoot = join(resolve(root), PUBLICATION_JOURNAL_DIR);
+  await mkdir(journalRoot, { recursive: true, mode: 0o700 });
+  const target = join(journalRoot, `${journal.publicationId}.json`);
+  const temp = join(journalRoot, `.${journal.publicationId}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(temp, `${JSON.stringify(journal, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+    await fsyncFile(temp);
+    await rename(temp, target);
+    await fsyncParent(target);
+  } catch (error) {
+    await rm(temp, { force: true });
+    throw error;
+  }
+}
+
+async function reconcilePublicationJournals(root: string): Promise<void> {
+  const journalRoot = join(resolve(root), PUBLICATION_JOURNAL_DIR);
+  let files;
+  try {
+    files = await readdir(journalRoot, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  for (const file of files.filter((entry) => entry.isFile() && entry.name.endsWith('.json'))) {
+    const path = join(journalRoot, file.name);
+    const journal = parsePublicationJournal(root, JSON.parse(await readFile(path, 'utf8')), file.name);
+    await reconcilePublicationJournal(root, journal);
+  }
+}
+
+async function cleanupStaleSkillStorage(root: string, retentionMs: number): Promise<void> {
+  const cutoff = Date.now() - retentionMs;
+  await cleanupStaleDirectories(join(resolve(root), SKILL_IMPORTS_DIR), cutoff, (name) => name !== '.concurrency');
+  await cleanupStaleDirectories(join(resolve(root), SKILL_PUBLISHED_DIR), cutoff, (name) => name.startsWith('.staging-'));
+  await cleanupStaleDirectories(
+    join(resolve(root), SKILL_TOMBSTONES_DIR),
+    cutoff,
+    isManagedSkillTombstoneName,
+  );
+}
+
+async function cleanupStaleDirectories(
+  root: string,
+  cutoff: number,
+  eligible: (name: string) => boolean,
+): Promise<void> {
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !eligible(entry.name)) continue;
+    const target = join(root, entry.name);
+    const info = await stat(target).catch(() => undefined);
+    if (info && info.mtimeMs <= cutoff) await rm(target, { recursive: true, force: true });
+  }
+}
+
+function parsePublicationJournal(root: string, value: unknown, filename?: string): PublicationJournal {
+  if (!value || typeof value !== 'object') throw new Error('技能发布 journal 无效');
+  const journal = value as Partial<PublicationJournal>;
+  if (journal.schemaVersion !== 1
+    || typeof journal.publicationId !== 'string' || !/^[a-zA-Z0-9._-]+$/.test(journal.publicationId)
+    || typeof journal.sourceId !== 'string' || !journal.sourceId
+    || typeof journal.sourceDigest !== 'string' || !/^[a-f0-9]{64}$/.test(journal.sourceDigest)
+    || typeof journal.sourceVersion !== 'string' || !journal.sourceVersion
+    || typeof journal.sourcePath !== 'string'
+    || typeof journal.stagedPath !== 'string'
+    || typeof journal.publishedPath !== 'string'
+    || typeof journal.tombstonePath !== 'string'
+    || typeof journal.createdAt !== 'string') {
+    throw new Error('技能发布 journal 无效');
+  }
+  if (filename !== undefined && filename !== `${journal.publicationId}.json`) {
+    throw new Error('技能发布 journal 文件名无效');
+  }
+  const resolvedRoot = resolve(root);
+  assertContainedPublicationPath(resolvedRoot, journal.sourcePath, resolvedRoot);
+  assertContainedPublicationPath(resolvedRoot, journal.stagedPath, join(resolvedRoot, SKILL_PUBLISHED_DIR));
+  assertContainedPublicationPath(resolvedRoot, journal.publishedPath, join(resolvedRoot, SKILL_PUBLISHED_DIR));
+  assertContainedPublicationPath(resolvedRoot, journal.tombstonePath, join(resolvedRoot, SKILL_TOMBSTONES_DIR));
+  return journal as PublicationJournal;
+}
+
+function assertContainedPublicationPath(root: string, candidate: string, requiredRoot: string): void {
+  const target = resolve(candidate);
+  const boundary = resolve(requiredRoot);
+  if (target === root || (target !== boundary && !target.startsWith(`${boundary}${sep}`))) {
+    throw new Error('技能发布 journal 路径越界');
+  }
+}
+
+async function reconcilePublicationJournal(root: string, journal: PublicationJournal): Promise<void> {
+  const markerCommitted = await exists(join(journal.publishedPath, PUBLISHED_COMMIT_FILE));
+  if (markerCommitted) await finishCommittedPublication(root, journal);
+  else await rollbackUncommittedPublication(root, journal);
+}
+
+async function finishCommittedPublication(root: string, journal: PublicationJournal): Promise<void> {
+  await mkdir(dirname(journal.tombstonePath), { recursive: true, mode: 0o700 });
+  if (await publicationSourceOwnedBy(journal.sourcePath, journal.publicationId)) {
+    try {
+      await rename(journal.sourcePath, journal.tombstonePath);
+      await Promise.all([fsyncParent(journal.sourcePath), fsyncParent(journal.tombstonePath)]);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  const journalPath = publicationJournalPath(root, journal.publicationId);
+  await rm(journalPath, { force: true });
+  await fsyncParent(journalPath);
+  await rm(journal.tombstonePath, { recursive: true, force: true });
+  await fsyncParent(journal.tombstonePath).catch(() => undefined);
+}
+
+async function rollbackUncommittedPublication(root: string, journal: PublicationJournal): Promise<void> {
+  if (!await exists(journal.sourcePath) && await exists(journal.tombstonePath)) {
+    await mkdir(dirname(journal.sourcePath), { recursive: true });
+    try {
+      await rename(journal.tombstonePath, journal.sourcePath);
+      await Promise.all([fsyncParent(journal.tombstonePath), fsyncParent(journal.sourcePath)]);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  await removePublicationSourceMarker(journal.sourcePath, journal.publicationId);
+  await rm(journal.stagedPath, { recursive: true, force: true });
+  await rm(journal.publishedPath, { recursive: true, force: true });
+  await rm(journal.tombstonePath, { recursive: true, force: true });
+  await rm(publicationJournalPath(root, journal.publicationId), { force: true });
+}
+
+function publicationJournalPath(root: string, publicationId: string): string {
+  return join(resolve(root), PUBLICATION_JOURNAL_DIR, `${publicationId}.json`);
+}
+
+async function writePublicationSourceMarker(sourcePath: string, publicationId: string): Promise<void> {
+  const target = join(sourcePath, PUBLICATION_SOURCE_MARKER);
+  const temp = join(sourcePath, `.${PUBLICATION_SOURCE_MARKER}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(temp, `${publicationId}\n`, { flag: 'wx', mode: 0o600 });
+    await fsyncFile(temp);
+    await rename(temp, target);
+    await fsyncParent(target);
+  } catch (error) {
+    await rm(temp, { force: true });
+    throw error;
+  }
+}
+
+async function publicationSourceOwnedBy(sourcePath: string, publicationId: string): Promise<boolean> {
+  return readFile(join(sourcePath, PUBLICATION_SOURCE_MARKER), 'utf8')
+    .then((value) => value.trim() === publicationId, () => false);
+}
+
+async function removePublicationSourceMarker(sourcePath: string, publicationId: string): Promise<void> {
+  if (!await publicationSourceOwnedBy(sourcePath, publicationId)) return;
+  const marker = join(sourcePath, PUBLICATION_SOURCE_MARKER);
+  await rm(marker, { force: true });
+  await fsyncParent(marker).catch(() => undefined);
+}
+
+function isManagedSkillTombstoneName(name: string): boolean {
+  return /^publication-[a-zA-Z0-9._-]+$/.test(name)
+    || /^\d+-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(name);
 }
 
 async function rollbackPublishedArtifact(stagingPath: string, publishedPath: string): Promise<string | undefined> {

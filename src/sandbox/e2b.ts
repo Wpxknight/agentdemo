@@ -1,5 +1,6 @@
 import { Sandbox } from '@e2b/code-interpreter';
 import { posix } from 'node:path';
+import { remoteWorkspacePath } from './workspace-path.js';
 import { AiosE2bProvider } from './aios-e2b.js';
 import type { AiosE2bProviderOptions } from './aios-e2b.js';
 import type {
@@ -36,6 +37,10 @@ class E2bHandle implements SandboxHandle {
 
   get sandboxId(): string {
     return this.sbx.sandboxId;
+  }
+
+  workspacePath(relativePath = ''): string {
+    return remoteWorkspacePath(relativePath);
   }
 
   async runCode(code: string, opts?: RunCodeOpts): Promise<ExecResult> {
