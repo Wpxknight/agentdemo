@@ -7,6 +7,7 @@ import {
   readSessionContextProjection,
   readSessionUsageProjection,
 } from '../../src/server/http.js';
+import { piSessionStorageId } from '../../packages/pi-runtime/src/store/session-id.js';
 
 describe('HTTP Pi event projection compatibility', () => {
   it.each([
@@ -58,14 +59,6 @@ describe('HTTP Pi event projection compatibility', () => {
       { event: 'context_compacted', data: { summarizedMessages: 6, beforeTokens: 100, afterTokens: 40 } },
     ],
     [
-      { type: 'todo_updated', detail: { todos: [{ content: 'ship', status: 'completed' }] } },
-      { event: 'todo_updated', data: { todos: [{ content: 'ship', status: 'completed' }] } },
-    ],
-    [
-      { type: 'file_exported', detail: { name: 'report.txt', url: '/files/report.txt', size: 12, mime: 'text/plain', expiresAt: '2026-07-30T00:00:00Z' } },
-      { event: 'file_exported', data: { name: 'report.txt', url: '/files/report.txt', size: 12, mime: 'text/plain', expiresAt: '2026-07-30T00:00:00Z' } },
-    ],
-    [
       { type: 'abort', detail: { reason: 'cancelled' } },
       { event: 'stop', data: { reason: 'cancelled' } },
     ],
@@ -76,6 +69,8 @@ describe('HTTP Pi event projection compatibility', () => {
   it('suppresses unknown and non-product durable events', () => {
     expect(projectDurableHttpEvent({ type: 'pi_extension', detail: { secret: 'must-not-leak' } })).toBeUndefined();
     expect(projectDurableHttpEvent({ type: 'retry_scheduled', detail: { errorMessage: 'internal' } })).toBeUndefined();
+    expect(projectDurableHttpEvent({ type: 'todo_updated', detail: { todos: [] } })).toBeUndefined();
+    expect(projectDurableHttpEvent({ type: 'file_exported', detail: { name: 'report.txt' } })).toBeUndefined();
   });
 
   it('retains the legacy done DTO fields for durable results', () => {
@@ -100,7 +95,9 @@ describe('HTTP Pi event projection compatibility', () => {
   it('uses committed Pi SessionStats for the production session usage projections', async () => {
     const rt = {
       piSessionStore: {
-        async getSessionStats() {
+        async getSessionStats(tenantId: string, sessionId: string) {
+          expect(tenantId).toBe('tenant-a');
+          expect(sessionId).toBe(piSessionStorageId('user-a', 'session-a'));
           return { messageCount: 3, cachedTokens: 20, uncachedTokens: 30, totalTokens: 75, costTotal: 0.2 };
         },
       },

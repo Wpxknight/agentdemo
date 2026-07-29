@@ -7,6 +7,7 @@ import {
   projectPiSessionStats,
   projectPiUsage,
 } from '../../src/agent/projections.js';
+import { piSessionStorageId } from '../../packages/pi-runtime/src/store/session-id.js';
 import type { RequestContext } from '../../src/auth/types.js';
 
 const ctx: RequestContext = { tenantId: 'tenant-a', userId: 'user-a', role: 'user' };
@@ -133,7 +134,8 @@ describe('Pi session projection', () => {
     const store = new MemoryStore();
     const all = entries();
     const source = {
-      async get() {
+      async get(_tenantId: string, sessionId: string) {
+        expect(sessionId).toBe(piSessionStorageId(ctx.userId, 'session-a'));
         return {
           tenantId: ctx.tenantId,
           sessionId: 'session-a',
@@ -143,7 +145,8 @@ describe('Pi session projection', () => {
           committedLeafId: 'assistant-1',
         };
       },
-      async listEntries(_tenantId: string, _sessionId: string, options?: { committedOnly?: boolean }) {
+      async listEntries(_tenantId: string, sessionId: string, options?: { committedOnly?: boolean }) {
+        expect(sessionId).toBe(piSessionStorageId(ctx.userId, 'session-a'));
         expect(options).toEqual({ committedOnly: true });
         return all.slice(0, 2).map((entry, index) => ({
           tenantId: ctx.tenantId,

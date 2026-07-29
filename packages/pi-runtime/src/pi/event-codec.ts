@@ -1,5 +1,5 @@
 import type { AgentRunEvent, JsonValue } from '@aiop/control-contracts';
-import type { AgentHarnessEvent } from '@earendil-works/pi-agent-core';
+import { estimateContextTokens, type AgentHarnessEvent, type AgentMessage } from '@earendil-works/pi-agent-core';
 
 export interface EventCodecOptions {
   tenantId: string;
@@ -25,6 +25,7 @@ const UNSERIALIZABLE = { kind: 'unserializable' } as const;
 
 export class EventCodec {
   private readonly now: () => Date;
+  private pendingCompactionMessages?: number;
 
   constructor(private readonly options: EventCodecOptions) {
     this.now = options.now ?? (() => new Date());
@@ -35,9 +36,13 @@ export class EventCodec {
     const known = KNOWN_EVENTS.has(eventType);
     let detail: JsonValue;
     try {
-      detail = toDurableJsonValue(known ? projectKnown(event) : {
+      if (event.type === 'session_before_compact') {
+        this.pendingCompactionMessages = event.preparation.messagesToSummarize.length;
+      }
+      detail = toDurableJsonValue(known ? projectKnown(event, this.pendingCompactionMessages) : {
         version: 1, kind: 'pi_harness_event', originalType: limited(eventType, MAX_NAME), keys: safeKeys(event),
       });
+      if (event.type === 'session_compact') this.pendingCompactionMessages = undefined;
     } catch {
       detail = UNSERIALIZABLE;
     }
@@ -50,7 +55,7 @@ export class EventCodec {
   }
 }
 
-function projectKnown(event: AgentHarnessEvent): Record<string, unknown> {
+function projectKnown(event: AgentHarnessEvent, summarizedMessages?: number): Record<string, unknown> {
   switch (event.type) {
     case 'agent_start': case 'turn_start': return { version: 1 };
     case 'agent_end': return { version: 1, messageCount: event.messages.length };
@@ -111,6 +116,8 @@ function projectKnown(event: AgentHarnessEvent): Record<string, unknown> {
     case 'session_compact': return {
       version: 1, entryId: limited(event.compactionEntry.id, MAX_NAME), fromHook: event.fromHook,
       tokensBefore: event.compactionEntry.tokensBefore, summaryLength: event.compactionEntry.summary.length,
+      tokensAfter: compactionTokensAfter(event.compactionEntry),
+      summarizedMessages: summarizedMessages ?? 0,
     };
     case 'session_before_tree': return {
       version: 1, targetId: limited(event.preparation.targetId, MAX_NAME),
@@ -137,6 +144,14 @@ function projectKnown(event: AgentHarnessEvent): Record<string, unknown> {
       activeToolNames: event.activeToolNames.slice(0, MAX_ARRAY).map((n) => limited(n, MAX_NAME)), source: event.source,
     };
   }
+}
+
+function compactionTokensAfter(entry: Extract<AgentHarnessEvent, { type: 'session_compact' }>['compactionEntry']): number {
+  const summary: AgentMessage = {
+    role: 'compactionSummary', summary: entry.summary, tokensBefore: entry.tokensBefore,
+    timestamp: new Date(entry.timestamp).getTime(),
+  };
+  return estimateContextTokens([summary, ...(entry.retainedTail ?? [])]).tokens;
 }
 
 function safeMessage(message: unknown): Record<string, unknown> {

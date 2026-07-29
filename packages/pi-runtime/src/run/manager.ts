@@ -12,6 +12,7 @@ import { startLeaseHeartbeat } from './lease.js';
 import { nextTurnNo } from './attempt.js';
 import type { DurableRunStore } from '../store/types.js';
 import { assertToolCallsAllowed, assertUsageAllowed } from './limits.js';
+import { piSessionStorageId } from '../store/session-id.js';
 
 const ZERO_USAGE = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 } as const;
 
@@ -138,14 +139,15 @@ export class DurableRunManager implements DurableRunRuntime {
     let eventsPersisted = false;
     try {
       const events = this.options.eventOptions({ tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, turnNo });
-      const sessionRecord = await this.options.store.sessions.get(identity.tenantId, claimed.record.sessionId);
+      const piSessionId = piSessionStorageId(claimed.record.actorId, claimed.record.sessionId);
+      const sessionRecord = await this.options.store.sessions.get(identity.tenantId, piSessionId);
       const metadata = {
-        id: claimed.record.sessionId, tenantId: identity.tenantId,
+        id: piSessionId, tenantId: identity.tenantId,
         createdAt: (sessionRecord?.createdAt ?? claimed.record.createdAt).toISOString(), metadata: sessionRecord?.metadata,
       };
       session = loadCommittedSession
         ? await this.options.sessions.load({ metadata, initialMessage, events })
-        : await this.options.sessions.create({ id: claimed.record.sessionId, initialMessage, events, session: { tenantId: identity.tenantId } });
+        : await this.options.sessions.create({ id: piSessionId, initialMessage, events, session: { tenantId: identity.tenantId } });
       this.active.set(activeKey, { abort, session });
       baselineUsage = usageFromEntries(await session.entries());
       let stopInboxPump = false;
@@ -211,12 +213,12 @@ export class DurableRunManager implements DurableRunRuntime {
       const actualUsage = addUsage(claimed.record.usage, subtractUsage(usageFromEntries(entries), baselineUsage));
       assertUsageAllowed(claimed.record.limits, actualUsage);
       assertToolCallsAllowed(claimed.record.limits, unionSize(persistedToolCallIds, currentToolCallIds));
-      await this.syncEntries(identity.tenantId, claimed.record.sessionId, entries);
+      await this.syncEntries(identity.tenantId, piSessionId, entries);
       const leafId = await session.leafId();
       const committedAt = this.now();
       await this.options.store.commitTurn({
         tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, turnNo, fencingToken: claimed.fencingToken,
-        checkpoint: { piSessionId: claimed.record.sessionId, piLeafId: leafId },
+        checkpoint: { piSessionId, piLeafId: leafId },
         events: durableEvents, status: 'succeeded', usage: actualUsage, committedAt,
       });
       eventsPersisted = true;

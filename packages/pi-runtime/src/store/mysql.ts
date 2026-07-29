@@ -11,6 +11,7 @@ import type {
 } from './types.js';
 import { assertAttemptAllowed, assertTurnAllowed } from '../run/limits.js';
 import { sessionStats } from './session-stats.js';
+import { piSessionStorageId } from './session-id.js';
 
 type Db = Kysely<any> | Transaction<any>;
 
@@ -20,15 +21,16 @@ export class MysqlRunStore implements DurableRunStore {
   async create(input: Parameters<DurableRunStore['create']>[0]): Promise<RunRecord & { sessionCreated: boolean }> {
     const record = input.record;
     return this.transaction(async (store) => {
+      const piSessionId = piSessionStorageId(record.actorId, record.sessionId);
       const insertedSession = await store.db.insertInto('pi_sessions').values({
-        tenant_id: record.tenantId, session_id: record.sessionId, current_leaf_id: null, committed_leaf_id: null,
+        tenant_id: record.tenantId, session_id: piSessionId, current_leaf_id: null, committed_leaf_id: null,
         metadata_json: null, created_at: record.createdAt, updated_at: record.updatedAt,
       }).ignore().executeTakeFirst();
       const sessionCreated = Number(insertedSession.numInsertedOrUpdatedRows ?? 0) > 0;
       await store.db.selectFrom('pi_sessions').select('session_id')
-        .where('tenant_id', '=', record.tenantId).where('session_id', '=', record.sessionId).forUpdate().executeTakeFirstOrThrow();
+        .where('tenant_id', '=', record.tenantId).where('session_id', '=', piSessionId).forUpdate().executeTakeFirstOrThrow();
       const active = await store.db.selectFrom('agent_runs').select('run_id')
-        .where('tenant_id', '=', record.tenantId).where('session_id', '=', record.sessionId)
+        .where('tenant_id', '=', record.tenantId).where('user_id', '=', record.actorId).where('session_id', '=', record.sessionId)
         .where('status', 'in', ['queued', 'running', 'waiting']).limit(1).executeTakeFirst();
       if (active) throw conflict('Session already has an active run');
       await store.db.insertInto('agent_runs').values({
@@ -57,11 +59,12 @@ export class MysqlRunStore implements DurableRunStore {
 
   async claim(input: Parameters<DurableRunStore['claim']>[0]): Promise<Awaited<ReturnType<DurableRunStore['claim']>>> {
     return this.transaction(async (store) => {
-      const candidate = await store.db.selectFrom('agent_runs').select(['session_id'])
+      const candidate = await store.db.selectFrom('agent_runs').select(['session_id', 'user_id'])
         .where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId).executeTakeFirst();
       if (!candidate) throw new RunNotFoundError();
       await store.db.selectFrom('pi_sessions').select('session_id')
-        .where('tenant_id', '=', input.identity.tenantId).where('session_id', '=', candidate.session_id)
+        .where('tenant_id', '=', input.identity.tenantId)
+        .where('session_id', '=', piSessionStorageId(candidate.user_id, candidate.session_id))
         .forUpdate().executeTakeFirstOrThrow();
       const row = await store.db.selectFrom('agent_runs').selectAll().where('tenant_id', '=', input.identity.tenantId)
         .where('run_id', '=', input.runId).forUpdate().executeTakeFirst();
@@ -71,6 +74,7 @@ export class MysqlRunStore implements DurableRunStore {
       if (input.resume) {
         const active = await store.db.selectFrom('agent_runs').select('run_id')
           .where('tenant_id', '=', input.identity.tenantId).where('session_id', '=', row.session_id)
+          .where('user_id', '=', row.user_id)
           .where('run_id', '!=', input.runId).where('status', 'in', ['queued', 'running', 'waiting'])
           .limit(1).executeTakeFirst();
         if (active) throw conflict('Session already has an active run');

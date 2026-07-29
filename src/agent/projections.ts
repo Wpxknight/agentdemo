@@ -2,7 +2,7 @@ import type { SessionStats, SessionTreeEntry } from '@earendil-works/pi-agent-co
 import type { RequestContext } from '../auth/types.js';
 import type { AgentRunUsage, SessionContextUsage, SessionTokenUsage, Store } from '../db/store.js';
 import type { JsonValue, Msg, ToolContentBlock } from '../model/types.js';
-import type { PiSessionStore } from '@aiop/pi-runtime';
+import { piSessionStorageId, type PiSessionStore } from '@aiop/pi-runtime';
 
 export interface ProjectPiSessionInput {
   ctx: RequestContext;
@@ -31,9 +31,10 @@ export async function projectCommittedPiSession(input: {
   sessionId: string;
   durationMs?: number;
 }): Promise<boolean> {
-  const session = await input.sessions.get(input.ctx.tenantId, input.sessionId);
+  const storageId = piSessionStorageId(input.ctx.userId, input.sessionId);
+  const session = await input.sessions.get(input.ctx.tenantId, storageId);
   if (!session?.committedLeafId) return false;
-  const records = await input.sessions.listEntries(input.ctx.tenantId, input.sessionId, { committedOnly: true });
+  const records = await input.sessions.listEntries(input.ctx.tenantId, storageId, { committedOnly: true });
   const entries = records.map((record) => record.entry);
   const finalAssistant = entries.findLast((entry) => entry.type === 'message' && entry.message.role === 'assistant');
   await new PiSessionProjection(input.store).project({

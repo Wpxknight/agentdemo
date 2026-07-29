@@ -6,6 +6,7 @@ import { SignJWT, jwtVerify } from 'jose';
 import { logger } from '../logger.js';
 import type { Runtime, RuntimeModelConfig } from '../runtime.js';
 import { COMPACTION_RETRY_GROWTH_TOKENS } from '../agent/compaction.js';
+import { piSessionStorageId } from '@aiop/pi-runtime';
 import { resolveAgentRuntime } from '../agent/runtime.js';
 import {
   DEFAULT_CONTEXT_WINDOW_TOKENS,
@@ -1744,6 +1745,7 @@ async function handle(
   if (method === 'GET' && sessionContextMatch) {
     const ctx = await requireAuth(rt, req);
     const sessionId = decodeURIComponent(sessionContextMatch[1]!);
+    if (!await hasCurrentUserSession(rt, ctx, sessionId)) throw new HttpError(404, '会话不存在');
     const usage = await readSessionContextProjection(rt, ctx, sessionId, contextWindowTokens(currentModelConfig(rt)));
     return sendJson(res, 200, { sessionId, ...usage });
   }
@@ -1752,8 +1754,7 @@ async function handle(
   if (method === 'GET' && sessionUsageMatch) {
     const ctx = await requireAuth(rt, req);
     const sessionId = decodeURIComponent(sessionUsageMatch[1]!);
-    const owned = (await rt.store.listSessions(ctx)).some((session) => session.sessionId === sessionId);
-    if (!owned) throw new HttpError(404, '会话不存在');
+    if (!await hasCurrentUserSession(rt, ctx, sessionId)) throw new HttpError(404, '会话不存在');
     const usage = await readSessionUsageProjection(rt, ctx, sessionId);
     return sendJson(res, 200, { sessionId, ...usage });
   }
@@ -1959,9 +1960,15 @@ async function handle(
 }
 
 async function findAppendableRun(rt: Runtime, ctx: RequestContext, sessionId: string): Promise<AgentRunRecord | undefined> {
+  const ownerCtx: RequestContext = { ...ctx, role: 'user' };
   const candidates = (await Promise.all((['running', 'waiting', 'queued'] as const)
-    .map((status) => rt.store.listAgentRuns(ctx, { sessionId, status, limit: 1 })))).flat();
+    .map((status) => rt.store.listAgentRuns(ownerCtx, { sessionId, status, limit: 1 })))).flat();
   return candidates.sort((left, right) => right.updatedAt.getTime() - left.updatedAt.getTime())[0];
+}
+
+async function hasCurrentUserSession(rt: Runtime, ctx: RequestContext, sessionId: string): Promise<boolean> {
+  const count = await rt.store.countSessions(ctx);
+  return (await rt.store.listSessions(ctx, count)).some((session) => session.sessionId === sessionId);
 }
 
 function toolCategory(name: string): string {
@@ -2073,7 +2080,7 @@ function skillHttpError(err: unknown): HttpError {
 }
 
 function activeRunKey(ctx: RequestContext, sessionId: string): string {
-  return JSON.stringify([ctx.tenantId, sessionId]);
+  return JSON.stringify([ctx.tenantId, ctx.userId, sessionId]);
 }
 
 function addActiveRun(activeRuns: ActiveAgentRuns, key: string, run: ActiveAgentRun): void {
@@ -2786,7 +2793,7 @@ async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req:
       }
     }
     const result = await handle.result();
-    if (rt.piSessionStore) await projectCommittedPiSession({
+    if (rt.piSessionStore && result.status === 'succeeded') await projectCommittedPiSession({
       store: rt.store,
       sessions: rt.piSessionStore,
       ctx,
@@ -2857,18 +2864,6 @@ export function projectDurableHttpEvent(event: { type: string; detail?: unknown 
       afterTokens,
     } };
   }
-  if (event.type === 'todo_updated') {
-    const todos = Array.isArray(detail.todos) ? detail.todos.flatMap(projectTodo) : [];
-    return { event: 'todo_updated', data: { todos } };
-  }
-  if (event.type === 'file_exported') {
-    const name = stringValue(detail.name);
-    const url = stringValue(detail.url);
-    const mime = stringValue(detail.mime);
-    const expiresAt = stringValue(detail.expiresAt);
-    if (!name || !url || !mime || !expiresAt) return undefined;
-    return { event: 'file_exported', data: { name, url, size: finiteNumber(detail.size), mime, expiresAt } };
-  }
   if (event.type === 'abort') {
     return { event: 'stop', data: { reason: stringValue(detail.reason) ?? 'aborted' } };
   }
@@ -2920,15 +2915,6 @@ function redactedArgs(keys: unknown): Record<string, string> {
   return Object.fromEntries(keys.filter((key): key is string => typeof key === 'string').map((key) => [key, '[redacted]']));
 }
 
-function projectTodo(value: unknown): Array<{ content: string; status: 'pending' | 'in_progress' | 'completed' }> {
-  if (!value || typeof value !== 'object') return [];
-  const todo = value as Record<string, unknown>;
-  const content = stringValue(todo.content);
-  const status = todo.status;
-  if (!content || (status !== 'pending' && status !== 'in_progress' && status !== 'completed')) return [];
-  return [{ content, status }];
-}
-
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
@@ -2957,7 +2943,9 @@ export async function readSessionContextProjection(
   maxTokens: number,
 ): Promise<SessionContextUsage> {
   if (!rt.piSessionStore) return rt.store.getSessionContextUsage(ctx, sessionId, maxTokens);
-  return projectPiSessionStats(await rt.piSessionStore.getSessionStats(ctx.tenantId, sessionId), maxTokens).context;
+  return projectPiSessionStats(await rt.piSessionStore.getSessionStats(
+    ctx.tenantId, piSessionStorageId(ctx.userId, sessionId),
+  ), maxTokens).context;
 }
 
 export async function readSessionUsageProjection(
@@ -2966,7 +2954,9 @@ export async function readSessionUsageProjection(
   sessionId: string,
 ): Promise<{ totalTokens: number }> {
   if (!rt.piSessionStore) return rt.store.getSessionTokenUsage(ctx, sessionId);
-  return projectPiSessionStats(await rt.piSessionStore.getSessionStats(ctx.tenantId, sessionId), 0).usage;
+  return projectPiSessionStats(await rt.piSessionStore.getSessionStats(
+    ctx.tenantId, piSessionStorageId(ctx.userId, sessionId),
+  ), 0).usage;
 }
 
 function finiteNumber(value: unknown): number {

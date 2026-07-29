@@ -7,6 +7,7 @@ import type {
 } from './types.js';
 import { assertAttemptAllowed, assertTurnAllowed } from '../run/limits.js';
 import { sessionStats } from './session-stats.js';
+import { piSessionStorageId } from './session-id.js';
 
 const clone = <T>(value: T): T => structuredClone(value);
 const key = (tenantId: string, id: string): string => `${tenantId}\0${id}`;
@@ -28,12 +29,14 @@ export class MemoryRunStore implements DurableRunStore {
       const runKey = key(record.tenantId, record.runId);
       if (this.runs.has(runKey)) throw conflict('Run already exists');
       const active = [...this.runs.values()].some((run) => run.tenantId === record.tenantId
-        && run.sessionId === record.sessionId && ['queued', 'running', 'waiting'].includes(run.status));
+        && run.actorId === record.actorId && run.sessionId === record.sessionId
+        && ['queued', 'running', 'waiting'].includes(run.status));
       if (active) throw conflict('Session already has an active run');
-      const sessionKey = key(record.tenantId, record.sessionId);
+      const sessionId = piSessionStorageId(record.actorId, record.sessionId);
+      const sessionKey = key(record.tenantId, sessionId);
       const sessionCreated = !this.sessionRecords.has(sessionKey);
       if (sessionCreated) this.sessionRecords.set(sessionKey, {
-        tenantId: record.tenantId, sessionId: record.sessionId, createdAt: record.createdAt, updatedAt: record.createdAt,
+        tenantId: record.tenantId, sessionId, createdAt: record.createdAt, updatedAt: record.createdAt,
         currentLeafId: null, committedLeafId: null,
       });
       this.runs.set(runKey, record);
@@ -54,7 +57,7 @@ export class MemoryRunStore implements DurableRunStore {
       if (['succeeded', 'cancelled'].includes(run.status)) return null;
       if (['waiting', 'failed', 'recovery_required'].includes(run.status) && !input.resume) return null;
       if (input.resume && [...this.runs.values()].some((candidate) => candidate.tenantId === run.tenantId
-        && candidate.sessionId === run.sessionId && candidate.runId !== run.runId
+        && candidate.actorId === run.actorId && candidate.sessionId === run.sessionId && candidate.runId !== run.runId
         && ['queued', 'running', 'waiting'].includes(candidate.status))) {
         throw conflict('Session already has an active run');
       }

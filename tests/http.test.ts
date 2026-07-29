@@ -699,6 +699,20 @@ describe('HTTP server', () => {
       maxTokens: 200000,
       estimated: true,
     });
+
+    const missingContext = await fetch(`${base}/v1/sessions/not-owned/context`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(missingContext.status).toBe(404);
+
+    await store.appendMessage(ctx, 'context-beyond-first-page', { role: 'user', text: 'older owned session' });
+    for (let index = 0; index < 51; index += 1) {
+      await store.createSession(ctx, { sessionId: `newer-context-session-${index}` });
+    }
+    const olderContext = await fetch(`${base}/v1/sessions/context-beyond-first-page/context`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(olderContext.status).toBe(200);
   });
 
   it('exposes current-user session cumulative token usage', async () => {
@@ -930,6 +944,11 @@ describe('HTTP server', () => {
     const auth = new LocalAuthProvider({ store: localStore, secret: 'durable-result-secret' });
     await auth.createUser('default', 'admin', 'pw', 'platform_admin');
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    const ownerCtx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+    for (const sessionId of ['result-failed', 'result-cancelled']) {
+      await localStore.appendMessage(ownerCtx, sessionId, { role: 'user', text: 'prior question' });
+      await localStore.appendMessage(ownerCtx, sessionId, { role: 'assistant', text: 'prior answer', durationMs: 77 });
+    }
     const run = vi.fn(async (input: { input: Array<{ text?: string }> }) => {
       const mode = input.input[0]?.text;
       const status = mode === 'fail' ? 'failed' as const : mode === 'cancel' ? 'cancelled' as const : 'succeeded' as const;
@@ -949,6 +968,31 @@ describe('HTTP server', () => {
     const rt = {
       model, tools: new ToolRegistry(), store: localStore, policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(),
       authProvider: auth, jwtSecret: 'durable-result-secret', systemExtra: '', durableRunRuntime: { run },
+      piSessionStore: {
+        async getSessionStats() {
+          return { messageCount: 2, cachedTokens: 0, uncachedTokens: 2, totalTokens: 2, costTotal: 0 };
+        },
+        async get() {
+          return { tenantId: 'default', sessionId: 'stored', createdAt: new Date(), updatedAt: new Date(),
+            currentLeafId: 'assistant-prior', committedLeafId: 'assistant-prior' };
+        },
+        async listEntries() {
+          return [
+            { tenantId: 'default', sessionId: 'stored', sequence: 1n, entry: {
+              type: 'message', id: 'user-prior', parentId: null, timestamp: '2026-07-29T00:00:00.000Z',
+              message: { role: 'user', content: 'prior question', timestamp: 1 },
+            } },
+            { tenantId: 'default', sessionId: 'stored', sequence: 2n, entry: {
+              type: 'message', id: 'assistant-prior', parentId: 'user-prior', timestamp: '2026-07-29T00:00:01.000Z',
+              message: { role: 'assistant', content: [{ type: 'text', text: 'prior answer' }], timestamp: 2,
+                api: 'openai-completions', provider: 'aiop', model: 'm', stopReason: 'stop', usage: {
+                  input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+                } },
+            } },
+          ];
+        },
+      },
     } as unknown as Runtime;
     const server = createHttpServer(rt);
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -969,9 +1013,11 @@ describe('HTTP server', () => {
       const failed = await request('fail', 'result-failed');
       expect(failed).toContain('event: error');
       expect(failed).toContain('provider failed');
+      expect((await localStore.listMessages(ownerCtx, 'result-failed')).at(-1)?.durationMs).toBe(77);
 
       const cancelled = await request('cancel', 'result-cancelled');
       expect(cancelled).toContain('event: terminated');
+      expect((await localStore.listMessages(ownerCtx, 'result-cancelled')).at(-1)?.durationMs).toBe(77);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
@@ -2053,6 +2099,8 @@ describe('HTTP server 会话互斥与自动压缩', () => {
     const auth = new LocalAuthProvider({ store: localStore, secret: 'mutex-secret' });
     await auth.createUser('default', 'admin', 'pw', 'platform_admin');
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    await auth.createUser('default', 'other', 'pw', 'user');
+    const otherToken = (await auth.login('default', 'other', 'pw'))!;
     const rt = {
       model: chatModel,
       tools: new ToolRegistry(),
@@ -2068,7 +2116,8 @@ describe('HTTP server 会话互斥与自动压缩', () => {
     await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve));
     const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
     const headers = { 'content-type': 'application/json', authorization: `Bearer ${adminToken}` };
-    return { srv, url, headers, localStore };
+    const otherHeaders = { 'content-type': 'application/json', authorization: `Bearer ${otherToken}` };
+    return { srv, url, headers, otherHeaders, localStore };
   }
 
   it('rejects a concurrent run on the same session with 409', async () => {
@@ -2087,7 +2136,7 @@ describe('HTTP server 会话互斥与自动压缩', () => {
         yield { type: 'stop', reason: 'end_turn' };
       },
     };
-    const { srv, url, headers } = await makeServer(slowModel);
+    const { srv, url, headers, otherHeaders } = await makeServer(slowModel);
     try {
       const run = fetch(`${url}/v1/agent`, {
         method: 'POST',
@@ -2103,6 +2152,14 @@ describe('HTTP server 会话互斥与自动压缩', () => {
       });
       expect(second.status).toBe(409);
       expect(((await second.json()) as { error: string }).error).toContain('正在运行');
+
+      const sameNameForOtherOwner = await fetch(`${url}/v1/agent`, {
+        method: 'POST',
+        headers: otherHeaders,
+        body: JSON.stringify({ task: '另一个用户的同名会话', sessionId: 'mutex-sess' }),
+      });
+      expect(sameNameForOtherOwner.status).toBe(200);
+      await sameNameForOtherOwner.text();
 
       // 其他会话不受影响
       const other = await fetch(`${url}/v1/agent`, {

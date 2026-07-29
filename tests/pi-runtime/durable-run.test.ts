@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { LeaseLostError } from '@aiop/control-contracts';
-import { createMysqlDurablePiRuntime, DurableRunManager, MemoryRunStore, MysqlRunStore } from '../../packages/pi-runtime/src/index.js';
+import { createMysqlDurablePiRuntime, DurableRunManager, MemoryRunStore, MysqlRunStore, piSessionStorageId } from '../../packages/pi-runtime/src/index.js';
 import type { ManagedPiSession } from '../../packages/pi-runtime/src/index.js';
 import type { AgentRunEvent } from '@aiop/control-contracts';
 import type { DurableRunStore } from '../../packages/pi-runtime/src/index.js';
@@ -11,6 +11,20 @@ const identity = { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] } as
 const usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
 
 describe('MemoryRunStore durable contract', () => {
+  it('isolates same-named sessions by run owner', async () => {
+    const store = new MemoryRunStore();
+    const now = new Date('2026-07-29T00:00:00.000Z');
+    for (const actorId of ['user-a', 'user-b']) {
+      await expect(store.create({ record: {
+        tenantId: 'tenant-a', runId: `run-${actorId}`, actorId, sessionId: 'shared-session', kernel: 'pi',
+        kernelVersion: '0.82.1', status: 'queued', leaseToken: 0n, usage, createdAt: now, updatedAt: now,
+      } })).resolves.toMatchObject({ sessionCreated: true });
+    }
+
+    expect(await store.sessions.get('tenant-a', piSessionStorageId('user-a', 'shared-session'))).toBeDefined();
+    expect(await store.sessions.get('tenant-a', piSessionStorageId('user-b', 'shared-session'))).toBeDefined();
+  });
+
   it('fences a stale worker from committing after another worker reclaims the lease', async () => {
     const store = new MemoryRunStore();
     const createdAt = new Date('2026-07-28T00:00:00.000Z');
@@ -289,8 +303,13 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('shared RunStore MySQL integrati
           await db.deleteFrom(table).where('tenant_id', '=', 'pi-runtime-contract').where('run_id', '=', targetRunId).execute();
         }
       }
-      await db.deleteFrom('pi_session_entries').where('tenant_id', '=', 'pi-runtime-contract').where('session_id', '=', `session-${runId}-success`).execute();
-      await db.deleteFrom('pi_sessions').where('tenant_id', '=', 'pi-runtime-contract').where('session_id', '=', `session-${runId}-success`).execute();
+      const sessionIds = [
+        piSessionStorageId('user-a', `session-${runId}`),
+        piSessionStorageId('user-a', `session-${runId}-success`),
+        `session-${runId}-success`,
+      ];
+      await db.deleteFrom('pi_session_entries').where('tenant_id', '=', 'pi-runtime-contract').where('session_id', 'in', sessionIds).execute();
+      await db.deleteFrom('pi_sessions').where('tenant_id', '=', 'pi-runtime-contract').where('session_id', 'in', sessionIds).execute();
       await db.destroy();
     }
   });
@@ -323,7 +342,8 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('shared RunStore MySQL integrati
       for (const runId of runIds) {
         await db.deleteFrom('agent_runs').where('tenant_id', '=', tenantId).where('run_id', '=', runId).execute();
       }
-      await db.deleteFrom('pi_sessions').where('tenant_id', '=', tenantId).where('session_id', '=', sessionId).execute();
+      await db.deleteFrom('pi_sessions').where('tenant_id', '=', tenantId)
+        .where('session_id', '=', piSessionStorageId('user-a', sessionId)).execute();
       await db.destroy();
     }
   });
@@ -344,8 +364,9 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('shared RunStore MySQL integrati
           await db.deleteFrom(table).where('tenant_id', '=', identity.tenantId).where('run_id', '=', runId).execute();
         }
       }
-      await db.deleteFrom('pi_session_entries').where('tenant_id', '=', identity.tenantId).where('session_id', '=', sessionId).execute();
-      await db.deleteFrom('pi_sessions').where('tenant_id', '=', identity.tenantId).where('session_id', '=', sessionId).execute();
+      const storageId = piSessionStorageId(identity.actorId, sessionId);
+      await db.deleteFrom('pi_session_entries').where('tenant_id', '=', identity.tenantId).where('session_id', '=', storageId).execute();
+      await db.deleteFrom('pi_sessions').where('tenant_id', '=', identity.tenantId).where('session_id', '=', storageId).execute();
       await db.destroy();
     }
   });
@@ -400,6 +421,8 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('shared RunStore MySQL integrati
       for (const table of ['agent_run_inbox_messages', 'agent_run_attempts', 'agent_runs'] as const) {
         await db.deleteFrom(table).where('tenant_id', '=', tenantId).where('run_id', '=', runId).execute();
       }
+      await db.deleteFrom('pi_sessions').where('tenant_id', '=', tenantId)
+        .where('session_id', '=', piSessionStorageId(owner.actorId, sessionId)).execute();
       await db.destroy();
     }
   });
@@ -440,7 +463,8 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('shared RunStore MySQL integrati
           await db.deleteFrom(table).where('tenant_id', '=', tenantId).where('run_id', '=', runId).execute();
         }
       }
-      await db.deleteFrom('pi_sessions').where('tenant_id', '=', tenantId).where('session_id', '=', sessionId).execute();
+      await db.deleteFrom('pi_sessions').where('tenant_id', '=', tenantId)
+        .where('session_id', '=', piSessionStorageId(owner.actorId, sessionId)).execute();
       await db.destroy();
     }
   });
@@ -512,7 +536,7 @@ describe('DurableRunManager', () => {
       })).result();
 
       expect(result.status).toBe('succeeded');
-      expect(loadedMetadata).toMatchObject({ id: sessionId, tenantId: identity.tenantId });
+      expect(loadedMetadata).toMatchObject({ id: piSessionStorageId(identity.actorId, sessionId), tenantId: identity.tenantId });
     },
   );
 
@@ -568,7 +592,7 @@ describe('DurableRunManager', () => {
     });
     await expect(handle.result()).resolves.toMatchObject({ status: 'succeeded', text: 'durable answer' });
     expect(continued).toBe(1);
-    expect((await store.sessions.get('tenant-a', 'session-a'))?.committedLeafId).toBe('leaf-a');
+    expect((await store.sessions.get('tenant-a', piSessionStorageId(identity.actorId, 'session-a')))?.committedLeafId).toBe('leaf-a');
     expect(await store.listEvents({ tenantId: 'tenant-a', runId: 'run-manager' })).toHaveLength(2);
   });
 
@@ -862,7 +886,7 @@ describe('DurableRunManager', () => {
       runId, identity, sessionId, input: [{ role: 'user', text: 'first attempt' }], limits: { maxToolCalls: 1 },
     })).result();
     expect(firstResult.status).toBe('failed');
-    expect((await store.sessions.get(identity.tenantId, sessionId))?.committedLeafId).toBeNull();
+    expect((await store.sessions.get(identity.tenantId, piSessionStorageId(identity.actorId, sessionId)))?.committedLeafId).toBeNull();
     expect((await store.listEvents({ tenantId: identity.tenantId, runId })).map((event) => event.detail)).toEqual([
       expect.objectContaining({ toolCallId: 'prior-call' }),
       expect.objectContaining({ toolCallId: 'prior-call' }),

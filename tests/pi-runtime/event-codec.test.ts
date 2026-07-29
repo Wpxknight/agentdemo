@@ -112,6 +112,30 @@ describe('Pi EventCodec', () => {
     }, signal: new AbortController().signal } as never).detail).toMatchObject({ tokensBefore: 987 });
   });
 
+  it('emits the real compaction fields required by the HTTP compatibility projection', () => {
+    const codec = new EventCodec({ tenantId: 't', runId: 'r', attemptId: 'a', turnNo: 1,
+      correlationId: 'c', sequence: () => 1n });
+    codec.fromPi({ type: 'session_before_compact', branchEntries: [], preparation: {
+      tokensBefore: 100, messagesToSummarize: [
+        { role: 'user', content: 'old question', timestamp: 1 },
+        { role: 'assistant', content: [{ type: 'text', text: 'old answer' }], timestamp: 2,
+          api: 'openai-completions', provider: 'aiop', model: 'm', stopReason: 'stop', usage: {
+            input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          } },
+      ], retainedTail: [], firstKeptEntryId: 'kept',
+    }, signal: new AbortController().signal } as never);
+
+    expect(codec.fromPi({ type: 'session_compact', fromHook: false, compactionEntry: {
+      type: 'compaction', id: 'compact', parentId: 'kept', timestamp: '2026-07-29T00:00:00.000Z',
+      summary: 'short summary', firstKeptEntryId: 'kept', tokensBefore: 100, retainedTail: [],
+    } } as never).detail).toMatchObject({
+      tokensBefore: 100,
+      tokensAfter: expect.any(Number),
+      summarizedMessages: 2,
+    });
+  });
+
   it('turns throwing keys, getters, and proxies into stable unserializable detail', () => {
     const keysThrow = new Proxy({}, { ownKeys: () => { throw new Error('ownKeys failed'); } });
     const getterThrow = Object.defineProperty({}, 'value', {
