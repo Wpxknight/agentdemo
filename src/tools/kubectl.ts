@@ -1,4 +1,4 @@
-import type { ToolResult } from '../model/types.js';
+import type { ToolResult } from '../llm/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import type { ClusterRegistry, ClusterInfo } from '../config/clusters.js';
 import type { SandboxManagerLike } from '@aiop/sandbox-runtime';

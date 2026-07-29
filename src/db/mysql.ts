@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { sql, type Kysely, type Selectable } from 'kysely';
-import type { Msg, Role as MsgRole } from '../model/types.js';
+import type { Msg, Role as MsgRole } from '../llm/types.js';
 import type { AuditEvent } from '../audit/sink.js';
 import type { RequestContext, Role, Tenant, User } from '../auth/types.js';
 import type { Database } from './schema.js';
@@ -42,9 +42,9 @@ import { DEFAULT_SESSION_TITLE } from './store.js';
 import { McpServerSchema } from '../config/schema.js';
 import type { McpServerConfig } from '@aiop/mcp-runtime';
 import { nextRunAt } from '../scheduler/cron.js';
-import { estimateTokens } from '../agent/context.js';
+import { estimateTokens } from '../llm/context.js';
 import { parseStoredSandboxSettings } from '@aiop/sandbox-runtime';
-import { MysqlRuntimeStore, type RuntimeMysqlDatabase } from '@aiop/agent-runtime-mysql';
+import { MysqlRuntimeStore, type RuntimeMysqlDatabase } from '@aiop/pi-runtime';
 
 interface TaskRow {
   id: number;

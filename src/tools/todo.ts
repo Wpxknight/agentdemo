@@ -1,4 +1,4 @@
-import type { JsonValue, TodoItem, ToolResult } from '../model/types.js';
+import type { JsonValue, TodoItem, ToolResult } from '../llm/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 
 /**

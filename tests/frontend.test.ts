@@ -8,7 +8,7 @@ import { LocalAuthProvider } from '../src/auth/local.js';
 import { ToolRegistry } from '../src/agent/tools.js';
 import { AllowAllPolicy } from '../src/agent/policy.js';
 import type { Runtime } from '../src/runtime.js';
-import type { ChatModel, StreamEvent } from '../src/model/types.js';
+import type { ChatModel, StreamEvent } from '../src/llm/types.js';
 
 describe('React frontend stack', () => {
   it('uses the AIOP logo as the browser tab icon', async () => {

@@ -5,16 +5,10 @@ import ts from 'typescript';
 const root = resolve(import.meta.dirname, '..');
 const packages = [
   'control-contracts',
-  'agent-runtime-core',
   'scheduler-runtime',
-  'agent-kernel-pi',
   'pi-runtime',
   'sandbox-runtime',
-  'agent-runtime-mysql',
-  'agent-runtime-aiop',
   'mcp-runtime',
-  'skill-runtime',
-  'tool-runtime',
 ];
 
 const configPath = resolve(root, 'tsconfig.packages.json');

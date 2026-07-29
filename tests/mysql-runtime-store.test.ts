@@ -4,7 +4,7 @@ import { readMysqlConfig } from '../src/config/mysql.js';
 import { createStore } from '../src/db/index.js';
 import type { MysqlStore } from '../src/db/mysql.js';
 
-const sourceUrl = new URL('../packages/agent-runtime-mysql/src/index.ts', import.meta.url);
+const sourceUrl = new URL('../packages/pi-runtime/src/store/runtime-mysql.ts', import.meta.url);
 const mysqlStoreSourceUrl = new URL('../src/db/mysql.ts', import.meta.url);
 
 describe('MySQL runtime adapter contract', () => {

@@ -1,4 +1,4 @@
-import type { JsonValue, StreamEvent, ToolCall, ToolDef, ToolResult } from '../model/types.js';
+import type { JsonValue, StreamEvent, ToolCall, ToolDef, ToolResult } from '../llm/types.js';
 import type { RequestContext, Role } from '../auth/types.js';
 import type { OutputSink } from '@aiop/sandbox-runtime';
 import type { QuestionAnswers, QuestionSpec } from './question.js';

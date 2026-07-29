@@ -1,21 +1,22 @@
 import { logger } from './logger.js';
 import { SandboxConfigSchema, type Config, type SandboxConfig } from './config/schema.js';
-import { createModel, type ModelConfig as FactoryModelConfig } from './model/factory.js';
-import type { ChatModel } from './model/types.js';
+import { createModel, type ModelConfig as FactoryModelConfig } from './llm/factory.js';
+import type { ChatModel } from './llm/types.js';
 import { ToolRegistry } from './agent/tools.js';
 import { AllowAllPolicy, OpsPolicy } from './agent/policy.js';
 import type { PolicyMiddleware } from './agent/policy.js';
 import { PermissionRules } from './agent/rules.js';
 import { HookRunner } from './agent/hooks.js';
 import { PlanApprovalState } from './agent/plan.js';
-import { AgentRuntime, createConfiguredAgentRuntime } from './agent/runtime.js';
 import type {
   DurableRunRuntime,
   IdentityContext,
+  InteractionResolution,
   ResolvedInteraction,
+  RunExecutionProfile,
   ToolRuntime,
 } from '@aiop/control-contracts';
-import type { RuntimeStore, ToolLedgerApprovalClaim, ToolLedgerRepository } from '@aiop/agent-runtime-core';
+import type { RuntimeStore, ToolLedgerApprovalClaim, ToolLedgerRepository } from '@aiop/pi-runtime';
 import {
   InMemoryCredentialStore, createModels, type Api, type Model as PiModel, type Provider as PiProvider,
 } from '@earendil-works/pi-ai';
@@ -23,11 +24,13 @@ import { builtinProviders } from '@earendil-works/pi-ai/providers/all';
 import {
   bridgeGovernedTools,
   attachGovernedToolFacts,
+  createMemoryDurablePiRuntime,
   createMysqlDurablePiRuntime,
   GovernedToolOutcomeError,
   ResourceConcurrencyController,
   type PiSessionStore,
   type GovernedToolDefinition,
+  type EventCodecOptions,
 } from '@aiop/pi-runtime';
 import { SandboxManager, type SandboxManagerLike } from '@aiop/sandbox-runtime';
 import {
@@ -98,9 +101,9 @@ import type { PublicSandboxProfile, SandboxProfile } from '@aiop/sandbox-runtime
 import { LocalAuthProvider } from './auth/local.js';
 import { OidcAuthProvider } from './auth/oidc.js';
 import { AiosAuthProvider } from './auth/aios.js';
-import { createAIOPToolRuntime } from './agent/pi/tool-runtime.js';
+import { createAIOPToolRuntime } from './tools/governance.js';
 import { UserCredentials } from './auth/credentials.js';
-import { buildSystemPrompt } from './agent/services/prompt.js';
+import { buildSystemPrompt } from './prompt.js';
 import type { AuthProvider } from './auth/provider.js';
 import type { RequestContext } from './auth/types.js';
 import {
@@ -139,10 +142,8 @@ export interface SandboxSettingsUpdate {
 }
 
 export interface Runtime {
-  /** Agent 执行 facade；支持 Legacy 与 Pi Kernel，历史 LangGraph Run 仅供查询。 */
-  agentRuntime: AgentRuntime;
-  /** Pi-first durable control plane; deployments enable it while legacy callers migrate. */
-  durableRunRuntime?: DurableRunRuntime;
+  /** 唯一 Agent 执行入口；HTTP、CLI 与 Scheduler 共享同一个 durable Pi runtime。 */
+  durableRunRuntime: DurableRunRuntime;
   /** Committed Pi session entries used to rebuild legacy product message projections. */
   piSessionStore?: PiSessionStore;
   model: ChatModel;
@@ -281,10 +282,10 @@ export async function createDefaultDurableRunRuntime(
   policy?: PolicyMiddleware,
   tools = new ToolRegistry(),
   policyPreApproved = policy,
-): Promise<DurableRunRuntime | undefined> {
+): Promise<DurableRunRuntime> {
   return (await createDefaultDurableRunAssembly(
     store, modelConfig, systemPrompt, enabled, mcp, policy, tools, policyPreApproved,
-  ))?.runtime;
+  )).runtime;
 }
 
 async function createDefaultDurableRunAssembly(
@@ -297,7 +298,7 @@ async function createDefaultDurableRunAssembly(
   tools = new ToolRegistry(),
   policyPreApproved = policy,
 ) {
-  if (!enabled || !(store instanceof MysqlStore)) return undefined;
+  if (!enabled) throw new Error('DurableRunRuntime is mandatory and cannot be disabled');
   const targetApi = modelConfig.protocol === 'anthropic' ? 'anthropic-messages' : 'openai-completions';
   const provider = builtinProviders().find((candidate) => candidate.getModels().some((model) => model.api === targetApi));
   const template = provider?.getModels().find((model) => model.api === targetApi);
@@ -330,12 +331,18 @@ async function createDefaultDurableRunAssembly(
   };
   models.setProvider(configuredProvider);
   const runtimeStore = store.agentRuntimeStore();
-  return createMysqlDurablePiRuntime({
-    db: store.database(), models, model, systemPrompt,
-    resolveSystemPrompt: ({ execution }) => execution?.unattended
+  const assemblyOptions = {
+    models, model, systemPrompt,
+    resolveSystemPrompt: ({ execution }: { execution?: RunExecutionProfile }) => execution?.unattended
       ? buildSystemPrompt(systemPrompt, true)
       : systemPrompt,
-    resolveTools: async ({ identity, sessionId, events, interactionResolution, execution }) => {
+    resolveTools: async ({ identity, sessionId, events, interactionResolution, execution }: {
+      identity?: IdentityContext;
+      sessionId?: string;
+      events: EventCodecOptions;
+      interactionResolution?: InteractionResolution;
+      execution?: RunExecutionProfile;
+    }) => {
       if (!identity) return [];
       const definitions = mcp ? await mcp.tools(identity) : [];
       const toolContext = {
@@ -384,7 +391,10 @@ async function createDefaultDurableRunAssembly(
         },
       });
     },
-  });
+  };
+  return store instanceof MysqlStore
+    ? createMysqlDurablePiRuntime({ db: store.database(), ...assemblyOptions })
+    : createMemoryDurablePiRuntime(assemblyOptions);
 }
 
 export function resolveMcpBootstrapConfigs(
@@ -437,7 +447,6 @@ export async function buildRuntime(
     settingsSecretBox?: ReturnType<typeof createSettingsSecretBox>;
     durableRunRuntime?: DurableRunRuntime;
     piSessionStore?: PiSessionStore;
-    enableDefaultDurableRuntime?: boolean;
   } = {},
 ): Promise<Runtime> {
   let modelConfig = defaultRuntimeModelConfig(config);
@@ -841,13 +850,13 @@ export async function buildRuntime(
       store,
       modelConfig,
       systemExtra,
-      options.enableDefaultDurableRuntime,
+      true,
       mcp,
       policy,
       tools,
       policyPreApproved,
     );
-  const durableRunRuntime = options.durableRunRuntime ?? defaultDurableAssembly?.runtime;
+  const durableRunRuntime = options.durableRunRuntime ?? defaultDurableAssembly!.runtime;
   const piSessionStore = options.piSessionStore ?? defaultDurableAssembly?.store.sessions;
   const publicSandboxState = (): SandboxSettingsState => {
     const catalog = sandboxController.catalogInfo();
@@ -950,11 +959,6 @@ export async function buildRuntime(
   };
 
   const runtime: Runtime = {
-    agentRuntime: createConfiguredAgentRuntime(process.env, {
-      bindingStore: store,
-      runStore: store,
-      runtimeStore: store.agentRuntimeStore(),
-    }),
     durableRunRuntime,
     piSessionStore,
     model,

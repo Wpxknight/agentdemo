@@ -6,7 +6,7 @@ import {
   type ToolLedgerStore,
 } from '../../packages/pi-runtime/src/index.js';
 import { ToolRegistry, defineTool } from '../../src/agent/tools.js';
-import { createCompatibilityAIOPToolRuntime } from '../../src/agent/pi/tool-runtime.js';
+import { createCompatibilityAIOPToolRuntime } from '../../src/tools/governance.js';
 import { McpManager } from '../../packages/mcp-runtime/src/index.js';
 import { buildAskUserTool } from '../../src/tools/ask-user.js';
 import { buildSandboxTools } from '../../src/tools/builtin.js';

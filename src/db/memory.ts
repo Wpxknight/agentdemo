@@ -1,5 +1,5 @@
-import type { Msg } from '../model/types.js';
-import { estimateTokens } from '../agent/context.js';
+import type { Msg } from '../llm/types.js';
+import { estimateTokens } from '../llm/context.js';
 import type { AuditEvent } from '../audit/sink.js';
 import type { RequestContext, Tenant, User } from '../auth/types.js';
 import type { McpServerConfig } from '@aiop/mcp-runtime';
@@ -35,8 +35,8 @@ import type {
 } from './store.js';
 import { DEFAULT_SESSION_TITLE } from './store.js';
 import { nextRunAt } from '../scheduler/cron.js';
-import { MemoryRuntimeStore } from '@aiop/agent-runtime-core';
-import type { InteractionRecord as RuntimeInteractionRecord } from '@aiop/agent-runtime-core';
+import { MemoryRuntimeStore } from '@aiop/pi-runtime';
+import type { InteractionRecord as RuntimeInteractionRecord } from '@aiop/pi-runtime';
 import type { JsonValue } from '@aiop/control-contracts';
 
 interface MsgRow {

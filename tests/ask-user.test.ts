@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { buildAskUserTool } from '../src/tools/ask-user.js';
 import { InMemoryQuestionStore } from '../src/agent/question.js';
 import type { QuestionAnswers, QuestionSpec } from '../src/agent/question.js';
-import type { JsonValue } from '../src/model/types.js';
+import type { JsonValue } from '../src/llm/types.js';
 
 const validArgs = {
   questions: [

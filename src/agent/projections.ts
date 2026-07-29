@@ -1,7 +1,7 @@
 import type { SessionStats, SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import type { RequestContext } from '../auth/types.js';
 import type { AgentRunUsage, SessionContextUsage, SessionTokenUsage, Store } from '../db/store.js';
-import type { JsonValue, Msg, ToolContentBlock } from '../model/types.js';
+import type { JsonValue, Msg, ToolContentBlock } from '../llm/types.js';
 import { piSessionStorageId, type PiSessionStore } from '@aiop/pi-runtime';
 
 export interface ProjectPiSessionInput {

@@ -113,6 +113,8 @@ describe('durable runtime migrations', () => {
     const indexes = new Set<string>();
     const recorded = Array.from({ length: 23 }, (_, index) => ({ version: index + 1 }));
     const query = async (statement: string, values?: unknown[]) => {
+      if (statement.includes('GET_LOCK')) return [[{ acquired: 1 }]];
+      if (statement.includes('RELEASE_LOCK')) return [[{ released: 1 }]];
       if (statement === 'SELECT version FROM schema_migrations') return [recorded];
       if (statement.startsWith('INSERT INTO schema_migrations')) {
         recorded.push({ version: Number(values?.[0]) });
@@ -126,7 +128,7 @@ describe('durable runtime migrations', () => {
       }
       return [[]];
     };
-    const pool = { promise: () => ({ query }) };
+    const pool = { promise: () => ({ getConnection: async () => ({ query, release() {} }) }) };
 
     await runMigrations(pool as never);
 

@@ -1,4 +1,4 @@
-import type { JsonValue, ToolResult } from '../model/types.js';
+import type { JsonValue, ToolResult } from '../llm/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import { SandboxDesktopRuntime, type DesktopHandle } from '@aiop/sandbox-runtime';
 

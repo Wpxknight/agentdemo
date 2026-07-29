@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { buildTodoTool } from '../src/tools/todo.js';
-import type { StreamEvent } from '../src/model/types.js';
+import type { StreamEvent } from '../src/llm/types.js';
 
 describe('todo_write tool', () => {
   it('validates, stores, renders and emits todo_updated', async () => {

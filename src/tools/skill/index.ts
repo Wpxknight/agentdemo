@@ -1,5 +1,5 @@
 import { logger } from '../../logger.js';
-import type { JsonValue, ToolResult } from '../../model/types.js';
+import type { JsonValue, ToolResult } from '../../llm/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../../agent/tools.js';
 import type { SkillRegistry } from '../../skill/registry.js';
 import type { SandboxManagerLike } from '@aiop/sandbox-runtime';

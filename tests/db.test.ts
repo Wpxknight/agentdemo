@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { readMysqlConfig } from '../src/config/mysql.js';
 import { MemoryStore } from '../src/db/memory.js';
 import { createStore } from '../src/db/index.js';
-import type { Msg } from '../src/model/types.js';
+import type { Msg } from '../src/llm/types.js';
 import type { RequestContext } from '../src/auth/types.js';
 import { readFile } from 'node:fs/promises';
 

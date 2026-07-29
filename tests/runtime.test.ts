@@ -209,15 +209,13 @@ describe('production durable runtime assembly', () => {
     expect(runtime).toBeInstanceOf(DurableRunManager);
   });
 
-  it('supports explicitly disabling the default durable Pi runtime', async () => {
-    const runtime = await createDefaultDurableRunRuntime(
+  it('rejects attempts to disable the mandatory durable Pi runtime', async () => {
+    await expect(createDefaultDurableRunRuntime(
       new MysqlStore({} as never),
       { id: 'configured', protocol: 'openai', baseURL: 'http://model.local/v1', apiKey: 'secret', model: 'custom-model' },
       'system prompt',
       false,
-    );
-
-    expect(runtime).toBeUndefined();
+    )).rejects.toThrow('mandatory');
   });
 
   it('assembles identity-resolved MCP tools into durable Pi sessions through the governed adapter', async () => {

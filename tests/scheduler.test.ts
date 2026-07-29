@@ -248,16 +248,7 @@ describe('createScheduledTaskRunner', () => {
       execution: { unattended: true, preApproved: true },
       limits: { deadlineAt: new Date('2026-07-29T02:05:00.000Z') },
     }));
-  });
-
-  it('fails explicitly when durable Run creation is unavailable', async () => {
-    const runner = createScheduledTaskRunner({ store: new MemoryStore() } as unknown as Runtime);
-    await expect(runner({
-      id: 1, tenantId: 't1', userId: 'u1', sessionId: 'cron-sess', cron: '* * * * *',
-      title: '巡检', task: '巡检', preApproved: false, enabled: true, nextRunAt: new Date(),
-    })).rejects.toThrow('DurableRunRuntime');
-  });
-});
+  });});
 
 describe('embedded scheduler deployment', () => {
   it('maps a waiting bound Durable Run to compatibility error detail without run or resume', async () => {

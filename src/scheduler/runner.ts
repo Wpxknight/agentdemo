@@ -9,7 +9,7 @@ import {
   type SchedulerMysqlDatabase,
   type SchedulerStore,
   type ScheduledRunInput,
-} from '../../packages/scheduler-runtime/src/index.js';
+} from '@aiop/scheduler-runtime';
 import { logger } from '../logger.js';
 import type { Runtime } from '../runtime.js';
 import { DEFAULT_TASK_MAX_RUN_MS, type AgentRunRecord, type ScheduledTask } from '../db/store.js';
@@ -28,9 +28,6 @@ export function shouldEmbedScheduler(env: Env = process.env): boolean {
 /** Creates a durable product Run. The scheduler never enters an agent/Pi execution loop. */
 export function createScheduledTaskRunner(rt: Runtime): TaskRunner {
   return async (task: ScheduledTask) => {
-    if (!rt.durableRunRuntime) {
-      throw new Error('DurableRunRuntime is required for scheduled Run creation');
-    }
     const dispatcher = createRunDispatcher(rt.durableRunRuntime, scheduledRunLookup(rt));
     const fireTime = new Date();
     const result = await dispatcher.startScheduledRun({
@@ -78,9 +75,6 @@ export function createRuntimeScheduler(
   rt: Runtime,
   options: RuntimeSchedulerOptions = {},
 ): RuntimeScheduler {
-  if (!rt.durableRunRuntime) {
-    throw new Error('DurableRunRuntime is required for scheduled Run creation');
-  }
   const store = options.store ?? productionSchedulerStore(rt);
   const runner = new SchedulerRunner({
     store,
@@ -225,7 +219,7 @@ function durableBoundRunRecovery(rt: Runtime): BoundRunRecovery {
       return { kind: 'recoverable' };
     },
     async resume(fire, signal) {
-      const handle = await rt.durableRunRuntime!.resume({
+      const handle = await rt.durableRunRuntime.resume({
         identity: fire.identity,
         runId: fire.runId,
         signal,

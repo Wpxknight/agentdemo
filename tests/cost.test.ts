@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { estimateCost } from '../src/model/cost.js';
+import { estimateCost } from '../src/llm/cost.js';
 import type { Usage } from '../src/agent/run-types.js';
 
 const usage: Usage = {

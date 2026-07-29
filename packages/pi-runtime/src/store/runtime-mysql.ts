@@ -11,7 +11,7 @@ import type {
   ToolLedgerRecord,
   TurnCommit,
   TurnSnapshot,
-} from '@aiop/agent-runtime-core';
+} from './runtime-spi.js';
 import type { ColumnType, Generated, Kysely, Transaction } from 'kysely';
 
 type JsonColumn = ColumnType<unknown, string, string>;
@@ -296,7 +296,7 @@ export class MysqlRuntimeStore implements RuntimeStore {
       }).where('tenant_id', '=', record.tenantId).where('run_id', '=', record.runId)
         .where('logical_call_id', '=', record.logicalCallId).execute();
     },
-    claimPendingApproval: async (input: import('@aiop/agent-runtime-core').ToolLedgerApprovalClaim): Promise<boolean> => {
+    claimPendingApproval: async (input: import('./runtime-spi.js').ToolLedgerApprovalClaim): Promise<boolean> => {
       const result = await this.db.updateTable('agent_tool_executions').set({
         attempt_id: input.started.attemptId, turn_no: input.started.turnNo,
         tool_call_id: input.started.toolCallId, idempotency_key: input.started.idempotencyKey,

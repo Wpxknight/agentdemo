@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { RunCenterService, type RunCenterStore } from '../packages/agent-runtime-aiop/src/index.js';
+import { RunCenterService, type RunCenterStore } from '../src/agent/run-center.js';
 
 describe('Pi Run Center summaries', () => {
   it('adds attempt and committed-turn summaries to every listed run', async () => {

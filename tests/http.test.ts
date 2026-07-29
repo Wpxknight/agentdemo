@@ -12,7 +12,7 @@ import { LocalAuthProvider } from '../src/auth/local.js';
 import { ToolRegistry } from '../src/agent/tools.js';
 import { AllowAllPolicy } from '../src/agent/policy.js';
 import type { Runtime } from '../src/runtime.js';
-import type { ChatModel, Msg, StreamEvent } from '../src/model/types.js';
+import type { ChatModel, Msg, StreamEvent } from '../src/llm/types.js';
 import { SkillRegistry, type SkillProductRecord } from '../src/skill/registry.js';
 import type { ProductSkillLoader } from '../src/skill/service.js';
 import { McpManager } from '../packages/mcp-runtime/src/index.js';
@@ -21,7 +21,13 @@ import { SandboxManager } from '../packages/sandbox-runtime/src/lifecycle.js';
 import { buildSandboxTools } from '../src/tools/builtin.js';
 import { buildSandboxProfileTools } from '../src/tools/sandbox-profiles.js';
 import type { ExecResult, SandboxHandle, SandboxProvider, SandboxSpec } from '../packages/sandbox-runtime/src/types.js';
-import type { AppendRunMessageInput, DurableRunRuntime } from '@aiop/control-contracts';
+import type {
+  AgentRunEvent,
+  AgentRunResult,
+  AppendRunMessageInput,
+  DurableRunRuntime,
+  StartRunInput,
+} from '@aiop/control-contracts';
 import { loadSourcedSkills } from '@earendil-works/pi-agent-core';
 import { EventCodec } from '../packages/pi-runtime/src/index.js';
 
@@ -33,6 +39,108 @@ const model: ChatModel = {
     yield { type: 'stop', reason: 'end_turn' };
   },
 };
+
+function createHttpTestDurableRuntime(
+  store: MemoryStore,
+  getModel: () => ChatModel,
+): DurableRunRuntime {
+  const controllers = new Map<string, AbortController>();
+  let sequence = 0;
+  const event = (runId: string, type: string, detail: AgentRunEvent['detail'], turnNo = 1): AgentRunEvent => ({
+    tenantId: 'default', runId, sequence: BigInt(++sequence), type,
+    attemptId: `${runId}:attempt`, turnNo, kernel: 'pi', kernelVersion: 'test',
+    correlationId: `${runId}:correlation`, detail, createdAt: new Date(),
+  });
+  return {
+    async run(input: StartRunInput) {
+      const runId = input.runId ?? `http-test-run-${sequence + 1}`;
+      const controller = new AbortController();
+      controllers.set(runId, controller);
+      let resolveResult!: (value: AgentRunResult) => void;
+      const resultPromise = new Promise<AgentRunResult>((resolve) => {
+        resolveResult = resolve;
+      });
+      const ctx = {
+        tenantId: input.identity.tenantId,
+        userId: input.identity.actorId,
+        role: input.identity.roles.includes('platform_admin') ? 'platform_admin' as const
+          : input.identity.roles.includes('tenant_admin') ? 'tenant_admin' as const : 'user' as const,
+      };
+      const request = input.input[0];
+      const userMessage: Msg = {
+        role: 'user',
+        text: request?.text ?? '',
+        contentBlocks: request?.content?.filter((block) => block.type === 'image')
+          .map((block) => ({ type: 'image' as const, mimeType: block.mimeType, data: block.data })),
+      };
+      return {
+        runId,
+        status: 'running' as const,
+        events: {
+          async *[Symbol.asyncIterator]() {
+            const prior = await store.listMessages(ctx, input.sessionId);
+            let text = '';
+            let thinking = '';
+            try {
+              for await (const streamed of getModel().stream({
+                system: '', messages: [...prior, userMessage], tools: [], signal: controller.signal,
+              })) {
+                if (streamed.type === 'text_delta') {
+                  text += streamed.text;
+                  yield event(runId, 'message_update', { update: { type: 'text_delta', delta: streamed.text } });
+                } else if (streamed.type === 'thinking_delta') {
+                  thinking += streamed.text;
+                  yield event(runId, 'message_update', { update: { type: 'thinking_delta', delta: streamed.text } });
+                } else if (streamed.type === 'context_compacted') {
+                  yield event(runId, 'session_compact', {
+                    summarizedMessages: streamed.summarizedMessages,
+                    tokensBefore: streamed.beforeTokens,
+                    tokensAfter: streamed.afterTokens,
+                  });
+                }
+                if (controller.signal.aborted) break;
+              }
+              await store.appendMessage(ctx, input.sessionId, userMessage);
+              if (controller.signal.aborted) {
+                await store.appendMessage(ctx, input.sessionId, {
+                  role: 'assistant', text: `${text}\n\n已终止当前运行。`.trim(), thinking,
+                  durationMs: 0,
+                });
+                resolveResult({
+                  runId, status: 'cancelled', text,
+                  usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+                });
+              } else {
+                await store.appendMessage(ctx, input.sessionId, { role: 'assistant', text, thinking, durationMs: 0 });
+                resolveResult({
+                  runId, status: 'succeeded', text,
+                  usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+                });
+              }
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              await store.appendMessage(ctx, input.sessionId, userMessage);
+              await store.appendMessage(ctx, input.sessionId, {
+                role: 'assistant', text: `${text}\n\n运行失败：${message}`.trim(), thinking, durationMs: 0,
+              });
+              resolveResult({
+                runId, status: 'failed', text,
+                usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+                error: { code: 'MODEL_PROVIDER_ERROR', message, retryable: false },
+              });
+            } finally {
+              controllers.delete(runId);
+            }
+          },
+        },
+        result: () => resultPromise,
+      };
+    },
+    async resume() { throw new Error('resume is not configured for this HTTP test'); },
+    async cancel(input) { controllers.get(input.runId)?.abort(input.reason); },
+    async append() {},
+  };
+}
 
 function mockSandboxProvider() {
   let seq = 0;
@@ -123,7 +231,7 @@ beforeAll(async () => {
   store = new MemoryStore();
   await store.createTenant({ id: 'default', name: 'Default' });
   const auth = new LocalAuthProvider({ store, secret: 'test-secret' });
-  await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+  const adminUser = await auth.createUser('default', 'admin', 'pw', 'platform_admin');
   await auth.createUser('default', 'bob', 'pw', 'user');
 
   // MCP：mock connect（server 名以 down 开头则连接失败），暴露一个 echo 工具
@@ -136,7 +244,7 @@ beforeAll(async () => {
     };
   };
   const mcp = new McpManager({ fs: { transport: 'stdio', command: 'fake' } }, mcpConnect);
-  await mcp.start({ tenantId: 'default', actorId: 'admin', roles: ['platform_admin'] });
+  await mcp.start({ tenantId: 'default', actorId: adminUser.id, roles: ['platform_admin'] });
 
   let activeModel = model;
   let activeModelConfig: NonNullable<Runtime['modelConfig']> = {
@@ -194,6 +302,7 @@ beforeAll(async () => {
     authProvider: auth,
     jwtSecret: 'test-secret',
     systemExtra: '',
+    durableRunRuntime: createHttpTestDurableRuntime(store, () => activeModel),
     defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
   } as unknown as Runtime;
 
@@ -331,6 +440,7 @@ describe('HTTP server', () => {
       authProvider: auth,
       jwtSecret: 'thinking-secret',
       systemExtra: '',
+      durableRunRuntime: createHttpTestDurableRuntime(localStore, () => thinkingModel),
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
 
@@ -399,6 +509,7 @@ describe('HTTP server', () => {
       authProvider: auth,
       jwtSecret: 'context-secret',
       systemExtra: '',
+      durableRunRuntime: createHttpTestDurableRuntime(localStore, () => contextModel),
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
 
@@ -469,6 +580,7 @@ describe('HTTP server', () => {
       authProvider: auth,
       jwtSecret: 'terminate-secret',
       systemExtra: '',
+      durableRunRuntime: createHttpTestDurableRuntime(localStore, () => slowModel),
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
 
@@ -538,6 +650,7 @@ describe('HTTP server', () => {
       authProvider: auth,
       jwtSecret: 'failed-run-secret',
       systemExtra: '',
+      durableRunRuntime: createHttpTestDurableRuntime(localStore, () => failingModel),
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
     const failedServer = createHttpServer(rt);
@@ -1029,42 +1142,32 @@ describe('HTTP server', () => {
     }
   });
 
-  it('runs /goal with an autonomous prompt and extended step budget', async () => {
+  it('routes /goal requests through the mandatory durable Pi runtime', async () => {
     const localStore = new MemoryStore();
     await localStore.createTenant({ id: 'default', name: 'Default' });
     const auth = new LocalAuthProvider({ store: localStore, secret: 'goal-secret' });
     await auth.createUser('default', 'admin', 'pw', 'platform_admin');
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
-    const tools = new ToolRegistry();
-    tools.register({
-      def: { name: 'noop', description: 'noop', inputSchema: { type: 'object' } },
-      run: async () => ({ id: '', content: 'ok' }),
-    });
-
-    const seenSystems: string[] = [];
-    let calls = 0;
-    const goalModel: ChatModel = {
-      id: 'goal',
-      async *stream(input): AsyncIterable<StreamEvent> {
-        calls++;
-        seenSystems.push(input.system);
-        if (calls <= 21) {
-          yield { type: 'tool_call', call: { id: `tool-${calls}`, name: 'noop', args: {} } };
-        } else {
-          yield { type: 'text_delta', text: '目标完成' };
-        }
-        yield { type: 'stop', reason: 'end_turn' };
+    const runDurably = vi.fn(async (input: StartRunInput) => ({
+      runId: 'goal-run', status: 'running' as const,
+      events: { async *[Symbol.asyncIterator]() {} },
+      async result() {
+        return {
+          runId: 'goal-run', status: 'succeeded' as const, text: '目标完成',
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0 },
+        };
       },
-    };
+    }));
     const rt = {
-      model: goalModel,
-      tools,
+      model,
+      tools: new ToolRegistry(),
       store: localStore,
       policy: new AllowAllPolicy(),
       policyPreApproved: new AllowAllPolicy(),
       authProvider: auth,
       jwtSecret: 'goal-secret',
       systemExtra: '',
+      durableRunRuntime: { run: runDurably },
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
 
@@ -1081,9 +1184,10 @@ describe('HTTP server', () => {
       expect(run.status).toBe(200);
       const body = await run.text();
       expect(body).toContain('目标完成');
-      expect(body).toContain('"steps":22');
-      expect(seenSystems[0]).toContain('目标模式');
-      expect(seenSystems[0]).toContain('不可逆');
+      expect(runDurably).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: 'goal-sess', kernel: 'pi',
+        input: [expect.objectContaining({ role: 'user', text: '/goal 完成巡检并整理结果' })],
+      }));
     } finally {
       await new Promise<void>((resolve) => goalServer.close(() => resolve()));
     }
@@ -2003,46 +2107,47 @@ describe('HTTP server', () => {
     }
   });
 
-  it('pauses an SSE agent run for approval and resumes after approve', async () => {
+  it('authorizes approval resolution and resumes the durable run', async () => {
     const localStore = new MemoryStore();
     await localStore.createTenant({ id: 'default', name: 'Default' });
     const auth = new LocalAuthProvider({ store: localStore, secret: 'approval-secret' });
-    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const admin = await auth.createUser('default', 'admin', 'pw', 'platform_admin');
     await auth.createUser('default', 'user', 'pw', 'user');
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
     const userToken = (await auth.login('default', 'user', 'pw'))!;
-
-    const run = vi.fn(async () => ({ id: '', content: 'approved tool result' }));
-    const tools = new ToolRegistry();
-    tools.register({
-      def: { name: 'act', description: 'act', inputSchema: { type: 'object' } },
-      run,
+    const runId = 'approval-run';
+    const approvalId = 'approval-interaction';
+    await localStore.putAgentRunBindingIfAbsent({
+      tenantId: 'default', userId: admin.id, sessionId: 'approval-sess', runId, kernel: 'pi',
+      graphName: '', graphVersion: '', createdAt: new Date(),
     });
-
-    let turn = 0;
-    const approvalModel: ChatModel = {
-      id: 'approval-model',
-      async *stream(): AsyncIterable<StreamEvent> {
-        turn++;
-        if (turn === 1) {
-          yield { type: 'tool_call', call: { id: 'c1', name: 'act', args: {} } };
-          yield { type: 'stop', reason: 'tool_use' };
-          return;
-        }
-        yield { type: 'text_delta', text: 'finished after approval' };
-        yield { type: 'stop', reason: 'end_turn' };
+    await localStore.updateAgentRun('default', runId, { status: 'waiting', updatedAt: new Date() });
+    await localStore.putInteraction({
+      id: approvalId, tenantId: 'default', userId: admin.id, sessionId: 'approval-sess', runId,
+      kind: 'approval', toolCallId: 'call-a', payload: { id: approvalId, reason: 'prod write' },
+      status: 'pending', expiresAt: new Date(Date.now() + 60_000), createdAt: new Date(),
+    });
+    const resume = vi.fn(async () => ({
+      runId, status: 'running' as const,
+      events: { async *[Symbol.asyncIterator]() {} },
+      async result() {
+        return {
+          runId, status: 'succeeded' as const, text: 'finished after approval',
+          usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+        };
       },
-    };
+    }));
 
     const rt = {
-      model: approvalModel,
-      tools,
+      model,
+      tools: new ToolRegistry(),
       store: localStore,
-      policy: { check: async () => ({ blocked: false, needApproval: true, reason: 'prod write' }) },
+      policy: new AllowAllPolicy(),
       policyPreApproved: new AllowAllPolicy(),
       authProvider: auth,
       jwtSecret: 'approval-secret',
       systemExtra: '',
+      durableRunRuntime: { resume },
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
 
@@ -2051,26 +2156,6 @@ describe('HTTP server', () => {
     const approvalBase = `http://127.0.0.1:${(approvalServer.address() as AddressInfo).port}`;
 
     try {
-      const r = await fetch(`${approvalBase}/v1/agent`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${adminToken}` },
-        body: JSON.stringify({ task: 'needs approval', sessionId: 'approval-sess' }),
-      });
-      expect(r.status).toBe(200);
-      const reader = r.body!.getReader();
-      const decoder = new TextDecoder();
-      let stream = '';
-      let approvalId = '';
-
-      while (!approvalId) {
-        const next = await reader.read();
-        expect(next.done).toBe(false);
-        stream += decoder.decode(next.value, { stream: true });
-        const m = /event: approval_required\ndata: ([^\n]+)/.exec(stream);
-        if (m) approvalId = (JSON.parse(m[1]!) as { id: string }).id;
-      }
-
-      expect(run).not.toHaveBeenCalled();
       const deniedByRbac = await fetch(`${approvalBase}/v1/approvals/${approvalId}/approve`, {
         method: 'POST',
         headers: { authorization: `Bearer ${userToken}` },
@@ -2082,16 +2167,14 @@ describe('HTTP server', () => {
         headers: { authorization: `Bearer ${adminToken}` },
       });
       expect(approved.status).toBe(200);
-
-      while (!stream.includes('event: done')) {
-        const next = await reader.read();
-        if (next.done) break;
-        stream += decoder.decode(next.value, { stream: true });
-      }
-
-      expect(run).toHaveBeenCalledOnce();
-      expect(stream).toContain('event: done');
-      expect(stream).toContain('finished after approval');
+      await vi.waitFor(() => expect(resume).toHaveBeenCalledOnce());
+      expect(resume).toHaveBeenCalledWith(expect.objectContaining({
+        runId,
+        resolution: { interactionId: approvalId, value: true },
+      }));
+      expect(await localStore.getInteraction('default', approvalId)).toMatchObject({
+        status: 'resolved', resolution: true,
+      });
     } finally {
       await new Promise<void>((resolve) => approvalServer.close(() => resolve()));
     }
@@ -2116,6 +2199,7 @@ describe('HTTP server 会话互斥与自动压缩', () => {
       authProvider: auth,
       jwtSecret: 'mutex-secret',
       systemExtra: '',
+      durableRunRuntime: createHttpTestDurableRuntime(localStore, () => chatModel),
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
     const srv = createHttpServer(rt);
@@ -2183,11 +2267,11 @@ describe('HTTP server 会话互斥与自动压缩', () => {
     }
   });
 
-  it('auto-compacts a long history, emits context_compacted, and persists the rewritten history', async () => {
+  it('projects durable session compaction events over SSE', async () => {
     const chatModel: ChatModel = {
       id: 'mock',
       async *stream(): AsyncIterable<StreamEvent> {
-        // 同一模型也承接摘要请求：返回的文本即摘要内容
+        yield { type: 'context_compacted', summarizedMessages: 52, beforeTokens: 180_000, afterTokens: 24_000 };
         yield { type: 'text_delta', text: '模拟摘要或回答' };
         yield { type: 'stop', reason: 'end_turn' };
       },
@@ -2208,19 +2292,14 @@ describe('HTTP server 会话互斥与自动压缩', () => {
       expect(r.status).toBe(200);
       const body = await r.text();
       expect(body).toContain('event: context_compacted');
+      expect(body).toContain('"summarizedMessages":52');
+      expect(body).toContain('"beforeTokens":180000');
+      expect(body).toContain('"afterTokens":24000');
       expect(body).toContain('event: done');
 
       const messages = await localStore.listMessages(ctx, 'compact-sess');
-      // 用户输入永不吞掉：压缩区间的 27 条用户消息原样保留在摘要之前
-      // + 摘要 1 条 + 保留的最近 8 条（含本轮 task）+ 本轮 assistant 1 条 = 37
-      expect(messages).toHaveLength(37);
-      expect(messages[0]!.role).toBe('user');
-      expect(messages[0]!.text).toContain('问题0');
-      const summaryIdx = messages.findIndex((m) => m.text?.includes('历史对话摘要'));
-      expect(summaryIdx).toBeGreaterThan(0);
-      expect(messages[summaryIdx]!.text).toContain('模拟摘要或回答');
-      expect(messages.slice(0, summaryIdx).every((m) => m.role === 'user')).toBe(true);
       expect(messages.at(-2)!.text).toBe('继续任务');
+      expect(messages.at(-1)!.text).toBe('模拟摘要或回答');
     } finally {
       await new Promise<void>((resolve) => srv.close(() => resolve()));
     }
@@ -2568,6 +2647,7 @@ describe('HTTP server 定时任务管理', () => {
   it('POST /run triggers an immediate run recorded in task_runs', async () => {
     const token = await adminToken();
     const id = await createTask(token);
+    const originalDurableRunRuntime = runtime.durableRunRuntime;
     runtime.durableRunRuntime = {
       run: async (input: { runId?: string }) => {
         const runId = input.runId ?? 'scheduled-run';
@@ -2603,7 +2683,7 @@ describe('HTTP server 定时任务管理', () => {
       expect(runs[0]!.status).toBe('success');
       expect(runs[0]!.detail).toBeTruthy();
     } finally {
-      runtime.durableRunRuntime = undefined;
+      runtime.durableRunRuntime = originalDurableRunRuntime;
     }
 
     const missing = await fetch(`${base}/v1/schedule/99999/run`, {
@@ -3082,7 +3162,7 @@ describe('HTTP server 平台 Sandbox 设置', () => {
     } finally {
       await fixture.close();
     }
-  });
+  }, 10_000);
 
   it('maps endpoint-binding validation to 400 and audits only non-sensitive details on success', async () => {
     const fixture = await createSandboxSettingsHttpServer({

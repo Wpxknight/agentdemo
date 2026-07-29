@@ -1,4 +1,4 @@
-import type { JsonValue, ToolResult } from '../model/types.js';
+import type { JsonValue, ToolResult } from '../llm/types.js';
 import type { ChangePlan } from '../agent/plan.js';
 import { parseChangePlan, renderChangePlan } from '../agent/plan.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';

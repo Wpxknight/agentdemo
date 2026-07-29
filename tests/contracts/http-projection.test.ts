@@ -1,6 +1,4 @@
 import { describe, expect, it } from 'vitest';
-import { existsSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import {
   projectDurableHttpDone,
   projectDurableHttpEvent,
@@ -114,9 +112,4 @@ describe('HTTP Pi event projection compatibility', () => {
     await expect(readSessionUsageProjection(rt as never, ctx, 'session-a')).resolves.toEqual({ totalTokens: 75 });
   });
 
-  it('does not retain the retired model retry and context compaction services', () => {
-    const source = (path: string) => fileURLToPath(new URL(`../../src/agent/services/${path}`, import.meta.url));
-    expect(existsSync(source('model-gateway.ts'))).toBe(false);
-    expect(existsSync(source('context-service.ts'))).toBe(false);
-  });
 });

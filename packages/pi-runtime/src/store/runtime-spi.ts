@@ -10,7 +10,7 @@ import type {
   RunLimits,
   WaitingReason,
 } from '@aiop/control-contracts';
-import type { KernelMessage, ModelBinding } from './kernel.js';
+import type { KernelMessage, ModelBinding } from './runtime-kernel.js';
 
 export interface RunIdentity {
   tenantId: string;

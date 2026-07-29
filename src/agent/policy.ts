@@ -1,4 +1,4 @@
-import type { ToolCall } from '../model/types.js';
+import type { ToolCall } from '../llm/types.js';
 import type { ToolContext } from './tools.js';
 import type { ClusterRegistry } from '../config/clusters.js';
 import type { AuditSink } from '../audit/sink.js';

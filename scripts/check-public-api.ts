@@ -3,9 +3,7 @@ import { join, relative, resolve, sep } from 'node:path';
 
 const root = resolve(import.meta.dirname, '..');
 const packages = [
-  'control-contracts', 'agent-kernel-pi', 'agent-runtime-aiop', 'agent-runtime-core', 'agent-runtime-mysql', 'pi-runtime',
-  'mcp-runtime', 'sandbox-runtime',
-  'scheduler-runtime', 'skill-runtime', 'tool-runtime',
+  'control-contracts', 'pi-runtime', 'mcp-runtime', 'sandbox-runtime', 'scheduler-runtime',
 ];
 const snapshotDir = resolve(root, 'docs/public-api');
 const update = process.argv.includes('--update');

@@ -1,20 +1,22 @@
 import { createHash } from 'node:crypto';
 import type { JsonValue, ToolExecutionOutcome, ToolRuntime } from '@aiop/control-contracts';
-import type { InteractionRepository, ToolLedgerRepository } from '@aiop/agent-runtime-core';
 import {
   GovernedToolFactory,
   ResourceConcurrencyController,
   type GovernedToolDefinition,
   type ResourceConcurrency,
+  type ToolApprovalClaim,
+  type ToolInteractionStore,
+  type ToolLedgerStore,
 } from '@aiop/pi-runtime';
-import type { RunAgentOptions } from '../run-types.js';
-import { logger } from '../../logger.js';
+import type { RunAgentOptions } from '../agent/run-types.js';
+import { logger } from '../logger.js';
 
 export function createAIOPToolRuntime(
   options: RunAgentOptions,
-  ledger: ToolLedgerRepository,
+  ledger: ToolLedgerStore,
   concurrency: ResourceConcurrency,
-  interactions?: InteractionRepository,
+  interactions?: ToolInteractionStore,
   commitLedgerUpdates = false,
 ): ToolRuntime {
   const durableGovernance = Boolean(interactions);
@@ -167,7 +169,7 @@ export function createCompatibilityAIOPToolRuntime(options: RunAgentOptions): To
   );
 }
 
-class MemoryToolLedger implements ToolLedgerRepository {
+class MemoryToolLedger implements ToolLedgerStore {
   private readonly records = new Map<string, import('@aiop/control-contracts').DurableToolLedgerUpdate>();
 
   async putIfAbsent(record: import('@aiop/control-contracts').DurableToolLedgerUpdate): Promise<boolean> {
@@ -185,7 +187,7 @@ class MemoryToolLedger implements ToolLedgerRepository {
     this.records.set(ledgerKey(record), structuredClone(record));
   }
 
-  async claimPendingApproval(input: import('@aiop/agent-runtime-core').ToolLedgerApprovalClaim): Promise<boolean> {
+  async claimPendingApproval(input: ToolApprovalClaim): Promise<boolean> {
     const key = ledgerKey(input);
     const current = this.records.get(key);
     if (!current || current.status !== 'pending_approval' || current.attemptId !== input.attemptId
@@ -198,7 +200,7 @@ class MemoryToolLedger implements ToolLedgerRepository {
 }
 
 async function commitLedger(
-  ledger: ToolLedgerRepository,
+  ledger: ToolLedgerStore,
   update: import('@aiop/control-contracts').DurableToolLedgerUpdate,
 ): Promise<void> {
   const existing = await ledger.get(update);

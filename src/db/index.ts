@@ -35,7 +35,13 @@ export function createKysely(pool: Pool): Kysely<Database> {
  * 已应用记录在 schema_migrations 表（幂等、可演进，对既有库追加 ALTER）。
  */
 export async function runMigrations(pool: Pool): Promise<void> {
-  const conn = pool.promise();
+  const conn = await pool.promise().getConnection();
+  const lockName = 'aiop:schema-migrations';
+  try {
+  const [lockRows] = await conn.query('SELECT GET_LOCK(?, ?) AS acquired', [lockName, 60]);
+  if (Number((lockRows as Array<{ acquired: number | null }>)[0]?.acquired) !== 1) {
+    throw new Error('Timed out waiting for the schema migration lock');
+  }
   await conn.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
     version    INT          NOT NULL,
     name       VARCHAR(128) NOT NULL,
@@ -64,6 +70,12 @@ export async function runMigrations(pool: Pool): Promise<void> {
     count++;
   }
   log.info({ applied: count, total: files.length }, 'migrations up to date');
+  } finally {
+    await conn.query('SELECT RELEASE_LOCK(?) AS released', [lockName]).catch((error) => {
+      log.warn({ err: String(error) }, 'failed to release schema migration lock');
+    });
+    conn.release();
+  }
 }
 
 /** 按配置创建 Store：有 MySQL 则迁移+MysqlStore，否则回落 MemoryStore。 */

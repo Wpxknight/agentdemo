@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { MemoryRuntimeStore } from '../packages/agent-runtime-core/src/memory-store.js';
-import type { RunRecord, TurnSnapshot } from '../packages/agent-runtime-core/src/store.js';
+import {
+  MemoryRuntimeStore,
+  type RuntimeRunRecord as RunRecord,
+  type RuntimeTurnSnapshot as TurnSnapshot,
+} from '@aiop/pi-runtime';
 
 const identity = { tenantId: 'tenant-a', runId: 'run-a' } as const;
 

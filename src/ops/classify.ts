@@ -1,4 +1,4 @@
-import type { JsonValue } from '../model/types.js';
+import type { JsonValue } from '../llm/types.js';
 
 /** 只读类 verb（不改变集群状态）。 */
 const READ_VERBS = new Set([

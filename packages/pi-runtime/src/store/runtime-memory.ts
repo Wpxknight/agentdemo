@@ -12,7 +12,7 @@ import type {
   ToolLedgerRecord,
   TurnCommit,
   TurnSnapshot,
-} from './store.js';
+} from './runtime-spi.js';
 
 interface MemoryState {
   runs: Map<string, RunRecord>;
@@ -232,7 +232,7 @@ export class MemoryRuntimeStore implements RuntimeStore {
       if (!this.state.ledger.has(key)) throw new Error(`Tool ledger record not found: ${key}`);
       this.state.ledger.set(key, clone(record));
     },
-    claimPendingApproval: async (input: import('./store.js').ToolLedgerApprovalClaim): Promise<boolean> => {
+    claimPendingApproval: async (input: import('./runtime-spi.js').ToolLedgerApprovalClaim): Promise<boolean> => {
       const key = ledgerKey(input);
       const current = this.state.ledger.get(key);
       if (!current || current.status !== 'pending_approval' || current.attemptId !== input.attemptId

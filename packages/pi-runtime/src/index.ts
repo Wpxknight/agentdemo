@@ -22,6 +22,20 @@ export * from './store/mysql.js';
 export * from './store/pi-session-mysql.js';
 export * from './store/session-stats.js';
 export * from './store/session-id.js';
+export type {
+  InteractionRepository,
+  InteractionRecord,
+  RuntimeStore,
+  RuntimeTransaction,
+  ToolLedgerApprovalClaim,
+  ToolLedgerRepository,
+} from './store/runtime-spi.js';
+export type {
+  RunRecord as RuntimeRunRecord,
+  TurnSnapshot as RuntimeTurnSnapshot,
+} from './store/runtime-spi.js';
+export * from './store/runtime-memory.js';
+export * from './store/runtime-mysql.js';
 export * from './run/attempt.js';
 export * from './run/cancellation.js';
 export * from './run/event-stream.js';
@@ -30,4 +44,5 @@ export * from './run/lease.js';
 export * from './run/limits.js';
 export * from './run/manager.js';
 export * from './run/mysql-assembly.js';
+export * from './run/memory-assembly.js';
 export * from './run/recovery.js';

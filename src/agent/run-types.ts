@@ -1,4 +1,4 @@
-import type { ChatModel, JsonValue, Msg, StreamEvent, ToolContentBlock, ToolDef } from '../model/types.js';
+import type { ChatModel, JsonValue, Msg, StreamEvent, ToolContentBlock, ToolDef } from '../llm/types.js';
 import type { PolicyMiddleware } from './policy.js';
 import type { ToolContext, ToolRegistry } from './tools.js';
 import type { ApprovalGate } from './approval.js';

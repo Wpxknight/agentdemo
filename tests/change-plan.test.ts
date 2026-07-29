@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { PlanApprovalState, parseChangePlan, renderChangePlan } from '../src/agent/plan.js';
 import { buildChangePlanTool } from '../src/tools/change-plan.js';
 import type { ChangePlan } from '../src/agent/plan.js';
-import type { JsonValue } from '../src/model/types.js';
+import type { JsonValue } from '../src/llm/types.js';
 
 const valid = {
   summary: '扩容 aiop-server',

@@ -1,5 +1,5 @@
 import { posix } from 'node:path';
-import type { JsonValue, ToolResult } from '../model/types.js';
+import type { JsonValue, ToolResult } from '../llm/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import type { SandboxManagerLike } from '@aiop/sandbox-runtime';
 import { isSandboxAcquirer } from '@aiop/sandbox-runtime';

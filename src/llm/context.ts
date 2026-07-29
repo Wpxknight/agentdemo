@@ -1,4 +1,4 @@
-import type { Msg, ToolContentBlock } from '../model/types.js';
+import type { Msg, ToolContentBlock } from './types.js';
 
 /**
  * 上下文管理：在发送给模型前把历史裁剪 / 压缩到 token 预算内，避免超出模型上下文窗口（400）。

@@ -3,7 +3,7 @@ import { createReadStream } from 'node:fs';
 import { cp, link, mkdir, open, readdir, readFile, rename, rm, stat, statfs, writeFile } from 'node:fs/promises';
 import { dirname, join, posix, relative, resolve, sep } from 'node:path';
 import { logger } from '../logger.js';
-import type { JsonValue, ToolResult } from '../model/types.js';
+import type { JsonValue, ToolResult } from '../llm/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import { isAdminRole } from '../auth/rbac.js';
 import { NodeExecutionEnv } from '@earendil-works/pi-agent-core/node';

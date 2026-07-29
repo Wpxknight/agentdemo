@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { logger } from '../logger.js';
 import { assertPublicUrl } from '../net/ssrf.js';
-import type { ToolCall } from '../model/types.js';
+import type { ToolCall } from '../llm/types.js';
 import type { ToolContext } from './tools.js';
 
 const log = logger.child({ mod: 'hooks' });

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { ToolCall } from '../model/types.js';
+import type { ToolCall } from '../llm/types.js';
 import type { ToolContext } from './tools.js';
 
 export interface ApprovalRequest {

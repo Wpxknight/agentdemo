@@ -1,9 +1,9 @@
-import type { Msg } from '../model/types.js';
+import type { Msg } from '../llm/types.js';
 import type { AuditEvent, AuditSink } from '../audit/sink.js';
 import type { AuthProviderKind, Role, RequestContext, Tenant, User, UserStatus } from '../auth/types.js';
 import type { McpServerConfig } from '@aiop/mcp-runtime';
-import type { ToolResult } from '../model/types.js';
-import type { RuntimeStore } from '@aiop/agent-runtime-core';
+import type { ToolResult } from '../llm/types.js';
+import type { RuntimeStore } from '@aiop/pi-runtime';
 
 export interface LlmSettings {
   id: string;

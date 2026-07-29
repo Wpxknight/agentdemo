@@ -1,4 +1,4 @@
-import type { JsonValue, ToolCall, ToolDef } from '../model/types.js';
+import type { JsonValue, ToolCall, ToolDef } from '../llm/types.js';
 import { parseKubectlArgs, classifyKubectl, positionals } from '../ops/classify.js';
 
 /**
