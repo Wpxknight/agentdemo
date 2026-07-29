@@ -733,7 +733,12 @@ function productInteractionBaseMatches(
     && payload.userId === (interaction.userId ?? null)
     && payload.sessionId === (interaction.sessionId ?? '')
     && payload.runId === interaction.runId
-    && payload.createdAt === interaction.createdAt.toISOString();
+    && payload.createdAt === interactionDateIso(interaction.createdAt);
+}
+
+function interactionDateIso(value: Date | string): string | undefined {
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
 }
 
 function productPlanQuestionsMatch(questions: JsonValue, plan: JsonValue): boolean {

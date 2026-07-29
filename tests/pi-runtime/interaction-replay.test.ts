@@ -8,7 +8,7 @@ import {
   type Model,
   type SimpleStreamOptions,
 } from '@earendil-works/pi-ai';
-import { InMemorySessionRepo } from '@earendil-works/pi-agent-core';
+import { InMemorySessionRepo, InMemorySessionStorage, Session, type SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import type { DurableInteractionUpdate } from '@aiop/control-contracts';
 import {
   GovernedToolFactory,
@@ -19,6 +19,7 @@ import {
   createMemoryDurablePiRuntime,
   PiAgentSessionFactory,
 } from '../../packages/pi-runtime/src/index.js';
+import { digestToolValue } from '../../packages/pi-runtime/src/tools/ledger.js';
 
 const model: Model<'pi-interaction-replay-test'> = {
   id: 'pi-interaction-replay-test', name: 'Pi Interaction Replay Test',
@@ -30,6 +31,96 @@ const model: Model<'pi-interaction-replay-test'> = {
 const identity = { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] } as const;
 
 describe('durable Pi interaction replay', () => {
+  it('replays a persisted product plan after interaction dates pass through entry JSON', async () => {
+    const createdAt = new Date('2026-07-30T08:09:10.123Z');
+    const plan = { summary: 'Deploy staging' };
+    const interactionId = 'plan-persisted-a';
+    const toolCallId = 'call-plan-persisted-a';
+    const toolName = 'submit_change_plan';
+    const ledgerUpdate = {
+      tenantId: identity.tenantId, runId: 'run-persisted-plan', attemptId: 'attempt-a', turnNo: 1,
+      logicalCallId: toolCallId, toolCallId, toolName, argsDigest: digestToolValue(plan),
+      capability: 'retryable_write' as const, idempotencyKey: 'key-persisted-plan',
+      approvedInteractionId: interactionId, status: 'pending_approval' as const,
+      createdAt, updatedAt: createdAt,
+    };
+    const interactionUpdate = {
+      tenantId: identity.tenantId, runId: 'run-persisted-plan', id: interactionId,
+      userId: identity.actorId, sessionId: 'session-persisted-plan', attemptId: 'attempt-a', turnNo: 1,
+      kind: 'plan' as const, toolCallId, status: 'pending' as const,
+      payload: {
+        id: interactionId, tenantId: identity.tenantId, userId: identity.actorId,
+        sessionId: 'session-persisted-plan', runId: 'run-persisted-plan', createdAt: createdAt.toISOString(),
+        questions: [{
+          question: '请审批变更方案：Deploy staging', header: '变更审批',
+          options: [{ label: '批准' }, { label: '拒绝' }],
+        }],
+        plan,
+      },
+      createdAt,
+    };
+    const entries: SessionTreeEntry[] = [
+      {
+        type: 'message', id: 'assistant-persisted-plan', parentId: null, timestamp: createdAt.toISOString(),
+        message: {
+          role: 'assistant', content: [{ type: 'toolCall', id: toolCallId, name: toolName, arguments: plan }],
+          api: model.api, provider: model.provider, model: model.id, stopReason: 'toolUse', timestamp: createdAt.getTime(),
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        },
+      },
+      {
+        type: 'message', id: 'waiting-persisted-plan', parentId: 'assistant-persisted-plan',
+        timestamp: createdAt.toISOString(),
+        message: {
+          role: 'toolResult', toolCallId, toolName, content: [{ type: 'text', text: 'tool waiting for plan' }],
+          details: {
+            version: 1, kind: 'governed_tool_outcome',
+            outcome: {
+              kind: 'waiting', reason: 'plan', interactionId,
+              ledgerUpdates: [ledgerUpdate], interactionUpdates: [interactionUpdate],
+            },
+          },
+          isError: true, timestamp: createdAt.getTime(),
+        },
+      },
+    ];
+    const persistedEntries = JSON.parse(JSON.stringify(entries)) as SessionTreeEntry[];
+    const persistedEntry = persistedEntries[1];
+    if (persistedEntry?.type !== 'message' || persistedEntry.message.role !== 'toolResult') {
+      throw new Error('persisted waiting tool result is missing');
+    }
+    const persistedDetails = persistedEntry.message.details as {
+      outcome: { interactionUpdates: Array<{ createdAt: unknown }> };
+    };
+    expect(persistedDetails.outcome.interactionUpdates[0]?.createdAt).toBe(createdAt.toISOString());
+    const persistedSession = new Session(new InMemorySessionStorage({
+      metadata: { id: 'session-persisted-plan', createdAt: createdAt.toISOString() }, entries: persistedEntries,
+    }));
+    const execute = vi.fn(async () => ({ callId: toolCallId, content: 'plan resolved: true' }));
+    const tools = bridgeGovernedTools([{
+      definition: {
+        name: toolName, description: 'Submit plan', capability: 'retryable_write',
+        inputSchema: {
+          type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'], additionalProperties: false,
+        },
+      },
+      execute,
+    }]);
+    const session = await new PiAgentSessionFactory({
+      repository: { open: async () => persistedSession } as never, models: createModels(), model, tools,
+    }).load({
+      metadata: { id: 'session-persisted-plan', createdAt: createdAt.toISOString() },
+      initialMessage: { role: 'user', text: 'resume' }, events: testEvents('run-persisted-plan'),
+    });
+
+    await expect(session.replayInteraction({
+      interactionId, kind: 'plan', toolCallId, value: true,
+    })).resolves.toBeUndefined();
+    expect(execute).toHaveBeenCalledOnce();
+    await session.close();
+  });
+
   it.each([
     {
       kind: 'approval' as const, value: true, expectedContent: 'deployment completed',
