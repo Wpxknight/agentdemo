@@ -3,6 +3,7 @@ import type { Usage } from '@earendil-works/pi-ai';
 import type { RequestContext } from '../auth/types.js';
 import type { AgentRunUsage, Store } from '../db/store.js';
 import type { JsonValue, Msg, ToolContentBlock } from '../model/types.js';
+import type { PiSessionStore } from '@aiop/pi-runtime';
 
 export interface ProjectPiSessionInput {
   ctx: RequestContext;
@@ -22,6 +23,30 @@ export class PiSessionProjection {
     await this.store.replaceMessages(input.ctx, input.sessionId, messages);
     await this.store.touchSession(input.ctx, input.sessionId, { updatedAt: new Date() });
   }
+}
+
+export async function projectCommittedPiSession(input: {
+  store: Pick<Store, 'replaceMessages' | 'touchSession'>;
+  sessions: Pick<PiSessionStore, 'get' | 'listEntries'>;
+  ctx: RequestContext;
+  sessionId: string;
+  durationMs?: number;
+}): Promise<boolean> {
+  const session = await input.sessions.get(input.ctx.tenantId, input.sessionId);
+  if (!session) return false;
+  const records = await input.sessions.listEntries(input.ctx.tenantId, input.sessionId, { committedOnly: true });
+  const entries = records.map((record) => record.entry);
+  const finalAssistant = entries.findLast((entry) => entry.type === 'message' && entry.message.role === 'assistant');
+  await new PiSessionProjection(input.store).project({
+    ctx: input.ctx,
+    sessionId: input.sessionId,
+    entries,
+    committedLeafId: session.committedLeafId,
+    ...(finalAssistant && Number.isFinite(input.durationMs) && input.durationMs! >= 0
+      ? { assistantDurationMs: { [finalAssistant.id]: input.durationMs! } }
+      : {}),
+  });
+  return true;
 }
 
 export function projectPiUsage(usage: Pick<Usage, 'input' | 'output' | 'cacheRead' | 'cacheWrite' | 'cost'>): AgentRunUsage {

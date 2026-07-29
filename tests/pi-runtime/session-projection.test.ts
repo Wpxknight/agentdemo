@@ -3,6 +3,7 @@ import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import { MemoryStore } from '../../src/db/memory.js';
 import {
   PiSessionProjection,
+  projectCommittedPiSession,
   projectPiUsage,
 } from '../../src/agent/projections.js';
 import type { RequestContext } from '../../src/auth/types.js';
@@ -110,6 +111,44 @@ describe('Pi session projection', () => {
       cacheReadTokens: 3,
       cacheCreationTokens: 2,
       costUsd: 0.28,
+    });
+  });
+
+  it('loads only committed entries from the Pi store and preserves terminal duration', async () => {
+    const store = new MemoryStore();
+    const all = entries();
+    const source = {
+      async get() {
+        return {
+          tenantId: ctx.tenantId,
+          sessionId: 'session-a',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          currentLeafId: 'uncommitted',
+          committedLeafId: 'assistant-1',
+        };
+      },
+      async listEntries(_tenantId: string, _sessionId: string, options?: { committedOnly?: boolean }) {
+        expect(options).toEqual({ committedOnly: true });
+        return all.slice(0, 2).map((entry, index) => ({
+          tenantId: ctx.tenantId,
+          sessionId: 'session-a',
+          sequence: BigInt(index + 1),
+          entry,
+        }));
+      },
+    };
+
+    await projectCommittedPiSession({
+      store,
+      sessions: source as never,
+      ctx,
+      sessionId: 'session-a',
+      durationMs: 42,
+    });
+
+    expect((await store.listMessages(ctx, 'session-a')).at(-1)).toMatchObject({
+      role: 'assistant', text: 'done', durationMs: 42,
     });
   });
 });

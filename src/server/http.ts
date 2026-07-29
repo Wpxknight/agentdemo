@@ -41,7 +41,7 @@ import {
   type SandboxApiKeyUpdate,
 } from '../sandbox/settings.js';
 import { SessionCommitter } from '../agent/services/session-committer.js';
-import { PiSessionProjection } from '../agent/projections.js';
+import { projectCommittedPiSession } from '../agent/projections.js';
 import { DurableToolLedger } from '../agent/tool-ledger/store.js';
 import { DurableInteractionService } from '../agent/interactions/store.js';
 import {
@@ -2728,6 +2728,7 @@ async function runAgentSse(
 
 async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req: Req, res: Res): Promise<void> {
   const runtime = rt.durableRunRuntime!;
+  const runStartedAt = Date.now();
   const ctx = await requireAuth(rt, req);
   const body = await readJson(req);
   const sessionId = sessionIdFromBody(body);
@@ -2784,18 +2785,13 @@ async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req:
       }
     }
     const result = await handle.result();
-    if (rt.piSessionStore) {
-      const session = await rt.piSessionStore.get(ctx.tenantId, sessionId);
-      if (session) {
-        const records = await rt.piSessionStore.listEntries(ctx.tenantId, sessionId, { committedOnly: true });
-        await new PiSessionProjection(rt.store).project({
-          ctx,
-          sessionId,
-          entries: records.map((record) => record.entry),
-          committedLeafId: session.committedLeafId,
-        });
-      }
-    }
+    if (rt.piSessionStore) await projectCommittedPiSession({
+      store: rt.store,
+      sessions: rt.piSessionStore,
+      ctx,
+      sessionId,
+      durationMs: Math.max(0, Date.now() - runStartedAt),
+    });
     if (result.status === 'cancelled') {
       sse('terminated', { sessionId, runId: result.runId, reason: result.error?.message });
     } else if (result.status === 'failed' || result.status === 'recovery_required') {
