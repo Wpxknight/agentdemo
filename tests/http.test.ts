@@ -78,6 +78,9 @@ function createHttpTestDurableRuntime(
       return {
         runId,
         status: 'running' as const,
+        attempt: async () => ({
+          attemptId: `${runId}:attempt`, workerId: 'http-test-worker', fencingToken: 1n,
+        }),
         events: {
           async *[Symbol.asyncIterator]() {
             const prior = await store.listMessages(ctx, input.sessionId);
@@ -2268,6 +2271,7 @@ describe('HTTP server', () => {
     });
     const resume = vi.fn(async () => ({
       runId, status: 'running' as const,
+      attempt: async () => ({ attemptId: 'approval-attempt', workerId: 'approval-worker', fencingToken: 1n }),
       events: { async *[Symbol.asyncIterator]() {} },
       async result() {
         return {

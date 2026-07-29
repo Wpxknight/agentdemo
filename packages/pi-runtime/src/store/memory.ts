@@ -15,20 +15,37 @@ import { piSessionStorageId } from './session-id.js';
 
 const clone = <T>(value: T): T => structuredClone(value);
 const key = (tenantId: string, id: string): string => `${tenantId}\0${id}`;
-type MutationContext = { active: boolean };
+type MemoryState = {
+  runRecords: Map<string, StoredRun>;
+  attemptsState: Map<string, ProductAttemptRecord>;
+  commits: Map<string, ProductTurnCommit[]>;
+  eventRecords: Map<string, AgentRunEvent[]>;
+  sessionRecords: Map<string, PiSessionRecord>;
+  sessionEntries: Map<string, SessionEntryRecord[]>;
+  inboxMessages: Map<string, RunInboxMessage[]>;
+  interactionRecords: Map<string, DurableInteractionUpdate>;
+  toolLedgerRecords: Map<string, DurableToolLedgerUpdate>;
+};
+type MutationContext = { active: boolean; state?: MemoryState };
 
 export class MemoryRunStore implements DurableProductRunStore {
-  private readonly runRecords = new Map<string, StoredRun>();
-  private readonly attemptsState = new Map<string, ProductAttemptRecord>();
-  private readonly commits = new Map<string, ProductTurnCommit[]>();
-  private readonly eventRecords = new Map<string, AgentRunEvent[]>();
-  private readonly sessionRecords = new Map<string, PiSessionRecord>();
-  private readonly sessionEntries = new Map<string, SessionEntryRecord[]>();
-  private readonly inboxMessages = new Map<string, RunInboxMessage[]>();
-  private readonly interactionRecords = new Map<string, DurableInteractionUpdate>();
-  private readonly toolLedgerRecords = new Map<string, DurableToolLedgerUpdate>();
+  private readonly baseState: MemoryState = {
+    runRecords: new Map(), attemptsState: new Map(), commits: new Map(), eventRecords: new Map(),
+    sessionRecords: new Map(), sessionEntries: new Map(), inboxMessages: new Map(),
+    interactionRecords: new Map(), toolLedgerRecords: new Map(),
+  };
   private transactionTail: Promise<void> = Promise.resolve();
   private readonly mutationContext = new AsyncLocalStorage<MutationContext>();
+
+  private get runRecords(): MemoryState['runRecords'] { return this.currentState().runRecords; }
+  private get attemptsState(): MemoryState['attemptsState'] { return this.currentState().attemptsState; }
+  private get commits(): MemoryState['commits'] { return this.currentState().commits; }
+  private get eventRecords(): MemoryState['eventRecords'] { return this.currentState().eventRecords; }
+  private get sessionRecords(): MemoryState['sessionRecords'] { return this.currentState().sessionRecords; }
+  private get sessionEntries(): MemoryState['sessionEntries'] { return this.currentState().sessionEntries; }
+  private get inboxMessages(): MemoryState['inboxMessages'] { return this.currentState().inboxMessages; }
+  private get interactionRecords(): MemoryState['interactionRecords'] { return this.currentState().interactionRecords; }
+  private get toolLedgerRecords(): MemoryState['toolLedgerRecords'] { return this.currentState().toolLedgerRecords; }
 
   constructor(private readonly now: () => Date = () => new Date()) {}
 
@@ -387,30 +404,15 @@ export class MemoryRunStore implements DurableProductRunStore {
 
   async transaction<T>(work: (tx: DurableProductRunStore) => Promise<T>): Promise<T> {
     return this.lock(async () => {
-      const snapshot = clone({
-        runRecords: this.runRecords,
-        attemptsState: this.attemptsState,
-        commits: this.commits,
-        eventRecords: this.eventRecords,
-        sessionRecords: this.sessionRecords,
-        sessionEntries: this.sessionEntries,
-        inboxMessages: this.inboxMessages,
-        interactionRecords: this.interactionRecords,
-        toolLedgerRecords: this.toolLedgerRecords,
-      });
+      const parentContext = this.mutationContext.getStore();
+      const parentState = this.currentState();
+      const transactionContext: MutationContext = { active: true, state: clone(parentState) };
       try {
-        return await work(this);
-      } catch (error) {
-        restoreMap(this.runRecords, snapshot.runRecords);
-        restoreMap(this.attemptsState, snapshot.attemptsState);
-        restoreMap(this.commits, snapshot.commits);
-        restoreMap(this.eventRecords, snapshot.eventRecords);
-        restoreMap(this.sessionRecords, snapshot.sessionRecords);
-        restoreMap(this.sessionEntries, snapshot.sessionEntries);
-        restoreMap(this.inboxMessages, snapshot.inboxMessages);
-        restoreMap(this.interactionRecords, snapshot.interactionRecords);
-        restoreMap(this.toolLedgerRecords, snapshot.toolLedgerRecords);
-        throw error;
+        const result = await this.mutationContext.run(transactionContext, () => work(this));
+        if (parentContext?.active) restoreState(parentState, transactionContext.state!);
+        return result;
+      } finally {
+        transactionContext.active = false;
       }
     });
   }
@@ -567,6 +569,11 @@ export class MemoryRunStore implements DurableProductRunStore {
       release();
     }
   }
+
+  private currentState(): MemoryState {
+    const context = this.mutationContext.getStore();
+    return context?.active && context.state ? context.state : this.baseState;
+  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -579,6 +586,18 @@ function conflict(message: string): AgentPlatformError {
 
 function canManageRun(identity: { actorId: string; roles: readonly string[] }, actorId: string): boolean {
   return identity.actorId === actorId || identity.roles.includes('tenant_admin') || identity.roles.includes('platform_admin');
+}
+
+function restoreState(target: MemoryState, snapshot: MemoryState): void {
+  restoreMap(target.runRecords, snapshot.runRecords);
+  restoreMap(target.attemptsState, snapshot.attemptsState);
+  restoreMap(target.commits, snapshot.commits);
+  restoreMap(target.eventRecords, snapshot.eventRecords);
+  restoreMap(target.sessionRecords, snapshot.sessionRecords);
+  restoreMap(target.sessionEntries, snapshot.sessionEntries);
+  restoreMap(target.inboxMessages, snapshot.inboxMessages);
+  restoreMap(target.interactionRecords, snapshot.interactionRecords);
+  restoreMap(target.toolLedgerRecords, snapshot.toolLedgerRecords);
 }
 
 function restoreMap<K, V>(target: Map<K, V>, snapshot: Map<K, V>): void {

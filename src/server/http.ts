@@ -45,7 +45,7 @@ import {
   RunCenterService,
 } from '../agent/run-center.js';
 import type { AgentRunRecord, AgentRunStatus, SessionContextUsage } from '../db/store.js';
-import type { AgentRunResult, IdentityContext } from '@aiop/control-contracts';
+import type { AgentRunResult, IdentityContext, RunHandle } from '@aiop/control-contracts';
 import { createAIOPToolRuntime } from '../tools/governance.js';
 import { ResourceConcurrencyController } from '@aiop/pi-runtime';
 
@@ -896,24 +896,25 @@ async function superviseDurableRecovery(
 ): Promise<void> {
   const identity = { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] };
   let expectedLease: { ownerId: string; token: bigint } | undefined;
-  const observeLease = async (): Promise<void> => {
-    const run = await rt.store.durableRunStore().get({ tenantId: ctx.tenantId, runId });
-    if (run?.leaseOwner && run.leaseExpiresAt && run.leaseExpiresAt > new Date()) {
-      expectedLease = { ownerId: run.leaseOwner, token: run.leaseToken };
-    }
-  };
+  let handle: RunHandle | undefined;
+  let drainEvents: Promise<void> | undefined;
+  let resultObserved = false;
   try {
     await bestEffortAppendRecoveryEvent(rt, ctx, runId, 'started');
-    const handle = await rt.durableRunRuntime.resume({
+    handle = await rt.durableRunRuntime.resume({
       identity,
       runId,
       ...(resolution ? { resolution } : {}),
     });
-    await observeLease();
-    for await (const _event of handle.events) {
-      // Recovery is detached from an HTTP response, but its event stream still needs a consumer.
-      if (!expectedLease) await observeLease();
-    }
+    drainEvents = (async () => {
+      for await (const _event of handle!.events) {
+        // Recovery is detached from an HTTP response, but its event stream still needs a consumer.
+      }
+    })();
+    const attempt = await handle.attempt();
+    expectedLease = { ownerId: attempt.workerId, token: attempt.fencingToken };
+    await drainEvents;
+    resultObserved = true;
     const result = await handle.result();
     if (result.status === 'succeeded' || result.status === 'waiting') {
       await bestEffortAppendRecoveryEvent(rt, ctx, runId, 'succeeded', { status: result.status });
@@ -921,10 +922,15 @@ async function superviseDurableRecovery(
     }
     await persistRecoveryFailure(rt, ctx, runId, result.error?.message ?? `Recovery ended with ${result.status}`, expectedLease);
   } catch (err) {
-    await observeLease().catch(() => {});
-    await persistRecoveryFailure(rt, ctx, runId, safeRecoveryError(err), expectedLease).catch((persistError) => {
-      log.error({ error: safeRecoveryError(persistError), runId }, 'durable recovery failure persistence failed');
-    });
+    await drainEvents?.catch(() => {});
+    if (!resultObserved) await handle?.result().catch(() => {});
+    if (expectedLease) {
+      await persistRecoveryFailure(rt, ctx, runId, safeRecoveryError(err), expectedLease).catch((persistError) => {
+        log.error({ error: safeRecoveryError(persistError), runId }, 'durable recovery failure persistence failed');
+      });
+    } else {
+      await bestEffortAppendRecoveryEvent(rt, ctx, runId, 'failed', { error: safeRecoveryError(err) });
+    }
     log.error({ error: safeRecoveryError(err), runId }, 'durable run recovery failed');
   }
 }
@@ -959,7 +965,7 @@ async function persistRecoveryFailure(
   ctx: RequestContext,
   runId: string,
   error: string,
-  expectedLease?: { ownerId: string; token: bigint },
+  expectedLease: { ownerId: string; token: bigint },
 ): Promise<void> {
   const message = safeRecoveryError(error);
   const failedAt = new Date();

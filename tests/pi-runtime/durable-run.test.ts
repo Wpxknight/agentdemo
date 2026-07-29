@@ -300,6 +300,62 @@ describe('MemoryRunStore durable contract', () => {
       tenantId: identity.tenantId, runId: 'escaped-context-run', interactionId: 'rolled-back',
     })).resolves.toBeUndefined();
   });
+
+  it('does not let an escaped nested transaction roll back a later successful mutation', async () => {
+    const store = new MemoryRunStore();
+    let nestedEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { nestedEntered = resolve; });
+    let rejectNested!: () => void;
+    const nestedGate = new Promise<void>((resolve) => { rejectNested = resolve; });
+    const record = (id: string) => ({
+      id, tenantId: identity.tenantId, runId: 'nested-rollback-run', attemptId: 'attempt-a', turnNo: 1,
+      kind: 'approval' as const, status: 'pending' as const, payload: {}, createdAt: new Date(),
+    });
+    let nested!: Promise<void>;
+
+    await store.transaction(async () => {
+      nested = store.transaction(async (tx) => {
+        nestedEntered();
+        await nestedGate;
+        await tx.interactions.put(record('nested-write'));
+        throw new Error('nested rollback');
+      });
+      await entered;
+    });
+
+    await store.interactions.put(record('later-success'));
+    rejectNested();
+
+    await expect(nested).rejects.toThrow('nested rollback');
+    await expect(store.interactions.get({
+      tenantId: identity.tenantId, runId: 'nested-rollback-run', interactionId: 'later-success',
+    })).resolves.toMatchObject({ id: 'later-success' });
+    await expect(store.interactions.get({
+      tenantId: identity.tenantId, runId: 'nested-rollback-run', interactionId: 'nested-write',
+    })).resolves.toBeUndefined();
+  });
+
+  it('does not expose a stale transaction overlay through an escaped read context', async () => {
+    const store = new MemoryRunStore();
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const record = (version: 'stale' | 'current') => ({
+      id: 'overlay-read', tenantId: identity.tenantId, runId: 'overlay-read-run', attemptId: 'attempt-a', turnNo: 1,
+      kind: 'approval' as const, status: 'pending' as const, payload: { version }, createdAt: new Date(),
+    });
+    let escapedRead!: Promise<Awaited<ReturnType<typeof store.interactions.get>>>;
+
+    await store.transaction(async (tx) => {
+      await tx.interactions.put(record('stale'));
+      escapedRead = readGate.then(() => store.interactions.get({
+        tenantId: identity.tenantId, runId: 'overlay-read-run', interactionId: 'overlay-read',
+      }));
+    });
+    await store.interactions.put(record('current'));
+
+    releaseRead();
+    await expect(escapedRead).resolves.toMatchObject({ payload: { version: 'current' } });
+  });
 });
 
 describe('MysqlRunStore durable contract surface', () => {

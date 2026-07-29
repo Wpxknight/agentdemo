@@ -22,6 +22,7 @@ function completedHandle(runId: string): RunHandle {
   return {
     runId,
     status: 'running',
+    attempt: async () => ({ attemptId: 'completed-attempt', workerId: 'completed-worker', fencingToken: 1n }),
     events: { async *[Symbol.asyncIterator]() {} },
     result: async () => ({
       runId, status: 'succeeded',
@@ -216,7 +217,7 @@ describe('mandatory durable Run Center HTTP API', () => {
     await vi.waitFor(async () => {
       expect(resume).toHaveBeenCalledOnce();
       expect(await store.getAgentRun({ tenantId: 'default', userId, role: 'user' }, 'run-user')).toMatchObject({
-        status: 'recovery_required', errorMessage: expect.stringContaining('[redacted]'),
+        status: 'failed', errorMessage: undefined,
       });
       const recovery = (await store.listAgentRunEvents({ tenantId: 'default', userId, role: 'user' }, 'run-user'))
         .filter((event) => event.type === 'recovery');
@@ -226,9 +227,18 @@ describe('mandatory durable Run Center HTTP API', () => {
 
     const drained = vi.fn();
     const result = vi.fn(async () => { throw new Error('password=hunter2 handle failure'); });
-    resume.mockResolvedValueOnce({
-      runId: 'run-user', status: 'running',
-      events: { async *[Symbol.asyncIterator]() { drained(); } }, result,
+    resume.mockImplementationOnce(async (input) => {
+      const claim = await store.durableRunStore().claim({
+        identity: input.identity, runId: input.runId, workerId: 'worker-handle', now: new Date(),
+        leaseTtlMs: 60_000, resume: true,
+      });
+      return {
+        runId: input.runId, status: 'running',
+        attempt: async () => ({
+          attemptId: claim!.attemptId, workerId: 'worker-handle', fencingToken: claim!.fencingToken,
+        }),
+        events: { async *[Symbol.asyncIterator]() { drained(); } }, result,
+      };
     });
     const second = await fetch(`${base}/v1/agent/runs/run-user/resume`, {
       method: 'POST', headers: auth(userToken), body: '{}',
@@ -268,6 +278,9 @@ describe('mandatory durable Run Center HTTP API', () => {
       });
       return {
         runId: input.runId, status: 'running',
+        attempt: async () => ({
+          attemptId: firstClaim!.attemptId, workerId: 'worker-a', fencingToken: firstClaim!.fencingToken,
+        }),
         events: { async *[Symbol.asyncIterator]() { supervisorObservedLease(); await failureGate; } },
         result: async () => { throw new Error('delayed worker-a failure'); },
       };
@@ -303,6 +316,97 @@ describe('mandatory durable Run Center HTTP API', () => {
     await expect(markRecovery.mock.results.at(-1)?.value).resolves.toBe(false);
     await expect(durable.get({ tenantId: 'default', runId: 'run-user' })).resolves.toMatchObject({
       status: 'waiting', waitingReason: 'approval', leaseToken: second!.fencingToken,
+    });
+    markRecovery.mockRestore();
+  });
+
+  it('does not borrow a live winner lease when a losing recovery supervisor fails', async () => {
+    const durable = store.durableRunStore();
+    const markRecovery = vi.spyOn(durable, 'markRecoveryRequired');
+    const startedAt = new Date();
+    await store.updateAgentRun('default', 'run-user', {
+      status: 'failed', waitingReason: null, cancelRequestedAt: null, completedAt: startedAt, updatedAt: startedAt,
+    });
+    let winner!: Awaited<ReturnType<typeof durable.claim>>;
+    resume.mockImplementationOnce(async (input) => {
+      winner = await durable.claim({
+        identity: input.identity, runId: input.runId, workerId: 'worker-b', now: startedAt,
+        leaseTtlMs: 60_000, resume: true,
+      });
+      return {
+        runId: input.runId, status: 'running',
+        attempt: async () => { throw new Error('loser did not claim'); },
+        events: { async *[Symbol.asyncIterator]() {} },
+        result: async () => { throw new Error('losing resume failed'); },
+      } as RunHandle;
+    });
+
+    const response = await fetch(`${base}/v1/agent/runs/run-user/resume`, {
+      method: 'POST', headers: auth(userToken), body: '{}',
+    });
+    expect(response.status).toBe(202);
+    await vi.waitFor(async () => {
+      const recovery = (await store.listAgentRunEvents({ tenantId: 'default', userId, role: 'user' }, 'run-user'))
+        .filter((event) => event.type === 'recovery');
+      expect(recovery.at(-1)?.status).toBe('failed');
+    });
+
+    expect(markRecovery).not.toHaveBeenCalled();
+    await expect(durable.get({ tenantId: 'default', runId: 'run-user' })).resolves.toMatchObject({
+      status: 'running', leaseOwner: 'worker-b', leaseToken: winner!.fencingToken,
+    });
+    await durable.complete({
+      tenantId: 'default', runId: 'run-user', attemptId: winner!.attemptId, fencingToken: winner!.fencingToken,
+      status: 'failed', usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      completedAt: new Date(startedAt.getTime() + 1),
+    });
+    markRecovery.mockRestore();
+  });
+
+  it('does not mark recovery without a fence after a winner clears its lease for waiting', async () => {
+    const durable = store.durableRunStore();
+    const markRecovery = vi.spyOn(durable, 'markRecoveryRequired');
+    const startedAt = new Date();
+    await store.updateAgentRun('default', 'run-user', {
+      status: 'failed', waitingReason: null, cancelRequestedAt: null, completedAt: startedAt, updatedAt: startedAt,
+    });
+    let supervisorStarted!: () => void;
+    const supervisorEntered = new Promise<void>((resolve) => { supervisorStarted = resolve; });
+    let releaseFailure!: () => void;
+    const failureGate = new Promise<void>((resolve) => { releaseFailure = resolve; });
+    resume.mockResolvedValueOnce({
+      runId: 'run-user', status: 'running',
+      attempt: async () => { throw new Error('loser did not claim'); },
+      events: { async *[Symbol.asyncIterator]() { supervisorStarted(); await failureGate; } },
+      result: async () => { throw new Error('losing resume failed after winner waited'); },
+    } as RunHandle);
+
+    const response = await fetch(`${base}/v1/agent/runs/run-user/resume`, {
+      method: 'POST', headers: auth(userToken), body: '{}',
+    });
+    expect(response.status).toBe(202);
+    await supervisorEntered;
+    const winner = await durable.claim({
+      identity: { tenantId: 'default', actorId: userId, roles: ['user'] }, runId: 'run-user',
+      workerId: 'worker-b', now: startedAt, leaseTtlMs: 60_000, resume: true,
+    });
+    const turnNo = ((await durable.get({ tenantId: 'default', runId: 'run-user' }))?.lastTurnNo ?? 0) + 1;
+    await durable.commitTurn({
+      tenantId: 'default', runId: 'run-user', attemptId: winner!.attemptId, turnNo,
+      fencingToken: winner!.fencingToken, checkpoint: {}, events: [], status: 'waiting', waitingReason: 'approval',
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      committedAt: new Date(startedAt.getTime() + 1),
+    });
+    releaseFailure();
+
+    await vi.waitFor(async () => {
+      const recovery = (await store.listAgentRunEvents({ tenantId: 'default', userId, role: 'user' }, 'run-user'))
+        .filter((event) => event.type === 'recovery');
+      expect(recovery.at(-1)?.status).toBe('failed');
+    });
+    expect(markRecovery).not.toHaveBeenCalled();
+    await expect(durable.get({ tenantId: 'default', runId: 'run-user' })).resolves.toMatchObject({
+      status: 'waiting', waitingReason: 'approval', leaseToken: winner!.fencingToken,
     });
     markRecovery.mockRestore();
   });

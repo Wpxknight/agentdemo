@@ -215,10 +215,16 @@ export interface AgentRunResult {
     usage: AgentRunUsage;
     error?: AgentPlatformErrorData;
 }
+export interface RunExecutionAttempt {
+    attemptId: string;
+    workerId: string;
+    fencingToken: bigint;
+}
 export interface RunHandle {
     runId: string;
     status: AgentRunStatus;
     events: AsyncIterable<AgentRunEvent>;
+    attempt(): Promise<RunExecutionAttempt>;
     result(): Promise<AgentRunResult>;
 }
 /**

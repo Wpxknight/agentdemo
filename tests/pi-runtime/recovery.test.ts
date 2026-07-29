@@ -100,6 +100,7 @@ describe('fault recovery boundaries', () => {
     });
     const identity = { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] } as const;
     const first = await manager.resume({ identity, runId: 'run-duplicate' });
+    await expect(first.attempt()).resolves.toMatchObject({ workerId: 'worker-a', fencingToken: 1n });
     await expect(manager.resume({ identity, runId: 'run-duplicate' }))
       .rejects.toMatchObject({ code: 'RUN_STATE_CONFLICT' });
     release();

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { AgentPlatformError } from '@aiop/control-contracts';
 import type {
   AgentInputMessage, AgentRunEvent, AgentRunResult, AgentRunUsage, AppendRunMessageInput, CancelRunInput,
-  AgentPlatformErrorData, DurableInteractionUpdate, DurableRunRuntime, DurableToolLedgerUpdate, RunHandle,
+  AgentPlatformErrorData, ClaimedRun, DurableInteractionUpdate, DurableRunRuntime, DurableToolLedgerUpdate, RunHandle,
   StartRunInput, ResumeRunInput,
 } from '@aiop/control-contracts';
 import type { SessionMetadata, SessionTreeEntry } from '@earendil-works/pi-agent-core';
@@ -122,21 +122,33 @@ export class DurableRunManager implements DurableRunRuntime {
     let resolveResult!: (result: AgentRunResult) => void;
     let rejectResult!: (error: unknown) => void;
     const result = new Promise<AgentRunResult>((resolve, reject) => { resolveResult = resolve; rejectResult = reject; });
-    const execution = this.execute(identity, runId, initialMessage, resume, loadCommittedSession, signal, stream, interactionResolution)
-      .then(resolveResult, rejectResult).finally(() => { stream.close(); this.executions.delete(key); });
-    void execution;
-    return { runId, status: 'running', events: stream, result: () => result };
-  }
-
-  private async execute(
-    identity: StartRunInput['identity'], runId: string, initialMessage: AgentInputMessage, resume: boolean,
-    loadCommittedSession: boolean, externalSignal: AbortSignal | undefined, stream: AsyncEventStream<AgentRunEvent>,
-    interactionResolution?: ResumeRunInput['resolution'],
-  ): Promise<AgentRunResult> {
-    const claimed = await this.options.store.claim({
+    const claim = this.options.store.claim({
       identity, runId, workerId: this.workerId, now: this.now(), leaseTtlMs: this.leaseTtlMs, resume,
       resolution: interactionResolution,
     });
+    const execution = this.execute(
+      identity, runId, initialMessage, loadCommittedSession, signal, stream, claim, interactionResolution,
+    )
+      .then(resolveResult, rejectResult).finally(() => { stream.close(); this.executions.delete(key); });
+    void execution;
+    return {
+      runId, status: 'running', events: stream,
+      attempt: async () => {
+        const claimed = await claim;
+        if (!claimed) throw new Error('Run is not claimable');
+        return { attemptId: claimed.attemptId, workerId: this.workerId, fencingToken: claimed.fencingToken };
+      },
+      result: () => result,
+    };
+  }
+
+  private async execute(
+    identity: StartRunInput['identity'], runId: string, initialMessage: AgentInputMessage,
+    loadCommittedSession: boolean, externalSignal: AbortSignal | undefined, stream: AsyncEventStream<AgentRunEvent>,
+    claim: Promise<ClaimedRun | null>,
+    interactionResolution?: ResumeRunInput['resolution'],
+  ): Promise<AgentRunResult> {
+    const claimed = await claim;
     if (!claimed) throw new Error('Run is not claimable');
     const storedRun = await this.options.store.get({ tenantId: identity.tenantId, runId });
     const turnNo = nextTurnNo(storedRun?.lastTurnNo ?? 0);

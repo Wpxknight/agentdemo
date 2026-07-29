@@ -612,17 +612,18 @@ import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import type { ClaimInboxInput, ConsumeInboxInput, DurableRunStore, EnqueueInboxInput, PiSessionRecord, RunInboxMessage, SessionEntryRecord, StoredRun, DurableProductRunStore, ProductAttemptRecord, ProductTurnCommit } from './types.js';
 export declare class MemoryRunStore implements DurableProductRunStore {
     private readonly now;
-    private readonly runRecords;
-    private readonly attemptsState;
-    private readonly commits;
-    private readonly eventRecords;
-    private readonly sessionRecords;
-    private readonly sessionEntries;
-    private readonly inboxMessages;
-    private readonly interactionRecords;
-    private readonly toolLedgerRecords;
+    private readonly baseState;
     private transactionTail;
     private readonly mutationContext;
+    private get runRecords();
+    private get attemptsState();
+    private get commits();
+    private get eventRecords();
+    private get sessionRecords();
+    private get sessionEntries();
+    private get inboxMessages();
+    private get interactionRecords();
+    private get toolLedgerRecords();
     constructor(now?: () => Date);
     create(input: Parameters<DurableRunStore['create']>[0]): Promise<StoredRun & {
         sessionCreated: boolean;
@@ -755,6 +756,7 @@ export declare class MemoryRunStore implements DurableProductRunStore {
     private hasSessionEntry;
     private reachableEntryIds;
     private lock;
+    private currentState;
 }
 
 // file: store/mysql.d.ts
