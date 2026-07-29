@@ -1,156 +1,85 @@
 # HTTP API 与 Web 设计
 
+本文描述当前 Pi-only Durable Run 的 HTTP/SSE 与 React Web 行为。
+
 ## 1. HTTP 服务
 
-`src/server/http.ts` 使用 Node.js HTTP Server 实现静态资源、健康检查、认证回调、JSON API、文件下载和 Agent SSE。没有引入 Express/Fastify 路由层。
-
-~~~mermaid
-flowchart TB
-  Browser[React Web]
-  HTTP[Node HTTP Server]
-  Auth[Auth Context]
-  API[JSON API Handlers]
-  SSE[Agent SSE Handler]
-  Runtime[Runtime Services]
-  Static[Web dist]
-  Download[Download Store]
-
-  Browser --> HTTP
-  HTTP --> Static
-  HTTP --> Auth
-  Auth --> API
-  Auth --> SSE
-  API --> Runtime
-  SSE --> Runtime
-  HTTP --> Download
-~~~
-
-`/healthz` 用于存活探针，`/readyz` 用于就绪探针。Web 资产由 Server 返回或由部署中的 Web 容器反向代理。
-
-## 2. API 分组
+`src/server/http.ts` 使用 Node.js HTTP Server 提供静态资源、健康检查、认证回调、JSON API、文件下载和 Agent SSE。精确方法、路径和 DTO 以该文件、`web/src/api.ts` 与 HTTP tests 为准。
 
 主要接口族：
 
 | 分组 | 能力 |
 | --- | --- |
-| Auth | Local 登录、OIDC 登录与 callback、AIOS exchange、当前用户 |
-| Sessions | 创建、列表、消息、上下文/用量、追加、终止、删除 |
-| Agent | SSE 执行、pending interaction、approval/question/plan 解析 |
-| Runs | 运行中心列表、详情、事件、取消、恢复 |
-| Skills | 列表、文件树、导入、启停、共享、删除 |
-| MCP | Server 列表、新增、删除、重连、工具测试 |
-| Schedule | 任务 CRUD、启停、立即运行、运行记录 |
-| Sandbox | 实例、Profile、截图、会话回收、模板刷新 |
-| Settings | LLM、Scheduler、Sandbox、MCP 等租户/平台设置 |
-| Admin | 用户、租户、状态和生命周期 |
-| Files | 短期能力 URL 下载 |
-| Audit/Tools | 审计查询和当前工具信息 |
+| Auth | Local、OIDC、AIOS exchange 与当前用户 |
+| Sessions | 会话、消息、上下文/用量、append、terminate |
+| Agent | 创建 Durable Pi Run 与 SSE 事件 |
+| Runs | 列表、详情、事件 replay、取消、恢复 |
+| Interactions | approval/question/plan 查询与解析 |
+| Skills/MCP/Sandbox | 产品扩展与运行设置 |
+| Schedule | 任务 CRUD、Fire 与 Run 记录 |
+| Admin/Settings/Audit | 多租户控制面 |
 
-精确方法、路径和响应体以 `src/server/http.ts` 与 `web/src/api.ts` 为事实源。
+`/healthz` 用于存活探针，`/readyz` 用于就绪探针。staging 的 Web 容器把 API/SSE 反向代理到同 Pod backend。
 
-## 3. Agent SSE 时序
+## 2. Agent SSE 与 Durable Run
 
-~~~mermaid
+```mermaid
 sequenceDiagram
   actor U as User
   participant W as Web
   participant H as HTTP
-  participant S as Store
-  participant A as Agent Runtime
-  participant M as Model and Tools
+  participant R as Durable Pi Runtime
+  participant D as Durable Store
 
   U->>W: send message
-  W->>H: authenticated POST
-  H->>S: create or touch session and load history
-  H->>A: run with AbortSignal
-  A->>M: stream execution
-  loop events
-    M-->>A: neutral event
-    A-->>H: StreamEvent
-    H-->>W: SSE event
+  W->>H: authenticated POST /v1/agent
+  H->>R: create Run and Attempt
+  R->>D: persist ordered events
+  loop live events
+    R-->>H: durable event
+    H-->>W: SSE projection
   end
-  alt success
-    A-->>H: result
-    H->>S: commit success and usage
-  else failure or terminate
-    H->>S: commit partial output and reason
-    H-->>W: error or stop event
-  end
-~~~
+  R->>D: commit terminal state and Pi leaf
+  H-->>W: done / terminated / error
+```
 
-客户端断开、终止接口或 Agent Run 取消会触发 AbortSignal。SSE 已经发送不代表最终消息已持久化，前端需等待终止事件或重新读取会话。
+SSE 客户端断开只会 detach 响应；HTTP handler 停止向已销毁 response 写数据，但 Durable Run、Pi Session 和事件持久化继续执行。断开本身不会请求取消，也不会触发 Agent AbortSignal。
 
-## 4. Web 页面结构
+只有显式 session terminate、Run cancel、deadline、shutdown 或 durable fencing 才进入取消/中止语义。断线客户端可通过 `GET /v1/agent/runs/{runId}/events`，结合 `Last-Event-ID` 或 `?after=<sequence>` 补发持久事件。
 
-React 应用的一级页面：
+对应行为由 `tests/http.test.ts` 中 “detaches a closed SSE response while the durable run continues and remains replayable” 锁定。
 
-- Chat：会话历史、Markdown 消息、工具状态、Sandbox 终端和浏览器预览。
-- Runs：Agent Run 筛选、详情、节点时间线、Interaction、Tool Ledger、取消与恢复。
-- Skills：Skill 列表、文件树、导入和共享管理。
-- MCP：连接状态、Server CRUD、重连和工具测试。
-- Schedule：任务与运行记录。
-- Sandbox：运行实例和模板/Profile。
-- Users：管理员用户生命周期。
-- Settings：LLM、Scheduler、Sandbox 和用户目录等设置。
+## 3. Append、取消与恢复
 
-~~~mermaid
-flowchart LR
-  App[App]
-  Nav[Sidebar Navigation]
-  Chat[Chat Workspace]
-  Runs[Run Center]
-  Ext[Skills and MCP]
-  Ops[Schedule and Sandbox]
-  Admin[Users and Settings]
+- 活跃同 Worker Run 可由 Pi `steer`/`followUp` 接收 append。
+- 跨 Worker append 写入 durable inbox，由当前 lease owner 领取。
+- terminate/cancel 是持久状态，不依赖原 SSE 连接仍存在。
+- recover 创建受 fencing 保护的新 Attempt；未知非幂等副作用仍保持 `recovery_required`。
+- Interaction 解析必须匹配 tenant、actor、run、interaction 与 pending state。
 
-  App --> Nav
-  Nav --> Chat
-  Nav --> Runs
-  Nav --> Ext
-  Nav --> Ops
-  Nav --> Admin
-~~~
+## 4. Web 页面
 
-当前 `App.tsx` 集中了多数页面和状态，是现状而非推荐的长期模块边界；运行中心已拆为独立组件。
+React 应用位于 `web/src/`：
 
-## 5. Markdown、Mermaid 与终端
+- Chat：消息、流式事件、Tool 状态、append 与 terminate；
+- Runs：Attempt、Turn、Timeline、Interaction、Ledger、取消与恢复；
+- Skills、MCP、Schedule、Sandbox：扩展与运维入口；
+- Users、Settings：管理控制面。
 
-`react-markdown`、`remark-gfm` 和 `rehype-highlight` 渲染模型输出。Mermaid 由独立组件按需解析和渲染，失败时应展示可读的源文本或错误，而不是破坏整条消息。
+Run Center 组件是 `web/src/components/run-center-page.tsx`。Markdown/Mermaid 渲染属于展示层；Tool output、终端预览和模型文本都不是审计事实。
 
-Sandbox 输出按 stdout、stderr、命令和结果解析；终端预览来自 tool_output SSE，不应被当作审计事实。
+## 5. 前端状态与安全
 
-浏览器截图和文件下载使用受控 API，不直接暴露 Sandbox 内任意路径。
+- 认证失败清理登录态；权限必须由服务端再次校验。
+- 新 SSE 事件应允许旧前端忽略；字段变更同步更新 `web/src/types.ts`、parser 和 HTTP tests。
+- 运行中心从持久化数据恢复，不能只依赖浏览器内存中的 live stream。
+- API error、Tool output、MCP header、Sandbox 路径和 Credential 必须脱敏。
+- 文件下载与截图使用受控 capability URL，不暴露任意文件系统路径。
 
-## 6. 前端状态与错误
+## 6. 测试与源码
 
-- Token 用于认证请求，401 清除登录态。
-- 页面数据按导航按需加载。
-- SSE 状态包括流式文本、思考、工具调用、重试回滚、用量、Todo 和下载。
-- 运行中心数据来自持久表，因此刷新后仍可查看。
-- 确认对话框用于删除、清密钥等显式破坏操作。
-- 后端错误信息需要脱敏；前端不展示密钥或 MCP header。
-
-## 7. 契约与兼容
-
-后端以中立事件和 JSON shape 为契约。新增事件应保持旧前端可忽略；修改字段需同时更新 `web/src/types.ts`、解析逻辑和 HTTP 测试。
-
-管理 API 的授权必须在服务端执行，隐藏按钮只改善体验，不是安全控制。
-
-## 8. 测试重点与源码依据
-
-- HTTP 鉴权、租户隔离、路由方法和状态码。
-- SSE 事件顺序、断开、终止、模型重试回滚和失败提交。
-- Run 取消/恢复、Interaction 解析。
-- Web build、类型、关键页面状态和 Mermaid 错误回退。
-- 下载能力、截图和敏感字段隐藏。
-
-源码：
-
-- `src/server/http.ts`
-- `src/server/context.ts`
-- `src/server/downloads.ts`
-- `web/src/App.tsx`
-- `web/src/api.ts`
-- `web/src/types.ts`
-- `web/src/components/run-center-page.tsx`
-- `web/src/components/mermaid-diagram.tsx`
+- HTTP/SSE：`tests/http.test.ts`、`tests/http-agent-runs.test.ts`
+- DTO projection：`tests/contracts/http-projection.test.ts`
+- Web source/interaction：`tests/frontend.test.ts`、`tests/web-run-center-source.test.ts`
+- Server：`src/server/http.ts`、`src/server/context.ts`、`src/server/downloads.ts`
+- Web：`web/src/App.tsx`、`web/src/api.ts`、`web/src/types.ts`

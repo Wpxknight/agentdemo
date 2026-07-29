@@ -47,6 +47,17 @@ describe('runtime refactor staging rollout source boundary', () => {
     }
   });
 
+  it('uses the injected MySQL root password for readiness without exposing it in arguments', async () => {
+    const manifest = await readFile(new URL('deploy/dev-k8s/mysql.yaml', root), 'utf8');
+
+    expect(manifest).toContain('name: MYSQL_ROOT_PASSWORD');
+    expect(manifest).toContain(
+      'command: ["sh", "-c", "MYSQL_PWD=\\\"$MYSQL_ROOT_PASSWORD\\\" exec mysqladmin ping -h 127.0.0.1 -uroot --silent"]',
+    );
+    expect(manifest).not.toContain('aiop-root-pass');
+    expect(manifest).not.toMatch(/mysqladmin[^\n]*-p[^$\s"']/);
+  });
+
   it('rolls back the aiop-dev server deployment and waits for readiness', async () => {
     const makefile = await readFile(new URL('Makefile', root), 'utf8');
 
@@ -68,6 +79,8 @@ describe('runtime refactor documentation source boundary', () => {
       'docs/design/05-sandbox-and-ops.md',
       'docs/design/07-data-and-persistence.md',
       'docs/design/08-scheduler.md',
+      'docs/design/09-api-and-web.md',
+      'docs/design/10-deployment-observability.md',
       'docs/design/README.md',
       'docs/guide/code-walkthrough.md',
       'docs/pi-agent-platform-operations.md',
@@ -97,5 +110,24 @@ describe('runtime refactor documentation source boundary', () => {
     for (const retiredSource of ['src/model/', 'src/mcp/', 'src/sandbox/']) {
       expect(source).not.toMatch(new RegExp(`(?<!/)${retiredSource}`));
     }
+  });
+
+  it('keeps current HTTP and deployment docs aligned with Pi-only runtime behavior', async () => {
+    const [api, deployment, operations] = await Promise.all([
+      readFile(new URL('docs/design/09-api-and-web.md', root), 'utf8'),
+      readFile(new URL('docs/design/10-deployment-observability.md', root), 'utf8'),
+      readFile(new URL('docs/pi-agent-platform-operations.md', root), 'utf8'),
+    ]);
+
+    expect(api).toContain('SSE 客户端断开只会 detach 响应');
+    expect(api).not.toContain('客户端断开、终止接口或 Agent Run 取消会触发 AbortSignal');
+    expect(deployment).toContain('deploy/dev-k8s/');
+    expect(deployment).toContain('namespace `aiop-dev`');
+    expect(deployment).toContain('make deploy-staging');
+    expect(deployment).toContain('make rollback-staging');
+    for (const retiredConcept of ['LangGraph', 'Checkpoint', '图版本', 'Kernel 灰度']) {
+      expect(deployment).not.toContain(retiredConcept);
+    }
+    expect(operations).toContain('--no-tablespaces');
   });
 });

@@ -43,7 +43,7 @@ spec:
               mountPath: /var/lib/mysql
           readinessProbe:
             exec:
-              command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-paiop-root-pass"]
+              command: ["sh", "-c", "MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" exec mysqladmin ping -h 127.0.0.1 -uroot --silent"]
             initialDelaySeconds: 20
             periodSeconds: 10
           resources:

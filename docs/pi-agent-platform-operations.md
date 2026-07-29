@@ -62,7 +62,7 @@ BACKUP_FILE="${REHEARSAL_DIR}/${BACKUP_ID}.sql"
 mkdir -p "${REHEARSAL_DIR}"
 
 kubectl -n aiop-dev exec deployment/mysql -- sh -c \
-  'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysqldump -uroot --single-transaction --routines --triggers "$MYSQL_DATABASE"' \
+  'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysqldump -uroot --single-transaction --no-tablespaces --routines --triggers "$MYSQL_DATABASE"' \
   > "${BACKUP_FILE}"
 test -s "${BACKUP_FILE}"
 sha256sum "${BACKUP_FILE}" > "${BACKUP_FILE}.sha256"
