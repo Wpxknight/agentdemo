@@ -470,7 +470,8 @@ function productInteractionPayloadMatches(
   const payload = interaction.payload;
   if (payload.id !== interaction.id || payload.tenantId !== interaction.tenantId
     || payload.userId !== (interaction.userId ?? null) || payload.sessionId !== (interaction.sessionId ?? '')
-    || payload.runId !== interaction.runId || payload.createdAt !== interaction.createdAt.toISOString()) return false;
+    || payload.runId !== interaction.runId
+    || !interactionTimestampsMatch(payload.createdAt, interaction.createdAt)) return false;
   const binding = Object.hasOwn(payload, GOVERNED_INPUT_BINDING)
     ? payload[GOVERNED_INPUT_BINDING] : undefined;
   if (binding !== undefined && digestToolValue(binding) !== digestToolValue(argumentsValue)) return false;
@@ -491,6 +492,14 @@ function productInteractionPayloadMatches(
     !PRODUCT_INTERACTION_BASE_KEYS.includes(key as typeof PRODUCT_INTERACTION_BASE_KEYS[number])
       && key !== GOVERNED_INPUT_BINDING)) as JsonValue;
   return digestToolValue(rawQuestion) === digestToolValue(argumentsValue);
+}
+
+function interactionTimestampsMatch(payloadValue: unknown, interactionValue: Date | string): boolean {
+  if (typeof payloadValue !== 'string') return false;
+  const payloadDate = new Date(payloadValue);
+  const interactionDate = interactionValue instanceof Date ? interactionValue : new Date(interactionValue);
+  if (Number.isNaN(payloadDate.getTime()) || Number.isNaN(interactionDate.getTime())) return false;
+  return Math.floor(payloadDate.getTime() / 1000) === Math.floor(interactionDate.getTime() / 1000);
 }
 
 function isJsonObject(value: JsonValue | undefined): value is Record<string, JsonValue> {

@@ -78,6 +78,48 @@ describe('product durable interaction replay', () => {
   });
 
   it.each([
+    { kind: 'question' as const, toolName: 'ask_user' as const, input: questionInput, value: { Continue: ['Yes'] } },
+    { kind: 'plan' as const, toolName: 'submit_change_plan' as const, input: planInput, value: true },
+  ])('resumes a transformed $kind payload when MySQL truncates createdAt to seconds', async (testCase) => {
+    const result = await runProductReplay(testCase, (interaction) => {
+      const second = Math.floor(interaction.createdAt.getTime() / 1000) * 1000;
+      return {
+        ...interaction,
+        createdAt: new Date(second),
+        payload: { ...asObject(interaction.payload), createdAt: new Date(second + 302).toISOString() },
+      };
+    });
+
+    expect(result.resolved.createdAt.getTime() % 1000).toBe(0);
+    expect(asObject(result.resolved.payload).createdAt).toBe(
+      new Date(result.resolved.createdAt.getTime() + 302).toISOString(),
+    );
+    expect(result.resumed.error).toBeUndefined();
+    expect(result.resumed).toMatchObject({ status: 'succeeded', text: 'continued after interaction' });
+    expect(result.handler).not.toHaveBeenCalled();
+    expect(result.providerTurns).toBe(2);
+  });
+
+  it.each([
+    { kind: 'question' as const, toolName: 'ask_user' as const, input: questionInput, value: { Continue: ['Yes'] } },
+    { kind: 'plan' as const, toolName: 'submit_change_plan' as const, input: planInput, value: true },
+  ])('rejects a transformed $kind payload when createdAt differs by more than one second', async (testCase) => {
+    const result = await runProductReplay(testCase, (interaction) => ({
+      ...interaction,
+      createdAt: new Date(interaction.createdAt.getTime() + 2_000),
+    }));
+
+    expect(result.resumed).toMatchObject({
+      status: 'recovery_required',
+      error: expect.objectContaining({
+        message: expect.stringContaining('interaction payload is not bound to the pending tool call'),
+      }),
+    });
+    expect(result.handler).not.toHaveBeenCalled();
+    expect(result.providerTurns).toBe(1);
+  });
+
+  it.each([
     {
       kind: 'question' as const, toolName: 'ask_user' as const, input: questionInput, value: { Continue: ['Yes'] },
       legacyPayload: (payload: JsonValue) => withoutBinding(payload),
@@ -234,7 +276,7 @@ async function runProductReplay(
   const resumed = await (await runtime.resume({
     identity, runId, resolution: { interactionId: resolved.id, value: testCase.value },
   })).result();
-  return { resumed, pending: pending!, handler, providerTurns, runId, toolCallId };
+  return { resumed, pending: pending!, resolved, handler, providerTurns, runId, toolCallId };
 }
 
 function withoutBinding(payload: JsonValue): JsonValue {

@@ -733,12 +733,15 @@ function productInteractionBaseMatches(
     && payload.userId === (interaction.userId ?? null)
     && payload.sessionId === (interaction.sessionId ?? '')
     && payload.runId === interaction.runId
-    && payload.createdAt === interactionDateIso(interaction.createdAt);
+    && interactionTimestampsMatch(payload.createdAt, interaction.createdAt);
 }
 
-function interactionDateIso(value: Date | string): string | undefined {
-  const date = value instanceof Date ? value : new Date(value);
-  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+function interactionTimestampsMatch(payloadValue: unknown, interactionValue: Date | string): boolean {
+  if (typeof payloadValue !== 'string') return false;
+  const payloadDate = new Date(payloadValue);
+  const interactionDate = interactionValue instanceof Date ? interactionValue : new Date(interactionValue);
+  if (Number.isNaN(payloadDate.getTime()) || Number.isNaN(interactionDate.getTime())) return false;
+  return Math.floor(payloadDate.getTime() / 1000) === Math.floor(interactionDate.getTime() / 1000);
 }
 
 function productPlanQuestionsMatch(questions: JsonValue, plan: JsonValue): boolean {
