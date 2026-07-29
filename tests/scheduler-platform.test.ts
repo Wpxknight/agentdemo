@@ -1,23 +1,20 @@
 import { describe, expect, it, vi } from 'vitest';
-import { Scheduler } from '../packages/scheduler-core/src/index.js';
+import { MemorySchedulerStore, SchedulerRunner } from '../packages/scheduler-runtime/src/index.js';
 
-describe('Scheduler core', () => {
-  it('only claims due tasks, creates agent runs and records task links', async () => {
-    const run = vi.fn(async () => ({ runId: 'run-a', status: 'queued' as const, events: emptyEvents(), result: vi.fn() }));
-    const recordRunLink = vi.fn();
-    const scheduler = new Scheduler({
-      store: {
-        claimDue: async () => [{
-          taskId: 'task-a', tenantId: 'tenant-a', actorId: 'user-a', sessionId: 'session-a', input: 'diagnose',
-        }],
-        recordRunLink,
-      },
-      runtime: { run, resume: vi.fn(), cancel: vi.fn() },
-    });
-    expect(await scheduler.tick(new Date('2026-07-27T00:00:00Z'), 10)).toBe(1);
-    expect(run).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'session-a', input: [{ role: 'user', text: 'diagnose' }] }));
-    expect(recordRunLink).toHaveBeenCalledWith({ taskId: 'task-a', tenantId: 'tenant-a', runId: 'run-a' });
+describe('Scheduler runtime package', () => {
+  it('only claims due fires and asks the dispatcher to create product Runs', async () => {
+    const fireTime = new Date('2026-07-27T00:00:00Z');
+    const store = new MemorySchedulerStore([{
+      taskId: 'task-a', tenantId: 'tenant-a', actorId: 'user-a', sessionId: 'session-a',
+      cron: '0 * * * *', input: [{ role: 'user', text: 'diagnose' }], nextFireAt: fireTime,
+    }]);
+    const startScheduledRun = vi.fn(async () => ({ runId: 'run-a' }));
+    const scheduler = new SchedulerRunner({ store, dispatcher: { startScheduledRun }, workerId: 'worker-a' });
+
+    expect(await scheduler.tick(fireTime, 10)).toBe(1);
+    expect(startScheduledRun).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'session-a', input: [{ role: 'user', text: 'diagnose' }],
+    }));
+    expect((await store.listFires())[0]).toMatchObject({ state: 'started', runId: 'run-a' });
   });
 });
-
-async function* emptyEvents() { return; }

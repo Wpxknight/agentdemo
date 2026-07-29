@@ -5,7 +5,7 @@ const root = resolve(import.meta.dirname, '..');
 const packages = [
   'control-contracts', 'agent-kernel-pi', 'agent-runtime-aiop', 'agent-runtime-core', 'agent-runtime-mysql', 'pi-runtime',
   'mcp-runtime', 'sandbox-runtime',
-  'scheduler-core', 'scheduler-mysql', 'skill-runtime', 'tool-runtime',
+  'scheduler-runtime', 'skill-runtime', 'tool-runtime',
 ];
 const snapshotDir = resolve(root, 'docs/public-api');
 const update = process.argv.includes('--update');

@@ -6,7 +6,7 @@ const root = resolve(import.meta.dirname, '..');
 const packages = [
   'control-contracts',
   'agent-runtime-core',
-  'scheduler-core',
+  'scheduler-runtime',
   'agent-kernel-pi',
   'pi-runtime',
   'sandbox-runtime',
@@ -15,7 +15,6 @@ const packages = [
   'mcp-runtime',
   'skill-runtime',
   'tool-runtime',
-  'scheduler-mysql',
 ];
 
 const configPath = resolve(root, 'tsconfig.packages.json');

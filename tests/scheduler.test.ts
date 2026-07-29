@@ -5,7 +5,6 @@ import { Scheduler } from '../src/scheduler/ticker.js';
 import { isValidCron, nextRunAt } from '../src/scheduler/cron.js';
 import { createScheduledTaskRunner, shouldEmbedScheduler } from '../src/scheduler/runner.js';
 import { buildScheduleTools } from '../src/tools/schedule.js';
-import { ToolRegistry } from '../src/agent/tools.js';
 import type { Runtime } from '../src/runtime.js';
 import type { RequestContext } from '../src/auth/types.js';
 
@@ -181,32 +180,12 @@ describe('Scheduler', () => {
 });
 
 describe('createScheduledTaskRunner', () => {
-  it('对定时任务同样施加上下文预算（超长历史发送前被裁剪）', async () => {
+  it('creates a product Run through DurableRunRuntime.run', async () => {
     const store = new MemoryStore();
-    // 800 条 × 4000 字符 ≈ 80 万 token，远超默认预算 152k
-    for (let i = 0; i < 800; i++) {
-      await store.appendMessage(rctx, 'cron-sess', { role: 'user', text: 'x'.repeat(4000) });
-    }
-
-    const seen: number[] = [];
-    const systems: string[] = [];
-    const model = {
-      id: 'mock',
-      async *stream(input: { system: string; messages: unknown[] }) {
-        seen.push(input.messages.length);
-        systems.push(input.system);
-        yield { type: 'text_delta' as const, text: 'ok' };
-        yield { type: 'stop' as const, reason: 'end_turn' };
-      },
-    };
+    const run = vi.fn(async () => ({ runId: 'scheduled-run' }));
     const rt = {
-      model,
-      tools: new ToolRegistry(),
       store,
-      audit: store,
-      policy: { check: async () => ({}) },
-      policyPreApproved: { check: async () => ({}) },
-      systemExtra: '',
+      durableRunRuntime: { run },
     } as unknown as Runtime;
 
     const result = await createScheduledTaskRunner(rt)({
@@ -216,46 +195,20 @@ describe('createScheduledTaskRunner', () => {
     });
 
     expect(result.status).toBe('success');
-    expect(seen[0]).toBeLessThan(801); // 发送前被裁剪，而不是全量 801 条
-    expect(systems[0]).toContain('无人值守运行说明'); // 定时任务走无人值守提示词
+    expect(result.detail).toBe('scheduled-run');
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      identity: { tenantId: 't1', actorId: 'u1', roles: ['user'] },
+      sessionId: 'cron-sess',
+      input: [{ role: 'user', text: '巡检' }],
+    }));
   });
 
-  it('超过最长运行时长的定时任务被中止并记录失败（默认 4h，租户可配）', async () => {
-    const store = new MemoryStore();
-    await store.setSchedulerSettings(rctx, { maxRunMs: 50 });
-
-    const model = {
-      id: 'hang',
-      async *stream(input: { signal?: AbortSignal }) {
-        // 模拟卡死的上游：直到被中止才结束
-        await new Promise<void>((resolve) => {
-          if (input.signal?.aborted) return resolve();
-          input.signal?.addEventListener('abort', () => resolve(), { once: true });
-        });
-        yield { type: 'text_delta' as const, text: '不应到达' };
-      },
-    };
-    const rt = {
-      model,
-      tools: new ToolRegistry(),
-      store,
-      audit: store,
-      policy: { check: async () => ({}) },
-      policyPreApproved: { check: async () => ({}) },
-      systemExtra: '',
-    } as unknown as Runtime;
-
-    // 当前时间设在创建后 +1 分钟，使任务到点
-    const now = () => new Date(Date.now() + 90_000);
-    const scheduler = new Scheduler({ store, runner: createScheduledTaskRunner(rt), now });
-    await store.createScheduledTask(rctx, { sessionId: 'timeout-sess', cron: '* * * * *', task: '慢任务', preApproved: true });
-    await scheduler.tick();
-
-    const tasks = await store.listScheduledTasks(rctx);
-    const runs = await store.listTaskRuns(rctx, tasks[0]!.id);
-    expect(runs).toHaveLength(1);
-    expect(runs[0]!.status).toBe('error');
-    expect(runs[0]!.detail).toContain('最长运行时长');
+  it('fails explicitly when durable Run creation is unavailable', async () => {
+    const runner = createScheduledTaskRunner({ store: new MemoryStore() } as unknown as Runtime);
+    await expect(runner({
+      id: 1, tenantId: 't1', userId: 'u1', sessionId: 'cron-sess', cron: '* * * * *',
+      title: '巡检', task: '巡检', preApproved: false, enabled: true, nextRunAt: new Date(),
+    })).rejects.toThrow('DurableRunRuntime');
   });
 });
 

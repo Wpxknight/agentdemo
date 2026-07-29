@@ -74,6 +74,26 @@ export interface TaskAgentRunsTable {
   created_at: Date;
 }
 
+export interface SchedulerFiresTable {
+  fire_id: string;
+  task_id: number;
+  tenant_id: string;
+  actor_id: string;
+  session_id: string;
+  fire_time: Date;
+  input_json: JsonColumn;
+  state: string;
+  attempts: number;
+  run_id: string | null;
+  claim_token: string | null;
+  claim_owner: string | null;
+  lease_expires_at: Date | null;
+  retry_at: Date | null;
+  last_error: string | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
 export interface TenantsTable {
   id: string;
   name: string;
@@ -308,6 +328,7 @@ export interface Database {
   scheduled_tasks: ScheduledTasksTable;
   task_runs: TaskRunsTable;
   task_agent_runs: TaskAgentRunsTable;
+  scheduler_fires: SchedulerFiresTable;
   tenants: TenantsTable;
   users: UsersTable;
   user_credentials: UserCredentialsTable;

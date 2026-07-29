@@ -117,6 +117,7 @@ let server: Server;
 let base: string;
 let store: MemoryStore;
 let token: string;
+let runtime: Runtime;
 
 beforeAll(async () => {
   store = new MemoryStore();
@@ -145,7 +146,7 @@ beforeAll(async () => {
     apiKey: 'initial-key',
     model: 'mock-model',
   };
-  const rt = {
+  runtime = {
     get model() {
       return activeModel;
     },
@@ -2567,24 +2568,31 @@ describe('HTTP server 定时任务管理', () => {
   it('POST /run triggers an immediate run recorded in task_runs', async () => {
     const token = await adminToken();
     const id = await createTask(token);
+    runtime.durableRunRuntime = {
+      run: async (input: { runId?: string }) => ({ runId: input.runId ?? 'scheduled-run' }),
+    } as unknown as DurableRunRuntime;
 
-    const run = await fetch(`${base}/v1/schedule/${id}/run`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${token}` },
-    });
-    expect(run.status).toBe(202);
-    expect(await run.json()).toMatchObject({ ok: true, taskId: id, started: true });
+    try {
+      const run = await fetch(`${base}/v1/schedule/${id}/run`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(run.status).toBe(202);
+      expect(await run.json()).toMatchObject({ ok: true, taskId: id, started: true });
 
-    // 异步执行：轮询 task_runs 直到出现结果
-    let runs: Array<{ status: string; detail?: string }> = [];
-    for (let i = 0; i < 50 && !runs.length; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      const r = await fetch(`${base}/v1/schedule/${id}/runs`, { headers: { authorization: `Bearer ${token}` } });
-      runs = ((await r.json()) as { runs: typeof runs }).runs;
+      // 异步执行：轮询 task_runs 直到出现结果
+      let runs: Array<{ status: string; detail?: string }> = [];
+      for (let i = 0; i < 50 && !runs.length; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        const r = await fetch(`${base}/v1/schedule/${id}/runs`, { headers: { authorization: `Bearer ${token}` } });
+        runs = ((await r.json()) as { runs: typeof runs }).runs;
+      }
+      expect(runs.length).toBeGreaterThan(0);
+      expect(runs[0]!.status).toBe('success');
+      expect(runs[0]!.detail).toBeTruthy();
+    } finally {
+      runtime.durableRunRuntime = undefined;
     }
-    expect(runs.length).toBeGreaterThan(0);
-    expect(runs[0]!.status).toBe('success');
-    expect(runs[0]!.detail).toBeTruthy(); // mock 模型输出（具体内容取决于当前激活的 mock 模型）
 
     const missing = await fetch(`${base}/v1/schedule/99999/run`, {
       method: 'POST',

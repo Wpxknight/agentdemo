@@ -1,16 +1,7 @@
-import { logger } from '../logger.js';
-import { resolveAgentRuntime } from '../agent/runtime.js';
-import { estimateCost } from '../model/cost.js';
-import { contextBudgetTokens } from '../agent/context.js';
-import { AutoDenyGate } from '../agent/approval.js';
-import { boundUserHomeNote } from '@aiop/sandbox-runtime';
-import { SANDBOX_SERVICE_NOTE } from '@aiop/sandbox-runtime';
+import { createRunDispatcher, scheduledFireId } from '../../packages/scheduler-runtime/src/index.js';
 import type { Runtime } from '../runtime.js';
-import { DEFAULT_TASK_MAX_RUN_MS, type ScheduledTask } from '../db/store.js';
+import type { ScheduledTask } from '../db/store.js';
 import { Scheduler, type TaskRunner } from './ticker.js';
-import { randomUUID } from 'node:crypto';
-import { DurableToolLedger } from '../agent/tool-ledger/store.js';
-import { SessionCommitter } from '../agent/services/session-committer.js';
 
 type Env = Record<string, string | undefined>;
 
@@ -19,85 +10,24 @@ export function shouldEmbedScheduler(env: Env = process.env): boolean {
   return value === 'true' || value === '1';
 }
 
+/** Creates a durable product Run. The scheduler never enters an agent/Pi execution loop. */
 export function createScheduledTaskRunner(rt: Runtime): TaskRunner {
-  return async (t: ScheduledTask) => {
-    logger.info({ taskId: t.id, tenantId: t.tenantId, sessionId: t.sessionId }, 'running scheduled task');
-    const taskCtx = { tenantId: t.tenantId, userId: t.userId, role: 'user' as const };
-    // 最长运行时长兜底：无人值守没人能按终止，超时中止并记录失败（默认 4 小时，租户可在设置页调整）。
-    const maxRunMs = (await rt.store.getSchedulerSettings({ tenantId: t.tenantId }))?.maxRunMs ?? DEFAULT_TASK_MAX_RUN_MS;
-    const abort = new AbortController();
-    const timer = setTimeout(
-      () => abort.abort(new Error(`定时任务超过最长运行时长（${Math.round(maxRunMs / 60000)} 分钟），已中止`)),
-      maxRunMs,
-    );
-    timer.unref?.();
-    try {
-      return await runScheduledTask(rt, t, taskCtx, abort.signal);
-    } finally {
-      clearTimeout(timer);
+  return async (task: ScheduledTask) => {
+    if (!rt.durableRunRuntime) {
+      throw new Error('DurableRunRuntime is required for scheduled Run creation');
     }
+    const dispatcher = createRunDispatcher(rt.durableRunRuntime);
+    const fireTime = task.nextRunAt;
+    const result = await dispatcher.startScheduledRun({
+      taskId: String(task.id),
+      fireId: scheduledFireId(String(task.id), fireTime),
+      fireTime,
+      identity: { tenantId: task.tenantId, actorId: task.userId, roles: ['user'] },
+      sessionId: task.sessionId,
+      input: [{ role: 'user', text: task.task }],
+    });
+    return { status: 'success', detail: result.runId };
   };
-}
-
-async function runScheduledTask(
-  rt: Runtime,
-  t: ScheduledTask,
-  taskCtx: { tenantId: string; userId: string; role: 'user' },
-  signal: AbortSignal,
-): Promise<{ status: 'success'; detail: string; steps: number }> {
-  const prior = await rt.store.listMessages(taskCtx, t.sessionId);
-  const runId = randomUUID();
-  const startedAt = Date.now();
-  // 用户绑定了主目录：与交互链路一致，告知模型挂载点、交付物默认写入持久化目录。
-  const userHomeNote = rt.sandboxSettings?.enabled && rt.userHome
-    ? await boundUserHomeNote(rt.store, t.tenantId, t.userId, rt.userHome)
-    : '';
-  const result = await resolveAgentRuntime(rt.agentRuntime).run({
-    runId,
-    model: rt.model,
-    tools: rt.tools,
-    governedTools: rt.mcp ? await rt.mcp.tools({
-      tenantId: taskCtx.tenantId,
-      actorId: taskCtx.userId,
-      roles: [taskCtx.role],
-    }) : [],
-    policy: t.preApproved ? rt.policyPreApproved : rt.policy,
-    filterToolDefs: (defs) => rt.permissionRules?.filterToolDefs(defs) ?? defs,
-    hooks: rt.hooks,
-    toolLedger: new DurableToolLedger(rt.store),
-    approval: new AutoDenyGate(), // 无人值守：未预批准的审批一律拒绝
-    unattended: true, // 系统提示切换为“确认类操作跳过并汇报”，不对着空气等确认
-    // 技能摘要按任务归属用户过滤（他人私有技能不可见），与交互链路同一套可见性规则。
-    system: [
-      rt.skillRegistry
-        ? await rt.skillRegistry.summariesFor({ tenantId: taskCtx.tenantId, userId: t.userId, role: taskCtx.role })
-        : rt.systemExtra,
-      rt.sandboxSettings?.enabled ? SANDBOX_SERVICE_NOTE : '',
-      userHomeNote,
-    ].filter(Boolean).join('\n\n'),
-    ctx: { sessionId: t.sessionId, ...taskCtx },
-    messages: prior,
-    task: t.task,
-    // 定时任务复用同一会话、历史只增不减，同样必须受上下文预算约束，否则迟早超窗 400。
-    contextBudgetTokens: contextBudgetTokens(rt.modelConfig?.contextWindowTokens),
-    keepImages: rt.modelConfig?.contextKeepImages,
-    signal,
-  });
-  await new SessionCommitter(rt.store).commitSuccess({
-    ctx: taskCtx,
-    sessionId: t.sessionId,
-    priorMessageCount: prior.length,
-    result,
-    durationMs: Math.max(0, Date.now() - startedAt),
-  });
-  await rt.audit.record({
-    kind: 'usage',
-    action: 'scheduled',
-    tenantId: t.tenantId,
-    sessionId: t.sessionId,
-    detail: { ...result.usage, steps: result.steps, taskId: t.id, cost: estimateCost(result.usage, rt.modelConfig?.pricing) },
-  });
-  return { status: 'success' as const, detail: result.text.slice(0, 4000), steps: result.steps };
 }
 
 export function startRuntimeScheduler(rt: Runtime): Scheduler {

@@ -7,7 +7,7 @@ const root = resolve(import.meta.dirname, '..');
 const packageDirs = [
   'control-contracts', 'agent-kernel-pi', 'agent-runtime-aiop', 'agent-runtime-core', 'agent-runtime-mysql', 'pi-runtime',
   'mcp-runtime', 'sandbox-runtime',
-  'scheduler-core', 'scheduler-mysql', 'skill-runtime', 'tool-runtime',
+  'scheduler-runtime', 'skill-runtime', 'tool-runtime',
 ];
 const temp = await mkdtemp(join(tmpdir(), 'aiop-package-verify-'));
 try {

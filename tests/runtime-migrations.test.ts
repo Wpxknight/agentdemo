@@ -89,6 +89,15 @@ describe('durable runtime migrations', () => {
     expect(source).toContain('idx_agent_runs_session_status');
   });
 
+  it('adds durable scheduler fires for leased claims and crash recovery', async () => {
+    const source = await sql('0025_scheduler_fires.sql');
+    expect(source).toContain('create table if not exists scheduler_fires');
+    expect(source).toContain('primary key (fire_id)');
+    for (const column of ['state', 'attempts', 'claim_token', 'claim_owner', 'lease_expires_at', 'retry_at', 'run_id']) {
+      expect(source).toContain(column);
+    }
+  });
+
   it('upgrades a database that already recorded the original 0023 migration', async () => {
     const columns = new Set<string>();
     const indexes = new Set<string>();
@@ -111,7 +120,7 @@ describe('durable runtime migrations', () => {
 
     await runMigrations(pool as never);
 
-    expect(recorded.at(-1)?.version).toBe(24);
+    expect(recorded.at(-1)?.version).toBe(25);
     expect(columns).toEqual(new Set(['cost_usd', 'limits_json', 'append_closed_at']));
     expect(indexes).toEqual(new Set(['idx_agent_runs_session_status']));
   });
@@ -129,6 +138,7 @@ describe('durable runtime migrations', () => {
     expect(source).toContain('append_closed_at: date | null');
     expect(source).toContain('cost_usd: string | number | null');
     expect(source).toContain('correlation_id: string | null');
+    expect(source).toContain('scheduler_fires:');
     expect(source).not.toContain('langgraph_checkpoints:');
     expect(source).not.toContain('langgraph_checkpoint_writes:');
   });

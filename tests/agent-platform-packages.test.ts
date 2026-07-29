@@ -73,7 +73,7 @@ describe('agent platform package boundaries', () => {
     const names = [
       'control-contracts', 'agent-kernel-pi', 'agent-runtime-aiop', 'agent-runtime-core', 'agent-runtime-mysql', 'pi-runtime',
       'mcp-runtime', 'sandbox-runtime',
-      'scheduler-core', 'scheduler-mysql', 'skill-runtime', 'tool-runtime',
+      'scheduler-runtime', 'skill-runtime', 'tool-runtime',
     ];
     for (const name of names) {
       const pkg = await manifest(name) as { dependencies?: Record<string, string> };
