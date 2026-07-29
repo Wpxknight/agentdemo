@@ -194,6 +194,14 @@ describe('SchedulerRunner', () => {
     expect(await store.recoverExpired(afterSchedulerLease)).toBe(0);
     expect(await store.claimDue({ now: afterSchedulerLease, limit: 1, workerId: 'worker-b', leaseMs: 1_000 })).toEqual([]);
 
+    expect(await store.claimBound({
+      fireId: fire!.fireId, expectedClaimToken: 'stale-token',
+      now: afterSchedulerLease, workerId: 'worker-b', leaseMs: 1_000,
+    })).toBeUndefined();
+    expect((await store.listFires())[0]).toMatchObject({
+      state: 'bound', claimToken: originalToken, claimedBy: undefined, attempts: 1,
+    });
+
     const recovering = await store.claimBound({
       fireId: fire!.fireId, expectedClaimToken: originalToken,
       now: afterSchedulerLease, workerId: 'worker-b', leaseMs: 1_000,
@@ -220,7 +228,7 @@ describe('SchedulerRunner', () => {
 
     expect((await store.listFires())[0]).toMatchObject({
       state: 'bound', runId: fire!.fireId, claimToken: recovering!.claimToken,
-      claimedBy: undefined, retryAt, attempts: 1, lastError: 'result unavailable',
+      claimedBy: undefined, leaseExpiresAt: retryAt, retryAt, attempts: 1, lastError: 'result unavailable',
     });
   });
 
