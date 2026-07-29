@@ -1112,6 +1112,112 @@ describe('DurableRunManager', () => {
     expect((await store.get({ tenantId: identity.tenantId, runId }))?.waitingReason).toBeUndefined();
   });
 
+  it('cancels after resume load without replaying the resolved governed call', async () => {
+    const store = new MemoryRunStore();
+    const runId = 'cancel-before-replay-run';
+    const binding = await seedResolvedWaitingReplay(store, runId);
+    let replayCalls = 0;
+    let providerCalls = 0;
+    const session: ManagedPiSession = {
+      ...emptySession('cancel-before-replay-session'),
+      async replayInteraction() { replayCalls++; },
+      async *continue() { providerCalls++; },
+    };
+    const manager = new DurableRunManager({
+      store, heartbeatMs: 0,
+      sessions: {
+        create: async () => session,
+        load: async () => {
+          await store.requestCancellation({ identity, runId, requestedAt: new Date(), reason: 'cancel before replay' });
+          return session;
+        },
+      },
+      eventOptions: () => ({}),
+    });
+
+    const result = await (await manager.resume({
+      identity, runId, resolution: { interactionId: binding.interactionId, value: true },
+    })).result();
+
+    expect(result.status).toBe('cancelled');
+    expect(replayCalls).toBe(0);
+    expect(providerCalls).toBe(0);
+    expect(await store.get({ tenantId: identity.tenantId, runId })).toMatchObject({
+      status: 'cancelled', leaseOwner: undefined, leaseExpiresAt: undefined,
+    });
+    expect(await store.attempts.list({ tenantId: identity.tenantId, runId })).toEqual([
+      expect.objectContaining({ status: 'cancelled', completedAt: expect.any(Date) }),
+    ]);
+    expect(await store.toolLedger.get({
+      tenantId: identity.tenantId, runId, logicalCallId: binding.logicalCallId,
+    })).toMatchObject({ status: 'pending_approval', toolCallId: binding.toolCallId });
+    expect(await store.interactions.get({
+      tenantId: identity.tenantId, runId, interactionId: binding.interactionId,
+    })).toMatchObject({ status: 'resolved', toolCallId: binding.toolCallId, resolution: true });
+  });
+
+  it('aborts a blocked replay before its governed side effect can start when cancellation wins', async () => {
+    const store = new MemoryRunStore();
+    const runId = 'cancel-blocked-replay-run';
+    const binding = await seedResolvedWaitingReplay(store, runId);
+    await store.inbox.enqueue({
+      identity, tenantId: identity.tenantId, runId, idempotencyKey: 'must-not-deliver', mode: 'steer',
+      message: { role: 'user', text: 'must not steer during replay' }, createdAt: new Date(),
+    });
+    let replayEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { replayEntered = resolve; });
+    let releaseReplay!: () => void;
+    const released = new Promise<void>((resolve) => { releaseReplay = resolve; });
+    let sideEffectCalls = 0;
+    let providerCalls = 0;
+    let steerCalls = 0;
+    let replaySignalAborted = false;
+    const session: ManagedPiSession = {
+      ...emptySession('cancel-blocked-replay-session'),
+      async replayInteraction(_resolution, signal, guard?: () => Promise<void>) {
+        replayEntered();
+        await released;
+        try {
+          await guard?.();
+        } catch (error) {
+          replaySignalAborted = signal?.aborted === true;
+          throw error;
+        }
+        if (!signal?.aborted) sideEffectCalls++;
+      },
+      async *continue() { providerCalls++; },
+      async steer() { steerCalls++; },
+    };
+    const manager = new DurableRunManager({
+      store, heartbeatMs: 0, inboxPollMs: 60_000,
+      sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+    const handle = await manager.resume({
+      identity, runId, resolution: { interactionId: binding.interactionId, value: true },
+    });
+    await entered;
+    await store.requestCancellation({ identity, runId, requestedAt: new Date(), reason: 'cancel blocked replay' });
+    releaseReplay();
+
+    await expect(handle.result()).resolves.toMatchObject({ status: 'cancelled' });
+    expect(replaySignalAborted).toBe(true);
+    expect(sideEffectCalls).toBe(0);
+    expect(providerCalls).toBe(0);
+    expect(steerCalls).toBe(0);
+    expect(await store.get({ tenantId: identity.tenantId, runId })).toMatchObject({
+      status: 'cancelled', leaseOwner: undefined, leaseExpiresAt: undefined,
+    });
+    expect(await store.attempts.list({ tenantId: identity.tenantId, runId })).toEqual([
+      expect.objectContaining({ status: 'cancelled', completedAt: expect.any(Date) }),
+    ]);
+    expect(await store.toolLedger.get({
+      tenantId: identity.tenantId, runId, logicalCallId: binding.logicalCallId,
+    })).toMatchObject({ status: 'pending_approval', toolCallId: binding.toolCallId });
+    expect(await store.interactions.get({
+      tenantId: identity.tenantId, runId, interactionId: binding.interactionId,
+    })).toMatchObject({ status: 'resolved', toolCallId: binding.toolCallId, resolution: true });
+  });
+
   it('preserves a governed recovery-required outcome instead of classifying it as a model failure', async () => {
     const store = new MemoryRunStore();
     const session = {
@@ -1824,6 +1930,32 @@ function emptySession(id: string): ManagedPiSession {
     async metadata() { return { id, tenantId: 'tenant-a', createdAt: new Date().toISOString() }; },
     async abort() {}, async close() {}, async steer() {}, async followUp() {}, async appendCustomEntry() { return 'marker'; },
   };
+}
+
+async function seedResolvedWaitingReplay(store: MemoryRunStore, runId: string) {
+  const now = new Date('2026-07-30T00:00:00.000Z');
+  const toolCallId = `call-${runId}`;
+  const logicalCallId = `logical-${runId}`;
+  const interactionId = `approval-${runId}`;
+  await store.create({ record: {
+    tenantId: identity.tenantId, runId, actorId: identity.actorId, sessionId: `session-${runId}`,
+    kernel: 'pi', kernelVersion: '0.82.1', status: 'waiting', waitingReason: 'approval', leaseToken: 0n,
+    usage, createdAt: now, updatedAt: now,
+  } });
+  await store.toolLedger.putIfAbsent({
+    tenantId: identity.tenantId, runId, attemptId: 'attempt-waiting', turnNo: 1,
+    logicalCallId, toolCallId, toolName: 'deploy', argsDigest: 'digest', capability: 'retryable_write',
+    idempotencyKey: `key-${runId}`, approvedInteractionId: interactionId,
+    status: 'pending_approval', createdAt: now, updatedAt: now,
+  });
+  const pending = {
+    tenantId: identity.tenantId, runId, id: interactionId, attemptId: 'attempt-waiting', turnNo: 1,
+    kind: 'approval' as const, toolCallId, status: 'pending' as const,
+    payload: { call: { id: toolCallId, name: 'deploy', args: {} } }, createdAt: now,
+  };
+  await store.interactions.put(pending);
+  await store.resolveInteraction({ ...pending, status: 'resolved', resolution: true, resolvedAt: now });
+  return { toolCallId, logicalCallId, interactionId };
 }
 
 type MysqlContractRow = Record<string, any>;

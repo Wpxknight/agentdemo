@@ -21,7 +21,11 @@ const ZERO_USAGE = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheC
 
 export interface ManagedPiSession extends InboxCapableSession {
   continue(signal?: AbortSignal): AsyncIterable<AgentRunEvent>;
-  replayInteraction?(resolution: ResolvedInteraction, signal?: AbortSignal): Promise<void>;
+  replayInteraction?(
+    resolution: ResolvedInteraction,
+    signal?: AbortSignal,
+    guard?: () => Promise<void>,
+  ): Promise<void>;
   abort(): Promise<void>;
   close(): Promise<void>;
   metadata(): Promise<SessionMetadata & { tenantId?: string }>;
@@ -194,91 +198,113 @@ export class DurableRunManager implements DurableRunRuntime {
           });
       this.active.set(activeKey, { abort, session });
       baselineUsage = usageFromEntries(await session.entries());
-      if (interactionResolution) {
-        if (!session.replayInteraction) {
-          throw conflict('Loaded Pi session cannot replay the resolved interaction');
-        }
-        await session.replayInteraction(interactionResolution, abort.signal);
-      }
-      let stopInboxPump = false;
       const stopControl = new AbortController();
       const controlSignal = AbortSignal.any([abort.signal, stopControl.signal]);
-      const pumpInbox = async (): Promise<void> => {
-        while (!stopInboxPump && !abort.signal.aborted) {
+      let stopControlPump = false;
+      const guardControl = async (): Promise<void> => {
+        await abortIfCancellationRequested(this.options.store, { tenantId: identity.tenantId, runId }, abort);
+        if (claimed.record.limits?.deadlineAt && claimed.record.limits.deadlineAt <= this.now()) {
+          abort.abort(new AgentPlatformError({
+            code: 'RUN_LIMIT_EXCEEDED', message: 'Run deadline exceeded', retryable: false,
+          }));
+        }
+        if (abort.signal.aborted) throw abort.signal.reason ?? new Error('Run control aborted');
+      };
+      const pumpControl = async (): Promise<void> => {
+        while (!stopControlPump && !abort.signal.aborted) {
           try {
-            if (await this.options.store.isCancellationRequested({ tenantId: identity.tenantId, runId })) {
-              abort.abort(new Error('Run cancellation requested'));
-              await session!.abort();
-              return;
-            }
-            if (claimed.record.limits?.deadlineAt && claimed.record.limits.deadlineAt <= this.now()) {
-              const error = new AgentPlatformError({ code: 'RUN_LIMIT_EXCEEDED', message: 'Run deadline exceeded', retryable: false });
-              abort.abort(error);
-              await session!.abort();
-              return;
-            }
-            await drainDurableInbox({
-              store: this.options.store, session: session!, entries: await session!.entries(),
-              tenantId: identity.tenantId, runId, workerId: this.workerId, fencingToken: claimed.fencingToken,
-              now: this.now, claimTtlMs: this.inboxClaimTtlMs,
-            });
+            await guardControl();
           } catch (error) {
             abort.abort(error);
+            await session!.abort().catch(() => {});
             return;
           }
           await delay(this.inboxPollMs, controlSignal);
         }
       };
-      const inboxPump = pumpInbox();
-      const currentToolCallIds = new Set<string>();
+      const controlPump = pumpControl();
       try {
-        for await (const event of session.continue(abort.signal)) {
-          await abortIfCancellationRequested(this.options.store, { tenantId: identity.tenantId, runId }, abort);
-          const normalized = normalizeEvent(event, identity.tenantId, runId, claimed.attemptId, turnNo);
-          durableEvents.push(withoutSequence(normalized));
-          stream.push(normalized);
-          if (normalized.type === 'message_end') {
-            observedUsage = addUsage(observedUsage, usageFromEvent(normalized));
-            hasObservedUsage = true;
-            assertOnlineUsageAllowed(claimed.record.limits, addUsage(claimed.record.usage, observedUsage), observedUsage);
+        if (interactionResolution) {
+          await guardControl();
+          if (!session.replayInteraction) {
+            throw conflict('Loaded Pi session cannot replay the resolved interaction');
           }
-          const toolCallId = toolCallIdFromEvent(normalized);
-          if (toolCallId) currentToolCallIds.add(toolCallId);
-          assertToolCallsAllowed(claimed.record.limits, unionSize(persistedToolCallIds, currentToolCallIds));
+          await session.replayInteraction(interactionResolution, abort.signal, guardControl);
+          await guardControl();
         }
+        let stopInboxPump = false;
+        const inboxStop = new AbortController();
+        const inboxSignal = AbortSignal.any([abort.signal, inboxStop.signal]);
+        const pumpInbox = async (): Promise<void> => {
+          while (!stopInboxPump && !abort.signal.aborted) {
+            try {
+              await drainDurableInbox({
+                store: this.options.store, session: session!, entries: await session!.entries(),
+                tenantId: identity.tenantId, runId, workerId: this.workerId, fencingToken: claimed.fencingToken,
+                now: this.now, claimTtlMs: this.inboxClaimTtlMs,
+              });
+            } catch (error) {
+              abort.abort(error);
+              return;
+            }
+            await delay(this.inboxPollMs, inboxSignal);
+          }
+        };
+        const inboxPump = pumpInbox();
+        const currentToolCallIds = new Set<string>();
+        try {
+          for await (const event of session.continue(abort.signal)) {
+            await guardControl();
+            const normalized = normalizeEvent(event, identity.tenantId, runId, claimed.attemptId, turnNo);
+            durableEvents.push(withoutSequence(normalized));
+            stream.push(normalized);
+            if (normalized.type === 'message_end') {
+              observedUsage = addUsage(observedUsage, usageFromEvent(normalized));
+              hasObservedUsage = true;
+              assertOnlineUsageAllowed(claimed.record.limits, addUsage(claimed.record.usage, observedUsage), observedUsage);
+            }
+            const toolCallId = toolCallIdFromEvent(normalized);
+            if (toolCallId) currentToolCallIds.add(toolCallId);
+            assertToolCallsAllowed(claimed.record.limits, unionSize(persistedToolCallIds, currentToolCallIds));
+          }
+        } finally {
+          stopInboxPump = true;
+          inboxStop.abort();
+          await inboxPump;
+        }
+        await this.options.store.closeInbox({
+          tenantId: identity.tenantId, runId, workerId: this.workerId,
+          fencingToken: claimed.fencingToken, now: this.now(),
+        });
+        await drainDurableInbox({
+          store: this.options.store, session, entries: await session.entries(), tenantId: identity.tenantId, runId,
+          workerId: this.workerId, fencingToken: claimed.fencingToken, now: this.now, claimTtlMs: this.inboxClaimTtlMs,
+        });
+        const entries = await session.entries();
+        const actualUsage = addUsage(claimed.record.usage, subtractUsage(usageFromEntries(entries), baselineUsage));
+        assertUsageAllowed(claimed.record.limits, actualUsage);
+        assertToolCallsAllowed(claimed.record.limits, unionSize(persistedToolCallIds, currentToolCallIds));
+        await this.syncEntries(identity.tenantId, piSessionId, entries);
+        const leafId = await session.leafId();
+        const facts = session.takeToolExecutionFacts?.();
+        const committedAt = this.now();
+        await this.options.store.commitTurn({
+          tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, turnNo, fencingToken: claimed.fencingToken,
+          checkpoint: { piSessionId, piLeafId: leafId },
+          events: durableEvents, status: 'succeeded', usage: actualUsage,
+          ledgerUpdates: facts?.ledgerUpdates, interactionUpdates: facts?.interactionUpdates, committedAt,
+        });
+        eventsPersisted = true;
+        await this.options.store.complete({
+          tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, fencingToken: claimed.fencingToken,
+          status: 'succeeded', usage: actualUsage, completedAt: this.now(),
+        });
+        return { runId, status: 'succeeded', text: assistantText(entries, leafId), usage: actualUsage };
       } finally {
-        stopInboxPump = true;
+        stopControlPump = true;
         stopControl.abort();
-        await inboxPump;
+        await controlPump;
       }
-      await this.options.store.closeInbox({
-        tenantId: identity.tenantId, runId, workerId: this.workerId,
-        fencingToken: claimed.fencingToken, now: this.now(),
-      });
-      await drainDurableInbox({
-        store: this.options.store, session, entries: await session.entries(), tenantId: identity.tenantId, runId,
-        workerId: this.workerId, fencingToken: claimed.fencingToken, now: this.now, claimTtlMs: this.inboxClaimTtlMs,
-      });
-      const entries = await session.entries();
-      const actualUsage = addUsage(claimed.record.usage, subtractUsage(usageFromEntries(entries), baselineUsage));
-      assertUsageAllowed(claimed.record.limits, actualUsage);
-      assertToolCallsAllowed(claimed.record.limits, unionSize(persistedToolCallIds, currentToolCallIds));
-      await this.syncEntries(identity.tenantId, piSessionId, entries);
-      const leafId = await session.leafId();
-      const facts = session.takeToolExecutionFacts?.();
-      const committedAt = this.now();
-      await this.options.store.commitTurn({
-        tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, turnNo, fencingToken: claimed.fencingToken,
-        checkpoint: { piSessionId, piLeafId: leafId },
-        events: durableEvents, status: 'succeeded', usage: actualUsage,
-        ledgerUpdates: facts?.ledgerUpdates, interactionUpdates: facts?.interactionUpdates, committedAt,
-      });
-      eventsPersisted = true;
-      await this.options.store.complete({
-        tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, fencingToken: claimed.fencingToken,
-        status: 'succeeded', usage: actualUsage, completedAt: this.now(),
-      });
-      return { runId, status: 'succeeded', text: assistantText(entries, leafId), usage: actualUsage };
     } catch (error) {
       const actualUsage = await terminalUsage(session, claimed.record.usage, baselineUsage, observedUsage, hasObservedUsage);
       const cancellation = await this.options.store.isCancellationRequested({ tenantId: identity.tenantId, runId });

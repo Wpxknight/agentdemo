@@ -159,10 +159,15 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
     return { [Symbol.asyncIterator]: () => owner.iterate(signal) };
   }
 
-  async replayInteraction(resolution: ResolvedInteraction, signal?: AbortSignal): Promise<void> {
+  async replayInteraction(
+    resolution: ResolvedInteraction,
+    signal?: AbortSignal,
+    guard?: () => Promise<void>,
+  ): Promise<void> {
     this.ensureOpen();
     if (this.activeRun) throw runStateConflict('Cannot replay an interaction while a Pi run is active');
     if (signal?.aborted) throw abortReason(signal);
+    await guard?.();
     const branch = await this.session.getBranch();
     const calls = branch.flatMap((entry) => entry.type === 'message' && entry.message.role === 'assistant'
       ? entry.message.content.filter((block): block is Extract<AssistantMessage['content'][number], { type: 'toolCall' }> =>
@@ -200,6 +205,8 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
 
     let replacement: ToolResultMessage;
     try {
+      await guard?.();
+      if (signal?.aborted) throw abortReason(signal);
       const result = await tools[0]!.execute(
         resolution.toolCallId, original.call.arguments, signal, undefined, undefined,
       );
