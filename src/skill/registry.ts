@@ -29,7 +29,7 @@ import { canManageSkill, isSkillVisibleTo } from './visibility.js';
 import { enumerateSkillProductRecords } from './source.js';
 import { SkillProductService, type ProductSkillLoader } from './service.js';
 import type { SkillMutationLock } from './lock.js';
-import { ImmutableDigestCache } from './digest-cache.js';
+import { ImmutableDigestCache, mapConcurrentOrdered } from './digest-cache.js';
 
 export {
   PUBLIC_SKILLS_DIR,
@@ -55,12 +55,16 @@ const MARKER_FILES = new Set([
 const PRODUCT_SCHEMA_VERSION = 2;
 const BUILTIN_GOVERNANCE_DIR = '.aiop-governance';
 const BUILTIN_CATALOG_DIR = 'builtin-catalog';
+const BUILTIN_MIGRATIONS_DIR = 'migrations';
+const LEGACY_SEED_MIGRATION_ID = 'legacy-seed-governance-v1';
+const LEGACY_SEED_MIGRATION_LOCK_KEY = 'skill-legacy-migration:v1';
 const PUBLICATION_JOURNAL_DIR = '.aiop-publications';
 const PUBLICATION_LOCK_KEY = 'skill-publication';
 const LEGACY_MUTATION_LOCK_KEY = 'skill-mutation';
 const STORAGE_QUOTA_LOCK_KEY = 'skill-quota:storage';
 const processNameLockTails = new Map<string, Promise<void>>();
 const immutableDigestCache = new ImmutableDigestCache(256);
+const DIGEST_VERIFICATION_CONCURRENCY = 4;
 
 interface BuiltinGovernanceOverlay {
   schemaVersion: 1;
@@ -114,6 +118,7 @@ export interface SkillRegistryOptions {
   importPermitLock?: SkillMutationLock;
   pendingQuota?: Partial<SkillPendingQuota>;
   availableBytes?: () => Promise<number>;
+  verifyContentDigest?: (path: string) => Promise<string>;
 }
 
 export interface SkillPendingQuota {
@@ -154,6 +159,7 @@ export class SkillRegistry {
   private readonly importPermitLock?: SkillMutationLock;
   private readonly pendingQuota: SkillPendingQuota;
   private readonly availableBytes: () => Promise<number>;
+  private readonly verifyContentDigest: (path: string) => Promise<string>;
   private mutationTail: Promise<void> = Promise.resolve();
   private distributedLockDepth = 0;
 
@@ -167,6 +173,8 @@ export class SkillRegistry {
       const info = await statfs(resolve(this.dir));
       return Number(info.bavail) * Number(info.bsize);
     });
+    this.verifyContentDigest = opts.verifyContentDigest
+      ?? ((path) => contentDigest(path, { immutable: true }));
     this.service = new SkillProductService(
       opts.env ?? new NodeExecutionEnv({ cwd: dir }),
       opts.loader,
@@ -240,7 +248,7 @@ export class SkillRegistry {
   }
 
   async scan(): Promise<void> {
-    await this.withMutationLock(() => this.scanUnlocked());
+    await this.withMutationLock(() => this.scanUnlocked([], true));
   }
 
   /** 全量列表（管理/CLI 用；对外接口请用 listFor 按查看者过滤）。 */
@@ -705,17 +713,17 @@ export class SkillRegistry {
   }
 
   private async verifiedRecords(records: readonly SkillProductRecord[]): Promise<SkillProductRecord[]> {
-    const checked = await Promise.all(records.map(async (record) => {
+    const checked = await mapConcurrentOrdered(records, DIGEST_VERIFICATION_CONCURRENCY, async (record) => {
       if (!record.contentDigest) return record;
       try {
-        const actual = await contentDigest(record.path, { immutable: true });
+        const actual = await this.verifyContentDigest(record.path);
         if (actual === record.contentDigest) return record;
         log.error({ skill: record.name, expected: record.contentDigest, actual }, 'published skill digest mismatch');
       } catch (error) {
         log.error({ skill: record.name, err: String(error) }, 'published skill digest verification failed');
       }
       return undefined;
-    }));
+    });
     return checked.filter((record): record is SkillProductRecord => record !== undefined);
   }
 
@@ -810,7 +818,10 @@ export class SkillRegistry {
     }
   }
 
-  private async scanUnlocked(excludedPaths: readonly string[] = []): Promise<void> {
+  private async scanUnlocked(
+    excludedPaths: readonly string[] = [],
+    runStartupMigrations = false,
+  ): Promise<void> {
     if (!this.configuredRecords && this.distributedLockDepth === 0) {
       await this.withDistributedLocks([PUBLICATION_LOCK_KEY], () => reconcilePublicationJournals(this.dir));
     }
@@ -823,19 +834,18 @@ export class SkillRegistry {
         this.builtinRoots.map((root) => this.enumerateWithSnapshot(root)),
       )).flat();
       const builtinCatalog = await this.updateBuiltinCatalog(rawBuiltinRecords);
-      const legacyProductRecords = await this.enumerateWithSnapshot(this.dir);
-      await this.migrateLegacySeedGovernance(rawBuiltinRecords, builtinCatalog, legacyProductRecords);
+      if (runStartupMigrations) {
+        await this.ensureLegacySeedMigration(rawBuiltinRecords, builtinCatalog);
+      }
+      await readLegacySeedMigrationMarker(this.dir);
       await cleanupStaleSkillStorage(this.dir, this.pendingQuota.retentionMs);
       const builtinRecords = (await Promise.all(
         rawBuiltinRecords.map((record) => this.applyBuiltinGovernance(record)),
       )).filter((record): record is SkillProductRecord => record !== undefined);
       const productRecords = await this.enumerateWithSnapshot(this.dir);
-      const filteredProductRecords = (await Promise.all(productRecords.map(async (record) => (
-        await isSeededBuiltinCopy(record, builtinCatalog, this.dir) ? undefined : record
-      )))).filter((record): record is SkillProductRecord => record !== undefined);
       records = [
         ...builtinRecords,
-        ...filteredProductRecords,
+        ...productRecords,
       ];
     }
     this.records = records.filter((record) => !excluded.has(resolve(record.path)));
@@ -886,13 +896,21 @@ export class SkillRegistry {
     digest: string;
     relativePath: string;
   }> {
+    const location = this.builtinLocation(record);
+    return { ...location, digest: await contentDigest(record.path) };
+  }
+
+  private builtinLocation(record: SkillProductRecord): {
+    identity: string;
+    relativePath: string;
+  } {
     const root = this.builtinRootFor(record.path);
     if (!root) throw new Error(`技能 ${record.name} 不是内置技能`);
     const relativePath = relative(resolve(root), resolve(record.path)).split(sep).join('/');
     const identity = createHash('sha256')
       .update(`${record.tenantId}\0${record.name}\0${relativePath}`)
       .digest('hex');
-    return { identity, digest: await contentDigest(record.path), relativePath };
+    return { identity, relativePath };
   }
 
   private async updateBuiltinCatalog(records: readonly SkillProductRecord[]): Promise<readonly BuiltinCatalogEntry[]> {
@@ -915,39 +933,45 @@ export class SkillRegistry {
   private async migrateLegacySeedGovernance(
     rawBuiltinRecords: readonly SkillProductRecord[],
     catalog: readonly BuiltinCatalogEntry[],
-    legacyProductRecords: readonly SkillProductRecord[],
   ): Promise<void> {
     if (!rawBuiltinRecords.length || !catalog.length) return;
     const rawByIdentity = new Map<string, SkillProductRecord>();
     for (const record of rawBuiltinRecords) {
-      rawByIdentity.set((await this.builtinSource(record)).identity, record);
+      rawByIdentity.set(this.builtinLocation(record).identity, record);
     }
-    for (const legacy of legacyProductRecords) {
-      const relativePath = relative(resolve(this.dir), resolve(legacy.path)).split(sep).join('/');
-      const digest = await contentDigest(legacy.path).catch(() => undefined);
-      if (!digest) continue;
-      const candidates = catalog.filter((entry) => entry.name === legacy.name
-        && entry.tenantId === legacy.tenantId
-        && entry.sourceVersion === legacy.version
-        && entry.sourceDigest === digest
-        && entry.relativePath === relativePath);
-      if (candidates.length !== 1) continue;
-      await this.migrateLegacySeedRecord(legacy, candidates[0]!, rawByIdentity, false);
+    for (const source of catalog) {
+      const candidatePath = safeResolve(this.dir, source.relativePath);
+      const legacy = await readLegacySeedCandidate(candidatePath, source);
+      if (!legacy) continue;
+      const digest = await contentDigest(legacy.path);
+      if (digest !== source.sourceDigest) continue;
+      await this.migrateLegacySeedRecord(legacy, source, rawByIdentity, false);
     }
 
     const tombstoneRoot = join(resolve(this.dir), SKILL_TOMBSTONES_DIR);
     const tombstones = await enumerateSkillProductRecords(tombstoneRoot);
     for (const legacy of tombstones) {
-      const digest = await contentDigest(legacy.path).catch(() => undefined);
-      if (!digest) continue;
       const candidates = catalog.filter((entry) => entry.name === legacy.name
         && entry.tenantId === legacy.tenantId
         && entry.sourceVersion === legacy.version
-        && entry.sourceDigest === digest
         && legacyRelativePathCandidates(legacy).includes(entry.relativePath));
       if (candidates.length !== 1) continue;
+      const digest = await contentDigest(legacy.path);
+      if (digest !== candidates[0]!.sourceDigest) continue;
       await this.migrateLegacySeedRecord(legacy, candidates[0]!, rawByIdentity, true);
     }
+  }
+
+  private async ensureLegacySeedMigration(
+    rawBuiltinRecords: readonly SkillProductRecord[],
+    catalog: readonly BuiltinCatalogEntry[],
+  ): Promise<void> {
+    if (!rawBuiltinRecords.length || !catalog.length || await readLegacySeedMigrationMarker(this.dir)) return;
+    await this.withDistributedLocks([LEGACY_SEED_MIGRATION_LOCK_KEY], async () => {
+      if (await readLegacySeedMigrationMarker(this.dir)) return;
+      await this.migrateLegacySeedGovernance(rawBuiltinRecords, catalog);
+      await writeLegacySeedMigrationMarker(this.dir);
+    });
   }
 
   private async migrateLegacySeedRecord(
@@ -1176,6 +1200,47 @@ function compareBuiltinCatalogEntry(a: BuiltinCatalogEntry, b: BuiltinCatalogEnt
   return builtinCatalogEntryKey(a).localeCompare(builtinCatalogEntryKey(b));
 }
 
+async function readLegacySeedMigrationMarker(root: string): Promise<boolean> {
+  const path = join(
+    resolve(root),
+    BUILTIN_GOVERNANCE_DIR,
+    BUILTIN_MIGRATIONS_DIR,
+    `${LEGACY_SEED_MIGRATION_ID}.done`,
+  );
+  let value;
+  try {
+    value = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+  if (value.schemaVersion !== 1 || value.migration !== LEGACY_SEED_MIGRATION_ID
+    || typeof value.completedAt !== 'string') {
+    throw new Error(`Skill legacy migration marker 无效：${path}`);
+  }
+  return true;
+}
+
+async function writeLegacySeedMigrationMarker(root: string): Promise<void> {
+  const migrationRoot = join(resolve(root), BUILTIN_GOVERNANCE_DIR, BUILTIN_MIGRATIONS_DIR);
+  await mkdir(migrationRoot, { recursive: true, mode: 0o700 });
+  const target = join(migrationRoot, `${LEGACY_SEED_MIGRATION_ID}.done`);
+  const temp = join(migrationRoot, `.${LEGACY_SEED_MIGRATION_ID}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(temp, `${JSON.stringify({
+      schemaVersion: 1,
+      migration: LEGACY_SEED_MIGRATION_ID,
+      completedAt: new Date().toISOString(),
+    }, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+    await fsyncFile(temp);
+    await rename(temp, target);
+    await fsyncParent(target);
+  } catch (error) {
+    await rm(temp, { force: true });
+    throw error;
+  }
+}
+
 async function writeBuiltinGovernanceOverlay(
   root: string,
   overlay: BuiltinGovernanceOverlay,
@@ -1316,23 +1381,25 @@ function legacyRelativePathCandidates(record: SkillProductRecord): string[] {
   ];
 }
 
-/** Ignore only byte-identical legacy PVC copies made by the retired seed-skills initContainer. */
-async function isSeededBuiltinCopy(
-  record: SkillProductRecord,
-  catalog: readonly BuiltinCatalogEntry[],
-  productRoot: string,
-): Promise<boolean> {
-  if (!isSeedEligibleBuiltin(record)) return false;
-  const relativePath = relative(resolve(productRoot), resolve(record.path)).split(sep).join('/');
-  if (!relativePath || relativePath === '..' || relativePath.startsWith('../')) return false;
-  const candidates = catalog.filter((entry) => entry.seedEligible
-    && entry.name === record.name
-    && entry.tenantId === record.tenantId
-    && entry.sourceVersion === record.version
-    && entry.relativePath === relativePath);
-  if (!candidates.length) return false;
-  const digest = await contentDigest(record.path).catch(() => undefined);
-  return digest !== undefined && candidates.some((entry) => entry.sourceDigest === digest);
+async function readLegacySeedCandidate(
+  path: string,
+  source: BuiltinCatalogEntry,
+): Promise<SkillProductRecord | undefined> {
+  let metadata;
+  try {
+    metadata = parseSkillProductMetadata(JSON.parse(await readFile(join(path, PRODUCT_RECORD_FILE), 'utf8')));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    log.warn({ path, err: String(error) }, 'skipping invalid legacy seed candidate metadata');
+    return undefined;
+  }
+  if (metadata.name !== source.name || metadata.tenantId !== source.tenantId
+    || metadata.version !== source.sourceVersion) return undefined;
+  return normalizeSkillProductRecord({
+    id: `${metadata.tenantId}:${metadata.ownerUserId ?? 'public'}:${metadata.name}`,
+    path,
+    ...metadata,
+  });
 }
 
 function skillFromRecord(

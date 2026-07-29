@@ -1,4 +1,5 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { lstat, mkdir, mkdtemp, open, rm, type FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -68,6 +69,7 @@ function codeFile(language: string | undefined): string {
 
 class LocalSandboxHandle implements SandboxHandle {
   readonly sandboxId: string;
+  readonly supportsSecretFiles = false;
   private killed = false;
 
   constructor(private readonly dir: string, key: string) {
@@ -81,9 +83,8 @@ class LocalSandboxHandle implements SandboxHandle {
   async runCode(code: string, opts?: RunCodeOpts): Promise<ExecResult> {
     if (this.killed) return { stdout: '', stderr: '', exitCode: 1, error: 'sandbox already killed' };
     const fileName = codeFile(opts?.language);
-    const file = path.join(this.dir, fileName);
-    await writeFile(file, code);
-    const cmd = codeCommand(opts?.language, file);
+    await this.writeFile(fileName, Buffer.from(code, 'utf8'));
+    const cmd = codeCommand(opts?.language, fileName);
     return runProcess(cmd.command, cmd.args, { cwd: this.dir, onOutput: opts?.onOutput });
   }
 
@@ -94,15 +95,33 @@ class LocalSandboxHandle implements SandboxHandle {
 
   async readFile(p: string): Promise<Uint8Array> {
     if (this.killed) throw new Error('sandbox already killed');
-    return readFile(this.resolveSandboxPath(p));
+    return this.withSandboxParent(p, false, async (parent, name) => {
+      const file = await this.openFileAt(parent, name, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        return await file.readFile();
+      } finally {
+        await file.close();
+      }
+    });
   }
 
   async writeFile(p: string, content: Uint8Array, options?: { mode?: number }): Promise<void> {
     if (this.killed) throw new Error('sandbox already killed');
-    const target = this.resolveSandboxPath(p);
-    await mkdir(path.dirname(target), { recursive: true });
-    await writeFile(target, content, { mode: options?.mode });
-    if (options?.mode !== undefined) await chmod(target, options.mode);
+    await this.withSandboxParent(p, true, async (parent, name) => {
+      const mode = options?.mode ?? 0o666;
+      const file = await this.openFileAt(
+        parent,
+        name,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
+        mode,
+      );
+      try {
+        await file.writeFile(content);
+        if (options?.mode !== undefined) await file.chmod(options.mode);
+      } finally {
+        await file.close();
+      }
+    });
   }
 
   async setTimeout(_ms: number): Promise<void> {
@@ -115,21 +134,97 @@ class LocalSandboxHandle implements SandboxHandle {
     await rm(this.dir, { recursive: true, force: true });
   }
 
-  private resolveSandboxPath(requested: string): string {
-    const segments = requested.replace(/\\/g, '/').split('/');
+  private sandboxPathParts(requested: string): string[] {
+    const normalized = requested.replace(/\\/g, '/');
+    const segments = normalized.split('/');
     if (segments.includes('..')) throw new Error('sandbox path escapes sandbox root');
-    let relativePath = requested;
-    if (path.isAbsolute(requested)) {
-      if (requested === '/workspace') relativePath = 'workspace';
-      else if (requested.startsWith('/workspace/')) relativePath = `workspace/${requested.slice('/workspace/'.length)}`;
+    let relativePath = normalized;
+    if (path.posix.isAbsolute(normalized)) {
+      if (normalized === '/workspace') relativePath = 'workspace';
+      else if (normalized.startsWith('/workspace/')) relativePath = `workspace/${normalized.slice('/workspace/'.length)}`;
       else throw new Error('unsupported sandbox absolute path');
     }
     const target = path.resolve(this.dir, relativePath);
-    const relative = path.relative(this.dir, target);
-    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    const relativeTarget = path.relative(this.dir, target);
+    if (relativeTarget === '..' || relativeTarget.startsWith(`..${path.sep}`) || path.isAbsolute(relativeTarget)) {
       throw new Error('sandbox path escapes sandbox root');
     }
-    return target;
+    const parts = relativeTarget.split(path.sep).filter(Boolean);
+    if (!parts.length) throw new Error('sandbox file path is required');
+    return parts;
+  }
+
+  private async withSandboxParent<T>(
+    requested: string,
+    createParents: boolean,
+    operation: (parent: FileHandle, name: string) => Promise<T>,
+  ): Promise<T> {
+    const parts = this.sandboxPathParts(requested);
+    const name = parts.pop()!;
+    let current = await open(
+      this.dir,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    try {
+      for (const segment of parts) {
+        const next = await this.openDirectoryAt(current, segment, createParents);
+        const previous = current;
+        current = next;
+        await previous.close();
+      }
+      return await operation(current, name);
+    } finally {
+      await current.close().catch(() => undefined);
+    }
+  }
+
+  private async openDirectoryAt(parent: FileHandle, name: string, create: boolean): Promise<FileHandle> {
+    const target = this.pathAt(parent, name);
+    for (;;) {
+      try {
+        return await open(
+          target,
+          constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+        );
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT' && create) {
+          try {
+            await mkdir(target, { mode: 0o700 });
+          } catch (mkdirError) {
+            if ((mkdirError as NodeJS.ErrnoException).code !== 'EEXIST') throw mkdirError;
+          }
+          continue;
+        }
+        await this.throwIfSymlink(target);
+        throw error;
+      }
+    }
+  }
+
+  private async openFileAt(parent: FileHandle, name: string, flags: number, mode?: number): Promise<FileHandle> {
+    const target = this.pathAt(parent, name);
+    try {
+      return await open(target, flags, mode);
+    } catch (error) {
+      await this.throwIfSymlink(target);
+      throw error;
+    }
+  }
+
+  private pathAt(parent: FileHandle, name: string): string {
+    return `/proc/self/fd/${parent.fd}/${name}`;
+  }
+
+  private async throwIfSymlink(target: string): Promise<void> {
+    try {
+      if ((await lstat(target)).isSymbolicLink()) {
+        throw new Error('sandbox path contains symbolic link');
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
   }
 }
 

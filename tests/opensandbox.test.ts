@@ -141,6 +141,7 @@ describe('OpenSandboxProvider', () => {
     const p = new OpenSandboxProvider();
     const handle = await p.create({ key: 'k' });
     expect(handle.workspacePath?.('skills/demo')).toBe('/workspace/skills/demo');
+    expect(handle.supportsSecretFiles).toBe(true);
     expect(() => handle.workspacePath?.('../escape')).toThrow('escapes sandbox root');
     await handle.runCode('print(1+1)', { language: 'python' });
     const b64 = Buffer.from('print(1+1)', 'utf8').toString('base64');

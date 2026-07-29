@@ -74,6 +74,8 @@ function defaultSleep(ms: number): Promise<void> {
 
 /** AIOS Lifecycle REST 的 SandboxHandle 适配器。 */
 class AiosE2bHandle implements SandboxHandle {
+  readonly supportsSecretFiles = true;
+
   constructor(
     readonly sandboxId: string,
     private readonly provider: AiosE2bProvider,

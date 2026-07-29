@@ -1,4 +1,4 @@
-import { chmod, cp, mkdtemp, mkdir, readFile, readdir, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdtemp, mkdir, readFile, readdir, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -103,6 +103,10 @@ function testZip(files: Record<string, string>): Buffer {
 
 async function writeProduct(dir: string, metadata: Record<string, unknown>): Promise<void> {
   await writeFile(join(dir, '.product.json'), `${JSON.stringify(metadata, null, 2)}\n`);
+}
+
+function legacyMigrationMarker(root: string): string {
+  return join(root, '.aiop-governance', 'migrations', 'legacy-seed-governance-v1.done');
 }
 
 describe('SkillRegistry', () => {
@@ -440,6 +444,8 @@ describe('SkillRegistry', () => {
     await registry.scan();
     await registry.scan();
 
+    await expect(stat(legacyMigrationMarker(productRoot))).resolves.toBeDefined();
+
     expect(registry.listFor(admin).find((skill) => skill.name === 'legacy-disabled')?.enabled).toBe(false);
     expect(registry.listFor(admin).find((skill) => skill.name === 'legacy-unreviewed')?.reviewed).toBe(false);
     await expect(registry.loadFor('legacy-private', viewer)).resolves.toBeUndefined();
@@ -450,6 +456,113 @@ describe('SkillRegistry', () => {
       await expect(stat(join(productRoot, definition.relative))).rejects.toThrow();
     }
     await expect(stat(join(productRoot, '.aiop-tombstones', 'old-legacy-deleted'))).rejects.toThrow();
+  });
+
+  it('does not rerun legacy migration or hash later user and cross-tenant published records', async () => {
+    const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-marker-source-'));
+    const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-marker-product-'));
+    const relative = 'users/admin/late-user';
+    const builtin = join(builtinRoot, relative);
+    await mkdir(builtin, { recursive: true });
+    await writeFile(join(builtin, 'SKILL.md'), '---\nname: late-user\ndescription: late\n---\nbody');
+    await writeProduct(builtin, {
+      name: 'late-user', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'shared', ownerUserId: 'admin',
+    });
+    await new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] }).scan();
+    await expect(stat(legacyMigrationMarker(productRoot))).resolves.toBeDefined();
+
+    const lateUser = join(productRoot, relative);
+    await mkdir(dirname(lateUser), { recursive: true });
+    await cp(builtin, lateUser, { recursive: true });
+    const published = join(productRoot, '.aiop-published', 'tenant-other', '1-artifact', 'cross-tenant');
+    await mkdir(published, { recursive: true });
+    const publishedSkill = join(published, 'SKILL.md');
+    await writeFile(
+      publishedSkill,
+      `---\nname: cross-tenant\ndescription: other\n---\n${'x'.repeat(4 * 1024 * 1024)}`,
+    );
+    await writeProduct(published, {
+      name: 'cross-tenant', version: '1', enabled: true, reviewed: true,
+      tenantId: 'tenant-other', visibility: 'public', contentDigest: 'a'.repeat(64),
+      artifactVersion: '1-artifact', submittedByUserId: 'other-user',
+    });
+    await writeFile(join(published, '.aiop-committed'), 'committed\n');
+    const old = new Date('2001-01-01T00:00:00.000Z');
+    const recent = new Date('2026-01-01T00:00:00.000Z');
+    await utimes(publishedSkill, old, recent);
+    const initialAtime = (await stat(publishedSkill)).atimeMs;
+
+    const registry = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    await registry.scan();
+    const viewer = { tenantId: 'default', userId: 'viewer', role: 'user' as const };
+    await registry.listLoadedFor(viewer);
+    await registry.summariesFor(viewer);
+    await registry.loadFor('late-user', viewer);
+
+    await expect(stat(lateUser)).resolves.toBeDefined();
+    expect((await stat(publishedSkill)).atimeMs).toBe(initialAtime);
+  });
+
+  it('coordinates the versioned legacy migration marker across registries', async () => {
+    const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-concurrent-migration-source-'));
+    const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-concurrent-migration-product-'));
+    for (const root of [builtinRoot, productRoot]) {
+      const skill = join(root, 'concurrent-migration');
+      await mkdir(skill);
+      await writeFile(join(skill, 'SKILL.md'), '---\nname: concurrent-migration\ndescription: concurrent\n---\nbody');
+      await writeProduct(skill, {
+        name: 'concurrent-migration', version: '1', enabled: true, reviewed: true,
+        tenantId: 'default', visibility: 'public',
+      });
+    }
+    const lockKeys: string[][] = [];
+    let tail = Promise.resolve();
+    const lock: SkillMutationLock = {
+      async withLock<T>(key: string, _timeoutMs: number, operation: () => Promise<T>): Promise<T> {
+        return this.withLocks!([key], _timeoutMs, operation);
+      },
+      async withLocks<T>(keys: readonly string[], _timeoutMs: number, operation: () => Promise<T>): Promise<T> {
+        lockKeys.push([...keys]);
+        const current = tail.then(operation);
+        tail = current.then(() => undefined, () => undefined);
+        return current;
+      },
+    };
+    const first = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot], mutationLock: lock });
+    const second = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot], mutationLock: lock });
+
+    await Promise.all([first.scan(), second.scan()]);
+
+    expect(lockKeys.flat()).toContain('skill-legacy-migration:v1');
+    await expect(stat(legacyMigrationMarker(productRoot))).resolves.toBeDefined();
+    await expect(stat(join(productRoot, 'concurrent-migration'))).rejects.toThrow();
+  });
+
+  it('does not persist the legacy migration marker after failure and retries later', async () => {
+    const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-retry-migration-source-'));
+    const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-retry-migration-product-'));
+    const builtin = join(builtinRoot, 'retry-migration');
+    const legacy = join(productRoot, 'retry-migration');
+    await mkdir(builtin);
+    await writeFile(join(builtin, 'SKILL.md'), '---\nname: retry-migration\ndescription: retry\n---\nbody');
+    await writeProduct(builtin, {
+      name: 'retry-migration', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+    });
+    await cp(builtin, legacy, { recursive: true });
+    await rm(join(legacy, 'SKILL.md'));
+    await symlink(join(builtin, 'SKILL.md'), join(legacy, 'SKILL.md'));
+    const registry = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+
+    await expect(registry.scan()).rejects.toThrow('符号链接');
+    await expect(stat(legacyMigrationMarker(productRoot))).rejects.toThrow();
+
+    await rm(join(legacy, 'SKILL.md'));
+    await writeFile(join(legacy, 'SKILL.md'), '---\nname: retry-migration\ndescription: retry\n---\nbody');
+    await registry.scan();
+    await expect(stat(legacyMigrationMarker(productRoot))).resolves.toBeDefined();
+    await expect(stat(legacy)).rejects.toThrow();
   });
 
   it('keeps a legacy seed when an existing governance overlay is incomplete', async () => {
@@ -644,6 +757,53 @@ describe('SkillRegistry', () => {
 });
 
 describe('SkillRegistry governed Pi loading', () => {
+  it('bounds cold digest verification concurrency while preserving record order', async () => {
+    const records: SkillProductRecord[] = Array.from({ length: 9 }, (_, index) => ({
+      id: `cold-${index}`,
+      name: `cold-${index}`,
+      path: `/skills/cold-${index}`,
+      version: '1',
+      tenantId: 'tenant-a',
+      visibility: 'public' as const,
+      enabled: true,
+      reviewed: true,
+      contentDigest: index.toString(16).padStart(64, '0'),
+    }));
+    let inflight = 0;
+    let maxInflight = 0;
+    const verifiedPaths: string[] = [];
+    const verifyContentDigest = vi.fn(async (path: string) => {
+      inflight += 1;
+      maxInflight = Math.max(maxInflight, inflight);
+      await new Promise((resolvePending) => setTimeout(resolvePending, 5));
+      verifiedPaths.push(path);
+      inflight -= 1;
+      return records.find((record) => record.path === path)!.contentDigest!;
+    });
+    const loader = vi.fn(async (_env, sources: Array<{ path: string; source: SkillProductRecord }>) => ({
+      skills: sources.map(({ path, source }) => ({
+        source,
+        skill: { name: source.name, description: source.name, content: source.name, filePath: join(path, 'SKILL.md') },
+      })),
+      diagnostics: [],
+    }));
+    const registry = new SkillRegistry('/unused', {
+      records,
+      loader,
+      env: {} as never,
+      verifyContentDigest,
+    });
+    await registry.scan();
+
+    const loaded = await registry.listLoadedFor({ tenantId: 'tenant-a', userId: 'u', role: 'user' });
+
+    expect(verifyContentDigest).toHaveBeenCalledTimes(records.length);
+    expect(new Set(verifiedPaths)).toEqual(new Set(records.map((record) => record.path)));
+    expect(maxInflight).toBe(4);
+    expect(loader).toHaveBeenCalledOnce();
+    expect(loaded.map((skill) => skill.name)).toEqual(records.map((record) => record.name));
+  });
+
   it('loads reviewed built-in products through their explicit platform-global tenant contract', async () => {
     const reg = new SkillRegistry(resolve('skills'));
     await reg.scan();

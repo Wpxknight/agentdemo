@@ -33,6 +33,8 @@ type E2bCreateOptions = {
 
 /** 把 E2B Sandbox 实例适配为统一的 SandboxHandle。 */
 class E2bHandle implements SandboxHandle {
+  readonly supportsSecretFiles = true;
+
   constructor(private readonly sbx: Sandbox) {}
 
   get sandboxId(): string {

@@ -75,6 +75,8 @@ export interface RunCommandOpts {
 /** 一个已就绪沙箱的统一句柄。 */
 export interface SandboxHandle {
   readonly sandboxId: string;
+  /** Whether this provider can keep injected secret files isolated from the host environment. */
+  readonly supportsSecretFiles?: boolean;
   /** Returns a command-visible path beneath this sandbox's workspace root. */
   workspacePath?(relativePath?: string): string;
   /** 在沙箱里执行代码（默认 python）。 */

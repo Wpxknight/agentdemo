@@ -179,6 +179,7 @@ describe('E2bProvider standard SDK mode', () => {
     const p = new E2bProvider({ apiKey: 'key' });
     const handle = await p.create({ key: 'session:dev' });
     expect(handle.workspacePath?.('skills/demo')).toBe('/workspace/skills/demo');
+    expect(handle.supportsSecretFiles).toBe(true);
     expect(() => handle.workspacePath?.('../escape')).toThrow('escapes sandbox root');
 
     await expect(handle.runCommand('exit 7', {

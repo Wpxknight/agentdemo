@@ -24,6 +24,9 @@ export async function injectSkillCredentials(opts: {
 }): Promise<string> {
   const { skill, sbx, dest, ctx, markCredentialInjected, deps } = opts;
   if (!skill.credentials.length) return '';
+  if (sbx.supportsSecretFiles === false) {
+    return '\n注意：本地沙箱不支持安全凭据文件，未获取或注入平台凭据。';
+  }
   if (!deps.credentials || !ctx.tenantId || !ctx.userId) {
     return '\n注意：该技能需要平台凭据，但当前环境未启用凭据注入。';
   }

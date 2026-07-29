@@ -1,8 +1,8 @@
-import { access, mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { SkillRegistry } from '../src/skill/registry.js';
 import { buildSkillTools } from '../src/tools/skill/index.js';
 import type { SandboxManager } from '../src/sandbox/lifecycle.js';
@@ -174,10 +174,11 @@ describe('buildSkillTools', () => {
       get: async () => handle,
       markCredentialInjected: () => {},
     } as unknown as SandboxManager;
+    const getCredential = vi.fn(async (_tenant: string, _user: string, provider: string) => ({
+      token: `${provider}-secret`,
+    }));
     const sync = buildSkillTools(localRegistry, manager, undefined, {
-      credentials: {
-        get: async (_tenant: string, _user: string, provider: string) => ({ token: `${provider}-secret` }),
-      } as never,
+      credentials: { get: getCredential } as never,
     }).find((tool) => tool.def.name === 'skill__sync_to_sandbox')!;
     const hostWorkspaceFile = `/workspace/skills/${name}/sub/token.json`;
     const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
@@ -187,29 +188,109 @@ describe('buildSkillTools', () => {
       const result = await sync.run({ name }, {
         sessionId: 'local-sync', tenantId: 'default', userId: 'u', role: 'user',
       });
-      const dest = handle.workspacePath?.(`skills/${name}`);
+      const dest = /到沙箱 (.+)\/（/.exec(result.content)?.[1];
 
       expect(result.isError).toBeFalsy();
-      expect(result.content).toContain('已按当前用户注入 aios 凭据');
-      expect(result.content).toContain('已按当前用户注入 gitlab 凭据');
-      expect(dest).toBe(`workspace/skills/${name}`);
-      expect(JSON.parse(Buffer.from(await handle.readFile(`${dest}/sub/token.json`)).toString('utf8'))).toEqual({
-        providers: {
-          aios: { token: 'aios-secret' },
-          gitlab: { token: 'gitlab-secret' },
-        },
-      });
-      expect(await readFile(join(sandboxRoot, 'workspace', 'skills', name, 'sub', 'token.json'), 'utf8'))
-        .toContain('aios-secret');
-      const command = await handle.runCommand(`cat '${dest}/sub/token.json'`);
+      expect(result.content).toContain('本地沙箱不支持安全凭据文件');
+      expect(getCredential).not.toHaveBeenCalled();
+      expect(dest).toMatch(new RegExp(`^workspace/skills/${name}/[0-9a-f-]+$`));
+      await expect(handle.readFile(`${dest}/sub/token.json`)).rejects.toThrow();
+      expect(await readFile(join(sandboxRoot, dest!, 'SKILL.md'), 'utf8'))
+        .toContain('local credential sync');
+      const command = await handle.runCommand(`cat '${dest}/SKILL.md'`);
       expect(command).toMatchObject({ exitCode: 0 });
-      expect(command.stdout).toContain('gitlab-secret');
+      expect(command.stdout).toContain('local credential sync');
       await expect(access(hostWorkspaceFile)).rejects.toThrow();
     } finally {
       await handle.kill();
     }
     await expect(access(sandboxRoot)).rejects.toThrow();
     await expect(access(hostWorkspaceFile)).rejects.toThrow();
+  });
+
+  it('does not follow a local sandbox destination symlink during partial sync', async () => {
+    const handle = await new LocalSandboxProvider().create({ key: 'local-sync-symlink' });
+    const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
+    const hostTarget = await mkdtemp(join(tmpdir(), 'aiop-local-sync-host-'));
+    await mkdir(join(sandboxRoot, 'workspace', 'skills'), { recursive: true });
+    await symlink(hostTarget, join(sandboxRoot, 'workspace', 'skills', 'demo'));
+    const sync = buildSkillTools(registry, {
+      get: async () => handle,
+      markCredentialInjected: () => {},
+    } as unknown as SandboxManager).find((tool) => tool.def.name === 'skill__sync_to_sandbox')!;
+    try {
+      const result = await sync.run({ name: 'demo', paths: ['sub/scripts/run.py'] }, {
+        sessionId: 'local-sync-symlink', tenantId: 'default', userId: 'u', role: 'user',
+      });
+      expect(result.isError).toBe(true);
+      await expect(access(join(hostTarget, 'sub', 'scripts', 'run.py'))).rejects.toThrow();
+    } finally {
+      await handle.kill();
+    }
+    await expect(access(sandboxRoot)).rejects.toThrow();
+    await expect(access(join(hostTarget, 'sub', 'scripts', 'run.py'))).rejects.toThrow();
+  });
+
+  it('does not delete through a local sandbox parent symlink during full sync', async () => {
+    const handle = await new LocalSandboxProvider().create({ key: 'local-full-sync-parent-symlink' });
+    const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
+    const hostTarget = await mkdtemp(join(tmpdir(), 'aiop-local-full-sync-host-'));
+    const hostSkill = join(hostTarget, 'demo');
+    const hostFile = join(hostSkill, 'host.txt');
+    await mkdir(hostSkill, { recursive: true });
+    await writeFile(hostFile, 'host-original');
+    await mkdir(join(sandboxRoot, 'workspace'), { recursive: true });
+    await symlink(hostTarget, join(sandboxRoot, 'workspace', 'skills'));
+    const sync = buildSkillTools(registry, {
+      get: async () => handle,
+      markCredentialInjected: () => {},
+    } as unknown as SandboxManager).find((tool) => tool.def.name === 'skill__sync_to_sandbox')!;
+    try {
+      const result = await sync.run({ name: 'demo' }, {
+        sessionId: 'local-full-sync-parent-symlink', tenantId: 'default', userId: 'u', role: 'user',
+      });
+
+      expect(result.isError).toBe(true);
+      await expect(readFile(hostFile, 'utf8')).resolves.toBe('host-original');
+    } finally {
+      await handle.kill();
+    }
+    await expect(readFile(hostFile, 'utf8')).resolves.toBe('host-original');
+  });
+
+  it('uses a fresh destination for each local full sync without deleting the previous copy', async () => {
+    const handle = await new LocalSandboxProvider().create({ key: 'local-full-sync-unique-dest' });
+    const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
+    const sync = buildSkillTools(registry, {
+      get: async () => handle,
+      markCredentialInjected: () => {},
+    } as unknown as SandboxManager).find((tool) => tool.def.name === 'skill__sync_to_sandbox')!;
+    const destination = (content: string) => /到沙箱 (.+)\/（/.exec(content)?.[1];
+    let firstDest: string | undefined;
+    let secondDest: string | undefined;
+    try {
+      const first = await sync.run({ name: 'demo' }, {
+        sessionId: 'local-full-sync-unique-dest', tenantId: 'default', userId: 'u', role: 'user',
+      });
+      const second = await sync.run({ name: 'demo' }, {
+        sessionId: 'local-full-sync-unique-dest', tenantId: 'default', userId: 'u', role: 'user',
+      });
+      firstDest = destination(first.content);
+      secondDest = destination(second.content);
+
+      expect(first.isError).toBeFalsy();
+      expect(second.isError).toBeFalsy();
+      expect(firstDest).toMatch(/^workspace\/skills\/demo\//);
+      expect(secondDest).toMatch(/^workspace\/skills\/demo\//);
+      expect(secondDest).not.toBe(firstDest);
+      await expect(handle.readFile(`${firstDest}/SKILL.md`)).resolves.toBeInstanceOf(Uint8Array);
+      await expect(handle.readFile(`${secondDest}/SKILL.md`)).resolves.toBeInstanceOf(Uint8Array);
+    } finally {
+      await handle.kill();
+    }
+    await expect(access(sandboxRoot)).rejects.toThrow();
+    await expect(access(join(sandboxRoot, firstDest!))).rejects.toThrow();
+    await expect(access(join(sandboxRoot, secondDest!))).rejects.toThrow();
   });
 
   it('keeps the multi-provider schema when only some credentials are available', async () => {

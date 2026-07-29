@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
-import { access, readFile, stat } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { access, mkdir, mkdtemp, readFile, rename, stat, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SandboxManager } from '../src/sandbox/lifecycle.js';
 import { LocalSandboxProvider } from '../src/sandbox/local.js';
@@ -516,6 +518,7 @@ describe('LocalSandboxProvider', () => {
     const sandboxPath = `/workspace/${handle.sandboxId}/credentials/token.json`;
     const workspaceFile = handle.workspacePath?.(`${handle.sandboxId}/credentials/token.json`);
     const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
+    expect(handle.supportsSecretFiles).toBe(false);
     expect(workspaceFile).toBe(`workspace/${handle.sandboxId}/credentials/token.json`);
     await handle.writeFile?.(sandboxPath, Buffer.from('secret'), { mode: 0o600 });
 
@@ -540,6 +543,76 @@ describe('LocalSandboxProvider', () => {
     } finally {
       await handle.kill();
     }
+  });
+
+  it('rejects parent and final symlinks without changing host files', async () => {
+    const hostRoot = await mkdtemp(join(tmpdir(), 'aiop-local-symlink-host-'));
+    const parentTarget = join(hostRoot, 'parent.txt');
+    const finalTarget = join(hostRoot, 'final.txt');
+    await writeFile(parentTarget, 'parent-original');
+    await writeFile(finalTarget, 'final-original');
+    const handle = await new LocalSandboxProvider().create({ key: 'local-symlink-test' });
+    const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
+    await mkdir(join(sandboxRoot, 'workspace'), { recursive: true });
+    await symlink(hostRoot, join(sandboxRoot, 'workspace', 'parent-link'));
+    await symlink(finalTarget, join(sandboxRoot, 'workspace', 'final-link'));
+    try {
+      await expect(handle.writeFile?.('workspace/parent-link/parent.txt', Buffer.from('changed')))
+        .rejects.toThrow('symbolic link');
+      await expect(handle.readFile('workspace/parent-link/parent.txt')).rejects.toThrow('symbolic link');
+      await expect(handle.writeFile?.('workspace/final-link', Buffer.from('changed')))
+        .rejects.toThrow('symbolic link');
+      await expect(handle.readFile('workspace/final-link')).rejects.toThrow('symbolic link');
+      await expect(readFile(parentTarget, 'utf8')).resolves.toBe('parent-original');
+      await expect(readFile(finalTarget, 'utf8')).resolves.toBe('final-original');
+    } finally {
+      await handle.kill();
+    }
+    await expect(access(sandboxRoot)).rejects.toThrow();
+    await expect(readFile(parentTarget, 'utf8')).resolves.toBe('parent-original');
+    await expect(readFile(finalTarget, 'utf8')).resolves.toBe('final-original');
+  });
+
+  it('keeps file operations anchored when a checked parent is replaced before open', async () => {
+    const hostRoot = await mkdtemp(join(tmpdir(), 'aiop-local-race-host-'));
+    const hostFile = join(hostRoot, 'victim.txt');
+    await writeFile(hostFile, 'host-original');
+    let swapped = false;
+    vi.resetModules();
+    vi.doMock('node:fs/promises', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs/promises')>();
+      return {
+        ...actual,
+        open: async (...args: Parameters<typeof actual.open>) => {
+          const [target, flags] = args;
+          if (!swapped && String(target).endsWith('/victim.txt')
+            && typeof flags === 'number' && (flags & constants.O_TRUNC) !== 0) {
+            swapped = true;
+            await actual.rename(sandboxParent, `${sandboxParent}-checked`);
+            await actual.symlink(hostRoot, sandboxParent);
+          }
+          return actual.open(...args);
+        },
+      };
+    });
+    const { LocalSandboxProvider: FreshLocalSandboxProvider } = await import('../src/sandbox/local.js');
+    const handle = await new FreshLocalSandboxProvider().create({ key: 'local-parent-race-test' });
+    const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
+    const sandboxParent = join(sandboxRoot, 'workspace', 'parent');
+    await mkdir(sandboxParent, { recursive: true });
+    await writeFile(join(sandboxParent, 'victim.txt'), 'sandbox-original');
+    try {
+      await handle.writeFile?.('workspace/parent/victim.txt', Buffer.from('sandbox-changed'));
+
+      expect(swapped).toBe(true);
+      await expect(readFile(hostFile, 'utf8')).resolves.toBe('host-original');
+      await expect(readFile(`${sandboxParent}-checked/victim.txt`, 'utf8')).resolves.toBe('sandbox-changed');
+    } finally {
+      vi.doUnmock('node:fs/promises');
+      vi.resetModules();
+      await handle.kill();
+    }
+    await expect(readFile(hostFile, 'utf8')).resolves.toBe('host-original');
   });
 });
 

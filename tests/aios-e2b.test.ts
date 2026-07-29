@@ -210,6 +210,7 @@ describe('AiosE2bProvider', () => {
     ]);
     const handle = await provider(fetch).create({ key: 'session:code', template: 'code-id' });
     expect(handle.workspacePath?.('skills/demo')).toBe('/workspace/skills/demo');
+    expect(handle.supportsSecretFiles).toBe(true);
     expect(() => handle.workspacePath?.('../escape')).toThrow('escapes sandbox root');
 
     await expect(handle.runCode('console.log(42)', { language: 'javascript' }))

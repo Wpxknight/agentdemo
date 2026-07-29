@@ -1,5 +1,7 @@
 import { execFile } from 'node:child_process';
-import { posix } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { posix, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import type { SandboxHandle } from '../sandbox/types.js';
 import type { SkillFileEntry } from './product.js';
@@ -34,6 +36,12 @@ export async function syncSkillToSandbox(input: {
   const result = { dest, kept, skipped, total };
   if (!kept.length) return { ...result, error: '没有可同步的文件（可能全部被大小过滤跳过）' };
   if (total > SYNC_TOTAL_BYTES) return { ...result, error: '待同步文件总量超过上限；请用 paths 参数缩小同步范围' };
+  if (input.sbx.supportsSecretFiles === false && input.sbx.writeFile) {
+    return syncLocalSkillFiles(input, {
+      ...result,
+      dest: posix.join(dest, randomUUID()),
+    });
+  }
 
   const { stdout: archive } = await execFileAsync(
     'tar', ['-C', input.dir, '-czf', '-', ...kept.map((file) => file.path)],
@@ -62,6 +70,31 @@ export async function syncSkillToSandbox(input: {
   );
   if (failed(unpack) || !unpack.stdout.includes('AIOP_SYNC_OK')) {
     return { ...result, error: `沙箱解包失败：${execErrorText(unpack)}` };
+  }
+  return result;
+}
+
+async function syncLocalSkillFiles(
+  input: {
+    dir: string;
+    partial: boolean;
+    sbx: SandboxHandle;
+  },
+  result: Omit<SandboxSyncResult, 'error'>,
+): Promise<SandboxSyncResult> {
+  const writeSandboxFile = input.sbx.writeFile;
+  if (!writeSandboxFile) return { ...result, error: '本地沙箱不支持安全文件上传' };
+  try {
+    for (const file of result.kept) {
+      const source = resolve(input.dir, file.path);
+      const relativeSource = relative(resolve(input.dir), source);
+      if (relativeSource === '..' || relativeSource.startsWith(`..${sep}`) || relativeSource === '') {
+        throw new Error('技能同步源路径越界');
+      }
+      await writeSandboxFile.call(input.sbx, posix.join(result.dest, file.path), await readFile(source));
+    }
+  } catch (error) {
+    return { ...result, error: `沙箱文件写入失败：${String(error)}` };
   }
   return result;
 }

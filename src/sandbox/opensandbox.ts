@@ -83,6 +83,8 @@ function safeMetadataValues(metadata: Record<string, string>): Record<string, st
 
 /** 把 OpenSandbox Sandbox 实例适配为统一的 SandboxHandle。 */
 class OpenSandboxHandle implements SandboxHandle {
+  readonly supportsSecretFiles = true;
+
   constructor(private readonly sbx: Sandbox) {}
 
   workspacePath(relativePath = ''): string {
