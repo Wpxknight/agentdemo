@@ -273,6 +273,35 @@ describe('GovernedToolFactory', () => {
     expect(execute).not.toHaveBeenCalled();
   });
 
+  it('rejects a pending ledger whose persisted capability differs from the current definition', async () => {
+    const ledger = new MemoryLedger();
+    await ledger.putIfAbsent({
+      tenantId: 'tenant-a', runId: 'run-a', attemptId: 'attempt-a', turnNo: 1,
+      logicalCallId: 'logical-a', toolCallId: 'call-a', toolName: 'write',
+      argsDigest: digestToolValue({ resource: 'deployment/a' }), capability: 'retryable_write',
+      idempotencyKey: 'tenant-a:run-a:logical-a', approvedInteractionId: 'approval-a',
+      status: 'pending_approval', createdAt: new Date(), updatedAt: new Date(),
+    });
+    const execute = vi.fn(async () => ({ content: 'must not execute' }));
+    const interactions = new MemoryInteractions([{
+      tenantId: 'tenant-a', runId: 'run-a', id: 'approval-a', attemptId: 'attempt-a', turnNo: 1,
+      toolCallId: 'call-a', kind: 'approval', status: 'resolved', resolution: true,
+      payload: approvalPayload(), createdAt: new Date(),
+    }]);
+    const runtime = new GovernedToolFactory({ ledger, interactions }).create([{
+      name: 'write', description: 'write', inputSchema: {}, capability: 'read', execute,
+    }]);
+
+    await expect(runtime.execute(call(), {
+      ...context,
+      attemptId: 'attempt-resume',
+      interactionResolution: {
+        interactionId: 'approval-a', kind: 'approval', toolCallId: 'call-a', value: true,
+      },
+    })).resolves.toMatchObject({ kind: 'recovery_required' });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it('returns a committed completed ledger result without re-executing', async () => {
     const ledger = new MemoryLedger();
     const execute = vi.fn(async () => ({ content: 'changed' }));

@@ -74,7 +74,7 @@ class GovernedToolRuntime implements ToolRuntime {
     const existing = await this.options.ledger.get({
       tenantId: context.identity.tenantId, runId: context.runId, logicalCallId: call.logicalCallId,
     });
-    const mismatch = ledgerMismatch(existing, call, argsDigest);
+    const mismatch = ledgerMismatch(existing, call, argsDigest, tool.capability);
     if (mismatch) return mismatch;
     if (existing?.status === 'completed' && existing.result) return { kind: 'result', result: existing.result };
 
@@ -225,7 +225,7 @@ class GovernedToolRuntime implements ToolRuntime {
     const existing = await this.options.ledger.get({
       tenantId: context.identity.tenantId, runId: context.runId, logicalCallId: call.logicalCallId,
     });
-    const mismatch = ledgerMismatch(existing, call, digestToolValue(call.arguments));
+    const mismatch = ledgerMismatch(existing, call, digestToolValue(call.arguments), tool.capability);
     if (mismatch) return mismatch;
     if (!existing || existing.status !== 'pending_approval' || existing.approvedInteractionId !== interactionId) {
       return { kind: 'recovery_required', message: 'approval resolution does not match the pending tool call' };
@@ -268,7 +268,7 @@ class GovernedToolRuntime implements ToolRuntime {
     const existing = await this.options.ledger.get({
       tenantId: context.identity.tenantId, runId: context.runId, logicalCallId: call.logicalCallId,
     });
-    const mismatch = ledgerMismatch(existing, call, digestToolValue(call.arguments));
+    const mismatch = ledgerMismatch(existing, call, digestToolValue(call.arguments), tool.capability);
     if (mismatch) return mismatch;
     if (existing?.status === 'completed' && existing.result) return { kind: 'result', result: existing.result };
     if (!context.interactionResolution) {
@@ -290,6 +290,23 @@ class GovernedToolRuntime implements ToolRuntime {
     if (resolution.kind !== kind || resolution.toolCallId !== call.id || !existing
       || existing.status !== 'pending_approval' || existing.approvedInteractionId !== resolution.interactionId) {
       return { kind: 'recovery_required', message: 'interaction resolution does not match the pending tool call' };
+    }
+    const interaction = await this.options.interactions?.get({
+      tenantId: context.identity.tenantId,
+      runId: context.runId,
+      interactionId: resolution.interactionId,
+    });
+    if (!interaction || interaction.tenantId !== context.identity.tenantId || interaction.runId !== context.runId
+      || interaction.id !== resolution.interactionId || interaction.kind !== kind
+      || interaction.status !== 'resolved' || interaction.attemptId !== existing.attemptId
+      || interaction.turnNo !== existing.turnNo || interaction.toolCallId !== existing.toolCallId
+      || interaction.toolCallId !== call.id
+      || digestToolValue(interaction.resolution ?? null) !== digestToolValue(resolution.value)) {
+      return { kind: 'recovery_required', message: 'interaction resolution is not bound to the pending interaction' };
+    }
+    const callArgsDigest = digestToolValue(call.arguments);
+    if (digestToolValue(interaction.payload) !== callArgsDigest || existing.argsDigest !== callArgsDigest) {
+      return { kind: 'recovery_required', message: 'interaction payload is not bound to the pending tool call' };
     }
     const toolResult: ToolResult = {
       callId: call.id, content: `${kind} resolved: ${stableJson(resolution.value)}`,
@@ -402,8 +419,10 @@ function ledgerMismatch(
   existing: DurableToolLedgerUpdate | undefined,
   call: ToolCall,
   argsDigest: string,
+  capability: GovernedToolDefinition['capability'],
 ): ToolExecutionOutcome | undefined {
-  if (existing && (existing.toolName !== call.name || existing.argsDigest !== argsDigest)) {
+  if (existing && (existing.toolName !== call.name || existing.argsDigest !== argsDigest
+    || existing.capability !== capability)) {
     return { kind: 'recovery_required', message: 'logical tool call identity changed across attempts' };
   }
   return undefined;

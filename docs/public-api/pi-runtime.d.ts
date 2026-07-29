@@ -66,7 +66,7 @@ export declare function createConcurrentModels(models: Models, controller: Model
 // file: pi/agent.d.ts
 import type { AgentInputMessage, AgentRunEvent, DurableInteractionUpdate, DurableToolLedgerUpdate, IdentityContext, ResolvedInteraction, RunExecutionProfile } from '@aiop/control-contracts';
 import { AgentHarness, type AgentHarnessResources, type AgentHarnessTool, type Session, type SessionCreateOptions, type SessionMetadata, type SessionRepo, type SessionTreeEntry } from '@earendil-works/pi-agent-core';
-import type { Model, Models } from '@earendil-works/pi-ai';
+import { type Model, type Models } from '@earendil-works/pi-ai';
 import { EventCodec, type EventCodecOptions } from './event-codec.js';
 import { type ModelConcurrencyController } from '../model/concurrency.js';
 export interface PiAgentSessionFactoryOptions<TMetadata extends SessionMetadata, TCreateOptions extends SessionCreateOptions, TListOptions> {
@@ -240,7 +240,7 @@ export declare class EventCodec {
 export declare function toDurableJsonValue(value: unknown): JsonValue;
 
 // file: pi/governed-tool-state.d.ts
-import type { DurableInteractionUpdate, DurableToolLedgerUpdate, ToolCall, ToolExecutionOutcome, ToolResult } from '@aiop/control-contracts';
+import type { DurableInteractionUpdate, DurableToolLedgerUpdate, ToolCall, ToolDefinition, ToolExecutionOutcome, ToolResult } from '@aiop/control-contracts';
 import type { AgentHarnessEvent, AgentHarnessTool } from '@earendil-works/pi-agent-core';
 import type { GovernedToolOutcomeError } from './tool-bridge.js';
 export interface GovernedToolFailure {
@@ -253,6 +253,7 @@ export interface GovernedToolFailureTracker {
     facts: Map<string, ToolExecutionOutcome[]>;
 }
 interface GovernedToolDescriptor {
+    definition: ToolDefinition;
     createScoped(): {
         tool: AgentHarnessTool<undefined>;
         tracker: GovernedToolFailureTracker;
@@ -272,7 +273,7 @@ export interface GovernedToolScope {
         ledgerUpdates: DurableToolLedgerUpdate[];
         interactionUpdates: DurableInteractionUpdate[];
     };
-    isGoverned(tool: AgentHarnessTool<undefined>): boolean;
+    definition(tool: AgentHarnessTool<undefined>): ToolDefinition | undefined;
     hasPending(): boolean;
     clear(): void;
 }

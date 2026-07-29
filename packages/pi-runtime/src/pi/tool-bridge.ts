@@ -67,6 +67,7 @@ export function bridgeGovernedTools(
 ): AgentHarnessTool<undefined>[] {
   return tools.map((governed) => {
     const descriptor = {
+      definition: governed.definition,
       createScoped: () => {
         const tracker = createGovernedToolFailureTracker();
         const tool = createAgentTool(governed, options, tracker);

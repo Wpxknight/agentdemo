@@ -1,5 +1,5 @@
 import type {
-  DurableInteractionUpdate, DurableToolLedgerUpdate, ToolCall, ToolExecutionOutcome, ToolResult,
+  DurableInteractionUpdate, DurableToolLedgerUpdate, ToolCall, ToolDefinition, ToolExecutionOutcome, ToolResult,
 } from '@aiop/control-contracts';
 import type { AgentHarnessEvent, AgentHarnessTool } from '@earendil-works/pi-agent-core';
 import type { GovernedToolOutcomeError } from './tool-bridge.js';
@@ -16,6 +16,7 @@ export interface GovernedToolFailureTracker {
 }
 
 interface GovernedToolDescriptor {
+  definition: ToolDefinition;
   createScoped(): { tool: AgentHarnessTool<undefined>; tracker: GovernedToolFailureTracker };
 }
 
@@ -24,7 +25,7 @@ export interface GovernedToolScope {
   patch(event: Extract<AgentHarnessEvent, { type: 'tool_result' }>): { details: unknown; isError: true; terminate?: boolean } | undefined;
   takeOutcome(): GovernedToolOutcomeError | undefined;
   takeFacts(): { ledgerUpdates: DurableToolLedgerUpdate[]; interactionUpdates: DurableInteractionUpdate[] };
-  isGoverned(tool: AgentHarnessTool<undefined>): boolean;
+  definition(tool: AgentHarnessTool<undefined>): ToolDefinition | undefined;
   hasPending(): boolean;
   clear(): void;
 }
@@ -129,8 +130,8 @@ export function adoptGovernedToolScope(tools: readonly AgentHarnessTool<undefine
       const result = { ledgerUpdates: ledgerUpdates.splice(0), interactionUpdates: interactionUpdates.splice(0) };
       return result;
     },
-    isGoverned(tool) {
-      return SCOPED_TRACKERS.has(tool);
+    definition(tool) {
+      return SCOPED_TRACKERS.has(tool) ? governedDescriptor(tool)?.definition : undefined;
     },
     hasPending() {
       if (pendingOutcomes.length > 0) return true;

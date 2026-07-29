@@ -1,6 +1,6 @@
 import type {
-  AgentInputMessage, AgentRunEvent, DurableInteractionUpdate, DurableToolLedgerUpdate, IdentityContext,
-  ResolvedInteraction, RunExecutionProfile,
+  AgentInputMessage, AgentRunEvent, DurableInteractionUpdate, DurableToolLedgerUpdate, IdentityContext, JsonValue,
+  ResolvedInteraction, RunExecutionProfile, ToolExecutionOutcome,
 } from '@aiop/control-contracts';
 import { AgentPlatformError } from '@aiop/control-contracts';
 import {
@@ -14,7 +14,10 @@ import {
   type SessionRepo,
   type SessionTreeEntry,
 } from '@earendil-works/pi-agent-core';
-import type { AssistantMessage, ImageContent, Model, Models, ToolResultMessage } from '@earendil-works/pi-ai';
+import {
+  validateToolArguments,
+  type AssistantMessage, type ImageContent, type Model, type Models, type ToolResultMessage,
+} from '@earendil-works/pi-ai';
 import { EventCodec, type EventCodecOptions } from './event-codec.js';
 import { createConcurrentModels, type ModelConcurrencyController } from '../model/concurrency.js';
 import {
@@ -23,6 +26,7 @@ import {
   type GovernedToolScope,
 } from './governed-tool-state.js';
 import { GovernedToolExecutionError, GovernedToolOutcomeError } from './tool-bridge.js';
+import { digestToolValue } from '../tools/ledger.js';
 
 export interface PiAgentSessionFactoryOptions<
   TMetadata extends SessionMetadata,
@@ -169,16 +173,29 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
       throw runStateConflict('Resolved interaction original tool call is missing or ambiguous');
     }
     const original = calls[0]!;
-    const waiting = branch.filter((entry): entry is Extract<SessionTreeEntry, { type: 'message' }> =>
-      entry.type === 'message' && entry.message.role === 'toolResult'
-      && entry.message.toolCallId === resolution.toolCallId && waitingInteraction(entry.message, resolution));
-    if (waiting.length !== 1 || waiting[0]!.parentId !== original.entry.id
-      || waiting[0]!.id !== await this.session.getLeafId()) {
+    const waiting = branch.flatMap((entry) => {
+      if (entry.type !== 'message' || entry.message.role !== 'toolResult'
+        || entry.message.toolCallId !== resolution.toolCallId) return [];
+      const binding = waitingInteractionBinding(entry.message, resolution, original.call);
+      return binding ? [{ entry, binding }] : [];
+    });
+    if (waiting.length !== 1 || waiting[0]!.entry.parentId !== original.entry.id
+      || waiting[0]!.entry.id !== await this.session.getLeafId()) {
       throw runStateConflict('Resolved interaction does not match the committed waiting result');
     }
     const tools = this.harness.getActiveTools().filter((tool) => tool.name === original.call.name);
-    if (tools.length !== 1 || !this.governedToolScope.isGoverned(tools[0]!)) {
+    const definition = tools.length === 1 ? this.governedToolScope.definition(tools[0]!) : undefined;
+    if (!definition) {
       throw runStateConflict('Resolved interaction governed tool is missing or ambiguous');
+    }
+    if (definition.name !== waiting[0]!.binding.ledger.toolName
+      || definition.capability !== waiting[0]!.binding.ledger.capability) {
+      throw runStateConflict('Resolved interaction governed tool definition does not match the committed waiting call');
+    }
+    try {
+      validateToolArguments(tools[0]!, original.call);
+    } catch {
+      throw runStateConflict('Resolved interaction arguments do not match the current governed tool schema');
     }
 
     let replacement: ToolResultMessage;
@@ -199,7 +216,7 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
       replacement = {
         role: 'toolResult', toolCallId: resolution.toolCallId, toolName: original.call.name,
         content: result.content, details: result.details, usage: result.usage, isError: false,
-        timestamp: waiting[0]!.message.timestamp,
+        timestamp: waiting[0]!.entry.message.timestamp,
       };
     } catch (error) {
       if (error instanceof GovernedToolOutcomeError) {
@@ -222,7 +239,7 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
       replacement = {
         role: 'toolResult', toolCallId: resolution.toolCallId, toolName: original.call.name,
         content: [{ type: 'text', text: error.result.content }], details: error.result, isError: true,
-        timestamp: waiting[0]!.message.timestamp,
+        timestamp: waiting[0]!.entry.message.timestamp,
       };
     }
     const resultCallId = replacement.details && typeof replacement.details === 'object'
@@ -462,14 +479,50 @@ function promptParts(message: AgentInputMessage): { text: string; images: ImageC
   return { text, images };
 }
 
-function waitingInteraction(message: ToolResultMessage, resolution: ResolvedInteraction): boolean {
-  if (!message.isError || !message.details || typeof message.details !== 'object') return false;
+function waitingInteractionBinding(
+  message: ToolResultMessage,
+  resolution: ResolvedInteraction,
+  call: Extract<AssistantMessage['content'][number], { type: 'toolCall' }>,
+): { ledger: DurableToolLedgerUpdate; interaction: DurableInteractionUpdate } | undefined {
+  if (!message.isError || !message.details || typeof message.details !== 'object') return undefined;
   const details = message.details as {
     kind?: unknown;
-    outcome?: { kind?: unknown; reason?: unknown; interactionId?: unknown };
+    outcome?: Extract<ToolExecutionOutcome, { kind: 'waiting' }>;
   };
-  return details.kind === 'governed_tool_outcome' && details.outcome?.kind === 'waiting'
-    && details.outcome.reason === resolution.kind && details.outcome.interactionId === resolution.interactionId;
+  const outcome = details.outcome;
+  if (details.kind !== 'governed_tool_outcome' || outcome?.kind !== 'waiting'
+    || outcome.reason !== resolution.kind || outcome.interactionId !== resolution.interactionId) return undefined;
+  const ledgerUpdates = outcome.ledgerUpdates ?? [];
+  const interactionUpdates = outcome.interactionUpdates ?? [];
+  const ledgers = ledgerUpdates.filter((ledger) => ledger.status === 'pending_approval'
+    && ledger.toolCallId === call.id && ledger.toolName === call.name
+    && ledger.approvedInteractionId === resolution.interactionId
+    && ledger.argsDigest === digestToolValue(call.arguments));
+  const interactions = interactionUpdates.filter((interaction) => interaction.status === 'pending'
+    && interaction.id === resolution.interactionId && interaction.kind === resolution.kind
+    && interaction.toolCallId === call.id);
+  if (ledgerUpdates.length !== 1 || interactionUpdates.length !== 1
+    || ledgers.length !== 1 || interactions.length !== 1
+    || interactions[0]!.tenantId !== ledgers[0]!.tenantId || interactions[0]!.runId !== ledgers[0]!.runId
+    || interactions[0]!.attemptId !== ledgers[0]!.attemptId || interactions[0]!.turnNo !== ledgers[0]!.turnNo
+    || !waitingPayloadMatches(interactions[0]!.payload, resolution.kind, call)) return undefined;
+  return { ledger: ledgers[0]!, interaction: interactions[0]! };
+}
+
+function waitingPayloadMatches(
+  payload: JsonValue,
+  kind: ResolvedInteraction['kind'],
+  call: Extract<AssistantMessage['content'][number], { type: 'toolCall' }>,
+): boolean {
+  if (kind !== 'approval') return digestToolValue(payload) === digestToolValue(call.arguments);
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+    || !payload.call || typeof payload.call !== 'object' || Array.isArray(payload.call)) return false;
+  const pendingCall = payload.call;
+  const toolCallIds = ['id', 'toolCallId'].filter((key) => Object.hasOwn(pendingCall, key))
+    .map((key) => pendingCall[key]);
+  return toolCallIds.length > 0 && toolCallIds.every((toolCallId) => toolCallId === call.id)
+    && pendingCall.name === call.name && Object.hasOwn(pendingCall, 'args')
+    && digestToolValue(pendingCall.args) === digestToolValue(call.arguments);
 }
 
 function replayToolResultEvent(

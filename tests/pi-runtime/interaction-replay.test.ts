@@ -8,6 +8,7 @@ import {
   type Model,
 } from '@earendil-works/pi-ai';
 import { InMemorySessionRepo } from '@earendil-works/pi-agent-core';
+import type { DurableInteractionUpdate } from '@aiop/control-contracts';
 import {
   GovernedToolFactory,
   GovernedToolOutcomeError,
@@ -203,7 +204,148 @@ describe('durable Pi interaction replay', () => {
     expect(providerTurns).toBe(1);
     await session.close();
   });
+
+  it.each([
+    {
+      name: 'exact toolCallId mismatch', kind: 'question' as const,
+      mutateInteraction: (interaction: DurableInteractionUpdate) => ({ ...interaction, toolCallId: 'call-other' }),
+    },
+    {
+      name: 'ledger interaction attempt mismatch', kind: 'question' as const,
+      mutateInteraction: (interaction: DurableInteractionUpdate) => ({ ...interaction, attemptId: 'attempt-other' }),
+    },
+    {
+      name: 'ledger interaction turn mismatch', kind: 'plan' as const,
+      mutateInteraction: (interaction: DurableInteractionUpdate) => ({ ...interaction, turnNo: interaction.turnNo + 1 }),
+    },
+    {
+      name: 'payload arguments mismatch', kind: 'question' as const,
+      mutateInteraction: (interaction: DurableInteractionUpdate) => ({ ...interaction, payload: { target: 'production' } }),
+    },
+    {
+      name: 'same-name capability mismatch', kind: 'approval' as const,
+      resumedDefinition: { capability: 'read' as const },
+    },
+    {
+      name: 'same-name schema mismatch', kind: 'approval' as const,
+      resumedDefinition: {
+        inputSchema: {
+          type: 'object', properties: { region: { type: 'string' } }, required: ['region'],
+          additionalProperties: false,
+        },
+      },
+    },
+  ])('fails safe for $name before handler or provider continuation', async (testCase) => {
+    const result = await runNegativeReplayCase(testCase);
+
+    expect(['failed', 'recovery_required']).toContain(result.resumed.status);
+    expect(result.handler).not.toHaveBeenCalled();
+    expect(result.providerTurns).toBe(1);
+    expect(await result.store.toolLedger.get({
+      tenantId: identity.tenantId, runId: result.runId, logicalCallId: result.logicalCallId,
+    })).toMatchObject({ status: 'pending_approval', toolCallId: result.toolCallId });
+  });
 });
+
+type NegativeReplayCase = {
+  name: string;
+  kind: 'approval' | 'question' | 'plan';
+  mutateInteraction?: (interaction: DurableInteractionUpdate) => DurableInteractionUpdate;
+  resumedDefinition?: {
+    capability?: 'read' | 'retryable_write';
+    inputSchema?: Record<string, unknown>;
+  };
+};
+
+async function runNegativeReplayCase(testCase: NegativeReplayCase) {
+  const suffix = testCase.name.replace(/[^a-z]+/gi, '-').toLowerCase();
+  const runId = `negative-${suffix}`;
+  const sessionId = `negative-session-${suffix}`;
+  const toolCallId = 'call-negative-a';
+  const logicalCallId = 'logical-negative-a';
+  const interactionId = 'approval-negative-a';
+  const value = testCase.kind === 'question' ? { answer: ['yes'] } : true;
+  const store = new MemoryRunStore();
+  const models = createModels();
+  let providerTurns = 0;
+  const stream = () => {
+    providerTurns++;
+    const output = createAssistantMessageEventStream();
+    finish(output, providerTurns === 1
+      ? [{ type: 'toolCall', id: toolCallId, name: 'deploy-negative', arguments: { target: 'staging' } }]
+      : [{ type: 'text', text: 'provider must not continue' }], providerTurns === 1 ? 'toolUse' : 'stop');
+    return output;
+  };
+  models.setProvider(createProvider({
+    id: model.provider,
+    auth: { apiKey: { name: 'test', resolve: async () => ({ auth: { apiKey: 'test' } }) } },
+    models: [model], api: { stream, streamSimple: stream },
+  }));
+  const handler = vi.fn(async () => ({ content: 'handler must not execute' }));
+  const baseDefinition = {
+    name: 'deploy-negative', description: 'Deploy negative', capability: 'retryable_write' as const,
+    inputSchema: {
+      type: 'object', properties: { target: { type: 'string' } }, required: ['target'], additionalProperties: false,
+    },
+    ...(testCase.kind === 'approval' ? {} : { interactionKind: testCase.kind }),
+    execute: handler,
+  };
+  const { runtime } = createMemoryDurablePiRuntime({
+    store, models, model, heartbeatMs: 0,
+    resolveTools: async ({ identity: currentIdentity, sessionId: currentSessionId, events, interactionResolution }) => {
+      if (!currentIdentity) return [];
+      const definition = interactionResolution && testCase.resumedDefinition
+        ? { ...baseDefinition, ...testCase.resumedDefinition }
+        : baseDefinition;
+      const governed = new GovernedToolFactory({
+        ledger: store.toolLedger, interactions: store.interactions,
+        policy: { check: async () => testCase.kind === 'approval'
+          ? { allowed: true, needsApproval: true, reason: 'deployment approval' }
+          : { allowed: true } },
+        ...(testCase.kind === 'approval' ? { approval: { request: async () => ({
+            approved: false, pending: true, interactionId,
+            payload: { call: { id: toolCallId, name: definition.name, args: { target: 'staging' } } },
+          }) } } : {}),
+      }).create([definition]);
+      const resolved = interactionResolution
+        ? await store.interactions.get({
+            tenantId: currentIdentity.tenantId, runId: events.runId,
+            interactionId: interactionResolution.interactionId,
+          })
+        : undefined;
+      return bridgeGovernedTools([{
+        definition,
+        logicalCallId: () => logicalCallId,
+        execute: async (call, context) => {
+          const outcome = await governed.execute(call, {
+            identity: currentIdentity, runId: events.runId, attemptId: events.attemptId, turnNo: events.turnNo,
+            sessionId: currentSessionId ?? events.runId, signal: context.signal,
+            interactionResolution: resolved?.status === 'resolved' && resolved.toolCallId
+              ? {
+                  interactionId: resolved.id, kind: resolved.kind, toolCallId: resolved.toolCallId,
+                  value: resolved.resolution ?? interactionResolution?.value ?? null,
+                }
+              : undefined,
+          });
+          if (outcome.kind === 'result') return attachGovernedToolFacts(outcome.result, outcome);
+          throw new GovernedToolOutcomeError(outcome);
+        },
+      }]);
+    },
+  });
+  expect((await (await runtime.run({
+    runId, identity, sessionId, input: [{ role: 'user', text: 'deploy staging' }],
+  })).result()).status).toBe('waiting');
+  const [pending] = await store.interactions.list({ tenantId: identity.tenantId, runId });
+  const resolved = testCase.mutateInteraction?.(pending!) ?? pending!;
+  await store.interactions.put({
+    ...resolved, status: 'resolved', resolution: value, resolvedAt: new Date(),
+  });
+  const resumed = await (await runtime.resume({
+    identity, runId, resolution: { interactionId: resolved.id, value },
+  })).result();
+  return { resumed, handler, providerTurns, store, runId, logicalCallId, toolCallId };
+}
 
 function expectsHandlerOrder(executesHandler: boolean): string[] {
   return executesHandler ? ['model-1', 'replay', 'tool', 'model-2'] : ['model-1', 'replay', 'model-2'];
