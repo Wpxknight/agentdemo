@@ -1,12 +1,12 @@
 import { z } from 'zod';
-import type { SandboxConfig } from '../config/schema.js';
 import type {
+  SandboxConfig,
   SandboxSettings,
   SandboxSettingsRecord,
   SandboxSettingsSecretUpdate,
-  Store,
-} from '../db/store.js';
-import type { SecretBox } from '../security/secret-box.js';
+  SandboxSettingsStore,
+  SecretBoxLike,
+} from './contracts.js';
 
 const PLATFORM_SETTINGS_CONTEXT = { tenantId: 'default' } as const;
 const SECRET_SCHEMA_VERSION = 1;
@@ -141,7 +141,7 @@ function legacySettings(value: Record<string, unknown>): SandboxSettings {
   throw new Error('旧版 sandbox provider 无效');
 }
 
-function parseStoredSecret(box: SecretBox, encrypted: string): StoredSecretV1 {
+function parseStoredSecret(box: SecretBoxLike, encrypted: string): StoredSecretV1 {
   let value: unknown;
   try {
     value = JSON.parse(box.open(encrypted));
@@ -163,7 +163,7 @@ function parseStoredSecret(box: SecretBox, encrypted: string): StoredSecretV1 {
   return secret as StoredSecretV1;
 }
 
-function encryptedSecret(box: SecretBox, settings: SandboxSettings, apiKey: string): string {
+function encryptedSecret(box: SecretBoxLike, settings: SandboxSettings, apiKey: string): string {
   const payload: StoredSecretV1 = {
     schemaVersion: SECRET_SCHEMA_VERSION,
     apiKey,
@@ -245,8 +245,8 @@ export function sandboxSettingsToConfig(settings: SandboxSettings, apiKey?: stri
 /** 平台 Sandbox 设置编排：加解密、目标绑定校验和配置+secret 原子保存。 */
 export class SandboxSettingsPersistence {
   constructor(
-    private readonly store: Store,
-    private readonly box: SecretBox,
+    private readonly store: SandboxSettingsStore,
+    private readonly box: SecretBoxLike,
     private readonly ctx: { tenantId: string } = PLATFORM_SETTINGS_CONTEXT,
   ) {}
 

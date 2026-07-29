@@ -17,10 +17,10 @@ import { SkillRegistry, type SkillProductRecord } from '../src/skill/registry.js
 import type { ProductSkillLoader } from '../src/skill/service.js';
 import { McpManager } from '../src/mcp/manager.js';
 import type { McpClientLike } from '../src/mcp/types.js';
-import { SandboxManager } from '../src/sandbox/lifecycle.js';
+import { SandboxManager } from '../packages/sandbox-runtime/src/lifecycle.js';
 import { buildSandboxTools } from '../src/tools/builtin.js';
 import { buildSandboxProfileTools } from '../src/tools/sandbox-profiles.js';
-import type { ExecResult, SandboxHandle, SandboxProvider, SandboxSpec } from '../src/sandbox/types.js';
+import type { ExecResult, SandboxHandle, SandboxProvider, SandboxSpec } from '../packages/sandbox-runtime/src/types.js';
 import type { AppendRunMessageInput, DurableRunRuntime } from '@aiop/control-contracts';
 import { loadSourcedSkills } from '@earendil-works/pi-agent-core';
 import { EventCodec } from '../packages/pi-runtime/src/index.js';

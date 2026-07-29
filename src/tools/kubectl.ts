@@ -1,10 +1,10 @@
 import type { ToolResult } from '../model/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import type { ClusterRegistry, ClusterInfo } from '../config/clusters.js';
-import type { SandboxManagerLike } from '../sandbox/lifecycle.js';
-import { isSandboxAcquirer } from '../sandbox/acquisition.js';
-import { sandboxIdentityMetadata, sandboxScopedKey, type SandboxIdentity } from '../sandbox/keys.js';
-import type { SandboxSpec } from '../sandbox/types.js';
+import type { SandboxManagerLike } from '@aiop/sandbox-runtime';
+import { isSandboxAcquirer } from '@aiop/sandbox-runtime';
+import { sandboxIdentityMetadata, sandboxScopedKey, type SandboxIdentity } from '@aiop/sandbox-runtime';
+import type { SandboxSpec } from '@aiop/sandbox-runtime';
 import type { AuditSink } from '../audit/sink.js';
 import { LogAuditSink } from '../audit/sink.js';
 import { classifyKubectl, parseKubectlArgs } from '../ops/classify.js';

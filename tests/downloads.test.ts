@@ -5,8 +5,8 @@ import { SignJWT } from 'jose';
 import { describe, expect, it } from 'vitest';
 import { DownloadStore } from '../src/server/downloads.js';
 import { buildExportTool } from '../src/tools/export.js';
-import type { SandboxManager } from '../src/sandbox/lifecycle.js';
-import type { SandboxHandle } from '../src/sandbox/types.js';
+import type { SandboxManager } from '../packages/sandbox-runtime/src/lifecycle.js';
+import type { SandboxHandle } from '../packages/sandbox-runtime/src/types.js';
 
 const SECRET = 'test-secret';
 

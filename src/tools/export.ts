@@ -1,8 +1,8 @@
 import { posix } from 'node:path';
 import type { JsonValue, ToolResult } from '../model/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
-import type { SandboxManagerLike } from '../sandbox/lifecycle.js';
-import { isSandboxAcquirer } from '../sandbox/acquisition.js';
+import type { SandboxManagerLike } from '@aiop/sandbox-runtime';
+import { isSandboxAcquirer } from '@aiop/sandbox-runtime';
 import type { ExportSink } from '../server/downloads.js';
 import { resolveSandboxSpec, type SpecResolver } from './builtin.js';
 

@@ -33,7 +33,7 @@ vi.mock('@e2b/code-interpreter', () => {
   return { Sandbox };
 });
 
-const { E2bProvider } = await import('../src/sandbox/e2b.js');
+const { E2bProvider } = await import('../packages/sandbox-runtime/src/e2b.js');
 
 beforeEach(() => {
   h.created.length = 0;

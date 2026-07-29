@@ -1,11 +1,12 @@
 import type { JsonValue, ToolResult } from '../model/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
-import type { SandboxManagerLike } from '../sandbox/lifecycle.js';
-import { isSandboxAcquirer, type SpecResolver } from '../sandbox/acquisition.js';
-import { sandboxIdentityKey, sandboxIdentityMetadata } from '../sandbox/keys.js';
-import type { ExecResult, SandboxSpec } from '../sandbox/types.js';
+import type { SandboxManagerLike } from '@aiop/sandbox-runtime';
+import { isSandboxAcquirer, type SpecResolver } from '@aiop/sandbox-runtime';
+import { sandboxIdentityKey, sandboxIdentityMetadata } from '@aiop/sandbox-runtime';
+import { createSandboxToolDefinitions } from '@aiop/sandbox-runtime';
+import type { SandboxSpec } from '@aiop/sandbox-runtime';
 
-export type { SpecResolver } from '../sandbox/acquisition.js';
+export type { SpecResolver } from '@aiop/sandbox-runtime';
 
 /** 默认：每个租户用户会话一个沙箱。 */
 const defaultResolver: SpecResolver = (ctx) => ({
@@ -21,22 +22,6 @@ function reqString(o: Record<string, JsonValue>, key: string): string {
   const v = o[key];
   if (typeof v !== 'string' || !v) throw new Error(`参数 ${key} 必须是非空字符串`);
   return v;
-}
-
-function formatExec(r: ExecResult): ToolResult {
-  const parts: string[] = [];
-  if (r.stdout) parts.push(r.stdout.trimEnd());
-  if (r.stderr) parts.push(`[stderr]\n${r.stderr.trimEnd()}`);
-  if (r.error) parts.push(`[error]\n${r.error}`);
-  if (typeof r.exitCode === 'number' && r.exitCode !== 0) {
-    parts.push(`[exit code] ${r.exitCode}`);
-  }
-  const isError = Boolean(r.error) || (typeof r.exitCode === 'number' && r.exitCode !== 0);
-  return {
-    id: '',
-    content: parts.join('\n\n') || '(no output)',
-    isError,
-  };
 }
 
 export async function resolveSandboxSpec(resolve: SpecResolver, ctx: ToolContext): Promise<SandboxSpec> {
@@ -57,6 +42,45 @@ export function buildSandboxTools(
     if (isSandboxAcquirer(manager)) return manager.acquire(ctx);
     const spec = await resolveSandboxSpec(resolve, ctx);
     return { handle: await manager.get(spec), spec };
+  };
+  const executeAdapter = async (
+    name: 'sbx__run_code' | 'sbx__run_command',
+    args: JsonValue,
+    ctx: ToolContext,
+  ): Promise<ToolResult> => {
+    const sandbox = (await acquire(ctx)).handle;
+    const definitions = createSandboxToolDefinitions({
+      runCode: (code, options) => sandbox.runCode(code, {
+        language: options.language,
+        onOutput: ctx.onOutput,
+      }),
+      runCommand: (command) => sandbox.runCommand(command, { onOutput: ctx.onOutput }),
+      readFile: (path) => sandbox.readFile(path),
+      writeFile: async (path, content) => {
+        if (!sandbox.writeFile) throw new Error('sandbox does not support file writes');
+        await sandbox.writeFile(path, content);
+      },
+      desktop: async () => { throw new Error('desktop calls require the desktop runtime'); },
+    });
+    const definition = definitions.find((candidate) => candidate.name === name)!;
+    const output = await definition.execute({
+      id: name,
+      logicalCallId: name,
+      name,
+      arguments: args,
+    }, {
+      identity: {
+        tenantId: ctx.tenantId ?? 'default',
+        actorId: ctx.userId ?? 'anonymous',
+        roles: ctx.role ? [ctx.role] : [],
+      },
+      runId: ctx.sessionId,
+      attemptId: ctx.sessionId,
+      turnNo: 0,
+      idempotencyKey: `${ctx.sessionId}:${name}`,
+      signal: ctx.signal,
+    });
+    return { id: '', content: output.content, isError: output.isError };
   };
   return [
     defineTool({
@@ -79,8 +103,7 @@ export function buildSandboxTools(
         const o = asObject(args);
         const code = reqString(o, 'code');
         const language = typeof o.language === 'string' ? o.language : undefined;
-        const sbx = (await acquire(ctx)).handle;
-        return formatExec(await sbx.runCode(code, { language, onOutput: ctx.onOutput }));
+        return executeAdapter('sbx__run_code', { code, ...(language ? { language } : {}) }, ctx);
       },
     }),
     defineTool({
@@ -97,8 +120,7 @@ export function buildSandboxTools(
       async execute(args, ctx): Promise<ToolResult> {
         const o = asObject(args);
         const command = reqString(o, 'command');
-        const sbx = (await acquire(ctx)).handle;
-        return formatExec(await sbx.runCommand(command, { onOutput: ctx.onOutput }));
+        return executeAdapter('sbx__run_command', { command }, ctx);
       },
     }),
   ];

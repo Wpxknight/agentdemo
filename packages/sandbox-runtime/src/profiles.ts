@@ -1,5 +1,4 @@
-import type { Role } from '../auth/types.js';
-import type { SandboxConfig } from '../config/schema.js';
+import type { Role, SandboxConfig } from './contracts.js';
 import { sandboxIdentityKey, sandboxIdentityMetadata, sandboxScopedKey, type SandboxIdentity } from './keys.js';
 import type { SandboxSpec } from './types.js';
 

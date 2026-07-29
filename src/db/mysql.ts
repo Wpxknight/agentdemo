@@ -43,7 +43,7 @@ import { McpServerSchema } from '../config/schema.js';
 import type { McpServerConfig } from '../mcp/types.js';
 import { nextRunAt } from '../scheduler/cron.js';
 import { estimateTokens } from '../agent/context.js';
-import { parseStoredSandboxSettings } from '../sandbox/settings.js';
+import { parseStoredSandboxSettings } from '@aiop/sandbox-runtime';
 import { MysqlRuntimeStore, type RuntimeMysqlDatabase } from '@aiop/agent-runtime-mysql';
 
 interface TaskRow {

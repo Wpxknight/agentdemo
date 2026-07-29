@@ -1,6 +1,5 @@
-import type { ToolContext } from '../agent/tools.js';
-import type { RequestContext } from '../auth/types.js';
-import { logger } from '../logger.js';
+import type { RequestContext, ToolContext } from './contracts.js';
+import { logger } from './logger.js';
 import {
   SandboxManager,
   type SandboxManagerLike,

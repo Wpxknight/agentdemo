@@ -23,7 +23,7 @@ vi.mock('@alibaba-group/opensandbox', () => {
   return { Sandbox };
 });
 
-const { OpenSandboxProvider } = await import('../src/sandbox/opensandbox.js');
+const { OpenSandboxProvider } = await import('../packages/sandbox-runtime/src/opensandbox.js');
 
 const exec = (stdout: string, extra: Record<string, unknown> = {}) => ({
   logs: { stdout: [{ text: stdout }], stderr: [] },

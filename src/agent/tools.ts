@@ -1,6 +1,6 @@
 import type { JsonValue, StreamEvent, ToolCall, ToolDef, ToolResult } from '../model/types.js';
 import type { RequestContext, Role } from '../auth/types.js';
-import type { OutputSink } from '../sandbox/types.js';
+import type { OutputSink } from '@aiop/sandbox-runtime';
 import type { QuestionAnswers, QuestionSpec } from './question.js';
 import type { ChangePlan } from './plan.js';
 import { UnifiedToolRegistry, type ToolSource } from '@aiop/pi-runtime';

@@ -1,4 +1,4 @@
-import { logger } from '../logger.js';
+import { logger } from './logger.js';
 import type { SandboxHandle, SandboxProvider, SandboxSpec } from './types.js';
 
 const log = logger.child({ mod: 'warmpool' });

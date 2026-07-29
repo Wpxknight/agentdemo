@@ -3,9 +3,9 @@ import { constants } from 'node:fs';
 import { access, link, mkdir, mkdtemp, readFile, rename, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SandboxManager } from '../src/sandbox/lifecycle.js';
-import { LocalSandboxProvider } from '../src/sandbox/local.js';
-import { OpenSandboxDesktopProvider } from '../src/sandbox/opensandbox-desktop.js';
+import { SandboxManager } from '../packages/sandbox-runtime/src/lifecycle.js';
+import { LocalSandboxProvider } from '../packages/sandbox-runtime/src/local.js';
+import { OpenSandboxDesktopProvider } from '../packages/sandbox-runtime/src/opensandbox-desktop.js';
 import { buildSandboxTools } from '../src/tools/builtin.js';
 import { buildSandboxProfileTools } from '../src/tools/sandbox-profiles.js';
 import type {
@@ -13,7 +13,7 @@ import type {
   SandboxHandle,
   SandboxProvider,
   SandboxSpec,
-} from '../src/sandbox/types.js';
+} from '../packages/sandbox-runtime/src/types.js';
 
 function deferredHandle() {
   let resolve!: (handle: SandboxHandle) => void;
@@ -595,7 +595,7 @@ describe('LocalSandboxProvider', () => {
         },
       };
     });
-    const { LocalSandboxProvider: FreshLocalSandboxProvider } = await import('../src/sandbox/local.js');
+    const { LocalSandboxProvider: FreshLocalSandboxProvider } = await import('../packages/sandbox-runtime/src/local.js');
     const handle = await new FreshLocalSandboxProvider().create({ key: 'local-parent-race-test' });
     const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
     const sandboxParent = join(sandboxRoot, 'workspace', 'parent');

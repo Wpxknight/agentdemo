@@ -1,4 +1,4 @@
-import type { ToolContext } from '../agent/tools.js';
+import type { ToolContext } from './contracts.js';
 import type { SandboxManagerLike } from './lifecycle.js';
 import type { SandboxHandle, SandboxSpec } from './types.js';
 

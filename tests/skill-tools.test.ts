@@ -5,9 +5,9 @@ import { gunzipSync } from 'node:zlib';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { SkillRegistry } from '../src/skill/registry.js';
 import { buildSkillTools } from '../src/tools/skill/index.js';
-import type { SandboxManager } from '../src/sandbox/lifecycle.js';
-import type { ExecResult, SandboxHandle } from '../src/sandbox/types.js';
-import { LocalSandboxProvider } from '../src/sandbox/local.js';
+import type { SandboxManager } from '../packages/sandbox-runtime/src/lifecycle.js';
+import type { ExecResult, SandboxHandle } from '../packages/sandbox-runtime/src/types.js';
+import { LocalSandboxProvider } from '../packages/sandbox-runtime/src/local.js';
 import { syncSkillToSandbox, SYNC_TOTAL_BYTES } from '../src/skill/sandbox-sync.js';
 
 /** 记录 runCommand 调用并按脚本约定返回成功的假沙箱。 */

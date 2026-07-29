@@ -3,7 +3,7 @@ import { logger } from '../logger.js';
 import type { ToolContext } from '../agent/tools.js';
 import type { UserCredentials } from '../auth/credentials.js';
 import type { AuditSink } from '../audit/sink.js';
-import type { SandboxHandle } from '../sandbox/types.js';
+import type { SandboxHandle } from '@aiop/sandbox-runtime';
 import type { Skill } from './product.js';
 import { normalizeCredentialFile } from './product.js';
 

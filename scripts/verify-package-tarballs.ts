@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 const root = resolve(import.meta.dirname, '..');
 const packageDirs = [
   'control-contracts', 'agent-kernel-pi', 'agent-runtime-aiop', 'agent-runtime-core', 'agent-runtime-mysql', 'pi-runtime',
-  'mcp-runtime', 'sandbox-core', 'sandbox-e2b', 'sandbox-local', 'sandbox-opensandbox',
+  'mcp-runtime', 'sandbox-runtime',
   'scheduler-core', 'scheduler-mysql', 'skill-runtime', 'tool-runtime',
 ];
 const temp = await mkdtemp(join(tmpdir(), 'aiop-package-verify-'));

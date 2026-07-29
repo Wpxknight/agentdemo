@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AiosE2bProvider } from '../src/sandbox/aios-e2b.js';
+import { AiosE2bProvider } from '../packages/sandbox-runtime/src/aios-e2b.js';
 
 interface RecordedRequest {
   url: string;

@@ -6,7 +6,7 @@
  *
  * 期望：每段输出的相对时间戳 ≈ 1000ms 递增；若是缓冲，全部会在 ~5000ms 同时到达。
  */
-import { OpenSandboxProvider } from '../src/sandbox/opensandbox.js';
+import { OpenSandboxProvider } from '../packages/sandbox-runtime/src/opensandbox.js';
 
 const domain = process.env.OSB_DOMAIN ?? '127.0.0.1:8899';
 const image = process.env.OSB_IMAGE ?? 'aiop/opensandbox-browser:dev';

@@ -11,14 +11,14 @@ import {
   parseStoredSandboxSettings,
   parseSandboxSettings,
   sandboxSettingsToConfig,
-} from '../src/sandbox/settings.js';
+} from '../packages/sandbox-runtime/src/settings.js';
 import {
   findSandboxProfile,
   resolveSandboxProfiles,
   sandboxSpecForProfile,
   selectBrowserProfile,
   selectDefaultProfile,
-} from '../src/sandbox/profiles.js';
+} from '../packages/sandbox-runtime/src/profiles.js';
 
 const platform: Pick<RequestContext, 'tenantId'> = { tenantId: 'default' };
 

@@ -26,8 +26,8 @@ import { softDeleteUser, setUserEnabled } from '../auth/lifecycle.js';
 import { createTenant, createUser, listTenants } from '../auth/admin.js';
 import type { RequestContext, Role } from '../auth/types.js';
 import { DEFAULT_TASK_MAX_RUN_MS, type SandboxSettings, type ScheduledTaskPatch } from '../db/store.js';
-import { boundUserHomeNote, normalizeUserHomeDir } from '../sandbox/userhome.js';
-import { SANDBOX_SERVICE_NOTE } from '../sandbox/notes.js';
+import { boundUserHomeNote, normalizeUserHomeDir } from '@aiop/sandbox-runtime';
+import { SANDBOX_SERVICE_NOTE } from '@aiop/sandbox-runtime';
 import { isValidCron } from '../scheduler/cron.js';
 import { createScheduledTaskRunner } from '../scheduler/runner.js';
 import { createModel } from '../model/factory.js';
@@ -40,7 +40,7 @@ import { McpServerSchema } from '../config/schema.js';
 import {
   parseSandboxSettings,
   type SandboxApiKeyUpdate,
-} from '../sandbox/settings.js';
+} from '@aiop/sandbox-runtime';
 import { SessionCommitter } from '../agent/services/session-committer.js';
 import { projectCommittedPiSession, projectPiSessionStats, projectPiUsage } from '../agent/projections.js';
 import { DurableToolLedger } from '../agent/tool-ledger/store.js';

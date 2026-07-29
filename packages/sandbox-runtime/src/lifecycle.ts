@@ -1,5 +1,5 @@
-import { logger } from '../logger.js';
-import type { RequestContext } from '../auth/types.js';
+import { logger } from './logger.js';
+import type { RequestContext } from './contracts.js';
 import type { SandboxHandle, SandboxProvider, SandboxSpec } from './types.js';
 import type { WarmPool } from './warmpool.js';
 

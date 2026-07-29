@@ -2,9 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { buildKubectlTool } from '../src/tools/kubectl.js';
 import { classifyKubectl, parseKubectlArgs } from '../src/ops/classify.js';
 import { ClusterRegistry } from '../src/config/clusters.js';
-import { SandboxManager } from '../src/sandbox/lifecycle.js';
+import { SandboxManager } from '../packages/sandbox-runtime/src/lifecycle.js';
 import { MemoryAuditSink } from '../src/audit/sink.js';
-import type { ExecResult, SandboxHandle, SandboxProvider } from '../src/sandbox/types.js';
+import type { ExecResult, SandboxHandle, SandboxProvider } from '../packages/sandbox-runtime/src/types.js';
 
 /** mock provider：runCommand 回显命令，便于断言拼装。 */
 function echoManager() {

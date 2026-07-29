@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { logger } from '../src/logger.js';
+import { logger } from '../packages/sandbox-runtime/src/logger.js';
 import {
   AiosLifecycleHttpClient,
   AiosLifecycleHttpError,
-} from '../src/sandbox/aios-http.js';
-import { AiosTemplateCatalog } from '../src/sandbox/aios-template-catalog.js';
+} from '../packages/sandbox-runtime/src/aios-http.js';
+import { AiosTemplateCatalog } from '../packages/sandbox-runtime/src/aios-template-catalog.js';
 
 const API_KEY = 'complete-test-key';
 

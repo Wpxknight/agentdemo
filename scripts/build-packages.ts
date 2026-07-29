@@ -6,18 +6,15 @@ const root = resolve(import.meta.dirname, '..');
 const packages = [
   'control-contracts',
   'agent-runtime-core',
-  'sandbox-core',
   'scheduler-core',
   'agent-kernel-pi',
   'pi-runtime',
+  'sandbox-runtime',
   'agent-runtime-mysql',
   'agent-runtime-aiop',
   'mcp-runtime',
   'skill-runtime',
   'tool-runtime',
-  'sandbox-local',
-  'sandbox-opensandbox',
-  'sandbox-e2b',
   'scheduler-mysql',
 ];
 

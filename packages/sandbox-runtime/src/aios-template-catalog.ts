@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { logger } from '../logger.js';
+import { logger } from './logger.js';
 import {
   AiosLifecycleHttpClient,
   type AiosLifecycleHttpOptions,

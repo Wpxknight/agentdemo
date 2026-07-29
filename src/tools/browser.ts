@@ -1,6 +1,6 @@
 import type { JsonValue, ToolResult } from '../model/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
-import type { DesktopHandle } from '../sandbox/desktop.js';
+import type { DesktopHandle } from '@aiop/sandbox-runtime';
 
 /** 按上下文取（必要时创建）一个浏览器会话。 */
 export type DesktopResolver = (ctx: ToolContext) => Promise<DesktopHandle>;

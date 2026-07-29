@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { open } from 'node:fs/promises';
 import { posix, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
-import type { SandboxHandle } from '../sandbox/types.js';
+import type { SandboxHandle } from '@aiop/sandbox-runtime';
 import type { SkillFileEntry } from './product.js';
 
 const execFileAsync = promisify(execFile);

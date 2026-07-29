@@ -72,7 +72,7 @@ describe('agent platform package boundaries', () => {
   it('keeps every public package free of product imports and undeclared workspace dependencies', async () => {
     const names = [
       'control-contracts', 'agent-kernel-pi', 'agent-runtime-aiop', 'agent-runtime-core', 'agent-runtime-mysql', 'pi-runtime',
-      'mcp-runtime', 'sandbox-core', 'sandbox-e2b', 'sandbox-local', 'sandbox-opensandbox',
+      'mcp-runtime', 'sandbox-runtime',
       'scheduler-core', 'scheduler-mysql', 'skill-runtime', 'tool-runtime',
     ];
     for (const name of names) {

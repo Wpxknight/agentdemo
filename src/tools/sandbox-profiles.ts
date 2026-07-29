@@ -1,10 +1,10 @@
 import type { JsonValue, ToolResult } from '../model/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
-import type { SandboxManagerLike } from '../sandbox/lifecycle.js';
-import { isSandboxAcquirer } from '../sandbox/acquisition.js';
-import type { SandboxProfile } from '../sandbox/profiles.js';
-import { findSandboxProfile, publicSandboxProfiles, sandboxSpecForProfile } from '../sandbox/profiles.js';
-import type { ExecResult } from '../sandbox/types.js';
+import type { SandboxManagerLike } from '@aiop/sandbox-runtime';
+import { isSandboxAcquirer } from '@aiop/sandbox-runtime';
+import type { SandboxProfile } from '@aiop/sandbox-runtime';
+import { findSandboxProfile, publicSandboxProfiles, sandboxSpecForProfile } from '@aiop/sandbox-runtime';
+import type { ExecResult } from '@aiop/sandbox-runtime';
 
 function asObject(args: JsonValue): Record<string, JsonValue> {
   return args && typeof args === 'object' && !Array.isArray(args) ? args : {};

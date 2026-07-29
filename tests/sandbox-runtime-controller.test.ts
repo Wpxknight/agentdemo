@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { sandboxIdentityKey } from '../src/sandbox/keys.js';
-import { SandboxRuntimeController } from '../src/sandbox/runtime-controller.js';
-import type { DesktopHandle } from '../src/sandbox/desktop.js';
+import { sandboxIdentityKey } from '../packages/sandbox-runtime/src/keys.js';
+import { SandboxRuntimeController } from '../packages/sandbox-runtime/src/runtime-controller.js';
+import type { DesktopHandle } from '../packages/sandbox-runtime/src/desktop.js';
 import { buildSandboxProfileTools } from '../src/tools/sandbox-profiles.js';
-import type { SandboxProfile } from '../src/sandbox/profiles.js';
-import type { SandboxHandle, SandboxProvider, SandboxSpec } from '../src/sandbox/types.js';
+import type { SandboxProfile } from '../packages/sandbox-runtime/src/profiles.js';
+import type { SandboxHandle, SandboxProvider, SandboxSpec } from '../packages/sandbox-runtime/src/types.js';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;

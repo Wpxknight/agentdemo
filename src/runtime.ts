@@ -15,26 +15,26 @@ import {
 } from '@earendil-works/pi-ai';
 import { builtinProviders } from '@earendil-works/pi-ai/providers/all';
 import { createMysqlDurablePiRuntime, type PiSessionStore } from '@aiop/pi-runtime';
-import { SandboxManager, type SandboxManagerLike } from './sandbox/lifecycle.js';
+import { SandboxManager, type SandboxManagerLike } from '@aiop/sandbox-runtime';
 import {
   SandboxRuntimeController,
   type SandboxGenerationInput,
-} from './sandbox/runtime-controller.js';
-import { E2bProvider } from './sandbox/e2b.js';
-import { OpenSandboxProvider } from './sandbox/opensandbox.js';
-import { LocalSandboxProvider } from './sandbox/local.js';
-import type { SandboxProvider } from './sandbox/types.js';
-import { normalizeUserHomeDir } from './sandbox/userhome.js';
-import { WarmPool } from './sandbox/warmpool.js';
-import { E2bDesktopProvider } from './sandbox/e2b-desktop.js';
-import { LocalDesktopProvider } from './sandbox/local-desktop.js';
-import { OpenSandboxDesktopProvider } from './sandbox/opensandbox-desktop.js';
-import { CommandDesktopProvider } from './sandbox/command-desktop.js';
-import type { DesktopHandle, DesktopProvider } from './sandbox/desktop.js';
+} from '@aiop/sandbox-runtime';
+import { E2bProvider } from '@aiop/sandbox-runtime';
+import { OpenSandboxProvider } from '@aiop/sandbox-runtime';
+import { LocalSandboxProvider } from '@aiop/sandbox-runtime';
+import type { SandboxProvider } from '@aiop/sandbox-runtime';
+import { normalizeUserHomeDir } from '@aiop/sandbox-runtime';
+import { WarmPool } from '@aiop/sandbox-runtime';
+import { E2bDesktopProvider } from '@aiop/sandbox-runtime';
+import { LocalDesktopProvider } from '@aiop/sandbox-runtime';
+import { OpenSandboxDesktopProvider } from '@aiop/sandbox-runtime';
+import { CommandDesktopProvider } from '@aiop/sandbox-runtime';
+import type { DesktopHandle, DesktopProvider } from '@aiop/sandbox-runtime';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildSandboxTools } from './tools/builtin.js';
-import type { SpecResolver } from './sandbox/acquisition.js';
+import type { SpecResolver } from '@aiop/sandbox-runtime';
 import { buildExportTool } from './tools/export.js';
 import { DownloadStore } from './server/downloads.js';
 import { buildSkillTools } from './tools/skill/index.js';
@@ -60,7 +60,7 @@ import {
   sandboxSettingsToConfig,
   type LoadedSandboxSettings,
   type SandboxApiKeyUpdate,
-} from './sandbox/settings.js';
+} from '@aiop/sandbox-runtime';
 import { createSettingsSecretBox } from './security/secret-box.js';
 import { buildScheduleTools } from './tools/schedule.js';
 import { buildTodoTool } from './tools/todo.js';
@@ -74,8 +74,8 @@ import {
   sandboxSpecForProfile,
   selectBrowserProfile,
   selectDefaultProfile,
-} from './sandbox/profiles.js';
-import type { PublicSandboxProfile, SandboxProfile } from './sandbox/profiles.js';
+} from '@aiop/sandbox-runtime';
+import type { PublicSandboxProfile, SandboxProfile } from '@aiop/sandbox-runtime';
 import { LocalAuthProvider } from './auth/local.js';
 import { OidcAuthProvider } from './auth/oidc.js';
 import { AiosAuthProvider } from './auth/aios.js';
@@ -85,7 +85,7 @@ import type { RequestContext } from './auth/types.js';
 import {
   AiosTemplateCatalog,
   sandboxProfilesFromAiosCatalog,
-} from './sandbox/aios-template-catalog.js';
+} from '@aiop/sandbox-runtime';
 
 /** 当前生效的非敏感 Sandbox 设置（默认 Key 绝不进入该结构）。 */
 export type SandboxConnectionInfo = SandboxSettings;
