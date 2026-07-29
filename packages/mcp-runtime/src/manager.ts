@@ -73,16 +73,17 @@ export class McpManager {
   }
 
   private ensureConfigured(identity: IdentityContext): Promise<void> {
-    const existing = this.initialized.get(identity.tenantId);
+    const key = identity.tenantId;
+    const existing = this.initialized.get(key);
     if (existing) return existing;
     const configuring = (async () => {
       const loaded = await this.options.loadConfigs?.(identity);
       await this.runtime.configure(identity, loaded ?? this.initial);
     })();
-    this.initialized.set(identity.tenantId, configuring);
+    this.initialized.set(key, configuring);
     void configuring.catch(() => {
-      if (this.initialized.get(identity.tenantId) === configuring) {
-        this.initialized.delete(identity.tenantId);
+      if (this.initialized.get(key) === configuring) {
+        this.initialized.delete(key);
       }
     });
     return configuring;

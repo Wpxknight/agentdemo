@@ -1,4 +1,4 @@
-import type { JsonValue, ToolCall, ToolDefinition, ToolResult } from '@aiop/control-contracts';
+import type { JsonValue, ToolCall, ToolDefinition, ToolExecutionOutcome, ToolResult } from '@aiop/control-contracts';
 import type { TSchema } from '@earendil-works/pi-ai';
 import type { AgentHarnessTool } from '@earendil-works/pi-agent-core';
 import {
@@ -6,6 +6,8 @@ import {
   markGovernedToolPrototype,
   markScopedGovernedTool,
   recordGovernedToolFailure,
+  recordGovernedToolFacts,
+  recordGovernedToolOutcome,
   type GovernedToolFailureTracker,
 } from './governed-tool-state.js';
 
@@ -36,6 +38,28 @@ export class GovernedToolExecutionError extends Error {
     super(message, { cause });
     this.name = 'GovernedToolExecutionError';
   }
+}
+
+export class GovernedToolOutcomeError extends Error {
+  readonly is_bubble_up = true;
+  readonly kind: Exclude<ToolExecutionOutcome['kind'], 'result'>;
+  readonly interactionId?: string;
+  readonly correlationId?: string;
+
+  constructor(readonly outcome: Exclude<ToolExecutionOutcome, { kind: 'result' }>) {
+    super(outcome.kind === 'waiting' ? `tool waiting for ${outcome.reason}` : outcome.message);
+    this.name = 'GovernedToolOutcomeError';
+    this.kind = outcome.kind;
+    this.interactionId = outcome.kind === 'waiting' ? outcome.interactionId : undefined;
+    this.correlationId = outcome.kind === 'recovery_required' ? outcome.correlationId : undefined;
+  }
+}
+
+const GOVERNED_TOOL_FACTS = Symbol('aiop.pi.governedToolFacts');
+
+export function attachGovernedToolFacts(result: ToolResult, outcome: ToolExecutionOutcome): ToolResult {
+  Object.defineProperty(result, GOVERNED_TOOL_FACTS, { value: outcome, configurable: true });
+  return result;
 }
 
 export function bridgeGovernedTools(
@@ -85,6 +109,13 @@ function createAgentTool(
       try {
         result = await execute(call, context);
       } catch (error) {
+        if (error instanceof GovernedToolOutcomeError) {
+          if (tracker) {
+            recordGovernedToolFacts(tracker, toolCallId, error.outcome);
+            recordGovernedToolOutcome(tracker, toolCallId, error);
+          }
+          throw error;
+        }
         const governedError = error instanceof GovernedToolExecutionError ? error
           : new GovernedToolExecutionError('Governed tool execution failed', call, {
           callId: toolCallId, content: error instanceof Error ? error.message : String(error), isError: true,
@@ -92,6 +123,8 @@ function createAgentTool(
         if (tracker) recordGovernedToolFailure(tracker, toolCallId, governedError);
         throw governedError;
       }
+      const facts = (result as ToolResult & { [GOVERNED_TOOL_FACTS]?: ToolExecutionOutcome })[GOVERNED_TOOL_FACTS];
+      if (tracker && facts) recordGovernedToolFacts(tracker, toolCallId, facts);
       if (result.isError) {
         const error = new GovernedToolExecutionError(result.content, call, result);
         if (tracker) recordGovernedToolFailure(tracker, toolCallId, error);

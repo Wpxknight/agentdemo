@@ -22,6 +22,7 @@ export * from './store/memory.js';
 export * from './store/mysql.js';
 export * from './store/pi-session-mysql.js';
 export * from './store/session-stats.js';
+export * from './store/session-id.js';
 export * from './run/attempt.js';
 export * from './run/cancellation.js';
 export * from './run/event-stream.js';
@@ -33,7 +34,7 @@ export * from './run/mysql-assembly.js';
 export * from './run/recovery.js';
 
 // file: pi/agent.d.ts
-import type { AgentInputMessage, AgentRunEvent, IdentityContext } from '@aiop/control-contracts';
+import type { AgentInputMessage, AgentRunEvent, DurableInteractionUpdate, DurableToolLedgerUpdate, IdentityContext, InteractionResolution } from '@aiop/control-contracts';
 import { AgentHarness, type AgentHarnessResources, type AgentHarnessTool, type Session, type SessionCreateOptions, type SessionMetadata, type SessionRepo, type SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import type { Model, Models } from '@earendil-works/pi-ai';
 import { EventCodec, type EventCodecOptions } from './event-codec.js';
@@ -47,6 +48,7 @@ export interface PiAgentSessionFactoryOptions<TMetadata extends SessionMetadata,
         identity?: IdentityContext;
         sessionId?: string;
         events: EventCodecOptions;
+        interactionResolution?: InteractionResolution;
     }): Promise<AgentHarnessTool<undefined>[]>;
     resources?: AgentHarnessResources;
 }
@@ -63,12 +65,14 @@ type SessionCreateField<TCreateOptions extends SessionCreateOptions> = [
 export type CreatePiAgentSessionInput<TCreateOptions extends SessionCreateOptions = SessionCreateOptions> = {
     id?: string;
     identity?: IdentityContext;
+    interactionResolution?: InteractionResolution;
     initialMessage: AgentInputMessage;
     events: EventCodecOptions;
 } & SessionCreateField<TCreateOptions>;
 export interface LoadPiAgentSessionInput<TMetadata extends SessionMetadata = SessionMetadata> {
     metadata: TMetadata;
     identity?: IdentityContext;
+    interactionResolution?: InteractionResolution;
     initialMessage: AgentInputMessage;
     events: EventCodecOptions;
 }
@@ -103,6 +107,10 @@ export declare class PiAgentSession<TMetadata extends SessionMetadata = SessionM
     metadata(): Promise<TMetadata>;
     entries(): Promise<SessionTreeEntry[]>;
     leafId(): Promise<string | null>;
+    takeToolExecutionFacts(): {
+        ledgerUpdates: DurableToolLedgerUpdate[];
+        interactionUpdates: DurableInteractionUpdate[];
+    };
     appendCustomEntry(customType: string, data?: unknown): Promise<string>;
     close(): Promise<void>;
     private installGovernedToolHook;
@@ -173,7 +181,7 @@ export type CompatibleAgentMessage = {
 
 // file: pi/event-codec.d.ts
 import type { AgentRunEvent, JsonValue } from '@aiop/control-contracts';
-import type { AgentHarnessEvent } from '@earendil-works/pi-agent-core';
+import { type AgentHarnessEvent } from '@earendil-works/pi-agent-core';
 export interface EventCodecOptions {
     tenantId: string;
     runId: string;
@@ -186,20 +194,24 @@ export interface EventCodecOptions {
 export declare class EventCodec {
     private readonly options;
     private readonly now;
+    private pendingCompactionMessages?;
     constructor(options: EventCodecOptions);
     fromPi(event: AgentHarnessEvent): AgentRunEvent;
 }
 export declare function toDurableJsonValue(value: unknown): JsonValue;
 
 // file: pi/governed-tool-state.d.ts
-import type { ToolCall, ToolResult } from '@aiop/control-contracts';
+import type { DurableInteractionUpdate, DurableToolLedgerUpdate, ToolCall, ToolExecutionOutcome, ToolResult } from '@aiop/control-contracts';
 import type { AgentHarnessEvent, AgentHarnessTool } from '@earendil-works/pi-agent-core';
+import type { GovernedToolOutcomeError } from './tool-bridge.js';
 export interface GovernedToolFailure {
     call: ToolCall;
     result: ToolResult;
 }
 export interface GovernedToolFailureTracker {
     failures: Map<string, GovernedToolFailure[]>;
+    outcomes: Map<string, GovernedToolOutcomeError[]>;
+    facts: Map<string, ToolExecutionOutcome[]>;
 }
 interface GovernedToolDescriptor {
     createScoped(): {
@@ -214,7 +226,13 @@ export interface GovernedToolScope {
     }>): {
         details: unknown;
         isError: true;
+        terminate?: boolean;
     } | undefined;
+    takeOutcome(): GovernedToolOutcomeError | undefined;
+    takeFacts(): {
+        ledgerUpdates: DurableToolLedgerUpdate[];
+        interactionUpdates: DurableInteractionUpdate[];
+    };
     hasPending(): boolean;
     clear(): void;
 }
@@ -222,6 +240,8 @@ export declare function createGovernedToolFailureTracker(): GovernedToolFailureT
 export declare function markGovernedToolPrototype(tool: AgentHarnessTool<undefined>, descriptor: GovernedToolDescriptor): void;
 export declare function markScopedGovernedTool(tool: AgentHarnessTool<undefined>, tracker: GovernedToolFailureTracker): void;
 export declare function recordGovernedToolFailure(tracker: GovernedToolFailureTracker, toolCallId: string, failure: GovernedToolFailure): void;
+export declare function recordGovernedToolOutcome(tracker: GovernedToolFailureTracker, toolCallId: string, outcome: GovernedToolOutcomeError): void;
+export declare function recordGovernedToolFacts(tracker: GovernedToolFailureTracker, toolCallId: string, outcome: ToolExecutionOutcome): void;
 export declare function scopeGovernedTools(tools: readonly AgentHarnessTool<undefined>[]): GovernedToolScope;
 export declare function adoptGovernedToolScope(tools: readonly AgentHarnessTool<undefined>[]): GovernedToolScope;
 export {};
@@ -296,7 +316,7 @@ export declare function loadAvailableSkills<TProduct extends PiSkillProduct>(env
 }>;
 
 // file: pi/tool-bridge.d.ts
-import type { JsonValue, ToolCall, ToolDefinition, ToolResult } from '@aiop/control-contracts';
+import type { JsonValue, ToolCall, ToolDefinition, ToolExecutionOutcome, ToolResult } from '@aiop/control-contracts';
 import type { AgentHarnessTool } from '@earendil-works/pi-agent-core';
 export interface GovernedTool {
     definition: ToolDefinition;
@@ -321,6 +341,19 @@ export declare class GovernedToolExecutionError extends Error {
     readonly result: ToolResult;
     constructor(message: string, call: ToolCall, result: ToolResult, cause?: unknown);
 }
+export declare class GovernedToolOutcomeError extends Error {
+    readonly outcome: Exclude<ToolExecutionOutcome, {
+        kind: 'result';
+    }>;
+    readonly is_bubble_up = true;
+    readonly kind: Exclude<ToolExecutionOutcome['kind'], 'result'>;
+    readonly interactionId?: string;
+    readonly correlationId?: string;
+    constructor(outcome: Exclude<ToolExecutionOutcome, {
+        kind: 'result';
+    }>);
+}
+export declare function attachGovernedToolFacts(result: ToolResult, outcome: ToolExecutionOutcome): ToolResult;
 export declare function bridgeGovernedTools(tools: readonly GovernedTool[], options?: GovernedToolBridgeOptions): AgentHarnessTool<undefined>[];
 
 // file: run/attempt.d.ts
@@ -386,7 +419,7 @@ export declare function assertUsageAllowed(limits: RunLimits | undefined, usage:
 export declare function assertToolCallsAllowed(limits: RunLimits | undefined, toolCalls: number): void;
 
 // file: run/manager.d.ts
-import type { AgentInputMessage, AgentRunEvent, AppendRunMessageInput, CancelRunInput, DurableRunRuntime, RunHandle, StartRunInput, ResumeRunInput } from '@aiop/control-contracts';
+import type { AgentInputMessage, AgentRunEvent, AppendRunMessageInput, CancelRunInput, DurableInteractionUpdate, DurableRunRuntime, DurableToolLedgerUpdate, RunHandle, StartRunInput, ResumeRunInput } from '@aiop/control-contracts';
 import type { SessionMetadata, SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import { type InboxCapableSession } from './inbox.js';
 import type { DurableRunStore } from '../store/types.js';
@@ -399,11 +432,16 @@ export interface ManagedPiSession extends InboxCapableSession {
     }>;
     entries(): Promise<SessionTreeEntry[]>;
     leafId(): Promise<string | null>;
+    takeToolExecutionFacts?(): {
+        ledgerUpdates: DurableToolLedgerUpdate[];
+        interactionUpdates: DurableInteractionUpdate[];
+    };
 }
 export interface DurableRunSessionFactory {
     create(input: {
         id?: string;
         identity: StartRunInput['identity'];
+        interactionResolution?: ResumeRunInput['resolution'];
         initialMessage: AgentInputMessage;
         events: unknown;
         session?: Record<string, unknown>;
@@ -413,6 +451,7 @@ export interface DurableRunSessionFactory {
             tenantId?: string;
         };
         identity: StartRunInput['identity'];
+        interactionResolution?: ResumeRunInput['resolution'];
         initialMessage: AgentInputMessage;
         events: unknown;
     }): Promise<ManagedPiSession>;
@@ -494,7 +533,7 @@ import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
 export declare function committedInboxIds(entries: readonly SessionTreeEntry[]): Set<string>;
 
 // file: store/memory.d.ts
-import { type AgentRunEvent } from '@aiop/control-contracts';
+import { type AgentRunEvent, type DurableInteractionUpdate } from '@aiop/control-contracts';
 import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import type { ClaimInboxInput, ConsumeInboxInput, DurableRunStore, EnqueueInboxInput, PiSessionRecord, RunInboxMessage, SessionEntryRecord, StoredRun } from './types.js';
 export declare class MemoryRunStore implements DurableRunStore {
@@ -505,6 +544,8 @@ export declare class MemoryRunStore implements DurableRunStore {
     private readonly sessionRecords;
     private readonly sessionEntries;
     private readonly inboxMessages;
+    private readonly interactions;
+    private readonly toolLedger;
     private transactionTail;
     constructor(now?: () => Date);
     create(input: Parameters<DurableRunStore['create']>[0]): Promise<StoredRun & {
@@ -532,6 +573,12 @@ export declare class MemoryRunStore implements DurableRunStore {
         tenantId: string;
         runId: string;
     }): Promise<number>;
+    getInteraction(identity: {
+        tenantId: string;
+        runId: string;
+        interactionId: string;
+    }): Promise<DurableInteractionUpdate | undefined>;
+    resolveInteraction(record: DurableInteractionUpdate): Promise<boolean>;
     closeInbox(input: Parameters<DurableRunStore['closeInbox']>[0]): Promise<void>;
     readonly sessions: {
         create: (input: {
@@ -562,7 +609,7 @@ export declare class MemoryRunStore implements DurableRunStore {
 }
 
 // file: store/mysql.d.ts
-import { type AgentRunEvent, type RunRecord } from '@aiop/control-contracts';
+import { type AgentRunEvent, type DurableInteractionUpdate, type RunRecord } from '@aiop/control-contracts';
 import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import type { Kysely, Transaction } from 'kysely';
 import type { ClaimInboxInput, ConsumeInboxInput, DurableRunStore, EnqueueInboxInput, PiSessionRecord, RunInboxMessage, SessionEntryRecord, StoredRun } from './types.js';
@@ -597,6 +644,12 @@ export declare class MysqlRunStore implements DurableRunStore {
         tenantId: string;
         runId: string;
     }): Promise<number>;
+    getInteraction(identity: {
+        tenantId: string;
+        runId: string;
+        interactionId: string;
+    }): Promise<DurableInteractionUpdate | undefined>;
+    resolveInteraction(record: DurableInteractionUpdate): Promise<boolean>;
     closeInbox(input: Parameters<DurableRunStore['closeInbox']>[0]): Promise<void>;
     readonly sessions: {
         create: (input: {
@@ -709,12 +762,16 @@ export declare class PiMysqlSessionRepo implements SessionRepo<PiMysqlSessionMet
 }
 export {};
 
+// file: store/session-id.d.ts
+/** Keeps the product session id stable while isolating Pi's internal session tree by owner. */
+export declare function piSessionStorageId(actorId: string, sessionId: string): string;
+
 // file: store/session-stats.d.ts
 import type { SessionStats, SessionTreeEntry } from '@earendil-works/pi-agent-core';
 export declare function sessionStats(entries: readonly SessionTreeEntry[]): SessionStats;
 
 // file: store/types.d.ts
-import type { AgentInputMessage, AgentRunEvent, AgentRunResult, ClaimRunInput, ClaimedRun, CommitTurnInput, CompleteRunInput, CreateRunRecord, RenewLeaseInput, RequestCancellationInput, RunRecord, RunStore } from '@aiop/control-contracts';
+import type { AgentInputMessage, AgentRunEvent, AgentRunResult, ClaimRunInput, ClaimedRun, CommitTurnInput, CompleteRunInput, CreateRunRecord, DurableInteractionUpdate, RenewLeaseInput, RequestCancellationInput, RunRecord, RunStore } from '@aiop/control-contracts';
 import type { SessionStats, SessionTreeEntry } from '@earendil-works/pi-agent-core';
 export interface StoredRun extends RunRecord {
     cancelRequestedAt?: Date;
@@ -835,6 +892,12 @@ export interface DurableRunStore extends RunStore {
         tenantId: string;
         runId: string;
     }): Promise<number>;
+    getInteraction(identity: {
+        tenantId: string;
+        runId: string;
+        interactionId: string;
+    }): Promise<DurableInteractionUpdate | undefined>;
+    resolveInteraction(record: DurableInteractionUpdate): Promise<boolean>;
     closeInbox(input: CloseInboxInput): Promise<void>;
     sessions: PiSessionStore;
     inbox: RunInboxStore;

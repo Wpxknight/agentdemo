@@ -6,6 +6,8 @@ import { MemoryStore } from '../src/db/memory.js';
 import { MysqlStore } from '../src/db/mysql.js';
 import {
   buildRuntime,
+  bridgeDurableGovernedTools,
+  createFencedToolLedger,
   createDefaultDurableRunRuntime,
   createMcpCredentialProvider,
   resolveMcpBootstrapConfigs,
@@ -14,6 +16,7 @@ import {
 } from '../src/runtime.js';
 import { ConfigSchema, SandboxConfigSchema, type Config } from '../src/config/schema.js';
 import { DurableRunManager } from '@aiop/pi-runtime';
+import { GovernedToolOutcomeError } from '@aiop/pi-runtime';
 import { McpManager } from '@aiop/mcp-runtime';
 import { AllowAllPolicy } from '../src/agent/policy.js';
 
@@ -51,6 +54,79 @@ describe('resolveRuntimeModelConfig', () => {
 });
 
 describe('production durable runtime assembly', () => {
+  it('fences pre-execution ledger mutations with the active durable attempt lease', async () => {
+    const calls: string[] = [];
+    const ledger = {
+      get: async () => undefined,
+      putIfAbsent: async () => { calls.push('write'); return true; },
+      update: async () => { calls.push('write'); },
+      claimPendingApproval: async () => { calls.push('write'); return true; },
+    };
+    const store = {
+      toolLedger: ledger,
+      transaction: async (work: (tx: unknown) => Promise<unknown>) => work({
+        attempts: { list: async () => [{
+          tenantId: 'tenant-a', runId: 'run-a', attemptId: 'attempt-a', workerId: 'worker-a',
+          leaseToken: 3n, kernel: 'pi', kernelVersion: '0.82.1', status: 'running', startedAt: new Date(),
+        }] },
+        runs: { assertLease: async () => { calls.push('fence'); } },
+        toolLedger: ledger,
+      }),
+    } as never;
+    const fenced = createFencedToolLedger(store, { tenantId: 'tenant-a', runId: 'run-a', attemptId: 'attempt-a' });
+    await fenced.putIfAbsent({
+      tenantId: 'tenant-a', runId: 'run-a', attemptId: 'attempt-a', turnNo: 1,
+      logicalCallId: 'logical-a', toolCallId: 'call-a', toolName: 'deploy', argsDigest: 'digest',
+      capability: 'non_idempotent_write', idempotencyKey: 'key-a', status: 'started',
+      createdAt: new Date(), updatedAt: new Date(),
+    });
+    expect(calls).toEqual(['fence', 'write']);
+  });
+
+  it('persists durable MCP waiting interactions and preserves outcomes for resume', async () => {
+    const definition = {
+      name: 'mcp__ops__deploy', description: 'deploy', inputSchema: {}, capability: 'non_idempotent_write' as const,
+      execute: async () => ({ content: 'unused' }),
+    };
+    const waiting = {
+      kind: 'waiting' as const, reason: 'approval' as const, interactionId: 'approval-a',
+      interactionUpdates: [{
+        tenantId: 'tenant-a', runId: 'run-a', id: 'approval-a', userId: 'user-a', sessionId: 'session-a',
+        attemptId: 'attempt-a', turnNo: 1, kind: 'approval' as const, toolCallId: 'call-a', status: 'pending' as const,
+        payload: {}, createdAt: new Date('2026-07-29T00:00:00.000Z'),
+      }],
+    };
+    const execute = vi.fn(async (_call, context) => context.interactionResolution
+      ? { kind: 'result' as const, result: { callId: 'call-a', content: 'approved' } }
+      : waiting);
+    const tools = bridgeDurableGovernedTools({
+      definitions: [definition], runtime: { execute },
+      context: {
+        identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+        runId: 'run-a', attemptId: 'attempt-a', turnNo: 1, sessionId: 'session-a',
+      },
+    });
+
+    await expect(tools[0]!.execute('call-a', {}, new AbortController().signal, () => undefined, undefined))
+      .rejects.toMatchObject({
+        kind: 'waiting', interactionId: 'approval-a',
+        outcome: { interactionUpdates: waiting.interactionUpdates },
+      });
+
+    const resumed = bridgeDurableGovernedTools({
+      definitions: [definition], runtime: { execute },
+      context: {
+        identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+        runId: 'run-a', attemptId: 'attempt-b', turnNo: 2, sessionId: 'session-a',
+        interactionResolution: {
+          interactionId: 'approval-a', kind: 'approval', toolCallId: 'call-a', value: true,
+        },
+      },
+    });
+    await expect(resumed[0]!.execute('call-a', {}, new AbortController().signal, () => undefined, undefined))
+      .resolves.toMatchObject({ content: [{ type: 'text', text: 'approved' }] });
+    expect(GovernedToolOutcomeError).toBeTypeOf('function');
+  });
   it('limits startup MCP config fallback to the default tenant', () => {
     const startup = { shared: { transport: 'http' as const, url: 'https://mcp.example', headers: { authorization: 'secret' } } };
     expect(resolveMcpBootstrapConfigs('default', startup, undefined)).toEqual(startup);

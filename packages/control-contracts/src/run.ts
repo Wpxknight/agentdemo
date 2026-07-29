@@ -1,8 +1,9 @@
 import type { AgentPlatformErrorData } from './errors.js';
 import type { AgentRunEvent } from './events.js';
 import type { IdentityContext } from './identity.js';
-import type { InteractionResolution, WaitingReason } from './interaction.js';
+import type { DurableInteractionUpdate, InteractionResolution, WaitingReason } from './interaction.js';
 import type { JsonValue } from './json.js';
+import type { DurableToolLedgerUpdate } from './tool.js';
 
 export type AgentKernelName = 'pi' | (string & {});
 export type AgentRunStatus = 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'recovery_required';
@@ -129,10 +130,26 @@ export interface ClaimRunInput {
    * Succeeded and cancelled runs remain terminal even when this is true.
    */
   resume?: boolean;
+  resolution?: InteractionResolution;
 }
 export interface ClaimedRun { record: RunRecord; attemptId: string; fencingToken: bigint }
 export interface RenewLeaseInput { tenantId: string; runId: string; workerId: string; fencingToken: bigint; now: Date; leaseTtlMs: number }
-export interface CommitTurnInput { tenantId: string; runId: string; attemptId: string; turnNo: number; fencingToken: bigint; checkpoint: JsonValue; events: readonly Omit<AgentRunEvent, 'sequence'>[]; status: AgentRunStatus; usage: AgentRunUsage; committedAt: Date }
+export interface CommitTurnInput {
+  tenantId: string;
+  runId: string;
+  attemptId: string;
+  turnNo: number;
+  fencingToken: bigint;
+  checkpoint: JsonValue;
+  events: readonly Omit<AgentRunEvent, 'sequence'>[];
+  status: AgentRunStatus;
+  waitingReason?: WaitingReason;
+  usage: AgentRunUsage;
+  error?: AgentPlatformErrorData;
+  ledgerUpdates?: readonly DurableToolLedgerUpdate[];
+  interactionUpdates?: readonly DurableInteractionUpdate[];
+  committedAt: Date;
+}
 export interface RequestCancellationInput { identity: IdentityContext; runId: string; reason?: string; requestedAt: Date }
 export interface CompleteRunInput { tenantId: string; runId: string; attemptId: string; fencingToken: bigint; status: Extract<AgentRunStatus, 'succeeded' | 'failed' | 'cancelled' | 'recovery_required'>; usage: AgentRunUsage; error?: AgentPlatformErrorData; completedAt: Date }
 

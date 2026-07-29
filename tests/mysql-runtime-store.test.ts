@@ -23,6 +23,15 @@ describe('MySQL runtime adapter contract', () => {
     expect(source).toContain("where('lease_token', '=', Number(token))");
   });
 
+  it('locks the run row while asserting a transaction-scoped lease', async () => {
+    const source = await readFile(sourceUrl, 'utf8');
+    const method = source.slice(
+      source.indexOf('assertLease: async'),
+      source.indexOf('readonly attempts ='),
+    );
+    expect(method).toContain('.forUpdate()');
+  });
+
   it('persists and maps every durable interaction identity and lifecycle field', async () => {
     const source = await readFile(sourceUrl, 'utf8');
     for (const field of [
@@ -66,6 +75,53 @@ describe('MySQL Run Center query contract', () => {
 });
 
 describe.runIf(Boolean(process.env.MYSQL_HOST))('MySQL runtime adapter integration', () => {
+  it('prevents a concurrent lease takeover until a fenced ledger transaction commits', async () => {
+    const store = await createStore(readMysqlConfig()) as MysqlStore;
+    const runtimeStore = store.agentRuntimeStore();
+    const runId = `mysql-runtime-ledger-fence-${Date.now()}`;
+    const identity = { tenantId: 'it', runId };
+    const now = new Date();
+    let releaseWrite!: () => void;
+    let locked!: () => void;
+    const mayWrite = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    const rowLocked = new Promise<void>((resolve) => { locked = resolve; });
+    try {
+      await runtimeStore.runs.create({
+        ...identity, actorId: 'user-a', sessionId: `session-${runId}`, kernel: 'pi', kernelVersion: '0.82.1',
+        runtimeVersion: 'test', status: 'running', leaseToken: 0n,
+        usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+        createdAt: now, updatedAt: now,
+      });
+      const lease = await runtimeStore.runs.acquireLease(identity, 'worker-a', now, 1_000);
+      const staleWrite = runtimeStore.transaction(async (tx) => {
+        await tx.runs.assertLease(identity, 'worker-a', lease!.token, new Date(now.getTime() + 500));
+        locked();
+        await mayWrite;
+        await tx.toolLedger.putIfAbsent({
+          ...identity, attemptId: 'attempt-a', turnNo: 1, logicalCallId: 'logical-a', toolCallId: 'call-a',
+          toolName: 'deploy', argsDigest: 'digest', capability: 'non_idempotent_write', idempotencyKey: 'key-a',
+          status: 'started', createdAt: now, updatedAt: now,
+        });
+      });
+      await rowLocked;
+      let takeoverFinished = false;
+      const takeover = runtimeStore.runs.acquireLease(identity, 'worker-b', new Date(now.getTime() + 2_000), 1_000)
+        .then((value) => { takeoverFinished = true; return value; });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(takeoverFinished).toBe(false);
+      releaseWrite();
+      await staleWrite;
+      await expect(takeover).resolves.toMatchObject({ ownerId: 'worker-b' });
+    } finally {
+      releaseWrite?.();
+      await store.database().deleteFrom('agent_tool_executions')
+        .where('tenant_id', '=', identity.tenantId).where('run_id', '=', runId).execute();
+      await store.database().deleteFrom('agent_runs')
+        .where('tenant_id', '=', identity.tenantId).where('run_id', '=', runId).execute();
+      await store.close();
+    }
+  });
+
   it('commits a persisted turn snapshot containing bigint versions', async () => {
     const store = await createStore(readMysqlConfig()) as MysqlStore;
     const runtimeStore = store.agentRuntimeStore();

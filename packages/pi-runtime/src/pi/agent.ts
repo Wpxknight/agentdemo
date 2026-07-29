@@ -1,4 +1,7 @@
-import type { AgentInputMessage, AgentRunEvent, IdentityContext } from '@aiop/control-contracts';
+import type {
+  AgentInputMessage, AgentRunEvent, DurableInteractionUpdate, DurableToolLedgerUpdate, IdentityContext,
+  InteractionResolution,
+} from '@aiop/control-contracts';
 import {
   AgentHarness,
   type AgentHarnessEvent,
@@ -28,7 +31,12 @@ export interface PiAgentSessionFactoryOptions<
   model: Model<any>;
   systemPrompt?: string;
   tools?: AgentHarnessTool<undefined>[];
-  resolveTools?(input: { identity?: IdentityContext; sessionId?: string; events: EventCodecOptions }): Promise<AgentHarnessTool<undefined>[]>;
+  resolveTools?(input: {
+    identity?: IdentityContext;
+    sessionId?: string;
+    events: EventCodecOptions;
+    interactionResolution?: InteractionResolution;
+  }): Promise<AgentHarnessTool<undefined>[]>;
   resources?: AgentHarnessResources;
 }
 
@@ -41,6 +49,7 @@ type SessionCreateField<TCreateOptions extends SessionCreateOptions> =
 export type CreatePiAgentSessionInput<TCreateOptions extends SessionCreateOptions = SessionCreateOptions> = {
   id?: string;
   identity?: IdentityContext;
+  interactionResolution?: InteractionResolution;
   initialMessage: AgentInputMessage;
   events: EventCodecOptions;
 } & SessionCreateField<TCreateOptions>;
@@ -48,6 +57,7 @@ export type CreatePiAgentSessionInput<TCreateOptions extends SessionCreateOption
 export interface LoadPiAgentSessionInput<TMetadata extends SessionMetadata = SessionMetadata> {
   metadata: TMetadata;
   identity?: IdentityContext;
+  interactionResolution?: InteractionResolution;
   initialMessage: AgentInputMessage;
   events: EventCodecOptions;
 }
@@ -61,17 +71,20 @@ export class PiAgentSessionFactory<
 
   async create(input: CreatePiAgentSessionInput<TCreateOptions>): Promise<PiAgentSession<TMetadata>> {
     const createOptions = { ...input.session, ...(input.id ? { id: input.id } : {}) } as TCreateOptions;
-    const tools = await this.resolveTools(input.identity, input.id, input.events);
+    const tools = await this.resolveTools(input.identity, input.id, input.events, input.interactionResolution);
     return this.wrap(await this.options.repository.create(createOptions), input.initialMessage, input.events, tools);
   }
 
   async load(input: LoadPiAgentSessionInput<TMetadata>): Promise<PiAgentSession<TMetadata>> {
-    const tools = await this.resolveTools(input.identity, input.metadata.id, input.events);
+    const tools = await this.resolveTools(input.identity, input.metadata.id, input.events, input.interactionResolution);
     return this.wrap(await this.options.repository.open(input.metadata), input.initialMessage, input.events, tools);
   }
 
-  private async resolveTools(identity: IdentityContext | undefined, sessionId: string | undefined, events: EventCodecOptions) {
-    return this.options.resolveTools?.({ identity, sessionId, events }) ?? this.options.tools ?? [];
+  private async resolveTools(
+    identity: IdentityContext | undefined, sessionId: string | undefined, events: EventCodecOptions,
+    interactionResolution?: InteractionResolution,
+  ) {
+    return this.options.resolveTools?.({ identity, sessionId, events, interactionResolution }) ?? this.options.tools ?? [];
   }
 
   private wrap(
@@ -192,6 +205,8 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
         }
         await new Promise<void>((resolve) => { wake = resolve; });
       }
+      const governedOutcome = this.governedToolScope.takeOutcome();
+      if (governedOutcome) throw governedOutcome;
       if (failure) throw failure;
     } finally {
       try { await active.finalize(!finished); } catch (error) {
@@ -253,6 +268,13 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
 
   leafId(): Promise<string | null> {
     return this.session.getLeafId();
+  }
+
+  takeToolExecutionFacts(): {
+    ledgerUpdates: DurableToolLedgerUpdate[];
+    interactionUpdates: DurableInteractionUpdate[];
+  } {
+    return this.governedToolScope.takeFacts();
   }
 
   appendCustomEntry(customType: string, data?: unknown): Promise<string> {

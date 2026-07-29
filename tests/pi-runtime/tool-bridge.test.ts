@@ -7,7 +7,10 @@ import {
   type Model,
 } from '@earendil-works/pi-ai';
 import { InMemorySessionRepo } from '@earendil-works/pi-agent-core';
-import { GovernedToolExecutionError, PiAgentSessionFactory, bridgeGovernedTools } from '../../packages/pi-runtime/src/index.js';
+import {
+  attachGovernedToolFacts, GovernedToolExecutionError, GovernedToolOutcomeError, PiAgentSessionFactory,
+  bridgeGovernedTools,
+} from '../../packages/pi-runtime/src/index.js';
 
 const model: Model<'pi-tool-test'> = {
   id: 'pi-tool-test', name: 'Pi Tool Test', api: 'pi-tool-test', provider: 'pi-tool-test', baseUrl: '',
@@ -131,6 +134,44 @@ describe('Pi governed tool bridge', () => {
     });
     expect(JSON.stringify(await session.entries())).toContain('logical-denied-1');
     expect(JSON.stringify(await session.entries())).toContain('digest-1');
+    await session.close();
+  });
+
+  it('bubbles governed waiting outcomes through the real Harness', async () => {
+    const outcome = new GovernedToolOutcomeError({
+      kind: 'waiting', reason: 'approval', interactionId: 'approval-a',
+    });
+    const tools = bridgeGovernedTools([{
+      definition: { name: 'lookup', description: 'Lookup', capability: 'read', inputSchema: { type: 'object' } },
+      execute: async () => { throw outcome; },
+    }]);
+    const session = await new PiAgentSessionFactory({
+      repository: new InMemorySessionRepo(), models: toolModels({}), model, tools,
+    }).create({ id: 'governed-waiting', initialMessage: { role: 'user', text: 'start' }, events: events() });
+
+    await expect(collect(session.continue())).rejects.toBe(outcome);
+    await session.close();
+  });
+
+  it('carries successful governed ledger facts through the real Harness for fenced commit', async () => {
+    const ledgerUpdate = {
+      tenantId: 'tenant-1', runId: 'run-tools', attemptId: 'attempt-1', turnNo: 1,
+      logicalCallId: 'call-1', toolCallId: 'call-1', toolName: 'lookup', argsDigest: 'digest',
+      capability: 'read' as const, idempotencyKey: 'key', status: 'completed' as const,
+      result: { callId: 'call-1', content: 'ok' }, createdAt: new Date(), updatedAt: new Date(),
+    };
+    const tools = bridgeGovernedTools([{
+      definition: { name: 'lookup', description: 'Lookup', capability: 'read', inputSchema: { type: 'object' } },
+      execute: async () => attachGovernedToolFacts({ callId: 'call-1', content: 'ok' }, {
+        kind: 'result', result: { callId: 'call-1', content: 'ok' }, ledgerUpdates: [ledgerUpdate],
+      }),
+    }]);
+    const session = await new PiAgentSessionFactory({
+      repository: new InMemorySessionRepo(), models: toolModels({}), model, tools,
+    }).create({ id: 'governed-facts', initialMessage: { role: 'user', text: 'start' }, events: events() });
+
+    await collect(session.continue());
+    expect(session.takeToolExecutionFacts()).toEqual({ ledgerUpdates: [ledgerUpdate], interactionUpdates: [] });
     await session.close();
   });
 

@@ -5,7 +5,7 @@ import { GovernedToolFactory, type ToolLedgerStore } from '../../packages/pi-run
 const tenant = { tenantId: 'tenant-a', actorId: 'user-a', roles: ['operator'] };
 
 describe('MCP governed tool adapter', () => {
-  it('routes direct invoke through governed idempotency instead of executing the definition twice', async () => {
+  it('uses unique direct invoke identities unless the caller supplies an idempotency key', async () => {
     const callTool = vi.fn(async () => ({ content: [{ type: 'text', text: 'once' }] }));
     const records = new Map<string, Parameters<ToolLedgerStore['putIfAbsent']>[0]>();
     const ledger: ToolLedgerStore = {
@@ -39,9 +39,16 @@ describe('MCP governed tool adapter', () => {
       ops: { transport: 'http', url: 'https://mcp.example', toolCapabilities: { read: 'read' } },
     });
 
-    await expect(runtime.invoke('mcp__ops__read', {}, tenant)).resolves.toEqual({ content: 'once' });
-    await expect(runtime.invoke('mcp__ops__read', {}, tenant)).resolves.toEqual({ content: 'once' });
-    expect(callTool).toHaveBeenCalledOnce();
+    await expect(runtime.invoke('mcp__ops__read', { value: 1 }, tenant)).resolves.toEqual({ content: 'once' });
+    await expect(runtime.invoke('mcp__ops__read', { value: 2 }, tenant)).resolves.toEqual({ content: 'once' });
+    await expect(runtime.invoke('mcp__ops__read', { value: 3 }, tenant, { idempotencyKey: 'retry-a' }))
+      .resolves.toEqual({ content: 'once' });
+    await expect(runtime.invoke('mcp__ops__read', { value: 3 }, tenant, { idempotencyKey: 'retry-a' }))
+      .resolves.toEqual({ content: 'once' });
+    expect(callTool).toHaveBeenCalledTimes(3);
+    const runIds = [...records.values()].map((record) => record.runId);
+    expect(new Set(runIds).size).toBe(3);
+    expect(runIds.filter((runId) => runId.endsWith(':retry-a'))).toHaveLength(1);
   });
 
   it('redacts transport details from failed-call audit events', async () => {

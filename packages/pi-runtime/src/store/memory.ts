@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { AgentPlatformError, LeaseLostError, RunNotFoundError, type AgentRunEvent } from '@aiop/control-contracts';
+import {
+  AgentPlatformError, LeaseLostError, RunNotFoundError, type AgentRunEvent, type DurableInteractionUpdate,
+  type DurableToolLedgerUpdate,
+} from '@aiop/control-contracts';
 import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import type {
   ClaimInboxInput, ConsumeInboxInput, DurableRunStore, EnqueueInboxInput, PiSessionRecord, RunInboxMessage,
@@ -14,11 +17,15 @@ const key = (tenantId: string, id: string): string => `${tenantId}\0${id}`;
 
 export class MemoryRunStore implements DurableRunStore {
   private readonly runs = new Map<string, StoredRun>();
-  private readonly attempts = new Map<string, { tenantId: string; runId: string; attemptId: string; status: string }>();
+  private readonly attempts = new Map<string, {
+    tenantId: string; runId: string; attemptId: string; status: string; completedAt?: Date;
+  }>();
   private readonly events = new Map<string, AgentRunEvent[]>();
   private readonly sessionRecords = new Map<string, PiSessionRecord>();
   private readonly sessionEntries = new Map<string, SessionEntryRecord[]>();
   private readonly inboxMessages = new Map<string, RunInboxMessage[]>();
+  private readonly interactions = new Map<string, DurableInteractionUpdate>();
+  private readonly toolLedger = new Map<string, DurableToolLedgerUpdate>();
   private transactionTail: Promise<void> = Promise.resolve();
 
   constructor(private readonly now: () => Date = () => new Date()) {}
@@ -56,6 +63,18 @@ export class MemoryRunStore implements DurableRunStore {
       if (!canManageRun(input.identity, run.actorId)) return null;
       if (['succeeded', 'cancelled'].includes(run.status)) return null;
       if (['waiting', 'failed', 'recovery_required'].includes(run.status) && !input.resume) return null;
+      if (run.status === 'waiting' && !input.resolution) {
+        throw conflict('Waiting run requires an interaction resolution');
+      }
+      if (input.resolution) {
+        const interaction = this.interactions.get(key(runKey, input.resolution.interactionId));
+        if (!interaction || interaction.status !== 'resolved' || !interaction.toolCallId
+          || interaction.runId !== run.runId || interaction.tenantId !== run.tenantId
+          || (run.status === 'waiting' && interaction.kind !== run.waitingReason)
+          || JSON.stringify(interaction.resolution) !== JSON.stringify(input.resolution.value)) {
+          throw conflict('Interaction resolution does not match the waiting run');
+        }
+      }
       if (input.resume && [...this.runs.values()].some((candidate) => candidate.tenantId === run.tenantId
         && candidate.actorId === run.actorId && candidate.sessionId === run.sessionId && candidate.runId !== run.runId
         && ['queued', 'running', 'waiting'].includes(candidate.status))) {
@@ -71,6 +90,7 @@ export class MemoryRunStore implements DurableRunStore {
       Object.assign(run, {
         leaseOwner: input.workerId, leaseToken: fencingToken,
         leaseExpiresAt: new Date(input.now.getTime() + input.leaseTtlMs), status: 'running', updatedAt: input.now,
+        waitingReason: undefined,
         ...(input.resume && ['waiting', 'failed', 'recovery_required'].includes(run.status) ? { appendClosedAt: undefined } : {}),
       });
       this.attempts.set(key(runKey, attemptId), { tenantId: run.tenantId, runId: run.runId, attemptId, status: 'running' });
@@ -91,7 +111,7 @@ export class MemoryRunStore implements DurableRunStore {
         if (input.turnNo === run.lastTurnNo && JSON.stringify(run.checkpoint) === JSON.stringify(input.checkpoint)) return;
         throw conflict('Turn commit is not monotonic');
       }
-      if (run.cancelRequestedAt) throw conflict('Cancellation won the commit race');
+      if (run.cancelRequestedAt && input.status !== 'cancelled') throw conflict('Cancellation won the commit race');
       const checkpoint = asRecord(input.checkpoint);
       const piSessionId = typeof checkpoint.piSessionId === 'string' ? checkpoint.piSessionId : undefined;
       const piLeafId = typeof checkpoint.piLeafId === 'string' ? checkpoint.piLeafId : null;
@@ -108,8 +128,29 @@ export class MemoryRunStore implements DurableRunStore {
       run.lastTurnNo = input.turnNo;
       run.checkpoint = clone(input.checkpoint);
       run.status = input.status;
+      run.waitingReason = input.waitingReason;
       run.usage = clone(input.usage);
       run.updatedAt = input.committedAt;
+      for (const interaction of input.interactionUpdates ?? []) {
+        this.interactions.set(key(key(interaction.tenantId, interaction.runId), interaction.id), clone(interaction));
+      }
+      for (const ledger of input.ledgerUpdates ?? []) {
+        this.toolLedger.set(key(key(ledger.tenantId, ledger.runId), ledger.logicalCallId), clone(ledger));
+      }
+      if (input.status === 'waiting') {
+        run.leaseOwner = undefined;
+        run.leaseExpiresAt = undefined;
+        const attempt = this.attempts.get(key(key(input.tenantId, input.runId), input.attemptId));
+        if (attempt) Object.assign(attempt, { status: 'succeeded', completedAt: input.committedAt });
+      }
+      if (input.status === 'recovery_required') {
+        run.result = { runId: input.runId, status: input.status, usage: clone(input.usage), error: input.error };
+        run.appendClosedAt ??= input.committedAt;
+        run.leaseOwner = undefined;
+        run.leaseExpiresAt = undefined;
+        const attempt = this.attempts.get(key(key(input.tenantId, input.runId), input.attemptId));
+        if (attempt) Object.assign(attempt, { status: 'failed', completedAt: input.committedAt });
+      }
     });
   }
 
@@ -128,6 +169,7 @@ export class MemoryRunStore implements DurableRunStore {
       const run = this.requireLease(input, input.completedAt);
       const status = run.cancelRequestedAt ? 'cancelled' : input.status;
       run.status = status;
+      run.waitingReason = undefined;
       run.usage = clone(input.usage);
       run.result = { runId: input.runId, status, usage: clone(input.usage), error: input.error };
       run.appendClosedAt ??= input.completedAt;
@@ -135,7 +177,7 @@ export class MemoryRunStore implements DurableRunStore {
       run.leaseExpiresAt = undefined;
       run.updatedAt = input.completedAt;
       const attempt = this.attempts.get(key(key(input.tenantId, input.runId), input.attemptId));
-      if (attempt) attempt.status = status;
+      if (attempt) Object.assign(attempt, { status, completedAt: input.completedAt });
     });
   }
 
@@ -158,6 +200,22 @@ export class MemoryRunStore implements DurableRunStore {
 
   async countAttempts(identity: { tenantId: string; runId: string }): Promise<number> {
     return [...this.attempts.values()].filter((attempt) => attempt.tenantId === identity.tenantId && attempt.runId === identity.runId).length;
+  }
+
+  async getInteraction(
+    identity: { tenantId: string; runId: string; interactionId: string },
+  ): Promise<DurableInteractionUpdate | undefined> {
+    return clone(this.interactions.get(key(key(identity.tenantId, identity.runId), identity.interactionId)));
+  }
+
+  async resolveInteraction(record: DurableInteractionUpdate): Promise<boolean> {
+    return this.lock(async () => {
+      const interactionKey = key(key(record.tenantId, record.runId), record.id);
+      const current = this.interactions.get(interactionKey);
+      if (!current || current.status !== 'pending' || record.status !== 'resolved') return false;
+      this.interactions.set(interactionKey, clone(record));
+      return true;
+    });
   }
 
   async closeInbox(input: Parameters<DurableRunStore['closeInbox']>[0]): Promise<void> {

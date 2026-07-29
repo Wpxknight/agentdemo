@@ -1,6 +1,6 @@
 import type {
   AgentInputMessage, AgentRunEvent, AgentRunResult, ClaimRunInput, ClaimedRun, CommitTurnInput,
-  CompleteRunInput, CreateRunRecord, RenewLeaseInput, RequestCancellationInput, RunRecord, RunStore,
+  CompleteRunInput, CreateRunRecord, DurableInteractionUpdate, RenewLeaseInput, RequestCancellationInput, RunRecord, RunStore,
 } from '@aiop/control-contracts';
 import type { SessionStats, SessionTreeEntry } from '@earendil-works/pi-agent-core';
 
@@ -113,6 +113,8 @@ export interface DurableRunStore extends RunStore {
   appendEvents(input: AppendRunEventsInput): Promise<void>;
   isCancellationRequested(identity: { tenantId: string; runId: string }): Promise<boolean>;
   countAttempts(identity: { tenantId: string; runId: string }): Promise<number>;
+  getInteraction(identity: { tenantId: string; runId: string; interactionId: string }): Promise<DurableInteractionUpdate | undefined>;
+  resolveInteraction(record: DurableInteractionUpdate): Promise<boolean>;
   closeInbox(input: CloseInboxInput): Promise<void>;
   sessions: PiSessionStore;
   inbox: RunInboxStore;

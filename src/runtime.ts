@@ -9,16 +9,25 @@ import { PermissionRules } from './agent/rules.js';
 import { HookRunner } from './agent/hooks.js';
 import { PlanApprovalState } from './agent/plan.js';
 import { AgentRuntime, createConfiguredAgentRuntime } from './agent/runtime.js';
-import type { DurableRunRuntime } from '@aiop/control-contracts';
+import type {
+  DurableRunRuntime,
+  IdentityContext,
+  ResolvedInteraction,
+  ToolRuntime,
+} from '@aiop/control-contracts';
+import type { RuntimeStore, ToolLedgerApprovalClaim, ToolLedgerRepository } from '@aiop/agent-runtime-core';
 import {
   InMemoryCredentialStore, createModels, type Api, type Model as PiModel, type Provider as PiProvider,
 } from '@earendil-works/pi-ai';
 import { builtinProviders } from '@earendil-works/pi-ai/providers/all';
 import {
   bridgeGovernedTools,
+  attachGovernedToolFacts,
   createMysqlDurablePiRuntime,
+  GovernedToolOutcomeError,
   ResourceConcurrencyController,
   type PiSessionStore,
+  type GovernedToolDefinition,
 } from '@aiop/pi-runtime';
 import { SandboxManager, type SandboxManagerLike } from '@aiop/sandbox-runtime';
 import {
@@ -214,6 +223,54 @@ export async function resolveRuntimeModelConfig(
   return persisted ? toRuntimeModelConfig(persisted) : fallback;
 }
 
+export function bridgeDurableGovernedTools(input: {
+  definitions: readonly GovernedToolDefinition[];
+  runtime: ToolRuntime;
+  context: {
+    identity: IdentityContext;
+    runId: string;
+    attemptId: string;
+    turnNo: number;
+    sessionId: string;
+    interactionResolution?: ResolvedInteraction;
+  };
+}) {
+  return bridgeGovernedTools(input.definitions.map((definition) => ({
+    definition,
+    execute: async (call, context) => {
+      const outcome = await input.runtime.execute(call, {
+        identity: input.context.identity,
+        runId: input.context.runId,
+        attemptId: input.context.attemptId,
+        turnNo: input.context.turnNo,
+        sessionId: input.context.sessionId,
+        signal: context.signal,
+        interactionResolution: input.context.interactionResolution,
+      });
+      if (outcome.kind === 'result') return attachGovernedToolFacts(outcome.result, outcome);
+      throw new GovernedToolOutcomeError(outcome);
+    },
+  })));
+}
+
+export function createFencedToolLedger(
+  store: RuntimeStore,
+  current: { tenantId: string; runId: string; attemptId: string },
+): ToolLedgerRepository {
+  const mutate = <T>(work: (ledger: ToolLedgerRepository) => Promise<T>): Promise<T> => store.transaction(async (tx) => {
+    const attempt = (await tx.attempts.list(current)).find((candidate) => candidate.attemptId === current.attemptId);
+    if (!attempt || attempt.status !== 'running') throw new Error('Current durable attempt is not active');
+    await tx.runs.assertLease(current, attempt.workerId, attempt.leaseToken, new Date());
+    return work(tx.toolLedger);
+  });
+  return {
+    get: (identity) => store.toolLedger.get(identity),
+    putIfAbsent: (record) => mutate((ledger) => ledger.putIfAbsent(record)),
+    update: (record) => mutate((ledger) => ledger.update(record)),
+    claimPendingApproval: (input: ToolLedgerApprovalClaim) => mutate((ledger) => ledger.claimPendingApproval(input)),
+  };
+}
+
 export async function createDefaultDurableRunRuntime(
   store: Store,
   modelConfig: RuntimeModelConfig,
@@ -268,7 +325,7 @@ async function createDefaultDurableRunAssembly(
   const runtimeStore = store.agentRuntimeStore();
   return createMysqlDurablePiRuntime({
     db: store.database(), models, model, systemPrompt,
-    resolveTools: mcp ? async ({ identity, sessionId, events }) => {
+    resolveTools: mcp ? async ({ identity, sessionId, events, interactionResolution }) => {
       if (!identity) return [];
       const definitions = await mcp.tools(identity);
       const governed = createAIOPToolRuntime({
@@ -284,27 +341,34 @@ async function createDefaultDurableRunAssembly(
               : 'user',
           sessionId: sessionId ?? events.runId,
         },
-      }, runtimeStore.toolLedger, new ResourceConcurrencyController(), undefined, true);
-      return bridgeGovernedTools(definitions.map((definition) => ({
-        definition,
-        execute: async (call, context) => {
-          const outcome = await governed.execute(call, {
-            identity,
-            runId: events.runId,
-            attemptId: events.attemptId,
-            turnNo: events.turnNo,
-            signal: context.signal,
-          });
-          if (outcome.kind === 'result') return outcome.result;
-          return {
-            callId: call.id,
-            content: outcome.kind === 'waiting'
-              ? `tool waiting for ${outcome.reason}`
-              : outcome.message,
-            isError: true,
-          };
+      }, createFencedToolLedger(runtimeStore, {
+        tenantId: identity.tenantId, runId: events.runId, attemptId: events.attemptId,
+      }), new ResourceConcurrencyController(), runtimeStore.interactions, false);
+      const resolvedInteraction = interactionResolution
+        ? await runtimeStore.interactions.get({
+            tenantId: identity.tenantId, runId: events.runId,
+            interactionId: interactionResolution.interactionId,
+          })
+        : undefined;
+      return bridgeDurableGovernedTools({
+        definitions,
+        runtime: governed,
+        context: {
+          identity,
+          runId: events.runId,
+          attemptId: events.attemptId,
+          turnNo: events.turnNo,
+          sessionId: sessionId ?? events.runId,
+          interactionResolution: resolvedInteraction?.status === 'resolved' && resolvedInteraction.toolCallId
+            ? {
+                interactionId: resolvedInteraction.id,
+                kind: resolvedInteraction.kind,
+                toolCallId: resolvedInteraction.toolCallId,
+                value: resolvedInteraction.resolution ?? interactionResolution?.value ?? null,
+              }
+            : undefined,
         },
-      })));
+      });
     } : undefined,
   });
 }

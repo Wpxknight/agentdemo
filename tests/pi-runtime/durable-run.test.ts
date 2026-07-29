@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { LeaseLostError } from '@aiop/control-contracts';
-import { createMysqlDurablePiRuntime, DurableRunManager, MemoryRunStore, MysqlRunStore, piSessionStorageId } from '../../packages/pi-runtime/src/index.js';
+import {
+  createMysqlDurablePiRuntime, DurableRunManager, GovernedToolOutcomeError, MemoryRunStore, MysqlRunStore,
+  piSessionStorageId,
+} from '../../packages/pi-runtime/src/index.js';
 import type { ManagedPiSession } from '../../packages/pi-runtime/src/index.js';
 import type { AgentRunEvent } from '@aiop/control-contracts';
 import type { DurableRunStore } from '../../packages/pi-runtime/src/index.js';
@@ -693,6 +696,247 @@ describe('DurableRunManager', () => {
       input: [{ role: 'user', text: 'start' }], limits: { maxCostUsd: 0.1 },
     })).result();
     expect(result).toMatchObject({ status: 'succeeded', usage: { costUsd: 0.05 } });
+  });
+
+  it('commits a governed waiting outcome and resumes it immediately on another worker with its resolution', async () => {
+    const store = new MemoryRunStore();
+    const runId = 'governed-waiting-run';
+    const sessionId = 'governed-waiting-session';
+    const waitingSession: ManagedPiSession = {
+      ...emptySession(sessionId),
+      async *continue() {
+        throw new GovernedToolOutcomeError({
+          kind: 'waiting', reason: 'approval', interactionId: 'approval-a',
+          interactionUpdates: [{
+            tenantId: identity.tenantId, runId, id: 'approval-a', attemptId: 'attempt-a', turnNo: 1,
+            kind: 'approval', toolCallId: 'call-a', status: 'pending', payload: {}, createdAt: new Date(),
+          }],
+        });
+      },
+    };
+    let receivedResolution: unknown;
+    const resumedSession = emptySession(sessionId);
+    const firstManager = new DurableRunManager({
+      store, workerId: 'waiting-worker-a', heartbeatMs: 0,
+      sessions: { create: async () => waitingSession, load: async () => waitingSession },
+      eventOptions: () => ({}),
+    });
+    const secondManager = new DurableRunManager({
+      store, workerId: 'waiting-worker-b', heartbeatMs: 0,
+      sessions: {
+        create: async () => resumedSession,
+        load: async ({ interactionResolution }) => {
+          receivedResolution = interactionResolution;
+          return resumedSession;
+        },
+      },
+      eventOptions: () => ({}),
+    });
+
+    const waitingResult = await (await firstManager.run({
+      runId, identity, sessionId, input: [{ role: 'user', text: 'needs approval' }],
+    })).result();
+
+    expect(waitingResult).toMatchObject({ status: 'waiting' });
+    const waitingRun = await store.get({ tenantId: identity.tenantId, runId });
+    expect(waitingRun).toMatchObject({
+      status: 'waiting', waitingReason: 'approval', leaseOwner: undefined, leaseExpiresAt: undefined,
+    });
+    expect(waitingRun?.appendClosedAt).toBeUndefined();
+
+    const resolution = { interactionId: 'approval-a', value: { approved: true } };
+    const pendingInteraction = await store.getInteraction({
+      tenantId: identity.tenantId, runId, interactionId: resolution.interactionId,
+    });
+    await expect(store.resolveInteraction({
+      ...pendingInteraction!, status: 'resolved', resolution: resolution.value, resolvedAt: new Date(),
+    })).resolves.toBe(true);
+    const resumedResult = await (await secondManager.resume({ identity, runId, resolution })).result();
+
+    expect(receivedResolution).toEqual(resolution);
+    expect(resumedResult.status).toBe('succeeded');
+    expect((await store.get({ tenantId: identity.tenantId, runId }))?.waitingReason).toBeUndefined();
+  });
+
+  it('preserves a governed recovery-required outcome instead of classifying it as a model failure', async () => {
+    const store = new MemoryRunStore();
+    const session = {
+      ...emptySession('governed-recovery-session'),
+      async *continue() {
+        throw new GovernedToolOutcomeError({
+          kind: 'recovery_required', correlationId: 'external-a', message: 'external result is uncertain',
+        });
+      },
+    };
+    const manager = new DurableRunManager({
+      store, heartbeatMs: 0, sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+
+    const result = await (await manager.run({
+      runId: 'governed-recovery-run', identity, sessionId: 'governed-recovery-session',
+      input: [{ role: 'user', text: 'write externally' }],
+    })).result();
+
+    expect(result).toMatchObject({
+      status: 'recovery_required',
+      error: { code: 'TOOL_RESULT_UNKNOWN', message: 'external result is uncertain', retryable: false },
+    });
+    expect(await store.get({ tenantId: identity.tenantId, runId: 'governed-recovery-run' })).toMatchObject({
+      status: 'recovery_required', appendClosedAt: expect.any(Date),
+    });
+  });
+
+  it('commits governed ledger and interaction facts through the fenced turn transaction', async () => {
+    const base = new MemoryRunStore();
+    let committed: Record<string, unknown> | undefined;
+    const store = new Proxy(base, {
+      get(target, property) {
+        if (property === 'commitTurn') return async (input: Record<string, unknown>) => {
+          committed = input;
+          return target.commitTurn(input as never);
+        };
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const ledgerUpdate = {
+      tenantId: identity.tenantId, runId: 'governed-facts-run', attemptId: 'tool-attempt', turnNo: 1,
+      logicalCallId: 'logical-a', toolCallId: 'call-a', toolName: 'deploy', argsDigest: 'digest',
+      capability: 'non_idempotent_write' as const, idempotencyKey: 'idempotency-a', status: 'pending_approval' as const,
+      approvedInteractionId: 'approval-a', createdAt: new Date(), updatedAt: new Date(),
+    };
+    const interactionUpdate = {
+      tenantId: identity.tenantId, runId: 'governed-facts-run', id: 'approval-a', attemptId: 'tool-attempt',
+      turnNo: 1, kind: 'approval' as const, toolCallId: 'call-a', status: 'pending' as const,
+      payload: {}, createdAt: new Date(),
+    };
+    const session = {
+      ...emptySession('governed-facts-session'),
+      async *continue() {
+        throw new GovernedToolOutcomeError({
+          kind: 'waiting', reason: 'approval', interactionId: 'approval-a',
+          ledgerUpdates: [ledgerUpdate], interactionUpdates: [interactionUpdate],
+        });
+      },
+    };
+    const manager = new DurableRunManager({
+      store: store as never, heartbeatMs: 0,
+      sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+
+    await (await manager.run({
+      runId: 'governed-facts-run', identity, sessionId: 'governed-facts-session', input: [{ role: 'user', text: 'deploy' }],
+    })).result();
+
+    expect(committed).toMatchObject({ ledgerUpdates: [ledgerUpdate], interactionUpdates: [interactionUpdate] });
+  });
+
+  it('finalizes governed recovery-required in the turn transaction without a second completion write', async () => {
+    const base = new MemoryRunStore();
+    const store = new Proxy(base, {
+      get(target, property) {
+        if (property === 'complete') return async () => { throw new Error('second completion write must not run'); };
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const session = {
+      ...emptySession('atomic-recovery-session'),
+      async *continue() {
+        throw new GovernedToolOutcomeError({ kind: 'recovery_required', message: 'uncertain' });
+      },
+    };
+    const manager = new DurableRunManager({
+      store: store as never, heartbeatMs: 0,
+      sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+
+    await expect((await manager.run({
+      runId: 'atomic-recovery-run', identity, sessionId: 'atomic-recovery-session',
+      input: [{ role: 'user', text: 'deploy' }],
+    })).result()).resolves.toMatchObject({ status: 'recovery_required' });
+  });
+
+  it('rejects a waiting resume whose resolution is not the resolved interaction for that run', async () => {
+    const base = new MemoryRunStore();
+    const now = new Date();
+    await base.create({ record: {
+      tenantId: identity.tenantId, runId: 'validated-resume-run', actorId: identity.actorId,
+      sessionId: 'validated-resume-session', kernel: 'pi', kernelVersion: '0.82.1', status: 'waiting',
+      waitingReason: 'approval', leaseToken: 0n, usage, createdAt: now, updatedAt: now,
+    } });
+    const store = new Proxy(base, {
+      get(target, property) {
+        if (property === 'getInteraction') return async () => ({
+          tenantId: identity.tenantId, runId: 'different-run', id: 'approval-a', attemptId: 'attempt-a', turnNo: 1,
+          kind: 'approval', toolCallId: 'call-a', status: 'resolved', payload: {}, resolution: true, createdAt: now,
+        });
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const manager = new DurableRunManager({
+      store: store as never, heartbeatMs: 0,
+      sessions: { create: async () => { throw new Error('must not create'); }, load: async () => { throw new Error('must not load'); } },
+      eventOptions: () => ({}),
+    });
+
+    await expect(manager.resume({
+      identity, runId: 'validated-resume-run', resolution: { interactionId: 'approval-a', value: true },
+    })).rejects.toMatchObject({ code: 'RUN_STATE_CONFLICT' });
+    expect((await base.get({ tenantId: identity.tenantId, runId: 'validated-resume-run' }))?.status).toBe('waiting');
+  });
+
+  it('rejects an atomic waiting claim that omits the required resolution', async () => {
+    const store = new MemoryRunStore();
+    const now = new Date();
+    await store.create({ record: {
+      tenantId: identity.tenantId, runId: 'claim-without-resolution', actorId: identity.actorId,
+      sessionId: 'claim-without-resolution-session', kernel: 'pi', kernelVersion: '0.82.1', status: 'waiting',
+      waitingReason: 'approval', leaseToken: 0n, usage, createdAt: now, updatedAt: now,
+    } });
+
+    await expect(store.claim({
+      identity, runId: 'claim-without-resolution', workerId: 'worker-b', now, leaseTtlMs: 1_000, resume: true,
+    })).rejects.toMatchObject({ code: 'RUN_STATE_CONFLICT' });
+    expect((await store.get({ tenantId: identity.tenantId, runId: 'claim-without-resolution' }))?.status)
+      .toBe('waiting');
+  });
+
+  it('commits accumulated governed facts when a later provider operation fails', async () => {
+    const base = new MemoryRunStore();
+    let committed: Record<string, unknown> | undefined;
+    const store = new Proxy(base, {
+      get(target, property) {
+        if (property === 'commitTurn') return async (input: Record<string, unknown>) => {
+          committed = input;
+          return target.commitTurn(input as never);
+        };
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const ledgerUpdate = {
+      tenantId: identity.tenantId, runId: 'facts-before-provider-failure', attemptId: 'attempt-a', turnNo: 1,
+      logicalCallId: 'logical-a', toolCallId: 'call-a', toolName: 'deploy', argsDigest: 'digest',
+      capability: 'non_idempotent_write' as const, idempotencyKey: 'key-a', status: 'completed' as const,
+      result: { callId: 'call-a', content: 'ok' }, createdAt: new Date(), updatedAt: new Date(),
+    };
+    const session: ManagedPiSession = {
+      ...emptySession('facts-before-provider-failure-session'),
+      async *continue() { throw new Error('provider failed after tool completion'); },
+      takeToolExecutionFacts: () => ({ ledgerUpdates: [ledgerUpdate], interactionUpdates: [] }),
+    };
+    const manager = new DurableRunManager({
+      store: store as never, heartbeatMs: 0,
+      sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+
+    await expect((await manager.run({
+      runId: 'facts-before-provider-failure', identity, sessionId: 'facts-before-provider-failure-session',
+      input: [{ role: 'user', text: 'deploy' }],
+    })).result()).resolves.toMatchObject({ status: 'failed' });
+    expect(committed).toMatchObject({ status: 'failed', ledgerUpdates: [ledgerUpdate], interactionUpdates: [] });
   });
 
   it.each([

@@ -139,8 +139,9 @@ export type JsonValue = string | number | boolean | null | JsonValue[] | {
 import type { AgentPlatformErrorData } from './errors.js';
 import type { AgentRunEvent } from './events.js';
 import type { IdentityContext } from './identity.js';
-import type { InteractionResolution, WaitingReason } from './interaction.js';
+import type { DurableInteractionUpdate, InteractionResolution, WaitingReason } from './interaction.js';
 import type { JsonValue } from './json.js';
+import type { DurableToolLedgerUpdate } from './tool.js';
 export type AgentKernelName = 'pi' | (string & {});
 export type AgentRunStatus = 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'recovery_required';
 export type AttemptStatus = 'running' | 'succeeded' | 'failed' | 'cancelled' | 'lost_lease';
@@ -259,6 +260,7 @@ export interface ClaimRunInput {
      * Succeeded and cancelled runs remain terminal even when this is true.
      */
     resume?: boolean;
+    resolution?: InteractionResolution;
 }
 export interface ClaimedRun {
     record: RunRecord;
@@ -282,7 +284,11 @@ export interface CommitTurnInput {
     checkpoint: JsonValue;
     events: readonly Omit<AgentRunEvent, 'sequence'>[];
     status: AgentRunStatus;
+    waitingReason?: WaitingReason;
     usage: AgentRunUsage;
+    error?: AgentPlatformErrorData;
+    ledgerUpdates?: readonly DurableToolLedgerUpdate[];
+    interactionUpdates?: readonly DurableInteractionUpdate[];
     committedAt: Date;
 }
 export interface RequestCancellationInput {

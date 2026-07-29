@@ -105,6 +105,85 @@ describe('MCP multi-tenant isolation', () => {
     })).rejects.toThrow('tenant identity mismatch');
   });
 
+  it('never reuses the first actor credentials for another actor in the same tenant', async () => {
+    const connections: string[] = [];
+    const runtime = new McpRuntime({
+      connect: async (_name, _config, context) => {
+        connections.push(`${context.identity.actorId}:${context.credentials.headers?.authorization}`);
+        return client(String(context.credentials.headers?.authorization));
+      },
+      credentials: {
+        resolve: async ({ actorId }) => ({ headers: { authorization: `Bearer ${actorId}` } }),
+      },
+    });
+    const actorA = { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] };
+    const actorB = { tenantId: 'tenant-a', actorId: 'user-b', roles: ['user'] };
+    await runtime.configure(actorA, { shared: { transport: 'http', url: 'https://mcp.example' } });
+    await runtime.configure(actorB, { shared: { transport: 'http', url: 'https://mcp.example' } });
+
+    const [toolA] = await runtime.discover(actorA);
+    const [toolB] = await runtime.discover(actorB);
+    await expect(toolA!.execute({ id: 'a', logicalCallId: 'a', name: toolA!.name, arguments: {} }, {
+      identity: actorA, runId: 'run-a', attemptId: 'attempt-a', turnNo: 1,
+      idempotencyKey: 'actor-a',
+    })).resolves.toMatchObject({ content: 'Bearer user-a' });
+    await expect(toolB!.execute({ id: 'b', logicalCallId: 'b', name: toolB!.name, arguments: {} }, {
+      identity: actorB, runId: 'run-b', attemptId: 'attempt-b', turnNo: 1,
+      idempotencyKey: 'actor-b',
+    })).resolves.toMatchObject({ content: 'Bearer user-b' });
+    expect(connections).toEqual(['user-a:Bearer user-a', 'user-b:Bearer user-b']);
+  });
+
+  it('shares tenant server configuration changes without sharing actor clients or credentials', async () => {
+    const connections: string[] = [];
+    const manager = new McpManager({
+      shared: { transport: 'http', url: 'https://mcp.example/shared' },
+    }, async (name, _config, context) => {
+      connections.push(`${context.identity.actorId}:${name}`);
+      return client(`${context.identity.actorId}:${name}`);
+    }, {
+      credentials: { resolve: async ({ actorId }) => ({ headers: { authorization: `Bearer ${actorId}` } }) },
+    });
+    const actorA = { tenantId: 'tenant-a', actorId: 'user-a', roles: ['tenant_admin'] };
+    const actorB = { tenantId: 'tenant-a', actorId: 'user-b', roles: ['user'] };
+    await manager.tools(actorA);
+    await manager.tools(actorB);
+
+    await manager.add(actorA, 'extra', { transport: 'http', url: 'https://mcp.example/extra' });
+    expect((await manager.list(actorB)).map((server) => server.name).sort()).toEqual(['extra', 'shared']);
+    const extraB = (await manager.tools(actorB)).find((tool) => tool.name === 'mcp__extra__whoami');
+    await expect(extraB!.execute({ id: 'extra-b', logicalCallId: 'extra-b', name: extraB!.name, arguments: {} }, {
+      identity: actorB, runId: 'run-extra-b', attemptId: 'attempt-extra-b', turnNo: 1,
+      idempotencyKey: 'extra-b',
+    })).resolves.toMatchObject({ content: 'user-b:extra' });
+
+    await manager.remove(actorA, 'shared');
+    expect((await manager.list(actorB)).map((server) => server.name)).toEqual(['extra']);
+    expect(connections).toContain('user-b:extra');
+  });
+
+  it('does not let a delayed actor initialization restore an obsolete tenant snapshot', async () => {
+    let releaseActorB!: () => void;
+    const actorBMayLoad = new Promise<void>((resolve) => { releaseActorB = resolve; });
+    const manager = new McpManager({}, async (name) => client(name), {
+      loadConfigs: async ({ actorId }) => {
+        if (actorId === 'user-b') await actorBMayLoad;
+        return { old: { transport: 'http', url: 'https://mcp.example/old' } };
+      },
+    });
+    const actorA = { tenantId: 'tenant-a', actorId: 'user-a', roles: ['tenant_admin'] };
+    const actorB = { tenantId: 'tenant-a', actorId: 'user-b', roles: ['user'] };
+    await manager.list(actorA);
+    const delayedActorB = manager.list(actorB);
+    await Promise.resolve();
+    await manager.add(actorA, 'new', { transport: 'http', url: 'https://mcp.example/new' });
+    releaseActorB();
+    await delayedActorB;
+
+    expect((await manager.list(actorA)).map((server) => server.name).sort()).toEqual(['new', 'old']);
+    expect((await manager.list(actorB)).map((server) => server.name).sort()).toEqual(['new', 'old']);
+  });
+
   it('reuses a tenant/server connection and closes it when configuration changes', async () => {
     const first = client('first');
     const second = client('second');

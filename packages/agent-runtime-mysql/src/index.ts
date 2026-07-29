@@ -133,7 +133,7 @@ export class MysqlRuntimeStore implements RuntimeStore {
       const row = await this.db.selectFrom('agent_runs').select('run_id')
         .where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId)
         .where('lease_owner', '=', ownerId).where('lease_token', '=', Number(token))
-        .where('lease_expires_at', '>', now).executeTakeFirst();
+        .where('lease_expires_at', '>', now).forUpdate().executeTakeFirst();
       if (!row) throw leaseLost();
     },
   };

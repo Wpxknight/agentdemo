@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { IdentityContext, JsonValue, ToolCapability, ToolCall, ToolExecutionContext } from '@aiop/control-contracts';
 import type { GovernedToolDefinition } from '@aiop/pi-runtime';
 import { connectMcp } from './client.js';
@@ -29,6 +30,7 @@ export class McpDisconnectedError extends Error {}
 
 export class McpRuntime {
   private readonly tenants = new Map<string, Map<string, ServerState>>();
+  private readonly tenantConfigs = new Map<string, Record<string, McpServerConfig>>();
   private readonly connect;
 
   constructor(private readonly options: McpRuntimeOptions) {
@@ -39,31 +41,29 @@ export class McpRuntime {
     identity: IdentityContext,
     configs: Record<string, McpServerConfig>,
   ): Promise<void> {
-    const current = this.tenants.get(identity.tenantId) ?? new Map<string, ServerState>();
-    this.tenants.set(identity.tenantId, current);
+    this.tenantConfigs.set(identity.tenantId, structuredClone(configs));
+    const scope = identityScope(identity);
+    const current = this.tenants.get(scope) ?? new Map<string, ServerState>();
+    this.tenants.set(scope, current);
     const closing: Promise<void>[] = [];
-    for (const [name, state] of current) {
-      const config = configs[name];
-      if (!config || fingerprint(config) !== state.fingerprint) {
-        current.delete(name);
-        state.generation += 1;
-        if (state.client) closing.push(closeQuietly(state.client));
+    for (const states of this.tenantStates(identity.tenantId)) {
+      for (const [name, state] of states) {
+        const config = configs[name];
+        if (!config || fingerprint(config) !== state.fingerprint) {
+          states.delete(name);
+          state.generation += 1;
+          if (state.client) closing.push(closeQuietly(state.client));
+        }
       }
-    }
-    for (const [name, config] of Object.entries(configs)) {
-      if (!current.has(name)) {
-        current.set(name, {
-          config: structuredClone(config), fingerprint: fingerprint(config), generation: 0,
-          status: 'error',
-        });
+      for (const [name, config] of Object.entries(configs)) {
+        if (!states.has(name)) states.set(name, newServerState(config));
       }
     }
     return Promise.all(closing).then(() => undefined);
   }
 
   async discover(identity: IdentityContext): Promise<GovernedToolDefinition[]> {
-    const states = this.tenants.get(identity.tenantId);
-    if (!states) return [];
+    const states = this.ensureScope(identity);
     const output: GovernedToolDefinition[] = [];
     for (const [server, state] of states) {
       try {
@@ -84,16 +84,16 @@ export class McpRuntime {
     name: string,
     argumentsValue: JsonValue,
     identity: IdentityContext,
+    options: { idempotencyKey?: string } = {},
   ): Promise<{ content: string }> {
     const tools = await this.discover(identity);
     const tool = tools.find((candidate) => candidate.name === name);
     if (!tool) throw new Error('MCP tool is not visible');
     if (!this.options.governance) throw new Error('MCP invoke requires an injected governance runtime');
-    const call = {
-      id: name, logicalCallId: name, name, arguments: argumentsValue,
-    };
+    const logicalCallId = options.idempotencyKey ?? randomUUID();
+    const call = { id: logicalCallId, logicalCallId, name, arguments: argumentsValue };
     const outcome = await this.options.governance(tools).execute(call, {
-        identity, runId: `mcp-direct:${identity.actorId}`, attemptId: 'mcp-direct', turnNo: 0,
+        identity, runId: `mcp-direct:${identity.actorId}:${logicalCallId}`, attemptId: logicalCallId, turnNo: 0,
       });
     if (outcome.kind === 'result') {
       if (outcome.result.isError) throw new Error(outcome.result.content);
@@ -117,28 +117,41 @@ export class McpRuntime {
   }
 
   async add(identity: IdentityContext, server: string, config: McpServerConfig): Promise<McpServerInfo> {
-    const states = this.tenants.get(identity.tenantId) ?? new Map<string, ServerState>();
-    this.tenants.set(identity.tenantId, states);
-    if (states.has(server)) throw new Error(`mcp server 已存在: ${server}`);
-    states.set(server, {
-      config: structuredClone(config), fingerprint: fingerprint(config), generation: 0, status: 'error',
-    });
+    const states = this.ensureScope(identity);
+    if (this.tenantStates(identity.tenantId).some((candidate) => candidate.has(server))) {
+      throw new Error(`mcp server 已存在: ${server}`);
+    }
+    const configs = this.tenantConfigs.get(identity.tenantId) ?? {};
+    this.tenantConfigs.set(identity.tenantId, { ...configs, [server]: structuredClone(config) });
+    for (const candidate of this.tenantStates(identity.tenantId)) candidate.set(server, newServerState(config));
     await this.discover(identity);
     return this.info(identity, server)!;
   }
 
   async remove(identity: IdentityContext, server: string): Promise<boolean> {
-    const states = this.tenants.get(identity.tenantId);
-    const state = states?.get(server);
-    if (!state) return false;
-    states!.delete(server);
-    state.generation += 1;
-    if (state.client) await closeQuietly(state.client);
-    return true;
+    this.ensureScope(identity);
+    let removed = false;
+    const closing: Promise<void>[] = [];
+    for (const states of this.tenantStates(identity.tenantId)) {
+      const state = states.get(server);
+      if (!state) continue;
+      removed = true;
+      states.delete(server);
+      state.generation += 1;
+      if (state.client) closing.push(closeQuietly(state.client));
+    }
+    await Promise.all(closing);
+    const configs = this.tenantConfigs.get(identity.tenantId);
+    if (configs && server in configs) {
+      const next = { ...configs };
+      delete next[server];
+      this.tenantConfigs.set(identity.tenantId, next);
+    }
+    return removed;
   }
 
   info(identity: IdentityContext, server: string): McpServerInfo | undefined {
-    const state = this.tenants.get(identity.tenantId)?.get(server);
+    const state = this.ensureScope(identity).get(server);
     if (!state) return undefined;
     return {
       name: server,
@@ -154,15 +167,13 @@ export class McpRuntime {
   }
 
   list(identity: IdentityContext): McpServerInfo[] {
-    return [...(this.tenants.get(identity.tenantId)?.keys() ?? [])]
+    return [...this.ensureScope(identity).keys()]
       .map((server) => this.info(identity, server)!);
   }
 
   configs(identity: IdentityContext): Record<string, McpServerConfig> {
-    return Object.fromEntries(
-      [...(this.tenants.get(identity.tenantId)?.entries() ?? [])]
-        .map(([server, state]) => [server, structuredClone(state.config)]),
-    );
+    this.ensureScope(identity);
+    return structuredClone(this.tenantConfigs.get(identity.tenantId) ?? {});
   }
 
   async close(): Promise<void> {
@@ -172,6 +183,7 @@ export class McpRuntime {
     const clients = [...this.tenants.values()].flatMap((states) =>
       [...states.values()].flatMap((state) => state.client ? [state.client] : []));
     this.tenants.clear();
+    this.tenantConfigs.clear();
     await Promise.all(clients.map(closeQuietly));
   }
 
@@ -215,7 +227,7 @@ export class McpRuntime {
     call: ToolCall,
     context: ToolExecutionContext,
   ): Promise<{ content: string; isError?: boolean }> {
-    if (context.identity.tenantId !== resolvedIdentity.tenantId) {
+    if (identityScope(context.identity) !== identityScope(resolvedIdentity)) {
       throw new Error('MCP tenant identity mismatch');
     }
     const startedAt = Date.now();
@@ -335,11 +347,36 @@ export class McpRuntime {
   }
 
   private requireState(identity: IdentityContext, server: string): ServerState {
-    const state = this.tenants.get(identity.tenantId)?.get(server);
+    const state = this.ensureScope(identity).get(server);
     if (!state) throw new Error(`mcp server 不存在: ${server}`);
     return state;
   }
 
+  private tenantStates(tenantId: string): Map<string, ServerState>[] {
+    const prefix = `${tenantId}\0`;
+    return [...this.tenants.entries()].filter(([scope]) => scope.startsWith(prefix)).map(([, states]) => states);
+  }
+
+  private ensureScope(identity: IdentityContext): Map<string, ServerState> {
+    const scope = identityScope(identity);
+    const existing = this.tenants.get(scope);
+    if (existing) return existing;
+    const states = new Map<string, ServerState>();
+    for (const [name, config] of Object.entries(this.tenantConfigs.get(identity.tenantId) ?? {})) {
+      states.set(name, newServerState(config));
+    }
+    this.tenants.set(scope, states);
+    return states;
+  }
+
+}
+
+function identityScope(identity: IdentityContext): string {
+  return `${identity.tenantId}\0${identity.actorId}`;
+}
+
+function newServerState(config: McpServerConfig): ServerState {
+  return { config: structuredClone(config), fingerprint: fingerprint(config), generation: 0, status: 'error' };
 }
 
 export function mcpToolName(server: string, tool: string): string {

@@ -44,11 +44,14 @@ export declare class McpDisconnectedError extends Error {
 export declare class McpRuntime {
     private readonly options;
     private readonly tenants;
+    private readonly tenantConfigs;
     private readonly connect;
     constructor(options: McpRuntimeOptions);
     configure(identity: IdentityContext, configs: Record<string, McpServerConfig>): Promise<void>;
     discover(identity: IdentityContext): Promise<GovernedToolDefinition[]>;
-    invoke(name: string, argumentsValue: JsonValue, identity: IdentityContext): Promise<{
+    invoke(name: string, argumentsValue: JsonValue, identity: IdentityContext, options?: {
+        idempotencyKey?: string;
+    }): Promise<{
         content: string;
     }>;
     reconnect(identity: IdentityContext, server: string): Promise<McpServerInfo>;
@@ -65,6 +68,8 @@ export declare class McpRuntime {
     private ensureConnected;
     private invalidate;
     private requireState;
+    private tenantStates;
+    private ensureScope;
 }
 export declare function mcpToolName(server: string, tool: string): string;
 

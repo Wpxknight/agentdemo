@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { AgentPlatformError } from '@aiop/control-contracts';
 import type {
-  AgentInputMessage, AgentRunEvent, AgentRunResult, AgentRunUsage, AppendRunMessageInput, CancelRunInput, DurableRunRuntime,
-  RunHandle, StartRunInput, ResumeRunInput,
+  AgentInputMessage, AgentRunEvent, AgentRunResult, AgentRunUsage, AppendRunMessageInput, CancelRunInput,
+  AgentPlatformErrorData, DurableInteractionUpdate, DurableRunRuntime, DurableToolLedgerUpdate, RunHandle,
+  StartRunInput, ResumeRunInput,
 } from '@aiop/control-contracts';
 import type { SessionMetadata, SessionTreeEntry } from '@earendil-works/pi-agent-core';
 import { AsyncEventStream } from './event-stream.js';
@@ -13,6 +14,7 @@ import { nextTurnNo } from './attempt.js';
 import type { DurableRunStore } from '../store/types.js';
 import { assertToolCallsAllowed, assertUsageAllowed } from './limits.js';
 import { piSessionStorageId } from '../store/session-id.js';
+import { GovernedToolOutcomeError } from '../pi/tool-bridge.js';
 
 const ZERO_USAGE = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 } as const;
 
@@ -23,11 +25,15 @@ export interface ManagedPiSession extends InboxCapableSession {
   metadata(): Promise<SessionMetadata & { tenantId?: string }>;
   entries(): Promise<SessionTreeEntry[]>;
   leafId(): Promise<string | null>;
+  takeToolExecutionFacts?(): {
+    ledgerUpdates: DurableToolLedgerUpdate[];
+    interactionUpdates: DurableInteractionUpdate[];
+  };
 }
 
 export interface DurableRunSessionFactory {
-  create(input: { id?: string; identity: StartRunInput['identity']; initialMessage: AgentInputMessage; events: unknown; session?: Record<string, unknown> }): Promise<ManagedPiSession>;
-  load(input: { metadata: SessionMetadata & { tenantId?: string }; identity: StartRunInput['identity']; initialMessage: AgentInputMessage; events: unknown }): Promise<ManagedPiSession>;
+  create(input: { id?: string; identity: StartRunInput['identity']; interactionResolution?: ResumeRunInput['resolution']; initialMessage: AgentInputMessage; events: unknown; session?: Record<string, unknown> }): Promise<ManagedPiSession>;
+  load(input: { metadata: SessionMetadata & { tenantId?: string }; identity: StartRunInput['identity']; interactionResolution?: ResumeRunInput['resolution']; initialMessage: AgentInputMessage; events: unknown }): Promise<ManagedPiSession>;
 }
 
 export interface DurableRunManagerOptions {
@@ -76,10 +82,21 @@ export class DurableRunManager implements DurableRunRuntime {
     const run = await this.options.store.get({ tenantId: input.identity.tenantId, runId: input.runId });
     if (!run) throw new Error('Run not found');
     if (run.status === 'waiting' && !input.resolution) throw conflict('Waiting run requires an interaction resolution');
+    if (input.resolution) {
+      const interaction = await this.options.store.getInteraction({
+        tenantId: input.identity.tenantId, runId: input.runId, interactionId: input.resolution.interactionId,
+      });
+      if (!interaction || interaction.tenantId !== input.identity.tenantId || interaction.runId !== input.runId
+        || interaction.status !== 'resolved' || !interaction.toolCallId
+        || (run.status === 'waiting' && interaction.kind !== run.waitingReason)
+        || JSON.stringify(interaction.resolution) !== JSON.stringify(input.resolution.value)) {
+        throw conflict('Interaction resolution does not match the waiting run');
+      }
+    }
     const message: AgentInputMessage = input.resolution
       ? { role: 'user', text: JSON.stringify(input.resolution) }
       : { role: 'user', text: 'Continue from the last committed state.' };
-    return this.start(input.identity, input.runId, message, true, true, input.signal);
+    return this.start(input.identity, input.runId, message, true, true, input.signal, input.resolution);
   }
 
   async cancel(input: CancelRunInput): Promise<void> {
@@ -95,7 +112,7 @@ export class DurableRunManager implements DurableRunRuntime {
 
   private async start(
     identity: StartRunInput['identity'], runId: string, initialMessage: AgentInputMessage, resume: boolean,
-    loadCommittedSession: boolean, signal?: AbortSignal,
+    loadCommittedSession: boolean, signal?: AbortSignal, interactionResolution?: ResumeRunInput['resolution'],
   ): Promise<RunHandle> {
     const key = runKey(identity.tenantId, runId);
     if (this.executions.has(key)) throw conflict('Run recovery is already active');
@@ -104,7 +121,7 @@ export class DurableRunManager implements DurableRunRuntime {
     let resolveResult!: (result: AgentRunResult) => void;
     let rejectResult!: (error: unknown) => void;
     const result = new Promise<AgentRunResult>((resolve, reject) => { resolveResult = resolve; rejectResult = reject; });
-    const execution = this.execute(identity, runId, initialMessage, resume, loadCommittedSession, signal, stream)
+    const execution = this.execute(identity, runId, initialMessage, resume, loadCommittedSession, signal, stream, interactionResolution)
       .then(resolveResult, rejectResult).finally(() => { stream.close(); this.executions.delete(key); });
     void execution;
     return { runId, status: 'running', events: stream, result: () => result };
@@ -113,9 +130,11 @@ export class DurableRunManager implements DurableRunRuntime {
   private async execute(
     identity: StartRunInput['identity'], runId: string, initialMessage: AgentInputMessage, resume: boolean,
     loadCommittedSession: boolean, externalSignal: AbortSignal | undefined, stream: AsyncEventStream<AgentRunEvent>,
+    interactionResolution?: ResumeRunInput['resolution'],
   ): Promise<AgentRunResult> {
     const claimed = await this.options.store.claim({
       identity, runId, workerId: this.workerId, now: this.now(), leaseTtlMs: this.leaseTtlMs, resume,
+      resolution: interactionResolution,
     });
     if (!claimed) throw new Error('Run is not claimable');
     const storedRun = await this.options.store.get({ tenantId: identity.tenantId, runId });
@@ -137,17 +156,17 @@ export class DurableRunManager implements DurableRunRuntime {
     let hasObservedUsage = false;
     const durableEvents: Array<Omit<AgentRunEvent, 'sequence'>> = [];
     let eventsPersisted = false;
+    const piSessionId = piSessionStorageId(claimed.record.actorId, claimed.record.sessionId);
     try {
       const events = this.options.eventOptions({ tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, turnNo });
-      const piSessionId = piSessionStorageId(claimed.record.actorId, claimed.record.sessionId);
       const sessionRecord = await this.options.store.sessions.get(identity.tenantId, piSessionId);
       const metadata = {
         id: piSessionId, tenantId: identity.tenantId,
         createdAt: (sessionRecord?.createdAt ?? claimed.record.createdAt).toISOString(), metadata: sessionRecord?.metadata,
       };
       session = loadCommittedSession
-        ? await this.options.sessions.load({ metadata, identity, initialMessage, events })
-        : await this.options.sessions.create({ id: piSessionId, identity, initialMessage, events, session: { tenantId: identity.tenantId } });
+        ? await this.options.sessions.load({ metadata, identity, interactionResolution, initialMessage, events })
+        : await this.options.sessions.create({ id: piSessionId, identity, interactionResolution, initialMessage, events, session: { tenantId: identity.tenantId } });
       this.active.set(activeKey, { abort, session });
       baselineUsage = usageFromEntries(await session.entries());
       let stopInboxPump = false;
@@ -215,11 +234,13 @@ export class DurableRunManager implements DurableRunRuntime {
       assertToolCallsAllowed(claimed.record.limits, unionSize(persistedToolCallIds, currentToolCallIds));
       await this.syncEntries(identity.tenantId, piSessionId, entries);
       const leafId = await session.leafId();
+      const facts = session.takeToolExecutionFacts?.();
       const committedAt = this.now();
       await this.options.store.commitTurn({
         tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, turnNo, fencingToken: claimed.fencingToken,
         checkpoint: { piSessionId, piLeafId: leafId },
-        events: durableEvents, status: 'succeeded', usage: actualUsage, committedAt,
+        events: durableEvents, status: 'succeeded', usage: actualUsage,
+        ledgerUpdates: facts?.ledgerUpdates, interactionUpdates: facts?.interactionUpdates, committedAt,
       });
       eventsPersisted = true;
       await this.options.store.complete({
@@ -229,13 +250,61 @@ export class DurableRunManager implements DurableRunRuntime {
       return { runId, status: 'succeeded', text: assistantText(entries, leafId), usage: actualUsage };
     } catch (error) {
       const actualUsage = await terminalUsage(session, claimed.record.usage, baselineUsage, observedUsage, hasObservedUsage);
-      if (!eventsPersisted && durableEvents.length > 0) {
-        await this.options.store.appendEvents({
-          tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, fencingToken: claimed.fencingToken,
-          events: durableEvents, appendedAt: this.now(),
+      if (error instanceof GovernedToolOutcomeError) {
+        const entries = await session?.entries() ?? [];
+        if (session) await this.syncEntries(identity.tenantId, piSessionId, entries);
+        const leafId = await session?.leafId() ?? null;
+        const outcome = error.outcome;
+        const facts = session?.takeToolExecutionFacts?.();
+        await this.options.store.commitTurn({
+          tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, turnNo,
+          fencingToken: claimed.fencingToken,
+          checkpoint: { piSessionId, piLeafId: leafId },
+          events: durableEvents, status: outcome.kind,
+          waitingReason: outcome.kind === 'waiting' ? outcome.reason : undefined,
+          ledgerUpdates: facts?.ledgerUpdates ?? outcome.ledgerUpdates,
+          interactionUpdates: facts?.interactionUpdates ?? outcome.interactionUpdates,
+          error: outcome.kind === 'recovery_required'
+            ? { code: 'TOOL_RESULT_UNKNOWN', message: error.message, retryable: false }
+            : undefined,
+          usage: actualUsage, committedAt: this.now(),
         });
         eventsPersisted = true;
+        if (outcome.kind === 'waiting') return { runId, status: 'waiting', usage: actualUsage };
+        const errorData = { code: 'TOOL_RESULT_UNKNOWN' as const, message: error.message, retryable: false };
+        return { runId, status: 'recovery_required', usage: actualUsage, error: errorData };
       }
+      let leafId: string | null = null;
+      if (session) {
+        try {
+          const entries = await session.entries();
+          await this.syncEntries(identity.tenantId, piSessionId, entries);
+        } catch {
+          // Provider/session failures may leave the terminal tree unreadable; durable facts still must commit.
+        }
+        try { leafId = await session.leafId(); } catch { leafId = null; }
+      }
+      const facts = session?.takeToolExecutionFacts?.();
+      const commitFailure = async (
+        status: 'cancelled' | 'failed' | 'recovery_required',
+        errorData?: AgentPlatformErrorData,
+      ): Promise<void> => {
+        const committedAt = this.now();
+        await this.options.store.commitTurn({
+          tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, turnNo,
+          fencingToken: claimed.fencingToken,
+          checkpoint: { piSessionId, piLeafId: leafId },
+          events: durableEvents, status, usage: actualUsage, error: errorData,
+          ledgerUpdates: facts?.ledgerUpdates, interactionUpdates: facts?.interactionUpdates, committedAt,
+        });
+        eventsPersisted = true;
+        if (status !== 'recovery_required') {
+          await this.options.store.complete({
+            tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, fencingToken: claimed.fencingToken,
+            status, usage: actualUsage, error: errorData, completedAt: this.now(),
+          });
+        }
+      };
       if (abort.signal.aborted) {
         await session?.abort().catch(() => {});
         const cancellation = await this.options.store.isCancellationRequested({ tenantId: identity.tenantId, runId });
@@ -243,10 +312,7 @@ export class DurableRunManager implements DurableRunRuntime {
           ? abort.signal.reason : undefined;
         const status = cancellation ? 'cancelled' : limitError ? 'failed' : 'recovery_required';
         const errorData = limitError ? { code: limitError.code, message: limitError.message, retryable: limitError.retryable } : undefined;
-        await this.options.store.complete({
-          tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, fencingToken: claimed.fencingToken,
-          status, usage: actualUsage, error: errorData, completedAt: this.now(),
-        }).catch(() => {});
+        await commitFailure(status, errorData).catch(() => {});
         return { runId, status, usage: actualUsage, error: errorData };
       }
       const recoveryRequired = hasErrorCode(error, 'TOOL_RESULT_UNKNOWN');
@@ -255,10 +321,7 @@ export class DurableRunManager implements DurableRunRuntime {
         ? { code: error.code, message: error.message, retryable: error.retryable }
         : { code: recoveryRequired ? 'TOOL_RESULT_UNKNOWN' as const : 'MODEL_PROVIDER_ERROR' as const,
             message: error instanceof Error ? error.message : String(error), retryable: false };
-      await this.options.store.complete({
-        tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, fencingToken: claimed.fencingToken,
-        status, usage: actualUsage, error: errorData, completedAt: this.now(),
-      });
+      await commitFailure(status, errorData);
       return { runId, status, usage: actualUsage, error: errorData };
     } finally {
       stopHeartbeat();
