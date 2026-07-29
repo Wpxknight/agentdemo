@@ -26,6 +26,12 @@ interface LocalFileReadResult {
 }
 
 type LocalFileReader = (path: string, maxBytes: number) => Promise<LocalFileReadResult>;
+interface LocalReadableFile {
+  read(buffer: Uint8Array, offset: number, length: number, position: null): Promise<{ bytesRead: number }>;
+  close(): Promise<void>;
+}
+type LocalFileOpen = (path: string) => Promise<LocalReadableFile>;
+type LocalFileAllocator = (size: number) => Buffer;
 
 export async function syncSkillToSandbox(input: {
   name: string;
@@ -34,6 +40,8 @@ export async function syncSkillToSandbox(input: {
   partial: boolean;
   sbx: SandboxHandle;
   localFileReader?: LocalFileReader;
+  localFileOpen?: LocalFileOpen;
+  localFileAllocator?: LocalFileAllocator;
 }): Promise<SandboxSyncResult> {
   const kept = input.partial ? input.files : input.files.filter((file) => file.size <= SYNC_SKIP_FILE_BYTES);
   const skipped = input.partial ? [] : input.files.filter((file) => file.size > SYNC_SKIP_FILE_BYTES);
@@ -85,6 +93,8 @@ async function syncLocalSkillFiles(
     partial: boolean;
     sbx: SandboxHandle;
     localFileReader?: LocalFileReader;
+    localFileOpen?: LocalFileOpen;
+    localFileAllocator?: LocalFileAllocator;
   },
   result: Omit<SandboxSyncResult, 'error'>,
 ): Promise<SandboxSyncResult> {
@@ -104,7 +114,11 @@ async function syncLocalSkillFiles(
       const maxBytes = input.partial
         ? remaining + 1
         : SYNC_SKIP_FILE_BYTES + 1;
-      const { content, overflow } = await (input.localFileReader ?? readLocalFileBounded)(source, maxBytes);
+      const reader = input.localFileReader ?? ((path, limit) => readLocalFileBounded(path, limit, {
+        openFile: input.localFileOpen,
+        allocate: input.localFileAllocator,
+      }));
+      const { content, overflow } = await reader(source, maxBytes);
       if (content.byteLength > maxBytes) throw new Error('技能同步读取器返回内容超过请求上限');
       const actualFile = { ...file, size: content.byteLength };
       if (!input.partial && (overflow || content.byteLength > SYNC_SKIP_FILE_BYTES)) {
@@ -153,17 +167,39 @@ async function syncLocalSkillFiles(
   }
 }
 
-async function readLocalFileBounded(path: string, maxBytes: number): Promise<LocalFileReadResult> {
-  const file = await open(path, 'r');
-  const content = Buffer.allocUnsafe(maxBytes);
-  let offset = 0;
+async function readLocalFileBounded(
+  path: string,
+  maxBytes: number,
+  hooks: { openFile?: LocalFileOpen; allocate?: LocalFileAllocator } = {},
+): Promise<LocalFileReadResult> {
+  const file = await (hooks.openFile ?? ((source) => open(source, 'r')))(path);
+  const allocate = hooks.allocate ?? ((size) => Buffer.allocUnsafeSlow(size));
   try {
-    while (offset < maxBytes) {
-      const { bytesRead } = await file.read(content, offset, Math.min(64 * 1024, maxBytes - offset), null);
+    const chunks: Buffer[] = [];
+    let total = 0;
+    const requestedScratchSize = Math.min(64 * 1024, maxBytes);
+    const scratch = allocate(requestedScratchSize);
+    const scratchSize = Math.min(scratch.byteLength, requestedScratchSize);
+    if (scratchSize === 0) throw new Error('技能同步读取器分配的缓冲区为空');
+    while (total < maxBytes) {
+      const requested = Math.min(scratchSize, maxBytes - total);
+      const { bytesRead } = await file.read(scratch, 0, requested, null);
+      if (!Number.isInteger(bytesRead) || bytesRead < 0 || bytesRead > requested) {
+        throw new Error('技能同步读取器返回了无效的读取长度');
+      }
       if (bytesRead === 0) break;
-      offset += bytesRead;
+      const retained = Buffer.allocUnsafeSlow(bytesRead);
+      scratch.copy(retained, 0, 0, bytesRead);
+      chunks.push(retained);
+      total += bytesRead;
     }
-    return { content: content.subarray(0, offset), overflow: offset === maxBytes };
+    const content = Buffer.allocUnsafeSlow(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      chunk.copy(content, offset);
+      offset += chunk.byteLength;
+    }
+    return { content, overflow: total === maxBytes };
   } finally {
     await file.close();
   }

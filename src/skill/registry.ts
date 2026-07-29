@@ -57,6 +57,7 @@ const BUILTIN_GOVERNANCE_DIR = '.aiop-governance';
 const BUILTIN_CATALOG_DIR = 'builtin-catalog';
 const BUILTIN_MIGRATIONS_DIR = 'migrations';
 const LEGACY_SEED_MIGRATION_ID = 'legacy-seed-governance-v1';
+const LEGACY_TOMBSTONE_STATE_DIR = `${LEGACY_SEED_MIGRATION_ID}-tombstones`;
 const LEGACY_SEED_MIGRATION_LOCK_KEY = 'skill-legacy-migration:v1';
 const PUBLICATION_JOURNAL_DIR = '.aiop-publications';
 const PUBLICATION_LOCK_KEY = 'skill-publication';
@@ -84,6 +85,15 @@ interface BuiltinGovernanceOverlay {
 interface LegacySeedMigrationOutcome {
   resolved: number;
   unresolved: number;
+}
+
+interface LegacyTombstoneMigrationState {
+  schemaVersion: 1;
+  tombstoneRelativePath: string;
+  inventoryFingerprint: string;
+  contentDigest: string;
+  catalogFingerprint: string;
+  result: 'no-candidate' | 'digest-mismatch' | 'ambiguous' | 'source-unavailable';
 }
 
 interface BuiltinCatalogEntry {
@@ -124,6 +134,7 @@ export interface SkillRegistryOptions {
   pendingQuota?: Partial<SkillPendingQuota>;
   availableBytes?: () => Promise<number>;
   verifyContentDigest?: (path: string) => Promise<string>;
+  legacyContentDigest?: (path: string) => Promise<string>;
 }
 
 export interface SkillPendingQuota {
@@ -165,6 +176,7 @@ export class SkillRegistry {
   private readonly pendingQuota: SkillPendingQuota;
   private readonly availableBytes: () => Promise<number>;
   private readonly verifyContentDigest: (path: string) => Promise<string>;
+  private readonly legacyContentDigest: (path: string) => Promise<string>;
   private mutationTail: Promise<void> = Promise.resolve();
   private distributedLockDepth = 0;
 
@@ -180,6 +192,7 @@ export class SkillRegistry {
     });
     this.verifyContentDigest = opts.verifyContentDigest
       ?? ((path) => contentDigest(path, { immutable: true }));
+    this.legacyContentDigest = opts.legacyContentDigest ?? ((path) => contentDigest(path));
     this.service = new SkillProductService(
       opts.env ?? new NodeExecutionEnv({ cwd: dir }),
       opts.loader,
@@ -957,30 +970,53 @@ export class SkillRegistry {
 
     const tombstoneRoot = join(resolve(this.dir), SKILL_TOMBSTONES_DIR);
     const tombstones = await enumerateSkillProductRecords(tombstoneRoot);
+    const catalogFingerprint = builtinCatalogFingerprint(catalog);
     for (const legacy of tombstones) {
+      const inventoryFingerprint = await artifactFingerprint(legacy.path);
+      const cachedState = await readLegacyTombstoneMigrationState(this.dir, legacy.path);
+      const digest = cachedState?.inventoryFingerprint === inventoryFingerprint
+        ? cachedState.contentDigest
+        : await this.legacyContentDigest(legacy.path);
+      const persistUnresolved = async (result: LegacyTombstoneMigrationState['result']): Promise<void> => {
+        const state: LegacyTombstoneMigrationState = {
+          schemaVersion: 1,
+          tombstoneRelativePath: legacyTombstoneRelativePath(this.dir, legacy.path),
+          inventoryFingerprint,
+          contentDigest: digest,
+          catalogFingerprint,
+          result,
+        };
+        if (!sameLegacyTombstoneMigrationState(cachedState, state)) {
+          await writeLegacyTombstoneMigrationState(this.dir, legacy.path, state);
+        }
+        outcome.unresolved += 1;
+      };
       const candidates = catalog.filter((entry) => entry.name === legacy.name
         && entry.tenantId === legacy.tenantId
         && entry.sourceVersion === legacy.version
         && legacyRelativePathCandidates(legacy).includes(entry.relativePath));
       if (!candidates.length) {
-        outcome.unresolved += 1;
+        await persistUnresolved('no-candidate');
         continue;
       }
-      const digest = await contentDigest(legacy.path);
       const exactByIdentity = new Map(
         candidates.filter((entry) => entry.sourceDigest === digest).map((entry) => [entry.identity, entry]),
       );
       if (!exactByIdentity.size) {
-        outcome.unresolved += 1;
+        await persistUnresolved('digest-mismatch');
         continue;
       }
       if (exactByIdentity.size !== 1) {
-        outcome.unresolved += 1;
+        await persistUnresolved('ambiguous');
         continue;
       }
       const source = exactByIdentity.values().next().value!;
-      if (await this.migrateLegacySeedRecord(legacy, source, rawByIdentity, true)) outcome.resolved += 1;
-      else outcome.unresolved += 1;
+      if (await this.migrateLegacySeedRecord(legacy, source, rawByIdentity, true)) {
+        outcome.resolved += 1;
+        await removeLegacyTombstoneMigrationState(this.dir, legacy.path);
+      } else {
+        await persistUnresolved('source-unavailable');
+      }
     }
     return outcome;
   }
@@ -1252,6 +1288,97 @@ function builtinCatalogEntryKey(entry: BuiltinCatalogEntry): string {
 
 function compareBuiltinCatalogEntry(a: BuiltinCatalogEntry, b: BuiltinCatalogEntry): number {
   return builtinCatalogEntryKey(a).localeCompare(builtinCatalogEntryKey(b));
+}
+
+function builtinCatalogFingerprint(catalog: readonly BuiltinCatalogEntry[]): string {
+  const hash = createHash('sha256');
+  for (const entry of catalog) hash.update(`${builtinCatalogEntryKey(entry)}\0`);
+  return hash.digest('hex');
+}
+
+function legacyTombstoneRelativePath(root: string, tombstonePath: string): string {
+  const tombstoneRoot = join(resolve(root), SKILL_TOMBSTONES_DIR);
+  const relativePath = relative(tombstoneRoot, resolve(tombstonePath)).split(sep).join('/');
+  if (!relativePath || relativePath === '..' || relativePath.startsWith('../')) {
+    throw new Error(`Legacy tombstone 路径越界：${tombstonePath}`);
+  }
+  return relativePath;
+}
+
+function legacyTombstoneMigrationStatePath(root: string, tombstonePath: string): string {
+  const relativePath = legacyTombstoneRelativePath(root, tombstonePath);
+  const filename = `${createHash('sha256').update(relativePath).digest('hex')}.json`;
+  return join(resolve(root), BUILTIN_GOVERNANCE_DIR, BUILTIN_MIGRATIONS_DIR,
+    LEGACY_TOMBSTONE_STATE_DIR, filename);
+}
+
+async function readLegacyTombstoneMigrationState(
+  root: string,
+  tombstonePath: string,
+): Promise<LegacyTombstoneMigrationState | undefined> {
+  const path = legacyTombstoneMigrationStatePath(root, tombstonePath);
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(path, 'utf8')) as unknown;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    log.warn({ path, err: String(error) }, 'ignoring invalid legacy tombstone migration state');
+    return undefined;
+  }
+  if (!isLegacyTombstoneMigrationState(value)
+    || value.tombstoneRelativePath !== legacyTombstoneRelativePath(root, tombstonePath)) {
+    log.warn({ path }, 'ignoring invalid legacy tombstone migration state');
+    return undefined;
+  }
+  return value;
+}
+
+function isLegacyTombstoneMigrationState(value: unknown): value is LegacyTombstoneMigrationState {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const state = value as Partial<LegacyTombstoneMigrationState>;
+  return state.schemaVersion === 1
+    && typeof state.tombstoneRelativePath === 'string' && state.tombstoneRelativePath.length > 0
+    && typeof state.inventoryFingerprint === 'string' && /^[a-f0-9]{64}$/.test(state.inventoryFingerprint)
+    && typeof state.contentDigest === 'string' && /^[a-f0-9]{64}$/.test(state.contentDigest)
+    && typeof state.catalogFingerprint === 'string' && /^[a-f0-9]{64}$/.test(state.catalogFingerprint)
+    && ['no-candidate', 'digest-mismatch', 'ambiguous', 'source-unavailable'].includes(String(state.result));
+}
+
+function sameLegacyTombstoneMigrationState(
+  left: LegacyTombstoneMigrationState | undefined,
+  right: LegacyTombstoneMigrationState,
+): boolean {
+  return left?.schemaVersion === right.schemaVersion
+    && left.tombstoneRelativePath === right.tombstoneRelativePath
+    && left.inventoryFingerprint === right.inventoryFingerprint
+    && left.contentDigest === right.contentDigest
+    && left.catalogFingerprint === right.catalogFingerprint
+    && left.result === right.result;
+}
+
+async function writeLegacyTombstoneMigrationState(
+  root: string,
+  tombstonePath: string,
+  state: LegacyTombstoneMigrationState,
+): Promise<void> {
+  const target = legacyTombstoneMigrationStatePath(root, tombstonePath);
+  await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+  const temp = join(dirname(target), `.${randomUUID()}.tmp`);
+  try {
+    await writeFile(temp, `${JSON.stringify(state, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+    await fsyncFile(temp);
+    await rename(temp, target);
+    await fsyncParent(target);
+  } catch (error) {
+    await rm(temp, { force: true });
+    throw error;
+  }
+}
+
+async function removeLegacyTombstoneMigrationState(root: string, tombstonePath: string): Promise<void> {
+  const target = legacyTombstoneMigrationStatePath(root, tombstonePath);
+  await rm(target, { force: true });
+  await fsyncParent(target).catch(() => undefined);
 }
 
 async function readLegacySeedMigrationMarker(root: string): Promise<boolean> {
@@ -1556,11 +1683,7 @@ async function exists(path: string): Promise<boolean> {
 
 async function contentDigest(root: string, options: { immutable?: boolean } = {}): Promise<string> {
   const entries = await artifactEntries(root);
-  const identityHash = createHash('sha256');
-  for (const entry of entries) {
-    identityHash.update(`${entry.directory ? 'D' : 'F'}\0${entry.path}\0${entry.size}\0${entry.mtimeMs}\0${entry.ctimeMs}\0${entry.ino}\0`);
-  }
-  const identity = identityHash.digest('hex');
+  const identity = artifactEntriesFingerprint(entries);
   const cacheKey = resolve(root);
   const cached = options.immutable ? immutableDigestCache.get(cacheKey, identity) : undefined;
   if (cached) return cached;
@@ -1575,6 +1698,18 @@ async function contentDigest(root: string, options: { immutable?: boolean } = {}
   const digest = hash.digest('hex');
   if (options.immutable) immutableDigestCache.set(cacheKey, identity, digest);
   return digest;
+}
+
+async function artifactFingerprint(root: string): Promise<string> {
+  return artifactEntriesFingerprint(await artifactEntries(root));
+}
+
+function artifactEntriesFingerprint(entries: readonly ArtifactEntryIdentity[]): string {
+  const identityHash = createHash('sha256');
+  for (const entry of entries) {
+    identityHash.update(`${entry.directory ? 'D' : 'F'}\0${entry.path}\0${entry.size}\0${entry.mtimeMs}\0${entry.ctimeMs}\0${entry.ino}\0`);
+  }
+  return identityHash.digest('hex');
 }
 
 interface ArtifactEntryIdentity {

@@ -109,6 +109,18 @@ function legacyMigrationMarker(root: string): string {
   return join(root, '.aiop-governance', 'migrations', 'legacy-seed-governance-v1.done');
 }
 
+async function builtinCatalogDigest(root: string, name: string): Promise<string> {
+  const catalogRoot = join(root, '.aiop-governance', 'builtin-catalog');
+  for (const file of await readdir(catalogRoot)) {
+    const entry = JSON.parse(await readFile(join(catalogRoot, file), 'utf8')) as {
+      name: string;
+      sourceDigest: string;
+    };
+    if (entry.name === name) return entry.sourceDigest;
+  }
+  throw new Error(`missing catalog digest for ${name}`);
+}
+
 describe('SkillRegistry', () => {
   let dir: string;
 
@@ -652,20 +664,36 @@ describe('SkillRegistry', () => {
       });
     }
 
-    await new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] }).scan();
+    const probeRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-first-catalog-probe-'));
+    await new SkillRegistry(probeRoot, { builtinRoots: [backupRoot] }).scan();
+    const absentDigest = await builtinCatalogDigest(probeRoot, absentName);
+    let tombstoneDigestCalls = 0;
+    const registryOptions = {
+      builtinRoots: [builtinRoot],
+      legacyContentDigest: async (_path: string) => {
+        tombstoneDigestCalls += 1;
+        return absentDigest;
+      },
+    };
+
+    await new SkillRegistry(productRoot, registryOptions).scan();
     await rm(legacyMigrationMarker(productRoot));
     const tombstone = join(productRoot, '.aiop-tombstones', `old-${absentName}`);
     await mkdir(join(productRoot, '.aiop-tombstones'), { recursive: true });
     await cp(absentBackup, tombstone, { recursive: true });
 
-    const first = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    const first = new SkillRegistry(productRoot, registryOptions);
     await first.scan();
 
     await expect(stat(tombstone)).resolves.toBeDefined();
     await expect(stat(legacyMigrationMarker(productRoot))).rejects.toThrow();
+    expect(tombstoneDigestCalls).toBe(1);
+    await new SkillRegistry(productRoot, registryOptions).scan();
+    expect(tombstoneDigestCalls).toBe(1);
+    await expect(stat(legacyMigrationMarker(productRoot))).rejects.toThrow();
 
     await cp(absentBackup, join(builtinRoot, absentName), { recursive: true });
-    const second = new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] });
+    const second = new SkillRegistry(productRoot, registryOptions);
     await second.scan();
 
     await expect(second.loadFor(absentName, {
@@ -673,6 +701,48 @@ describe('SkillRegistry', () => {
     })).resolves.toBeUndefined();
     await expect(stat(tombstone)).rejects.toThrow();
     await expect(stat(legacyMigrationMarker(productRoot))).resolves.toBeDefined();
+    expect(tombstoneDigestCalls).toBe(1);
+  });
+
+  it('recomputes a cached unresolved tombstone digest after inventory changes or state corruption', async () => {
+    const builtinRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-tombstone-state-source-'));
+    const productRoot = await mkdtemp(join(tmpdir(), 'aiop-builtin-tombstone-state-product-'));
+    const current = join(builtinRoot, 'state-current');
+    await mkdir(current);
+    await writeFile(join(current, 'SKILL.md'), '---\nname: state-current\ndescription: current\n---\nbody');
+    await writeProduct(current, {
+      name: 'state-current', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+    });
+    await new SkillRegistry(productRoot, { builtinRoots: [builtinRoot] }).scan();
+    await rm(legacyMigrationMarker(productRoot));
+    const tombstone = join(productRoot, '.aiop-tombstones', 'unknown-state');
+    await mkdir(tombstone, { recursive: true });
+    await writeFile(join(tombstone, 'SKILL.md'), '---\nname: unknown-state\ndescription: old\n---\nold');
+    await writeProduct(tombstone, {
+      name: 'unknown-state', version: '1', enabled: true, reviewed: true,
+      tenantId: 'default', visibility: 'public',
+    });
+    let digestCalls = 0;
+    const options = {
+      builtinRoots: [builtinRoot],
+      legacyContentDigest: async (_path: string) => `${++digestCalls}`.padStart(64, '0'),
+    };
+
+    await new SkillRegistry(productRoot, options).scan();
+    expect(digestCalls).toBe(1);
+    const stateRoot = join(productRoot, '.aiop-governance', 'migrations',
+      'legacy-seed-governance-v1-tombstones');
+    const [stateFile] = await readdir(stateRoot);
+    await writeFile(join(stateRoot, stateFile!), '{broken');
+    await new SkillRegistry(productRoot, options).scan();
+    expect(digestCalls).toBe(2);
+
+    await writeFile(join(tombstone, 'SKILL.md'),
+      '---\nname: unknown-state\ndescription: changed\n---\nchanged');
+    await new SkillRegistry(productRoot, options).scan();
+    expect(digestCalls).toBe(3);
+    await expect(stat(legacyMigrationMarker(productRoot))).rejects.toThrow();
   });
 
   it('resolves a tombstone against the unique matching historical catalog digest', async () => {

@@ -465,6 +465,192 @@ describe('buildSkillTools', () => {
     }
   });
 
+  it('retains only actual bytes instead of the per-file read cap', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-local-sync-retained-capacity-'));
+    await writeFile(join(root, 'tiny.bin'), Buffer.from([1]));
+    const sandbox = Object.assign(new FakeSandbox(), {
+      supportsSecretFiles: false as const,
+      reserveSyncGeneration: async (_bytes: number) => {},
+    });
+
+    const result = await syncSkillToSandbox({
+      name: 'retained-capacity', dir: root, partial: true, sbx: sandbox,
+      files: [{
+        name: 'tiny.bin', path: 'tiny.bin', size: 1,
+        isDirectory: false, updatedAt: new Date().toISOString(),
+      }],
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(sandbox.writtenFiles[0]!.content.byteLength).toBe(1);
+    expect(sandbox.writtenFiles[0]!.content.buffer.byteLength).toBeLessThanOrEqual(64 * 1024);
+  });
+
+  it('uses exact unpooled backing after fragmented short reads', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-local-sync-short-read-capacity-'));
+    const close = vi.fn(async () => {});
+    let reads = 0;
+    const openFile = vi.fn(async () => ({
+      read: vi.fn(async (buffer: Uint8Array) => {
+        if (reads >= 2) return { bytesRead: 0 };
+        buffer[0] = ++reads;
+        return { bytesRead: 1 };
+      }),
+      close,
+    }));
+    const sandbox = Object.assign(new FakeSandbox(), {
+      supportsSecretFiles: false as const,
+      reserveSyncGeneration: async (_bytes: number) => {},
+    });
+
+    const result = await syncSkillToSandbox({
+      name: 'short-read-capacity', dir: root, partial: true, sbx: sandbox,
+      files: [{
+        name: 'fragmented.bin', path: 'fragmented.bin', size: 2,
+        isDirectory: false, updatedAt: new Date().toISOString(),
+      }],
+      localFileOpen: openFile,
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.total).toBe(2);
+    expect(sandbox.writtenFiles[0]!.content).toEqual(Buffer.from([1, 2]));
+    expect(sandbox.writtenFiles[0]!.content.buffer.byteLength).toBe(2);
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('ignores oversized scratch padding when counting and writing content', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-local-sync-oversized-allocation-'));
+    const close = vi.fn(async () => {});
+    let read = false;
+    const openFile = vi.fn(async () => ({
+      read: vi.fn(async (buffer: Uint8Array) => {
+        if (read) return { bytesRead: 0 };
+        read = true;
+        buffer[0] = 7;
+        return { bytesRead: 1 };
+      }),
+      close,
+    }));
+    const reserveSyncGeneration = vi.fn(async (_bytes: number) => {});
+    const sandbox = Object.assign(new FakeSandbox(), {
+      supportsSecretFiles: false as const,
+      reserveSyncGeneration,
+    });
+
+    const result = await syncSkillToSandbox({
+      name: 'oversized-allocation', dir: root, partial: true, sbx: sandbox,
+      files: [{
+        name: 'source.bin', path: 'source.bin', size: 1,
+        isDirectory: false, updatedAt: new Date().toISOString(),
+      }],
+      localFileOpen: openFile,
+      localFileAllocator: (size: number) => Buffer.allocUnsafeSlow(size + 100).fill(0xa5),
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.total).toBe(1);
+    expect(reserveSyncGeneration).toHaveBeenCalledWith(1);
+    expect(sandbox.writtenFiles).toHaveLength(1);
+    expect(sandbox.writtenFiles[0]!.content).toEqual(Buffer.from([7]));
+    expect(sandbox.writtenFiles[0]!.content.buffer.byteLength).toBe(1);
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('uses the actual scratch capacity when the allocator returns a smaller buffer', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-local-sync-small-scratch-'));
+    const close = vi.fn(async () => {});
+    const source = Buffer.from([1, 2, 3, 4, 5]);
+    let offset = 0;
+    const requestedLengths: number[] = [];
+    const openFile = vi.fn(async () => ({
+      read: vi.fn(async (buffer: Uint8Array, _offset: number, length: number) => {
+        requestedLengths.push(length);
+        const bytesRead = Math.min(length, source.byteLength - offset);
+        source.copy(buffer, 0, offset, offset + bytesRead);
+        offset += bytesRead;
+        return { bytesRead };
+      }),
+      close,
+    }));
+    const sandbox = Object.assign(new FakeSandbox(), {
+      supportsSecretFiles: false as const,
+      reserveSyncGeneration: async (_bytes: number) => {},
+    });
+
+    const result = await syncSkillToSandbox({
+      name: 'small-scratch', dir: root, partial: true, sbx: sandbox,
+      files: [{
+        name: 'source.bin', path: 'source.bin', size: source.byteLength,
+        isDirectory: false, updatedAt: new Date().toISOString(),
+      }],
+      localFileOpen: openFile,
+      localFileAllocator: () => Buffer.allocUnsafeSlow(2),
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.total).toBe(source.byteLength);
+    expect(requestedLengths).toEqual([2, 2, 2, 2]);
+    expect(sandbox.writtenFiles[0]!.content).toEqual(source);
+    expect(sandbox.writtenFiles[0]!.content.buffer.byteLength).toBe(source.byteLength);
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('closes an opened local source when chunk allocation fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-local-sync-allocation-close-'));
+    await writeFile(join(root, 'source.bin'), 'source');
+    const close = vi.fn(async () => {});
+    const openFile = vi.fn(async () => ({
+      read: vi.fn(async () => ({ bytesRead: 0, buffer: Buffer.alloc(0) })),
+      close,
+    }));
+    const sandbox = Object.assign(new FakeSandbox(), {
+      supportsSecretFiles: false as const,
+      reserveSyncGeneration: async (_bytes: number) => {},
+    });
+    const input = {
+      name: 'allocation-close', dir: root, partial: true, sbx: sandbox,
+      files: [{
+        name: 'source.bin', path: 'source.bin', size: 1,
+        isDirectory: false, updatedAt: new Date().toISOString(),
+      }],
+      localFileOpen: openFile,
+      localFileAllocator: (_size: number) => { throw new Error('allocator failed'); },
+    };
+
+    const result = await syncSkillToSandbox(input);
+
+    expect(result.error).toMatch(/allocator failed/);
+    expect(openFile).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('keeps retained backing capacity near actual bytes for 1000 tiny files', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aiop-local-sync-many-tiny-'));
+    const files = await Promise.all(Array.from({ length: 1_000 }, async (_, index) => {
+      const name = `tiny-${index}.bin`;
+      const content = index % 2 === 0 ? Buffer.alloc(0) : Buffer.from([index & 0xff]);
+      await writeFile(join(root, name), content);
+      return { name, path: name, size: content.byteLength,
+        isDirectory: false, updatedAt: new Date().toISOString() };
+    }));
+    const sandbox = Object.assign(new FakeSandbox(), {
+      supportsSecretFiles: false as const,
+      reserveSyncGeneration: async (_bytes: number) => {},
+    });
+
+    const result = await syncSkillToSandbox({
+      name: 'many-tiny', dir: root, files, partial: true, sbx: sandbox,
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.total).toBe(500);
+    const retainedCapacity = sandbox.writtenFiles.reduce(
+      (sum, file) => sum + file.content.buffer.byteLength, 0,
+    );
+    expect(retainedCapacity).toBeLessThanOrEqual(1_000);
+  });
+
   it('accepts multiple local files exactly at the total byte boundary', async () => {
     const root = await mkdtemp(join(tmpdir(), 'aiop-local-sync-total-boundary-'));
     const firstSize = Math.floor(SYNC_TOTAL_BYTES / 2);
