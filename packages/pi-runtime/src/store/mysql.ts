@@ -666,8 +666,8 @@ function mapInteraction(row: any): DurableInteractionUpdate { return {
   sessionId: row.session_id || undefined, attemptId: row.attempt_id ?? '', turnNo: row.turn_no ?? 0,
   kind: row.kind, toolCallId: row.tool_call_id ?? undefined, status: row.status,
   payload: parse(row.payload), resolution: row.resolution === null ? undefined : parse(row.resolution),
-  resolvedBy: row.resolved_by ?? undefined, expiresAt: row.expires_at, createdAt: row.created_at,
-  resolvedAt: row.resolved_at ?? undefined,
+  resolvedBy: row.resolved_by ?? undefined, expiresAt: toDate(row.expires_at), createdAt: toDate(row.created_at),
+  resolvedAt: row.resolved_at === null || row.resolved_at === undefined ? undefined : toDate(row.resolved_at),
 }; }
 function mapLedger(row: any): DurableToolLedgerUpdate { return {
   tenantId: row.tenant_id, runId: row.run_id, attemptId: row.attempt_id ?? '', turnNo: row.turn_no ?? 0,
@@ -690,6 +690,7 @@ function usage(row: any): AgentRunUsage { return {
 }; }
 function affected(result: any): boolean { return Number(result.numUpdatedRows ?? result.numAffectedRows ?? 0) > 0; }
 function parse(value: unknown): any { return typeof value === 'string' ? JSON.parse(value) : value; }
+function toDate(value: Date | string): Date { return value instanceof Date ? value : new Date(value); }
 function asRecord(value: unknown): Record<string, unknown> { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}; }
 function stringValue(value: unknown): string | null { return typeof value === 'string' ? value : null; }
 function conflict(message: string): AgentPlatformError { return new AgentPlatformError({ code: 'RUN_STATE_CONFLICT', message, retryable: false }); }

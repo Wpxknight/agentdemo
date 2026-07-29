@@ -477,6 +477,29 @@ describe('MysqlRunStore durable contract surface', () => {
       expect.objectContaining({ tenant_id: 'tenant-a', user_id: 'user-b', session_id: 'shared-session' }),
     ]));
   });
+
+  it('normalizes MySQL interaction timestamps for get and list reads', async () => {
+    const timestamp = '2026-07-30T08:09:10.123Z';
+    const row = {
+      tenant_id: 'tenant-a', run_id: 'run-a', id: 'interaction-a', user_id: 'user-a', session_id: 'session-a',
+      attempt_id: 'attempt-a', turn_no: 1, kind: 'approval', tool_call_id: 'call-a', status: 'resolved',
+      payload: '{}', resolution: 'true', resolved_by: 'user-a',
+      expires_at: timestamp, created_at: timestamp, resolved_at: timestamp,
+    };
+    const store = new MysqlRunStore(new MysqlInteractionReadDb(row) as never);
+
+    const interaction = await store.interactions.get({
+      tenantId: 'tenant-a', runId: 'run-a', interactionId: 'interaction-a',
+    });
+    const listed = await store.interactions.list({ tenantId: 'tenant-a', runId: 'run-a' });
+
+    for (const record of [interaction, listed[0]]) {
+      expect(record?.createdAt).toBeInstanceOf(Date);
+      expect(record?.expiresAt).toBeInstanceOf(Date);
+      expect(record?.resolvedAt).toBeInstanceOf(Date);
+      expect(record?.createdAt.toISOString()).toBe(timestamp);
+    }
+  });
 });
 
 async function runStoreContract(store: DurableRunStore, runId: string): Promise<void> {
@@ -1990,6 +2013,22 @@ async function seedResolvedWaitingReplay(store: MemoryRunStore, runId: string) {
 }
 
 type MysqlContractRow = Record<string, any>;
+
+class MysqlInteractionReadDb {
+  constructor(private readonly row: MysqlContractRow) {}
+
+  selectFrom() { return new MysqlInteractionReadSelect(this.row); }
+}
+
+class MysqlInteractionReadSelect {
+  constructor(private readonly row: MysqlContractRow) {}
+
+  selectAll() { return this; }
+  where() { return this; }
+  orderBy() { return this; }
+  async executeTakeFirst() { return { ...this.row }; }
+  async execute() { return [{ ...this.row }]; }
+}
 
 class MysqlCreateContractDb {
   readonly rows = { pi_sessions: [] as MysqlContractRow[], agent_runs: [] as MysqlContractRow[] };
