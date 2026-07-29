@@ -39,6 +39,24 @@ const planInput = {
 } satisfies JsonValue;
 
 describe('product durable interaction replay', () => {
+  it('preserves the legacy approval payload shape through createAIOPToolRuntime', async () => {
+    const input = { target: 'staging' };
+    const result = await runProductReplay({
+      kind: 'approval', toolName: 'deploy', input, value: true,
+    });
+
+    expect(result.pending.payload).toMatchObject({
+      id: result.pending.id,
+      runId: result.runId,
+      call: { id: result.toolCallId, name: 'deploy', args: input },
+      reason: null,
+    });
+    expect(asObject(result.pending.payload)).not.toHaveProperty('__aiopGovernedInput');
+    expect(result.resumed).toMatchObject({ status: 'succeeded', text: 'continued after interaction' });
+    expect(result.handler).toHaveBeenCalledTimes(1);
+    expect(result.providerTurns).toBe(2);
+  });
+
   it.each([
     { kind: 'question' as const, toolName: 'ask_user' as const, input: questionInput, value: { Continue: ['Yes'] } },
     { kind: 'plan' as const, toolName: 'submit_change_plan' as const, input: planInput, value: true },
@@ -121,8 +139,8 @@ describe('product durable interaction replay', () => {
 });
 
 type ReplayCase = {
-  kind: 'question' | 'plan';
-  toolName: 'ask_user' | 'submit_change_plan';
+  kind: 'approval' | 'question' | 'plan';
+  toolName: string;
   input: Record<string, JsonValue>;
   value: JsonValue;
 };
@@ -171,12 +189,12 @@ async function runProductReplay(
       };
       const definitions = tools.unified(toolContext).definitions().map((definition) => ({
         ...definition,
-        interactionKind: testCase.kind,
+        ...(testCase.kind === 'approval' ? {} : { interactionKind: testCase.kind }),
       }));
       const governed = createAIOPToolRuntime({
         model: {} as never,
         tools,
-        policy: { check: async () => ({ blocked: false, needApproval: false }) },
+        policy: { check: async () => ({ blocked: false, needApproval: testCase.kind === 'approval' }) },
         ctx: toolContext,
       }, store.toolLedger, concurrency, store.interactions);
       const resolved = interactionResolution
@@ -216,7 +234,7 @@ async function runProductReplay(
   const resumed = await (await runtime.resume({
     identity, runId, resolution: { interactionId: resolved.id, value: testCase.value },
   })).result();
-  return { resumed, pending: pending!, handler, providerTurns, runId };
+  return { resumed, pending: pending!, handler, providerTurns, runId, toolCallId };
 }
 
 function withoutBinding(payload: JsonValue): JsonValue {

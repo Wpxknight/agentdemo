@@ -147,11 +147,11 @@ export function createAIOPToolRuntime(
                 plan: interaction.payload,
                 [GOVERNED_INPUT_BINDING]: interaction.payload,
               }
-            : {
+            : interaction.kind === 'question' ? {
                 ...asObject(interaction.payload),
                 ...base,
                 [GOVERNED_INPUT_BINDING]: interaction.payload,
-              };
+              } : { ...base, ...asObject(interaction.payload) };
           return {
             ...interaction,
             userId: interaction.userId ?? context.identity.actorId,
