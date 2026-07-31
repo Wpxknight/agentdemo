@@ -245,10 +245,20 @@ export class MysqlRunStore implements DurableProductRunStore {
         input_tokens: input.usage.inputTokens, output_tokens: input.usage.outputTokens,
         cache_read_tokens: input.usage.cacheReadTokens, cache_creation_tokens: input.usage.cacheCreationTokens,
         cost_usd: input.usage.costUsd ?? null, updated_at: input.committedAt,
+        ...(['failed', 'recovery_required'].includes(input.status)
+          ? { error_message: input.error?.message ?? null } : {}),
         ...(input.status === 'waiting' ? { lease_owner: null, lease_expires_at: null } : {}),
       }).where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId).execute();
       if (input.status === 'waiting') {
         await store.db.updateTable('agent_run_attempts').set({ status: 'succeeded', completed_at: input.committedAt })
+          .where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId)
+          .where('attempt_id', '=', input.attemptId).execute();
+      }
+      if (input.status === 'failed' || input.status === 'recovery_required') {
+        await store.db.updateTable('agent_run_attempts').set({
+          status: 'failed', error_code: input.error?.code ?? null, error_message: input.error?.message ?? null,
+          completed_at: input.committedAt,
+        })
           .where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId)
           .where('attempt_id', '=', input.attemptId).execute();
       }
@@ -257,9 +267,6 @@ export class MysqlRunStore implements DurableProductRunStore {
           error_message: input.error?.message ?? null, completed_at: input.committedAt,
           append_closed_at: run.append_closed_at ?? input.committedAt, lease_owner: null, lease_expires_at: null,
         }).where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId).execute();
-        await store.db.updateTable('agent_run_attempts').set({ status: 'failed', completed_at: input.committedAt })
-          .where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId)
-          .where('attempt_id', '=', input.attemptId).execute();
       }
     });
   }
@@ -293,14 +300,18 @@ export class MysqlRunStore implements DurableProductRunStore {
     await this.transaction(async (store) => {
       const row = await store.assertLease(input.tenantId, input.runId, input.fencingToken, true);
       const status = row.cancel_requested_at ? 'cancelled' : input.status;
+      const error = status === input.status ? input.error : undefined;
       await store.db.updateTable('agent_runs').set({
         status, waiting_reason: null, input_tokens: input.usage.inputTokens, output_tokens: input.usage.outputTokens,
         cache_read_tokens: input.usage.cacheReadTokens, cache_creation_tokens: input.usage.cacheCreationTokens,
         cost_usd: input.usage.costUsd ?? null,
-        error_message: input.error?.message ?? null, completed_at: input.completedAt, updated_at: input.completedAt,
+        error_message: error?.message ?? null, completed_at: input.completedAt, updated_at: input.completedAt,
         lease_owner: null, lease_expires_at: null, append_closed_at: row.append_closed_at ?? input.completedAt,
       }).where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId).execute();
-      await store.db.updateTable('agent_run_attempts').set({ status, completed_at: input.completedAt })
+      await store.db.updateTable('agent_run_attempts').set({
+        status, error_code: error?.code ?? null, error_message: error?.message ?? null,
+        completed_at: input.completedAt,
+      })
         .where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId)
         .where('attempt_id', '=', input.attemptId).execute();
     });

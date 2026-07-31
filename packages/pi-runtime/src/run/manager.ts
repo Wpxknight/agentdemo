@@ -289,8 +289,10 @@ export class DurableRunManager implements DurableRunRuntime {
         const actualUsage = addUsage(claimed.record.usage, subtractUsage(usageFromEntries(entries), baselineUsage));
         assertUsageAllowed(claimed.record.limits, actualUsage);
         assertToolCallsAllowed(claimed.record.limits, unionSize(persistedToolCallIds, currentToolCallIds));
-        await this.syncEntries(identity.tenantId, piSessionId, entries);
         const leafId = await session.leafId();
+        const terminalError = terminalAssistantError(entries, leafId);
+        if (terminalError) throw terminalError;
+        await this.syncEntries(identity.tenantId, piSessionId, entries);
         const facts = session.takeToolExecutionFacts?.();
         const committedAt = this.now();
         await this.options.store.commitTurn({
@@ -367,15 +369,25 @@ export class DurableRunManager implements DurableRunRuntime {
       const commitFailure = async (
         status: 'cancelled' | 'failed' | 'recovery_required',
         errorData?: AgentPlatformErrorData,
-      ): Promise<void> => {
+      ): Promise<'cancelled' | 'failed' | 'recovery_required'> => {
         const committedAt = this.now();
-        await this.options.store.commitTurn({
+        const commit: CommitTurnInput = {
           tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, turnNo,
           fencingToken: claimed.fencingToken,
           checkpoint: { piSessionId, piLeafId: leafId },
           events: durableEvents, status, usage: actualUsage, error: errorData,
           ledgerUpdates: facts?.ledgerUpdates, interactionUpdates: facts?.interactionUpdates, committedAt,
-        });
+        };
+        try {
+          await this.options.store.commitTurn(commit);
+        } catch (commitError) {
+          const cancellationWon = status !== 'cancelled' && hasErrorCode(commitError, 'RUN_STATE_CONFLICT')
+            && await this.options.store.isCancellationRequested({ tenantId: identity.tenantId, runId });
+          if (!cancellationWon) throw commitError;
+          status = 'cancelled';
+          errorData = undefined;
+          await this.options.store.commitTurn({ ...commit, status, error: undefined });
+        }
         eventsPersisted = true;
         if (status !== 'recovery_required') {
           await this.options.store.complete({
@@ -383,15 +395,20 @@ export class DurableRunManager implements DurableRunRuntime {
             status, usage: actualUsage, error: errorData, completedAt: this.now(),
           });
         }
+        return status;
       };
-      if (abort.signal.aborted || cancellation) {
+      const terminalProviderError = error instanceof AgentPlatformError && error.code === 'MODEL_PROVIDER_ERROR';
+      if ((abort.signal.aborted && !terminalProviderError) || cancellation) {
         await session?.abort().catch(() => {});
         const limitError = abort.signal.reason instanceof AgentPlatformError && abort.signal.reason.code === 'RUN_LIMIT_EXCEEDED'
           ? abort.signal.reason : undefined;
         const status = cancellation ? 'cancelled' : limitError ? 'failed' : 'recovery_required';
         const errorData = limitError ? { code: limitError.code, message: limitError.message, retryable: limitError.retryable } : undefined;
-        await commitFailure(status, errorData).catch(() => {});
-        return { runId, status, usage: actualUsage, error: errorData };
+        const committedStatus = await commitFailure(status, errorData).catch(() => status);
+        return {
+          runId, status: committedStatus, usage: actualUsage,
+          error: committedStatus === status ? errorData : undefined,
+        };
       }
       const recoveryRequired = hasErrorCode(error, 'TOOL_RESULT_UNKNOWN');
       const status = recoveryRequired ? 'recovery_required' : 'failed';
@@ -399,8 +416,11 @@ export class DurableRunManager implements DurableRunRuntime {
         ? { code: error.code, message: error.message, retryable: error.retryable }
         : { code: recoveryRequired ? 'TOOL_RESULT_UNKNOWN' as const : 'MODEL_PROVIDER_ERROR' as const,
             message: error instanceof Error ? error.message : String(error), retryable: false };
-      await commitFailure(status, errorData);
-      return { runId, status, usage: actualUsage, error: errorData };
+      const committedStatus = await commitFailure(status, errorData);
+      return {
+        runId, status: committedStatus, usage: actualUsage,
+        error: committedStatus === status ? errorData : undefined,
+      };
     } finally {
       stopHeartbeat();
       externalSignal?.removeEventListener('abort', onAbort);
@@ -443,6 +463,29 @@ function assistantText(entries: readonly SessionTreeEntry[], leafId: string | nu
     if (entry.type === 'message' && entry.message.role === 'assistant') {
       const text = entry.message.content.filter((block) => block.type === 'text').map((block) => block.text).join('');
       return text || undefined;
+    }
+    cursor = entry.parentId;
+  }
+  return undefined;
+}
+
+function terminalAssistantError(
+  entries: readonly SessionTreeEntry[],
+  leafId: string | null,
+): AgentPlatformError | undefined {
+  const byId = new Map(entries.map((entry) => [entry.id, entry]));
+  let cursor = leafId;
+  while (cursor) {
+    const entry = byId.get(cursor);
+    if (!entry) return undefined;
+    if (entry.type === 'message' && entry.message.role === 'assistant') {
+      if (entry.message.stopReason !== 'error' && entry.message.stopReason !== 'aborted') return undefined;
+      const fallback = entry.message.stopReason === 'aborted'
+        ? 'Model provider aborted the response'
+        : 'Model provider returned an error response';
+      return new AgentPlatformError({
+        code: 'MODEL_PROVIDER_ERROR', message: entry.message.errorMessage || fallback, retryable: false,
+      });
     }
     cursor = entry.parentId;
   }

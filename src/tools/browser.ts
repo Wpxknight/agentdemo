@@ -26,7 +26,7 @@ function reqNumber(o: Record<string, JsonValue>, key: string): number {
 
 /**
  * 远端浏览器工具（computer-use 风格）。
- * 截图返回元信息 + 预览地址（多模态回传超出当前文本消息格式，前端可经 stream URL 观察）。
+ * 截图返回简短元信息 + 多模态图像块；预览地址由独立工具返回。
  */
 export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
   return [
@@ -37,7 +37,8 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
         inputSchema: { type: 'object', properties: {} },
       async execute(_args, ctx): Promise<ToolResult> {
         const d = await resolve(ctx);
-        const url = await desktopRuntime.execute(d, () => d.startStream(), ctx.signal);
+        await desktopRuntime.execute(d, () => d.startStream(), ctx.signal);
+        const url = `/v1/browser/stream-view?sessionId=${encodeURIComponent(ctx.sessionId)}`;
         return { id: '', content: `浏览器预览地址：${url}` };
       },
     }),
@@ -114,12 +115,12 @@ export function buildBrowserTools(resolve: DesktopResolver): ToolHandler[] {
     defineTool({
         name: 'browser_screenshot',
         capability: 'read',
-        description: '截取远端浏览器画面；返回字节数与预览地址。',
+        description: '截取远端浏览器画面；返回字节数与图像内容。',
         inputSchema: { type: 'object', properties: {} },
       async execute(_args, ctx): Promise<ToolResult> {
         const d = await resolve(ctx);
         const img = await desktopRuntime.execute(d, () => d.screenshot(), ctx.signal);
-        const text = `截图已捕获（${img.byteLength} 字节）。浏览器预览：${d.streamUrl()}`;
+        const text = `截图已捕获（${img.byteLength} 字节）。`;
         return {
           id: '',
           content: text,

@@ -367,13 +367,17 @@ async function createDefaultDurableRunAssembly(
     }) => {
       if (!identity) return [];
       const definitions = mcp ? await mcp.tools(identity) : [];
+      const durableRun = sessionId?.startsWith('owner-')
+        ? await runtimeStore.get({ tenantId: identity.tenantId, runId: events.runId })
+        : undefined;
+      const toolSessionId = durableRun?.sessionId ?? sessionId ?? events.runId;
       const toolContext = {
         tenantId: identity.tenantId,
         userId: identity.actorId,
         role: identity.roles.includes('platform_admin') ? 'platform_admin' as const
           : identity.roles.includes('tenant_admin') ? 'tenant_admin' as const
             : 'user' as const,
-        sessionId: sessionId ?? events.runId,
+        sessionId: toolSessionId,
       };
       const productDefinitions = tools.unified(toolContext).definitions();
       const governed = createAIOPToolRuntime({
@@ -401,7 +405,7 @@ async function createDefaultDurableRunAssembly(
           runId: events.runId,
           attemptId: events.attemptId,
           turnNo: events.turnNo,
-          sessionId: sessionId ?? events.runId,
+          sessionId: toolSessionId,
           interactionResolution: resolvedInteraction?.status === 'resolved' && resolvedInteraction.toolCallId
             ? {
                 interactionId: resolvedInteraction.id,

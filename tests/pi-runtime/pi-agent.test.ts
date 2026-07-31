@@ -130,6 +130,39 @@ describe('PiAgentSessionFactory', () => {
     await loaded.close();
   });
 
+  it('removes legacy browser preview data URLs from provider context when loading a session', async () => {
+    const repository = new InMemorySessionRepo();
+    const stored = await repository.create({ id: 'legacy-browser-preview' });
+    await stored.appendMessage({ role: 'user', content: '打开浏览器', timestamp: 1 });
+    await stored.appendMessage({
+      role: 'assistant', api: model.api, provider: model.provider, model: model.id,
+      content: [{ type: 'toolCall', id: 'call-preview', name: 'desktop_stream_url', arguments: {} }],
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: 'toolUse', timestamp: 2,
+    });
+    await stored.appendMessage({
+      role: 'toolResult', toolCallId: 'call-preview', toolName: 'desktop_stream_url',
+      content: [{ type: 'text', text: `浏览器预览地址：data:text/html;charset=utf-8,${'preview'.repeat(20_000)}` }],
+      isError: false, timestamp: 3,
+    });
+    const controlled = testModels();
+    const loaded = await new PiAgentSessionFactory({ repository, models: controlled.models, model }).load({
+      metadata: await stored.getMetadata(),
+      initialMessage: { role: 'user', text: '继续' },
+      events: eventContext('legacy-browser-preview'),
+    });
+
+    const events = collect(loaded.continue());
+    controlled.release();
+    await events;
+
+    const providerContext = JSON.stringify(controlled.contexts[0]);
+    expect(providerContext).not.toContain('data:text/html');
+    expect(providerContext).toContain('浏览器预览已加载到右侧沙箱栏');
+    await loaded.close();
+  });
+
   it('flushes sequential inbox markers through real Harness safe-point events before finalization', async () => {
     const base = new InMemorySessionStorage({ metadata: { id: 'serialized', createdAt: new Date().toISOString() } });
     await base.appendEntry({

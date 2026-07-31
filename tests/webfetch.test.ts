@@ -1,7 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { buildWebFetchTool, htmlToText } from '../src/tools/webfetch.js';
 
 const ctx = { sessionId: 's1' };
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe('htmlToText', () => {
   it('strips scripts/styles/tags and decodes entities', () => {
@@ -40,5 +44,18 @@ describe('web_fetch tool guards', () => {
     const tool = buildWebFetchTool();
     const r = await tool.run({}, ctx);
     expect(r.isError).toBe(true);
+  });
+
+  it('reports the underlying network error and limits the conclusion to the target site', async () => {
+    const error = new TypeError('fetch failed', { cause: { code: 'ETIMEDOUT' } });
+    vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(error);
+    const tool = buildWebFetchTool();
+
+    const r = await tool.run({ url: 'https://1.1.1.1/weather' }, ctx);
+
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('ETIMEDOUT');
+    expect(r.content).toContain('仅表示当前目标访问失败');
+    expect(r.content).toContain('不同域名');
   });
 });

@@ -208,6 +208,17 @@ export class MemoryRunStore implements DurableProductRunStore {
       run.waitingReason = input.waitingReason;
       run.usage = clone(input.usage);
       run.updatedAt = input.committedAt;
+      const terminalFailure = input.status === 'failed' || input.status === 'recovery_required'
+        ? input.status : undefined;
+      if (terminalFailure) {
+        run.errorMessage = input.error?.message;
+        run.result = { runId: input.runId, status: terminalFailure, usage: clone(input.usage), error: input.error };
+        const attempt = this.attemptsState.get(key(key(input.tenantId, input.runId), input.attemptId));
+        if (attempt) Object.assign(attempt, {
+          status: 'failed', errorCode: input.error?.code, errorMessage: input.error?.message,
+          completedAt: input.committedAt,
+        });
+      }
       for (const interaction of input.interactionUpdates ?? []) {
         this.interactionRecords.set(key(key(interaction.tenantId, interaction.runId), interaction.id), clone(interaction));
       }
@@ -221,12 +232,9 @@ export class MemoryRunStore implements DurableProductRunStore {
         if (attempt) Object.assign(attempt, { status: 'succeeded', completedAt: input.committedAt });
       }
       if (input.status === 'recovery_required') {
-        run.result = { runId: input.runId, status: input.status, usage: clone(input.usage), error: input.error };
         run.appendClosedAt ??= input.committedAt;
         run.leaseOwner = undefined;
         run.leaseExpiresAt = undefined;
-        const attempt = this.attemptsState.get(key(key(input.tenantId, input.runId), input.attemptId));
-        if (attempt) Object.assign(attempt, { status: 'failed', completedAt: input.committedAt });
       }
     });
   }
@@ -261,16 +269,20 @@ export class MemoryRunStore implements DurableProductRunStore {
     await this.lock(async () => {
       const run = this.requireLease(input, input.completedAt);
       const status = run.cancelRequestedAt ? 'cancelled' : input.status;
+      const error = status === input.status ? input.error : undefined;
       run.status = status;
       run.waitingReason = undefined;
       run.usage = clone(input.usage);
-      run.result = { runId: input.runId, status, usage: clone(input.usage), error: input.error };
+      run.errorMessage = error?.message;
+      run.result = { runId: input.runId, status, usage: clone(input.usage), error };
       run.appendClosedAt ??= input.completedAt;
       run.leaseOwner = undefined;
       run.leaseExpiresAt = undefined;
       run.updatedAt = input.completedAt;
       const attempt = this.attemptsState.get(key(key(input.tenantId, input.runId), input.attemptId));
-      if (attempt) Object.assign(attempt, { status, completedAt: input.completedAt });
+      if (attempt) Object.assign(attempt, {
+        status, errorCode: error?.code, errorMessage: error?.message, completedAt: input.completedAt,
+      });
     });
   }
 

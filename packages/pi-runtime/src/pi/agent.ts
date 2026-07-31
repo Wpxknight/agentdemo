@@ -7,6 +7,7 @@ import {
   Agent,
   AgentHarness,
   convertToLlm,
+  type AgentMessage,
   type AgentEvent,
   type AgentHarnessEvent,
   type AgentHarnessResources,
@@ -135,6 +136,7 @@ export class PiAgentSessionFactory<
       tools: governedTools.tools,
       resources: this.options.resources,
     });
+    harness.on('context', ({ messages }) => ({ messages: sanitizeLegacyBrowserPreviewMessages(messages) }));
     return new PiAgentSession(session, harness, initialMessage, new EventCodec(events), models, systemPrompt);
   }
 }
@@ -538,6 +540,7 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
         })),
       },
       convertToLlm,
+      transformContext: async (messages) => sanitizeLegacyBrowserPreviewMessages(messages),
       sessionId: metadata.id,
       transport: streamOptions.transport,
       maxRetryDelayMs: streamOptions.maxRetryDelayMs,
@@ -648,6 +651,19 @@ function toPiUserMessage(message: AgentInputMessage) {
     content: [{ type: 'text' as const, text }, ...images],
     timestamp: Date.now(),
   };
+}
+
+function sanitizeLegacyBrowserPreviewMessages(messages: AgentMessage[]): AgentMessage[] {
+  return messages.map((message) => {
+    if (message.role !== 'toolResult' || message.toolName !== 'desktop_stream_url') return message;
+    let changed = false;
+    const content = message.content.map((block) => {
+      if (block.type !== 'text' || !block.text.includes('data:text/html')) return block;
+      changed = true;
+      return { ...block, text: '浏览器预览已加载到右侧沙箱栏。' };
+    });
+    return changed ? { ...message, content } : message;
+  });
 }
 
 function waitingInteractionBinding(

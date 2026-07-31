@@ -64,6 +64,9 @@ describe('production durable runtime assembly', () => {
     const unattended = runtimeModule.resolveRuntimeSystemPrompt('skill summary', { unattended: true });
 
     expect(interactive).toContain('聊天执行规则：');
+    expect(interactive).toContain('单个站点访问失败');
+    expect(interactive).toContain('不同域名');
+    expect(interactive).toContain('整体网络不可用');
     expect(interactive).toContain('skill summary');
     expect(interactive).not.toContain('无人值守运行说明');
     expect(unattended).toContain('聊天执行规则：');
@@ -307,6 +310,51 @@ describe('production durable runtime assembly', () => {
     await ordinary[0]!.execute('ordinary', {}, new AbortController().signal, () => undefined, undefined).catch(() => undefined);
     expect(standard.check).toHaveBeenCalledOnce();
     await mcp.close();
+  });
+
+  it('binds durable product tools to the product chat session instead of the Pi storage session', async () => {
+    const store = new MemoryStore();
+    const durableStore = store.durableRunStore();
+    const now = new Date();
+    await durableStore.create({ record: {
+      tenantId: 'tenant-a', runId: 'run-browser', actorId: 'user-a', sessionId: 'chat-session-a',
+      kernel: 'pi', kernelVersion: '0.82.1', status: 'queued', leaseToken: 0n,
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      createdAt: now, updatedAt: now,
+    } });
+    const claim = await durableStore.claim({
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+      runId: 'run-browser', workerId: 'worker-a', now, leaseTtlMs: 60_000,
+    });
+    const observedSessionIds: string[] = [];
+    const products = new ToolRegistry().register(defineTool({
+      name: 'browser_probe', description: 'browser probe', inputSchema: {}, capability: 'read',
+      execute: async (_args, ctx) => {
+        observedSessionIds.push(ctx.sessionId);
+        return { id: '', content: 'ok' };
+      },
+    }), 'sandbox');
+    const factory = createDefaultDurableRunRuntime as unknown as (...args: unknown[]) => Promise<DurableRunManager>;
+    const runtime = await factory(
+      store,
+      { id: 'configured', protocol: 'openai', baseURL: 'http://model.local/v1', apiKey: 'secret', model: 'custom-model' },
+      'system prompt', true, undefined, new AllowAllPolicy(), products,
+    );
+    const sessionFactory = (runtime as unknown as { options: { sessions: { options: {
+      resolveTools(input: unknown): Promise<Array<{ name: string; execute(...args: unknown[]): Promise<unknown> }>>;
+    } } } }).options.sessions;
+    const resolved = await sessionFactory.options.resolveTools({
+      identity: { tenantId: 'tenant-a', actorId: 'user-a', roles: ['user'] },
+      sessionId: 'owner-pi-storage-id',
+      events: {
+        tenantId: 'tenant-a', runId: 'run-browser', attemptId: claim!.attemptId, turnNo: 1,
+      },
+    });
+
+    await resolved.find((tool) => tool.name === 'browser_probe')!
+      .execute('call-browser', {}, new AbortController().signal, () => undefined, undefined);
+
+    expect(observedSessionIds).toEqual(['chat-session-a']);
   });
 
   it('preserves an explicitly injected durable runtime without enabling automatic assembly', async () => {

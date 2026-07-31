@@ -456,6 +456,14 @@ describe('MysqlRunStore durable contract surface', () => {
     expect(source).not.toContain('if (activeLease && (!input.expectedLease');
   });
 
+  it('writes terminal failure errors to the MySQL attempt inside commitTurn', () => {
+    const source = readFileSync(new URL('../../packages/pi-runtime/src/store/mysql.ts', import.meta.url), 'utf8');
+    const commitTurn = source.slice(source.indexOf('async commitTurn('), source.indexOf('async requestCancellation('));
+    expect(commitTurn).toContain("input.status === 'failed' || input.status === 'recovery_required'");
+    expect(commitTurn).toContain("status: 'failed', error_code: input.error?.code ?? null");
+    expect(commitTurn).toContain('error_message: input.error?.message ?? null');
+  });
+
   it('executes owner-scoped SQL reservations for same-tenant actors sharing an external session id', async () => {
     const db = new MysqlCreateContractDb();
     const store = new MysqlRunStore(db as never);
@@ -1058,6 +1066,127 @@ describe('DurableRunManager', () => {
     expect((await store.get({ tenantId: identity.tenantId, runId: 'usage-run' }))?.usage).toEqual(result.usage);
   });
 
+  it.each(['error', 'aborted'] as const)(
+    'persists a terminal assistant %s as a failed run with the session error message',
+    async (stopReason) => {
+      const store = new MemoryRunStore();
+      let finished = false;
+      const root = messageEntryForUsage(`terminal-${stopReason}-root`, null, 'user');
+      const baseAssistant = messageEntryForUsage(`terminal-${stopReason}-leaf`, root.id, 'assistant', {
+        input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costTotal: 0,
+      });
+      const assistant = {
+        ...baseAssistant,
+        message: {
+          ...baseAssistant.message,
+          content: [], stopReason, errorMessage: `provider ${stopReason} detail`,
+        },
+      };
+      const session: ManagedPiSession = {
+        ...emptySession(`terminal-${stopReason}-session`),
+        async *continue() {
+          yield { tenantId: '', runId: '', sequence: 1n, type: 'message_end', attemptId: '', turnNo: 0,
+            kernel: 'pi', kernelVersion: '0.82.1', correlationId: stopReason, createdAt: new Date(),
+            detail: { message: { role: 'assistant', content: [], stopReason } } } as AgentRunEvent;
+          finished = true;
+        },
+        async entries() { return finished ? [root, assistant] : [root]; },
+        async leafId() { return assistant.id; },
+      };
+      const manager = new DurableRunManager({
+        store, heartbeatMs: 0, sessions: { create: async () => session, load: async () => session },
+        eventOptions: () => ({}),
+      });
+      const runId = `terminal-${stopReason}-run`;
+
+      const result = await (await manager.run({
+        runId, identity, sessionId: `terminal-${stopReason}-session`, input: [{ role: 'user', text: 'start' }],
+      })).result();
+
+      expect(result).toMatchObject({
+        status: 'failed', error: { code: 'MODEL_PROVIDER_ERROR', message: `provider ${stopReason} detail` },
+      });
+      expect(await store.get({ tenantId: identity.tenantId, runId })).toMatchObject({
+        status: 'failed', errorMessage: `provider ${stopReason} detail`,
+      });
+      expect(await store.attempts.list({ tenantId: identity.tenantId, runId })).toEqual([
+        expect.objectContaining({
+          status: 'failed', errorCode: 'MODEL_PROVIDER_ERROR', errorMessage: `provider ${stopReason} detail`,
+        }),
+      ]);
+    },
+  );
+
+  it('keeps a terminal assistant abort as failed when the run signal aborts at the same time', async () => {
+    const store = new MemoryRunStore();
+    const controller = new AbortController();
+    let finished = false;
+    const root = messageEntryForUsage('terminal-signal-abort-root', null, 'user');
+    const baseAssistant = messageEntryForUsage('terminal-signal-abort-leaf', root.id, 'assistant', {
+      input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costTotal: 0,
+    });
+    const assistant = {
+      ...baseAssistant,
+      message: {
+        ...baseAssistant.message, content: [], stopReason: 'aborted' as const,
+        errorMessage: 'provider aborted terminal response',
+      },
+    };
+    const session: ManagedPiSession = {
+      ...emptySession('terminal-signal-abort-session'),
+      async *continue() {
+        yield { tenantId: '', runId: '', sequence: 1n, type: 'message_end', attemptId: '', turnNo: 0,
+          kernel: 'pi', kernelVersion: '0.82.1', correlationId: 'terminal-signal-abort', createdAt: new Date(),
+          detail: { message: { role: 'assistant', content: [], stopReason: 'aborted' } } } as AgentRunEvent;
+        finished = true;
+        controller.abort(new Error('runtime signal aborted'));
+      },
+      async entries() { return finished ? [root, assistant] : [root]; },
+      async leafId() { return assistant.id; },
+    };
+    const manager = new DurableRunManager({
+      store, heartbeatMs: 0, sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+
+    const result = await (await manager.run({
+      runId: 'terminal-signal-abort-run', identity, sessionId: 'terminal-signal-abort-session',
+      input: [{ role: 'user', text: 'start' }], signal: controller.signal,
+    })).result();
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      error: { code: 'MODEL_PROVIDER_ERROR', message: 'provider aborted terminal response', retryable: false },
+    });
+  });
+
+  it('keeps a terminal assistant length response successful', async () => {
+    const store = new MemoryRunStore();
+    const root = messageEntryForUsage('terminal-length-root', null, 'user');
+    const baseAssistant = messageEntryForUsage('terminal-length-leaf', root.id, 'assistant', {
+      input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costTotal: 0,
+    });
+    const assistant = {
+      ...baseAssistant,
+      message: {
+        ...baseAssistant.message,
+        stopReason: 'length' as const,
+      },
+    };
+    const session: ManagedPiSession = {
+      ...emptySession('terminal-length-session'),
+      async entries() { return [root, assistant]; },
+      async leafId() { return assistant.id; },
+    };
+    const manager = new DurableRunManager({
+      store, heartbeatMs: 0, sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+
+    await expect((await manager.run({
+      runId: 'terminal-length-run', identity, sessionId: 'terminal-length-session',
+      input: [{ role: 'user', text: 'start' }],
+    })).result()).resolves.toMatchObject({ status: 'succeeded', text: 'answer' });
+  });
+
   it('waits for a priced usage fact before enforcing a cost limit', async () => {
     const store = new MemoryRunStore();
     let finished = false;
@@ -1295,8 +1424,13 @@ describe('DurableRunManager', () => {
       error: { code: 'TOOL_RESULT_UNKNOWN', message: 'external result is uncertain', retryable: false },
     });
     expect(await store.get({ tenantId: identity.tenantId, runId: 'governed-recovery-run' })).toMatchObject({
-      status: 'recovery_required', appendClosedAt: expect.any(Date),
+      status: 'recovery_required', errorMessage: 'external result is uncertain', appendClosedAt: expect.any(Date),
     });
+    expect(await store.attempts.list({ tenantId: identity.tenantId, runId: 'governed-recovery-run' })).toEqual([
+      expect.objectContaining({
+        status: 'failed', errorCode: 'TOOL_RESULT_UNKNOWN', errorMessage: 'external result is uncertain',
+      }),
+    ]);
   });
 
   it('lets cancellation win when it lands between governed outcome arbitration and commit', async () => {
@@ -1355,6 +1489,47 @@ describe('DurableRunManager', () => {
       tenantId: identity.tenantId, runId: handle.runId, logicalCallId: ledgerUpdate.logicalCallId,
     })).toEqual(ledgerUpdate);
     expect(committed).toMatchObject({ status: 'cancelled', ledgerUpdates: [ledgerUpdate] });
+  });
+
+  it('lets cancellation win when it lands between ordinary failure arbitration and commit', async () => {
+    const base = new MemoryRunStore();
+    let cancellationInjected = false;
+    const store = new Proxy(base, {
+      get(target, property) {
+        if (property === 'commitTurn') return async (input: Record<string, unknown>) => {
+          if (input.status === 'failed' && !cancellationInjected) {
+            cancellationInjected = true;
+            await target.requestCancellation({
+              identity, runId: 'cancel-failed-run', requestedAt: new Date(), reason: 'stop before failed commit',
+            });
+          }
+          return target.commitTurn(input as never);
+        };
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const session: ManagedPiSession = {
+      ...emptySession('cancel-failed-session'),
+      async *continue() { throw new Error('provider failed'); },
+    };
+    const manager = new DurableRunManager({
+      store: store as never, heartbeatMs: 0,
+      sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+
+    const handle = await manager.run({
+      runId: 'cancel-failed-run', identity, sessionId: 'cancel-failed-session',
+      input: [{ role: 'user', text: 'start' }],
+    });
+
+    await expect(handle.result()).resolves.toMatchObject({ status: 'cancelled' });
+    expect(await base.get({ tenantId: identity.tenantId, runId: handle.runId })).toMatchObject({
+      status: 'cancelled', leaseOwner: undefined, leaseExpiresAt: undefined,
+    });
+    expect(await base.attempts.list({ tenantId: identity.tenantId, runId: handle.runId })).toEqual([
+      expect.objectContaining({ status: 'cancelled', completedAt: expect.any(Date) }),
+    ]);
   });
 
   it('commits governed ledger and interaction facts through the fenced turn transaction', async () => {
@@ -1508,6 +1683,39 @@ describe('DurableRunManager', () => {
       input: [{ role: 'user', text: 'deploy' }],
     })).result()).resolves.toMatchObject({ status: 'failed' });
     expect(committed).toMatchObject({ status: 'failed', ledgerUpdates: [ledgerUpdate], interactionUpdates: [] });
+  });
+
+  it('persists failed run and attempt errors in the turn commit before completion', async () => {
+    const base = new MemoryRunStore();
+    const store = new Proxy(base, {
+      get(target, property) {
+        if (property === 'complete') return async () => { throw new Error('completion write failed'); };
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const session: ManagedPiSession = {
+      ...emptySession('atomic-failed-session'),
+      async *continue() { throw new Error('provider failed before completion'); },
+    };
+    const manager = new DurableRunManager({
+      store: store as never, heartbeatMs: 0,
+      sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+    const runId = 'atomic-failed-run';
+
+    await expect((await manager.run({
+      runId, identity, sessionId: 'atomic-failed-session', input: [{ role: 'user', text: 'start' }],
+    })).result()).rejects.toThrow('completion write failed');
+
+    expect(await base.get({ tenantId: identity.tenantId, runId })).toMatchObject({
+      status: 'failed', errorMessage: 'provider failed before completion',
+    });
+    expect(await base.attempts.list({ tenantId: identity.tenantId, runId })).toEqual([
+      expect.objectContaining({
+        status: 'failed', errorCode: 'MODEL_PROVIDER_ERROR', errorMessage: 'provider failed before completion',
+      }),
+    ]);
   });
 
   it.each([

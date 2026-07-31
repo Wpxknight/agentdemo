@@ -57,6 +57,12 @@ function asObject(args: JsonValue): Record<string, JsonValue> {
   return args && typeof args === 'object' && !Array.isArray(args) ? args : {};
 }
 
+function errorCode(err: unknown): string | undefined {
+  if (!(err instanceof Error) || !err.cause || typeof err.cause !== 'object') return undefined;
+  const code = Reflect.get(err.cause, 'code');
+  return typeof code === 'string' && code ? code : undefined;
+}
+
 export function buildWebFetchTool(opts: WebFetchOptions = {}): ToolHandler {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   return defineTool({
@@ -105,7 +111,13 @@ export function buildWebFetchTool(opts: WebFetchOptions = {}): ToolHandler {
         return { id: '', content: `# ${target.href}\n${note}\n${text}` };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        return { id: '', content: `抓取失败：${msg}`, isError: true };
+        const code = errorCode(err);
+        const detail = code ? `${msg}（${code}）` : msg;
+        return {
+          id: '',
+          content: `抓取失败：${detail}。这仅表示当前目标访问失败，不代表整体网络不可用；可尝试不同域名的数据源。`,
+          isError: true,
+        };
       }
     },
   });
