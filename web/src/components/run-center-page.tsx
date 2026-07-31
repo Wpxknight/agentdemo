@@ -127,7 +127,7 @@ export function RunCenterPage({ api }: { api: RunCenterApi }) {
           <div className="run-center-table-scroll">
             <Table className="aios-table">
               <TableHeader><TableRow>
-                <TableHead>状态</TableHead><TableHead>Run / Session</TableHead><TableHead>Graph</TableHead>
+                <TableHead>状态</TableHead><TableHead>Run / Session</TableHead><TableHead>Kernel</TableHead>
                 <TableHead>当前节点</TableHead><TableHead>步骤</TableHead><TableHead>Token</TableHead><TableHead>耗时</TableHead>
               </TableRow></TableHeader>
               <TableBody>
@@ -135,7 +135,7 @@ export function RunCenterPage({ api }: { api: RunCenterApi }) {
                   <TableRow key={run.runId} data-state={run.runId === selectedRunId ? 'selected' : undefined} onClick={() => { setSelectedRunId(run.runId); void loadDetail(run.runId); }}>
                     <TableCell><RunStatus status={run.status} /></TableCell>
                     <TableCell><strong>{shortId(run.runId)}</strong><small>{run.sessionId}</small></TableCell>
-                    <TableCell>{run.graphName}<small>{run.graphVersion} · {run.kernel}</small></TableCell>
+                    <TableCell>{run.kernel}<small>{run.kernelVersion ?? '-'}</small></TableCell>
                     <TableCell>{run.currentNode ?? '-'}</TableCell>
                     <TableCell>{run.stepCount}<small>A {run.attemptSummary?.count ?? 0} · T {run.turnSummary?.count ?? 0}</small></TableCell>
                     <TableCell>{formatTokens(totalTokens(run))}</TableCell>
@@ -176,7 +176,7 @@ function RunDetail({ detail, busy, onCancel, onResume }: { detail: AgentRunDetai
     {run.errorMessage ? <p className="run-error-message">{run.errorMessage}</p> : null}
     <dl className="run-detail-metrics">
       <div><dt>Session</dt><dd>{run.sessionId}</dd></div><div><dt>用户</dt><dd>{run.userId}</dd></div>
-      <div><dt>Graph</dt><dd>{run.graphName} / {run.graphVersion}</dd></div><div><dt>当前节点</dt><dd>{run.currentNode ?? '-'}</dd></div>
+      <div><dt>Kernel</dt><dd>{run.kernel} / {run.kernelVersion ?? '-'}</dd></div><div><dt>当前节点</dt><dd>{run.currentNode ?? '-'}</dd></div>
       <div><dt>步骤</dt><dd>{run.stepCount}</dd></div><div><dt>Token</dt><dd>{formatTokens(totalTokens(run))}</dd></div>
       <div><dt>耗时</dt><dd>{formatDuration(run)}</dd></div><div><dt>租约</dt><dd>{run.leaseActive ? '活动' : '已释放'}</dd></div>
       <div><dt>Attempt 数</dt><dd>{detail.attempts.length}</dd></div><div><dt>Turn 数</dt><dd>{detail.turns.length}</dd></div>

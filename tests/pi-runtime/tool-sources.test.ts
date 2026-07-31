@@ -2,11 +2,12 @@ import { describe, expect, it, vi } from 'vitest';
 import type { AgentTool } from '@earendil-works/pi-agent-core';
 import {
   GovernedToolFactory,
+  ResourceConcurrencyController,
   UnifiedToolRegistry,
   type ToolLedgerStore,
 } from '../../packages/pi-runtime/src/index.js';
 import { ToolRegistry, defineTool } from '../../src/agent/tools.js';
-import { createCompatibilityAIOPToolRuntime } from '../../src/tools/governance.js';
+import { createAIOPToolRuntime } from '../../src/tools/governance.js';
 import { McpManager } from '../../packages/mcp-runtime/src/index.js';
 import { buildAskUserTool } from '../../src/tools/ask-user.js';
 import { buildSandboxTools } from '../../src/tools/builtin.js';
@@ -57,13 +58,13 @@ describe('real unified tool sources', () => {
       close: async () => undefined,
     }));
     const governedTools = await mcp.tools(context.identity);
-    const runtime = createCompatibilityAIOPToolRuntime({
+    const runtime = createAIOPToolRuntime({
       model: {} as never,
       tools: new ToolRegistry(),
       governedTools,
       policy: { check: async () => ({ blocked: false, needApproval: false }) },
       ctx: { sessionId: 'session-a', tenantId: 'tenant-a', userId: 'user-a', role: 'user' },
-    } as never);
+    } as never, ledger(), new ResourceConcurrencyController(), undefined, true);
 
     await expect(runtime.execute({
       id: 'call-mcp', logicalCallId: 'logical-mcp', name: 'mcp__demo__whoami', arguments: {},

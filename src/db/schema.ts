@@ -193,9 +193,6 @@ export interface AgentRunsTable {
   session_id: string;
   kernel: string;
   kernel_version: string;
-  graph_name: string;
-  graph_version: string;
-  runtime_version: string;
   status: string;
   waiting_reason: string | null;
   current_node: string | null;

@@ -86,7 +86,7 @@ class LocalDesktopHandle implements DesktopHandle {
   private debugPort = 0;
   private stream = 'data:text/html;charset=utf-8,%3Chtml%3E%3Cbody%3EChrome%20not%20started%3C%2Fbody%3E%3C%2Fhtml%3E';
 
-  constructor(private readonly key: string, private readonly timeoutMs = 60_000) {
+  constructor(key: string, private readonly timeoutMs = 60_000) {
     this.sandboxId = `local-desktop-${key.replace(/[^a-zA-Z0-9_.-]/g, '-')}`;
   }
 

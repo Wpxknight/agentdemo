@@ -160,21 +160,26 @@ describe('product durable interaction replay', () => {
   it.each([
     {
       kind: 'question' as const, toolName: 'ask_user' as const, input: questionInput, value: { Continue: ['Yes'] },
-      legacyPayload: (payload: JsonValue) => withoutBinding(payload),
+      unboundPayload: (payload: JsonValue) => withoutBinding(payload),
     },
     {
       kind: 'plan' as const, toolName: 'submit_change_plan' as const, input: planInput, value: true,
-      legacyPayload: (payload: JsonValue) => withoutBinding(payload),
+      unboundPayload: (payload: JsonValue) => withoutBinding(payload),
     },
-  ])('resumes the existing legacy $kind wrapper without an explicit binding', async (testCase) => {
+  ])('rejects an unbound $kind wrapper before replay', async (testCase) => {
     const result = await runProductReplay(testCase, (interaction) => ({
       ...interaction,
-      payload: testCase.legacyPayload(interaction.payload),
+      payload: testCase.unboundPayload(interaction.payload),
     }));
 
-    expect(result.resumed).toMatchObject({ status: 'succeeded', text: 'continued after interaction' });
+    expect(result.resumed).toMatchObject({
+      status: 'recovery_required',
+      error: expect.objectContaining({
+        message: expect.stringContaining('interaction payload is not bound to the pending tool call'),
+      }),
+    });
     expect(result.handler).not.toHaveBeenCalled();
-    expect(result.providerTurns).toBe(2);
+    expect(result.providerTurns).toBe(1);
   });
 
   it.each([
@@ -197,7 +202,7 @@ describe('product durable interaction replay', () => {
       }),
     },
     {
-      name: 'legacy plan wrapper', kind: 'plan' as const, toolName: 'submit_change_plan' as const, input: planInput,
+      name: 'unbound plan wrapper', kind: 'plan' as const, toolName: 'submit_change_plan' as const, input: planInput,
       value: true,
       mutate: (interaction: DurableInteractionUpdate) => ({
         ...interaction,
@@ -272,7 +277,6 @@ async function runProductReplay(
         ...(testCase.kind === 'approval' ? {} : { interactionKind: testCase.kind }),
       }));
       const governed = createAIOPToolRuntime({
-        model: {} as never,
         tools,
         policy: { check: async () => ({ blocked: false, needApproval: testCase.kind === 'approval' }) },
         ctx: toolContext,

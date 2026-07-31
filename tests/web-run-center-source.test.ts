@@ -24,7 +24,7 @@ describe('Run Center web UI contract', () => {
 
   it('shows filters, operational columns, timeline, interactions and tool ledger', () => {
     const page = source('web/src/components/run-center-page.tsx');
-    for (const label of ['状态筛选', 'Graph', '当前节点', '步骤', 'Token', '耗时', 'Timeline', '交互', '工具执行']) {
+    for (const label of ['状态筛选', 'Kernel', '当前节点', '步骤', 'Token', '耗时', 'Timeline', '交互', '工具执行']) {
       expect(page).toContain(label);
     }
   });

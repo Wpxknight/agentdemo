@@ -39,16 +39,10 @@ export class SecretBox {
   }
 }
 
-/** 设置 secret 优先独立变量；为兼容开发环境可临时回退 JWT secret。 */
+/** 设置凭据使用独立 secret；未配置时仅允许开发占位密钥。 */
 export function createSettingsSecretBox(env: NodeJS.ProcessEnv = process.env): SecretBox {
   const settingsSecret = env.AIOP_SETTINGS_SECRET?.trim();
   if (settingsSecret) return new SecretBox(settingsSecret, 'platform-settings');
-
-  const fallback = env.AIOP_JWT_SECRET?.trim();
-  if (fallback) {
-    logger.warn('AIOP_SETTINGS_SECRET 未设置，开发兼容模式回退 AIOP_JWT_SECRET；生产环境必须配置独立 secret');
-    return new SecretBox(fallback, 'platform-settings');
-  }
 
   logger.warn('AIOP_SETTINGS_SECRET 未设置，使用开发占位密钥（勿用于生产）');
   return new SecretBox('dev-insecure-settings-secret', 'platform-settings');

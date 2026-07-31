@@ -43,7 +43,7 @@ import { McpServerSchema } from '../config/schema.js';
 import type { McpServerConfig } from '@aiop/mcp-runtime';
 import { nextRunAt } from '../scheduler/cron.js';
 import { estimateTokens } from '../llm/context.js';
-import { parseStoredSandboxSettings } from '@aiop/sandbox-runtime';
+import { parseSandboxSettings } from '@aiop/sandbox-runtime';
 import { MysqlRunStore } from '@aiop/pi-runtime';
 
 interface TaskRow {
@@ -129,9 +129,6 @@ function toAgentRun(row: Selectable<Database['agent_runs']>): AgentRunRecord {
     sessionId: row.session_id,
     kernel: piKernel(row.kernel),
     kernelVersion: row.kernel_version,
-    runtimeVersion: row.runtime_version,
-    graphName: row.graph_name,
-    graphVersion: row.graph_version,
     status: row.status as AgentRunRecord['status'],
     waitingReason: row.waiting_reason as AgentRunRecord['waitingReason'] ?? undefined,
     currentNode: row.current_node ?? undefined,
@@ -616,9 +613,6 @@ export class MysqlStore implements Store {
       sessionId: row.session_id,
       kernel: piKernel(row.kernel),
       kernelVersion: row.kernel_version,
-      runtimeVersion: row.runtime_version,
-      graphName: row.graph_name,
-      graphVersion: row.graph_version,
       createdAt: toDate(row.created_at),
     } : undefined;
   }
@@ -631,9 +625,6 @@ export class MysqlStore implements Store {
       session_id: binding.sessionId,
       kernel: binding.kernel,
       kernel_version: binding.kernelVersion ?? `${binding.kernel}-v1`,
-      graph_name: binding.graphName,
-      graph_version: binding.graphVersion,
-      runtime_version: binding.runtimeVersion ?? 'compat-v1',
       status: 'queued',
       waiting_reason: null,
       current_node: null,
@@ -1279,11 +1270,10 @@ export class MysqlStore implements Store {
         .where('tenant_id', '=', ctx.tenantId)
         .where('setting_key', '=', 'sandbox.default.api_key')
         .executeTakeFirst();
-      const parsed = parseStoredSandboxSettings(parseJson(configRow.config));
+      const settings = parseSandboxSettings(parseJson(configRow.config));
       return {
-        settings: parsed.settings,
+        settings,
         ...(secretRow?.payload ? { encryptedApiKey: secretRow.payload } : {}),
-        ...(!secretRow?.payload && parsed.legacyApiKey ? { legacyApiKey: parsed.legacyApiKey } : {}),
       };
     });
   }
@@ -1318,14 +1308,6 @@ export class MysqlStore implements Store {
           .execute();
       }
     });
-  }
-
-  async getSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<SandboxSettings | undefined> {
-    return (await this.getSandboxSettingsRecord(ctx))?.settings;
-  }
-
-  async setSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SandboxSettings): Promise<void> {
-    await this.setSandboxSettingsRecord(ctx, settings, { action: 'retain' });
   }
 
   async setLlmSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: LlmSettings): Promise<void> {

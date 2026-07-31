@@ -219,27 +219,25 @@ describe('MemoryStore', () => {
   });
 
   it('has a MySQL migration for tenant settings', async () => {
-    const migration = await readFile('src/db/migrations/0002_tenant_settings.sql', 'utf8');
-    expect(migration).toContain('CREATE TABLE IF NOT EXISTS tenant_settings');
+    const migration = await readFile('src/db/migrations/0001_baseline.sql', 'utf8');
+    expect(migration).toContain('CREATE TABLE `tenant_settings`');
     expect(migration).toContain('tenant_id');
     expect(migration).toContain('setting_key');
   });
 
   it('has a MySQL index for tenant history ordering', async () => {
-    const migration = await readFile('src/db/migrations/0003_messages_tenant_history_index.sql', 'utf8');
+    const migration = await readFile('src/db/migrations/0001_baseline.sql', 'utf8');
     expect(migration).toContain('idx_messages_tenant_id');
     expect(migration).toContain('tenant_id');
     expect(migration).toContain('id');
   });
 
   it('has a MySQL migration for explicit sessions', async () => {
-    const migration = await readFile('src/db/migrations/0004_sessions.sql', 'utf8');
-    expect(migration).toContain('CREATE TABLE IF NOT EXISTS sessions');
+    const migration = await readFile('src/db/migrations/0001_baseline.sql', 'utf8');
+    expect(migration).toContain('CREATE TABLE `sessions`');
     expect(migration).toContain('tenant_id');
     expect(migration).toContain('session_id');
-    expect(migration).toContain('INSERT IGNORE INTO sessions');
-    // 回填 title 必须截到 VARCHAR(255) 内，否则严格模式下超长首条消息会让迁移失败
-    expect(migration).toMatch(/LEFT\(COALESCE\([\s\S]*?, 255\)/);
+    expect(migration).not.toContain('INSERT IGNORE INTO sessions');
   });
 
   it('lists sessions from the explicit sessions table', async () => {

@@ -685,7 +685,7 @@ describe('HTTP server', () => {
     const localStore = new MemoryStore();
     await localStore.createTenant({ id: 'default', name: 'Default' });
     const auth = new LocalAuthProvider({ store: localStore, secret: 'sse-detach-secret' });
-    const owner = await auth.createUser('default', 'sse-owner', 'pw', 'user');
+    await auth.createUser('default', 'sse-owner', 'pw', 'user');
     const ownerToken = (await auth.login('default', 'sse-owner', 'pw'))!;
     let sessionStarted!: () => void;
     const started = new Promise<void>((resolve) => { sessionStarted = resolve; });
@@ -1029,13 +1029,13 @@ describe('HTTP server', () => {
     const older = new Date('2026-07-28T00:00:00.000Z');
     await localStore.putAgentRunBindingIfAbsent({
       tenantId: 'default', userId: admin.id, sessionId, runId: 'run-active-older', kernel: 'pi',
-      graphName: '', graphVersion: '', createdAt: older,
+      createdAt: older,
     });
     await localStore.updateAgentRun('default', 'run-active-older', { status: 'running', updatedAt: older });
     const newer = new Date(older.getTime() + 1000);
     await localStore.putAgentRunBindingIfAbsent({
       tenantId: 'default', userId: admin.id, sessionId, runId: 'run-terminal-newer', kernel: 'pi',
-      graphName: '', graphVersion: '', createdAt: newer,
+      createdAt: newer,
     });
     await localStore.updateAgentRun('default', 'run-terminal-newer', { status: 'succeeded', updatedAt: newer, completedAt: newer });
     const append = vi.fn(async () => {});
@@ -1067,7 +1067,7 @@ describe('HTTP server', () => {
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
     await localStore.putAgentRunBindingIfAbsent({
       tenantId: 'default', userId: admin.id, sessionId: 'shared-session', runId: 'remote-running', kernel: 'pi',
-      graphName: '', graphVersion: '', createdAt: new Date(),
+      createdAt: new Date(),
     });
     await localStore.updateAgentRun('default', 'remote-running', { status: 'running', updatedAt: new Date() });
     const run = vi.fn(async () => { throw new Error('must not start a competing run'); });
@@ -1291,7 +1291,7 @@ describe('HTTP server', () => {
     const auth = new LocalAuthProvider({ store: localStore, secret: 'goal-secret' });
     await auth.createUser('default', 'admin', 'pw', 'platform_admin');
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
-    const runDurably = vi.fn(async (input: StartRunInput) => ({
+    const runDurably = vi.fn(async (_input: StartRunInput) => ({
       runId: 'goal-run', status: 'running' as const,
       events: { async *[Symbol.asyncIterator]() {} },
       async result() {
@@ -1499,37 +1499,37 @@ describe('HTTP server', () => {
     const calls: string[] = [];
     const tools = new ToolRegistry();
     tools.register({
-      def: { name: 'sbx__run_code', description: 'run code', inputSchema: { type: 'object' } },
-      run: async (args) => ({ id: '', content: `code:${(args as { code: string }).code}` }),
+      name: 'sbx__run_code', description: 'run code', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async (args) => ({ id: '', content: `code:${(args as { code: string }).code}` }),
     });
     tools.register({
-      def: { name: 'browser_navigate', description: 'navigate', inputSchema: { type: 'object' } },
-      run: async (args) => {
+      name: 'browser_navigate', description: 'navigate', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async (args) => {
         calls.push(`navigate:${(args as { url: string }).url}`);
         return { id: '', content: 'navigated' };
       },
     });
     tools.register({
-      def: { name: 'desktop_stream_url', description: 'stream', inputSchema: { type: 'object' } },
-      run: async () => ({ id: '', content: '浏览器预览地址：http://stream.local/session' }),
+      name: 'desktop_stream_url', description: 'stream', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async () => ({ id: '', content: '浏览器预览地址：http://stream.local/session' }),
     });
     tools.register({
-      def: { name: 'browser_click', description: 'click', inputSchema: { type: 'object' } },
-      run: async (args) => {
+      name: 'browser_click', description: 'click', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async (args) => {
         calls.push(`click:${(args as { x: number; y: number }).x},${(args as { x: number; y: number }).y}`);
         return { id: '', content: 'clicked' };
       },
     });
     tools.register({
-      def: { name: 'browser_type', description: 'type', inputSchema: { type: 'object' } },
-      run: async (args) => {
+      name: 'browser_type', description: 'type', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async (args) => {
         calls.push(`type:${(args as { text: string }).text}`);
         return { id: '', content: 'typed' };
       },
     });
     tools.register({
-      def: { name: 'browser_screenshot', description: 'screenshot', inputSchema: { type: 'object' } },
-      run: async () => ({
+      name: 'browser_screenshot', description: 'screenshot', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async () => ({
         id: '',
         content: 'screenshot',
         contentBlocks: [{ type: 'image', mimeType: 'image/png', data: 'AQID' }],
@@ -1740,8 +1740,8 @@ describe('HTTP server', () => {
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
     const tools = new ToolRegistry();
     tools.register({
-      def: { name: 'desktop_stream_url', description: 'stream', inputSchema: { type: 'object' } },
-      run: async () => ({ id: '', content: '浏览器预览地址：data:text/html;charset=utf-8,%3Chtml%3E%3C%2Fhtml%3E' }),
+      name: 'desktop_stream_url', description: 'stream', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async () => ({ id: '', content: '浏览器预览地址：data:text/html;charset=utf-8,%3Chtml%3E%3C%2Fhtml%3E' }),
     });
 
     const rt = {
@@ -1792,12 +1792,12 @@ describe('HTTP server', () => {
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
     const tools = new ToolRegistry();
     tools.register({
-      def: { name: 'load_skill', description: '加载技能', inputSchema: { type: 'object' } },
-      run: async (args) => ({ id: '', content: `skill:${(args as { name: string }).name}` }),
+      name: 'load_skill', description: '加载技能', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async (args) => ({ id: '', content: `skill:${(args as { name: string }).name}` }),
     });
     tools.register({
-      def: { name: 'mcp__fs__read_file', description: '读取文件', inputSchema: { type: 'object' } },
-      run: async (args) => ({ id: '', content: `file:${(args as { path: string }).path}` }),
+      name: 'mcp__fs__read_file', description: '读取文件', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async (args) => ({ id: '', content: `file:${(args as { path: string }).path}` }),
     });
 
     const rt = {
@@ -1872,7 +1872,7 @@ describe('HTTP server', () => {
       policyPreApproved: new AllowAllPolicy(),
       authProvider: auth,
       jwtSecret: 'skill-import-secret',
-      systemExtra: skills.summaries(),
+      systemExtra: '',
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
 
@@ -2262,7 +2262,7 @@ describe('HTTP server', () => {
     const approvalId = 'approval-interaction';
     await localStore.putAgentRunBindingIfAbsent({
       tenantId: 'default', userId: admin.id, sessionId: 'approval-sess', runId, kernel: 'pi',
-      graphName: '', graphVersion: '', createdAt: new Date(),
+      createdAt: new Date(),
     });
     await localStore.updateAgentRun('default', runId, { status: 'waiting', updatedAt: new Date() });
     await localStore.putInteraction({

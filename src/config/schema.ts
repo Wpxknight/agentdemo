@@ -294,8 +294,6 @@ export const ConfigSchema = z.object({
       builtinDir: z.string().optional(),
       /** Refuse startup unless a cross-process skill mutation lock is configured. */
       requireDistributedLock: z.boolean().optional(),
-      /** summaries() 注入 system prompt 的总字符预算（默认 4000）。 */
-      summaryBudget: z.number().int().positive().optional(),
       pendingQuota: z.object({
         perUserMaxCount: z.number().int().positive().optional(),
         perUserMaxBytes: z.number().int().positive().optional(),

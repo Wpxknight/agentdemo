@@ -596,10 +596,10 @@ describe('SandboxRuntimeController', () => {
       controller,
       (ctx) => controller.profileDefinitions({ role: ctx.role ?? 'user' }),
     );
-    const list = tools.find((tool) => tool.def.name === 'sandbox_list_profiles')!;
+    const list = tools.find((tool) => tool.name === 'sandbox_list_profiles')!;
 
-    const userResult = await list.run({}, { ...userA, sessionId: 'user-list' });
-    const adminResult = await list.run({}, { ...platformAdmin, sessionId: 'admin-list' });
+    const userResult = await list.execute({}, { ...userA, sessionId: 'user-list' });
+    const adminResult = await list.execute({}, { ...platformAdmin, sessionId: 'admin-list' });
 
     expect(userResult.content).toContain('Reader profile');
     expect(userResult.content).not.toContain('Diagnostic profile');
@@ -649,7 +649,8 @@ describe('SandboxRuntimeController', () => {
     await controller.commit({
       manager: { provider: first.instance },
       profiles: [{
-        name: 'browser', description: 'browser', desktop: true, privileged: false, capabilities: ['browser'],
+        id: 'browser', name: 'browser', description: 'browser', envType: 'browser',
+        runtimeRole: 'sandbox-reader', desktop: true, privileged: false, capabilities: ['browser'],
       }],
       drainWarmPool: drainFirst,
     });
@@ -658,8 +659,8 @@ describe('SandboxRuntimeController', () => {
     await controller.commit({
       manager: { provider: second.instance },
       profiles: [{
-        name: 'code', description: 'AIOS code', image: 'code-interpreter', desktop: false,
-        privileged: false, capabilities: ['python', 'node', 'shell'],
+        id: 'code', name: 'code', description: 'AIOS code', image: 'code-interpreter', envType: 'code',
+        runtimeRole: 'sandbox-reader', desktop: false, privileged: false, capabilities: ['python', 'node', 'shell'],
       }],
       drainWarmPool: drainSecond,
     });

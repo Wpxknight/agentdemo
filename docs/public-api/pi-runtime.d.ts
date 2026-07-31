@@ -1,10 +1,8 @@
 // file: index.d.ts
 export * from './pi/agent.js';
-export * from './pi/compatibility.js';
 export * from './pi/compaction.js';
 export { EventCodec } from './pi/event-codec.js';
 export type { EventCodecOptions } from './pi/event-codec.js';
-export * from './pi/message-codec.js';
 export * from './pi/models.js';
 export * from './pi/session.js';
 export * from './pi/skills.js';
@@ -175,60 +173,6 @@ export declare const preparePiCompaction: (entries: readonly SessionTreeEntry[],
 export declare const compactPiCompaction: typeof compact;
 export type { CompactionPreparation, CompactionSettings };
 
-// file: pi/compatibility.d.ts
-import type { Usage } from '@earendil-works/pi-ai';
-export type CompatibleContentBlock = {
-    type: 'text';
-    text: string;
-} | {
-    type: 'image';
-    mimeType: string;
-    data: string;
-} | {
-    type: 'toolCall';
-    id: string;
-    name: string;
-    arguments: Record<string, unknown>;
-    thoughtSignature?: string;
-};
-export interface PiContentExtension {
-    version: 1;
-    kind: 'pi_content_block';
-    value: unknown;
-    index?: number;
-}
-export type CompatibleAgentMessage = {
-    role: 'user';
-    content: string | CompatibleContentBlock[];
-    timestamp: number;
-    extensions?: PiContentExtension[];
-} | {
-    role: 'assistant';
-    content: CompatibleContentBlock[];
-    api: string;
-    provider: string;
-    model: string;
-    responseModel?: string;
-    responseId?: string;
-    diagnostics?: unknown[];
-    usage: Usage;
-    stopReason: 'stop' | 'length' | 'toolUse' | 'error' | 'aborted';
-    errorMessage?: string;
-    timestamp: number;
-    extensions?: PiContentExtension[];
-} | {
-    role: 'toolResult';
-    toolCallId: string;
-    toolName: string;
-    content: CompatibleContentBlock[];
-    details?: unknown;
-    usage?: Usage;
-    addedToolNames?: string[];
-    isError: boolean;
-    timestamp: number;
-    extensions?: PiContentExtension[];
-};
-
 // file: pi/event-codec.d.ts
 import type { AgentRunEvent, JsonValue } from '@aiop/control-contracts';
 import { type AgentHarnessEvent } from '@earendil-works/pi-agent-core';
@@ -297,14 +241,6 @@ export declare function recordGovernedToolFacts(tracker: GovernedToolFailureTrac
 export declare function scopeGovernedTools(tools: readonly AgentHarnessTool<undefined>[]): GovernedToolScope;
 export declare function adoptGovernedToolScope(tools: readonly AgentHarnessTool<undefined>[]): GovernedToolScope;
 export {};
-
-// file: pi/message-codec.d.ts
-import type { AgentMessage } from '@earendil-works/pi-agent-core';
-import type { CompatibleAgentMessage } from './compatibility.js';
-export declare class MessageCodec {
-    toPi(message: CompatibleAgentMessage): AgentMessage;
-    fromPi(message: AgentMessage): CompatibleAgentMessage;
-}
 
 // file: pi/models.d.ts
 export type { Model, Models } from '@earendil-works/pi-ai';
@@ -1015,9 +951,6 @@ export interface StoredRun extends RunRecord {
     lastTurnNo: number;
     checkpoint?: unknown;
     appendClosedAt?: Date;
-    runtimeVersion?: string;
-    graphName?: string;
-    graphVersion?: string;
     currentNode?: string;
     stepCount?: number;
     errorMessage?: string;

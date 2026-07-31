@@ -117,7 +117,7 @@ export class McpRuntime {
   }
 
   async add(identity: IdentityContext, server: string, config: McpServerConfig): Promise<McpServerInfo> {
-    const states = this.ensureScope(identity);
+    this.ensureScope(identity);
     if (this.tenantStates(identity.tenantId).some((candidate) => candidate.has(server))) {
       throw new Error(`mcp server 已存在: ${server}`);
     }

@@ -49,9 +49,9 @@ async function enumerateTenantRoot(
   root: string,
   tenantId: string,
   records: SkillProductRecord[],
-  includeLegacy: boolean,
+  includeRootProducts: boolean,
 ): Promise<void> {
-  if (includeLegacy) {
+  if (includeRootProducts) {
     for (const entry of await directories(root)) {
       if (entry === PUBLIC_SKILLS_DIR || entry === USER_SKILLS_DIR || entry === TENANT_SKILLS_DIR) continue;
       await appendRecord(records, join(root, entry), tenantId);

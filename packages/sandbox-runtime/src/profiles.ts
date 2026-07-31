@@ -6,14 +6,12 @@ export type SandboxProfileEnvType = 'code' | 'browser';
 export type SandboxProfileRuntimeRole = 'sandbox-reader' | 'sandbox-diag';
 
 export interface SandboxProfile {
-  /** Stable selector. Legacy callers may omit it; normalization falls back to name. */
-  id?: string;
+  id: string;
   name: string;
   template?: string;
   description: string;
-  /** Legacy callers may omit these; desktop and sandbox-reader defaults apply. */
-  envType?: SandboxProfileEnvType;
-  runtimeRole?: SandboxProfileRuntimeRole;
+  envType: SandboxProfileEnvType;
+  runtimeRole: SandboxProfileRuntimeRole;
   image?: string;
   domain?: string;
   namespace?: string;
@@ -42,25 +40,24 @@ export interface PublicSandboxProfile {
   timeoutMs?: number;
 }
 
-function legacyCapabilities(config: SandboxConfig): string[] {
+function defaultCapabilities(config: SandboxConfig): string[] {
   return config.desktop
     ? ['python', 'node', 'shell', 'browser', 'screenshot']
     : ['python', 'node', 'shell'];
 }
 
-function legacyProfile(config: SandboxConfig): SandboxProfile {
+function defaultProfile(config: SandboxConfig): SandboxProfile {
   return {
     id: 'default',
     name: 'default',
     description: config.desktop ? '默认会话沙箱，支持代码、命令和浏览器操作。' : '默认会话沙箱，支持代码和命令执行。',
-    // 非 AIOS 的 legacy desktop 镜像是代码/浏览器双用途，仍需作为默认代码 profile。
     envType: 'code',
     runtimeRole: 'sandbox-reader',
     image: config.defaultImage,
     domain: config.domain,
     desktop: config.desktop,
     privileged: false,
-    capabilities: legacyCapabilities(config),
+    capabilities: defaultCapabilities(config),
     timeoutMs: config.timeoutMs,
   };
 }
@@ -68,7 +65,7 @@ function legacyProfile(config: SandboxConfig): SandboxProfile {
 export function resolveSandboxProfiles(config: SandboxConfig | undefined): SandboxProfile[] {
   if (!config?.enabled) return [];
   const entries = Object.entries(config.profiles ?? {});
-  if (!entries.length) return [legacyProfile(config)];
+  if (!entries.length) return [defaultProfile(config)];
 
   const profiles: SandboxProfile[] = entries.map(([name, profile]) => {
     const desktop = profile.desktop ?? (name === 'default' ? config.desktop : false);
@@ -99,21 +96,21 @@ export function resolveSandboxProfiles(config: SandboxConfig | undefined): Sandb
   });
 
   if (!profiles.some((profile) => profile.name === 'default') && !profiles.some((profile) => profile.name === 'code')) {
-    profiles.unshift(legacyProfile(config));
+    profiles.unshift(defaultProfile(config));
   }
   return profiles;
 }
 
 function profileId(profile: SandboxProfile): string {
-  return profile.id ?? profile.name;
+  return profile.id;
 }
 
 function profileEnvType(profile: SandboxProfile): SandboxProfileEnvType {
-  return profile.envType ?? (profile.desktop ? 'browser' : 'code');
+  return profile.envType;
 }
 
 function profileRuntimeRole(profile: SandboxProfile): SandboxProfileRuntimeRole {
-  return profile.runtimeRole ?? 'sandbox-reader';
+  return profile.runtimeRole;
 }
 
 export function publicSandboxProfile(profile: SandboxProfile): PublicSandboxProfile {

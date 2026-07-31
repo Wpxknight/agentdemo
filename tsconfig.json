@@ -9,6 +9,8 @@
     "skipLibCheck": true,
     "resolveJsonModule": true,
     "noEmit": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "forceConsistentCasingInFileNames": true,
     "verbatimModuleSyntax": true,
     "types": ["node"]

@@ -157,7 +157,7 @@ describe('SandboxRuntime provider-neutral core contract', () => {
     }));
     const writeFile = vi.fn(async () => undefined);
     const readFile = vi.fn(async () => new Uint8Array([7, 8, 9]));
-    const create = vi.fn(async (spec: SandboxSpec): Promise<SandboxHandle> => ({
+    const create = vi.fn(async (_spec: SandboxSpec): Promise<SandboxHandle> => ({
       sandboxId: 'structured', executeCommand, runCode: async () => ({ stdout: '', stderr: '' }),
       runCommand: async () => ({ stdout: '', stderr: '' }), readFile, writeFile,
       setTimeout: async () => undefined, kill: async () => undefined,

@@ -34,41 +34,16 @@ export function reqContext(ctx: ToolContext): RequestContext {
   return { tenantId: ctx.tenantId, userId: ctx.userId, role: ctx.role };
 }
 
-export interface LegacyToolHandler {
-  def: ToolDef;
-  run(args: JsonValue, ctx: ToolContext): Promise<ToolResult>;
-}
-
 export interface ToolHandler {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
   capability: 'read' | 'retryable_write' | 'non_idempotent_write';
   execute(args: JsonValue, ctx: ToolContext): Promise<ToolResult>;
-  /** Task 11 compatibility aliases; Pi assembly does not use them. */
-  def: ToolDef;
-  run(args: JsonValue, ctx: ToolContext): Promise<ToolResult>;
 }
 
-export function defineTool(input: Omit<ToolHandler, 'def' | 'run'>): ToolHandler {
-  const def: ToolDef = {
-    name: input.name,
-    description: input.description,
-    inputSchema: input.inputSchema,
-    capability: input.capability,
-  };
-  return { ...input, def, run: input.execute };
-}
-
-type ToolRegistration = ToolHandler | LegacyToolHandler;
-
-function normalizeTool(handler: ToolRegistration): ToolHandler {
-  if ('execute' in handler && 'name' in handler) return handler;
-  return defineTool({
-    ...handler.def,
-    capability: handler.def.capability ?? 'non_idempotent_write',
-    execute: handler.run,
-  });
+export function defineTool(input: ToolHandler): ToolHandler {
+  return input;
 }
 
 /**
@@ -78,8 +53,7 @@ function normalizeTool(handler: ToolRegistration): ToolHandler {
 export class ToolRegistry {
   private handlers = new Map<string, { tool: ToolHandler; source: Exclude<ToolSource, 'pi'> }>();
 
-  register(handler: ToolRegistration, source: Exclude<ToolSource, 'pi'> = 'aiop'): this {
-    const tool = normalizeTool(handler);
+  register(tool: ToolHandler, source: Exclude<ToolSource, 'pi'> = 'aiop'): this {
     if (this.handlers.has(tool.name)) {
       throw new Error(`duplicate tool: ${tool.name}`);
     }
@@ -96,7 +70,12 @@ export class ToolRegistry {
   }
 
   defs(): ToolDef[] {
-    return [...this.handlers.values()].map(({ tool }) => tool.def);
+    return [...this.handlers.values()].map(({ tool }) => ({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+      capability: tool.capability,
+    }));
   }
 
   unified(

@@ -237,10 +237,6 @@ export interface DurableRunRuntime {
     cancel(input: CancelRunInput): Promise<void>;
     append(input: AppendRunMessageInput): Promise<void>;
 }
-/** Legacy compatibility surface retained while callers migrate to DurableRunRuntime. */
-export interface AgentRuntime extends Omit<DurableRunRuntime, 'append'> {
-    append?(input: AppendRunMessageInput): Promise<void>;
-}
 export interface RunRecord {
     tenantId: string;
     runId: string;

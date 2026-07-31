@@ -75,35 +75,35 @@ describe('buildSkillTools', () => {
 
   it('load_skill guidance mentions read_file, and sync only when sandbox available', async () => {
     const [loadWithSync, , syncTool] = buildSkillTools(registry, fakeManager(new FakeSandbox()));
-    const withSync = await loadWithSync!.run({ name: 'demo' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
+    const withSync = await loadWithSync!.execute({ name: 'demo' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
     expect(withSync.content).toContain('skill__read_file');
     expect(withSync.content).toContain('skill__sync_to_sandbox');
     expect(withSync.content).not.toContain(dir); // 不再暴露服务端本地路径
-    expect(syncTool!.def.description).not.toContain('/workspace/skills');
-    expect(syncTool!.def.description).toContain('返回的目标目录');
+    expect(syncTool!.description).not.toContain('/workspace/skills');
+    expect(syncTool!.description).toContain('返回的目标目录');
 
     const [loadNoSync, ...rest] = buildSkillTools(registry);
-    expect(rest.map((t) => t.def.name)).toEqual(['skill__read_file']);
-    const noSync = await loadNoSync!.run({ name: 'demo' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
+    expect(rest.map((t) => t.name)).toEqual(['skill__read_file']);
+    const noSync = await loadNoSync!.execute({ name: 'demo' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
     expect(noSync.content).not.toContain('skill__sync_to_sandbox');
   });
 
   it('skill__read_file reads files, lists directories, and rejects escapes', async () => {
     const tools = buildSkillTools(registry);
-    const readFileTool = tools.find((t) => t.def.name === 'skill__read_file')!;
+    const readFileTool = tools.find((t) => t.name === 'skill__read_file')!;
 
-    const file = await readFileTool.run({ name: 'demo', path: 'sub/SKILL.md' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
+    const file = await readFileTool.execute({ name: 'demo', path: 'sub/SKILL.md' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
     expect(file.content).toContain('子模块文档内容');
 
-    const rootList = await readFileTool.run({ name: 'demo' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
+    const rootList = await readFileTool.execute({ name: 'demo' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
     expect(rootList.content).toContain('sub/');
-    const subList = await readFileTool.run({ name: 'demo', path: 'sub' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
+    const subList = await readFileTool.execute({ name: 'demo', path: 'sub' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
     expect(subList.content).toContain('sub/scripts/');
 
-    const escape = await readFileTool.run({ name: 'demo', path: '../escape' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
+    const escape = await readFileTool.execute({ name: 'demo', path: '../escape' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
     expect(escape.isError).toBe(true);
 
-    const missing = await readFileTool.run({ name: 'nope', path: 'SKILL.md' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
+    const missing = await readFileTool.execute({ name: 'nope', path: 'SKILL.md' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
     expect(missing.isError).toBe(true);
   });
 
@@ -115,7 +115,7 @@ describe('buildSkillTools', () => {
       ['skill__read_file', { name: 'demo', path: 'SKILL.md' }],
       ['skill__sync_to_sandbox', { name: 'demo' }],
     ] as const) {
-      const result = await tools.find((tool) => tool.def.name === name)!.run(args, ctx);
+      const result = await tools.find((tool) => tool.name === name)!.execute(args, ctx);
       expect(result.isError, name).toBe(true);
       expect(result.content, name).toContain('未找到技能');
     }
@@ -137,9 +137,9 @@ describe('buildSkillTools', () => {
     const credentials = { get: async (_tenant: string, _user: string, provider: string) => ({ token: `${provider}-secret` }) };
     const sync = buildSkillTools(quotedRegistry, fakeManager(sbx), undefined, {
       credentials: credentials as never,
-    }).find((tool) => tool.def.name === 'skill__sync_to_sandbox')!;
+    }).find((tool) => tool.name === 'skill__sync_to_sandbox')!;
 
-    const result = await sync.run({ name: 'quoted' }, {
+    const result = await sync.execute({ name: 'quoted' }, {
       sessionId: 'quoted', tenantId: 'default', userId: 'u', role: 'user',
     });
 
@@ -180,13 +180,13 @@ describe('buildSkillTools', () => {
     }));
     const sync = buildSkillTools(localRegistry, manager, undefined, {
       credentials: { get: getCredential } as never,
-    }).find((tool) => tool.def.name === 'skill__sync_to_sandbox')!;
+    }).find((tool) => tool.name === 'skill__sync_to_sandbox')!;
     const hostWorkspaceFile = `/workspace/skills/${name}/sub/token.json`;
     const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
 
     await expect(access(hostWorkspaceFile)).rejects.toThrow();
     try {
-      const result = await sync.run({ name }, {
+      const result = await sync.execute({ name }, {
         sessionId: 'local-sync', tenantId: 'default', userId: 'u', role: 'user',
       });
       const dest = /到沙箱 (.+)\/（/.exec(result.content)?.[1];
@@ -218,9 +218,9 @@ describe('buildSkillTools', () => {
     const sync = buildSkillTools(registry, {
       get: async () => handle,
       markCredentialInjected: () => {},
-    } as unknown as SandboxManager).find((tool) => tool.def.name === 'skill__sync_to_sandbox')!;
+    } as unknown as SandboxManager).find((tool) => tool.name === 'skill__sync_to_sandbox')!;
     try {
-      const result = await sync.run({ name: 'demo', paths: ['sub/scripts/run.py'] }, {
+      const result = await sync.execute({ name: 'demo', paths: ['sub/scripts/run.py'] }, {
         sessionId: 'local-sync-symlink', tenantId: 'default', userId: 'u', role: 'user',
       });
       expect(result.isError).toBe(true);
@@ -245,9 +245,9 @@ describe('buildSkillTools', () => {
     const sync = buildSkillTools(registry, {
       get: async () => handle,
       markCredentialInjected: () => {},
-    } as unknown as SandboxManager).find((tool) => tool.def.name === 'skill__sync_to_sandbox')!;
+    } as unknown as SandboxManager).find((tool) => tool.name === 'skill__sync_to_sandbox')!;
     try {
-      const result = await sync.run({ name: 'demo' }, {
+      const result = await sync.execute({ name: 'demo' }, {
         sessionId: 'local-full-sync-parent-symlink', tenantId: 'default', userId: 'u', role: 'user',
       });
 
@@ -265,15 +265,15 @@ describe('buildSkillTools', () => {
     const sync = buildSkillTools(registry, {
       get: async () => handle,
       markCredentialInjected: () => {},
-    } as unknown as SandboxManager).find((tool) => tool.def.name === 'skill__sync_to_sandbox')!;
+    } as unknown as SandboxManager).find((tool) => tool.name === 'skill__sync_to_sandbox')!;
     const destination = (content: string) => /到沙箱 (.+)\/（/.exec(content)?.[1];
     let firstDest: string | undefined;
     let secondDest: string | undefined;
     try {
-      const first = await sync.run({ name: 'demo' }, {
+      const first = await sync.execute({ name: 'demo' }, {
         sessionId: 'local-full-sync-unique-dest', tenantId: 'default', userId: 'u', role: 'user',
       });
-      const second = await sync.run({ name: 'demo' }, {
+      const second = await sync.execute({ name: 'demo' }, {
         sessionId: 'local-full-sync-unique-dest', tenantId: 'default', userId: 'u', role: 'user',
       });
       firstDest = destination(first.content);
@@ -303,7 +303,7 @@ describe('buildSkillTools', () => {
     const syncTool = (handle: Awaited<ReturnType<LocalSandboxProvider['create']>>) => buildSkillTools(registry, {
       get: async () => handle,
       markCredentialInjected: () => {},
-    } as unknown as SandboxManager).find((tool) => tool.def.name === 'skill__sync_to_sandbox')!;
+    } as unknown as SandboxManager).find((tool) => tool.name === 'skill__sync_to_sandbox')!;
     const context = {
       sessionId: 'local-sync-quota', tenantId: 'default', userId: 'u', role: 'user' as const,
     };
@@ -313,9 +313,9 @@ describe('buildSkillTools', () => {
     const firstRoot = (await firstHandle.runCommand('pwd')).stdout.trim();
     try {
       const sync = syncTool(firstHandle);
-      expect((await sync.run({ name: 'demo' }, context)).isError).toBeFalsy();
-      expect((await sync.run({ name: 'demo' }, context)).isError).toBeFalsy();
-      const denied = await sync.run({ name: 'demo' }, context);
+      expect((await sync.execute({ name: 'demo' }, context)).isError).toBeFalsy();
+      expect((await sync.execute({ name: 'demo' }, context)).isError).toBeFalsy();
+      const denied = await sync.execute({ name: 'demo' }, context);
       expect(denied.isError).toBe(true);
       expect(denied.content).toMatch(/generation|次数|配额/i);
       await expect(readdir(join(firstRoot, 'workspace', 'skills', 'demo'))).resolves.toHaveLength(2);
@@ -324,7 +324,7 @@ describe('buildSkillTools', () => {
     }
     const resetHandle = await countProvider.create({ key: 'local-sync-count-reset' });
     try {
-      expect((await syncTool(resetHandle).run({ name: 'demo' }, context)).isError).toBeFalsy();
+      expect((await syncTool(resetHandle).execute({ name: 'demo' }, context)).isError).toBeFalsy();
     } finally {
       await resetHandle.kill();
     }
@@ -334,8 +334,8 @@ describe('buildSkillTools', () => {
     const byteRoot = (await byteHandle.runCommand('pwd')).stdout.trim();
     try {
       const sync = syncTool(byteHandle);
-      expect((await sync.run({ name: 'demo' }, context)).isError).toBeFalsy();
-      const denied = await sync.run({ name: 'demo' }, context);
+      expect((await sync.execute({ name: 'demo' }, context)).isError).toBeFalsy();
+      const denied = await sync.execute({ name: 'demo' }, context);
       expect(denied.isError).toBe(true);
       expect(denied.content).toMatch(/bytes|字节|配额/i);
       await expect(readdir(join(byteRoot, 'workspace', 'skills', 'demo'))).resolves.toHaveLength(1);
@@ -732,7 +732,7 @@ describe('buildSkillTools', () => {
           provider === 'aios' ? { token: 'available' } : undefined
         ),
       } as never,
-    }).find((tool) => tool.def.name === 'skill__sync_to_sandbox')!;
+    }).find((tool) => tool.name === 'skill__sync_to_sandbox')!;
 
     await sync.execute({ name: 'partial-creds' }, {
       tenantId: 'default', userId: 'u1', role: 'user', sessionId: 'partial',
@@ -746,9 +746,9 @@ describe('buildSkillTools', () => {
   it('skill__sync_to_sandbox packs files, chunks base64, unpacks, and skips large files', async () => {
     const sbx = new FakeSandbox();
     const tools = buildSkillTools(registry, fakeManager(sbx));
-    const sync = tools.find((t) => t.def.name === 'skill__sync_to_sandbox')!;
+    const sync = tools.find((t) => t.name === 'skill__sync_to_sandbox')!;
 
-    const res = await sync.run({ name: 'demo' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
+    const res = await sync.execute({ name: 'demo' }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
     expect(res.isError).toBeFalsy();
     expect(res.content).toContain('/workspace/skills/demo/');
     // 大文件默认被跳过并在结果中列出
@@ -769,9 +769,9 @@ describe('buildSkillTools', () => {
   it('skill__sync_to_sandbox with explicit paths syncs only that subtree without wiping dest', async () => {
     const sbx = new FakeSandbox();
     const tools = buildSkillTools(registry, fakeManager(sbx));
-    const sync = tools.find((t) => t.def.name === 'skill__sync_to_sandbox')!;
+    const sync = tools.find((t) => t.name === 'skill__sync_to_sandbox')!;
 
-    const res = await sync.run({ name: 'demo', paths: ['sub/scripts'] }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
+    const res = await sync.execute({ name: 'demo', paths: ['sub/scripts'] }, { sessionId: 's1', tenantId: 'default', userId: 'u', role: 'user' });
     expect(res.isError).toBeFalsy();
     expect(sbx.commands[0]).not.toContain('rm -rf ');
     const tarStream = gunzipSync(Buffer.from(appendedBase64(sbx.commands), 'base64'));
@@ -792,7 +792,7 @@ describe('SkillRegistry Pi summaries', () => {
         tenantId: 'default', visibility: 'public',
       }));
     }
-    const reg = new SkillRegistry(dir, { summaryBudget: 500 });
+    const reg = new SkillRegistry(dir);
     await reg.scan();
     const text = await reg.summariesFor({ tenantId: 'default', userId: 'u', role: 'user' });
     expect(text).toContain('<available_skills>');

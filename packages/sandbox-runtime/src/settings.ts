@@ -66,11 +66,6 @@ export interface LoadedSandboxSettings {
   apiKeySet: boolean;
 }
 
-export interface ParsedStoredSandboxSettings {
-  settings: SandboxSettings;
-  legacyApiKey?: string;
-}
-
 function normalizeDomain(value: string): string {
   if (value.includes('://')) throw new Error('domain 必须是 host[:port]，不能包含 scheme');
   let url: URL;
@@ -97,48 +92,6 @@ function normalizeLifecycleUrl(value: string): string {
   }
   url.pathname = url.pathname.replace(/\/+$/, '') || '/';
   return url.toString().replace(/\/$/, '');
-}
-
-function stringValue(value: unknown): string | undefined {
-  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
-}
-
-function legacySettings(value: Record<string, unknown>): SandboxSettings {
-  const provider = value.provider;
-  const enabled = typeof value.enabled === 'boolean' ? value.enabled : true;
-  const legacyAios = value.aios && typeof value.aios === 'object' && !Array.isArray(value.aios)
-    ? value.aios as Record<string, unknown>
-    : undefined;
-  const placement = legacyAios?.placement && typeof legacyAios.placement === 'object' && !Array.isArray(legacyAios.placement)
-    ? legacyAios.placement as Record<string, unknown>
-    : undefined;
-  const lifecycleUrl = stringValue(value.lifecycleUrl) ?? stringValue(legacyAios?.lifecycleUrl);
-
-  if (lifecycleUrl || legacyAios) {
-    return parseSandboxSettings({
-      enabled,
-      mode: 'aios_lifecycle',
-      lifecycleUrl,
-      placement: {
-        clusterId: stringValue(value.clusterId) ?? stringValue(placement?.clusterId),
-        namespace: stringValue(value.namespace) ?? stringValue(placement?.namespace),
-      },
-    });
-  }
-  if (provider === 'local') return { enabled, mode: 'local' };
-  if (provider === 'opensandbox') {
-    return parseSandboxSettings({
-      enabled,
-      mode: 'opensandbox',
-      domain: stringValue(value.domain),
-      protocol: value.protocol,
-      defaultImage: stringValue(value.defaultImage),
-    });
-  }
-  if (provider === undefined || provider === 'e2b') {
-    return parseSandboxSettings({ enabled, mode: 'standard_e2b', domain: stringValue(value.domain) });
-  }
-  throw new Error('旧版 sandbox provider 无效');
 }
 
 function parseStoredSecret(box: SecretBoxLike, encrypted: string): StoredSecretV1 {
@@ -180,13 +133,31 @@ export function parseSandboxSettings(value: unknown): SandboxSettings {
   return SandboxSettingsSchema.parse(value) as SandboxSettings;
 }
 
-/** 读取显式 v2 设置，或把旧 provider/apiKey JSON 转换为新模式并提取明文 key。 */
-export function parseStoredSandboxSettings(value: unknown): ParsedStoredSandboxSettings {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('sandbox settings 格式无效');
-  const input = value as Record<string, unknown>;
-  const settings = 'mode' in input ? parseSandboxSettings(input) : legacySettings(input);
-  const legacyApiKey = stringValue(input.apiKey);
-  return { settings, ...(legacyApiKey ? { legacyApiKey } : {}) };
+/** 把当前启动配置投影为页面设置；只用于展示，不写回数据库。 */
+export function sandboxConfigToSettings(config: SandboxConfig): SandboxSettings {
+  if (config.aios) {
+    return parseSandboxSettings({
+      enabled: config.enabled,
+      mode: 'aios_lifecycle',
+      lifecycleUrl: config.aios.lifecycleUrl,
+      placement: config.aios.placement,
+    });
+  }
+  if (config.provider === 'local') return { enabled: config.enabled, mode: 'local' };
+  if (config.provider === 'opensandbox') {
+    return parseSandboxSettings({
+      enabled: config.enabled,
+      mode: 'opensandbox',
+      domain: config.domain,
+      protocol: config.protocol,
+      defaultImage: config.defaultImage,
+    });
+  }
+  return parseSandboxSettings({
+    enabled: config.enabled,
+    mode: 'standard_e2b',
+    domain: config.domain,
+  });
 }
 
 /** key 只与模式和规范化远端目标绑定；AIOS placement 不改变凭据目标。 */
@@ -254,11 +225,6 @@ export class SandboxSettingsPersistence {
     const record = await this.store.getSandboxSettingsRecord(this.ctx);
     if (!record) return undefined;
 
-    if (record.legacyApiKey) {
-      const encryptedApiKey = encryptedSecret(this.box, record.settings, record.legacyApiKey);
-      await this.store.setSandboxSettingsRecord(this.ctx, record.settings, { action: 'replace', encryptedApiKey });
-      return { settings: record.settings, apiKey: record.legacyApiKey, apiKeySet: true };
-    }
     if (!record.encryptedApiKey) return { settings: record.settings, apiKeySet: false };
 
     const secret = parseStoredSecret(this.box, record.encryptedApiKey);
@@ -285,9 +251,7 @@ export class SandboxSettingsPersistence {
     } else {
       const retained = this.retainedSecret(current, settings);
       apiKey = retained?.apiKey;
-      storedUpdate = current?.legacyApiKey && apiKey
-        ? { action: 'replace', encryptedApiKey: encryptedSecret(this.box, settings, apiKey) }
-        : { action: 'retain' };
+      storedUpdate = { action: 'retain' };
       if (requiresApiKey(settings) && !apiKey) throw new Error('启用当前模式时必须配置 API key');
     }
 
@@ -297,15 +261,7 @@ export class SandboxSettingsPersistence {
 
   private retainedSecret(record: SandboxSettingsRecord | undefined, settings: SandboxSettings): StoredSecretV1 | undefined {
     if (!record) return undefined;
-    const secret = record.legacyApiKey
-      ? {
-          schemaVersion: 1 as const,
-          apiKey: record.legacyApiKey,
-          target: credentialTargetForSandboxSettings(record.settings),
-        }
-      : record.encryptedApiKey
-        ? parseStoredSecret(this.box, record.encryptedApiKey)
-        : undefined;
+    const secret = record.encryptedApiKey ? parseStoredSecret(this.box, record.encryptedApiKey) : undefined;
     if (secret && secret.target !== credentialTargetForSandboxSettings(settings)) {
       throw new Error('Sandbox 凭据目标已变化，请重新输入或清除 API key');
     }

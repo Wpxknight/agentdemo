@@ -7,11 +7,10 @@ import { logger } from '../logger.js';
 import type { Runtime, RuntimeModelConfig } from '../runtime.js';
 import { piSessionStorageId } from '@aiop/pi-runtime';
 const DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000;
-import { contextBudgetTokens as budgetForWindow, renderForSummary } from '../llm/context.js';
-import type { ChatModel, ToolContentBlock } from '../llm/types.js';
-import { InMemoryApprovalStore, InteractiveApprovalGate } from '../agent/approval.js';
+import type { ToolContentBlock } from '../llm/types.js';
+import { InMemoryApprovalStore } from '../agent/approval.js';
 import { InMemoryQuestionStore } from '../agent/question.js';
-import type { QuestionAnswers, QuestionSpec } from '../agent/question.js';
+import type { QuestionAnswers } from '../agent/question.js';
 import { authenticate } from './context.js';
 import { AuthzError, canManageUsersOf, requirePermission } from '../auth/rbac.js';
 import { LocalAuthProvider } from '../auth/local.js';
@@ -21,12 +20,10 @@ import { softDeleteUser, setUserEnabled } from '../auth/lifecycle.js';
 import { createTenant, createUser, listTenants } from '../auth/admin.js';
 import type { RequestContext, Role } from '../auth/types.js';
 import { DEFAULT_TASK_MAX_RUN_MS, type SandboxSettings, type ScheduledTaskPatch } from '../db/store.js';
-import { boundUserHomeNote, normalizeUserHomeDir } from '@aiop/sandbox-runtime';
-import { SANDBOX_SERVICE_NOTE } from '@aiop/sandbox-runtime';
+import { normalizeUserHomeDir } from '@aiop/sandbox-runtime';
 import { isValidCron } from '../scheduler/cron.js';
 import { createScheduledTaskRunner } from '../scheduler/runner.js';
 import { createModel } from '../llm/factory.js';
-import { estimateCost } from '../llm/cost.js';
 import type { JsonValue, Msg, ToolCall } from '../llm/types.js';
 import { importSkillZip, MAX_SKILL_ZIP_BYTES } from '../skill/import.js';
 import { SKILL_IMPORT_GLOBAL_CONCURRENCY, SKILL_IMPORT_TENANT_CONCURRENCY } from '../skill/lock.js';
@@ -37,7 +34,6 @@ import {
   type SandboxApiKeyUpdate,
 } from '@aiop/sandbox-runtime';
 import { projectCommittedPiSession, projectPiSessionStats, projectPiUsage } from '../agent/projections.js';
-import { DurableToolLedger } from '../agent/tool-ledger/store.js';
 import { DurableInteractionService } from '../agent/interactions/store.js';
 import {
   RunCenterConflictError,
@@ -66,13 +62,6 @@ const OIDC_COOKIE = 'aiop_oidc';
 /** 手动“立即执行”的任务 id 去重（本进程内），防止连点重复触发。 */
 const runningManualTasks = new Set<number>();
 const RUN_TERMINATED_MESSAGE = '会话运行已终止';
-const GOAL_MODE_SYSTEM = [
-  '目标模式：用户通过 /goal 授权你自主推进目标任务，直到目标完成、遇到阻塞或需要用户决策。',
-  '在目标模式下，低风险、可逆、只读或纯新增的辅助步骤可直接执行，不要为普通中间步骤反复请求确认。',
-  '涉及不可逆、高风险、破坏性、删除、修改现有系统状态、生产变更、凭据暴露或费用明显增加的操作，仍必须先询问用户并等待明确确认。',
-  '持续记录关键行动和验证结果；完成后用简洁 Markdown 汇报目标是否达成、执行过的关键步骤和遗留风险。',
-].join('\n');
-
 /** 10MB zip 的 base64 加 JSON 包装；该路由不继承通用大请求攻击面。 */
 const SKILL_IMPORT_MAX_BODY = Math.ceil(MAX_SKILL_ZIP_BYTES * 4 / 3) + 64_000;
 
@@ -569,45 +558,9 @@ function contextWindowTokens(config?: Pick<RuntimeModelConfig, 'contextWindowTok
   return config?.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
 }
 
-/** 发送给模型前压缩历史的 token 预算 = 上下文窗口 − 输出预留 − 安全余量。 */
-function contextBudgetTokens(config?: Pick<RuntimeModelConfig, 'contextWindowTokens'>): number {
-  return budgetForWindow(contextWindowTokens(config));
-}
-
-/** 触发摘要压缩的阈值：历史 token 超过预算的这个比例时，把最旧的消息摘要成一段。 */
-const COMPACTION_TRIGGER_RATIO = 0.85;
-/** 摘要压缩时保留原样的最近消息条数（更早的进摘要）。 */
-const COMPACTION_KEEP_RECENT = 8;
-
-/** 触发摘要压缩的 token 阈值（runAgent 在轮次边界按此检查，含首轮）。 */
-function compactionTriggerTokens(config?: Pick<RuntimeModelConfig, 'contextWindowTokens'>): number {
-  return Math.floor(contextBudgetTokens(config) * COMPACTION_TRIGGER_RATIO);
-}
-
 /** 历史里保留图片的最近带图消息条数（配置可调，默认 1）。 */
 function keepImagesOf(config?: Pick<RuntimeModelConfig, 'contextKeepImages'>): number {
   return config?.contextKeepImages ?? 1;
-}
-
-const SUMMARY_SYSTEM = [
-  '你是对话历史压缩器。把给定的较早对话浓缩成一段简洁摘要，供后续对话继续参考。',
-  '必须保留：用户目标与关键决策、已执行的操作与结论、涉及的资源/文件/命令、尚未完成的事项与已知报错。',
-  '不要编造；不要复述寒暄；用中文，尽量紧凑。',
-].join('\n');
-
-/** 用模型把一段较早的消息摘要成纯文本（图片/超长结果已在渲染时裁剪，避免摘要请求本身超窗）。 */
-async function summarizeMessages(model: ChatModel, stale: Msg[], signal?: AbortSignal): Promise<string> {
-  let text = '';
-  for await (const ev of model.stream({
-    system: SUMMARY_SYSTEM,
-    messages: [{ role: 'user', text: `请压缩以下对话历史：\n\n${renderForSummary(stale)}` }],
-    tools: [],
-    maxTokens: 2000,
-    signal,
-  })) {
-    if (ev.type === 'text_delta') text += ev.text;
-  }
-  return text.trim();
 }
 
 function sessionIdFromBody(body: Record<string, unknown>): string {
@@ -690,13 +643,6 @@ function userMessageFromBody(body: Record<string, unknown>): Msg {
   return { role: 'user', text: userTextFromBody(body), contentBlocks: blocks.length ? blocks : undefined };
 }
 
-function parseGoalTask(text: string): { goalMode: boolean; task: string } {
-  const match = /^\/goal(?:\s+|$)([\s\S]*)$/i.exec(text.trim());
-  if (!match) return { goalMode: false, task: text };
-  const task = match[1]?.trim() || '请自主完成这个目标任务。';
-  return { goalMode: true, task };
-}
-
 function browserStreamView(sessionId: string): string {
   const sid = JSON.stringify(sessionId);
   return `<!doctype html>
@@ -763,7 +709,6 @@ async function dispatchDirectTool(
     if (!definition) throw new HttpError(409, `工具未启用：${name}`);
     const logicalCallId = call.id;
     const outcome = await createAIOPToolRuntime({
-      model: rt.model,
       tools: rt.tools,
       governedTools: [definition],
       policy: rt.policy,
@@ -1318,7 +1263,6 @@ async function handle(
       } finally {
         await rm(stagingRoot, { recursive: true, force: true });
       }
-      rt.systemExtra = rt.skillRegistry.summaries();
       await rt.audit?.record({
         kind: 'auth', action: 'skill-imported', tenantId: ctx.tenantId,
         detail: { skill: product.name, by: ctx.userId, visibility: product.visibility, pendingReview: true },
@@ -1346,7 +1290,6 @@ async function handle(
     const name = decodeURIComponent(skillReviewMatch[1]!);
     try {
       const product = await rt.skillRegistry.review(name, ctx, { global });
-      rt.systemExtra = rt.skillRegistry.summaries();
       await rt.audit?.record({
         kind: 'auth', action: 'skill-reviewed', tenantId: ctx.tenantId,
         detail: { skill: product.name, by: ctx.userId, global },
@@ -1369,7 +1312,6 @@ async function handle(
     const skill = await requireManagedSkill(rt, ctx, name);
     try {
       const updated = await rt.skillRegistry.setShared(skill.name, skillShareMatch[2] === 'share', ctx);
-      rt.systemExtra = rt.skillRegistry.summaries();
       await rt.audit?.record({
         kind: 'auth', action: skillShareMatch[2] === 'share' ? 'skill-shared' : 'skill-unshared',
         tenantId: ctx.tenantId, detail: { skill: skill.name, by: ctx.userId },
@@ -1416,7 +1358,6 @@ async function handle(
     const enabled = skillActionMatch[2] === 'enable';
     try {
       const skill = await rt.skillRegistry.setEnabled(managed.name, enabled, ctx);
-      rt.systemExtra = rt.skillRegistry.summaries();
       return sendJson(res, 200, { skill: publicSkill(skill, rt.skillRegistry, ctx) });
     } catch (err) {
       throw skillHttpError(err);
@@ -1433,7 +1374,6 @@ async function handle(
     const managed = await requireManagedSkill(rt, ctx, name);
     try {
       await rt.skillRegistry.delete(managed.name, ctx);
-      rt.systemExtra = rt.skillRegistry.summaries();
       await rt.audit?.record({
         kind: 'auth', action: 'skill-deleted', tenantId: ctx.tenantId,
         detail: { skill: managed.name, by: ctx.userId },
@@ -1772,7 +1712,7 @@ async function handle(
     if (approved) await approvals.approve(id, ctx.tenantId);
     else await approvals.deny(id, ctx.tenantId);
     await scheduleResolvedInteractionRecovery(
-      rt, interactions, activeRuns, compactionWatermarks, ctx, resolved, wasPending,
+      rt, ctx, resolved, wasPending,
     );
     return sendJson(res, 200, { ok: true });
   }
@@ -1810,7 +1750,7 @@ async function handle(
     }).catch((error) => { throw interactionResolveHttpError(error, '问题不存在或已回答'); });
     questions.answer(id, ctx.tenantId, answers);
     await scheduleResolvedInteractionRecovery(
-      rt, interactions, activeRuns, compactionWatermarks, ctx, resolved, wasPending,
+      rt, ctx, resolved, wasPending,
     );
     return sendJson(res, 200, { ok: true });
   }
@@ -2252,17 +2192,8 @@ function abortActiveRunById(activeRuns: ActiveAgentRuns, tenantId: string, runId
   return aborted;
 }
 
-function abortReasonMessage(reason: unknown): string {
-  if (reason instanceof Error) return reason.message;
-  if (typeof reason === 'string' && reason) return reason;
-  return RUN_TERMINATED_MESSAGE;
-}
-
 async function scheduleResolvedInteractionRecovery(
   rt: Runtime,
-  interactions: DurableInteractionService,
-  activeRuns: ActiveAgentRuns,
-  compactionWatermarks: CompactionWatermarks,
   requester: RequestContext,
   interaction: Awaited<ReturnType<DurableInteractionService['resolve']>>,
   newlyResolved: boolean,
@@ -2294,19 +2225,6 @@ function interactionResolveHttpError(error: unknown, fallback: string): HttpErro
   }
   if (message.includes('无权')) return new HttpError(403, message);
   return new HttpError(404, message);
-}
-
-function asObject(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : { value };
-}
-
-function planSummary(value: unknown): string {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    && typeof (value as { summary?: unknown }).summary === 'string'
-    ? (value as { summary: string }).summary
-    : '';
 }
 
 async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req: Req, res: Res): Promise<void> {

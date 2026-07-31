@@ -20,9 +20,6 @@ export interface AgentRunRecord {
   runId: string;
   kernel: 'pi';
   kernelVersion?: string;
-  runtimeVersion?: string;
-  graphName: string;
-  graphVersion: string;
   createdAt: Date;
   status: AgentRunStatus;
   waitingReason?: 'approval' | 'question' | 'plan' | 'external';

@@ -34,10 +34,10 @@ describe('schedule tools', () => {
     const store = new MemoryStore();
     const [schedule] = buildScheduleTools(store);
 
-    const bad = await schedule!.run({ cron: 'nope', task: 'x' }, ctx);
+    const bad = await schedule!.execute({ cron: 'nope', task: 'x' }, ctx);
     expect(bad.isError).toBe(true);
 
-    const ok = await schedule!.run({ cron: '0 1 * * *', task: '巡检' }, ctx);
+    const ok = await schedule!.execute({ cron: '0 1 * * *', task: '巡检' }, ctx);
     expect(ok.isError).toBeFalsy();
     expect(await store.listScheduledTasks(rctx)).toHaveLength(1);
   });
@@ -46,11 +46,11 @@ describe('schedule tools', () => {
     const store = new MemoryStore();
     const [schedule] = buildScheduleTools(store);
 
-    const denied = await schedule!.run({ cron: '0 1 * * *', task: 't', preApproved: true }, ctx); // role=user
+    const denied = await schedule!.execute({ cron: '0 1 * * *', task: 't', preApproved: true }, ctx); // role=user
     expect(denied.isError).toBe(true);
 
     const adminCtx = { ...ctx, role: 'tenant_admin' as const };
-    const ok = await schedule!.run({ cron: '0 1 * * *', task: 't', preApproved: true }, adminCtx);
+    const ok = await schedule!.execute({ cron: '0 1 * * *', task: 't', preApproved: true }, adminCtx);
     expect(ok.isError).toBeFalsy();
     expect((await store.listScheduledTasks(rctx))[0]!.preApproved).toBe(true);
   });
@@ -59,9 +59,9 @@ describe('schedule tools', () => {
     const store = new MemoryStore();
     const tools = buildScheduleTools(store);
     const created = await store.createScheduledTask(rctx, { sessionId: 's1', cron: '* * * * *', task: 't' });
-    const cancel = tools.find((t) => t.def.name === 'cancel_scheduled_task')!;
+    const cancel = tools.find((t) => t.name === 'cancel_scheduled_task')!;
 
-    await cancel.run({ id: created.id }, ctx);
+    await cancel.execute({ id: created.id }, ctx);
 
     expect((await store.listScheduledTasks(rctx))[0]!.enabled).toBe(false);
   });
@@ -70,18 +70,18 @@ describe('schedule tools', () => {
     const store = new MemoryStore();
     const tools = buildScheduleTools(store);
     const created = await store.createScheduledTask(rctx, { sessionId: 's1', cron: '0 1 * * *', task: '旧任务' });
-    const update = tools.find((t) => t.def.name === 'update_scheduled_task')!;
+    const update = tools.find((t) => t.name === 'update_scheduled_task')!;
 
-    const badCron = await update.run({ id: created.id, cron: 'nope' }, ctx);
+    const badCron = await update.execute({ id: created.id, cron: 'nope' }, ctx);
     expect(badCron.isError).toBe(true);
 
-    const noFields = await update.run({ id: created.id }, ctx);
+    const noFields = await update.execute({ id: created.id }, ctx);
     expect(noFields.isError).toBe(true);
 
-    const deniedPre = await update.run({ id: created.id, preApproved: true }, ctx); // role=user
+    const deniedPre = await update.execute({ id: created.id, preApproved: true }, ctx); // role=user
     expect(deniedPre.isError).toBe(true);
 
-    const ok = await update.run({ id: created.id, cron: '0 2 * * *', task: '新任务', enabled: false }, ctx);
+    const ok = await update.execute({ id: created.id, cron: '0 2 * * *', task: '新任务', enabled: false }, ctx);
     expect(ok.isError).toBeFalsy();
     const after = (await store.listScheduledTasks(rctx))[0]!;
     expect(after.cron).toBe('0 2 * * *');
@@ -89,7 +89,7 @@ describe('schedule tools', () => {
     expect(after.enabled).toBe(false);
     expect(after.nextRunAt.getUTCHours()).toBe(2);
 
-    const missing = await update.run({ id: 999, task: 'x' }, ctx);
+    const missing = await update.execute({ id: 999, task: 'x' }, ctx);
     expect(missing.isError).toBe(true);
   });
 
@@ -98,14 +98,14 @@ describe('schedule tools', () => {
     const tools = buildScheduleTools(store);
     const created = await store.createScheduledTask(rctx, { sessionId: 's1', cron: '0 1 * * *', task: 't' });
     await store.recordTaskRun({ taskId: created.id, status: 'success', detail: 'ok' });
-    const del = tools.find((t) => t.def.name === 'delete_scheduled_task')!;
+    const del = tools.find((t) => t.name === 'delete_scheduled_task')!;
 
-    const ok = await del.run({ id: created.id }, ctx);
+    const ok = await del.execute({ id: created.id }, ctx);
     expect(ok.isError).toBeFalsy();
     expect(await store.listScheduledTasks(rctx)).toHaveLength(0);
     expect(await store.listTaskRuns(rctx, created.id)).toHaveLength(0);
 
-    const missing = await del.run({ id: created.id }, ctx);
+    const missing = await del.execute({ id: created.id }, ctx);
     expect(missing.isError).toBe(true);
   });
 });
@@ -264,7 +264,7 @@ describe('embedded scheduler deployment', () => {
     const store = new MemoryStore();
     await store.putAgentRunBindingIfAbsent({
       tenantId: 'tenant-a', userId: 'user-a', sessionId: 'session-a', runId: fire!.fireId,
-      kernel: 'pi', graphName: 'pi', graphVersion: '0.82.1', createdAt: fireTime,
+      kernel: 'pi', createdAt: fireTime,
     });
     await store.updateAgentRun('tenant-a', fire!.fireId, {
       status: 'waiting', usage: { inputTokens: 3, outputTokens: 2, cacheReadTokens: 1, cacheCreationTokens: 0 },
@@ -300,7 +300,7 @@ describe('embedded scheduler deployment', () => {
     const store = new MemoryStore();
     await store.putAgentRunBindingIfAbsent({
       tenantId: 'tenant-a', userId: 'user-a', sessionId: 'session-a', runId: fire!.fireId,
-      kernel: 'pi', graphName: 'pi', graphVersion: '0.82.1', createdAt: fireTime,
+      kernel: 'pi', createdAt: fireTime,
     });
     await store.updateAgentRun('tenant-a', fire!.fireId, {
       status: 'recovery_required', errorMessage: 'tool result is unknown',
@@ -336,7 +336,7 @@ describe('embedded scheduler deployment', () => {
     });
     const binding = {
       tenantId: 'tenant-a', userId: 'user-a', sessionId: 'session-a', runId: fire!.fireId,
-      kernel: 'pi' as const, graphName: 'pi', graphVersion: '0.82.1', createdAt: fireTime,
+      kernel: 'pi' as const, createdAt: fireTime,
     };
     const record = {
       ...binding, status: 'queued' as const, stepCount: 0,

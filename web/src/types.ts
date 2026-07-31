@@ -159,9 +159,6 @@ export interface AgentRunSummary {
   runId: string;
   kernel: 'pi';
   kernelVersion?: string;
-  runtimeVersion?: string;
-  graphName: string;
-  graphVersion: string;
   status: AgentRunStatus;
   waitingReason?: 'approval' | 'question' | 'plan' | 'external';
   currentNode?: string;

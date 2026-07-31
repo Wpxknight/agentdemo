@@ -9,7 +9,7 @@ import {
   type SimpleStreamOptions,
 } from '@earendil-works/pi-ai';
 import { InMemorySessionRepo, InMemorySessionStorage, Session, type SessionTreeEntry } from '@earendil-works/pi-agent-core';
-import type { DurableInteractionUpdate } from '@aiop/control-contracts';
+import type { DurableInteractionUpdate, JsonValue, ToolExecutionOutcome } from '@aiop/control-contracts';
 import {
   GovernedToolFactory,
   GovernedToolOutcomeError,
@@ -56,6 +56,7 @@ describe('durable Pi interaction replay', () => {
           options: [{ label: '批准' }, { label: '拒绝' }],
         }],
         plan,
+        __aiopGovernedInput: plan,
       },
       createdAt,
     };
@@ -215,7 +216,7 @@ describe('durable Pi interaction replay', () => {
           logicalCallId: () => logicalCallId,
           execute: async (call, context) => {
             if (resolved?.status === 'resolved') order.push('replay');
-            const outcome = await governed.execute(call, {
+            const outcome = bindProductInteractionPayloads(await governed.execute(call, {
               identity: currentIdentity, runId: events.runId, attemptId: events.attemptId, turnNo: events.turnNo,
               sessionId: currentSessionId ?? events.runId, signal: context.signal,
               interactionResolution: resolved?.status === 'resolved' && resolved.toolCallId
@@ -224,7 +225,7 @@ describe('durable Pi interaction replay', () => {
                     value: resolved.resolution ?? interactionResolution?.value ?? null,
                   }
                 : undefined,
-            });
+            }));
             if (outcome.kind === 'result') {
               return attachGovernedToolFacts(outcome.result, outcome);
             }
@@ -563,7 +564,7 @@ async function runNegativeReplayCase(testCase: NegativeReplayCase) {
         definition,
         logicalCallId: () => logicalCallId,
         execute: async (call, context) => {
-          const outcome = await governed.execute(call, {
+          const outcome = bindProductInteractionPayloads(await governed.execute(call, {
             identity: currentIdentity, runId: events.runId, attemptId: events.attemptId, turnNo: events.turnNo,
             sessionId: currentSessionId ?? events.runId, signal: context.signal,
             interactionResolution: resolved?.status === 'resolved' && resolved.toolCallId
@@ -572,7 +573,7 @@ async function runNegativeReplayCase(testCase: NegativeReplayCase) {
                   value: resolved.resolution ?? interactionResolution?.value ?? null,
                 }
               : undefined,
-          });
+          }));
           if (outcome.kind === 'result') return attachGovernedToolFacts(outcome.result, outcome);
           throw new GovernedToolOutcomeError(outcome);
         },
@@ -622,7 +623,7 @@ function createQuestionRuntime(input: {
         definition,
         logicalCallId: (toolCallId: string) => toolCallId,
         execute: async (call, context) => {
-          const outcome = await governed.execute(call, {
+          const outcome = bindProductInteractionPayloads(await governed.execute(call, {
             identity: currentIdentity, runId: events.runId, attemptId: events.attemptId, turnNo: events.turnNo,
             sessionId: sessionId ?? events.runId, signal: context.signal,
             interactionResolution: resolved?.status === 'resolved' && resolved.toolCallId === call.id
@@ -631,13 +632,56 @@ function createQuestionRuntime(input: {
                   value: resolved.resolution ?? interactionResolution?.value ?? null,
                 }
               : undefined,
-          });
+          }));
           if (outcome.kind === 'result') return attachGovernedToolFacts(outcome.result, outcome);
           throw new GovernedToolOutcomeError(outcome);
         },
       })));
     },
   });
+}
+
+function bindProductInteractionPayloads(outcome: ToolExecutionOutcome): ToolExecutionOutcome {
+  if (!outcome.interactionUpdates?.length) return outcome;
+  return {
+    ...outcome,
+    interactionUpdates: outcome.interactionUpdates.map((interaction) => {
+      if (interaction.kind !== 'question' && interaction.kind !== 'plan') return interaction;
+      const base = {
+        id: interaction.id,
+        tenantId: interaction.tenantId,
+        userId: interaction.userId ?? null,
+        sessionId: interaction.sessionId ?? '',
+        runId: interaction.runId,
+        createdAt: interaction.createdAt.toISOString(),
+      };
+      const payload = interaction.kind === 'plan'
+        ? {
+            ...base,
+            questions: [{
+              question: `请审批变更方案：${planSummary(interaction.payload)}`,
+              header: '变更审批', options: [{ label: '批准' }, { label: '拒绝' }],
+            }],
+            plan: interaction.payload,
+            __aiopGovernedInput: interaction.payload,
+          }
+        : {
+            ...asJsonObject(interaction.payload),
+            ...base,
+            __aiopGovernedInput: interaction.payload,
+          };
+      return { ...interaction, payload };
+    }),
+  };
+}
+
+function asJsonObject(value: JsonValue): Record<string, JsonValue> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function planSummary(value: JsonValue): string {
+  const summary = asJsonObject(value).summary;
+  return typeof summary === 'string' ? summary : '';
 }
 
 function expectsHandlerOrder(executesHandler: boolean): string[] {

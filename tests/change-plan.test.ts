@@ -37,12 +37,12 @@ describe('PlanApprovalState', () => {
 
 describe('submit_change_plan tool', () => {
   it('errors without an interactive endpoint', async () => {
-    const res = await buildChangePlanTool().run(valid, { sessionId: 's1' });
+    const res = await buildChangePlanTool().execute(valid, { sessionId: 's1' });
     expect(res.isError).toBe(true);
     expect(res.content).toContain('无交互端');
   });
   it('returns approved plan text when approved', async () => {
-    const res = await buildChangePlanTool().run(valid, {
+    const res = await buildChangePlanTool().execute(valid, {
       sessionId: 's1',
       requestPlanApproval: async (_p: ChangePlan) => true,
     });
@@ -50,7 +50,7 @@ describe('submit_change_plan tool', () => {
     expect(res.content).toContain('已批准');
   });
   it('returns error when rejected', async () => {
-    const res = await buildChangePlanTool().run(valid, {
+    const res = await buildChangePlanTool().execute(valid, {
       sessionId: 's1',
       requestPlanApproval: async () => false,
     });

@@ -90,7 +90,7 @@ describe('final runtime assembly boundary', () => {
         if (sql.includes('GET_LOCK')) return [[{ acquired: 1 }], []];
         if (sql.includes('RELEASE_LOCK')) return [[{ released: 1 }], []];
         if (sql === 'SELECT version FROM schema_migrations') {
-          return [[...Array.from({ length: 26 }, (_, index) => ({ version: index + 1 }))], []];
+          return [[{ version: 1 }], []];
         }
         return [[], []];
       },

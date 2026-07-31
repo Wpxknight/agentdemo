@@ -147,9 +147,9 @@ export class MysqlSchedulerStore implements SchedulerStore {
       }).where('fire_id', '=', input.fireId).execute();
       await tx.insertInto('task_runs').values({
         task_id: row.task_id, fire_id: input.fireId, run_id: input.runId,
-        status: compatibilityStatus(input.result), detail: compatibilityDetail(input.result), steps: null,
+        status: taskRunStatus(input.result), detail: taskRunDetail(input.result), steps: null,
       }).onDuplicateKeyUpdate({
-        run_id: input.runId, status: compatibilityStatus(input.result), detail: compatibilityDetail(input.result),
+        run_id: input.runId, status: taskRunStatus(input.result), detail: taskRunDetail(input.result),
       }).execute();
     });
   }
@@ -243,13 +243,13 @@ function toBoundFire(row: SchedulerMysqlDatabase['scheduler_fires']): BoundSched
   };
 }
 
-function compatibilityStatus(result: import('@aiop/control-contracts').AgentRunResult): 'success' | 'error' {
+function taskRunStatus(result: import('@aiop/control-contracts').AgentRunResult): 'success' | 'error' {
   return result.status === 'succeeded' ? 'success' : 'error';
 }
 
-function compatibilityDetail(result: import('@aiop/control-contracts').AgentRunResult): string {
+function taskRunDetail(result: import('@aiop/control-contracts').AgentRunResult): string {
   return JSON.stringify({
-    runId: result.runId, status: result.status, durableStatus: result.status,
+    runId: result.runId, status: result.status,
     text: result.text, error: result.error, usage: result.usage,
   });
 }

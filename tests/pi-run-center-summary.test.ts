@@ -7,7 +7,7 @@ describe('Pi Run Center summaries', () => {
     const store = {
       listAgentRuns: vi.fn(async () => [{
         tenantId: 'tenant-a', userId: 'user-a', sessionId: 'session-a', runId: 'run-a',
-        kernel: 'pi' as const, kernelVersion: '0.82.1', runtimeVersion: '1', graphName: '', graphVersion: '',
+        kernel: 'pi' as const, kernelVersion: '0.82.1',
         createdAt, status: 'succeeded' as const, stepCount: 2,
         usage: { inputTokens: 2, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0 },
         updatedAt: createdAt, leaseToken: 1,

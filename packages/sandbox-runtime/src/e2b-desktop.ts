@@ -47,17 +47,17 @@ class E2bDesktopHandle implements DesktopHandle {
 export class E2bDesktopProvider implements DesktopProvider {
   constructor(private readonly opts: E2bDesktopOptions = {}) {}
 
-  private connectOpts(spec: DesktopSpec) {
+  private connectOpts() {
     return { apiKey: this.opts.apiKey ?? process.env.E2B_API_KEY, domain: this.opts.domain };
   }
 
   async create(spec: DesktopSpec): Promise<DesktopHandle> {
-    const d = await Desktop.create({ ...this.connectOpts(spec), timeoutMs: spec.timeoutMs });
+    const d = await Desktop.create({ ...this.connectOpts(), timeoutMs: spec.timeoutMs });
     return new E2bDesktopHandle(d);
   }
 
   async connect(sandboxId: string, spec: DesktopSpec): Promise<DesktopHandle> {
-    const d = await Desktop.connect(sandboxId, this.connectOpts(spec));
+    const d = await Desktop.connect(sandboxId, this.connectOpts());
     if (spec.timeoutMs) await d.setTimeout(spec.timeoutMs);
     return new E2bDesktopHandle(d);
   }

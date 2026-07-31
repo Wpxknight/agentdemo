@@ -3,12 +3,10 @@ import { describe, expect, it } from 'vitest';
 import { MemoryStore } from '../src/db/memory.js';
 import type { RequestContext } from '../src/auth/types.js';
 import { SandboxConfigSchema } from '../src/config/schema.js';
-import type { Store } from '../src/db/store.js';
 import { SecretBox, createSettingsSecretBox } from '../src/security/secret-box.js';
 import {
   SandboxSettingsPersistence,
   credentialTargetForSandboxSettings,
-  parseStoredSandboxSettings,
   parseSandboxSettings,
   sandboxSettingsToConfig,
 } from '../packages/sandbox-runtime/src/settings.js';
@@ -79,7 +77,7 @@ describe('sandbox settings validation and conversion', () => {
     })).toThrow(/privileged|特权/i);
   });
 
-  it('normalizes legacy profiles with stable ids and separate templates', () => {
+  it('normalizes configured profiles with stable ids and separate templates', () => {
     const profiles = resolveSandboxProfiles(SandboxConfigSchema.parse({
       enabled: true,
       provider: 'e2b',
@@ -120,7 +118,7 @@ describe('sandbox settings validation and conversion', () => {
     });
   });
 
-  it('keeps legacy desktop profiles available to code and browser acquisition', () => {
+  it('provides a default desktop-capable code profile', () => {
     const profiles = resolveSandboxProfiles(SandboxConfigSchema.parse({
       enabled: true,
       provider: 'local',
@@ -195,25 +193,6 @@ describe('sandbox settings validation and conversion', () => {
     })).toThrow(/domain/i);
   });
 
-  it('converts legacy provider settings and extracts the legacy plaintext key', () => {
-    expect(parseStoredSandboxSettings({
-      provider: 'opensandbox',
-      domain: 'Sandbox.EXAMPLE.test:8080',
-      protocol: 'https',
-      defaultImage: 'sandbox:latest',
-      apiKey: 'legacy-key',
-    })).toEqual({
-      settings: {
-        enabled: true,
-        mode: 'opensandbox',
-        domain: 'sandbox.example.test:8080',
-        protocol: 'https',
-        defaultImage: 'sandbox:latest',
-      },
-      legacyApiKey: 'legacy-key',
-    });
-  });
-
   it('normalizes credential targets without binding AIOS placement', () => {
     const first = parseSandboxSettings({
       enabled: true,
@@ -249,15 +228,17 @@ describe('SecretBox', () => {
     expect(() => new SecretBox('new-secret', 'platform-settings').open(encrypted)).toThrow('设置凭据无法解密');
   });
 
-  it('prefers AIOP_SETTINGS_SECRET and supports the documented JWT fallback', () => {
+  it('uses AIOP_SETTINGS_SECRET without reusing the JWT secret', () => {
     const dedicated = createSettingsSecretBox({ AIOP_SETTINGS_SECRET: 'dedicated', AIOP_JWT_SECRET: 'jwt' });
-    const fallback = createSettingsSecretBox({ AIOP_JWT_SECRET: 'jwt' });
+    const development = createSettingsSecretBox({ AIOP_JWT_SECRET: 'jwt' });
     const dedicatedCipher = dedicated.seal('value');
-    const fallbackCipher = fallback.seal('value');
+    const developmentCipher = development.seal('value');
 
     expect(dedicated.open(dedicatedCipher)).toBe('value');
-    expect(fallback.open(fallbackCipher)).toBe('value');
-    expect(() => fallback.open(dedicatedCipher)).toThrow('设置凭据无法解密');
+    expect(development.open(developmentCipher)).toBe('value');
+    expect(() => development.open(dedicatedCipher)).toThrow('设置凭据无法解密');
+    expect(() => new SecretBox('jwt', 'platform-settings').open(developmentCipher))
+      .toThrow('设置凭据无法解密');
   });
 });
 
@@ -312,56 +293,6 @@ describe('SandboxSettingsPersistence', () => {
     expect(await persistence.load()).toEqual({ settings: { ...enabled, enabled: false }, apiKeySet: false });
   });
 
-  it('migrates a legacy plaintext key on first load', async () => {
-    let record = {
-      settings: parseSandboxSettings({ enabled: true, mode: 'opensandbox', domain: 'sandbox.example.test' }),
-      legacyApiKey: 'legacy-key',
-    };
-    const fakeStore = {
-      async getSandboxSettingsRecord() { return record; },
-      async setSandboxSettingsRecord(_ctx: unknown, settings: typeof record.settings, secret: { action: string; encryptedApiKey?: string }) {
-        record = {
-          settings,
-          ...(secret.action === 'replace' ? { encryptedApiKey: secret.encryptedApiKey } : {}),
-        } as typeof record;
-      },
-    } as unknown as Store;
-    const persistence = new SandboxSettingsPersistence(fakeStore, new SecretBox('settings-secret', 'platform-settings'));
-
-    expect(await persistence.load()).toEqual({
-      settings: record.settings,
-      apiKey: 'legacy-key',
-      apiKeySet: true,
-    });
-    expect(record).not.toHaveProperty('legacyApiKey');
-    expect(record).toHaveProperty('encryptedApiKey');
-    expect(JSON.stringify(record)).not.toContain('legacy-key');
-  });
-
-  it('migrates a retained legacy key while atomically updating settings', async () => {
-    const original = parseSandboxSettings({ enabled: true, mode: 'standard_e2b', domain: 'e2b.example.test' });
-    let record = { settings: original, legacyApiKey: 'legacy-key' };
-    let action = '';
-    const fakeStore = {
-      async getSandboxSettingsRecord() { return record; },
-      async setSandboxSettingsRecord(_ctx: unknown, settings: typeof original, secret: { action: string; encryptedApiKey?: string }) {
-        action = secret.action;
-        record = {
-          settings,
-          ...(secret.encryptedApiKey ? { encryptedApiKey: secret.encryptedApiKey } : {}),
-        } as typeof record;
-      },
-    } as unknown as Store;
-    const persistence = new SandboxSettingsPersistence(fakeStore, new SecretBox('settings-secret', 'platform-settings'));
-
-    const saved = await persistence.save({ ...original, enabled: false }, { action: 'retain' });
-
-    expect(saved).toEqual({ settings: { ...original, enabled: false }, apiKey: 'legacy-key', apiKeySet: true });
-    expect(action).toBe('replace');
-    expect(record).not.toHaveProperty('legacyApiKey');
-    expect(JSON.stringify(record)).not.toContain('legacy-key');
-  });
-
   it('keeps MemoryStore records tenant scoped', async () => {
     const store = new MemoryStore();
     const settings = parseSandboxSettings({ enabled: false, mode: 'local' });
@@ -372,9 +303,9 @@ describe('SandboxSettingsPersistence', () => {
   });
 
   it('has a dedicated MySQL secret table migration', async () => {
-    const migration = await readFile('src/db/migrations/0010_setting_secrets.sql', 'utf8');
-    expect(migration).toContain('CREATE TABLE IF NOT EXISTS setting_secrets');
+    const migration = await readFile('src/db/migrations/0001_baseline.sql', 'utf8');
+    expect(migration).toContain('CREATE TABLE `setting_secrets`');
     expect(migration).toContain('payload');
-    expect(migration).toContain('PRIMARY KEY (tenant_id, setting_key)');
+    expect(migration).toContain('PRIMARY KEY (`tenant_id`,`setting_key`)');
   });
 });

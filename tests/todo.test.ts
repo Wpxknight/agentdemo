@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { buildTodoTool } from '../src/tools/todo.js';
 import type { StreamEvent } from '../src/llm/types.js';
 
@@ -7,7 +7,7 @@ describe('todo_write tool', () => {
     const tool = buildTodoTool();
     const events: StreamEvent[] = [];
     const ctx = { sessionId: 's1', emitEvent: (e: StreamEvent) => events.push(e) };
-    const res = await tool.run(
+    const res = await tool.execute(
       { todos: [
         { content: '读文档', status: 'completed' },
         { content: '同步沙箱', status: 'in_progress' },
@@ -26,8 +26,8 @@ describe('todo_write tool', () => {
   it('rejects invalid status and missing content', async () => {
     const tool = buildTodoTool();
     const ctx = { sessionId: 's1' };
-    await expect(tool.run({ todos: [{ content: 'x', status: 'bogus' }] }, ctx)).rejects.toThrow('status');
-    await expect(tool.run({ todos: [{ content: '', status: 'pending' }] }, ctx)).rejects.toThrow('content');
-    await expect(tool.run({ todos: 'nope' }, ctx)).rejects.toThrow('数组');
+    await expect(tool.execute({ todos: [{ content: 'x', status: 'bogus' }] }, ctx)).rejects.toThrow('status');
+    await expect(tool.execute({ todos: [{ content: '', status: 'pending' }] }, ctx)).rejects.toThrow('content');
+    await expect(tool.execute({ todos: 'nope' }, ctx)).rejects.toThrow('数组');
   });
 });

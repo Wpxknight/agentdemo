@@ -204,7 +204,7 @@ describe('frontend API wiring', () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
     const css = await readFile('web/src/index.css', 'utf8');
 
-    expect(app).toContain('BrowserPreviewPanel');
+    expect(app).toContain('PrototypeSandboxPanel');
     expect(app).toContain('PrototypeChatShell');
     expect(app).toContain('prototype-chat-page');
     expect(app).toContain('prototype-sidebar-nav');
@@ -674,14 +674,11 @@ describe('frontend API wiring', () => {
     expect(app).toContain('message.id === assistantId');
     expect(app).not.toContain('message === assistant');
     expect(app).toContain('<time className="prototype-message-time">{message.time}</time>');
-    expect(app).toContain('<time className="message-time">{message.time}</time>');
     expect(app).not.toContain('<time>{message.time}</time>');
     expect(css).toContain('.prototype-message-stack');
     expect(css).toContain('.prototype-message-time');
-    expect(css).toContain('.message-time');
     expect(css).toContain('.thinking-block');
     expect(css).not.toContain('.prototype-bubble time');
-    expect(css).not.toContain('.bubble time');
   });
 
   it('shows live and final assistant execution duration beside the message time', async () => {
@@ -1059,16 +1056,16 @@ describe('frontend data APIs', () => {
 
     const tools = new ToolRegistry();
     tools.register({
-      def: { name: 'load_skill', description: '加载技能', inputSchema: { type: 'object' } },
-      run: async () => ({ id: '', content: 'ok' }),
+      name: 'load_skill', description: '加载技能', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async () => ({ id: '', content: 'ok' }),
     });
     tools.register({
-      def: { name: 'mcp__filesystem__read_file', description: '读取文件', inputSchema: { type: 'object' } },
-      run: async () => ({ id: '', content: 'ok' }),
+      name: 'mcp__filesystem__read_file', description: '读取文件', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async () => ({ id: '', content: 'ok' }),
     });
     tools.register({
-      def: { name: 'sbx__run_command', description: '执行命令', inputSchema: { type: 'object' } },
-      run: async () => ({ id: '', content: 'ok' }),
+      name: 'sbx__run_command', description: '执行命令', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async () => ({ id: '', content: 'ok' }),
     });
 
     const model: ChatModel = {

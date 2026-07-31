@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { estimateCost } from '../src/llm/cost.js';
-import type { Usage } from '../src/agent/run-types.js';
+import type { AgentRunUsage } from '@aiop/control-contracts';
 
-const usage: Usage = {
+const usage: AgentRunUsage = {
   inputTokens: 1_000_000, // 含缓存
   outputTokens: 500_000,
   cacheReadTokens: 400_000,

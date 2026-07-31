@@ -118,7 +118,7 @@ describe('sbx__export_file tool', () => {
     const sbx = fakeSandbox({ '/workspace/out.xlsx': Buffer.from('PK\x03\x04excel') });
     const tool = buildExportTool(fakeManager(sbx), (c) => ({ key: c.sessionId }), store);
 
-    const res = await tool.run({ path: '/workspace/out.xlsx' }, ctx);
+    const res = await tool.execute({ path: '/workspace/out.xlsx' }, ctx);
     expect(res.isError).toBeFalsy();
     const m = /\]\((\/v1\/files\/[^)]+)\)/.exec(res.content as string);
     expect(m).toBeTruthy();
@@ -131,7 +131,7 @@ describe('sbx__export_file tool', () => {
     const { store } = await tmpStore();
     const sbx = fakeSandbox({ 'a.bin': Buffer.from('data') });
     const tool = buildExportTool(fakeManager(sbx), (c) => ({ key: c.sessionId }), store);
-    const res = await tool.run({ path: 'a.bin', filename: '结果.md', mime: 'text/markdown' }, ctx);
+    const res = await tool.execute({ path: 'a.bin', filename: '结果.md', mime: 'text/markdown' }, ctx);
     const token = /\]\(\/v1\/files\/([^)]+)\)/.exec(res.content as string)![1]!;
     const opened = await store.open(token);
     expect(opened!.meta.name).toBe('结果.md');
@@ -141,14 +141,14 @@ describe('sbx__export_file tool', () => {
   it('errors when the file is missing or empty', async () => {
     const { store } = await tmpStore();
     const tool = buildExportTool(fakeManager(fakeSandbox({ empty: new Uint8Array() })), (c) => ({ key: c.sessionId }), store);
-    expect((await tool.run({ path: 'nope' }, ctx)).isError).toBe(true);
-    expect((await tool.run({ path: 'empty' }, ctx)).isError).toBe(true);
+    expect((await tool.execute({ path: 'nope' }, ctx)).isError).toBe(true);
+    expect((await tool.execute({ path: 'empty' }, ctx)).isError).toBe(true);
   });
 
   it('rejects files above the sink limit', async () => {
     const { store } = await tmpStore({ maxBytes: 3 });
     const tool = buildExportTool(fakeManager(fakeSandbox({ big: Buffer.from('12345') })), (c) => ({ key: c.sessionId }), store);
-    const res = await tool.run({ path: 'big' }, ctx);
+    const res = await tool.execute({ path: 'big' }, ctx);
     expect(res.isError).toBe(true);
     expect(res.content).toContain('过大');
   });

@@ -136,7 +136,7 @@ export class PiAgentSessionFactory<
       tools: governedTools.tools,
       resources: this.options.resources,
     });
-    harness.on('context', ({ messages }) => ({ messages: sanitizeLegacyBrowserPreviewMessages(messages) }));
+    harness.on('context', ({ messages }) => ({ messages: sanitizeBrowserPreviewMessages(messages) }));
     return new PiAgentSession(session, harness, initialMessage, new EventCodec(events), models, systemPrompt);
   }
 }
@@ -540,7 +540,7 @@ export class PiAgentSession<TMetadata extends SessionMetadata = SessionMetadata>
         })),
       },
       convertToLlm,
-      transformContext: async (messages) => sanitizeLegacyBrowserPreviewMessages(messages),
+      transformContext: async (messages) => sanitizeBrowserPreviewMessages(messages),
       sessionId: metadata.id,
       transport: streamOptions.transport,
       maxRetryDelayMs: streamOptions.maxRetryDelayMs,
@@ -653,7 +653,7 @@ function toPiUserMessage(message: AgentInputMessage) {
   };
 }
 
-function sanitizeLegacyBrowserPreviewMessages(messages: AgentMessage[]): AgentMessage[] {
+function sanitizeBrowserPreviewMessages(messages: AgentMessage[]): AgentMessage[] {
   return messages.map((message) => {
     if (message.role !== 'toolResult' || message.toolName !== 'desktop_stream_url') return message;
     let changed = false;
@@ -721,15 +721,13 @@ function productInteractionPayloadMatches(
   kind: 'question' | 'plan',
   argumentsValue: JsonValue,
 ): boolean {
-  if (digestToolValue(interaction.payload) === digestToolValue(argumentsValue)) return true;
   const payload = asJsonObject(interaction.payload);
   if (!payload || !productInteractionBaseMatches(payload, interaction)) return false;
-  const binding = Object.hasOwn(payload, GOVERNED_INPUT_BINDING)
-    ? payload[GOVERNED_INPUT_BINDING] : undefined;
-  if (binding !== undefined && digestToolValue(binding) !== digestToolValue(argumentsValue)) return false;
+  if (!Object.hasOwn(payload, GOVERNED_INPUT_BINDING)) return false;
+  const binding = payload[GOVERNED_INPUT_BINDING];
+  if (digestToolValue(binding) !== digestToolValue(argumentsValue)) return false;
   if (kind === 'plan') {
-    const expectedKeys = [...PRODUCT_INTERACTION_BASE_KEYS, 'questions', 'plan',
-      ...(binding === undefined ? [] : [GOVERNED_INPUT_BINDING])];
+    const expectedKeys = [...PRODUCT_INTERACTION_BASE_KEYS, 'questions', 'plan', GOVERNED_INPUT_BINDING];
     return hasExactKeys(payload, expectedKeys)
       && digestToolValue(payload.plan) === digestToolValue(argumentsValue)
       && productPlanQuestionsMatch(payload.questions, argumentsValue);

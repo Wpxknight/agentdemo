@@ -11,7 +11,6 @@ import { PlanApprovalState } from './agent/plan.js';
 import type {
   DurableRunRuntime,
   IdentityContext,
-  InteractionResolution,
   ResolvedInteraction,
   RunExecutionProfile,
   ToolRuntime,
@@ -48,7 +47,7 @@ import { E2bDesktopProvider } from '@aiop/sandbox-runtime';
 import { LocalDesktopProvider } from '@aiop/sandbox-runtime';
 import { OpenSandboxDesktopProvider } from '@aiop/sandbox-runtime';
 import { CommandDesktopProvider } from '@aiop/sandbox-runtime';
-import type { DesktopHandle, DesktopProvider } from '@aiop/sandbox-runtime';
+import type { DesktopProvider } from '@aiop/sandbox-runtime';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildSandboxTools } from './tools/builtin.js';
@@ -79,7 +78,7 @@ import {
   SandboxSettingsPersistence,
   credentialTargetForSandboxSettings,
   parseSandboxSettings,
-  parseStoredSandboxSettings,
+  sandboxConfigToSettings,
   sandboxSettingsToConfig,
   type LoadedSandboxSettings,
   type SandboxApiKeyUpdate,
@@ -92,13 +91,12 @@ import { buildAskUserTool } from './tools/ask-user.js';
 import { buildChangePlanTool } from './tools/change-plan.js';
 import {
   findSandboxProfile,
-  publicSandboxProfiles,
   resolveSandboxProfiles,
   sandboxSpecForProfile,
   selectBrowserProfile,
   selectDefaultProfile,
 } from '@aiop/sandbox-runtime';
-import type { PublicSandboxProfile, SandboxProfile } from '@aiop/sandbox-runtime';
+import type { PublicSandboxProfile } from '@aiop/sandbox-runtime';
 import { LocalAuthProvider } from './auth/local.js';
 import { OidcAuthProvider } from './auth/oidc.js';
 import { AiosAuthProvider } from './auth/aios.js';
@@ -147,7 +145,7 @@ export interface Runtime {
   durableRunRuntime: DurableRunRuntime;
   /** Root-lifecycle controller shared by durable and direct governed tool calls. */
   toolConcurrency: ResourceConcurrencyController;
-  /** Committed Pi session entries used to rebuild legacy product message projections. */
+  /** Committed Pi session entries used to rebuild product message projections. */
   piSessionStore?: PiSessionStore;
   model: ChatModel;
   modelConfig?: RuntimeModelConfig;
@@ -381,7 +379,6 @@ async function createDefaultDurableRunAssembly(
       };
       const productDefinitions = tools.unified(toolContext).definitions();
       const governed = createAIOPToolRuntime({
-        model: createModel(modelConfig.id, modelConfig),
         tools,
         governedTools: definitions,
         policy: execution?.preApproved
@@ -464,7 +461,7 @@ function normalizeMcpCredentials(value: McpCredentials | undefined): McpCredenti
   return { ...(headers ? { headers } : {}), ...(env ? { env } : {}) };
 }
 
-/** 数据库页面设置优先；config.sandbox 仅在数据库尚无记录时作为启动 bootstrap。 */
+/** 数据库页面设置优先；未保存页面设置时使用当前启动配置。 */
 export function resolveRuntimeSandboxConfig(
   startup: SandboxConfig | undefined,
   persisted?: SandboxSettings,
@@ -699,11 +696,11 @@ export async function buildRuntime(
       sandboxCfg = sandboxSettingsToConfig(persistedSandbox.settings, persistedSandbox.apiKey);
     } else if (config.sandbox) {
       sandboxCfg = SandboxConfigSchema.parse(config.sandbox);
-      const bootstrap = parseStoredSandboxSettings(config.sandbox as unknown as Record<string, unknown>);
-      sandboxState = await sandboxPersistence.save(
-        bootstrap.settings,
-        config.sandbox.apiKey ? { action: 'replace', apiKey: config.sandbox.apiKey } : { action: 'retain' },
-      );
+      sandboxState = {
+        settings: sandboxConfigToSettings(sandboxCfg),
+        apiKey: sandboxCfg.apiKey,
+        apiKeySet: Boolean(sandboxCfg.apiKey),
+      };
     } else {
       sandboxState = { settings: { enabled: false, mode: 'local' }, apiKeySet: false };
     }
@@ -714,7 +711,7 @@ export async function buildRuntime(
     if (persistedRecord) {
       sandboxState = {
         settings: persistedRecord.settings,
-        apiKeySet: Boolean(persistedRecord.encryptedApiKey || persistedRecord.legacyApiKey),
+        apiKeySet: Boolean(persistedRecord.encryptedApiKey),
       };
     } else {
       sandboxState = { settings: { enabled: false, mode: 'local' }, apiKeySet: false };
@@ -753,7 +750,7 @@ export async function buildRuntime(
     );
     for (const tool of codeEnabled
       ? profileTools
-      : profileTools.filter((tool) => tool.def.name === 'sandbox_list_profiles')) {
+      : profileTools.filter((tool) => tool.name === 'sandbox_list_profiles')) {
       tools.register(tool, 'sandbox');
     }
     if (codeEnabled && downloads) {
@@ -823,7 +820,6 @@ export async function buildRuntime(
   let skillRegistry: SkillRegistry | undefined;
   if (config.skills?.dir) {
     const skills = new SkillRegistry(config.skills.dir, {
-      summaryBudget: config.skills.summaryBudget,
       builtinRoots: config.skills.builtinDir ? [config.skills.builtinDir] : [],
       mutationLock: skillMutationLock,
       importPermitLock: skillImportPermitLock,
@@ -832,10 +828,9 @@ export async function buildRuntime(
     await skills.scan();
     const skillTools = buildSkillTools(skills, sandboxController, undefined, { credentials, audit });
     for (const tool of skillTools) tools.register(tool);
-    skillSyncTool = skillTools.find((tool) => tool.def.name === 'skill__sync_to_sandbox');
+    skillSyncTool = skillTools.find((tool) => tool.name === 'skill__sync_to_sandbox');
     if (!sandboxController.codeEnabled()) tools.unregister('skill__sync_to_sandbox');
     skillRegistry = skills;
-    systemExtra = skills.summaries();
   }
 
   // 认证：本地或 OIDC（复用上方派生的 jwtSecret）
@@ -1063,9 +1058,12 @@ export async function buildRuntime(
         }
         const nextCfg = sandboxSettingsToConfig(settings, effectiveApiKey);
         const prepared = nextCfg.enabled ? await prepareGeneration(nextCfg) : undefined;
+        const persistenceUpdate = update.keyAction.action === 'retain' && effectiveApiKey
+          ? { action: 'replace' as const, apiKey: effectiveApiKey }
+          : update.keyAction;
         let saved: LoadedSandboxSettings;
         try {
-          saved = await sandboxPersistence.save(settings, update.keyAction);
+          saved = await sandboxPersistence.save(settings, persistenceUpdate);
         } catch (err) {
           await disposePreparedGeneration(
             prepared,

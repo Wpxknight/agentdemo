@@ -68,10 +68,6 @@ describe('Pi EventCodec', () => {
   });
 
   it('handles self-referential Error causes and AbortSignal reasons', () => {
-    const codec = new EventCodec({
-      tenantId: 'tenant-1', runId: 'run-1', attemptId: 'attempt-1', turnNo: 1,
-      correlationId: 'correlation-1', sequence: () => 1n,
-    });
     const error = new Error('recursive');
     error.cause = error;
     const controller = new AbortController();

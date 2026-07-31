@@ -1,5 +1,5 @@
 import type {
-  AgentInputMessage, AgentKernelName, AgentRunEvent, AgentRunResult, AgentRunStatus, AgentRunUsage,
+  AgentInputMessage, AgentKernelName, AgentRunEvent, AgentRunResult, AgentRunUsage,
   AttemptStatus, ClaimRunInput, ClaimedRun, CommitTurnInput,
   CompleteRunInput, CreateRunRecord, DurableInteractionUpdate, RenewLeaseInput, RequestCancellationInput, RunRecord, RunStore,
 } from '@aiop/control-contracts';
@@ -12,9 +12,6 @@ export interface StoredRun extends RunRecord {
   lastTurnNo: number;
   checkpoint?: unknown;
   appendClosedAt?: Date;
-  runtimeVersion?: string;
-  graphName?: string;
-  graphVersion?: string;
   currentNode?: string;
   stepCount?: number;
   errorMessage?: string;

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { constants } from 'node:fs';
-import { access, link, mkdir, mkdtemp, readFile, rename, stat, symlink, writeFile } from 'node:fs/promises';
+import { access, link, mkdir, mkdtemp, readFile, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SandboxManager } from '../packages/sandbox-runtime/src/lifecycle.js';
@@ -400,9 +400,9 @@ describe('production sandbox tools', () => {
       list: vi.fn(() => []), dispose: vi.fn(async () => undefined),
       disposeSession: vi.fn(async () => []), disposeAll: vi.fn(async () => undefined),
     } as unknown as Parameters<typeof buildSandboxTools>[0];
-    const runCommand = buildSandboxTools(manager).find((tool) => tool.def.name === 'sbx__run_command')!;
+    const runCommand = buildSandboxTools(manager).find((tool) => tool.name === 'sbx__run_command')!;
 
-    const execution = runCommand.run({ command: 'wait' }, {
+    const execution = runCommand.execute({ command: 'wait' }, {
       sessionId: 'session', tenantId: 'tenant', userId: 'user', role: 'user', signal: abort.signal,
     });
     abort.abort();
@@ -508,7 +508,7 @@ describe('sandbox tools', () => {
     const mgr = new SandboxManager({ provider });
     const [runCode] = buildSandboxTools(mgr);
 
-    const res = await runCode!.run({ code: 'print(1)' }, ctx);
+    const res = await runCode!.execute({ code: 'print(1)' }, ctx);
 
     expect(res.content).toBe('code:print(1)');
     expect(res.isError).toBeFalsy();
@@ -518,9 +518,9 @@ describe('sandbox tools', () => {
     const { provider } = mockProvider();
     const mgr = new SandboxManager({ provider });
     const tools = buildSandboxTools(mgr);
-    const runCommand = tools.find((t) => t.def.name === 'sbx__run_command')!;
+    const runCommand = tools.find((t) => t.name === 'sbx__run_command')!;
 
-    const res = await runCommand.run({ command: 'do-fail' }, ctx);
+    const res = await runCommand.execute({ command: 'do-fail' }, ctx);
 
     expect(res.isError).toBe(true);
     expect(res.content).toContain('boom');
@@ -532,7 +532,7 @@ describe('sandbox tools', () => {
     const mgr = new SandboxManager({ provider });
     const [runCode] = buildSandboxTools(mgr);
 
-    await expect(runCode!.run({}, ctx)).rejects.toThrow(/code/);
+    await expect(runCode!.execute({}, ctx)).rejects.toThrow(/code/);
   });
 
   it('isolates same-named sessions by tenant and user identity', async () => {
@@ -540,10 +540,10 @@ describe('sandbox tools', () => {
     const mgr = new SandboxManager({ provider });
     const [runCode] = buildSandboxTools(mgr);
 
-    await runCode!.run({ code: 'print("a")' }, {
+    await runCode!.execute({ code: 'print("a")' }, {
       sessionId: 'same', tenantId: 'tenant-a', userId: 'user-a', role: 'user',
     });
-    await runCode!.run({ code: 'print("b")' }, {
+    await runCode!.execute({ code: 'print("b")' }, {
       sessionId: 'same', tenantId: 'tenant-b', userId: 'user-b', role: 'user',
     });
 
@@ -562,8 +562,8 @@ describe('sandbox tools', () => {
     const mgr = new SandboxManager({ provider });
     const [runCode] = buildSandboxTools(mgr);
 
-    await runCode!.run({ code: 'print("a")' }, { sessionId: 'session-a' });
-    await runCode!.run({ code: 'print("b")' }, { sessionId: 'session-b' });
+    await runCode!.execute({ code: 'print("a")' }, { sessionId: 'session-a' });
+    await runCode!.execute({ code: 'print("b")' }, { sessionId: 'session-b' });
 
     expect(provider.create).toHaveBeenCalledTimes(2);
     expect(mgr.list().map((item) => [item.key, item.sessionId, item.id])).toEqual([
@@ -577,30 +577,32 @@ describe('sandbox tools', () => {
     const mgr = new SandboxManager({ provider });
     const tools = buildSandboxProfileTools(mgr, [
       {
-        name: 'code',
+        id: 'code', name: 'code',
         description: '普通代码沙箱',
+        envType: 'code', runtimeRole: 'sandbox-reader',
         image: 'aiop/opensandbox-code:dev',
         desktop: false,
         privileged: false,
         capabilities: ['python', 'shell'],
       },
       {
-        name: 'netdiag',
+        id: 'netdiag', name: 'netdiag',
         description: '网络排查沙箱',
+        envType: 'code', runtimeRole: 'sandbox-diag',
         image: 'aiop/opensandbox-netdiag:dev',
         desktop: false,
         privileged: true,
         capabilities: ['kubectl', 'tcpdump'],
       },
     ]);
-    const listProfiles = tools.find((tool) => tool.def.name === 'sandbox_list_profiles')!;
-    const runCommand = tools.find((tool) => tool.def.name === 'sandbox_run_command')!;
+    const listProfiles = tools.find((tool) => tool.name === 'sandbox_list_profiles')!;
+    const runCommand = tools.find((tool) => tool.name === 'sandbox_run_command')!;
 
-    const listed = await listProfiles.run({}, ctx);
+    const listed = await listProfiles.execute({}, ctx);
     expect(listed.content).toContain('netdiag');
     expect(listed.content).toContain('tcpdump');
 
-    const res = await runCommand.run({ profile: 'netdiag', command: 'kubectl get pods' }, ctx);
+    const res = await runCommand.execute({ profile: 'netdiag', command: 'kubectl get pods' }, ctx);
 
     expect(res.content).toContain('out:kubectl get pods');
     expect(provider.create).toHaveBeenCalledWith(expect.objectContaining({
@@ -831,7 +833,7 @@ describe('OpenSandboxDesktopProvider', () => {
     const manager = new SandboxManager({ provider });
     const [runCode] = buildSandboxTools(manager);
 
-    await runCode!.run({ code: 'print("same")' }, { sessionId: 'sess-k8s' });
+    await runCode!.execute({ code: 'print("same")' }, { sessionId: 'sess-k8s' });
     const desktops = new OpenSandboxDesktopProvider(manager);
     const desktop = await desktops.create({ key: 'sess-k8s', timeoutMs: 60_000 });
     await desktop.launch('google-chrome', 'https://example.com');

@@ -159,11 +159,7 @@ After saving settings, execute the smoke script in the AIOP container:
 kubectl -n aiop-dev exec deploy/aiop-server -c aiop -- npx tsx scripts/verify-aios-e2b.ts
 ```
 
-The script loads the effective saved configuration, then verifies create, readiness, commands, Python code fallback, file read, timeout and cleanup. It reports only status and sandbox IDs, never credentials. See `docs/DESIGN-aios-e2b-integration.md` for the lifecycle contract, settings authority, and bootstrap compatibility boundaries.
-
-### Bootstrap compatibility
-
-Existing deployments that already use startup `sandbox` configuration remain supported only as a one-time bootstrap path when the database has no `sandbox.default` row. After the first persisted page/API setting exists, the database is authoritative on every restart and startup configuration cannot overwrite it. Move legacy AIOS settings to **Settings → Sandbox**, then remove `sandbox.aios` and `AIOS_SANDBOX_KEY`; new deployments must not add `AIOS_SANDBOX_KEY`.
+The script loads the effective saved configuration, then verifies create, readiness, commands, Python code fallback, file read, timeout and cleanup. It reports only status and sandbox IDs, never credentials. See `docs/DESIGN-aios-e2b-integration.md` for the lifecycle contract and settings authority.
 
 Because the default model endpoint is a placeholder, calling sandbox tools through `/v1/agent` additionally requires a real model endpoint.
 

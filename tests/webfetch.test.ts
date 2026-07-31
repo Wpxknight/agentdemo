@@ -21,28 +21,28 @@ describe('htmlToText', () => {
 describe('web_fetch tool guards', () => {
   it('rejects non-http protocol', async () => {
     const tool = buildWebFetchTool();
-    const r = await tool.run({ url: 'file:///etc/passwd' }, ctx);
+    const r = await tool.execute({ url: 'file:///etc/passwd' }, ctx);
     expect(r.isError).toBe(true);
     expect(r.content).toContain('仅支持 http/https');
   });
 
   it('rejects loopback address (SSRF guard)', async () => {
     const tool = buildWebFetchTool();
-    const r = await tool.run({ url: 'http://127.0.0.1/admin' }, ctx);
+    const r = await tool.execute({ url: 'http://127.0.0.1/admin' }, ctx);
     expect(r.isError).toBe(true);
     expect(r.content).toContain('私网');
   });
 
   it('rejects host outside allowlist', async () => {
     const tool = buildWebFetchTool({ allowedDomains: ['docs.example.com'] });
-    const r = await tool.run({ url: 'http://evil.com/' }, ctx);
+    const r = await tool.execute({ url: 'http://evil.com/' }, ctx);
     expect(r.isError).toBe(true);
     expect(r.content).toContain('白名单');
   });
 
   it('requires url', async () => {
     const tool = buildWebFetchTool();
-    const r = await tool.run({}, ctx);
+    const r = await tool.execute({}, ctx);
     expect(r.isError).toBe(true);
   });
 
@@ -51,7 +51,7 @@ describe('web_fetch tool guards', () => {
     vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(error);
     const tool = buildWebFetchTool();
 
-    const r = await tool.run({ url: 'https://1.1.1.1/weather' }, ctx);
+    const r = await tool.execute({ url: 'https://1.1.1.1/weather' }, ctx);
 
     expect(r.isError).toBe(true);
     expect(r.content).toContain('ETIMEDOUT');

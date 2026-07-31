@@ -12,7 +12,7 @@ export interface ProjectPiSessionInput {
   assistantDurationMs?: Readonly<Record<string, number>>;
 }
 
-/** Rebuilds the legacy product message view from the committed Pi session path. */
+/** Rebuilds the product message view from the committed Pi session path. */
 export class PiSessionProjection {
   constructor(private readonly store: Pick<Store, 'replaceMessages' | 'touchSession'>) {}
 

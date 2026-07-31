@@ -12,6 +12,8 @@
     "types": ["node"],
     "declaration": true,
     "declarationMap": false,
-    "sourceMap": false
+    "sourceMap": false,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
   }
 }

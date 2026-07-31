@@ -36,7 +36,7 @@ export class MysqlRunStore implements DurableProductRunStore {
       if (active) throw conflict('Session already has an active run');
       await store.db.insertInto('agent_runs').values({
         tenant_id: record.tenantId, run_id: record.runId, user_id: record.actorId, session_id: record.sessionId,
-        kernel: record.kernel, kernel_version: record.kernelVersion, graph_name: '', graph_version: '', runtime_version: 'pi-durable-v1',
+        kernel: record.kernel, kernel_version: record.kernelVersion,
         status: record.status, waiting_reason: record.waitingReason ?? null, current_node: null, step_count: 0,
         input_tokens: record.usage.inputTokens, output_tokens: record.usage.outputTokens,
         cache_read_tokens: record.usage.cacheReadTokens, cache_creation_tokens: record.usage.cacheCreationTokens,
@@ -625,7 +625,6 @@ function mapRun(row: any, commit?: any): StoredRun {
     usage: usage(row), createdAt: row.created_at, updatedAt: row.updated_at,
     cancelRequestedAt: row.cancel_requested_at ?? undefined, lastTurnNo: Number(commit?.turn_no ?? 0),
     checkpoint: commit ? parse(commit.messages_json) : undefined, appendClosedAt: row.append_closed_at ?? undefined,
-    runtimeVersion: row.runtime_version, graphName: row.graph_name, graphVersion: row.graph_version,
     currentNode: row.current_node ?? undefined, stepCount: Number(row.step_count ?? 0),
     errorMessage: row.error_message ?? undefined, startedAt: row.started_at ?? undefined,
     completedAt: row.completed_at ?? undefined,

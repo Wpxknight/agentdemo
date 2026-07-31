@@ -2,20 +2,35 @@ import { createHash } from 'node:crypto';
 import type { JsonValue, ToolExecutionOutcome, ToolRuntime } from '@aiop/control-contracts';
 import {
   GovernedToolFactory,
-  ResourceConcurrencyController,
   type GovernedToolDefinition,
   type ResourceConcurrency,
-  type ToolApprovalClaim,
   type ToolInteractionStore,
   type ToolLedgerStore,
 } from '@aiop/pi-runtime';
-import type { RunAgentOptions } from '../agent/run-types.js';
+import type { StreamEvent, ToolDef } from '../llm/types.js';
+import type { ApprovalGate } from '../agent/approval.js';
+import type { PolicyMiddleware } from '../agent/policy.js';
+import type { ToolContext, ToolRegistry } from '../agent/tools.js';
 import { logger } from '../logger.js';
 
 const GOVERNED_INPUT_BINDING = '__aiopGovernedInput';
 
+export interface AIOPToolRuntimeOptions {
+  tools: ToolRegistry;
+  governedTools?: readonly GovernedToolDefinition[];
+  policy: PolicyMiddleware;
+  ctx: ToolContext;
+  onEvent?: (event: StreamEvent) => void;
+  approval?: ApprovalGate;
+  filterToolDefs?: (definitions: ToolDef[]) => ToolDef[];
+  durableInteractions?: { wait(id: string): Promise<unknown> };
+  askUser?: ToolContext['askUser'];
+  requestPlanApproval?: ToolContext['requestPlanApproval'];
+  runGuard?: () => Promise<void>;
+}
+
 export function createAIOPToolRuntime(
-  options: RunAgentOptions,
+  options: AIOPToolRuntimeOptions,
   ledger: ToolLedgerStore,
   concurrency: ResourceConcurrency,
   interactions?: ToolInteractionStore,
@@ -166,46 +181,6 @@ export function createAIOPToolRuntime(
   };
 }
 
-export function createCompatibilityAIOPToolRuntime(options: RunAgentOptions): ToolRuntime {
-  return createAIOPToolRuntime(
-    options,
-    new MemoryToolLedger(),
-    new ResourceConcurrencyController(),
-    undefined,
-    true,
-  );
-}
-
-class MemoryToolLedger implements ToolLedgerStore {
-  private readonly records = new Map<string, import('@aiop/control-contracts').DurableToolLedgerUpdate>();
-
-  async putIfAbsent(record: import('@aiop/control-contracts').DurableToolLedgerUpdate): Promise<boolean> {
-    const key = ledgerKey(record);
-    if (this.records.has(key)) return false;
-    this.records.set(key, structuredClone(record));
-    return true;
-  }
-
-  async get(input: { tenantId: string; runId: string; logicalCallId: string }) {
-    return structuredClone(this.records.get(ledgerKey(input)));
-  }
-
-  async update(record: import('@aiop/control-contracts').DurableToolLedgerUpdate): Promise<void> {
-    this.records.set(ledgerKey(record), structuredClone(record));
-  }
-
-  async claimPendingApproval(input: ToolApprovalClaim): Promise<boolean> {
-    const key = ledgerKey(input);
-    const current = this.records.get(key);
-    if (!current || current.status !== 'pending_approval' || current.attemptId !== input.attemptId
-      || current.turnNo !== input.turnNo || current.toolCallId !== input.toolCallId
-      || current.toolName !== input.toolName || current.argsDigest !== input.argsDigest
-      || current.approvedInteractionId !== input.approvedInteractionId) return false;
-    this.records.set(key, structuredClone(input.started));
-    return true;
-  }
-}
-
 async function commitLedger(
   ledger: ToolLedgerStore,
   update: import('@aiop/control-contracts').DurableToolLedgerUpdate,
@@ -213,10 +188,6 @@ async function commitLedger(
   const existing = await ledger.get(update);
   if (existing) await ledger.update(update);
   else await ledger.putIfAbsent(update);
-}
-
-function ledgerKey(input: { tenantId: string; runId: string; logicalCallId: string }): string {
-  return `${input.tenantId}:${input.runId}:${input.logicalCallId}`;
 }
 
 function safeAuditError(error: unknown): string {

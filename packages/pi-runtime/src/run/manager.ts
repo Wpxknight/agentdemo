@@ -181,7 +181,6 @@ export class DurableRunManager implements DurableRunRuntime {
     let observedUsage = zeroUsage();
     let hasObservedUsage = false;
     const durableEvents: Array<Omit<AgentRunEvent, 'sequence'>> = [];
-    let eventsPersisted = false;
     const piSessionId = piSessionStorageId(claimed.record.actorId, claimed.record.sessionId);
     try {
       const events = this.options.eventOptions({ tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, turnNo });
@@ -301,7 +300,6 @@ export class DurableRunManager implements DurableRunRuntime {
           events: durableEvents, status: 'succeeded', usage: actualUsage,
           ledgerUpdates: facts?.ledgerUpdates, interactionUpdates: facts?.interactionUpdates, committedAt,
         });
-        eventsPersisted = true;
         await this.options.store.complete({
           tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, fencingToken: claimed.fencingToken,
           status: 'succeeded', usage: actualUsage, completedAt: this.now(),
@@ -343,14 +341,12 @@ export class DurableRunManager implements DurableRunRuntime {
           await this.options.store.commitTurn({
             ...governedCommit, status: 'cancelled', waitingReason: undefined, error: undefined,
           });
-          eventsPersisted = true;
           await this.options.store.complete({
             tenantId: identity.tenantId, runId, attemptId: claimed.attemptId,
             fencingToken: claimed.fencingToken, status: 'cancelled', usage: actualUsage, completedAt: this.now(),
           });
           return { runId, status: 'cancelled', usage: actualUsage };
         }
-        eventsPersisted = true;
         if (outcome.kind === 'waiting') return { runId, status: 'waiting', usage: actualUsage };
         const errorData = { code: 'TOOL_RESULT_UNKNOWN' as const, message: error.message, retryable: false };
         return { runId, status: 'recovery_required', usage: actualUsage, error: errorData };
@@ -388,7 +384,6 @@ export class DurableRunManager implements DurableRunRuntime {
           errorData = undefined;
           await this.options.store.commitTurn({ ...commit, status, error: undefined });
         }
-        eventsPersisted = true;
         if (status !== 'recovery_required') {
           await this.options.store.complete({
             tenantId: identity.tenantId, runId, attemptId: claimed.attemptId, fencingToken: claimed.fencingToken,

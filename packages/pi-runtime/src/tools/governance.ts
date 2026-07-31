@@ -465,19 +465,17 @@ function productInteractionPayloadMatches(
   kind: 'question' | 'plan',
   argumentsValue: JsonValue,
 ): boolean {
-  if (digestToolValue(interaction.payload) === digestToolValue(argumentsValue)) return true;
   if (!isJsonObject(interaction.payload)) return false;
   const payload = interaction.payload;
   if (payload.id !== interaction.id || payload.tenantId !== interaction.tenantId
     || payload.userId !== (interaction.userId ?? null) || payload.sessionId !== (interaction.sessionId ?? '')
     || payload.runId !== interaction.runId
     || !interactionTimestampsMatch(payload.createdAt, interaction.createdAt)) return false;
-  const binding = Object.hasOwn(payload, GOVERNED_INPUT_BINDING)
-    ? payload[GOVERNED_INPUT_BINDING] : undefined;
-  if (binding !== undefined && digestToolValue(binding) !== digestToolValue(argumentsValue)) return false;
+  if (!Object.hasOwn(payload, GOVERNED_INPUT_BINDING)) return false;
+  const binding = payload[GOVERNED_INPUT_BINDING];
+  if (digestToolValue(binding) !== digestToolValue(argumentsValue)) return false;
   if (kind === 'plan') {
-    const expectedKeys = [...PRODUCT_INTERACTION_BASE_KEYS, 'questions', 'plan',
-      ...(binding === undefined ? [] : [GOVERNED_INPUT_BINDING])];
+    const expectedKeys = [...PRODUCT_INTERACTION_BASE_KEYS, 'questions', 'plan', GOVERNED_INPUT_BINDING];
     const summary = isJsonObject(argumentsValue) ? argumentsValue.summary : undefined;
     const expectedQuestions: JsonValue = [{
       question: `请审批变更方案：${typeof summary === 'string' ? summary : ''}`,

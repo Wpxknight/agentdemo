@@ -53,7 +53,7 @@ export class MemoryRunStore implements DurableProductRunStore {
   async create(input: Parameters<DurableRunStore['create']>[0]): Promise<StoredRun & { sessionCreated: boolean }> {
     return this.lock(async () => {
       const record: StoredRun = {
-        ...clone(input.record), lastTurnNo: 0, runtimeVersion: 'pi-durable-v1', graphName: '', graphVersion: '', stepCount: 0,
+        ...clone(input.record), lastTurnNo: 0, stepCount: 0,
       };
       const runKey = key(record.tenantId, record.runId);
       if (this.runRecords.has(runKey)) throw conflict('Run already exists');

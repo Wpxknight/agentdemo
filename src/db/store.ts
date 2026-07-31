@@ -35,11 +35,10 @@ export interface SandboxSettings {
   placement?: { clusterId: string; namespace: string };
 }
 
-/** Store 内部的 Sandbox 配置和不透明密文；legacyApiKey 只用于一次性旧数据迁移。 */
+/** Store 内部的 Sandbox 配置和不透明密文。 */
 export interface SandboxSettingsRecord {
   settings: SandboxSettings;
   encryptedApiKey?: string;
-  legacyApiKey?: string;
 }
 
 export type SandboxSettingsSecretUpdate =
@@ -128,9 +127,6 @@ export interface AgentRunBinding {
   runId: string;
   kernel: 'pi';
   kernelVersion?: string;
-  runtimeVersion?: string;
-  graphName: string;
-  graphVersion: string;
   createdAt: Date;
 }
 
@@ -423,9 +419,6 @@ export interface Store extends AuditSink {
     settings: SandboxSettings,
     secret: SandboxSettingsSecretUpdate,
   ): Promise<void>;
-  /** 兼容旧调用：仅读写非敏感配置，不得写 API key。 */
-  getSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<SandboxSettings | undefined>;
-  setSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SandboxSettings): Promise<void>;
   /** MCP server 配置（UI 动态增删后持久化；存在时覆盖 config.jsonc 的 mcpServers）。 */
   getMcpServers(ctx: Pick<RequestContext, 'tenantId'>): Promise<Record<string, McpServerConfig> | undefined>;
   setMcpServers(ctx: Pick<RequestContext, 'tenantId'>, servers: Record<string, McpServerConfig>): Promise<void>;

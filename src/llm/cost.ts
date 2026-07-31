@@ -1,4 +1,4 @@
-import type { Usage } from '../agent/run-types.js';
+import type { AgentRunUsage } from '@aiop/control-contracts';
 
 /** 每百万 token 单价（美元）。 */
 export interface ModelPricing {
@@ -22,7 +22,7 @@ export interface CostEstimate {
  * inputTokens 为总输入（含缓存），因此非缓存输入 = inputTokens - cacheRead - cacheCreation，
  * 分档计费：非缓存输入按 input 价，缓存读按 cacheRead 价（缺省回退 input），缓存写按 cacheWrite 价（缺省回退 input）。
  */
-export function estimateCost(usage: Usage, pricing?: ModelPricing): CostEstimate {
+export function estimateCost(usage: AgentRunUsage, pricing?: ModelPricing): CostEstimate {
   const base: CostEstimate = {
     inputTokens: usage.inputTokens,
     outputTokens: usage.outputTokens,

@@ -298,11 +298,11 @@ describe('SkillRegistry 所有权与可见性', () => {
   it('load_skill 执行链路做同一套可见性过滤（不信 LLM）', async () => {
     const tool = reg.tool();
     // u3 尝试加载 u1 的私有技能 → 等同不存在
-    const denied = await tool.run({ name: 'mine' }, { sessionId: 's', tenantId: 'default', userId: 'u3', role: 'user' });
+    const denied = await tool.execute({ name: 'mine' }, { sessionId: 's', tenantId: 'default', userId: 'u3', role: 'user' });
     expect(denied.isError).toBe(true);
     expect(denied.content).toContain('未找到技能');
     // u1 自己可以加载
-    const ok = await tool.run({ name: 'mine' }, { sessionId: 's', tenantId: 'default', userId: 'u1', role: 'user' });
+    const ok = await tool.execute({ name: 'mine' }, { sessionId: 's', tenantId: 'default', userId: 'u1', role: 'user' });
     expect(ok.isError).toBeUndefined();
   });
 

@@ -2,7 +2,6 @@ import type { RequestContext, ToolContext } from './contracts.js';
 import { logger } from './logger.js';
 import {
   SandboxManager,
-  type SandboxManagerLike,
   type SandboxManagerOptions,
   type SandboxSummary,
 } from './lifecycle.js';

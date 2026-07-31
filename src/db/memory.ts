@@ -460,14 +460,14 @@ export class MemoryStore implements Store {
 
   async listAgentRunToolExecutions(ctx: RequestContext, runId: string): Promise<ToolExecutionRecord[]> {
     if (!await this.getAgentRun(ctx, runId)) return [];
-    const compatibility = [...this.toolExecutions.values()]
+    const direct = [...this.toolExecutions.values()]
       .filter((record) => record.tenantId === ctx.tenantId && record.runId === runId)
       .sort((a, b) => a.startedAt.getTime() - b.startedAt.getTime())
       .map(cloneToolExecution);
     const durable = (await this.durableStore.toolLedger.list({ tenantId: ctx.tenantId, runId }))
       .map(fromDurableToolLedger);
     const durableCalls = new Set(durable.map((record) => record.toolCallId));
-    return [...compatibility.filter((record) => !durableCalls.has(record.toolCallId)), ...durable]
+    return [...direct.filter((record) => !durableCalls.has(record.toolCallId)), ...durable]
       .sort((left, right) => left.startedAt.getTime() - right.startedAt.getTime());
   }
 
@@ -532,9 +532,9 @@ export class MemoryStore implements Store {
 
   private async allAgentRuns(tenantId: string): Promise<AgentRunRecord[]> {
     const durable = (await this.durableStore.listRuns(tenantId)).map(fromStoredRun);
-    const compatibilityIds = new Set(this.agentRunBindings.keys());
+    const bindingIds = new Set(this.agentRunBindings.keys());
     return [...this.agentRunBindings.values(), ...durable.filter((record) =>
-      !compatibilityIds.has(`${record.tenantId}/${record.runId}`))];
+      !bindingIds.has(`${record.tenantId}/${record.runId}`))];
   }
 
   async record(event: AuditEvent): Promise<void> {
@@ -768,17 +768,8 @@ export class MemoryStore implements Store {
     if (secret.action === 'replace') next.encryptedApiKey = secret.encryptedApiKey;
     if (secret.action === 'retain') {
       if (current?.encryptedApiKey) next.encryptedApiKey = current.encryptedApiKey;
-      if (current?.legacyApiKey) next.legacyApiKey = current.legacyApiKey;
     }
     this.sandboxSettings.set(ctx.tenantId, next);
-  }
-
-  async getSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<SandboxSettings | undefined> {
-    return (await this.getSandboxSettingsRecord(ctx))?.settings;
-  }
-
-  async setSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SandboxSettings): Promise<void> {
-    await this.setSandboxSettingsRecord(ctx, settings, { action: 'retain' });
   }
 
   async setSchedulerSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SchedulerSettings): Promise<void> {
@@ -853,8 +844,7 @@ function cloneToolExecution(record: ToolExecutionRecord): ToolExecutionRecord {
 function fromStoredRun(run: StoredRun): AgentRunRecord {
   return {
     tenantId: run.tenantId, runId: run.runId, userId: run.actorId, sessionId: run.sessionId,
-    kernel: 'pi', kernelVersion: run.kernelVersion, runtimeVersion: run.runtimeVersion,
-    graphName: run.graphName ?? '', graphVersion: run.graphVersion ?? '', status: run.status,
+    kernel: 'pi', kernelVersion: run.kernelVersion, status: run.status,
     waitingReason: run.waitingReason, currentNode: run.currentNode, stepCount: run.stepCount ?? run.lastTurnNo,
     usage: structuredClone(run.usage), errorMessage: run.errorMessage, startedAt: run.startedAt,
     updatedAt: new Date(run.updatedAt), completedAt: run.completedAt,

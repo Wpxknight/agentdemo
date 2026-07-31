@@ -62,7 +62,6 @@ export interface SandboxSettings {
 export interface SandboxSettingsRecord {
   settings: SandboxSettings;
   encryptedApiKey?: string;
-  legacyApiKey?: string;
 }
 
 export type SandboxSettingsSecretUpdate =

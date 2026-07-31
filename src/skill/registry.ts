@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { cp, link, mkdir, open, readdir, readFile, rename, rm, stat, statfs, writeFile } from 'node:fs/promises';
+import { cp, mkdir, open, readdir, readFile, rename, rm, stat, statfs, writeFile } from 'node:fs/promises';
 import { dirname, join, posix, relative, resolve, sep } from 'node:path';
 import { logger } from '../logger.js';
 import type { JsonValue, ToolResult } from '../llm/types.js';
@@ -54,14 +54,9 @@ const MARKER_FILES = new Set([
 ]);
 const PRODUCT_SCHEMA_VERSION = 2;
 const BUILTIN_GOVERNANCE_DIR = '.aiop-governance';
-const BUILTIN_CATALOG_DIR = 'builtin-catalog';
-const BUILTIN_MIGRATIONS_DIR = 'migrations';
-const LEGACY_SEED_MIGRATION_ID = 'legacy-seed-governance-v1';
-const LEGACY_TOMBSTONE_STATE_DIR = `${LEGACY_SEED_MIGRATION_ID}-tombstones`;
-const LEGACY_SEED_MIGRATION_LOCK_KEY = 'skill-legacy-migration:v1';
 const PUBLICATION_JOURNAL_DIR = '.aiop-publications';
 const PUBLICATION_LOCK_KEY = 'skill-publication';
-const LEGACY_MUTATION_LOCK_KEY = 'skill-mutation';
+const MUTATION_LOCK_KEY = 'skill-mutation';
 const STORAGE_QUOTA_LOCK_KEY = 'skill-quota:storage';
 const processNameLockTails = new Map<string, Promise<void>>();
 const immutableDigestCache = new ImmutableDigestCache(256);
@@ -82,30 +77,6 @@ interface BuiltinGovernanceOverlay {
   deleted: boolean;
 }
 
-interface LegacySeedMigrationOutcome {
-  resolved: number;
-  unresolved: number;
-}
-
-interface LegacyTombstoneMigrationState {
-  schemaVersion: 1;
-  tombstoneRelativePath: string;
-  inventoryFingerprint?: string;
-  contentDigest?: string;
-  catalogFingerprint: string;
-  result: 'no-candidate' | 'digest-mismatch' | 'ambiguous' | 'source-unavailable';
-}
-
-interface BuiltinCatalogEntry {
-  identity: string;
-  name: string;
-  tenantId: string;
-  relativePath: string;
-  sourceDigest: string;
-  sourceVersion: string;
-  seedEligible: boolean;
-}
-
 interface PublicationJournal {
   schemaVersion: 1;
   publicationId: string;
@@ -120,13 +91,9 @@ interface PublicationJournal {
 }
 
 export interface SkillRegistryOptions {
-  /** @deprecated Pi owns prompt formatting and does not apply a product-side budget. */
-  summaryBudget?: number;
   records?: readonly SkillProductRecord[];
   loader?: ProductSkillLoader;
   env?: ConstructorParameters<typeof SkillProductService>[0];
-  /** @deprecated Local fallback is a process mutex and has no lease timeout. */
-  nameLockTimeoutMs?: number;
   /** Read-only image roots; mutations and uploads always use `dir`. */
   builtinRoots?: readonly string[];
   mutationLock?: SkillMutationLock;
@@ -134,7 +101,6 @@ export interface SkillRegistryOptions {
   pendingQuota?: Partial<SkillPendingQuota>;
   availableBytes?: () => Promise<number>;
   verifyContentDigest?: (path: string) => Promise<string>;
-  legacyContentDigest?: (path: string) => Promise<string>;
 }
 
 export interface SkillPendingQuota {
@@ -176,7 +142,6 @@ export class SkillRegistry {
   private readonly pendingQuota: SkillPendingQuota;
   private readonly availableBytes: () => Promise<number>;
   private readonly verifyContentDigest: (path: string) => Promise<string>;
-  private readonly legacyContentDigest: (path: string) => Promise<string>;
   private mutationTail: Promise<void> = Promise.resolve();
   private distributedLockDepth = 0;
 
@@ -192,7 +157,6 @@ export class SkillRegistry {
     });
     this.verifyContentDigest = opts.verifyContentDigest
       ?? ((path) => contentDigest(path, { immutable: true }));
-    this.legacyContentDigest = opts.legacyContentDigest ?? ((path) => contentDigest(path));
     this.service = new SkillProductService(
       opts.env ?? new NodeExecutionEnv({ cwd: dir }),
       opts.loader,
@@ -266,7 +230,7 @@ export class SkillRegistry {
   }
 
   async scan(): Promise<void> {
-    await this.withMutationLock(() => this.scanUnlocked([], true));
+    await this.withMutationLock(() => this.scanUnlocked());
   }
 
   /** 全量列表（管理/CLI 用；对外接口请用 listFor 按查看者过滤）。 */
@@ -308,11 +272,6 @@ export class SkillRegistry {
   async summariesFor(viewer: SkillViewer): Promise<string> {
     await this.refreshForRead();
     return this.service.prompt(await this.verifiedRecords(this.unambiguousAvailableRecords(viewer)), viewer);
-  }
-
-  /** 兼容旧调用：无查看者（public+shared）视角的摘要。 */
-  summaries(): string {
-    return '';
   }
 
   /** load_skill 工具：按名字展开完整 SKILL.md 正文。hasSandboxSync 决定使用说明里是否提及沙箱同步。 */
@@ -796,9 +755,9 @@ export class SkillRegistry {
     };
     if (this.mutationLock?.withLocks) return this.mutationLock.withLocks(ordered, 10_000, trackedOperation);
     if (this.mutationLock) {
-      // The legacy API cannot atomically compose independent advisory keys. Serialize every
+      // A single-key lock implementation cannot atomically compose advisory keys. Serialize every
       // mutation through one stable key so single-key and multi-key operations still interlock.
-      return this.mutationLock.withLock(LEGACY_MUTATION_LOCK_KEY, 10_000, trackedOperation);
+      return this.mutationLock.withLock(MUTATION_LOCK_KEY, 10_000, trackedOperation);
     }
     const acquire = (index: number): Promise<T> => {
       if (index >= ordered.length) return trackedOperation();
@@ -836,10 +795,7 @@ export class SkillRegistry {
     }
   }
 
-  private async scanUnlocked(
-    excludedPaths: readonly string[] = [],
-    runStartupMigrations = false,
-  ): Promise<void> {
+  private async scanUnlocked(excludedPaths: readonly string[] = []): Promise<void> {
     if (!this.configuredRecords && this.distributedLockDepth === 0) {
       await this.withDistributedLocks([PUBLICATION_LOCK_KEY], () => reconcilePublicationJournals(this.dir));
     }
@@ -851,11 +807,6 @@ export class SkillRegistry {
       const rawBuiltinRecords = (await Promise.all(
         this.builtinRoots.map((root) => this.enumerateWithSnapshot(root)),
       )).flat();
-      const builtinCatalog = await this.updateBuiltinCatalog(rawBuiltinRecords);
-      if (runStartupMigrations) {
-        await this.ensureLegacySeedMigration(rawBuiltinRecords, builtinCatalog);
-      }
-      await readLegacySeedMigrationMarker(this.dir);
       await cleanupStaleSkillStorage(this.dir, this.pendingQuota.retentionMs);
       const builtinRecords = (await Promise.all(
         rawBuiltinRecords.map((record) => this.applyBuiltinGovernance(record)),
@@ -931,175 +882,6 @@ export class SkillRegistry {
     return { identity, relativePath };
   }
 
-  private async updateBuiltinCatalog(records: readonly SkillProductRecord[]): Promise<readonly BuiltinCatalogEntry[]> {
-    const currentEntries = await Promise.all(records.map(async (record) => {
-      const source = await this.builtinSource(record);
-      return {
-        identity: source.identity,
-        name: record.name,
-        tenantId: record.tenantId,
-        relativePath: source.relativePath,
-        sourceDigest: source.digest,
-        sourceVersion: record.version,
-        seedEligible: isSeedEligibleBuiltin(record),
-      } satisfies BuiltinCatalogEntry;
-    }));
-    await Promise.all(currentEntries.map((entry) => writeBuiltinCatalogEntry(this.dir, entry)));
-    return readBuiltinCatalogEntries(this.dir);
-  }
-
-  private async migrateLegacySeedGovernance(
-    rawBuiltinRecords: readonly SkillProductRecord[],
-    catalog: readonly BuiltinCatalogEntry[],
-  ): Promise<LegacySeedMigrationOutcome> {
-    const outcome: LegacySeedMigrationOutcome = { resolved: 0, unresolved: 0 };
-    if (!rawBuiltinRecords.length || !catalog.length) return outcome;
-    const rawByIdentity = new Map<string, SkillProductRecord>();
-    for (const record of rawBuiltinRecords) {
-      rawByIdentity.set(this.builtinLocation(record).identity, record);
-    }
-    for (const source of catalog) {
-      const candidatePath = safeResolve(this.dir, source.relativePath);
-      const legacy = await readLegacySeedCandidate(candidatePath, source);
-      if (!legacy) continue;
-      const digest = await contentDigest(legacy.path);
-      if (digest !== source.sourceDigest) continue;
-      if (await this.migrateLegacySeedRecord(legacy, source, rawByIdentity, false)) outcome.resolved += 1;
-      else outcome.unresolved += 1;
-    }
-
-    const tombstoneRoot = join(resolve(this.dir), SKILL_TOMBSTONES_DIR);
-    const tombstones = await enumerateSkillProductRecords(tombstoneRoot);
-    const catalogFingerprint = builtinCatalogFingerprint(catalog);
-    for (const legacy of tombstones) {
-      const cachedState = await readLegacyTombstoneMigrationState(this.dir, legacy.path);
-      const candidates = catalog.filter((entry) => entry.name === legacy.name
-        && entry.tenantId === legacy.tenantId
-        && entry.sourceVersion === legacy.version
-        && legacyRelativePathCandidates(legacy).includes(entry.relativePath));
-      if (!candidates.length) {
-        const state: LegacyTombstoneMigrationState = {
-          schemaVersion: 1,
-          tombstoneRelativePath: legacyTombstoneRelativePath(this.dir, legacy.path),
-          catalogFingerprint,
-          result: 'no-candidate',
-        };
-        if (!sameLegacyTombstoneMigrationState(cachedState, state)) {
-          await writeLegacyTombstoneMigrationState(this.dir, legacy.path, state);
-        }
-        outcome.unresolved += 1;
-        continue;
-      }
-      const inventoryFingerprint = await artifactFingerprint(legacy.path);
-      const digest = cachedState?.inventoryFingerprint === inventoryFingerprint
-        && cachedState.contentDigest
-        ? cachedState.contentDigest
-        : await this.legacyContentDigest(legacy.path);
-      const persistUnresolved = async (result: LegacyTombstoneMigrationState['result']): Promise<void> => {
-        const state: LegacyTombstoneMigrationState = {
-          schemaVersion: 1,
-          tombstoneRelativePath: legacyTombstoneRelativePath(this.dir, legacy.path),
-          inventoryFingerprint,
-          contentDigest: digest,
-          catalogFingerprint,
-          result,
-        };
-        if (!sameLegacyTombstoneMigrationState(cachedState, state)) {
-          await writeLegacyTombstoneMigrationState(this.dir, legacy.path, state);
-        }
-        outcome.unresolved += 1;
-      };
-      const exactByIdentity = new Map(
-        candidates.filter((entry) => entry.sourceDigest === digest).map((entry) => [entry.identity, entry]),
-      );
-      if (!exactByIdentity.size) {
-        await persistUnresolved('digest-mismatch');
-        continue;
-      }
-      if (exactByIdentity.size !== 1) {
-        await persistUnresolved('ambiguous');
-        continue;
-      }
-      const source = exactByIdentity.values().next().value!;
-      if (await this.migrateLegacySeedRecord(legacy, source, rawByIdentity, true)) {
-        outcome.resolved += 1;
-        await removeLegacyTombstoneMigrationState(this.dir, legacy.path);
-      } else {
-        await persistUnresolved('source-unavailable');
-      }
-    }
-    return outcome;
-  }
-
-  private async ensureLegacySeedMigration(
-    rawBuiltinRecords: readonly SkillProductRecord[],
-    catalog: readonly BuiltinCatalogEntry[],
-  ): Promise<void> {
-    if (!rawBuiltinRecords.length || !catalog.length || await readLegacySeedMigrationMarker(this.dir)) return;
-    await this.withDistributedLocks([
-      LEGACY_SEED_MIGRATION_LOCK_KEY,
-      ...catalog.map((entry) => `skill-name:${entry.name}`),
-    ], async () => {
-      if (await readLegacySeedMigrationMarker(this.dir)) return;
-      const outcome = await this.migrateLegacySeedGovernance(rawBuiltinRecords, catalog);
-      if (outcome.unresolved === 0) await writeLegacySeedMigrationMarker(this.dir);
-    });
-  }
-
-  private async migrateLegacySeedRecord(
-    legacy: SkillProductRecord,
-    source: BuiltinCatalogEntry,
-    rawByIdentity: ReadonlyMap<string, SkillProductRecord>,
-    deleted: boolean,
-  ): Promise<boolean> {
-    const raw = rawByIdentity.get(source.identity);
-    const existing = await readBuiltinGovernanceOverlay(this.dir, source.identity);
-    if (existing) {
-      if (deleted && !existing.deleted) {
-        await writeBuiltinGovernanceOverlay(this.dir, {
-          ...existing,
-          sourceDigest: source.sourceDigest,
-          sourceVersion: source.sourceVersion,
-          sourceVisibility: raw?.visibility ?? existing.sourceVisibility,
-          revision: existing.revision + 1,
-          deleted: true,
-        });
-      }
-      await rm(legacy.path, { recursive: true, force: true });
-      await fsyncParent(legacy.path).catch(() => undefined);
-      return true;
-    }
-    if (!raw) return false;
-    await writeBuiltinGovernanceOverlayIfAbsent(this.dir, {
-      schemaVersion: 1,
-      identity: source.identity,
-      name: source.name,
-      tenantId: source.tenantId,
-      sourceDigest: source.sourceDigest,
-      sourceVersion: source.sourceVersion,
-      sourceVisibility: raw.visibility,
-      revision: Math.max(1, legacy.revision ?? 1),
-      enabled: legacy.enabled,
-      reviewed: legacy.reviewed,
-      visibility: legacy.visibility,
-      deleted,
-    });
-    const written = await readBuiltinGovernanceOverlay(this.dir, source.identity);
-    if (deleted && written && !written.deleted) {
-      await writeBuiltinGovernanceOverlay(this.dir, {
-        ...written,
-        sourceDigest: source.sourceDigest,
-        sourceVersion: source.sourceVersion,
-        sourceVisibility: raw.visibility,
-        revision: written.revision + 1,
-        deleted: true,
-      });
-    }
-    await rm(legacy.path, { recursive: true, force: true });
-    await fsyncParent(legacy.path).catch(() => undefined);
-    return true;
-  }
-
   private async applyBuiltinGovernance(
     record: SkillProductRecord,
   ): Promise<SkillProductRecord | undefined> {
@@ -1157,21 +939,10 @@ export class SkillRegistry {
     });
   }
 
-  private requireSkill(name: string, viewer?: SkillViewer): Skill {
-    return skillFromRecord(this.requireRecord(name, viewer));
-  }
-
   private async requireAvailableSkill(name: string, viewer?: SkillViewer): Promise<Skill> {
     const skill = viewer?.tenantId ? await this.loadFor(name, viewer) : undefined;
     if (!skill) throw new Error(`未找到技能 ${name}`);
     return skill;
-  }
-
-  private requireRecord(name: string, viewer?: SkillViewer): SkillProductRecord {
-    const record = this.records.find((item) => item.name === name
-      && (!viewer || this.visibleTo(skillFromRecord(item), viewer)));
-    if (!record) throw new Error(`未找到技能 ${name}`);
-    return record;
   }
 
   private requireManageableRecord(name: string, viewer?: SkillViewer, preferReviewed = false): SkillProductRecord {
@@ -1235,207 +1006,6 @@ function restrictiveOverlayVisibility(
   return overlay.visibility;
 }
 
-async function readBuiltinCatalogEntries(root: string): Promise<BuiltinCatalogEntry[]> {
-  const catalogRoot = join(resolve(root), BUILTIN_GOVERNANCE_DIR, BUILTIN_CATALOG_DIR);
-  let files;
-  try {
-    files = await readdir(catalogRoot, { withFileTypes: true });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
-    throw error;
-  }
-  const entries = await Promise.all(files
-    .filter((file) => file.isFile() && file.name.endsWith('.json'))
-    .map(async (file) => {
-      const value = JSON.parse(await readFile(join(catalogRoot, file.name), 'utf8')) as unknown;
-      if (!isBuiltinCatalogEntry(value)) throw new Error(`内置技能 catalog entry 无效：${file.name}`);
-      const expectedName = `${createHash('sha256').update(builtinCatalogEntryKey(value)).digest('hex')}.json`;
-      if (file.name !== expectedName) throw new Error(`内置技能 catalog entry 文件名无效：${file.name}`);
-      return value;
-    }));
-  return entries.sort(compareBuiltinCatalogEntry);
-}
-
-async function writeBuiltinCatalogEntry(root: string, entry: BuiltinCatalogEntry): Promise<void> {
-  const catalogRoot = join(resolve(root), BUILTIN_GOVERNANCE_DIR, BUILTIN_CATALOG_DIR);
-  await mkdir(catalogRoot, { recursive: true, mode: 0o700 });
-  const filename = `${createHash('sha256').update(builtinCatalogEntryKey(entry)).digest('hex')}.json`;
-  const target = join(catalogRoot, filename);
-  try {
-    const existing = JSON.parse(await readFile(target, 'utf8')) as unknown;
-    if (!isBuiltinCatalogEntry(existing) || builtinCatalogEntryKey(existing) !== builtinCatalogEntryKey(entry)) {
-      throw new Error(`内置技能 catalog entry 冲突：${filename}`);
-    }
-    return;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-  }
-  const temp = join(catalogRoot, `.${filename}.${randomUUID()}.tmp`);
-  try {
-    await writeFile(temp, `${JSON.stringify(entry, null, 2)}\n`, { flag: 'wx' });
-    await fsyncFile(temp);
-    await rename(temp, target);
-    await fsyncParent(target);
-  } catch (error) {
-    await rm(temp, { force: true });
-    throw error;
-  }
-}
-
-function isBuiltinCatalogEntry(value: unknown): value is BuiltinCatalogEntry {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const entry = value as Partial<BuiltinCatalogEntry>;
-  return typeof entry.identity === 'string' && /^[a-f0-9]{64}$/.test(entry.identity)
-    && typeof entry.name === 'string' && typeof entry.tenantId === 'string'
-    && typeof entry.relativePath === 'string'
-    && typeof entry.sourceDigest === 'string' && /^[a-f0-9]{64}$/.test(entry.sourceDigest)
-    && typeof entry.sourceVersion === 'string' && typeof entry.seedEligible === 'boolean';
-}
-
-function builtinCatalogEntryKey(entry: BuiltinCatalogEntry): string {
-  return `${entry.identity}\0${entry.sourceDigest}\0${entry.sourceVersion}\0${entry.seedEligible ? '1' : '0'}`;
-}
-
-function compareBuiltinCatalogEntry(a: BuiltinCatalogEntry, b: BuiltinCatalogEntry): number {
-  return builtinCatalogEntryKey(a).localeCompare(builtinCatalogEntryKey(b));
-}
-
-function builtinCatalogFingerprint(catalog: readonly BuiltinCatalogEntry[]): string {
-  const hash = createHash('sha256');
-  for (const entry of catalog) hash.update(`${builtinCatalogEntryKey(entry)}\0`);
-  return hash.digest('hex');
-}
-
-function legacyTombstoneRelativePath(root: string, tombstonePath: string): string {
-  const tombstoneRoot = join(resolve(root), SKILL_TOMBSTONES_DIR);
-  const relativePath = relative(tombstoneRoot, resolve(tombstonePath)).split(sep).join('/');
-  if (!relativePath || relativePath === '..' || relativePath.startsWith('../')) {
-    throw new Error(`Legacy tombstone 路径越界：${tombstonePath}`);
-  }
-  return relativePath;
-}
-
-function legacyTombstoneMigrationStatePath(root: string, tombstonePath: string): string {
-  const relativePath = legacyTombstoneRelativePath(root, tombstonePath);
-  const filename = `${createHash('sha256').update(relativePath).digest('hex')}.json`;
-  return join(resolve(root), BUILTIN_GOVERNANCE_DIR, BUILTIN_MIGRATIONS_DIR,
-    LEGACY_TOMBSTONE_STATE_DIR, filename);
-}
-
-async function readLegacyTombstoneMigrationState(
-  root: string,
-  tombstonePath: string,
-): Promise<LegacyTombstoneMigrationState | undefined> {
-  const path = legacyTombstoneMigrationStatePath(root, tombstonePath);
-  let value: unknown;
-  try {
-    value = JSON.parse(await readFile(path, 'utf8')) as unknown;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    log.warn({ path, err: String(error) }, 'ignoring invalid legacy tombstone migration state');
-    return undefined;
-  }
-  if (!isLegacyTombstoneMigrationState(value)
-    || value.tombstoneRelativePath !== legacyTombstoneRelativePath(root, tombstonePath)) {
-    log.warn({ path }, 'ignoring invalid legacy tombstone migration state');
-    return undefined;
-  }
-  return value;
-}
-
-function isLegacyTombstoneMigrationState(value: unknown): value is LegacyTombstoneMigrationState {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const state = value as Partial<LegacyTombstoneMigrationState>;
-  return state.schemaVersion === 1
-    && typeof state.tombstoneRelativePath === 'string' && state.tombstoneRelativePath.length > 0
-    && typeof state.catalogFingerprint === 'string' && /^[a-f0-9]{64}$/.test(state.catalogFingerprint)
-    && ['no-candidate', 'digest-mismatch', 'ambiguous', 'source-unavailable'].includes(String(state.result))
-    && (state.inventoryFingerprint === undefined
-      || typeof state.inventoryFingerprint === 'string' && /^[a-f0-9]{64}$/.test(state.inventoryFingerprint))
-    && (state.contentDigest === undefined
-      || typeof state.contentDigest === 'string' && /^[a-f0-9]{64}$/.test(state.contentDigest))
-    && (state.result === 'no-candidate'
-      || typeof state.inventoryFingerprint === 'string' && typeof state.contentDigest === 'string');
-}
-
-function sameLegacyTombstoneMigrationState(
-  left: LegacyTombstoneMigrationState | undefined,
-  right: LegacyTombstoneMigrationState,
-): boolean {
-  return left?.schemaVersion === right.schemaVersion
-    && left.tombstoneRelativePath === right.tombstoneRelativePath
-    && left.inventoryFingerprint === right.inventoryFingerprint
-    && left.contentDigest === right.contentDigest
-    && left.catalogFingerprint === right.catalogFingerprint
-    && left.result === right.result;
-}
-
-async function writeLegacyTombstoneMigrationState(
-  root: string,
-  tombstonePath: string,
-  state: LegacyTombstoneMigrationState,
-): Promise<void> {
-  const target = legacyTombstoneMigrationStatePath(root, tombstonePath);
-  await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-  const temp = join(dirname(target), `.${randomUUID()}.tmp`);
-  try {
-    await writeFile(temp, `${JSON.stringify(state, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
-    await fsyncFile(temp);
-    await rename(temp, target);
-    await fsyncParent(target);
-  } catch (error) {
-    await rm(temp, { force: true });
-    throw error;
-  }
-}
-
-async function removeLegacyTombstoneMigrationState(root: string, tombstonePath: string): Promise<void> {
-  const target = legacyTombstoneMigrationStatePath(root, tombstonePath);
-  await rm(target, { force: true });
-  await fsyncParent(target).catch(() => undefined);
-}
-
-async function readLegacySeedMigrationMarker(root: string): Promise<boolean> {
-  const path = join(
-    resolve(root),
-    BUILTIN_GOVERNANCE_DIR,
-    BUILTIN_MIGRATIONS_DIR,
-    `${LEGACY_SEED_MIGRATION_ID}.done`,
-  );
-  let value;
-  try {
-    value = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
-    throw error;
-  }
-  if (value.schemaVersion !== 1 || value.migration !== LEGACY_SEED_MIGRATION_ID
-    || typeof value.completedAt !== 'string') {
-    throw new Error(`Skill legacy migration marker 无效：${path}`);
-  }
-  return true;
-}
-
-async function writeLegacySeedMigrationMarker(root: string): Promise<void> {
-  const migrationRoot = join(resolve(root), BUILTIN_GOVERNANCE_DIR, BUILTIN_MIGRATIONS_DIR);
-  await mkdir(migrationRoot, { recursive: true, mode: 0o700 });
-  const target = join(migrationRoot, `${LEGACY_SEED_MIGRATION_ID}.done`);
-  const temp = join(migrationRoot, `.${LEGACY_SEED_MIGRATION_ID}.${randomUUID()}.tmp`);
-  try {
-    await writeFile(temp, `${JSON.stringify({
-      schemaVersion: 1,
-      migration: LEGACY_SEED_MIGRATION_ID,
-      completedAt: new Date().toISOString(),
-    }, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
-    await fsyncFile(temp);
-    await rename(temp, target);
-    await fsyncParent(target);
-  } catch (error) {
-    await rm(temp, { force: true });
-    throw error;
-  }
-}
-
 async function writeBuiltinGovernanceOverlay(
   root: string,
   overlay: BuiltinGovernanceOverlay,
@@ -1452,32 +1022,6 @@ async function writeBuiltinGovernanceOverlay(
   } catch (error) {
     await rm(temp, { force: true });
     throw error;
-  }
-}
-
-async function writeBuiltinGovernanceOverlayIfAbsent(
-  root: string,
-  overlay: BuiltinGovernanceOverlay,
-): Promise<void> {
-  const overlayRoot = join(resolve(root), BUILTIN_GOVERNANCE_DIR);
-  await mkdir(overlayRoot, { recursive: true, mode: 0o700 });
-  const target = join(overlayRoot, `${overlay.identity}.json`);
-  const temp = join(overlayRoot, `.${overlay.identity}.${randomUUID()}.tmp`);
-  try {
-    await writeFile(temp, `${JSON.stringify(overlay, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
-    await fsyncFile(temp);
-    try {
-      await link(temp, target);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      await readBuiltinGovernanceOverlay(root, overlay.identity);
-      return;
-    }
-    await fsyncParent(target);
-  } catch (error) {
-    throw error;
-  } finally {
-    await rm(temp, { force: true });
   }
 }
 
@@ -1556,45 +1100,6 @@ function recordVisibleInTenant(record: SkillProductRecord, tenantId: string): bo
   return record.tenantId === tenantId
     || record.allowedTenantIds?.includes(tenantId) === true
     || record.allowedTenantIds?.includes('*') === true;
-}
-
-function isSeedEligibleBuiltin(record: SkillProductRecord): boolean {
-  return record.reviewed && record.visibility === 'public'
-    && !record.ownerUserId && !record.submittedByUserId;
-}
-
-function legacyRelativePathCandidates(record: SkillProductRecord): string[] {
-  const tenantPrefix = record.tenantId === 'default'
-    ? ''
-    : `${TENANT_SKILLS_DIR}/${record.tenantId}/`;
-  if (record.ownerUserId) {
-    return [`${tenantPrefix}${USER_SKILLS_DIR}/${record.ownerUserId}/${record.name}`];
-  }
-  return [
-    `${tenantPrefix}${record.name}`,
-    `${tenantPrefix}${PUBLIC_SKILLS_DIR}/${record.name}`,
-  ];
-}
-
-async function readLegacySeedCandidate(
-  path: string,
-  source: BuiltinCatalogEntry,
-): Promise<SkillProductRecord | undefined> {
-  let metadata;
-  try {
-    metadata = parseSkillProductMetadata(JSON.parse(await readFile(join(path, PRODUCT_RECORD_FILE), 'utf8')));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    log.warn({ path, err: String(error) }, 'skipping invalid legacy seed candidate metadata');
-    return undefined;
-  }
-  if (metadata.name !== source.name || metadata.tenantId !== source.tenantId
-    || metadata.version !== source.sourceVersion) return undefined;
-  return normalizeSkillProductRecord({
-    id: `${metadata.tenantId}:${metadata.ownerUserId ?? 'public'}:${metadata.name}`,
-    path,
-    ...metadata,
-  });
 }
 
 function skillFromRecord(
@@ -1712,10 +1217,6 @@ async function contentDigest(root: string, options: { immutable?: boolean } = {}
   const digest = hash.digest('hex');
   if (options.immutable) immutableDigestCache.set(cacheKey, identity, digest);
   return digest;
-}
-
-async function artifactFingerprint(root: string): Promise<string> {
-  return artifactEntriesFingerprint(await artifactEntries(root));
 }
 
 function artifactEntriesFingerprint(entries: readonly ArtifactEntryIdentity[]): string {

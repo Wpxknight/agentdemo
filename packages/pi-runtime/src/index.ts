@@ -1,9 +1,7 @@
 export * from './pi/agent.js';
-export * from './pi/compatibility.js';
 export * from './pi/compaction.js';
 export { EventCodec } from './pi/event-codec.js';
 export type { EventCodecOptions } from './pi/event-codec.js';
-export * from './pi/message-codec.js';
 export * from './pi/models.js';
 export * from './pi/session.js';
 export * from './pi/skills.js';

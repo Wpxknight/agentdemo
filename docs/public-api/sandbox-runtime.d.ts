@@ -208,7 +208,6 @@ export interface SandboxSettings {
 export interface SandboxSettingsRecord {
     settings: SandboxSettings;
     encryptedApiKey?: string;
-    legacyApiKey?: string;
 }
 export type SandboxSettingsSecretUpdate = {
     action: 'retain';
@@ -541,14 +540,12 @@ import type { SandboxSpec } from './types.js';
 export type SandboxProfileEnvType = 'code' | 'browser';
 export type SandboxProfileRuntimeRole = 'sandbox-reader' | 'sandbox-diag';
 export interface SandboxProfile {
-    /** Stable selector. Legacy callers may omit it; normalization falls back to name. */
-    id?: string;
+    id: string;
     name: string;
     template?: string;
     description: string;
-    /** Legacy callers may omit these; desktop and sandbox-reader defaults apply. */
-    envType?: SandboxProfileEnvType;
-    runtimeRole?: SandboxProfileRuntimeRole;
+    envType: SandboxProfileEnvType;
+    runtimeRole: SandboxProfileRuntimeRole;
     image?: string;
     domain?: string;
     namespace?: string;
@@ -782,13 +779,9 @@ export interface LoadedSandboxSettings {
     apiKey?: string;
     apiKeySet: boolean;
 }
-export interface ParsedStoredSandboxSettings {
-    settings: SandboxSettings;
-    legacyApiKey?: string;
-}
 export declare function parseSandboxSettings(value: unknown): SandboxSettings;
-/** 读取显式 v2 设置，或把旧 provider/apiKey JSON 转换为新模式并提取明文 key。 */
-export declare function parseStoredSandboxSettings(value: unknown): ParsedStoredSandboxSettings;
+/** 把当前启动配置投影为页面设置；只用于展示，不写回数据库。 */
+export declare function sandboxConfigToSettings(config: SandboxConfig): SandboxSettings;
 /** key 只与模式和规范化远端目标绑定；AIOS placement 不改变凭据目标。 */
 export declare function credentialTargetForSandboxSettings(settings: SandboxSettings): string;
 /** 把已验证、已解密的页面设置转换成 provider 运行配置。 */

@@ -978,13 +978,13 @@ describe('scheduler runtime boundaries', () => {
     expect(completeFire).toContain("updateTable('scheduler_fires')");
     expect(completeFire).not.toContain("insertInto('task_agent_runs')");
     expect(completeFire).toContain('onDuplicateKeyUpdate');
-    expect(completeFire).toContain('compatibilityStatus(input.result)');
-    expect(completeFire).toContain('compatibilityDetail(input.result)');
+    expect(completeFire).toContain('taskRunStatus(input.result)');
+    expect(completeFire).toContain('taskRunDetail(input.result)');
     expect(completeFire).not.toContain("status: 'success', detail: input.runId");
-    const compatibilityDetail = source.slice(
-      source.indexOf('function compatibilityDetail'), source.indexOf('function parsePayload'),
+    const taskRunDetail = source.slice(
+      source.indexOf('function taskRunDetail'), source.indexOf('function parsePayload'),
     );
-    expect(compatibilityDetail).toContain('durableStatus: result.status');
+    expect(taskRunDetail).not.toContain('durableStatus');
   });
 
   it('MySQL persists bound Runs with exact-token recovery fencing', async () => {
