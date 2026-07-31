@@ -2,15 +2,28 @@
 
 ## 1. 当前结论
 
-AIoP 当前只有一条 Agent 执行路径：Durable Run 包装 Pi。Pi 是会话内 Agent loop 和 Session 的事实源，AIoP 不维护第二套 Agent loop，也不存在运行时 Kernel 选择。
+AIoP 当前只有一条 Agent 执行路径：`DurableRunManager` 包装 Pi `AgentHarness`/`Session`。Pi 是会话内 Agent loop 和 Session Tree 的事实源；AIoP 不维护第二套 loop，也没有运行时 Kernel 选择或兼容 `AgentRuntime` 接口。
 
 | 层次 | 所有权 | 实现 |
 | --- | --- | --- |
-| Model stream、Agent loop、Turn、Session、Compaction | Pi 复用 | `@earendil-works/pi-agent-core`、`@earendil-works/pi-ai` |
-| Agent/Session/Codec/Tool bridge | AIoP 薄适配 | `packages/pi-runtime/src/pi/` |
+| Model stream、Agent loop、Turn、Session、Compaction | Pi 复用 | `@earendil-works/pi-agent-core@0.82.1`、`@earendil-works/pi-ai@0.82.1` |
+| AgentHarness/Session/Event codec/Tool bridge | AIoP 薄适配 | `packages/pi-runtime/src/pi/` |
 | Run、Attempt、Lease、Turn commit、Inbox、取消、恢复 | AIoP 自研 | `packages/pi-runtime/src/run/` |
 | Tool policy、approval、ledger、audit、并发 | AIoP 自研 | `packages/pi-runtime/src/tools/` |
 | Memory/MySQL product store 与 Pi SessionStorage | AIoP 自研 | `packages/pi-runtime/src/store/` |
+
+### 1.1 目录与职责
+
+```text
+packages/pi-runtime/src/
+├── run/                 # 跨请求控制：Run、Attempt、Lease、Turn、Inbox、取消、限制、恢复
+├── pi/                  # 会话内执行：AgentHarness、Session、模型、事件、Skill、Tool bridge
+├── tools/               # Tool policy、approval、ledger、audit、registry、并发
+├── store/               # Durable Store、Pi SessionStorage、Memory/MySQL 实现
+└── model/               # 模型调用并发控制
+```
+
+调用方向是 `run/manager.ts → pi/agent.ts → tools/governance.ts`。`store/` 被三者依赖，但不反向调用执行循环。
 
 ## 2. Durable Run 状态流
 
@@ -24,29 +37,43 @@ stateDiagram-v2
   running --> failed: deterministic failure
   running --> cancelled: durable cancellation
   running --> recovery_required: unknown side effect
-  running --> queued: recoverable worker loss
+  running --> queued: lease expired / recoverable worker loss
 ```
 
-`packages/pi-runtime/src/run/manager.ts` 负责主流程；`attempt.ts`、`lease.ts`、`cancellation.ts`、`inbox.ts`、`limits.ts`、`recovery.ts` 分别封装状态边界。Memory 与 MySQL 装配位于 `memory-assembly.ts` 和 `mysql-assembly.ts`。
+`packages/pi-runtime/src/run/manager.ts` 负责主流程；状态边界分别位于 `packages/pi-runtime/src/run/attempt.ts`、`lease.ts`、`cancellation.ts`、`inbox.ts`、`limits.ts` 和 `recovery.ts`。Memory 与 MySQL 装配位于 `packages/pi-runtime/src/run/memory-assembly.ts` 和 `packages/pi-runtime/src/run/mysql-assembly.ts`。
 
 ## 3. Turn 与 Session 提交
 
 Pi Session 可以产生未提交分支。AIoP 只有在 Durable Turn 提交成功后才推进 `committed_leaf_id`：
 
 1. Pi 在当前 Session leaf 上执行 Turn。
-2. Tool Governance 记录审批、ledger 和审计结果。
+2. Tool Governance 产生 Interaction 与 Ledger 更新，并通过事件 codec 形成 durable event。
 3. Durable Store 以 lease token/fencing 校验所有权。
 4. Turn commit 写入 Pi session id、leaf id 与 entry sequence。
 5. `src/agent/projections.ts` 从 committed leaf 重建产品 message projection。
 
 失租、取消或提交冲突时不能发布终态，也不能把未提交 Pi 分支投影为产品历史。
 
+一次正常 Turn 的数据形态变化如下：
+
+```text
+AgentInputMessage
+  → Pi user message / Session entry
+  → AgentHarnessEvent
+  → AgentRunEvent + Interaction/Ledger facts
+  → CommitTurnInput
+  → agent_turn_commits / agent_run_events / committed_leaf_id
+  → 产品 message projection
+```
+
+这里最重要的边界是：Harness event 可以实时输出，但只有通过 `commitTurn()` 的事实才可参与恢复和产品历史。
+
 ## 4. Append、steer 与 follow-up
 
 - 同 Worker 的活跃 Run 可使用 Pi `steer()` 或 `followUp()`。
 - 跨 Worker 消息写入 `agent_run_inbox_messages`，由持有 lease 的 Attempt 领取。
 - Inbox 使用 idempotency key、sequence、claim token 和过期时间；消息消费凭证与 Pi Session entry 对账。
-- Run 终态或 append cutoff 后拒绝新消息。
+- Run 终态或 `append_closed_at` 截止后拒绝新消息；append 接口要求 idempotency key。
 
 ## 5. Tool 副作用与恢复
 
@@ -62,7 +89,7 @@ Pi Session 可以产生未提交分支。AIoP 只有在 Durable Turn 提交成�
 
 ## 6. 并发与 fencing
 
-- 同一 Run 只有持有当前 lease token 的 Attempt 能提交 Turn 或终态。
+- 同一 Run 只有持有当前 worker、attempt 与 fencing token 的 Attempt 能提交 Turn 或终态。
 - 旧 supervisor、旧 Attempt、过期 transaction context 和迟到 Tool result 都必须被拒绝。
 - Memory Store 的 transaction overlay 与 MySQL transaction 保持合同一致；嵌套事务只有在父上下文仍 active 时才能合并。
 - 模型并发位于 `packages/pi-runtime/src/model/concurrency.ts`；Tool 并发位于 `packages/pi-runtime/src/tools/concurrency.ts`。
@@ -75,3 +102,11 @@ Pi Session 可以产生未提交分支。AIoP 只有在 Durable Turn 提交成�
 - Durable tests：`tests/pi-runtime/durable-run.test.ts`、`tests/pi-runtime/recovery.test.ts`
 - Codec/Session tests：`tests/pi-runtime/`
 - HTTP tests：`tests/http-agent-runs.test.ts`
+
+## 8. 容易误改的地方
+
+- 不要在 HTTP handler、Scheduler 或产品 Tool 中直接驱动 Pi Session；统一通过 `DurableRunRuntime`。
+- 不要把 live SSE 是否成功写出当成 Run 是否成功提交。
+- 不要用 `current_leaf_id` 代替 `committed_leaf_id` 恢复，前者可能包含失败 Attempt 的未提交分支。
+- 不要在失去 lease 后补写终态，即使模型或工具已经返回成功。
+- `kernel` 当前固定为 `pi`，它是持久记录字段，不是运行时选择开关。

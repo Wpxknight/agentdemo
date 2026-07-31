@@ -9,27 +9,40 @@
 已具备：
 
 - HTTP、CLI、Scheduler 统一 Agent Runtime。
-- Legacy 与 LangGraph 双 Kernel 及 binding。
-- MySQL Checkpoint、Interaction、Tool Ledger、Agent Run Lease 和运行中心。
+- 单一 Durable Pi Runtime；旧 Kernel、LangGraph 和 compatibility surface 已删除。
+- MySQL Pi Session、Interaction、Tool Ledger、Agent Run Lease、Inbox、Event 和运行中心。
 - Local/OIDC/AIOS 身份与多租户 Store。
 - Skill、MCP、三种 Sandbox Provider。
 - React 管理与聊天界面。
-- Kubernetes 双副本清单。
+- 单副本 staging 清单与双副本通用部署模板。
+
+### 2.1 如何判断路线项仍未实现
+
+路线项只有同时满足“源码入口、持久化语义、测试、部署/运维入口”才可移入当前能力。例如存在接口或表字段但没有 supervisor 和故障测试，不能写成已经具备自动接管。
+
+| 能力 | 当前已有证据 | 仍缺什么 |
+| --- | --- | --- |
+| Durable Run | manager、lease/fencing、Memory/MySQL tests | 通用过期 Run 自动扫描接管 |
+| Durable Interaction | 表、replay、resume tests | 全部交互类型的跨副本通知/协调 |
+| Scheduler recovery | bound Fire inspection/resume tests | 与独立 Worker 部署的生产验证 |
+| 多副本部署 | 通用 2-replica manifest | 本地下载、连接、handle 与直接交互协调 |
+| 可观测性 | pino、audit、run events、ledger | metrics exporter、告警和容量基线 |
+| 数据升级 | 单一 baseline 与 migration tests | 历史数据库转换/dry-run/回滚工具 |
 
 ## 3. P0：可靠性与生产闭环
 
 ### 3.1 Agent Run 自动接管
 
-当前 Lease 提供 fencing，但运行接管仍需明确触发和恢复策略。建议补充：
+当前 HTTP Run 可显式 resume，Scheduler 可恢复 bound fire，但尚无通用的过期 Run 自动扫描 supervisor。建议补充：
 
 - 扫描过期 running/waiting Run。
 - 区分可安全恢复、需要人工确认和不可恢复。
-- 恢复前检查 graph version、pending interaction 和 tool ledger。
+- 恢复前检查 committed Pi leaf、pending interaction、inbox 和 tool ledger。
 - 建立恢复审计与运维手册。
 
 ### 3.2 Durable Interaction 跨副本唤醒
 
-当前 Interaction 事实写入数据库，但 waiter 是进程内 Map。建议采用数据库短轮询、数据库通知、消息队列或专用 Run Worker，使解析请求无论落到哪个副本都能唤醒拥有执行权的 Worker，并为原进程已退出的情况触发安全恢复。
+Agent Interaction 事实已写入数据库，但 live Attempt 与部分直接 Tool approval/question 仍有进程内协调。建议采用数据库通知、消息队列或专用 Run Worker，使解析请求无论落到哪个副本都能唤醒拥有执行权的 Worker，并为原进程已退出的情况触发安全恢复。
 
 ### 3.3 Tool 副作用幂等
 
@@ -40,7 +53,7 @@
 - 可补偿。
 - 不可自动恢复。
 
-Tool Ledger 应按 capability 决定自动复用、查询确认或 recovery_required，而不是统一策略。
+当前已有 `read/retryable_write/non_idempotent_write` capability 和 `recovery_required`；后续应为关键外部系统补齐原生幂等键、结果查询与补偿 adapter，减少人工判定。
 
 ### 3.4 多副本下载与本地状态
 
@@ -99,17 +112,16 @@ MCP 连接、Sandbox handle 和 generation 也是副本本地状态，需要在�
 - 对 privileged Sandbox Profile 增加强制审计与配额。
 - 将配置中的开发默认 Secret 在生产模式升级为启动失败。
 
-## 6. P1：数据生命周期
+## 6. P1：数据生命周期与升级
 
-- 实现 Checkpoint、Agent Run Event、Tool Ledger 和 Interaction 的保留作业。
+- 实现 Pi Session Entry、Agent Run Event、Tool Ledger 和 Interaction 的保留作业。
 - 定义审计不可删除周期。
 - 增加备份恢复演练。
 - 为大消息、截图和长期会话评估对象存储。
-- 为迁移增加生产前 dry-run 和兼容检查。
+- 为 `src/db/migrations/0001_baseline.sql` 之外的存量环境提供显式 schema 转换、dry-run 和兼容检查。
 
 ## 7. P2：执行能力
 
-- 将 LangGraph 图按稳定子图拆分，例如模型循环、审批、Sandbox 作业。
 - 基于工具 capability 做安全并行度控制。
 - 引入全局与租户级 Agent/Sandbox 并发配额。
 - 为长任务提供独立 Worker/Queue，降低 HTTP Pod 压力。
@@ -127,9 +139,8 @@ MCP 连接、Sandbox handle 和 generation 也是副本本地状态，需要在�
 
 ## 9. 暂不建议
 
-- 一次性删除 Legacy Kernel。
-- 把所有业务状态塞入 LangGraph State。
-- 依赖 Checkpoint 取代 Agent Run 表。
+- 重新引入第二套通用 Agent loop 或 Kernel 选择器。
+- 依赖 Pi Session 取代 Agent Run、Interaction 或 Tool Ledger。
 - 自动重放所有 started 工具调用。
 - 仅用提示词处理权限与审批。
 - 在未解决本地状态前无约束扩展副本数。
@@ -146,11 +157,13 @@ MCP 连接、Sandbox handle 和 generation 也是副本本地状态，需要在�
 5. 故障注入和兼容测试是什么。
 6. 是否增加新的本地状态或运维负担。
 
+建议每个路线项在合并前补一段“删除了什么旧假设”。例如引入专用 Worker 后，应明确 HTTP Pod 是否仍可本地持有活跃 Attempt；否则新旧模型会长期并存。
+
 ## 11. 事实依据
 
 - `src/runtime.ts` 和 `src/server/http.ts` 的文件规模与职责。
 - `web/src/App.tsx` 的页面集中度。
 - `src/db/store.ts` 的跨领域接口。
-- `src/agent/runtime.ts`、`run-coordinator.ts`、`tool-ledger/store.ts` 的恢复边界。
+- `packages/pi-runtime/src/run/`、`packages/pi-runtime/src/tools/` 与 `src/agent/run-center.ts` 的恢复边界。
 - `deploy/k8s/deployment-server.yaml` 的双副本与本地容器形态。
 - 当前 package manifests 中未包含专用队列和 metrics SDK。

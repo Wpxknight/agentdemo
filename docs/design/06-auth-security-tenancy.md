@@ -67,6 +67,19 @@ AIOS 支持 userinfo 或 JWKS 验证，使用固定系统 id、允许的父页�
 
 `requirePermission` 用于 API 动作，`canManageUsersOf` 防止租户管理员跨租户管理用户。
 
+### 3.1 一次认证请求的真实链路
+
+```text
+Authorization/Cookie/AIOS token
+  → AuthProvider 校验
+  → RequestContext { tenantId, userId, role }
+  → requirePermission / ownership 检查
+  → Store 方法再次带 tenant/user 条件
+  → ToolExecutionContext / Audit detail
+```
+
+任意一层缺少 tenant 条件都可能造成越权。HTTP 层的认证不能替代 Store 查询条件，Store 的 tenant 字段也不能替代动作权限检查。
+
 ## 4. 多租户数据隔离
 
 ~~~mermaid
@@ -86,7 +99,7 @@ flowchart TD
 
 - 会话与消息：tenant + user + session。
 - Agent Run：tenant + run，并校验 user/session binding。
-- Interaction、Tool Ledger、Checkpoint：tenant/run/thread 组合。
+- Interaction、Tool Ledger、Run Event 与 Pi Session：tenant/run/session 组合，并附 attempt/turn/tool call 标识。
 - 定时任务：tenant + 创建用户。
 - 用户凭据：tenant + user + provider。
 - 租户设置：tenant + setting key。
@@ -100,8 +113,8 @@ Memory Store 必须保持与 MySQL Store 相同的授权语义，不能因开发
 
 `SecretBox` 使用 AES-256-GCM。密钥通过 SHA-256 从独立 secret 和 domain 派生，密文包含版本、IV、tag 和 ciphertext。
 
-- `AIOP_SETTINGS_SECRET` 是平台设置密钥首选。
-- 开发环境可回退 `AIOP_JWT_SECRET`，生产必须分离。
+- `AIOP_SETTINGS_SECRET` 是平台设置加密密钥；未配置时使用固定开发占位密钥并告警，不复用 JWT secret。
+- `AIOP_JWT_SECRET` 独立用于 AIoP JWT；未配置时同样只允许开发占位行为。
 - API Key 更新使用 keep/set/clear 语义，避免空值误删。
 - 公开响应只返回是否设置和掩码预览。
 - 用户下游凭据存储于 `user_credentials`，按用户与 provider 隔离。
@@ -177,7 +190,8 @@ Prompt、模型选择和 Sandbox 内用户身份都不能跳过此链路。
 
 - Hook 为 fail-open，不适合作为唯一合规控制。
 - 内存 Store 只适合开发，重启丢失数据。
-- JWT 默认开发密钥会记录告警，生产必须显式设置。
+- JWT 与设置加密都有开发占位密钥，生产必须分别显式设置 `AIOP_JWT_SECRET` 与 `AIOP_SETTINGS_SECRET`。
+- Agent Interaction 已持久化，但直接 Tool 调用使用的部分审批/提问状态仍是进程内对象；通用双副本清单不能据此推断所有交互都可跨副本恢复。
 - Sandbox 隔离不能替代平台 RBAC。
 - AIOS/JIT 身份映射依赖管理员配置，错误映射可能造成越权，必须测试 claims 样例。
 
@@ -194,3 +208,11 @@ Prompt、模型选择和 Sandbox 内用户身份都不能跳过此链路。
 - `src/server/downloads.ts`
 - `src/config/schema.ts`
 - `src/db/store.ts`
+
+## 13. 安全修改检查清单
+
+- 新增 API 时同时定义认证要求、permission、ownership 与 404/403 信息泄漏策略。
+- 新增持久化查询时检查 Memory/MySQL 是否都强制 tenant，用户私有数据是否还需 user 条件。
+- 新增外部 URL 时复用 SSRF 检查，并明确 redirect、DNS 解析、超时和响应大小。
+- 新增 Secret 时定义加密 domain、keep/set/clear 更新语义、公开掩码和轮换失败行为。
+- 新增 Tool 时不把 prompt、Tool args 或 Sandbox 用户身份当作授权依据。

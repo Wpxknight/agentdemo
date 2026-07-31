@@ -1,6 +1,6 @@
 # 部署与可观测性设计
 
-本文描述当前 Task 12 staging 发布路径。真实环境结果必须写入 `/home/opt/develop/aicoding/aiop/dist/runtime-refactor-migration-rehearsal.md`，不能由文档预先声明成功。
+本文描述当前 staging 与通用 Kubernetes 发布路径。真实环境结果应写入仓库 `dist/`，不能由设计文档预先声明成功。
 
 ## 1. 当前 staging 拓扑
 
@@ -25,7 +25,7 @@ flowchart TB
   API --> Sandbox
 ```
 
-当前 staging manifests 位于 `deploy/dev-k8s/`，namespace `aiop-dev`。`deployment/aiop-server` 是单副本、双容器 Pod，backend 内嵌 Scheduler；MySQL 使用 `ReadWriteOnce` PVC。该环境不采用共享 RWX 存储。
+当前 staging manifests 位于 `deploy/dev-k8s/`，namespace `aiop-dev`。`deployment/aiop-server` 是单副本、双容器 Pod，backend 内嵌 Scheduler；MySQL 使用 `ReadWriteOnce` PVC。通用 `deploy/k8s/` 模板声明两副本和独立 skills PVC，但不代表所有进程内交互与本地资源已经具备无状态跨副本能力。
 
 ## 2. 镜像与发布入口
 
@@ -45,12 +45,21 @@ Makefile 不创建或读取 Secret，不应用示例 Secret，也不对 staging 
 
 ## 4. 进程生命周期与 readiness
 
-Backend 启动顺序：配置校验、Store/迁移、五包装配、外部连接、可选 Scheduler、HTTP listener。SIGINT/SIGTERM 停止接收新请求，再关闭 Scheduler、MCP、Sandbox、下载回收器和 Store。
+Backend 启动顺序：配置校验、Store/基线迁移、五个工作区包装配、外部连接、可选 Scheduler、HTTP listener。SIGINT/SIGTERM 停止接收新请求，再关闭 Scheduler、MCP、Sandbox、下载回收器和 Store。
 
 - `/healthz`：进程存活；
-- `/readyz`：是否接受新流量；
+- `/readyz`：当前实现返回进程可响应，不执行 MySQL/MCP/Sandbox 深度健康检查；
 - MySQL/Dex/backend rollout status：staging 发布门禁；
 - 单个模型、MCP 或 Sandbox 外部故障应体现为领域错误与告警，不泄露 Credential。
+
+### 4.1 启停顺序为什么重要
+
+```text
+启动：配置 → Store/迁移 → Runtime 装配 → 外部扩展 → Scheduler → HTTP listen
+停止：停止接流量 → 停 Scheduler → 取消/收敛活跃工作 → 关 MCP/Sandbox/下载 → 关 Store
+```
+
+如果先关闭 Store，再停止 Scheduler 或活跃 Run，清理路径会失去持久化取消、lease 和审计能力。反过来，readiness 也不应在 migration 与核心装配完成前对外成功。
 
 ## 5. Durable 多进程边界
 
@@ -80,12 +89,12 @@ Backend 启动顺序：配置校验、Store/迁移、五包装配、外部连接
 当前发布只运行 Durable Pi Runtime，不存在执行引擎选择或旧运行路径灰度。灰度单位是不可变镜像 revision、环境流量和 Tool capability：
 
 1. 构建并记录 SHA 镜像；
-2. 完成不可逆迁移前的备份恢复演练；
+2. 若目标不是空库，完成 schema 核对、转换方案和备份恢复演练；
 3. 部署 staging 并执行 HTTP、Scheduler、取消、恢复、Interaction、MCP、Sandbox 验收矩阵；
 4. 回滚前检查 schema、pending inbox、pending Interaction 和未知副作用兼容；
 5. `make rollback-staging` 只回滚应用 revision，不撤销数据库迁移。
 
-迁移 `src/db/migrations/0022_pi_only_runtime.sql` 不可逆。若旧应用不能安全忽略新结构或保留 pending 状态，停止应用回滚并使用已演练的数据库恢复方案。
+当前只有 `src/db/migrations/0001_baseline.sql`。应用 revision 回滚不能自动还原数据库；若历史构建与当前 Pi-only baseline 不兼容，应停止应用回滚并使用已演练的数据库恢复或前向修复方案。
 
 ## 8. 发布证据
 
@@ -111,3 +120,13 @@ Backend 启动顺序：配置校验、Store/迁移、五包装配、外部连接
 - `src/server/http.ts`
 - `packages/pi-runtime/src/run/`
 - `packages/scheduler-runtime/src/`
+
+## 10. 部署排障顺序
+
+1. 先记录 Git SHA、镜像 tag、Deployment revision 和配置版本，不读取 Secret 内容。
+2. 检查 Pod/容器 readiness、重启次数和非敏感日志。
+3. 检查 MySQL migration 版本、连接与锁，不直接手工改 durable 表。
+4. 用 Run id/attempt id/fire id/correlation id 串联 HTTP、Scheduler、Tool 与 Store 事实。
+5. 区分进程本地资源故障和 durable 状态故障，再决定重启、resume、rollback 或数据库恢复。
+
+staging 部署、镜像构建与回滚必须继续通过 `make image`、`make deploy-staging`、`make rollback-staging` 执行。
