@@ -146,8 +146,9 @@ export class SkillRegistry {
   private distributedLockDepth = 0;
 
   constructor(private readonly dir: string, opts: SkillRegistryOptions = {}) {
+    this.dir = resolve(dir);
     this.configuredRecords = opts.records;
-    this.builtinRoots = opts.builtinRoots ?? [];
+    this.builtinRoots = (opts.builtinRoots ?? []).map((root) => resolve(root));
     this.mutationLock = opts.mutationLock;
     this.importPermitLock = opts.importPermitLock ?? opts.mutationLock;
     this.pendingQuota = { ...DEFAULT_PENDING_QUOTA, ...opts.pendingQuota };
@@ -158,7 +159,7 @@ export class SkillRegistry {
     this.verifyContentDigest = opts.verifyContentDigest
       ?? ((path) => contentDigest(path, { immutable: true }));
     this.service = new SkillProductService(
-      opts.env ?? new NodeExecutionEnv({ cwd: dir }),
+      opts.env ?? new NodeExecutionEnv({ cwd: this.dir }),
       opts.loader,
     );
   }

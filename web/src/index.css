@@ -1856,6 +1856,24 @@
     padding-right: 4px;
   }
 
+  .skill-list-empty,
+  .skill-detail-empty,
+  .skill-preview-empty {
+    color: hsl(var(--muted-foreground));
+    font-size: 13px;
+  }
+
+  .skill-list-empty {
+    padding: 18px 8px;
+    text-align: center;
+  }
+
+  .skill-detail-empty,
+  .skill-preview-empty {
+    display: grid;
+    place-items: center;
+  }
+
   .skill-list-item {
     width: 100%;
     border: 1px solid transparent;

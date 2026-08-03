@@ -44,11 +44,12 @@ import {
   Users,
   X,
 } from 'lucide-react';
-import { NAV_ITEMS, defaultLlmConfig, fallbackTools } from './app-data';
+import { NAV_ITEMS, defaultLlmConfig } from './app-data';
 import { MermaidDiagram } from './components/mermaid-diagram';
 import { RunCenterPage } from './components/run-center-page';
 import { createApi, numericSessionId, randomId, readStorage, writeStorage } from './api';
 import { formatSandboxOutputChunk, parseSandboxOutput, sandboxOutputClassNames, sandboxOutputCommand, sandboxOutputLabels } from './sandbox-output';
+import { isPersistedSession } from './session-context';
 import {
   appendSessionTerminal,
   removeSessionTerminals,
@@ -1188,11 +1189,9 @@ export default function App() {
   }, [api]);
 
   useEffect(() => {
-    if (!token || !sessionId) return;
+    if (!token || !isPersistedSession(sessionId, sessions)) return;
     void loadContextUsage(sessionId);
-    if (sessions.some((session) => session.sessionId === sessionId)) {
-      void loadSessionTokenUsage(sessionId);
-    }
+    void loadSessionTokenUsage(sessionId);
   }, [loadContextUsage, loadSessionTokenUsage, sessionId, sessions, token]);
 
   const loadPageData = useCallback(async (target: PageId | 'login' = page) => {
@@ -1975,7 +1974,7 @@ export default function App() {
           <section className="content-shell content-wide">
             {activePage === 'skills' && (
               <SkillsPage
-                tools={skillTools.length ? skillTools : fallbackTools.filter((tool) => tool.category === 'skill')}
+                tools={skillTools}
                 api={api}
                 onImported={() => loadPageData('skills')}
                 onRequestConfirm={requestConfirmDialog}
@@ -2894,29 +2893,11 @@ function renderSandboxOutputSegments(entry: ReturnType<typeof parseSandboxOutput
 }
 
 function skillFileEntries(tool?: ToolSummary): SkillFileEntry[] {
-  if (tool?.fileEntries?.length) return tool.fileEntries;
-  const paths = ['SKILL.md', ...(tool?.files || [])];
-  return paths.map((path) => ({
-    path,
-    name: path.split('/').pop() || path,
-    isDirectory: false,
-    size: 0,
-    updatedAt: '',
-  }));
+  return tool?.fileEntries ?? [];
 }
 
 function skillFiles(tool?: ToolSummary): string[] {
   return skillFileEntries(tool).filter((file) => !file.isDirectory).map((file) => file.path);
-}
-
-function skillPreview(tool?: ToolSummary, selectedFile = 'SKILL.md'): string {
-  const name = toolDisplayName(tool?.name || 'skill');
-  const description = tool?.description || '后端已注册的 AI 助手技能。';
-  const files = skillFiles(tool).map((file) => `- ${file}`).join('\n');
-  if (selectedFile && selectedFile !== 'SKILL.md') {
-    return `# ${selectedFile}\n\n该文件来自技能 ${name} 的目录。\n\n文件内容需要通过后端技能导入或文件浏览能力读取。`;
-  }
-  return `# ${name}\n\n${description}\n\n## Files\n${files}`;
 }
 
 function skillIconFor(tool?: ToolSummary) {
@@ -3181,10 +3162,7 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
   onImported: () => Promise<void>;
   onRequestConfirm: (request: ConfirmDialogRequest) => void;
 }) {
-  const sourceTools = useMemo(
-    () => (tools.length ? tools : fallbackTools.filter((tool) => tool.category === 'skill')),
-    [tools],
-  );
+  const sourceTools = useMemo(() => tools, [tools]);
   const [selectedName, setSelectedName] = useState(sourceTools[0]?.name || '');
   const [selectedFile, setSelectedFile] = useState('SKILL.md');
   const [currentDir, setCurrentDir] = useState('');
@@ -3196,7 +3174,7 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
   const importInputRef = useRef<HTMLInputElement | null>(null);
 
   const selected = sourceTools.find((tool) => tool.name === selectedName) || sourceTools[0];
-  const selectedEntry = fileBody?.entry || skillFileEntries(selected).find((file) => file.path === selectedFile);
+  const selectedEntry = fileBody?.entry;
   const filteredTools = sourceTools.filter((tool) => {
     const value = `${toolDisplayName(tool.name)} ${tool.description || ''}`.toLowerCase();
     return value.includes(query.trim().toLowerCase());
@@ -3211,10 +3189,11 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
   }, [selectedName, sourceTools]);
 
   useEffect(() => {
-    if (!selectedName) return;
     setSelectedFile('SKILL.md');
     setCurrentDir('');
+    setDirectoryEntries([]);
     setFileBody(null);
+    if (!selectedName) return;
     void loadSkillDirectory('');
     void loadSkillFile('SKILL.md');
   }, [selectedName]);
@@ -3227,11 +3206,8 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
       setCurrentDir(body.path || path);
       setDirectoryEntries(body.entries || []);
     } catch (err) {
-      const entries = skillFileEntries(selected)
-        .filter((entry) => parentPathOf(entry.path) === path)
-        .sort((a, b) => Number(b.isDirectory) - Number(a.isDirectory) || a.name.localeCompare(b.name, 'zh-CN'));
       setCurrentDir(path);
-      setDirectoryEntries(entries);
+      setDirectoryEntries([]);
       setImportStatus(`目录加载失败：${formatError(err)}`);
     }
   }
@@ -3239,18 +3215,13 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
   async function loadSkillFile(path = 'SKILL.md') {
     if (!selectedName) return;
     setSelectedFile(path);
+    setFileBody(null);
     try {
       const body = await api.get<SkillFileBody>(`/v1/skills/${encodeURIComponent(selectedName)}/files?path=${encodeURIComponent(path)}`);
       setSelectedFile(body.path || path);
       setFileBody(body);
     } catch (err) {
-      const entry = skillFileEntries(selected).find((file) => file.path === path);
-      setFileBody({
-        path,
-        parentPath: parentPathOf(path),
-        entry,
-        content: `${skillPreview(selected, path)}\n\n读取失败：${formatError(err)}`,
-      });
+      setImportStatus(`读取失败：${formatError(err)}`);
     }
   }
 
@@ -3401,10 +3372,11 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
                   </button>
                 );
               })}
+              {!filteredTools.length ? <div className="skill-list-empty">暂无可用技能</div> : null}
             </div>
           </ScrollArea>
         </aside>
-        {showSkillFiles ? (
+        {showSkillFiles && selected ? (
           <aside className="skill-file-tree-panel">
             <div className="skill-panel-title">
               <strong>文件目录</strong>
@@ -3439,7 +3411,8 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
             </div>
           </aside>
         ) : null}
-        <main className="skill-detail-panel">
+        {selected ? (
+          <main className="skill-detail-panel">
           <div className="skill-detail-head">
             <div className="skill-title-block">
               <span className="skill-detail-icon"><SkillIcon /></span>
@@ -3481,14 +3454,21 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
             <span>更新时间 <strong>{formatDateTime(selectedEntry?.updatedAt)}</strong></span>
             <span>当前文件 <strong>{selectedFile}</strong></span>
           </div>
-          {selectedFile.toLowerCase().endsWith('.md') ? (
-            <div className="skill-preview-markdown">
-              <MarkdownMessage content={fileBody?.content || skillPreview(selected, selectedFile)} />
-            </div>
+          {typeof fileBody?.content === 'string' ? (
+            selectedFile.toLowerCase().endsWith('.md') ? (
+              <div className="skill-preview-markdown">
+                <MarkdownMessage content={fileBody.content} />
+              </div>
+            ) : (
+              <pre className="skill-preview">{fileBody.content}</pre>
+            )
           ) : (
-            <pre className="skill-preview">{fileBody?.content || skillPreview(selected, selectedFile)}</pre>
+            <div className="skill-preview-empty">暂无可显示的文件内容</div>
           )}
-        </main>
+          </main>
+        ) : (
+          <main className="skill-detail-panel skill-detail-empty">暂无可用技能，请导入 Skill 后重试。</main>
+        )}
       </div>
     </section>
   );

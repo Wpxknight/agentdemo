@@ -434,6 +434,7 @@ describe('frontend API wiring', () => {
     expect(app).toContain("api.post<{ session: SessionsBody['sessions'][number] }>('/v1/sessions'");
     expect(app).toContain('await fetchSessionsPage(0);');
     expect(app).toContain('api.get<ContextUsageBody>(`/v1/sessions/${encodeURIComponent(nextSessionId)}/context`)');
+    expect(app).toContain('if (!token || !isPersistedSession(sessionId, sessions)) return;');
     expect(app).toContain('api.post<{ ok: boolean; sessionId: string; queued: boolean }>(`/v1/sessions/${encodeURIComponent(sessionId)}/append`');
     expect(app).toContain('activeRunSessionIds.has(sessionId)');
     expect(app).toContain('event.data?.context');
@@ -843,6 +844,15 @@ describe('frontend API wiring', () => {
     expect(app).toContain('readFileAsDataUrl(file)');
     expect(app).toContain('await onImported()');
     expect(app).toContain("setSelectedFile('SKILL.md')");
+    expect(app).toContain('<SkillsPage');
+    expect(app).toContain('tools={skillTools}');
+    expect(app).toContain('暂无可用技能');
+    expect(app).toContain('setDirectoryEntries([])');
+    expect(app).toContain('setFileBody(null)');
+    expect(app).not.toContain("fallbackTools.filter((tool) => tool.category === 'skill')");
+    expect(app).not.toContain('const entries = skillFileEntries(selected)');
+    expect(app).not.toContain('content: `${skillPreview(selected, path)}');
+    expect(app).not.toContain('fileBody?.content || skillPreview(selected, selectedFile)');
     expect(app).toContain('导入技能');
     expect(app).toContain('文件大小');
     expect(app).toContain('更新时间');

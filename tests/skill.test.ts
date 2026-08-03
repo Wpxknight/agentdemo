@@ -573,6 +573,19 @@ describe('SkillRegistry governed Pi loading', () => {
       .map((skill) => skill.name).sort()).toEqual(['aios-request', 'aios-sandbox', 'netdiag']);
   });
 
+  it('loads canonical Pi skills when the configured product root is relative', async () => {
+    const reg = new SkillRegistry('skills');
+    await reg.scan();
+    const viewer = { tenantId: 'default', userId: 'u', role: 'user' as const };
+
+    expect((await reg.listLoadedFor(viewer)).map((skill) => skill.name).sort())
+      .toEqual(['aios-request', 'aios-sandbox', 'netdiag']);
+    await expect(reg.readFile('netdiag', 'SKILL.md', viewer)).resolves.toMatchObject({
+      path: 'SKILL.md',
+      entry: expect.objectContaining({ name: 'SKILL.md', isDirectory: false }),
+    });
+  });
+
   it('exposes only successfully loaded canonical Pi skills across list and lookup', async () => {
     const records: SkillProductRecord[] = [
       { id: 'valid', name: 'valid', path: '/skills/valid', version: '1', tenantId: 'tenant-a', visibility: 'public', enabled: true, reviewed: true },
