@@ -1011,7 +1011,8 @@ describe('scheduler runtime boundaries', () => {
     expect(claimBound).toContain("where('claim_token', '=', input.expectedClaimToken)");
     expect(claimBound).toContain("where('run_id', 'is not', null)");
     expect(claimBound).toContain("where('lease_expires_at', '<=', input.now)");
-    expect(claimBound).toContain('forUpdate().skipLocked()');
+    expect(claimBound).toContain('forUpdate().executeTakeFirst()');
+    expect(source).not.toContain('skipLocked()');
     expect(claimBound).toContain("state: 'recovering'");
     expect(releaseBound).toContain("where('state', '=', 'recovering')");
     expect(releaseBound).toContain("where('claim_token', '=', input.claimToken)");

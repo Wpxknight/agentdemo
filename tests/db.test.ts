@@ -47,6 +47,16 @@ describe('readMysqlConfig', () => {
 });
 
 describe('MysqlStore session summaries', () => {
+  it('uses MariaDB 10.2-compatible row locking for scheduled task claims', async () => {
+    const source = await readFile('src/db/mysql.ts', 'utf8');
+    const start = source.indexOf('async claimDueTasks(');
+    const end = source.indexOf('async recordTaskRun(', start);
+    const claimDueTasksSource = source.slice(start, end);
+
+    expect(claimDueTasksSource).toContain('.forUpdate()');
+    expect(claimDueTasksSource).not.toContain('.skipLocked()');
+  });
+
   it('sorts wide message rows in application memory instead of MySQL filesort', async () => {
     const source = await readFile('src/db/mysql.ts', 'utf8');
     const start = source.indexOf('async listSessions(');

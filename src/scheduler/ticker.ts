@@ -18,7 +18,7 @@ export interface SchedulerOptions {
 }
 
 /**
- * DB 驱动的调度器：周期 tick 领取到点任务（SKIP LOCKED）→ 执行 → 记录 task_runs。
+ * DB 驱动的调度器：周期 tick 通过行锁领取到点任务 → 执行 → 记录 task_runs。
  * 多副本各自 tick，靠 Store.claimDueTasks 的原子领取避免重复执行。
  */
 export class Scheduler {

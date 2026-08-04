@@ -997,7 +997,7 @@ export class MysqlStore implements Store {
     return true;
   }
 
-  /** 系统级：事务内 FOR UPDATE SKIP LOCKED 领取并推进，保证多副本不重复执行。 */
+  /** 系统级：事务内 FOR UPDATE 领取并推进，兼容 MariaDB 10.2，并保证多副本不重复执行。 */
   async claimDueTasks(now: Date, limit: number): Promise<ScheduledTask[]> {
     return this.db.transaction().execute(async (trx) => {
       const rows = await trx
@@ -1008,7 +1008,6 @@ export class MysqlStore implements Store {
         .orderBy('next_run_at', 'asc')
         .limit(limit)
         .forUpdate()
-        .skipLocked()
         .execute();
 
       const tasks = rows.map(toTask);

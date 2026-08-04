@@ -66,7 +66,7 @@ export class MysqlSchedulerStore implements SchedulerStore {
     return this.db.transaction().execute(async (tx) => {
       const tasks = await tx.selectFrom('scheduled_tasks').selectAll()
         .where('enabled', '=', 1).where('next_run_at', '<=', input.now)
-        .orderBy('next_run_at', 'asc').limit(input.limit).forUpdate().skipLocked().execute();
+        .orderBy('next_run_at', 'asc').limit(input.limit).forUpdate().execute();
 
       for (const task of tasks) {
         const fireTime = task.next_run_at;
@@ -88,7 +88,7 @@ export class MysqlSchedulerStore implements SchedulerStore {
       const rows = await tx.selectFrom('scheduler_fires').selectAll()
         .where('state', '=', 'pending')
         .where((eb) => eb.or([eb('retry_at', 'is', null), eb('retry_at', '<=', input.now)]))
-        .orderBy('fire_time', 'asc').limit(input.limit).forUpdate().skipLocked().execute();
+        .orderBy('fire_time', 'asc').limit(input.limit).forUpdate().execute();
 
       const claimed: ClaimedScheduledFire[] = [];
       for (const row of rows) {
@@ -170,7 +170,7 @@ export class MysqlSchedulerStore implements SchedulerStore {
         .where('claim_token', '=', input.expectedClaimToken).where('run_id', 'is not', null)
         .where('lease_expires_at', '<=', input.now)
         .where((eb) => eb.or([eb('retry_at', 'is', null), eb('retry_at', '<=', input.now)]))
-        .forUpdate().skipLocked().executeTakeFirst();
+        .forUpdate().executeTakeFirst();
       if (!row || !row.run_id || !row.claim_token || !row.lease_expires_at) return undefined;
       const claimToken = randomUUID();
       const leaseExpiresAt = new Date(input.now.getTime() + input.leaseMs);
