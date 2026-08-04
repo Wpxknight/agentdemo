@@ -101,6 +101,8 @@ describe('frontend API wiring', () => {
     expect(app).toContain("api.get<SandboxesBody>('/v1/sandboxes");
     expect(app).toContain('setSandboxProfiles(body.profiles || [])');
     expect(app).toContain("api.get<ModelSettingsBody>('/v1/settings/llm");
+    expect(app).toContain('允许不安全 HTTPS（忽略证书校验）');
+    expect(app).toContain('allow_insecure_tls: Boolean(llm.allow_insecure_tls)');
   });
 
   it('lets operators select scheduled tasks and inspect retained run results', async () => {

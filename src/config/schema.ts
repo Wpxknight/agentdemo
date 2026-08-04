@@ -5,6 +5,8 @@ export const ModelConfigSchema = z.object({
   baseURL: z.string(),
   apiKey: z.string(),
   model: z.string(),
+  /** 仅该 LLM 请求跳过 HTTPS 服务端证书校验；默认严格校验。 */
+  allowInsecureTls: z.boolean().optional(),
   contextWindowTokens: z.number().int().positive().optional(),
   /** 历史里保留图片的最近带图消息条数（更早的替换占位符），默认 1；0 表示一张不留。 */
   contextKeepImages: z.number().int().min(0).optional(),

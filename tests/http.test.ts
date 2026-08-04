@@ -1366,6 +1366,7 @@ describe('HTTP server', () => {
         api_key: 'initial-key',
         api_key_set: true,
         api_key_preview: 'ini...key',
+        allow_insecure_tls: false,
         context_window_tokens: 200000,
         context_keep_images: 1,
       },
@@ -1378,6 +1379,7 @@ describe('HTTP server', () => {
           api_key: 'initial-key',
           api_key_set: true,
           api_key_preview: 'ini...key',
+          allow_insecure_tls: false,
           context_window_tokens: 200000,
           context_keep_images: 1,
         },
@@ -1389,6 +1391,7 @@ describe('HTTP server', () => {
           api_key: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
           api_key_set: true,
           api_key_preview: 'tes...aZ3',
+          allow_insecure_tls: false,
           context_window_tokens: 200000,
           context_keep_images: 1,
         },
@@ -1402,6 +1405,7 @@ describe('HTTP server', () => {
         base_url: 'http://192.168.10.108:18317',
         api_key: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
         model: 'glm-5',
+        allow_insecure_tls: true,
         context_window_tokens: 128000,
       }),
     });
@@ -1415,6 +1419,7 @@ describe('HTTP server', () => {
         api_key: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
         api_key_set: true,
         api_key_preview: 'tes...aZ3',
+        allow_insecure_tls: true,
         context_window_tokens: 128000,
       },
     });
@@ -1424,8 +1429,16 @@ describe('HTTP server', () => {
       baseURL: 'http://192.168.10.108:18317',
       apiKey: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
       model: 'glm-5',
+      allowInsecureTls: true,
       contextWindowTokens: 128000,
     });
+
+    const invalidTls = await fetch(`${base}/v1/settings/llm`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ allow_insecure_tls: 'true' }),
+    });
+    expect(invalidTls.status).toBe(400);
 
     const probe = await fetch(`${base}/v1/settings/llm/test`, {
       method: 'POST',

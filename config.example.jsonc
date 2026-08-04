@@ -6,6 +6,8 @@
       "baseURL": "https://api.anthropic.com",
       "apiKey": "${ANTHROPIC_API_KEY}",
       "model": "claude-opus-4-8",
+      // 自签名/不受信任证书的内网 HTTPS 服务可设 true；公网服务请保持 false/不配置。
+      "allowInsecureTls": false,
       // 推理深度：none 关闭思考；low|medium|high|xhigh|max 对应 Anthropic effort。
       // 缺省=思考开启走模型默认深度。也可在设置页调整。仅 anthropic 协议生效。
       "effort": "medium",

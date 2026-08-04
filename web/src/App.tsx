@@ -4415,11 +4415,11 @@ function SettingsPage({ llm, status, api, me, onLlmChange, onStatus, onRequestCo
   // 隐藏只是 UX，权限边界在后端 RBAC：普通用户只保留我的主目录；全局沙箱仅平台管理员可见。
   const isAdmin = me?.role === 'platform_admin' || me?.role === 'tenant_admin';
   const isPlatformAdmin = me?.role === 'platform_admin';
-  const [form, setForm] = useState(() => ({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) }));
+  const [form, setForm] = useState(() => ({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', allow_insecure_tls: Boolean(llm.allow_insecure_tls), effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) }));
 
   useEffect(() => {
-    setForm({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) });
-  }, [llm.api_key, llm.base_url, llm.model, llm.protocol, llm.effort, llm.context_window_tokens]);
+    setForm({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', allow_insecure_tls: Boolean(llm.allow_insecure_tls), effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) });
+  }, [llm.api_key, llm.allow_insecure_tls, llm.base_url, llm.model, llm.protocol, llm.effort, llm.context_window_tokens]);
 
   // 上下文窗口仅在填了合法正整数时提交，避免编辑中间态触发后端 400。
   function formPayload() {
@@ -4470,6 +4470,11 @@ function SettingsPage({ llm, status, api, me, onLlmChange, onStatus, onRequestCo
               <CardContent className="settings-form">
                 <Label>协议<Select value={form.protocol} onValueChange={(protocol) => setForm((current) => ({ ...current, protocol: protocol as RuntimeModelConfig['protocol'] }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="anthropic">Anthropic</SelectItem><SelectItem value="openai">OpenAI Compatible</SelectItem></SelectGroup></SelectContent></Select></Label>
                 <Label>Base URL<Input value={form.base_url} onChange={(event) => setForm((current) => ({ ...current, base_url: event.target.value }))} /></Label>
+                <Label className="settings-checkbox-row">
+                  <input type="checkbox" checked={form.allow_insecure_tls} onChange={(event) => setForm((current) => ({ ...current, allow_insecure_tls: event.target.checked }))} />
+                  <span>允许不安全 HTTPS（忽略证书校验）</span>
+                </Label>
+                {form.allow_insecure_tls ? <div className="settings-status">仅用于自签名或证书链不受信任的内网 LLM 服务；会降低中间人攻击防护。</div> : null}
                 <Label>API Key<Input placeholder="输入 API Key" value={form.api_key} onChange={(event) => setForm((current) => ({ ...current, api_key: event.target.value }))} /></Label>
                 <Label>Model<Input value={form.model} onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))} /></Label>
                 <Label>上下文窗口（tokens）<Input type="number" min={20000} step={1000} placeholder="200000" value={form.context_window_tokens} onChange={(event) => setForm((current) => ({ ...current, context_window_tokens: event.target.value }))} /></Label>

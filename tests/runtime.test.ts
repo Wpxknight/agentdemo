@@ -34,6 +34,14 @@ const config: Config = {
 };
 
 describe('resolveRuntimeModelConfig', () => {
+  it('accepts an explicit insecure TLS flag in startup model config', () => {
+    const parsed = ConfigSchema.parse({
+      ...config,
+      models: { fallback: { ...config.models.fallback, allowInsecureTls: true } },
+    });
+    expect(parsed.models.fallback?.allowInsecureTls).toBe(true);
+  });
+
   it('prefers persisted default tenant LLM settings over startup config', async () => {
     const store = new MemoryStore();
     await store.setLlmSettings({ tenantId: 'default' }, {
@@ -42,6 +50,7 @@ describe('resolveRuntimeModelConfig', () => {
       baseURL: 'http://persisted/v1',
       apiKey: 'plain-persisted-key',
       model: 'persisted-model',
+      allowInsecureTls: true,
     });
 
     await expect(resolveRuntimeModelConfig(config, store)).resolves.toEqual({
@@ -50,6 +59,7 @@ describe('resolveRuntimeModelConfig', () => {
       baseURL: 'http://persisted/v1',
       apiKey: 'plain-persisted-key',
       model: 'persisted-model',
+      allowInsecureTls: true,
     });
   });
 });

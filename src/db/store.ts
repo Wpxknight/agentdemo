@@ -11,6 +11,8 @@ export interface LlmSettings {
   baseURL: string;
   apiKey: string;
   model: string;
+  /** 仅该 LLM 请求跳过 HTTPS 服务端证书校验。 */
+  allowInsecureTls?: boolean;
   contextWindowTokens?: number;
   /** 历史里保留图片的最近带图消息条数（更早的替换占位符），默认 1；0 表示一张不留。 */
   contextKeepImages?: number;

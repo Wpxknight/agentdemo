@@ -326,6 +326,7 @@ function publicModelConfig(config: RuntimeModelConfig): Record<string, unknown> 
     api_key: config.apiKey,
     api_key_set: Boolean(config.apiKey),
     api_key_preview: maskApiKey(config.apiKey),
+    allow_insecure_tls: Boolean(config.allowInsecureTls),
     context_window_tokens: contextWindowTokens(config),
     context_keep_images: keepImagesOf(config),
     effort: config.effort,
@@ -498,6 +499,8 @@ function modelConfigFromBody(
     'api_key',
     'apiKey',
     'model',
+    'allow_insecure_tls',
+    'allowInsecureTls',
     'context_window_tokens',
     'contextWindowTokens',
     'context_keep_images',
@@ -524,10 +527,18 @@ function modelConfigFromBody(
     baseURL,
     apiKey,
     model,
+    allowInsecureTls: parseAllowInsecureTls(body, base.allowInsecureTls),
     contextWindowTokens: parseContextWindowTokens(body, base.contextWindowTokens),
     contextKeepImages: parseContextKeepImages(body, base.contextKeepImages),
     effort: parseEffort(str(body, 'effort'), base.effort),
   };
+}
+
+function parseAllowInsecureTls(body: Record<string, unknown>, current: boolean | undefined): boolean | undefined {
+  const value = body.allow_insecure_tls ?? body.allowInsecureTls;
+  if (value === undefined) return current;
+  if (typeof value !== 'boolean') throw new HttpError(400, 'allow_insecure_tls 必须是 boolean');
+  return value;
 }
 
 function parseContextKeepImages(body: Record<string, unknown>, current: number | undefined): number | undefined {

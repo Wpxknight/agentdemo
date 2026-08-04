@@ -183,6 +183,7 @@ function parseLlmSettings(value: unknown): LlmSettings | undefined {
     baseURL: o.baseURL,
     apiKey: o.apiKey,
     model: o.model,
+    ...(typeof o.allowInsecureTls === 'boolean' ? { allowInsecureTls: o.allowInsecureTls } : {}),
     ...(typeof o.contextWindowTokens === 'number' && Number.isFinite(o.contextWindowTokens) && o.contextWindowTokens > 0
       ? { contextWindowTokens: Math.floor(o.contextWindowTokens) }
       : {}),

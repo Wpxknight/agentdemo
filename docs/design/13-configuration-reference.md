@@ -80,6 +80,7 @@ flowchart LR
 | `models.<id>.baseURL` | 字符串 | 是 | 无 | 模型条目 | 普通 | schema 不要求 URL 格式；连接时才暴露错误。 |
 | `models.<id>.apiKey` | 字符串 | 是 | 无 | 模型条目 | **Secret** | 可写 `${PROVIDER_API_KEY}`；缺失替换仍是普通字符串。 |
 | `models.<id>.model` | 字符串 | 是 | 无 | 模型条目 | 普通 | 实际上游模型 ID。 |
+| `models.<id>.allowInsecureTls` | boolean | 否 | `false` | 仅该 LLM 的 HTTPS 请求 | 安全开关 | `true` 时跳过服务端证书校验，用于自签名或证书链不受信任的可信内网模型服务；不影响其他 HTTPS 连接。 |
 | `models.<id>.contextWindowTokens` | 正整数 | 否 | 传统 HTTP 投影按 `200000`；Durable Pi 用 provider template 的 context window | 模型条目 | 普通 | 两条链缺省来源不同，不能视为单一固定默认值。 |
 | `models.<id>.contextKeepImages` | 非负整数 | 否 | `1` | 会话上下文投影 | 普通 | `0` 表示不保留历史图片。 |
 | `models.<id>.effort` | `none/low/medium/high/xhigh/max` | 否 | 缺省开启思考并使用模型默认深度 | Anthropic 传统模型链 | 普通 | `none` 关闭思考；Durable Pi 装配模型时当前未传递该字段。 |
@@ -88,7 +89,7 @@ flowchart LR
 | `models.<id>.pricing.cacheRead` | 非负数 | 否 | `pricing.input` | 同上 | 普通 | 未配时回退 input 单价。 |
 | `models.<id>.pricing.cacheWrite` | 非负数 | 否 | `pricing.input` | 同上 | 普通 | 未配时回退 input 单价。 |
 | `defaultModel` | 模型条目 ID | 是 | 无 | 启动 fallback | 普通 | 不存在对应条目时 Runtime 启动失败。 |
-| tenant LLM setting `id/protocol/baseURL/apiKey/model/contextWindowTokens/contextKeepImages/effort` | 持久化对象 | tenant 管理员更新时 | 启动配置 fallback | 租户设置记录 | `apiKey` 为 **Secret**，其余普通 | 当前 LLM setting 整体存于普通 settings 记录；不像 Sandbox API key 使用 SecretBox。 |
+| tenant LLM setting `id/protocol/baseURL/apiKey/model/allowInsecureTls/contextWindowTokens/contextKeepImages/effort` | 持久化对象 | tenant 管理员更新时 | 启动配置 fallback | 租户设置记录 | `apiKey` 为 **Secret**；`allowInsecureTls` 为安全开关 | 当前 LLM setting 整体存于普通 settings 记录；不像 Sandbox API key 使用 SecretBox。 |
 
 **优先级与生效分叉**：
 
@@ -98,7 +99,7 @@ flowchart LR
 - 多租户页面可以保存各自设置，但当前进程级热更新对象不是 tenant-scoped；这是一项现状限制。
 - `POST /v1/settings/llm/test` 带 body 时用临时模型测试，不持久化；空 body 测试当前 `runtime.model`。
 
-**安全注意**：`GET/POST /v1/settings/llm` 的 `publicModelConfig` 当前响应包含完整 `api_key`，同时还返回 preview；这不是安全的“仅掩码”响应。调用方与日志系统必须按 Secret 处理，风险见 [06-auth-security-tenancy.md](./06-auth-security-tenancy.md) 和 [12-http-api-reference.md](./12-http-api-reference.md)。
+**安全注意**：`GET/POST /v1/settings/llm` 的 `publicModelConfig` 当前响应包含完整 `api_key`，同时还返回 preview；这不是安全的“仅掩码”响应。调用方与日志系统必须按 Secret 处理。`allowInsecureTls=true` 会关闭目标 LLM 的服务端证书校验，只应对可信内网中的自签名服务启用。风险见 [06-auth-security-tenancy.md](./06-auth-security-tenancy.md) 和 [12-http-api-reference.md](./12-http-api-reference.md)。
 
 **启动失败/降级**：默认模型缺失、协议对应 Pi provider template 不可用会启动失败；`${VAR}` 未替换不会校验为缺 Secret，通常延迟到模型调用失败。
 

@@ -1,4 +1,5 @@
 import OpenAI from 'openai';
+import { llmTlsHeaders } from './insecure-tls.js';
 import type {
   ChatModel,
   JsonValue,
@@ -15,6 +16,7 @@ export interface OpenAIModelConfig {
   baseURL: string;
   apiKey: string;
   model: string;
+  allowInsecureTls?: boolean;
 }
 
 type ChatMsg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
@@ -118,7 +120,11 @@ export class OpenAIModel implements ChatModel {
   constructor(cfg: OpenAIModelConfig) {
     this.id = cfg.id;
     this.model = cfg.model;
-    this.client = new OpenAI({ baseURL: normalizeOpenAIBaseURL(cfg.baseURL), apiKey: cfg.apiKey });
+    this.client = new OpenAI({
+      baseURL: normalizeOpenAIBaseURL(cfg.baseURL),
+      apiKey: cfg.apiKey,
+      defaultHeaders: llmTlsHeaders(cfg.allowInsecureTls),
+    });
   }
 
   async *stream(input: StreamInput): AsyncIterable<StreamEvent> {

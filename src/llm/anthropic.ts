@@ -1,4 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
+import { llmTlsHeaders } from './insecure-tls.js';
 import type {
   ChatModel,
   JsonValue,
@@ -16,6 +17,7 @@ export interface AnthropicModelConfig {
   baseURL: string;
   apiKey: string;
   model: string;
+  allowInsecureTls?: boolean;
   /** 推理深度：none 关闭思考；low..max 对应 output_config.effort；缺省=思考开启走模型默认深度。 */
   effort?: ReasoningEffort;
 }
@@ -103,7 +105,11 @@ export class AnthropicModel implements ChatModel {
     this.id = cfg.id;
     this.model = cfg.model;
     this.effort = cfg.effort;
-    this.client = new Anthropic({ baseURL: cfg.baseURL, apiKey: cfg.apiKey });
+    this.client = new Anthropic({
+      baseURL: cfg.baseURL,
+      apiKey: cfg.apiKey,
+      defaultHeaders: llmTlsHeaders(cfg.allowInsecureTls),
+    });
   }
 
   async *stream(input: StreamInput): AsyncIterable<StreamEvent> {

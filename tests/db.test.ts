@@ -203,6 +203,7 @@ describe('MemoryStore', () => {
       baseURL: 'http://llm-a/v1',
       apiKey: 'plain-a-key',
       model: 'model-a',
+      allowInsecureTls: true,
     });
     await s.setLlmSettings(ctxB, {
       id: 'tenant-b',
@@ -218,6 +219,7 @@ describe('MemoryStore', () => {
       baseURL: 'http://llm-a/v1',
       apiKey: 'plain-a-key',
       model: 'model-a',
+      allowInsecureTls: true,
     });
     expect(await s.getLlmSettings(ctxB)).toEqual({
       id: 'tenant-b',

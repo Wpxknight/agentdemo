@@ -1,6 +1,7 @@
 import { logger } from './logger.js';
 import { SandboxConfigSchema, type Config, type SandboxConfig } from './config/schema.js';
 import { createModel, type ModelConfig as FactoryModelConfig } from './llm/factory.js';
+import { llmTlsHeaders } from './llm/insecure-tls.js';
 import type { ChatModel } from './llm/types.js';
 import { ToolRegistry } from './agent/tools.js';
 import { AllowAllPolicy, OpsPolicy } from './agent/policy.js';
@@ -323,6 +324,7 @@ async function createDefaultDurableRunAssembly(
     name: modelConfig.id,
     provider: providerId,
     baseUrl: modelConfig.baseURL,
+    headers: { ...template.headers, ...llmTlsHeaders(modelConfig.allowInsecureTls) },
     contextWindow: modelConfig.contextWindowTokens ?? template.contextWindow,
     cost: pricing ? {
       input: pricing.input,
