@@ -1,218 +1,150 @@
 # 认证、安全与多租户设计
 
-## 1. 安全目标
+> 状态：当前设计
+> 验证基线：`b5425a0d2ae3ddc23ada4d3184d4a95e3a717bae`
+> 最后核对：2026-08-03
+> 适用范围：`pi-agent-platform-integration` 当前实现
 
-AIoP 的安全控制面必须保证：
+## 1. 安全边界
 
-- 身份由服务端验证并映射为 tenant、user、role。
-- 所有业务数据按租户，用户私有数据进一步按 user 隔离。
-- 模型和工具参数不能提升权限。
-- 平台设置、用户下游凭据和下载能力不会以明文公开。
-- 外部 URL、Webhook、文件路径和 iframe 嵌入受边界控制。
-- 高风险运维动作经过 RBAC、Policy、审批和审计。
+AIoP 以服务端验证后的 tenant、user、role 作为授权输入。客户端字段、模型输出、Tool 参数和 Sandbox 内身份都不是可信授权依据。安全控制分布在 HTTP、Store、Tool governance、Sandbox/Kubernetes 与审计层；任一单层都不能替代其他层。
 
-## 2. 认证方式
+当前角色固定为 `platform_admin`、`tenant_admin`、`user`。`RequestContext` 固定携带：
 
-~~~mermaid
-flowchart LR
-  Browser[Browser or AIOS Host]
-  HTTP[HTTP Server]
-  Local[Local Auth]
-  OIDC[OIDC Provider]
-  AIOS[AIOS Token Verification]
-  Users[(users)]
-  Creds[(user_credentials)]
-  JWT[AIoP JWT]
-
-  Browser --> HTTP
-  HTTP --> Local
-  HTTP --> OIDC
-  HTTP --> AIOS
-  Local --> Users
-  OIDC --> Users
-  AIOS --> Users
-  AIOS --> Creds
-  Local --> JWT
-  OIDC --> JWT
-  AIOS --> JWT
-~~~
-
-### 2.1 Local Auth
-
-用户名和密码按 tenant 查询。密码使用 `scrypt` 派生并带随机 salt。禁用或软删除用户不能登录。`seed-admin` 仅在 Local Provider 下由运维人员执行。
-
-### 2.2 OIDC
-
-`openid-client` 处理授权码流程，`jose` 用于 Token/JWT。OIDC claims 经可配置字段映射到 tenant、username 和 role；不存在的用户可 JIT 创建。state/nonce 和回调必须绑定当前登录流程。
-
-### 2.3 AIOS 嵌入认证
-
-AIOS 支持 userinfo 或 JWKS 验证，使用固定系统 id、允许的父页面 origin 和字段映射。验证后的用户可 JIT 创建；交换得到的下游凭据按用户加密存储并设置 TTL，用于 Skill/Sandbox 内的受控请求。
-
-## 3. 请求上下文与授权
-
-`RequestContext` 包含 tenantId、userId、role。HTTP 层从已验证 Token 构建上下文；客户端提交的 tenant/user 字段不能覆盖它。
-
-角色权限：
-
-| 权限 | platform_admin | tenant_admin | user |
-| --- | --- | --- | --- |
-| 管理租户 | 是 | 否 | 否 |
-| 管理任意租户用户 | 是 | 否 | 否 |
-| 管理本租户用户 | 是 | 是 | 否 |
-| 集群写操作 | 是 | 是 | 否 |
-| 审批 | 是 | 是 | 否 |
-| 创建定时任务 | 是 | 是 | 是 |
-| 查看审计 | 是 | 是 | 否 |
-
-`requirePermission` 用于 API 动作，`canManageUsersOf` 防止租户管理员跨租户管理用户。
-
-### 3.1 一次认证请求的真实链路
-
-```text
-Authorization/Cookie/AIOS token
-  → AuthProvider 校验
-  → RequestContext { tenantId, userId, role }
-  → requirePermission / ownership 检查
-  → Store 方法再次带 tenant/user 条件
-  → ToolExecutionContext / Audit detail
+```typescript
+interface RequestContext {
+  tenantId: string;
+  userId: string;
+  role: 'platform_admin' | 'tenant_admin' | 'user';
+}
 ```
 
-任意一层缺少 tenant 条件都可能造成越权。HTTP 层的认证不能替代 Store 查询条件，Store 的 tenant 字段也不能替代动作权限检查。
+## 2. 认证接口与身份模型
 
-## 4. 多租户数据隔离
+`AuthProvider` 提供 `login(tenantId, username, password)` 和 `authenticate(token)`。三种认证入口最终都形成 AIoP `RequestContext`：
 
-~~~mermaid
+| 入口 | 当前实现 | 身份落库与 Token |
+| --- | --- | --- |
+| Local | tenant + username 查询，scrypt 校验密码 | 用户来自 `users`；HS256 AIoP JWT 携带 tenant、role，`sub=userId` |
+| OIDC | Authorization Code + PKCE；claims 映射 tenant、username、role | 可 JIT 创建 OIDC 用户；回调后颁发 AIoP JWT |
+| AIOS exchange | userinfo 或远端 JWKS 验证 AIOS token | 按固定目标 tenant 和稳定外部 user id JIT；缓存下游凭据并颁发 AIoP JWT |
+
+禁用用户不能登录或继续访问。OIDC/AIOS 的 JIT 映射依赖管理员配置；代码支持映射与校验，不等于任意 IdP 配置天然安全。
+
+### 2.1 认证与授权流程
+
+```mermaid
+flowchart LR
+  C[credential or token] --> P[AuthProvider]
+  P --> I[AIoP JWT or verified identity]
+  I --> A[requireAuth]
+  A --> R[RBAC and ownership]
+  R --> S[tenant and resource scope]
+  S --> H[handler or runtime]
+```
+
+`requireAuth` 验证 Bearer Token，并再次检查用户仍为 active。RBAC 当前由 `requirePermission`、`canManageUsersOf` 以及各资源的 owner-or-admin 检查共同实现。Store 查询仍必须带 tenant/user 条件，不能只依赖 HTTP 层。
+
+### 2.2 当前 RBAC 矩阵
+
+| Permission | platform_admin | tenant_admin | user |
+| --- | --- | --- | --- |
+| `tenant:manage` | 是 | 否 | 否 |
+| `user:manage:any` | 是 | 否 | 否 |
+| `user:manage:own` | 是 | 是 | 否 |
+| `cluster:write` | 是 | 是 | 否 |
+| `approve` | 是 | 是 | 否 |
+| `task:create` | 是 | 是 | 是 |
+| `audit:read` | 是 | 是 | 否 |
+
+该矩阵只说明已有 permission helper，不代表所有 HTTP 路由都统一由同一个中间件覆盖；资源 ownership 与路由级检查仍需逐接口核对。
+
+## 3. 租户隔离分层
+
+```mermaid
 flowchart TD
-  Req[Authenticated Request]
-  Ctx[tenantId userId role]
-  API[API Handler]
-  Store[Store Method]
-  DB[(MySQL)]
+  J[JWT identity] --> D[DB composite keys]
+  D --> M[MCP tenant plus actor scope]
+  M --> K[Skill paths]
+  K --> S[Sandbox identity]
+  S --> C[Cluster tenant ACL]
+  C --> A[Audit correlation]
+```
 
-  Req --> Ctx --> API --> Store --> DB
-  Store -->|tenant key| DB
-  Store -->|user key for private data| DB
-~~~
+- JWT identity：服务端还原 tenant/user/role，拒绝客户端覆盖。
+- DB composite keys：核心 Run、Session、Credential、Setting 等以 tenant 参与主键或查询条件；表结构详见[数据与持久化](07-data-and-persistence.md)。
+- MCP tenant + actor scope：连接状态 key 是 `tenantId + actorId`，执行时再次比较 identity scope。
+- Skill paths：用户资产按 tenant/user 路径和可见性规则处理。
+- Sandbox identity：metadata/spec 携带 tenant、user、session；非平台管理员只能管理匹配自身范围的 Sandbox。
+- Cluster tenant ACL：kubectl policy 检查 cluster tenant allowlist、namespace allowlist、只读属性和角色。
+- Audit correlation：tenant/session/cluster/tool 等字段用于追踪，不构成独立授权边界。
 
-主要隔离键：
+这些是分层控制，不应过度推导为“所有模块均已完成强租户隔离”。例如部分运行时配置仍按进程装配，审计 `tenant_id` 也允许为空。
 
-- 会话与消息：tenant + user + session。
-- Agent Run：tenant + run，并校验 user/session binding。
-- Interaction、Tool Ledger、Run Event 与 Pi Session：tenant/run/session 组合，并附 attempt/turn/tool call 标识。
-- 定时任务：tenant + 创建用户。
-- 用户凭据：tenant + user + provider。
-- 租户设置：tenant + setting key。
-- Sandbox：tenant + user + session + profile/cluster。
+## 4. Durable 工具安全链
 
-Memory Store 必须保持与 MySQL Store 相同的授权语义，不能因开发模式放宽。
+```mermaid
+flowchart LR
+  C[capability classification] --> R[permission rules]
+  R --> P[OpsPolicy RBAC and cluster ACL]
+  P --> I[approval interaction]
+  I --> L[ledger and fencing]
+  L --> K[Kubernetes SA and RBAC]
+  K --> A[Audit]
+```
 
-需要区分“表结构支持 tenant key”和“当前运行态按租户实例化”。模型、Sandbox Controller 与 MCP Manager 都是进程级单实例，启动时主要读取 `default` 租户设置；当前并未为每个 tenant 创建独立运行时。
+1. Tool definition 声明 `read`、`retryable_write` 或 `non_idempotent_write` 等 capability。
+2. Permission rules 按 `deny > ask > allow` 判定；无条件 deny 可在注入模型前移除工具。
+3. OpsPolicy 对 kubectl、危险 shell、角色、生产审批、cluster/namespace ACL 做额外检查。
+4. 需要审批时写 durable Interaction 与 pending Ledger；恢复时校验 interaction、tool call、args digest、attempt/turn 绑定。
+5. Tool Ledger 用 logical call、idempotency key、状态与 correlation 防止未知非幂等副作用被自动重放；Run lease token 提供 fencing。
+6. 实际 Kubernetes 权限最终仍受 Sandbox/进程 ServiceAccount 和 Kubernetes RBAC 限制。
+7. Policy 与 Governed Tool 执行写审计；工具审计为 best-effort，不可当作阻断控制。
+
+### 4.1 当前限制：Hook 未接入主链
+
+`src/agent/hooks.ts` 存在 fail-open `PreToolUse` runner，但当前 Durable Pi Governed Tool 主链没有调用它。因此它不是必经控制，也不能被用于证明 Durable Tool 已经过外部合规拦截；若未来接入，该 Hook 仍不应替代 fail-closed permission/policy、Ledger 和底层 RBAC。
+
+### 4.2 Netdiag 授权缺口
+
+AIOS template catalog 的 `sandbox-diag` profile 在运行时仅向 `platform_admin` 可见，并在 acquire 时复核。但仓库同时保留手工 OpenSandbox `netdiag-sandbox.yaml`：它启用 privileged、hostNetwork、hostPID、hostPath，并绑定高权限 ClusterRole。该手工 profile 的部署模板没有与 AIoP `RequestContext` 建立可验证的端到端授权绑定；若被错误挂到普通 Sandbox 全局模板，将绕过产品角色可见性。因此它只能视为受运维流程保护的高风险部署资产，不能宣称已有完整平台授权闭环。
 
 ## 5. 凭据与密钥
 
-`SecretBox` 使用 AES-256-GCM。密钥通过 SHA-256 从独立 secret 和 domain 派生，密文包含版本、IV、tag 和 ciphertext。
+- 平台设置由 `SecretBox` 使用 AES-256-GCM 加密，密钥从独立的 `AIOP_SETTINGS_SECRET` 与 `platform-settings` domain 经 SHA-256 派生。
+- 用户下游凭据由 `UserCredentials` 使用 AES-256-GCM 加密，但当前构造参数是 `AIOP_JWT_SECRET` 对应的 `jwtSecret`，再以 `aiop-credentials:` 前缀经 SHA-256 派生；它没有独立 credentials secret。
+- 两类 envelope 均形如 `v1:<iv-base64>:<tag-base64>:<ciphertext-base64>`。其中 base64 只是二进制序列化编码，保密性和完整性来自 AES-GCM。
+- `AIOP_SETTINGS_SECRET` 与 `AIOP_JWT_SECRET` 未配置时存在固定开发占位值/行为，生产必须分别注入强随机值。由于用户凭据当前复用 JWT secret，JWT secret 轮换也会使已有 `user_credentials` 无法解密，并扩大同一 secret 泄露的影响面；新增独立 credentials secret 是未来改进，不是当前事实。
+- `user_credentials` 与 `setting_secrets` 保存密文 envelope；公开接口只应返回设置状态或掩码。
+- `MYSQL_PASSWORD_BASE64` 只是把数据库密码做编码后由应用解码。这里使用 base64；它不提供保密性，也不是 Secret 管理替代品。Kubernetes Secret 的传输/静态保护取决于集群配置。
 
-- `AIOP_SETTINGS_SECRET` 是平台设置加密密钥；未配置时使用固定开发占位密钥并告警，不复用 JWT secret。
-- `AIOP_JWT_SECRET` 独立用于 AIoP JWT；未配置时同样只允许开发占位行为。
-- API Key 更新使用 keep/set/clear 语义，避免空值误删。
-- 公开响应只返回是否设置和掩码预览。
-- 用户下游凭据存储于 `user_credentials`，按用户与 provider 隔离。
-- 日志和 Agent Run 错误在落库前做敏感字段脱敏。
+## 6. 网络与浏览器边界
 
-## 6. 外部请求与 SSRF
+### 6.1 SSRF
 
-`assertPublicUrl` 解析目标并拒绝 loopback、私网、链路本地等地址。Web Fetch 和 Webhook 默认使用该检查；只有显式配置的开发场景可放宽。
+`assertPublicUrl` 仅允许 HTTP/HTTPS，DNS 解析后拒绝 loopback、IPv4 私网、链路本地/云 metadata 地址以及代码已覆盖的 IPv6 local 范围。Web Fetch 与 Hook webhook 禁止重定向，并设置超时；响应大小由具体调用方限制。
 
-安全要求包括：
+当前保护不是完整网络代理：它不提供请求阶段 DNS pinning，也没有覆盖所有特殊/保留地址类别。OIDC issuer、AIOS userinfo/JWKS、MCP URL 等管理员配置入口也不能一概宣称全部复用了相同 SSRF 校验，需按调用点审查。
 
-- 当前 Web Fetch 与 Webhook 使用 `redirect: 'error'`，直接禁止重定向，避免跳转绕过 SSRF 与域名检查。
-- 超时和响应大小受限。
-- 允许域名优先于任意 URL。
-- MCP HTTP header 不进入公开状态。
-- OIDC issuer、userinfo 和 JWKS 地址由平台管理员配置。
+### 6.2 frame ancestors 与 origin
 
-## 7. 文件、下载与路径
+Web `index.html` 的 CSP `frame-ancestors` 固定包含 `'self'`，并追加 `auth.aios.allowedParentOrigins`。当前该配置只进入 CSP，不进入前端 message handler：接收 `aiop:auth` 时未校验 `event.origin` 或 `event.source`，向父页面发送 `aiop:ready` 时 `targetOrigin` 也是 `*`。后端 exchange 会验证 AIOS token，但 Token 有效不能证明 postMessage 来源可信。因此当前只有 iframe 嵌入限制，没有闭环的精确 postMessage origin/source 绑定；`allowedParentOrigins` 的 schema 注释也超前于实现。
 
-- Skill 文件读取进行根目录 containment 校验。
-- 导入和同步限制路径、文件数与字节数。
-- Download Store 只写配置目录，文件名规范化。
-- 下载 URL 是短期能力，不等同于公开静态文件。
-- 用户主目录挂载必须落在平台允许根路径下。
+## 7. 安全变更约束
 
-## 8. iframe 与浏览器安全
+- 新 API 同时定义认证、permission、ownership、tenant 查询条件和 403/404 信息泄漏策略。
+- 新 Tool 同时定义 capability、policy、approval、Ledger 幂等/恢复和底层执行身份。
+- 新外部 URL 明确 SSRF、redirect、DNS、超时与响应上限。
+- 新 Secret 明确加密 domain、envelope 版本、轮换失败行为、掩码与日志脱敏；用户凭据应迁移到独立 credentials secret，并设计兼容解密/重加密流程。
+- privileged Sandbox 必须把平台身份到 profile、ServiceAccount、RBAC 的授权链做成可验证闭环。
 
-AIOS 嵌入场景通过 `frame-ancestors` 限制允许的父页面 origin；未配置时仅同源。CORS 或消息通信不能替代 CSP 嵌入边界。
+## 8. 事实依据
 
-SSE、Markdown、代码高亮和 Mermaid 都处理不可信内容。前端不执行模型输出中的任意 HTML 或脚本。
-
-## 9. 工具安全链
-
-~~~mermaid
-sequenceDiagram
-  participant M as Model
-  participant B as Tool Broker
-  participant R as Permission Rules
-  participant P as Ops Policy
-  participant A as Approval
-  participant H as Hook
-  participant T as Tool
-  participant D as Audit
-
-  M->>B: ToolCall
-  B->>R: evaluate
-  R-->>B: deny ask allow or none
-  B->>P: hard and domain policy
-  P->>D: decision audit
-  opt approval required
-    B->>A: request
-    A-->>B: approved or denied
-  end
-  B->>H: PreToolUse
-  H-->>B: allow or deny
-  B->>T: dispatch only after checks
-~~~
-
-Prompt、模型选择和 Sandbox 内用户身份都不能跳过此链路。
-
-## 10. 审计与生命周期
-
-审计记录包含 kind、action、tenant、session、cluster、tool 和结构化 detail。Policy 判定、kubectl、usage 等写入 Audit Sink/Store。
-
-用户禁用或软删除时：
-
-- 后续登录被拒绝。
-- 关联定时任务被禁用。
-- 下游用户凭据被删除。
-- 历史审计保留用于追踪。
-
-## 11. 已知边界
-
-- Hook 为 fail-open，不适合作为唯一合规控制。
-- 内存 Store 只适合开发，重启丢失数据。
-- JWT 与设置加密都有开发占位密钥，生产必须分别显式设置 `AIOP_JWT_SECRET` 与 `AIOP_SETTINGS_SECRET`。
-- Agent Interaction 已持久化，但直接 Tool 调用使用的部分审批/提问状态仍是进程内对象；通用双副本清单不能据此推断所有交互都可跨副本恢复。
-- Sandbox 隔离不能替代平台 RBAC。
-- AIOS/JIT 身份映射依赖管理员配置，错误映射可能造成越权，必须测试 claims 样例。
-
-## 12. 源码依据
-
-- `src/auth/`
-- `src/auth/rbac.ts`
-- `src/auth/aios.ts`
-- `src/auth/oidc.ts`
-- `src/auth/credentials.ts`
-- `src/security/secret-box.ts`
-- `src/net/ssrf.ts`
-- `src/server/context.ts`
-- `src/server/downloads.ts`
-- `src/config/schema.ts`
-- `src/db/store.ts`
-
-## 13. 安全修改检查清单
-
-- 新增 API 时同时定义认证要求、permission、ownership 与 404/403 信息泄漏策略。
-- 新增持久化查询时检查 Memory/MySQL 是否都强制 tenant，用户私有数据是否还需 user 条件。
-- 新增外部 URL 时复用 SSRF 检查，并明确 redirect、DNS 解析、超时和响应大小。
-- 新增 Secret 时定义加密 domain、keep/set/clear 更新语义、公开掩码和轮换失败行为。
-- 新增 Tool 时不把 prompt、Tool args 或 Sandbox 用户身份当作授权依据。
+- `src/auth/provider.ts`、`types.ts`、`local.ts`、`oidc.ts`、`aios.ts`、`session.ts`、`rbac.ts`
+- `src/server/context.ts`、`src/server/http.ts`
+- `src/security/secret-box.ts`、`src/auth/credentials.ts`、`src/net/ssrf.ts`
+- `src/agent/policy.ts`、`src/agent/rules.ts`、`src/agent/hooks.ts`
+- `packages/pi-runtime/src/tools/governance.ts`
+- `packages/mcp-runtime/src/runtime.ts`
+- `packages/sandbox-runtime/src/runtime-controller.ts`
+- `deploy/opensandbox/netdiag-sandbox.yaml`、`deploy/k8s/secret.example.yaml`

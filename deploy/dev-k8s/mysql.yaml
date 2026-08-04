@@ -35,7 +35,7 @@ spec:
             - name: MYSQL_ROOT_PASSWORD
               valueFrom: { secretKeyRef: { name: aiop-dev-secrets, key: MYSQL_ROOT_PASSWORD } }
             - name: MYSQL_DATABASE
-              value: ai_ops
+              value: aiop
             - name: MYSQL_USER
               value: ai_ops
             - name: MYSQL_PASSWORD

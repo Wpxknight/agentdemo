@@ -19,7 +19,7 @@ CREATE TABLE `agent_interactions` (
   KEY `idx_agent_interactions_pending` (`tenant_id`,`status`,`expires_at`),
   KEY `idx_agent_interactions_run` (`tenant_id`,`run_id`),
   KEY `idx_agent_interactions_turn` (`tenant_id`,`run_id`,`attempt_id`,`turn_no`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `agent_run_attempts` (
   `tenant_id` varchar(64) NOT NULL,
@@ -36,7 +36,7 @@ CREATE TABLE `agent_run_attempts` (
   `completed_at` datetime(3) DEFAULT NULL,
   PRIMARY KEY (`tenant_id`,`run_id`,`attempt_id`),
   KEY `idx_agent_run_attempt_status` (`tenant_id`,`status`,`started_at`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `agent_run_events` (
   `id` bigint NOT NULL AUTO_INCREMENT,
@@ -59,7 +59,7 @@ CREATE TABLE `agent_run_events` (
   KEY `idx_agent_run_events_resume` (`tenant_id`,`run_id`,`sequence`),
   KEY `idx_agent_run_event_attempt` (`tenant_id`,`run_id`,`attempt_id`,`turn_no`),
   KEY `idx_agent_run_event_correlation` (`tenant_id`,`correlation_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `agent_run_inbox_messages` (
   `tenant_id` varchar(64) NOT NULL,
@@ -80,7 +80,7 @@ CREATE TABLE `agent_run_inbox_messages` (
   UNIQUE KEY `uq_agent_run_inbox_sequence` (`tenant_id`,`run_id`,`sequence`),
   KEY `idx_agent_run_inbox_status` (`tenant_id`,`run_id`,`status`,`sequence`),
   KEY `idx_agent_run_inbox_expiry` (`tenant_id`,`status`,`claim_expires_at`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `agent_runs` (
   `tenant_id` varchar(64) NOT NULL,
@@ -115,7 +115,7 @@ CREATE TABLE `agent_runs` (
   KEY `idx_agent_runs_status` (`tenant_id`,`status`,`updated_at`),
   KEY `idx_agent_runs_lease` (`lease_expires_at`),
   KEY `idx_agent_runs_session_status` (`tenant_id`,`session_id`,`status`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `agent_tool_executions` (
   `tenant_id` varchar(64) NOT NULL,
@@ -141,7 +141,7 @@ CREATE TABLE `agent_tool_executions` (
   UNIQUE KEY `uq_agent_tool_logical_call` (`tenant_id`,`run_id`,`logical_call_id`),
   KEY `idx_agent_tool_recovery` (`tenant_id`,`status`,`updated_at`),
   KEY `idx_agent_tool_external_correlation` (`tenant_id`,`external_correlation_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `agent_turn_commits` (
   `tenant_id` varchar(64) NOT NULL,
@@ -162,7 +162,7 @@ CREATE TABLE `agent_turn_commits` (
   UNIQUE KEY `uq_agent_turn_commit_id` (`commit_id`),
   KEY `idx_agent_turn_commit_run` (`tenant_id`,`run_id`,`transcript_version`),
   KEY `idx_agent_turn_pi_session` (`tenant_id`,`pi_session_id`,`pi_entry_seq`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `agent_turn_snapshots` (
   `tenant_id` varchar(64) NOT NULL,
@@ -183,7 +183,7 @@ CREATE TABLE `agent_turn_snapshots` (
   `created_at` datetime(3) NOT NULL,
   PRIMARY KEY (`tenant_id`,`run_id`,`attempt_id`,`turn_no`),
   KEY `idx_agent_turn_snapshot_run` (`tenant_id`,`run_id`,`created_at`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `audit_events` (
   `id` bigint NOT NULL AUTO_INCREMENT,
@@ -198,7 +198,7 @@ CREATE TABLE `audit_events` (
   PRIMARY KEY (`id`),
   KEY `idx_audit_session` (`tenant_id`,`session_id`,`id`),
   KEY `idx_audit_kind` (`tenant_id`,`kind`,`id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `messages` (
   `id` bigint NOT NULL AUTO_INCREMENT,
@@ -212,7 +212,7 @@ CREATE TABLE `messages` (
   KEY `idx_messages_session` (`tenant_id`,`session_id`,`id`),
   KEY `idx_messages_tenant_id` (`tenant_id`,`id`),
   KEY `idx_messages_session_user` (`tenant_id`,`user_id`,`session_id`,`id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `pi_session_entries` (
   `tenant_id` varchar(64) NOT NULL,
@@ -226,7 +226,7 @@ CREATE TABLE `pi_session_entries` (
   PRIMARY KEY (`tenant_id`,`session_id`,`entry_id`),
   UNIQUE KEY `uq_pi_session_entry_seq` (`tenant_id`,`session_id`,`entry_seq`),
   KEY `idx_pi_session_entry_parent` (`tenant_id`,`session_id`,`parent_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `pi_sessions` (
   `tenant_id` varchar(64) NOT NULL,
@@ -238,7 +238,7 @@ CREATE TABLE `pi_sessions` (
   `updated_at` datetime(3) NOT NULL,
   PRIMARY KEY (`tenant_id`,`session_id`),
   KEY `idx_pi_sessions_updated` (`tenant_id`,`updated_at`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `scheduled_tasks` (
   `id` bigint NOT NULL AUTO_INCREMENT,
@@ -256,7 +256,7 @@ CREATE TABLE `scheduled_tasks` (
   PRIMARY KEY (`id`),
   KEY `idx_due` (`enabled`,`next_run_at`),
   KEY `idx_tenant` (`tenant_id`,`id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `scheduler_fires` (
   `fire_id` varchar(255) NOT NULL,
@@ -281,7 +281,7 @@ CREATE TABLE `scheduler_fires` (
   KEY `idx_scheduler_fires_lease` (`state`,`lease_expires_at`),
   KEY `idx_scheduler_fires_task` (`tenant_id`,`task_id`,`fire_time`),
   KEY `idx_scheduler_fires_run` (`tenant_id`,`run_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `sessions` (
   `tenant_id` varchar(64) NOT NULL,
@@ -293,7 +293,7 @@ CREATE TABLE `sessions` (
   PRIMARY KEY (`tenant_id`,`user_id`,`session_id`),
   KEY `idx_sessions_updated` (`tenant_id`,`updated_at`),
   KEY `idx_sessions_tenant_user` (`tenant_id`,`user_id`,`updated_at`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `setting_secrets` (
   `tenant_id` varchar(64) NOT NULL,
@@ -302,7 +302,7 @@ CREATE TABLE `setting_secrets` (
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`tenant_id`,`setting_key`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `task_agent_runs` (
   `tenant_id` varchar(64) NOT NULL,
@@ -311,7 +311,7 @@ CREATE TABLE `task_agent_runs` (
   `created_at` datetime(3) NOT NULL,
   PRIMARY KEY (`tenant_id`,`task_id`,`run_id`),
   KEY `idx_task_agent_runs_run` (`tenant_id`,`run_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `task_runs` (
   `id` bigint NOT NULL AUTO_INCREMENT,
@@ -325,7 +325,7 @@ CREATE TABLE `task_runs` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `uniq_task_runs_fire` (`fire_id`),
   KEY `idx_runs_task` (`task_id`,`id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `tenant_settings` (
   `tenant_id` varchar(64) NOT NULL,
@@ -334,14 +334,14 @@ CREATE TABLE `tenant_settings` (
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`tenant_id`,`setting_key`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `tenants` (
   `id` varchar(64) NOT NULL,
   `name` varchar(128) NOT NULL,
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `user_credentials` (
   `tenant_id` varchar(64) NOT NULL,
@@ -351,7 +351,7 @@ CREATE TABLE `user_credentials` (
   `expires_at` timestamp NULL DEFAULT NULL,
   `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`tenant_id`,`user_id`,`provider`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `users` (
   `id` varchar(64) NOT NULL,
@@ -366,5 +366,5 @@ CREATE TABLE `users` (
   `home_dir` varchar(512) DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uniq_user` (`tenant_id`,`username`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

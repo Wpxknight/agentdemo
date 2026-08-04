@@ -1,78 +1,70 @@
 # AIoP 设计文档
 
-本目录全部文档以 2026-07-31 当前代码为基线。01～10 章描述现状，11 章记录尚未实现的演进项，12 章记录 Pi 集成完成后的最终模块化结果；历史迁移过程不再作为当前设计。
+> 状态：当前设计
+> 验证基线：`b5425a0d2ae3ddc23ada4d3184d4a95e3a717bae`
+> 最后核对：2026-08-03
+> 适用范围：`pi-agent-platform-integration` 当前实现
 
-## 阅读顺序
+本目录描述当前实现，不以迁移过程或目标蓝图代替源码事实。系统级术语、唯一模块职责表和唯一全量目录树见 [01 系统总览](./01-system-overview.md)。
 
-1. [系统总览](./01-system-overview.md)
-2. [Agent Runtime](./02-agent-runtime.md)
-3. [模型与上下文](./03-model-and-context.md)
-4. [工具、Skill 与 MCP](./04-tools-skills-mcp.md)
-5. [Sandbox 与运维](./05-sandbox-and-ops.md)
-6. [认证、安全与多租户](./06-auth-security-tenancy.md)
-7. [数据与持久化](./07-data-and-persistence.md)
-8. [Scheduler](./08-scheduler.md)
-9. [HTTP API 与 Web](./09-api-and-web.md)
-10. [部署与可观测性](./10-deployment-observability.md)
-11. [演进路线与已知限制](./11-evolution-roadmap.md)
-12. [Pi 集成与 Agent Platform 模块化设计](./12-pi-integration-plan.md)
+## 事实优先级
 
-开发者可直接阅读[代码走读](../guide/code-walkthrough.md)，运维人员使用[Pi Agent Platform 操作说明](../pi-agent-platform-operations.md)。
+发生冲突时按以下顺序核对：
 
-## 按任务选择文档
+1. 数据迁移与运行配置：`src/db/migrations/`、`deploy/`、实际配置 schema。
+2. 公共契约：`packages/control-contracts/` 与各工作区包的 `package.json`、`src/index.ts`。
+3. 当前实现：`src/`、`packages/`、`web/src/`。
+4. 自动化测试：`tests/`。
+5. 当前设计文档：`docs/design/01`～`13`（不含已删除的旧第 12 篇）。
+6. 历史文档与生成物只作背景或快照，不作为当前行为的首要证据。
 
-| 你要处理的问题 | 先读 | 再核对源码 |
+依赖版本以根目录及 `web/` 的 lockfile 为准；API 行为以 `src/server/http.ts` 和 HTTP tests 为准；部署事实以 `deploy/k8s/`、`deploy/dev-k8s/` 与 `Makefile` 为准。
+
+## 01～13 文档职责
+
+| 编号 | 文档 | 唯一职责 |
 | --- | --- | --- |
-| 修改一次 Agent Run 的生命周期 | 02、03、07 | `packages/pi-runtime/src/run/`、`packages/pi-runtime/src/pi/` |
-| 新增或治理 Tool | 04、06 | `packages/pi-runtime/src/tools/`、`src/tools/`、`src/agent/tools.ts` |
-| 接入 MCP、Skill 或 Sandbox | 04、05 | 对应工作区包与 `src/runtime.ts` |
-| 修改登录、权限或租户隔离 | 06、07 | `src/auth/`、`src/server/context.ts`、`src/db/` |
-| 修改定时任务或恢复 | 08、02 | `packages/scheduler-runtime/`、`src/scheduler/` |
-| 修改 API、SSE 或 Web | 09 | `src/server/http.ts`、`web/src/`、HTTP/Web tests |
-| 构建、部署或排障 | 10 | `Makefile`、`deploy/`、`src/index.ts` |
-| 评估下一阶段重构 | 11、12 | 当前源码规模、测试和部署约束 |
+| 01 | [系统总览](./01-system-overview.md) | 系统边界、三层架构图、唯一模块职责表、唯一全量目录树、技术选型与主请求时序 |
+| 02 | [Agent Runtime](./02-agent-runtime.md) | `DurableRunRuntime`、`DurableRunManager`、Attempt、Lease/Fencing、等待与恢复语义 |
+| 03 | [模型与上下文](./03-model-and-context.md) | Model Provider、Pi Session Tree、上下文与 committed path |
+| 04 | [工具、Skill 与 MCP](./04-tools-skills-mcp.md) | Governed Tool Execution、Skill、MCP 与 `ToolExecutionOutcome` |
+| 05 | [Sandbox 与运维](./05-sandbox-and-ops.md) | Sandbox Provider、Sandbox Generation、Desktop 与运行维护边界 |
+| 06 | [认证、安全与多租户](./06-auth-security-tenancy.md) | 身份、RBAC、租户隔离、Secret、策略与审计 |
+| 07 | [数据与持久化](./07-data-and-persistence.md) | `MysqlStore`/`MemoryStore`、事务、数据模型与 product session projection |
+| 08 | [Scheduler](./08-scheduler.md) | Scheduler Fire、确定性 Run 绑定与 bound Run recovery |
+| 09 | [HTTP API 与 Web](./09-api-and-web.md) | HTTP/SSE、Web、Run Center、interaction-specific resume 与接口边界 |
+| 10 | [部署与可观测性](./10-deployment-observability.md) | Kubernetes 拓扑、配置、健康检查、日志指标与部署限制 |
+| 11 | [演进路线与已知限制](./11-evolution-roadmap.md) | 未实现能力、已知风险、验证缺口与渐进演进项 |
+| 12 | [HTTP API Reference](./12-http-api-reference.md) | HTTP 路由、认证、请求/响应、SSE 和错误契约的字段级参考 |
+| 13 | [Configuration Reference](./13-configuration-reference.md) | 环境变量、配置文件与部署参数的字段级参考 |
 
-每篇文档中的路径是“从哪里开始读”，不是完整调用图。接口和行为发生冲突时，优先级始终是 migration/配置 → public contract → 实现 → tests → 设计文档。
+旧 `12-pi-integration-plan.md` 已删除；其历史版本由 Git 保留，不作为当前架构入口。
 
-## 当前五个工作区包
+## 文档状态
 
-| 包 | 设计入口 |
-| --- | --- |
-| `@aiop/control-contracts` | 身份、Run、Interaction、Tool、Event、错误的纯契约 |
-| `@aiop/pi-runtime` | Pi AgentHarness/Session 适配、Durable Run、治理与 Store |
-| `@aiop/mcp-runtime` | MCP 连接、租户作用域、重连与 Tool adapter |
-| `@aiop/sandbox-runtime` | Sandbox Provider、生命周期、Profile、Desktop 与 Tool adapter |
-| `@aiop/scheduler-runtime` | Cron、Fire、claim、Run 绑定与恢复 |
+- **current**：`docs/design/01`～`13`（不含已删除的旧第 12 篇），描述本页验证基线上的当前实现或明确标记的演进项。
+- **historical**：`docs/superpowers/specs/`、`docs/superpowers/plans/` 等迁移设计和实施记录，只用于理解决策背景；其中旧组件名不代表当前组件。
+- **generated**：`docs/public-api/` 等由工具生成或校验的公共 API snapshot，用于发布面比对，不替代实现、契约源码或设计说明。
 
-五个包版本均为 `0.1.0-preview.1`，Node.js 基线均为 `>=22.19.0`。包的精确 export 以各自 `src/index.ts` 与 `package.json` 为准。
+## 源码入口地图
 
-## 所有权术语
+| 关注点 | 首要入口 | 补充证据 |
+| --- | --- | --- |
+| 进程与命令入口 | `src/index.ts` | `package.json` |
+| 应用装配 | `src/runtime.ts` | `packages/*/src/index.ts` |
+| Durable Pi Run | `packages/pi-runtime/src/run/`、`packages/pi-runtime/src/pi/` | `packages/control-contracts/src/run.ts` |
+| HTTP/SSE 与产品投影 | `src/server/http.ts`、`src/agent/projections.ts` | `tests/http*.test.ts` |
+| Governed Tool Execution | `src/tools/governance.ts`、`packages/pi-runtime/src/tools/` | `packages/control-contracts/src/tool.ts` |
+| Skill、MCP、Sandbox | `src/skill/`、`packages/mcp-runtime/`、`packages/sandbox-runtime/` | `skills/`、对应 tests |
+| Scheduler | `src/scheduler/runner.ts`、`packages/scheduler-runtime/` | `tests/scheduler*.test.ts` |
+| Store 与迁移 | `src/db/`、`src/db/migrations/0001_baseline.sql` | `tests/db.test.ts`、Store tests |
+| Web | `web/src/` | `web/package.json`、前端 tests |
+| 通用与开发部署 | `deploy/k8s/`、`deploy/dev-k8s/` | `Makefile`、manifest tests |
 
-- **Pi 复用**：行为由 Pi 公开 API 提供，AIoP 不复制实现。
-- **AIoP 薄适配**：稳定 codec、storage 或 product bridge，不成为第二套执行引擎。
-- **AIoP 自研**：Pi 不提供的 durable、多租户、治理和产品能力。
-- **外部系统**：模型 Provider、MCP Server、AIOS/OpenSandbox、Kubernetes、MySQL、OIDC。
+## 使用边界
 
-## 当前源码地图
+设计文档解释架构意图、当前职责和证据边界，但不替代：
 
-| 领域 | 路径 |
-| --- | --- |
-| Composition root | `src/runtime.ts` |
-| HTTP/SSE | `src/server/http.ts` |
-| 产品 Agent/Run Center/Projection | `src/agent/` |
-| 产品 Tool | `src/tools/` |
-| 产品 Skill 治理 | `src/skill/` |
-| Scheduler 应用装配 | `src/scheduler/` |
-| 数据库与基线迁移 | `src/db/`、`src/db/migrations/0001_baseline.sql` |
-| Web | `web/src/` |
-| Staging manifests | `deploy/dev-k8s/` |
-| 构建、部署、回滚 | `Makefile` |
-
-## 事实与证据规则
-
-- 依赖版本以 `package.json`、lockfile 和包 manifest 为准。
-- 数据结构以 `src/db/migrations/` 为准。
-- API 以 `src/server/http.ts` 和 HTTP tests 为准。
-- 部署命令以 `Makefile` 为准，不从历史文档复制命令。
-- 未实际执行的备份、部署、验收或回滚必须标记为“待执行”，不能写成已完成证据。
-- 临时 evidence 写入仓库 `dist/`，不提交仓库。
+- 操作手册：部署、配置、回滚和排障使用 `docs/pi-agent-platform-operations.md` 与 `Makefile`。
+- 公共 API snapshot：发布面的精确声明使用 `docs/public-api/`，并以包源码、export 和校验脚本为准。
+- 自动化验证：任何可用性、恢复、高可用或兼容性结论都需要对应测试、部署或演练证据；文档中的拓扑不等于已验证 SLA。

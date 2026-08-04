@@ -1,241 +1,207 @@
 # AIoP 系统总览
 
-本文描述 2026-07-31 移除旧兼容层后的当前架构。当前构建只有 Durable Pi Runtime，不包含 Legacy/LangGraph Kernel、运行时选择器或旧 checkpoint 兼容路径。
+> 状态：当前设计
+> 验证基线：`b5425a0d2ae3ddc23ada4d3184d4a95e3a717bae`
+> 最后核对：2026-08-03
+> 适用范围：`pi-agent-platform-integration` 当前实现
 
-## 1. 平台定位
+## 1. 背景与系统边界
 
-AIoP 是多租户 Agent 平台。HTTP/SSE、CLI 与 Scheduler 共享同一套 Durable Pi Runtime；Web 提供会话、Run Center、Skill、MCP、Sandbox、Scheduler 与管理页面。
+AIoP 后端是运行于 Node.js 的 TypeScript 模块化单体，`src/index.ts` 提供 HTTP、CLI 和 Scheduler 进程入口，`src/runtime.ts` 是 Composition Root。前端是 `web/` 下独立构建的 React/Vite 工程，通过 HTTP/SSE 使用后端能力。
 
-系统边界分为三层：
+仓库包含五个版本为 `0.1.0-preview.1` 的 `@aiop/*` workspace 发布边界：
 
-- **Pi 复用**：模型 Provider、Agent loop、Turn、Session Tree、上下文压缩、基础 Tool 执行和 Skill 加载。
-- **AIoP 薄适配**：产品输入到 Pi message 的映射、event codec、模型配置映射、SessionStorage、Tool bridge 与 Skill resource 映射。
-- **AIoP 自研**：Durable Run、Attempt、Lease/Fencing、Inbox、取消与恢复、Tool Governance、MCP 管理、Sandbox、Scheduler、认证、审计、产品 API 与 MySQL Projection。
+- `@aiop/control-contracts`：跨包控制契约。
+- `@aiop/pi-runtime`：Durable Pi Run、Pi Session 与治理桥接。
+- `@aiop/mcp-runtime`：MCP 连接和 Tool adapter。
+- `@aiop/sandbox-runtime`：Local、E2B、OpenSandbox、AIOS 等 Sandbox adapter。
+- `@aiop/scheduler-runtime`：Cron、Scheduler Fire、claim 和 Run 绑定。
 
-## 2. 五个工作区包
+当前生产 assembly/manager 是 **Pi-only Agent runtime**，不存在运行时 kernel 选择开关；控制契约仍保留可扩展的 kernel 字段形状，不代表当前支持其他内核。生产/通用 Kubernetes 与生产 Scheduler 以 MySQL `MysqlStore` 为持久化前提；未配置 `MYSQL_HOST` 时应用可回退到进程重启即丢失的 `MemoryStore`。证据见 `src/runtime.ts`、`src/db/index.ts`、`src/config/mysql.ts`、`src/scheduler/runner.ts`。
 
-| 包 | 当前职责 |
-| --- | --- |
-| `@aiop/control-contracts` | 身份、Durable Run、Interaction、Tool、Event 与错误契约；无运行时依赖 |
-| `@aiop/pi-runtime` | Pi AgentHarness/Session 适配、Durable Run、Tool Governance、Memory/MySQL Store 与装配 |
-| `@aiop/mcp-runtime` | MCP client、连接管理、租户/actor 作用域、凭据解析与 Tool 映射 |
-| `@aiop/sandbox-runtime` | Local/E2B/OpenSandbox/AIOS 生命周期、Profile、Warm Pool、Desktop 与 Tool adapter |
-| `@aiop/scheduler-runtime` | Cron、Fire、领取租约、Run 绑定、过期恢复与 MySQL Store |
+外部能力包括 Model Provider、MCP Server、Kubernetes/OpenSandbox，以及可替换的 E2B、Local、AIOS Sandbox Provider。各边界详见 [02 Agent Runtime](./02-agent-runtime.md)、[04 工具、Skill 与 MCP](./04-tools-skills-mcp.md)、[05 Sandbox 与运维](./05-sandbox-and-ops.md)、[06 认证、安全与多租户](./06-auth-security-tenancy.md)、[07 数据与持久化](./07-data-and-persistence.md)、[08 Scheduler](./08-scheduler.md)、[09 HTTP API 与 Web](./09-api-and-web.md)、[10 部署与可观测性](./10-deployment-observability.md)。
 
-应用层位于 `src/`：`src/runtime.ts` 是 composition root；`src/server/` 提供 API；`src/agent/` 提供产品投影和 Run Center；`src/skill/` 提供产品目录与治理；`src/tools/` 提供 AIoP 产品工具；`src/scheduler/` 将应用配置接到 scheduler package。
+## 2. 三层架构
 
-### 2.1 带职责注释的目录树
+### 2.1 系统架构图
 
-```text
-aiop/
-├── src/                         # 产品应用层：入口、装配、HTTP、身份、产品治理
-│   ├── index.ts                 # serve / scheduler / seed-admin / CLI 进程入口
-│   ├── runtime.ts               # Composition Root，选择并连接具体实现
-│   ├── server/                  # HTTP/SSE、认证请求上下文、下载与 Run API
-│   ├── agent/                   # Run Center、产品投影、规则、Interaction 与工具注册
-│   ├── tools/                   # AIoP 内置工具及产品治理适配
-│   ├── skill/                   # Skill 导入、审核、可见性、凭据与 Sandbox 同步
-│   ├── scheduler/               # scheduler-runtime 的产品装配与进程循环
-│   ├── db/                      # 产品 Store、Memory/MySQL 与 baseline migration
-│   └── auth/                    # Local、OIDC、AIOS 与 RBAC
-├── packages/
-│   ├── control-contracts/       # 跨包控制契约，不实现执行流程
-│   ├── pi-runtime/              # Durable Run、Pi adapter、Tool Governance 与 Store
-│   ├── mcp-runtime/             # MCP 连接、作用域、重连与 Tool 映射
-│   ├── sandbox-runtime/         # Provider、生命周期、Profile、Desktop 与 Tool adapter
-│   └── scheduler-runtime/       # Cron Fire、claim、Run 绑定与恢复
-├── web/src/                     # React 控制台，通过 HTTP/SSE 使用产品 API
-├── tests/                       # 契约、运行时、HTTP、存储、工具与前端回归
-└── deploy/                      # staging、通用 Kubernetes 与 OpenSandbox 资源
-```
-
-依赖方向是“根产品层依赖工作区包”，工作区包不得反向 import `src/`。`control-contracts` 是共享语言，不依赖任何具体运行时。
-
-## 3. 架构图
-
-### 3.1 系统架构图
-
-系统架构图只描述部署单元、集群边界和跨系统网络调用，不展开后端程序内部模块。AIoP 直接部署在 AIOS Portal 集群，通过 AIOS Sandbox 服务把 Sandbox 工作负载发布到目标算力集群。下图以 AIOS Lifecycle 生产集成为主；通用 Kubernetes 清单默认连接 OpenSandbox，二者位于同一个 Sandbox Provider 边界。
+该图只表达用户到平台及外部能力的系统关系，不表示部署对象或源码结构。
 
 ```mermaid
 flowchart LR
-    User["用户"]
-
-    subgraph PortalCluster["AIOS Portal 集群"]
-        direction TB
-        AIOSPortal["AIOS Portal"]
-        Gateway["Portal Ingress / Gateway"]
-
-        subgraph AIOPDeployment["AIoP 服务 Pod（aiop-server）"]
-            direction LR
-            Web["前端容器 aiop-web<br/>Nginx + React :8080"]
-            Backend["后端容器 aiop<br/>HTTP/SSE + Durable Runtime<br/>内嵌 Scheduler :8081"]
-            Web -->|"Pod 内 127.0.0.1:8081"| Backend
-        end
-
-        Service["AIoP Service"]
-        MySQL[("MySQL 服务")]
-        SkillVolume[("Skill PVC")]
-
-        AIOSPortal -->|"iframe / token exchange"| Gateway
-        Gateway --> Service --> Web
-        Backend <--> MySQL
-        Backend <--> SkillVolume
-    end
-
-    subgraph ExternalServices["外部服务"]
-        direction TB
-        Model["LLM Provider"]
-        MCPServer["MCP Server"]
-    end
-
-    subgraph SandboxCluster["AIOS Sandbox 服务集群"]
-        direction TB
-        AiosSandbox["aios-sandbox 容器<br/>Lifecycle API"]
-        TemplateCatalog["Sandbox Template Catalog"]
-        AiosSandbox <--> TemplateCatalog
-    end
-
-    subgraph ComputeCluster["AIOS 目标算力集群<br/>placement.clusterId / namespace"]
-        direction TB
-        SandboxPod["按模板创建的 Sandbox Pod / 容器"]
-        ComputeResources["算力、Kubernetes 与 AIOS 产品资源"]
-        SandboxPod -->|"受 ServiceAccount 约束访问"| ComputeResources
-    end
-
-    External["外部网络 / 浏览器目标"]
-
-    User --> AIOSPortal
-    Backend -->|"模型请求"| Model
-    Backend -->|"MCP 协议"| MCPServer
-    Backend -->|"Lifecycle REST<br/>创建、命令、文件、销毁"| AiosSandbox
-    AiosSandbox -->|"按 placement 发布与管理"| SandboxPod
-    SandboxPod -->|"受控网络访问"| External
-
-    classDef pi fill:#e8f4ff,stroke:#1677ff,color:#000;
-    classDef aiop fill:#fff7e6,stroke:#fa8c16,color:#000;
-    classDef external fill:#f6ffed,stroke:#52c41a,color:#000;
-    class Model pi;
-    class Gateway,Service,Web,Backend,SkillVolume,MySQL aiop;
-    class User,AIOSPortal,AiosSandbox,TemplateCatalog,SandboxPod,ComputeResources,MCPServer,External external;
-
-    style PortalCluster fill:#fffdf7,stroke:#fa8c16,color:#000;
-    style AIOPDeployment fill:#fffaf0,stroke:#fa8c16,color:#000;
-    style ExternalServices fill:#f8fbff,stroke:#1677ff,color:#000;
-    style SandboxCluster fill:#fbfff7,stroke:#52c41a,color:#000;
-    style ComputeCluster fill:#fbfff7,stroke:#52c41a,color:#000;
+    User["用户/AIOS"] --> Web["Web"]
+    Web --> HTTP["HTTP API"]
+    HTTP --> Platform["Durable Agent Platform"]
+    Scheduler["Scheduler"] --> Platform
+    Platform --> Capabilities["Tool/Skill/MCP/Sandbox capabilities"]
+    Platform <--> MySQL["MySQL"]
+    Platform --> Model["Model Provider"]
+    Capabilities --> K8s["Kubernetes/OpenSandbox"]
+    Platform --> HTTP
+    HTTP --> Web
 ```
 
-AIoP 的 `aiop-server` Deployment 位于 AIOS Portal 集群，通用清单默认运行 2 个副本。`aiop-web` 与 `aiop` 部署在同一个 Pod，Nginx 通过 `127.0.0.1:8081` 代理 API/SSE，Scheduler 内嵌在后端进程。AIOS Lifecycle 调用携带平台配置的固定 `clusterId/namespace` 和已授权模板 ID；Sandbox 实例由 `aios-sandbox` 侧发布到目标算力集群，AIoP 不直接创建目标集群中的 Pod。通用清单默认使用 OpenSandbox，其控制服务承担相同的创建、命令和销毁边界。
+系统事实：HTTP、CLI、Scheduler 的 **Agent Run entries** 共享 `DurableRunRuntime`；直接 Tool、Sandbox、Browser 等 HTTP 路由不属于统一 Agent Run 入口。`Pi Session Tree` 是 Durable Pi 的 context/commit source；成功 Pi Run 后可重建 Web 的 product session projection，但 idle session append 仍可直接写产品消息。证据见 `src/index.ts`、`src/server/http.ts`、`src/runtime.ts`、`src/agent/projections.ts`。
 
-### 3.2 程序架构图
+### 2.2 通用部署架构图
 
-程序架构图只描述 AIoP 程序内的大模块与主要调用链，不展开文件、类或 Provider 实现。箭头表示运行时调用或数据访问，指向 Store 的箭头表示持久化读写。
+该图对应 `deploy/k8s/` 的通用清单，不等同于 `deploy/dev-k8s/` 的单副本 NodePort 开发拓扑。
+
+```mermaid
+flowchart LR
+    Ingress["external ingress/gateway prerequisite"]
+
+    subgraph Cluster["Kubernetes cluster"]
+        subgraph Namespace["aiop namespace"]
+            Service["Service"]
+            subgraph PodGroup["2 x Pod"]
+                WebContainer["Web container :8080"] --> BackendContainer["Backend container :8081"]
+            end
+            Service --> WebContainer
+            BackendContainer <--> PVC["shared RWX skills PVC"]
+        end
+    end
+
+    Ingress --> Service
+    BackendContainer <--> MySQL["external MySQL"]
+    BackendContainer --> OpenSandbox["OpenSandbox service"]
+```
+
+通用 Deployment 声明 2 replicas，每个 Pod 包含 Web `:8080` 和 Backend `:8081`；ClusterIP Service 只转发到 Web，skills PVC 为 RWX，MySQL 地址来自 Secret，仓库通用清单未提供 Ingress。2 replicas 是部署事实，不足以证明端到端高可用、SLA、故障转移或 RTO/RPO。证据见 `deploy/k8s/deployment-server.yaml`、`deploy/k8s/service.yaml`、`deploy/k8s/pvc-skills.yaml`、`deploy/k8s/secret.example.yaml`。
+
+### 2.3 程序架构图
+
+该图表达模块依赖方向；工作区包不应反向依赖根目录产品层。
 
 ```mermaid
 flowchart TB
-    User["用户 / 外部系统"]
-    Web["AIoP Web"]
-    Entry["HTTP / SSE / CLI"]
-    Scheduler["AIoP Scheduler Runtime"]
-    App["AIoP 应用服务"]
-    Run["AIoP Durable Run 控制"]
-    PiAdapter["Pi 薄适配层"]
-    Pi["Pi Agent Runtime"]
-    Governance["AIoP Tool 治理"]
-    ProductTools["AIoP 产品 Tool"]
-    Skill["AIoP Skill 产品管理"]
-    PiSkill["Pi Skill Loader"]
-    MCP["MCP Runtime"]
-    Sandbox["Sandbox Runtime"]
-    Store[("AIoP MySQL")]
-    Model["LLM Provider"]
-    ProductBackend["Kubernetes / AIOS / 产品资源"]
-    MCPServer["MCP Server"]
-    SandboxProvider["Local / E2B / OpenSandbox / AIOS"]
-
-    User --> Web
-    Web --> Entry
-    Entry --> App
-    Scheduler --> Run
-    App --> Run
-    App --> Skill
-    Run --> PiAdapter
-    PiAdapter --> Pi
-    Pi --> Model
-    PiAdapter --> PiSkill
-    Skill -->|"过滤后的 Skill Source"| PiAdapter
-    PiSkill --> Pi
-    Skill -->|"版本、权限、审计"| Store
-    Skill -->|"同步已授权 Skill"| Sandbox
-    Pi --> Governance
-    Governance --> ProductTools
-    Governance --> MCP
-    Governance --> Sandbox
-    ProductTools --> ProductBackend
-    MCP --> MCPServer
-    Sandbox --> SandboxProvider
-    Run <--> Store
-    PiAdapter <--> Store
-    Scheduler <--> Store
-
-    classDef pi fill:#e8f4ff,stroke:#1677ff,color:#000;
-    classDef aiop fill:#fff7e6,stroke:#fa8c16,color:#000;
-    classDef external fill:#f6ffed,stroke:#52c41a,color:#000;
-    class Pi,PiSkill,Model pi;
-    class Web,Entry,Scheduler,App,Run,PiAdapter,Governance,ProductTools,Skill,MCP,Sandbox,Store aiop;
-    class User,ProductBackend,MCPServer,SandboxProvider external;
+    Entry["Process entry"] --> Root["Composition root"]
+    Entry --> Adapters["HTTP/CLI/Scheduler adapters"]
+    Root --> Runtime["Durable Pi runtime"]
+    Root --> Control["Store/Auth/Audit"]
+    Root --> CapabilityAdapters["MCP/Skill/Sandbox adapters"]
+    Adapters --> Runtime
+    Runtime --> Tools["Governed tools"]
+    Tools --> CapabilityAdapters
+    Runtime <--> Control
+    Tools <--> Control
+    CapabilityAdapters --> External["External systems"]
+    Runtime --> External
 ```
 
 | 模块 | 负责 | 是否自研 |
 | --- | --- | --- |
-| AIoP Web 与应用服务 | Web 页面、HTTP/SSE/CLI 接入、认证、产品 API、Run Center 和运行时装配 | **部分自研。** 产品页面和服务自研；复用 React、Node.js 与 Nginx |
-| Scheduler Runtime | Cron Fire、Run 绑定、领取租约和过期恢复 | **是。** 调度一致性与 Durable Run 绑定属于 AIoP 控制面 |
-| Durable Run 与 Pi 薄适配 | Run/Attempt/Turn、lease/fencing、Session、事件、取消和恢复 | **部分自研。** 复用 Pi 0.82.1 的 AgentHarness/Session，自研 durable 与持久化适配 |
-| Tool 治理与产品 Tool | capability、Policy、Approval、Ledger、Audit、并发和真实工具分发 | **是。** 平台必须掌握权限、副作用与恢复责任 |
-| Skill 产品管理 | 导入、审核、共享、Pi resource 投影和 Sandbox 同步 | **部分自研。** 复用 Pi Skill Loader，自研产品治理与租户边界 |
-| MCP Runtime | MCP 连接、作用域、重连、凭据解析和 Tool 映射 | **部分自研。** 复用 MCP SDK 1.29.0，自研多租户与治理接入 |
-| Sandbox Runtime | Local/E2B/OpenSandbox/AIOS Provider、生命周期、Profile、Desktop 和 Tool adapter | **部分自研。** 复用外部 Sandbox 基础设施，自研统一契约和控制层 |
-| Store 与 MySQL | 产品 Store、Durable Store、Pi SessionStorage、Scheduler Store 与事务/fencing | **部分自研。** 数据模型和一致性自研；复用 MySQL、Kysely 与 mysql2 |
+| Process entry | 启动 HTTP、CLI、独立或内嵌 Scheduler、管理进程生命周期；入口为 `src/index.ts` | **自研产品入口。** 复用 Node.js 进程模型；命令形态可调整但不承载 durable 语义 |
+| Composition root | 读取配置，选择 Store、认证、模型、五个 workspace runtime 和具体 Adapter；入口为 `src/runtime.ts` | **自研装配。** 复用各 workspace 与第三方 SDK；Adapter 可按配置替换 |
+| HTTP/CLI/Scheduler adapters | 将网络、命令行和 Scheduler Fire 转为共享 `DurableRunRuntime` 调用；见 `src/server/http.ts`、`src/index.ts`、`src/scheduler/runner.ts` | **自研适配。** HTTP/SSE、CLI 与调度触发可独立演进，不复制执行引擎 |
+| Durable Pi runtime | 实现 `DurableRunRuntime`/`DurableRunManager`、Run/Attempt/Turn、lease/fencing、取消、提交与已证实的恢复路径；见 `packages/pi-runtime/src/run/`、`packages/pi-runtime/src/pi/` | **部分自研。** 复用 Pi Core/Pi AI 的 AgentHarness、Session 和 agent loop；自研 durable、多租户与持久化边界 |
+| Governed tools | capability、策略、Interaction、fenced ledger、并发和审计，输出 `result`/`waiting`/`recovery_required`；见 `src/tools/governance.ts`、`packages/pi-runtime/src/tools/` | **自研治理。** 真实工具实现与 Adapter 可替换；治理链不能被旁路 |
+| MCP/Skill/Sandbox adapters | MCP 连接与重连、Skill 产品治理和 Pi resource 映射、Sandbox Provider 生命周期与 Tool adapter | **部分自研。** 复用 MCP SDK、Pi Skill 能力、OpenSandbox/E2B；Local/OpenSandbox/E2B/AIOS 为可替换 Adapter |
+| Store/Auth/Audit | MySQL/Memory Store、事务和投影、Local/OIDC/AIOS 认证、RBAC 与审计；见 `src/db/`、`src/auth/`、`src/audit/` | **部分自研。** 数据模型和安全边界自研；复用 MySQL、Kysely、mysql2、OIDC/JWT 组件 |
+| External systems | Model Provider、MCP Server、MySQL、Kubernetes/OpenSandbox、E2B、AIOS 等平台能力 | **非自研系统。** AIoP 通过稳定 Adapter 集成；可替换性受协议、凭据和产品语义约束 |
 
-### 3.3 调用关系与箭头含义
+## 3. 全量目录树
 
-- `Web → HTTP/SSE` 是网络调用；浏览器不直接依赖工作区包。
-- `HTTP/CLI → 应用服务 → Durable Run` 与 `Scheduler → Durable Run` 是两类运行时入口。
-- `Durable Run Manager → Pi Adapter` 是控制面调用：前者管理跨请求生命周期，后者管理会话内 Agent loop。
-- `Pi Agent Runtime → Tool Governance → 产品 Tool/MCP/Sandbox` 是受治理的 Tool 执行链，不允许直接旁路。
-- 指向 Store 的箭头是数据持久化；Store 不会反向驱动 Agent loop。
-- 指向外部系统的箭头跨越信任边界，返回值必须经过裁剪、校验或治理后才能持久化和展示。
+以下是本设计集唯一全量目录树；覆盖实际一级目录和关键二级职责，不枚举生成依赖目录。
 
-Pi Session Tree 是会话内上下文事实源；AIoP MySQL 是产品 Run、跨进程协调、治理记录和兼容查询事实源。`src/agent/projections.ts` 只从已提交 Pi leaf 重建产品消息视图。
+```text
+aiop/
+├── src/                         # Node.js/TypeScript 模块化单体产品层
+│   ├── index.ts                 # HTTP、CLI、Scheduler、seed-admin 进程入口
+│   ├── runtime.ts               # Composition Root 与 Pi-only runtime 装配
+│   ├── agent/                   # Run Center、Interaction、投影、规则与产品桥接
+│   ├── auth/                    # Local、OIDC、AIOS、会话与 RBAC
+│   ├── audit/                   # 审计事件 sink 与产品审计写入边界
+│   ├── config/                  # 配置 schema、加载、MySQL 与集群配置
+│   ├── db/                      # Memory/MySQL Store、schema 与 baseline migration
+│   ├── llm/                     # Model Provider factory、协议适配、上下文与成本统计
+│   ├── net/                     # 外部网络访问的 SSRF 校验边界
+│   ├── ops/                     # 运维命令与操作风险分类
+│   ├── scheduler/               # scheduler-runtime 产品装配、ticker 与恢复入口
+│   ├── security/                # 敏感设置与 Secret 加解密
+│   ├── server/                  # HTTP/SSE、请求上下文与下载
+│   ├── skill/                   # Skill 导入、治理、凭据、可见性与 Sandbox 同步
+│   └── tools/                   # 产品 Tool、Governed Tool Execution 与导出
+├── packages/                    # 五个 @aiop/* workspace 发布边界
+│   ├── control-contracts/       # Run、Tool、Interaction、Event、身份与错误契约
+│   ├── pi-runtime/              # Durable Pi runtime、Session、Tool bridge 与 Store
+│   ├── mcp-runtime/             # MCP client、作用域、重连与 Tool adapter
+│   ├── sandbox-runtime/         # Sandbox Provider、Generation、Desktop 与 Tool adapter
+│   └── scheduler-runtime/       # Cron、Scheduler Fire、claim、绑定与 Store
+├── web/                         # 独立 React/Vite Web 工程及 Nginx 容器配置
+│   └── src/                     # 页面、组件、API/SSE 客户端和前端状态
+├── skills/                      # 内置/导入 Skill 资源、脚本与参考材料
+│   └── aios-request/            # AIOS 请求与产品操作 Skill 集
+├── deploy/                      # 部署清单与 Sandbox 镜像/资源
+│   ├── k8s/                     # 通用 2 副本、外部 MySQL、RWX skills 部署
+│   ├── dev-k8s/                 # 单副本 NodePort、仓库内 MySQL/Dex 开发拓扑
+│   └── opensandbox/             # OpenSandbox 模板、镜像、ServiceAccount 与说明
+├── tests/                       # 契约、运行时、HTTP、存储、调度、Sandbox 与前端测试
+│   └── contracts/               # 工作区契约、发布面和旧兼容移除约束
+├── scripts/                     # 构建、验证、冒烟、基准和辅助服务脚本
+├── docs/                        # 当前设计、操作手册、公共 API snapshot 与历史记录
+│   ├── design/                  # 当前设计文档（01～13；旧第 12 篇已删除）
+│   │   ├── 12-http-api-reference.md # HTTP API 字段级参考
+│   │   └── 13-configuration-reference.md # 配置字段级参考
+│   ├── guide/                   # 开发者代码走读
+│   ├── public-api/              # generated 公共 API snapshot
+│   └── superpowers/             # historical specs/plans
+└── ui-design/                   # UI 设计规范与 AIOS 设计系统资料
+```
 
-## 4. 端到端请求路径
+## 4. 技术选型
 
-以“用户从 Web 发起一条需要 Sandbox Tool 的消息”为例：
+版本由 `package-lock.json`、`web/package-lock.json`、包 manifest 或 Dockerfile 核对；npm 依赖的 License 由对应 lockfile 核对，Node.js License 未在本基线核实。Star 不作为本基线事实。
 
-1. `web/src/` 通过 `POST /v1/agent` 发送认证请求，`src/server/http.ts` 从 Token 构建可信 tenant/actor/role。
-2. HTTP handler 调用 `DurableRunRuntime.run()`；`packages/pi-runtime/src/run/manager.ts` 创建 Run、claim Attempt 并启动 lease heartbeat。
-3. `packages/pi-runtime/src/pi/agent.ts` 创建或打开 Pi Session，由 `AgentHarness` 调用模型。
-4. 模型产生 Sandbox Tool Call 后，调用先进入 `packages/pi-runtime/src/tools/governance.ts`，完成 capability、Policy、Approval、Ledger、并发和审计检查。
-5. 通过治理的调用才进入 `packages/sandbox-runtime/src/tool-adapter.ts` 和具体 Provider；返回结果重新进入 Pi Session。
-6. `packages/pi-runtime/src/pi/event-codec.ts` 将 Harness 事件裁剪为 durable event；Turn commit 原子写入 Run/Interaction/Ledger/Event，并推进 committed Pi leaf。
-7. HTTP 将 live event 投影为 SSE；`src/agent/projections.ts` 只从 committed leaf 重建产品消息。SSE 断开不会自动取消 Run。
+| 技术 | 锁定版本 | License | Star | 选择与边界 |
+| --- | --- | --- | --- | --- |
+| Node.js | `>=22.19.0`；image Node `24` | 未核实（本基线） | 未核实（2026-08-03） | 后端和前端构建运行基线；镜像见根目录及 `web/Dockerfile` |
+| TypeScript | `6.0.3` | Apache-2.0 | 未核实（2026-08-03） | 后端与 workspace 类型系统；Web 自身 manifest 仍为 TypeScript 5.9.x 工具链，不能混称为同一锁定版本 |
+| Pi Core / Pi AI | `0.82.1` | MIT | 未核实（2026-08-03） | 复用 AgentHarness、Session、agent loop 和模型抽象；AIoP 不复制第二套执行引擎 |
+| MCP SDK | `1.29.0` | MIT | 未核实（2026-08-03） | 标准 MCP 协议实现；多租户作用域、治理和重连由 AIoP adapter 补充 |
+| Kysely | `0.29.2` | MIT | 未核实（2026-08-03） | 类型化 SQL 与事务接入；不替代 migration 事实源 |
+| mysql2 | `3.22.5` | MIT | 未核实（2026-08-03） | MySQL 驱动；MySQL 是生产/通用 K8s 与 Scheduler 的持久化前提 |
+| React | `19.2.7` | MIT | 未核实（2026-08-03） | 独立 Web 控制台渲染层 |
+| Vite | `7.3.5` | MIT | 未核实（2026-08-03） | Web 开发与构建工具，不进入后端运行时 |
+| Mermaid | `11.16.0` | MIT | 未核实（2026-08-03） | Web Markdown 图表渲染能力；设计文档仍应保持标准 Mermaid 语法 |
+| OpenSandbox | `0.1.9` | Apache-2.0 | 未核实（2026-08-03） | 通用 Sandbox Provider 集成；外部服务可用性不由 AIoP 进程保证 |
+| E2B code-interpreter | `2.6.0` | MIT | 未核实（2026-08-03） | 可替换的托管 Sandbox Adapter，不是通用 K8s 默认拓扑的必选组件 |
 
-## 5. 外部系统与信任边界
+## 5. 主请求时序
 
-- 客户端输入、模型输出、MCP 结果和 Sandbox 输出都不是授权依据。
-- tenant、actor、role、Run ownership 与 Tool capability 由服务端上下文和持久化状态决定。
-- Secret 只通过批准的 Secret 管理流程提供；ConfigMap、文档、日志、命令参数和镜像不得携带凭据。
-- 非幂等 Tool 出现未知结果时进入 `recovery_required`，不能自动重放。
+该时序描述一次进入 Agent Run 主链并产生受治理工具调用的请求。等待、恢复和 interaction-specific resume 的细节见 [02 Agent Runtime](./02-agent-runtime.md) 与 [09 HTTP API 与 Web](./09-api-and-web.md)。
 
-## 6. 真实入口
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant HTTP
+    participant DurableRunRuntime
+    participant DurableRunManager
+    participant PiSession as Pi Session
+    participant GovernedTool as Governed Tool
+    participant Store
+    participant SSE
 
-- Runtime 装配：`src/runtime.ts`
-- Durable Pi：`packages/pi-runtime/src/run/`
-- Pi 适配：`packages/pi-runtime/src/pi/`
-- 产品 Tool：`src/tools/`
-- 产品 Skill：`src/skill/`
-- API：`src/server/http.ts`
-- 数据库：`src/db/` 与 `src/db/migrations/`
-- 测试环境：`deploy/dev-k8s/`
-- 构建、部署、回滚：`Makefile`
+    Browser->>HTTP: 发起 Agent Run 请求
+    HTTP->>DurableRunRuntime: run(input)
+    DurableRunRuntime->>DurableRunManager: 创建并监督 Run
+    DurableRunManager->>PiSession: 打开/创建 Session 并执行
+    PiSession->>GovernedTool: 受治理 Tool Call
+    GovernedTool->>Store: 持久化治理事实
+    GovernedTool-->>PiSession: 返回受治理执行结果
+    PiSession->>Store: 持久化 Run/Turn/Event/Usage 事实
+    PiSession-->>DurableRunManager: 返回 Session 事件与提交结果
+    DurableRunManager-->>DurableRunRuntime: 发出 durable events / committed result
+    DurableRunRuntime-->>HTTP: 提供事件流
+    HTTP-->>SSE: 写入 SSE 响应
+    SSE-->>Browser: 流式事件与最终结果
+```
+
+`ToolExecutionOutcome` 仅有 `result`、`waiting`、`recovery_required` 三类。已证实的恢复路径是 Scheduler Fire 的 bound Run recovery 和 interaction-specific HTTP resume；没有通用 expired-run scanner。Hook 配置与实现存在，但当前源码未显示其接入 Durable Tool 主链，因此本图不声明 Hook 必经。
+
+## 6. 关键事实与限制
+
+- `MysqlStore` 是生产持久化方案；`MemoryStore` 仅是未配置 MySQL 时的易失回退，见 `src/db/index.ts`、`src/db/memory.ts`、`src/db/mysql.ts`。
+- `/healthz` 与 `/readyz` 当前都直接返回 `{ ok: true }`，`readyz` 不验证 MySQL、模型或 Sandbox，不能作为依赖就绪证明，见 `src/server/http.ts`。
+- 通用 K8s 的 2 replicas、RWX skills PVC 和外部 MySQL 只表明多副本部署意图；HA、SSE 协调、Scheduler 多副本正确性及灾备指标仍需独立设计和演练，见 [10 部署与可观测性](./10-deployment-observability.md) 与 [11 演进路线](./11-evolution-roadmap.md)。
+- 认证、租户、Tool capability 和审计边界见 [06 认证、安全与多租户](./06-auth-security-tenancy.md)；数据模型与投影边界见 [07 数据与持久化](./07-data-and-persistence.md)。

@@ -1231,6 +1231,40 @@ describe('kubernetes frontend deployment', () => {
     expect(deployment).toContain('containerPort: 8080');
     expect(deployment).toContain('containerPort: 8081');
   });
+
+  it('publishes multi-architecture images and deploys AIOP into aios-system', async () => {
+    const makefile = await readFile('Makefile', 'utf8');
+    const deployment = await readFile('deploy/aiop/deployment.yaml', 'utf8');
+    const service = await readFile('deploy/aiop/service-nodeport.yaml', 'utf8');
+    const pvc = await readFile('deploy/aiop/pvc-skills.yaml', 'utf8');
+
+    expect(makefile).toContain('IMAGE_PREFIX ?= deploy.bocloud.k8s:40443/aios');
+    expect(makefile).toContain('PLATFORMS ?= linux/amd64,linux/arm64');
+    expect(makefile).toMatch(/pipeline:[\s\S]*docker buildx build[\s\S]*--push/);
+    expect(makefile).toContain('docker manifest inspect --insecure $(PUBLISH_IMAGE)');
+    expect(makefile).toContain('AIOP_NAMESPACE ?= aios-system');
+    expect(makefile).toContain('deploy-aiop:');
+    expect(makefile).not.toMatch(/deploy-aiop:[\s\S]*deploy\/dev-k8s\/mysql\.yaml/);
+    expect(deployment).toMatch(/namespace:\s+aios-system/);
+    expect(deployment).toContain('deploy.bocloud.k8s:40443/aios/aiop-web:dev');
+    expect(deployment).toContain('deploy.bocloud.k8s:40443/aios/aiop:dev');
+    expect(service).toMatch(/nodePort:\s+30084/);
+    expect(pvc).toContain('storageClassName: nfs-csi');
+    expect(pvc).toContain('ReadWriteMany');
+  });
+
+  it('uses aiop as the default database name in deployment examples', async () => {
+    const files = await Promise.all([
+      readFile('deploy/dev-k8s/aiop-secret.example.yaml', 'utf8'),
+      readFile('deploy/dev-k8s/mysql.yaml', 'utf8'),
+      readFile('deploy/k8s/secret.example.yaml', 'utf8'),
+    ]);
+
+    for (const source of files) {
+      expect(source).toMatch(/MYSQL_DATABASE(?:\s*:\s*|\s*\n\s+value:\s*)"?aiop"?/);
+      expect(source).not.toMatch(/MYSQL_DATABASE(?:\s*:\s*|\s*\n\s+value:\s*)"?ai_ops"?/);
+    }
+  });
 });
 
 describe('AIOS design-system first pass', () => {

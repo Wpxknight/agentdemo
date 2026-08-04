@@ -1,68 +1,120 @@
 # Scheduler 设计
 
-## 1. 当前边界
+> 状态：当前设计
+> 验证基线：`b5425a0d2ae3ddc23ada4d3184d4a95e3a717bae`
+> 最后核对：2026-08-03
+> 适用范围：`pi-agent-platform-integration` 当前实现
 
-Scheduler 是 AIoP 自研控制面，不进入 Pi Agent loop。它只持久化 Fire，并通过 Durable Run dispatcher 创建或关联产品 Run；后续执行由 `packages/pi-runtime` 接管。
+本文描述 `packages/scheduler-runtime` 与生产装配的当前实现。Scheduler 是 Durable Run 的触发与绑定控制面，不进入 Pi Agent loop。
 
-| 能力 | 当前路径 |
-| --- | --- |
-| Cron 与领域模型 | `packages/scheduler-runtime/src/cron.ts`、`packages/scheduler-runtime/src/domain.ts` |
-| Fire Store/MySQL | `packages/scheduler-runtime/src/store.ts`、`packages/scheduler-runtime/src/mysql.ts` |
-| Claim、dispatch 与完成 | `packages/scheduler-runtime/src/runner.ts` |
-| 崩溃补偿 | `packages/scheduler-runtime/src/recovery.ts` |
-| 应用装配 | `src/scheduler/runner.ts` |
-| 应用循环与兼容封装 | `src/scheduler/cron.ts`、`src/scheduler/ticker.ts`、`src/scheduler/runner.ts` |
+## 1. 边界与装配
 
-## 2. Fire 状态流
+- `packages/scheduler-runtime` 定义 Cron、Fire 领域对象、Store ports、Runner 与过期租约回收。
+- `src/scheduler/runner.ts` 把 Scheduler 接到 `DurableRunRuntime`，并提供 Run 查询和 bound Run 恢复适配。
+- 生产装配只接受 `MysqlStore`，据此创建 `MysqlSchedulerStore`；内存 Store 和显式 `SchedulerStore` 注入用于测试。
+- 调度身份、Session、输入和 `execution.unattended/preApproved` 来自持久化任务；prompt 不能覆盖这些控制字段。
+
+## 2. 领域 ports
+
+| Port / 类型 | 输入与输出 | 责任边界 |
+| --- | --- | --- |
+| `ScheduledRunInput` | task/fire 身份、`fireTime`、Identity、Session、消息、execution、limits、signal | 一次调度执行的完整输入；不持有租约 |
+| `RunDispatcher.startScheduledRun` | 输入 `ScheduledRunInput`，可接收 `onStarted(runId)`；返回 `runId + AgentRunResult` | 创建或确认确定性 Durable Run；在等待最终结果前回调绑定 Run |
+| `ScheduledRunLookup.findScheduledRun` | 按调度输入查询；返回已存在且有最终结果的 Run，或 `undefined` | 仅补偿“Run 创建结果未知”；不得根据异常文本猜测创建是否成功 |
+| `BoundRunRecovery.inspect` | 输入过期 `bound` Fire 与当前时间；返回 `active / terminal / recoverable` | 校验 Fire 与 Durable Run 绑定，区分仍活跃、已有结果和可恢复 Run |
+| `BoundRunRecovery.resume` | 输入已 fenced 的 `recovering` Fire 与 signal；返回最终结果 | 使用原 `runId` 调用 Durable resume，不创建第二个 Run |
+| `SchedulerStore` | `claimDue/listBound/claimBound/bindRun/completeFire/releaseFire/deferBound/releaseBound/recoverExpired` | 原子状态迁移、租约、claim token 和陈旧写 fencing；不执行 Agent |
+
+幂等与 fencing 规则：
+
+- `fireId = taskId + ":" + fireTime.toISOString()`；默认 dispatcher 把 `fireId` 作为 `DurableRunRuntime.run()` 的 `runId`，因此当前生产链路中 `fireId === runId`。
+- `claimDue` 增加 attempts 并签发 claim token；`bindRun`、release/defer 操作校验 Fire、状态和 token；尚未 `started` 的 `completeFire` 写入也必须匹配当前 claim token。
+- Fire 已是 `started` 时，相同 `fireId/runId` 的重复 `completeFire` 直接 no-op，不校验 claim token，也不复核重复提交的 status、text、error 或 usage 内容；Run 不匹配则失败。
+- Scheduler 租约只保护 Fire 的领取、观察与恢复；Durable Run 自身另有 Worker lease/fencing，两层租约不能混用。
+
+## 3. Fire 状态机
+
+源码状态只有 `pending | claimed | bound | recovering | started`。`deferBound`、`releaseBound` 和 `releaseFire` 是操作名，不是额外状态。
 
 ```mermaid
 stateDiagram-v2
-  [*] --> pending
-  pending --> claimed: lease acquired
-  claimed --> bound: durable Run id persisted
-  claimed --> pending: dispatch failed / retryAt
-  bound --> recovering: bound lease expired and claimed
-  recovering --> bound: active or retryable recovery
-  bound --> started: terminal Run observed
-  recovering --> started: resumed Run completed
+  [*] --> pending: 到期任务物化 Fire
+  pending --> claimed: claimDue / 新 token 与租约
+  claimed --> bound: bindRun / 持久化 runId
+  claimed --> pending: releaseFire / 创建前失败
+  claimed --> pending: recoverExpired / claim 租约过期
+  bound --> bound: deferBound / 延后观察
+  bound --> started: inspect terminal 或执行完成
+  bound --> recovering: claimBound / 新恢复 token
+  recovering --> started: resume 后 completeFire
+  recovering --> bound: releaseBound / 恢复失败
+  recovering --> bound: recoverExpired / 恢复租约过期
   started --> [*]
 ```
 
-`fire_id` 由 `taskId + fireTime` 稳定生成。Run 创建后先持久化 `bound` 关系，再等待终态；Worker 崩溃后，recovery supervisor 领取过期 bound fire，检查原 Run 是 active、terminal 还是 recoverable，避免重复创建。
+`started` 是当前存储状态名，表示绑定 Run 的最终 `AgentRunResult` 已记录，同时 MySQL Store 已写入 `task_runs`；它不是“Run 刚开始”。
 
-### 2.1 到期任务的调用链
+## 4. Tick 与 bound Run 恢复
 
-1. `MemorySchedulerStore` 或 `MysqlSchedulerStore` 根据 task 的 `nextFireAt` 物化稳定 Fire。
-2. Runner 领取 `pending` Fire，写入 claim token、worker 和 lease expiry。
-3. Dispatcher 以 `fireId` 作为稳定 Run id 调用 `DurableRunRuntime.run()`。
-4. `onStarted` 回调先把 Run id 持久化为 `bound`，再等待 `handle.result()`。
-5. 正常完成后写 `started + result`；异常释放为 `pending + retryAt`。
-6. bound lease 过期时，recovery loop 检查原 Run，必要时调用 `resume()`，不会创建第二个 Run。
+每轮 `SchedulerRunner.tick()` 严格先处理旧工作，再领取新 Fire：
 
-## 3. 身份与无人值守策略
+1. `recoverExpired(now)` 把过期 `claimed` 释放回 `pending`，把过期 `recovering` 释放回 `bound`。
+2. `listBound()` 枚举观察租约已到期且达到 `retryAt` 的 bound Fire。
+3. `inspect()` 校验确定性 ID、tenant/actor/session binding 和 Durable Run 状态。
+4. `active` 保持 `bound`；`terminal` 直接 `completeFire()`；`recoverable` 才通过 `claimBound()` 获取新 token，随后调用 `resume()`。
+5. bound 观察或恢复失败时保留原 Run 绑定，并用 `deferBound/releaseBound` 延后重试。
+6. 最后用剩余 batch 容量 `claimDue()`；创建 Run 后先 `bindRun()`，再等待 `handle.result()` 并完成 Fire。
 
-- tenant/actor/session 来自持久化任务，不由 prompt 覆盖。
-- Scheduler 创建的 Run 使用与 HTTP 相同的 Durable Pi Runtime。
-- 未预批准的交互默认不能在后台无限等待；策略应拒绝或将 Run 明确置为 waiting/recovery 状态。
-- Tool capability、MCP、Skill 和 Sandbox 仍经过同一治理链。
+```mermaid
+sequenceDiagram
+  participant L as Scheduler Loop
+  participant S as SchedulerStore
+  participant B as BoundRunRecovery
+  participant D as DurableRunRuntime
 
-## 4. 多副本与取消
+  L->>S: recoverExpired(now)
+  L->>S: listBound(now, limit)
+  loop 每个过期 bound Fire
+    L->>B: inspect(fire, now)
+    alt Durable Run 已终态
+      L->>S: completeFire(fireId, token, runId, result)
+    else Durable Run 仍有活动租约
+      B-->>L: active
+    else Durable Run 可恢复
+      L->>S: claimBound(expected token)
+      S-->>L: recovering Fire + 新 token
+      L->>B: resume(recovering Fire)
+      B->>D: resume(identity, 原 runId)
+      D-->>B: AgentRunResult
+      L->>S: completeFire(...)
+    end
+  end
+  L->>S: claimDue(剩余 batch)
+  S-->>L: claimed Fires
+  L->>D: run(runId = fireId, ...)
+  D-->>L: onStarted(runId)
+  L->>S: bindRun(fireId, token, runId)
+  D-->>L: final result
+  L->>S: completeFire(...)
+```
 
-- Fire claim 与 bound recovery 都使用 token、owner 和 expiry。
-- 旧 supervisor 不能完成新一代 Fire。
-- 调度任务禁用只阻止新 Fire；代码不会自动取消已绑定 Run。
-- 修改 Cron 不回写历史 Fire 时间。
+`ScheduledRunLookup` 只覆盖一个窄窗口：`runtime.run()` 抛错，但确定性 Run 可能已经创建并完成。只有 lookup 证明该 `fireId` 对应的 Run 存在且 binding 一致时，dispatcher 才补做绑定并返回结果。
 
-## 5. 测试入口
+## 5. 能力边界
 
-- `tests/scheduler-runtime/`
-- `tests/scheduler.test.ts`
-- `tests/scheduler-platform.test.ts`
-- `tests/http-agent-runs.test.ts`
+Scheduler 只恢复已经持久化为 `bound` 的 Scheduler Fire：
 
-## 6. 容易误改的地方
+- 不扫描平台全部过期 Run；
+- 不为 HTTP、CLI 或其他来源的 Run 提供通用 supervisor；
+- 不因 HTTP/SSE 断开而取消或恢复 Run；
+- 禁用或删除 ScheduledTask 不会隐式取消已绑定 Run；
+- `unattended=true` 不等于自动批准写操作，只有可信创建者具备审批权限并显式设置 `preApproved` 才改变相应策略输入。
 
-- `started` 表示绑定 Run 已得到最终结果，不表示刚开始执行。
-- 禁用 ScheduledTask 只影响新 Fire，不会隐式取消已经 bound 的 Run。
-- `fireId` 是幂等键，不能在重试时重新随机生成。
-- Scheduler 的 `execution.unattended=true` 不代表自动批准写操作；只有可信创建者显式 preApproved 才改变普通生产写策略。
+平台其他 Run 的显式恢复和 Interaction resolve 后恢复由各自入口负责，不能把 Scheduler bound recovery 外推为全局自动恢复能力。
+
+## 6. 事实源与测试
+
+- Domain/Store：`packages/scheduler-runtime/src/domain.ts`、`packages/scheduler-runtime/src/store.ts`、`packages/scheduler-runtime/src/mysql.ts`
+- Runner/Recovery：`packages/scheduler-runtime/src/runner.ts`、`packages/scheduler-runtime/src/recovery.ts`
+- 生产装配：`src/scheduler/runner.ts`
+- 行为测试：`tests/scheduler-runtime/scheduler-runtime.test.ts`、`tests/scheduler-platform.test.ts`、`tests/scheduler.test.ts`

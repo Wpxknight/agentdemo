@@ -21,6 +21,8 @@ describe('fresh database baseline', () => {
     ]) expect(source).toContain(`\`${column}\``);
     expect(source).not.toMatch(/legacy|compat-v1|langgraph|graph_name|graph_version|runtime_version/);
     expect(source).not.toMatch(/\balter\s+table\b|\bdrop\s+(?:table|column|trigger)\b/);
+    expect(source).toContain('collate=utf8mb4_unicode_ci');
+    expect(source).not.toContain('utf8mb4_0900_ai_ci');
   });
 
   it('applies and records the baseline as version 1', async () => {
