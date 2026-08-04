@@ -44,7 +44,7 @@ import {
   Users,
   X,
 } from 'lucide-react';
-import { NAV_ITEMS, defaultLlmConfig } from './app-data';
+import { NAV_ITEMS, defaultLlmConfig, pageFromUrl, pageUrl } from './app-data';
 import { MermaidDiagram } from './components/mermaid-diagram';
 import { RunCenterPage } from './components/run-center-page';
 import { createApi, numericSessionId, randomId, readStorage, writeStorage } from './api';
@@ -194,7 +194,7 @@ const initialMessages: ChatMessage[] = [
 
 function initialPage(): PageId | 'login' {
   if (typeof window !== 'undefined' && window.location.pathname === '/login') return 'login';
-  return 'chat';
+  return typeof window !== 'undefined' ? pageFromUrl(window.location.pathname) ?? 'chat' : 'chat';
 }
 
 function formatTime(value?: string): string {
@@ -964,6 +964,23 @@ export default function App() {
   const sessionIdRef = useRef(sessionId);
   const sessionOffsetRef = useRef(0);
   const messagesRef = useRef(messages);
+  const requestedPageRef = useRef<PageId>(
+    typeof window !== 'undefined' ? pageFromUrl(window.location.pathname) ?? 'chat' : 'chat',
+  );
+
+  useEffect(() => {
+    const handlePopState = () => {
+      if (window.location.pathname === '/login') {
+        setPage('login');
+        return;
+      }
+      const next = pageFromUrl(window.location.pathname) ?? 'chat';
+      requestedPageRef.current = next;
+      setPage(next);
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
 
   useEffect(() => {
     sessionIdRef.current = sessionId;
@@ -1018,6 +1035,10 @@ export default function App() {
   }
 
   const redirectToLogin = useCallback(() => {
+    if (typeof window !== 'undefined') {
+      const requestedPage = pageFromUrl(window.location.pathname);
+      if (requestedPage) requestedPageRef.current = requestedPage;
+    }
     setPage('login');
     setToken('');
     writeStorage('aiop_token', '');
@@ -1031,10 +1052,9 @@ export default function App() {
   }, []);
 
   const routeAfterLogin = useCallback(() => {
-    setPage('chat');
-    if (typeof window !== 'undefined' && window.location.pathname === '/login') {
-      window.history.replaceState({}, '', '/');
-    }
+    const next = requestedPageRef.current;
+    setPage(next);
+    if (typeof window !== 'undefined') window.history.replaceState({}, '', pageUrl(next));
   }, []);
 
   const api = useMemo(() => createApi(token, redirectToLogin), [token, redirectToLogin]);
@@ -1262,8 +1282,11 @@ export default function App() {
       redirectToLogin();
       return;
     }
+    requestedPageRef.current = next;
     setPage(next);
-    if (typeof window !== 'undefined') window.history.replaceState({}, '', '/');
+    if (typeof window !== 'undefined' && window.location.pathname !== pageUrl(next)) {
+      window.history.pushState({}, '', pageUrl(next));
+    }
   }
 
   async function selectSession(session: SessionSummary) {

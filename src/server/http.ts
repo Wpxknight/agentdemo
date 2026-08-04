@@ -234,7 +234,11 @@ async function sendWebAsset(res: Res, path: string, frameAncestors?: string[]): 
   }
   const cleanPath = decodeURIComponent(path).replace(/^\/+/, '');
   if (cleanPath.includes('..')) return false;
-  const isSpaRoute = path === '/' || path === '/index.html' || path === '/login';
+  const spaRoutes = new Set([
+    '/', '/index.html', '/login', '/chat', '/runs', '/skills', '/mcp',
+    '/schedule', '/sandbox', '/users', '/settings',
+  ]);
+  const isSpaRoute = spaRoutes.has(path.replace(/\/+$/, '') || '/');
   const assetPath = isSpaRoute ? 'index.html' : cleanPath;
   if (!isSpaRoute && !assetPath.startsWith('assets/')) return false;
   const buf = await readWebFile(`dist/${assetPath}`).catch(() => undefined);

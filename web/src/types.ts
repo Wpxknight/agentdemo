@@ -6,6 +6,8 @@ export interface NavItem {
   id: PageId;
   label: string;
   icon: 'chat' | 'runs' | 'skills' | 'mcp' | 'schedule' | 'sandbox' | 'users' | 'settings';
+  /** 菜单对应的独立浏览器路径。 */
+  url: string;
   /** 仅管理员可见的一级菜单（前端隐藏只是 UX，真正的防线是后端 RBAC）。 */
   adminOnly?: boolean;
 }

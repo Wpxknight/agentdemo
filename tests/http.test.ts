@@ -1352,6 +1352,15 @@ describe('HTTP server', () => {
     expect(await r.text()).toContain('/app.js');
   });
 
+  it('serves the frontend shell for every menu route', async () => {
+    for (const path of ['/chat', '/runs', '/skills', '/mcp', '/schedule', '/sandbox', '/users', '/settings']) {
+      const r = await fetch(`${base}${path}`);
+      expect(r.status, path).toBe(200);
+      expect(r.headers.get('content-type'), path).toContain('text/html');
+      expect(await r.text(), path).toContain('/app.js');
+    }
+  });
+
   it('reads, updates, and tests runtime LLM settings', async () => {
     const initial = await fetch(`${base}/v1/settings/llm`, {
       headers: { authorization: `Bearer ${token}` },

@@ -55,6 +55,22 @@ describe('React frontend stack', () => {
     expect(data).toContain('hasSessionHistoryDrawer: true');
     expect(data).toContain('hasSandboxWorkspace: true');
     expect(data).toContain('hasSandboxWorkspace: false');
+    expect(data).toContain("url: '/chat'");
+    expect(data).toContain("url: '/runs'");
+    expect(data).toContain("url: '/skills'");
+    expect(data).toContain("url: '/mcp'");
+    expect(data).toContain("url: '/schedule'");
+    expect(data).toContain("url: '/sandbox'");
+    expect(data).toContain("url: '/users'");
+    expect(data).toContain("url: '/settings'");
+  });
+
+  it('keeps browser history in sync with menu navigation', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(app).toContain('pageFromUrl(window.location.pathname)');
+    expect(app).toContain("window.addEventListener('popstate', handlePopState)");
+    expect(app).toContain("window.history.pushState({}, '', pageUrl(next))");
   });
 });
 
