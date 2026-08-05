@@ -1,165 +1,154 @@
 # 部署与可观测性设计
 
-## 1. 部署拓扑
+> 状态：当前设计
+> 验证基线：`b5425a0d2ae3ddc23ada4d3184d4a95e3a717bae`
+> 最后核对：2026-08-03
+> 适用范围：`pi-agent-platform-integration` 当前实现
 
-~~~mermaid
-flowchart TB
-  User[User or AIOS]
-  Svc[Kubernetes Service]
-  Pod1[Pod replica 1]
-  Pod2[Pod replica 2]
-  Web1[Web container]
-  API1[AIoP container]
-  Web2[Web container]
-  API2[AIoP container]
-  DB[(External MySQL)]
-  Model[Model APIs]
-  OS[OpenSandbox Service]
-  MCP[MCP Servers]
-  K8s[Target Clusters]
+本文描述仓库已有的镜像、Kubernetes 清单、发布入口和观测能力。清单是部署基线，不等同于经过生产验证的高可用方案。
 
-  User --> Svc
-  Svc --> Web1
-  Svc --> Web2
-  Pod1 --- Web1
-  Pod1 --- API1
-  Pod2 --- Web2
-  Pod2 --- API2
-  API1 --> DB
-  API2 --> DB
-  API1 --> Model
-  API2 --> Model
-  API1 --> OS
-  API2 --> OS
-  API1 --> MCP
-  API2 --> MCP
-  OS --> K8s
-~~~
+## 1. 镜像与进程模型
 
-`deploy/k8s/deployment-server.yaml` 当前配置两个副本，每个 Pod 包含 Web 和 AIoP 容器。AIoP 容器监听 8081，并设置内嵌 Scheduler；Web 容器监听 8080。
+### 1.1 Backend
 
-## 2. 配置与 Secret
+根目录 `Dockerfile` 使用 Node 24 slim。构建阶段安装根 workspace 依赖并执行 `npm run build:packages`，将内部 `packages/*` 构建结果带入 runtime 阶段。runtime 仍保留开发依赖，通过 `tsx` 直接执行 TypeScript，而不是运行 `tsc` 生成的应用 JavaScript。
 
-非敏感配置由 ConfigMap 中的 JSONC 提供，`AIOP_CONFIG` 指向文件。敏感值通过 Kubernetes Secret 和环境变量注入。
+同一镜像支持两个常驻入口：
 
-生产必须显式设置：
+- `npm run serve`：启动 HTTP/SSE 服务；设置 `AIOP_EMBED_SCHEDULER=true` 时在服务进程内嵌 Scheduler。
+- `npm run scheduler`：启动独立 Scheduler 进程。
 
-- 模型 API Key。
-- `AIOP_JWT_SECRET`。
-- `AIOP_SETTINGS_SECRET`。
-- MySQL 连接参数。
-- OIDC/AIOS client secret 或校验配置。
-- Sandbox/OpenSandbox 凭据。
+当前 Kubernetes 清单使用 `serve` 并内嵌 Scheduler，没有部署独立 Scheduler workload。
 
-数据库内的设置密文不能替代 Kubernetes Secret 中的根加密密钥。
+### 1.2 Web
 
-## 3. 进程生命周期
+`web/Dockerfile` 在 Node 24 slim 阶段执行 Vite build，再把 `web/dist` 复制到 Nginx 1.27 Alpine。Nginx 监听 8080：静态资源和 SPA fallback 由 Nginx 提供，`/auth/`、`/v1/`、`/healthz`、`/readyz` 反向代理到同 Pod 的 Backend 8081。
 
-Server 启动：
+## 2. 通用 Kubernetes 基线
 
-1. 加载并校验配置。
-2. 创建 Store 并执行迁移。
-3. 组装 Runtime 和外部连接。
-4. 可选启动内嵌 Scheduler。
-5. 启动 HTTP listener。
+`deploy/k8s/` 面向 namespace `aiop`，部署关系如下。
 
-SIGINT/SIGTERM 时先停止接收请求，停止 Scheduler，释放 MCP、Sandbox、下载回收器和 Store。
+```mermaid
+flowchart LR
+  Client[集群内客户端]
+  Service[ClusterIP Service<br/>aiop-server:80]
+  subgraph Deployment[Deployment aiop-server · replicas 2]
+    PodA[Pod<br/>aiop-web :8080<br/>aiop :8081]
+    PodB[Pod<br/>aiop-web :8080<br/>aiop :8081]
+  end
+  Skills[(RWX skills PVC)]
+  MySQL[(外置 MySQL)]
+  OpenSandbox[OpenSandbox Service]
 
-独立 Scheduler 使用相同 Runtime，但不启动 HTTP。CLI 执行完成后提交会话和审计，再 dispose。
+  Client --> Service
+  Service --> PodA
+  Service --> PodB
+  PodA --> Skills
+  PodB --> Skills
+  PodA --> MySQL
+  PodB --> MySQL
+  PodA --> OpenSandbox
+  PodB --> OpenSandbox
+```
 
-## 4. 健康与就绪
+当前边界：
 
-Kubernetes 对 Web 和 API 容器都配置 `/healthz` 与 `/readyz`。
+- Deployment 声明 2 replicas；每个 Pod 同时包含 `aiop-web` 与 `aiop` 两个容器。
+- Service 类型为 `ClusterIP`，只提供集群内入口。仓库没有通用 Ingress、Gateway 或外部 LoadBalancer 清单。
+- 两个 Backend 副本共享 `ReadWriteMany` 的 `aiop-skills` PVC；存储系统必须提供 RWX。
+- MySQL 通过 Secret 中的连接信息外置，通用清单不部署 MySQL。
+- ConfigMap 默认把 Sandbox 指向集群内 OpenSandbox endpoint，但 OpenSandbox 本身不由该目录安装。
+- 仓库没有 HPA。副本数固定为 2，不会按负载自动扩缩。
 
-- liveness 只判断进程是否需要重启。
-- readiness 应反映是否能接收请求。
-- 外部模型或单个 MCP 短暂不可用不宜让整个 Pod 立即失活。
-- MySQL 不可用会破坏持久执行，应在 readiness 和告警中重点体现。
+2 replicas 只消除了单个应用 Pod 这一处单点，不代表端到端高可用。MCP 连接、Sandbox handle、下载与部分 live 交互仍有进程本地状态；外置 MySQL、RWX 存储、OpenSandbox 和集群入口各自也需要独立的可用性设计。
 
-当前接口较轻量，后续可增强依赖状态明细，但不能在健康响应中泄露 Secret 或内部错误。
+## 3. dev/staging 基线
 
-## 5. 多副本协调
+`deploy/dev-k8s/` 面向 namespace `aiop-dev`，用于当前 Makefile 的 staging 操作。
 
-- Agent Run 使用数据库 Lease 和 token fencing。
-- Scheduler 使用原子 claim/`SKIP LOCKED`。
-- 会话与设置使用 MySQL 共享状态。
-- MCP 连接和 Sandbox handle 是进程本地状态。
-- Sandbox 配置 generation 在每副本独立切换。
-- 下载文件若使用 Pod 本地目录，经其他副本访问可能失败；生产应使用粘性路由或共享/对象存储，这是当前部署的重要边界。
+```mermaid
+flowchart LR
+  User[测试用户]
+  subgraph Namespace[namespace aiop-dev]
+    AppService[NodePort Service<br/>aiop-server-nodeport · 30083 → 8080]
+    AppDeployment[Deployment aiop-server<br/>replicas 1]
+    AppPod[Pod<br/>aiop-web :8080 + aiop :8081<br/>embedded Scheduler]
+    MySQLService[ClusterIP Service mysql<br/>3306 → 3306]
+    MySQLDeployment[Deployment mysql<br/>replicas 1 · Recreate]
+    MySQLPod[Pod<br/>MySQL 8.4 :3306]
+    MySQLPVC[(RWO PVC · 2Gi)]
+    DexService[NodePort Service dex<br/>30084 → 5556]
+    DexDeployment[Deployment dex<br/>replicas 1]
+    DexPod[Pod<br/>Dex v2.42.0 :5556<br/>memory storage]
+  end
+  External[Model / MCP / Sandbox]
 
-Lease 只保证所有权校验和 fencing。当前没有后台扫描器自动发现并接管 Lease 已过期但状态仍为 running 的 Agent Run，运行中心手工 resume 也只允许 failed/recovery_required。
+  User --> AppService --> AppDeployment --> AppPod
+  User --> DexService --> DexDeployment --> DexPod
+  AppPod --> MySQLService --> MySQLDeployment --> MySQLPod --> MySQLPVC
+  AppPod --> DexService
+  AppPod --> External
+```
 
-Durable Interaction 的 waiter 是进程内状态。解析 approval/question/plan 的请求若落到另一副本，只会更新数据库，不会唤醒原执行进程；在完善轮询或消息通知前，需要粘性路由或单副本执行交互型 Agent Run。
+该环境的明确约束：
 
-模型、Sandbox Controller 和 MCP Manager 也是进程级单实例，并主要由 `default` 设置装配。数据库设置带 tenant key 不代表运行态已经按 tenant 隔离。
+- `aiop-server` Deployment 为单副本；Pod 内含 `aiop-web` 8080 与 `aiop` 8081 两个容器，并通过 `AIOP_EMBED_SCHEDULER=true` 内嵌 Scheduler。
+- 应用 NodePort Service 将 30083 转发到 Web 8080。
+- Dex 使用 `ghcr.io/dexidp/dex:v2.42.0`，容器与 Service 端口均为 5556，NodePort 为 30084；配置使用 memory storage，没有 PVC。
+- MySQL 使用 `mysql:8.4`，容器与 ClusterIP Service 端口均为 3306；单副本 Deployment 使用 `Recreate` 策略和 2Gi `ReadWriteOnce` PVC。
+- dev 清单没有挂载通用环境的 RWX skills PVC，也不构成生产容量或灾备基线。
 
-## 6. 日志、审计与指标
+## 4. 构建、部署与回滚
 
-`pino` 输出结构化日志。常用关联字段包括 tenantId、userId、sessionId、runId、taskId、tool、cluster、node 和 error。
+根目录 Makefile 提供以下入口：
 
-审计与日志不同：
+| 命令 | 当前行为 | 边界 |
+| --- | --- | --- |
+| `make image` | 以 Git short SHA 为默认 tag 构建 Backend 与 Web 镜像；执行内部 package import smoke 和 Node 版本校验 | 只构建本地镜像，不发布、不部署 |
+| `make deploy-staging` | apply `deploy/dev-k8s/` 中 namespace、MySQL、Dex、ConfigMap、NodePort Service、RBAC；检查预置 Secret；以 `kubectl set image --local` 注入镜像并等待三个 Deployment rollout | 只面向 `aiop-dev`；不会创建 Secret |
+| `make rollback-staging` | 对 `aiop-dev/deployment/aiop-server` 执行 `rollout undo`，可用 `ROLLBACK_REVISION` 指定 revision，并等待 rollout | 只回滚应用 Deployment revision |
 
-- 日志面向运行诊断，可按保留策略删除。
-- audit_events 是业务安全事实，需要租户授权和长期保留。
-- Agent Run events 是执行时间线。
-- Tool Ledger 是恢复事实。
+应用 rollback 不回滚数据库。当前 `src/db/migrations/` 只有 `0001_baseline.sql`，测试把它定义为 fresh database baseline；它不是从任意历史数据库自动升级到当前 schema 的转换方案。对非空旧库发布前，必须另行完成 schema 识别、转换、备份恢复和应用兼容性验证。
 
-当前可从数据和日志派生的指标：
+`deploy/k8s/secret.example.yaml` 与 `deploy/dev-k8s/aiop-secret.example.yaml` 只用于说明部分字段，包含占位值，不应直接作为自动部署输入。尤其是通用 `deploy/k8s/secret.example.yaml` 当前没有列出 `AIOP_SETTINGS_SECRET`，但 Deployment 会通过 `envFrom: aiop-secrets` 加载该值；若生产操作者按示例原样创建 Secret，应用不会 fail-fast，而会告警后静默使用固定开发占位密钥 `dev-insecure-settings-secret` 加密持久化 Sandbox settings secret。生产部署必须在 `aiop-secrets` 中额外注入独立强随机 `AIOP_SETTINGS_SECRET`，不能把当前示例视为完整的生产 Secret 清单。
 
-- Agent Run 状态、耗时、steps、token。
-- 模型重试和失败率。
-- Tool 成功/失败、recovery_required。
-- Pending Interaction 数量与等待时长。
-- Scheduler 到期、成功、失败和超时。
-- Sandbox 创建延迟、数量、回收和 generation 切换。
-- MCP 连接状态。
-- MySQL 延迟与连接失败。
+`make deploy-staging` 会执行 `kubectl get secret aiop-dev-secrets -o name`，只查询资源名称以验证 Secret 存在；它不读取或输出 Secret data、不 decode、不创建 Secret，也不 apply 示例 Secret。
 
-仓库未集成专用 metrics SDK；以上属于应采集口径，不应声称已有 Prometheus exporter。
+## 5. 健康检查
 
-## 7. 故障域与降级
+- `GET /healthz`：当前固定返回 `{ ok: true }`，表示 HTTP handler 可响应。
+- `GET /readyz`：当前同样固定返回 `{ ok: true }`。
+- Nginx 将两个路径代理到 Backend；Kubernetes 的 Web 与 Backend probes 最终都依赖这些 Backend handler。
 
-| 故障域 | 影响与处理 |
-| --- | --- |
-| 单 Pod | Service 转移新请求；Lease 到期后可被新 owner 获取，但当前没有自动接管扫描器 |
-| MySQL | 会话、调度和 durable run 不可可靠工作；不能降级到独立 Memory Store 继续生产 |
-| 模型 API | 当前轮重试；超过上限失败 |
-| 单 MCP Server | 标记 error，其他工具继续 |
-| Sandbox Provider | Sandbox 工具失败，纯模型/MCP 能力仍可运行 |
-| OpenSandbox/目标集群 | 运维工具失败并审计 |
-| 本地下载目录 | 可能受副本和 Pod 重建影响 |
-| ConfigMap 更新 | 需重启或通过设置 API热更新相应领域 |
+`readyz` 不检查 MySQL、Model Provider、MCP、Sandbox、Scheduler 或 RWX 存储，因此只能作为浅层进程就绪信号，不能证明依赖可用。dev MySQL 有独立的 `mysqladmin ping` readiness probe，但该结果没有汇总进应用 `readyz`。
 
-## 8. 发布与回滚
+## 6. 当前可观测性
 
-- 数据库迁移向前追加；回滚应用前必须确认旧版本能忽略新列/表。
-- Agent Run binding 锁定 Kernel 和图版本，发布时需保留仍有 Checkpoint 的图版本。
-- LangGraph 灰度可按 tenant/user/session 环境变量选择。
-- Sandbox 设置先准备新 generation，再原子切换；旧 generation drain。
-- 前端与 API 应保持事件向后兼容。
+| 能力 | 当前实现 | 能回答的问题 |
+| --- | --- | --- |
+| 结构化日志 | Pino，支持 `LOG_LEVEL`，各子系统创建 child logger | 进程诊断、错误和生命周期事件 |
+| 审计事件 | `AuditSink` 同时写 Pino audit log 与 Store；覆盖 policy、kubectl、sandbox、usage、auth、MCP 类别 | 谁在何租户执行了受治理动作 |
+| Run Center | Store 持久化并查询 Run、Attempt、Turn、Event、Interaction、Tool execution、usage、取消与人工 resume 事实 | 单个 Durable Run 的时间线、消耗、等待和恢复状态 |
+| 健康端点 | `/healthz`、`/readyz` | HTTP 进程是否可响应；不覆盖依赖健康 |
 
-## 9. 运维检查
+日志、审计与 Run Center 是不同证据面：日志面向运行诊断，审计面向治理事实，Run Center 面向 Durable Run 的业务执行事实；三者不能互相替代。
 
-上线前至少检查：
+## 7. 尚未实现的观测与恢复能力
 
-- typecheck、Vitest、Web build。
-- MySQL 8 连接和全量迁移。
-- JWT/Settings Secret 不使用开发默认值。
-- OIDC/AIOS 回调和 frame ancestors。
-- Sandbox Profile 与特权角色。
-- 两副本 Agent Run Lease 和 Scheduler claim。
-- 备份与恢复。
-- 下载目录跨副本策略。
-- SIGTERM 下的优雅关闭。
+当前仓库没有：
 
-## 10. 源码与清单依据
+- Prometheus metrics endpoint 或应用指标 exporter；
+- OpenTelemetry tracing 与 exporter；
+- `ServiceMonitor` 或 `PodMonitor`；
+- 汇总 MySQL、Model、MCP、Sandbox 等依赖状态的 readiness；
+- 面向所有过期 Durable Run 的通用 lease scanner / recovery supervisor。
 
-- `src/index.ts`
-- `src/runtime.ts`
-- `src/logger.ts`
-- `src/db/index.ts`
-- `src/agent/run-coordinator.ts`
-- `src/scheduler/`
-- `deploy/k8s/`
-- `deploy/dev-k8s/`
-- `deploy/opensandbox/`
+Scheduler 已有自己的 Fire 租约回收和 bound Run 检查，不等同于扫描所有 HTTP、CLI 与 Scheduler 来源 Run 的通用恢复器。增加指标、追踪或自动恢复前，需要先定义标签基数、租户信息脱敏、告警阈值、恢复安全分类和故障测试，不能仅凭端点或表字段宣称能力完成。
+
+## 8. 事实依据
+
+- 镜像与入口：`Dockerfile`、`web/Dockerfile`、`web/nginx.conf`、`package.json`、`src/index.ts`
+- 通用部署：`deploy/k8s/deployment-server.yaml`、`service.yaml`、`pvc-skills.yaml`、`configmap.yaml`
+- dev/staging：`deploy/dev-k8s/`、`Makefile`
+- 健康与观测：`src/server/http.ts`、`src/logger.ts`、`src/audit/sink.ts`、`src/agent/run-center.ts`
+- 数据基线：`src/db/migrations/0001_baseline.sql`、`tests/runtime-migrations.test.ts`

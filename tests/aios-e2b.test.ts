@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AiosE2bProvider } from '../src/sandbox/aios-e2b.js';
+import { AiosE2bProvider } from '../packages/sandbox-runtime/src/aios-e2b.js';
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
+}
 
 interface RecordedRequest {
   url: string;
@@ -16,7 +22,7 @@ function jsonResponse(status: number, body?: unknown): Response {
   });
 }
 
-function queuedFetch(responses: Response[]) {
+function queuedFetch(responses: Array<Response | Promise<Response>>) {
   const requests: RecordedRequest[] = [];
   const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const headers = Object.fromEntries(new Headers(init?.headers).entries());
@@ -48,6 +54,34 @@ function provider(fetch: typeof globalThis.fetch, overrides: Record<string, unkn
 }
 
 describe('AiosE2bProvider', () => {
+  it.each([
+    ['create', '/sandboxes'],
+    ['connect', '/sandboxes/remote/connect'],
+  ] as const)('propagates an external abort signal through %s lifecycle requests', async (mode, suffix) => {
+    let transportSignal: AbortSignal | undefined;
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      expect(String(input)).toContain(suffix);
+      transportSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+      });
+    }) as unknown as typeof globalThis.fetch;
+    const p = provider(fetch);
+    const abort = new AbortController();
+    const acquisition = mode === 'create'
+      ? p.create({ key: 'abort-create', template: 'code-id' }, { signal: abort.signal })
+      : p.connect('remote', { key: 'abort-connect', template: 'code-id' }, { signal: abort.signal });
+
+    await vi.waitFor(() => expect(transportSignal).toBeInstanceOf(AbortSignal));
+    expect(transportSignal?.aborted).toBe(false);
+    abort.abort();
+    await expect(Promise.race([
+      acquisition,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('AIOS acquisition abort was not prompt')), 100)),
+    ])).rejects.toMatchObject({ name: 'AbortError' });
+    expect(transportSignal?.aborted).toBe(true);
+  });
+
   it('rejects invalid readiness retry settings', () => {
     const fetch = vi.fn() as unknown as typeof globalThis.fetch;
     expect(() => provider(fetch, { readinessAttempts: 0 })).toThrow(/readinessAttempts/);
@@ -97,6 +131,41 @@ describe('AiosE2bProvider', () => {
       { command: 'true' },
     ]);
     expect(sleep).toHaveBeenCalledOnce();
+  });
+
+  it('aborts a 409 readiness retry sleep promptly and completes late sandbox cleanup', async () => {
+    const cleanup = deferred<Response>();
+    const cleanupFinished = vi.fn();
+    const { fetch, requests } = queuedFetch([
+      jsonResponse(201, { sandboxID: 'sb-abort-sleep' }),
+      jsonResponse(409, { code: 'sandbox_not_ready' }),
+      cleanup.promise.then((response) => {
+        cleanupFinished();
+        return response;
+      }),
+    ]);
+    const sleeping = deferred<void>();
+    const sleep = vi.fn(() => sleeping.promise);
+    const p = provider(fetch, { sleep, readinessAttempts: 3 });
+    const abort = new AbortController();
+    const acquisition = p.create(
+      { key: 'abort-readiness-sleep', template: 'code-id' },
+      { signal: abort.signal },
+    );
+    await vi.waitFor(() => expect(sleep).toHaveBeenCalledOnce());
+
+    abort.abort();
+
+    await expect(Promise.race([
+      acquisition,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('readiness sleep abort was not prompt')), 100)),
+    ])).rejects.toMatchObject({ name: 'AbortError' });
+    expect(requests.at(-1)).toMatchObject({
+      url: 'http://aios.local:8080/sandboxes/sb-abort-sleep',
+      method: 'DELETE',
+    });
+    cleanup.resolve(jsonResponse(204));
+    await vi.waitFor(() => expect(cleanupFinished).toHaveBeenCalledOnce());
   });
 
   it('deletes a newly-created sandbox when readiness never completes', async () => {
@@ -157,6 +226,27 @@ describe('AiosE2bProvider', () => {
     ]);
   });
 
+  it('preserves resource/network acquisition and structured command fields', async () => {
+    const { fetch, requests } = queuedFetch([
+      jsonResponse(201, { id: 'sb-structured' }),
+      jsonResponse(200, { stdout: '', stderr: '', exitCode: 0 }),
+      jsonResponse(200, { stdout: 'ok', stderr: '', exitCode: 0 }),
+    ]);
+    const handle = await provider(fetch).create({
+      key: 'structured', template: 'code-id', cpu: 2, memoryMb: 2048, network: 'restricted',
+    });
+    await handle.executeCommand!({
+      program: 'node', args: ['a b'], cwd: '/workspace', env: { TOKEN: 'x' }, timeoutMs: 1234,
+    });
+
+    expect(requests[0].body).toMatchObject({
+      resources: { cpu: 2, memoryMb: 2048 }, network: 'restricted',
+    });
+    expect(requests[2].body).toEqual({
+      command: "cd '/workspace' && env TOKEN='x' 'node' 'a b'", timeout: 2,
+    });
+  });
+
   it('keeps the transport request alive for the caller command timeout plus grace', async () => {
     vi.useFakeTimers();
     try {
@@ -209,6 +299,9 @@ describe('AiosE2bProvider', () => {
       jsonResponse(200, { stdout: '42\n', stderr: '', exitCode: 0 }),
     ]);
     const handle = await provider(fetch).create({ key: 'session:code', template: 'code-id' });
+    expect(handle.workspacePath?.('skills/demo')).toBe('/workspace/skills/demo');
+    expect(handle.supportsSecretFiles).toBe(true);
+    expect(() => handle.workspacePath?.('../escape')).toThrow('escapes sandbox root');
 
     await expect(handle.runCode('console.log(42)', { language: 'javascript' }))
       .resolves.toEqual({ stdout: '42\n', stderr: '', exitCode: 0 });

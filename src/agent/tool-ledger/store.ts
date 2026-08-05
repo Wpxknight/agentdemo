@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { JsonValue, ToolResult } from '../../model/types.js';
+import type { JsonValue, ToolResult } from '../../llm/types.js';
 import type { Store, ToolExecutionRecord } from '../../db/store.js';
 
 export interface ToolExecutionIdentity {

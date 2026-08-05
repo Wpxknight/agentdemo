@@ -2,9 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { buildKubectlTool } from '../src/tools/kubectl.js';
 import { classifyKubectl, parseKubectlArgs } from '../src/ops/classify.js';
 import { ClusterRegistry } from '../src/config/clusters.js';
-import { SandboxManager } from '../src/sandbox/lifecycle.js';
+import { SandboxManager } from '../packages/sandbox-runtime/src/lifecycle.js';
 import { MemoryAuditSink } from '../src/audit/sink.js';
-import type { ExecResult, SandboxHandle, SandboxProvider } from '../src/sandbox/types.js';
+import type { ExecResult, SandboxHandle, SandboxProvider } from '../packages/sandbox-runtime/src/types.js';
 
 /** mock provider：runCommand 回显命令，便于断言拼装。 */
 function echoManager() {
@@ -62,7 +62,7 @@ describe('kubectl tool', () => {
     const audit = new MemoryAuditSink();
     const tool = buildKubectlTool({ clusters, sandboxes: manager, audit });
 
-    const res = await tool.run({ cluster: 'dev', args: ['get', 'pods'] }, ctx);
+    const res = await tool.execute({ cluster: 'dev', args: ['get', 'pods'] }, ctx);
 
     expect(lastCmd.value).toBe('kubectl get pods');
     expect(res.content).toContain('OK: kubectl get pods');
@@ -73,14 +73,14 @@ describe('kubectl tool', () => {
   it('appends --dry-run=server when dryRun', async () => {
     const { manager, lastCmd } = echoManager();
     const tool = buildKubectlTool({ clusters, sandboxes: manager });
-    await tool.run({ cluster: 'dev', args: ['apply', '-f', 'x.yaml'], dryRun: true }, ctx);
+    await tool.execute({ cluster: 'dev', args: ['apply', '-f', 'x.yaml'], dryRun: true }, ctx);
     expect(lastCmd.value).toContain('--dry-run=server');
   });
 
   it('errors on unknown cluster', async () => {
     const { manager } = echoManager();
     const tool = buildKubectlTool({ clusters, sandboxes: manager });
-    const res = await tool.run({ cluster: 'ghost', args: ['get', 'pods'] }, ctx);
+    const res = await tool.execute({ cluster: 'ghost', args: ['get', 'pods'] }, ctx);
     expect(res.isError).toBe(true);
     expect(res.content).toContain('未知集群');
   });
@@ -114,7 +114,7 @@ describe('kubectl tool', () => {
     });
     const tool = buildKubectlTool({ clusters: withSa, sandboxes: new SandboxManager({ provider }) });
 
-    await tool.run({ cluster: 'dev', args: ['get', 'pods', '-n', 'aiop'] }, ctx);
+    await tool.execute({ cluster: 'dev', args: ['get', 'pods', '-n', 'aiop'] }, ctx);
 
     expect(specs[0]).toMatchObject({
       template: 'kubectl:latest',

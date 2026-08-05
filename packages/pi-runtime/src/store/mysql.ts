@@ -1,0 +1,714 @@
+import { randomUUID } from 'node:crypto';
+import {
+  AgentPlatformError, LeaseLostError, RunNotFoundError, type AgentRunEvent, type AgentRunUsage,
+  type DurableInteractionUpdate, type DurableToolLedgerUpdate, type RunRecord,
+} from '@aiop/control-contracts';
+import type { SessionTreeEntry } from '@earendil-works/pi-agent-core';
+import type { Kysely, Transaction } from 'kysely';
+import type {
+  ClaimInboxInput, ConsumeInboxInput, DurableRunStore, EnqueueInboxInput, PiSessionRecord, RunInboxMessage,
+  SessionEntryRecord, StoredRun, DurableProductRunStore, ProductAttemptRecord, ProductTurnCommit,
+} from './types.js';
+import { assertAttemptAllowed, assertTurnAllowed } from '../run/limits.js';
+import { sessionStats } from './session-stats.js';
+import { piSessionStorageId } from './session-id.js';
+import { equalJsonValue } from '../tools/ledger.js';
+
+type Db = Kysely<any> | Transaction<any>;
+
+export class MysqlRunStore implements DurableProductRunStore {
+  constructor(private readonly db: Db, private readonly transactionalView = false, private readonly now: () => Date = () => new Date()) {}
+
+  async create(input: Parameters<DurableRunStore['create']>[0]): Promise<RunRecord & { sessionCreated: boolean }> {
+    const record = input.record;
+    return this.transaction(async (store) => {
+      const piSessionId = piSessionStorageId(record.actorId, record.sessionId);
+      const insertedSession = await store.db.insertInto('pi_sessions').values({
+        tenant_id: record.tenantId, session_id: piSessionId, current_leaf_id: null, committed_leaf_id: null,
+        metadata_json: null, created_at: record.createdAt, updated_at: record.updatedAt,
+      }).ignore().executeTakeFirst();
+      const sessionCreated = Number(insertedSession.numInsertedOrUpdatedRows ?? 0) > 0;
+      await store.db.selectFrom('pi_sessions').select('session_id')
+        .where('tenant_id', '=', record.tenantId).where('session_id', '=', piSessionId).forUpdate().executeTakeFirstOrThrow();
+      const active = await store.db.selectFrom('agent_runs').select('run_id')
+        .where('tenant_id', '=', record.tenantId).where('user_id', '=', record.actorId).where('session_id', '=', record.sessionId)
+        .where('status', 'in', ['queued', 'running', 'waiting']).limit(1).executeTakeFirst();
+      if (active) throw conflict('Session already has an active run');
+      await store.db.insertInto('agent_runs').values({
+        tenant_id: record.tenantId, run_id: record.runId, user_id: record.actorId, session_id: record.sessionId,
+        kernel: record.kernel, kernel_version: record.kernelVersion,
+        status: record.status, waiting_reason: record.waitingReason ?? null, current_node: null, step_count: 0,
+        input_tokens: record.usage.inputTokens, output_tokens: record.usage.outputTokens,
+        cache_read_tokens: record.usage.cacheReadTokens, cache_creation_tokens: record.usage.cacheCreationTokens,
+        cost_usd: record.usage.costUsd ?? null, limits_json: record.limits ? JSON.stringify(record.limits) : null,
+        execution_json: record.execution ? JSON.stringify(record.execution) : null,
+        error_message: null, started_at: null, updated_at: record.updatedAt, completed_at: null,
+        cancel_requested_at: null, lease_owner: record.leaseOwner ?? null, lease_token: Number(record.leaseToken),
+        lease_expires_at: record.leaseExpiresAt ?? null, append_closed_at: null, created_at: record.createdAt,
+      }).execute();
+      return { ...record, sessionCreated };
+    });
+  }
+
+  async get(identity: { tenantId: string; runId: string }): Promise<StoredRun | undefined> {
+    const row = await this.db.selectFrom('agent_runs').selectAll().where('tenant_id', '=', identity.tenantId)
+      .where('run_id', '=', identity.runId).executeTakeFirst();
+    if (!row) return undefined;
+    const last = await this.db.selectFrom('agent_turn_commits').selectAll().where('tenant_id', '=', identity.tenantId)
+      .where('run_id', '=', identity.runId).orderBy('turn_no', 'desc').executeTakeFirst();
+    return mapRun(row, last);
+  }
+
+  async listRuns(tenantId: string): Promise<StoredRun[]> {
+    const rows = await this.db.selectFrom('agent_runs').selectAll().where('tenant_id', '=', tenantId).execute();
+    return Promise.all(rows.map(async (row: any) => {
+      const commit = await this.db.selectFrom('agent_turn_commits').selectAll()
+        .where('tenant_id', '=', tenantId).where('run_id', '=', row.run_id)
+        .orderBy('turn_no', 'desc').executeTakeFirst();
+      return mapRun(row, commit);
+    }));
+  }
+
+  async updateProductRun(identity: { tenantId: string; runId: string }, patch: Partial<StoredRun>): Promise<boolean> {
+    const result = await this.db.updateTable('agent_runs').set({
+      status: patch.status, waiting_reason: patch.waitingReason,
+      current_node: patch.currentNode, step_count: patch.stepCount,
+      input_tokens: patch.usage?.inputTokens, output_tokens: patch.usage?.outputTokens,
+      cache_read_tokens: patch.usage?.cacheReadTokens, cache_creation_tokens: patch.usage?.cacheCreationTokens,
+      cost_usd: patch.usage?.costUsd, error_message: patch.errorMessage,
+      started_at: patch.startedAt, updated_at: patch.updatedAt,
+      completed_at: patch.completedAt, cancel_requested_at: patch.cancelRequestedAt,
+      lease_owner: patch.leaseOwner, lease_token: patch.leaseToken === undefined ? undefined : Number(patch.leaseToken),
+      lease_expires_at: patch.leaseExpiresAt,
+    }).where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId).executeTakeFirst();
+    return affected(result);
+  }
+
+  async markRecoveryRequired(input: {
+    identity: Parameters<DurableRunStore['claim']>[0]['identity']; runId: string; errorMessage: string; failedAt: Date;
+    expectedLease?: { ownerId: string; token: bigint };
+  }): Promise<boolean> {
+    return this.transaction(async (store) => {
+      const row = await store.db.selectFrom('agent_runs').selectAll().where('tenant_id', '=', input.identity.tenantId)
+        .where('run_id', '=', input.runId).forUpdate().executeTakeFirst();
+      if (!row || !canManageRun(input.identity, row.user_id) || ['succeeded', 'cancelled'].includes(row.status)) return false;
+      const activeLease = Boolean(row.lease_owner && row.lease_expires_at && row.lease_expires_at > input.failedAt);
+      if (input.expectedLease) {
+        if (BigInt(row.lease_token) !== input.expectedLease.token
+          || (row.lease_owner && row.lease_owner !== input.expectedLease.ownerId)) return false;
+      } else if (activeLease) return false;
+      await store.db.updateTable('agent_runs').set({
+        status: 'recovery_required', waiting_reason: null, error_message: input.errorMessage,
+        completed_at: input.failedAt, append_closed_at: row.append_closed_at ?? input.failedAt,
+        updated_at: input.failedAt, lease_owner: null, lease_expires_at: null,
+      }).where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId).execute();
+      await store.db.updateTable('agent_run_attempts').set({
+        status: 'failed', error_message: input.errorMessage, completed_at: input.failedAt,
+      }).where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId)
+        .where('status', '=', 'running').execute();
+      return true;
+    });
+  }
+
+  async claim(input: Parameters<DurableRunStore['claim']>[0]): Promise<Awaited<ReturnType<DurableRunStore['claim']>>> {
+    return this.transaction(async (store) => {
+      const candidate = await store.db.selectFrom('agent_runs').select(['session_id', 'user_id'])
+        .where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId).executeTakeFirst();
+      if (!candidate) throw new RunNotFoundError();
+      await store.db.selectFrom('pi_sessions').select('session_id')
+        .where('tenant_id', '=', input.identity.tenantId)
+        .where('session_id', '=', piSessionStorageId(candidate.user_id, candidate.session_id))
+        .forUpdate().executeTakeFirstOrThrow();
+      const row = await store.db.selectFrom('agent_runs').selectAll().where('tenant_id', '=', input.identity.tenantId)
+        .where('run_id', '=', input.runId).forUpdate().executeTakeFirst();
+      if (!row) throw new RunNotFoundError();
+      if (!canManageRun(input.identity, row.user_id) || ['succeeded', 'cancelled'].includes(row.status)) return null;
+      if (['waiting', 'failed', 'recovery_required'].includes(row.status) && !input.resume) return null;
+      if (row.status === 'waiting' && !input.resolution) {
+        throw conflict('Waiting run requires an interaction resolution');
+      }
+      if (input.resolution) {
+        const interaction = await store.db.selectFrom('agent_interactions').selectAll()
+          .where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId)
+          .where('id', '=', input.resolution.interactionId).forUpdate().executeTakeFirst();
+        if (!interaction || interaction.status !== 'resolved' || !interaction.tool_call_id
+          || (row.status === 'waiting' && interaction.kind !== row.waiting_reason)
+          || !equalJsonValue(
+            interaction.resolution === null ? undefined : parse(interaction.resolution), input.resolution.value,
+          )) {
+          throw conflict('Interaction resolution does not match the waiting run');
+        }
+      }
+      if (input.resume) {
+        const active = await store.db.selectFrom('agent_runs').select('run_id')
+          .where('tenant_id', '=', input.identity.tenantId).where('session_id', '=', row.session_id)
+          .where('user_id', '=', row.user_id)
+          .where('run_id', '!=', input.runId).where('status', 'in', ['queued', 'running', 'waiting'])
+          .limit(1).executeTakeFirst();
+        if (active) throw conflict('Session already has an active run');
+      }
+      const attemptCount = await store.db.selectFrom('agent_run_attempts').select(({ fn }) => fn.countAll<number>().as('count'))
+        .where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId).executeTakeFirstOrThrow();
+      const limits = row.limits_json === null || row.limits_json === undefined ? undefined : reviveLimits(parse(row.limits_json));
+      assertAttemptAllowed(limits, Number(attemptCount.count), input.now);
+      const lastTurn = await store.db.selectFrom('agent_turn_commits').select(({ fn }) => fn.max<number>('turn_no').as('turn_no'))
+        .where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId).executeTakeFirst();
+      assertTurnAllowed(limits, Number(lastTurn?.turn_no ?? 0) + 1);
+      if (row.lease_owner && row.lease_owner !== input.workerId && row.lease_expires_at && row.lease_expires_at > input.now) return null;
+      const same = row.lease_owner === input.workerId && row.lease_expires_at && row.lease_expires_at > input.now;
+      const fencingToken = BigInt(same ? row.lease_token : Number(row.lease_token) + 1);
+      const attemptId = randomUUID();
+      await store.db.updateTable('agent_runs').set({
+        status: 'running', lease_owner: input.workerId, lease_token: Number(fencingToken),
+        lease_expires_at: new Date(input.now.getTime() + input.leaseTtlMs), updated_at: input.now,
+        waiting_reason: null,
+        ...(input.resume && ['waiting', 'failed', 'recovery_required'].includes(row.status) ? { append_closed_at: null } : {}),
+      }).where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId).execute();
+      await store.db.insertInto('agent_run_attempts').values({
+        tenant_id: input.identity.tenantId, run_id: input.runId, attempt_id: attemptId, worker_id: input.workerId,
+        lease_token: Number(fencingToken), kernel: row.kernel, kernel_version: row.kernel_version, status: 'running',
+        error_code: null, error_message: null, started_at: input.now, completed_at: null,
+      }).execute();
+      return { record: mapRun({
+        ...row, status: 'running', lease_owner: input.workerId, lease_token: Number(fencingToken),
+        lease_expires_at: new Date(input.now.getTime() + input.leaseTtlMs), waiting_reason: null,
+        ...(input.resume && ['waiting', 'failed', 'recovery_required'].includes(row.status) ? { append_closed_at: null } : {}),
+      }), attemptId, fencingToken };
+    });
+  }
+
+  async renewLease(input: Parameters<DurableRunStore['renewLease']>[0]): Promise<void> {
+    const result = await this.db.updateTable('agent_runs').set({
+      lease_expires_at: new Date(input.now.getTime() + input.leaseTtlMs), updated_at: input.now,
+    }).where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId)
+      .where('lease_owner', '=', input.workerId).where('lease_token', '=', Number(input.fencingToken))
+      .where('lease_expires_at', '>', input.now).executeTakeFirst();
+    if (!affected(result)) throw new LeaseLostError();
+  }
+
+  async commitTurn(input: Parameters<DurableRunStore['commitTurn']>[0]): Promise<void> {
+    await this.transaction(async (store) => {
+      const run = await store.assertLease(input.tenantId, input.runId, input.fencingToken, true, undefined, input.committedAt);
+      if (run.cancel_requested_at && input.status !== 'cancelled') throw conflict('Cancellation won the commit race');
+      const existing = await store.db.selectFrom('agent_turn_commits').selectAll()
+        .where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId)
+        .where('attempt_id', '=', input.attemptId).where('turn_no', '=', input.turnNo).executeTakeFirst();
+      if (existing) return;
+      const checkpoint = asRecord(input.checkpoint);
+      const piSessionId = stringValue(checkpoint.piSessionId);
+      const piLeafId = stringValue(checkpoint.piLeafId);
+      let piEntrySeq: number | null = null;
+      if (piSessionId && piLeafId) {
+        const entry = await store.db.selectFrom('pi_session_entries').select('entry_seq')
+          .where('tenant_id', '=', input.tenantId).where('session_id', '=', piSessionId)
+          .where('entry_id', '=', piLeafId).executeTakeFirst();
+        if (!entry) throw conflict('Pi leaf is outside tenant/session');
+        piEntrySeq = Number(entry.entry_seq);
+      }
+      const last = await store.db.selectFrom('agent_turn_commits').select(({ fn }) => fn.max<number>('transcript_version').as('version'))
+        .where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId).executeTakeFirst();
+      let eventSequenceEnd = 0;
+      for (const event of input.events) {
+        eventSequenceEnd = await store.appendEvent(event);
+      }
+      for (const interaction of input.interactionUpdates ?? []) {
+        await store.db.insertInto('agent_interactions').values(interactionValues(interaction)).onDuplicateKeyUpdate({
+          status: interaction.status,
+          resolution: interaction.resolution === undefined ? null : JSON.stringify(interaction.resolution),
+          resolved_by: interaction.resolvedBy ?? null,
+          resolved_at: interaction.resolvedAt ?? null,
+        }).execute();
+      }
+      for (const ledger of input.ledgerUpdates ?? []) {
+        await store.db.insertInto('agent_tool_executions').values(ledgerValues(ledger)).onDuplicateKeyUpdate({
+          attempt_id: ledger.attemptId, turn_no: ledger.turnNo, tool_call_id: ledger.toolCallId,
+          idempotency_key: ledger.idempotencyKey, capability: ledger.capability,
+          external_correlation_id: ledger.externalCorrelationId ?? null,
+          result_digest: ledger.resultDigest ?? null, approved_interaction_id: ledger.approvedInteractionId ?? null,
+          status: ledger.status, result: ledger.result === undefined ? null : JSON.stringify(ledger.result),
+          completed_at: ledger.status === 'completed' ? ledger.updatedAt : null, updated_at: ledger.updatedAt,
+        }).execute();
+      }
+      await store.db.insertInto('agent_turn_commits').values({
+        tenant_id: input.tenantId, run_id: input.runId, attempt_id: input.attemptId, turn_no: input.turnNo,
+        pi_session_id: piSessionId, pi_leaf_id: piLeafId, pi_entry_seq: piEntrySeq,
+        commit_id: randomUUID(), transcript_version: Number(last?.version ?? 0) + 1, stop_reason: null,
+        usage_json: JSON.stringify(input.usage), messages_json: JSON.stringify(input.checkpoint),
+        event_sequence_end: eventSequenceEnd, committed_at: input.committedAt,
+      }).execute();
+      if (piSessionId) {
+        await store.db.updateTable('pi_sessions').set({ committed_leaf_id: piLeafId, updated_at: input.committedAt })
+          .where('tenant_id', '=', input.tenantId).where('session_id', '=', piSessionId).execute();
+      }
+      await store.db.updateTable('agent_runs').set({
+        status: input.status, waiting_reason: input.waitingReason ?? null,
+        input_tokens: input.usage.inputTokens, output_tokens: input.usage.outputTokens,
+        cache_read_tokens: input.usage.cacheReadTokens, cache_creation_tokens: input.usage.cacheCreationTokens,
+        cost_usd: input.usage.costUsd ?? null, updated_at: input.committedAt,
+        ...(['failed', 'recovery_required'].includes(input.status)
+          ? { error_message: input.error?.message ?? null } : {}),
+        ...(input.status === 'waiting' ? { lease_owner: null, lease_expires_at: null } : {}),
+      }).where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId).execute();
+      if (input.status === 'waiting') {
+        await store.db.updateTable('agent_run_attempts').set({ status: 'succeeded', completed_at: input.committedAt })
+          .where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId)
+          .where('attempt_id', '=', input.attemptId).execute();
+      }
+      if (input.status === 'failed' || input.status === 'recovery_required') {
+        await store.db.updateTable('agent_run_attempts').set({
+          status: 'failed', error_code: input.error?.code ?? null, error_message: input.error?.message ?? null,
+          completed_at: input.committedAt,
+        })
+          .where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId)
+          .where('attempt_id', '=', input.attemptId).execute();
+      }
+      if (input.status === 'recovery_required') {
+        await store.db.updateTable('agent_runs').set({
+          error_message: input.error?.message ?? null, completed_at: input.committedAt,
+          append_closed_at: run.append_closed_at ?? input.committedAt, lease_owner: null, lease_expires_at: null,
+        }).where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId).execute();
+      }
+    });
+  }
+
+  async requestCancellation(input: Parameters<DurableRunStore['requestCancellation']>[0]): Promise<void> {
+    await this.transaction(async (store) => {
+      const row = await store.db.selectFrom('agent_runs').selectAll().where('tenant_id', '=', input.identity.tenantId)
+        .where('run_id', '=', input.runId).forUpdate().executeTakeFirst();
+      if (!row || !canManageRun(input.identity, row.user_id)) throw new RunNotFoundError();
+      const inactive = !row.lease_owner || !row.lease_expires_at || row.lease_expires_at <= input.requestedAt;
+      const cancelled = inactive && (row.status === 'queued' || row.status === 'waiting');
+      await store.db.updateTable('agent_runs').set({
+        cancel_requested_at: row.cancel_requested_at ?? input.requestedAt,
+        updated_at: input.requestedAt,
+        ...(cancelled ? {
+          status: 'cancelled', waiting_reason: null, error_message: input.reason ?? null,
+          completed_at: row.completed_at ?? input.requestedAt, append_closed_at: row.append_closed_at ?? input.requestedAt,
+          lease_owner: null, lease_expires_at: null,
+        } : {}),
+      })
+        .where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId).execute();
+      if (cancelled) {
+        await store.db.updateTable('agent_run_attempts').set({ status: 'cancelled', completed_at: input.requestedAt })
+          .where('tenant_id', '=', input.identity.tenantId).where('run_id', '=', input.runId)
+          .where('status', '=', 'running').execute();
+      }
+    });
+  }
+
+  async complete(input: Parameters<DurableRunStore['complete']>[0]): Promise<void> {
+    await this.transaction(async (store) => {
+      const row = await store.assertLease(input.tenantId, input.runId, input.fencingToken, true);
+      const status = row.cancel_requested_at ? 'cancelled' : input.status;
+      const error = status === input.status ? input.error : undefined;
+      await store.db.updateTable('agent_runs').set({
+        status, waiting_reason: null, input_tokens: input.usage.inputTokens, output_tokens: input.usage.outputTokens,
+        cache_read_tokens: input.usage.cacheReadTokens, cache_creation_tokens: input.usage.cacheCreationTokens,
+        cost_usd: input.usage.costUsd ?? null,
+        error_message: error?.message ?? null, completed_at: input.completedAt, updated_at: input.completedAt,
+        lease_owner: null, lease_expires_at: null, append_closed_at: row.append_closed_at ?? input.completedAt,
+      }).where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId).execute();
+      await store.db.updateTable('agent_run_attempts').set({
+        status, error_code: error?.code ?? null, error_message: error?.message ?? null,
+        completed_at: input.completedAt,
+      })
+        .where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId)
+        .where('attempt_id', '=', input.attemptId).execute();
+    });
+  }
+
+  async listEvents(identity: { tenantId: string; runId: string }, after = 0n): Promise<AgentRunEvent[]> {
+    const rows = await this.db.selectFrom('agent_run_events').selectAll().where('tenant_id', '=', identity.tenantId)
+      .where('run_id', '=', identity.runId).where('sequence', '>', Number(after)).orderBy('sequence', 'asc').execute();
+    return rows.map(mapEvent);
+  }
+
+  async appendEvents(input: Parameters<DurableRunStore['appendEvents']>[0]): Promise<void> {
+    await this.transaction(async (store) => {
+      await store.assertLease(input.tenantId, input.runId, input.fencingToken, true, undefined, input.appendedAt);
+      for (const event of input.events) await store.appendEvent(event);
+    });
+  }
+
+  async isCancellationRequested(identity: { tenantId: string; runId: string }): Promise<boolean> {
+    const row = await this.db.selectFrom('agent_runs').select('cancel_requested_at').where('tenant_id', '=', identity.tenantId)
+      .where('run_id', '=', identity.runId).executeTakeFirst();
+    return Boolean(row?.cancel_requested_at);
+  }
+
+  async countAttempts(identity: { tenantId: string; runId: string }): Promise<number> {
+    const row = await this.db.selectFrom('agent_run_attempts').select(({ fn }) => fn.countAll<number>().as('count'))
+      .where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId).executeTakeFirstOrThrow();
+    return Number(row.count);
+  }
+
+  async getInteraction(
+    identity: { tenantId: string; runId: string; interactionId: string },
+  ): Promise<DurableInteractionUpdate | undefined> {
+    const row = await this.db.selectFrom('agent_interactions').selectAll()
+      .where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId)
+      .where('id', '=', identity.interactionId).executeTakeFirst();
+    return row ? mapInteraction(row) : undefined;
+  }
+
+  async resolveInteraction(record: DurableInteractionUpdate): Promise<boolean> {
+    if (record.status !== 'resolved') return false;
+    const result = await this.db.updateTable('agent_interactions').set({
+      status: record.status, resolution: record.resolution === undefined ? null : JSON.stringify(record.resolution),
+      resolved_by: record.resolvedBy ?? null, resolved_at: record.resolvedAt ?? null,
+    }).where('tenant_id', '=', record.tenantId).where('run_id', '=', record.runId)
+      .where('id', '=', record.id).where('status', '=', 'pending').executeTakeFirst();
+    return affected(result);
+  }
+
+  async closeInbox(input: Parameters<DurableRunStore['closeInbox']>[0]): Promise<void> {
+    await this.transaction(async (store) => {
+      const row = await store.assertLease(input.tenantId, input.runId, input.fencingToken, true, input.workerId, input.now);
+      await store.db.updateTable('agent_runs').set({
+        append_closed_at: row.append_closed_at ?? input.now, updated_at: input.now,
+      }).where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId).execute();
+    });
+  }
+
+  readonly runs = {
+    assertLease: async (
+      identity: { tenantId: string; runId: string }, ownerId: string, token: bigint, now: Date,
+    ): Promise<void> => {
+      await this.assertLease(identity.tenantId, identity.runId, token, false, ownerId, now);
+    },
+  };
+
+  readonly attempts = {
+    list: async (identity: { tenantId: string; runId: string }): Promise<ProductAttemptRecord[]> =>
+      (await this.db.selectFrom('agent_run_attempts').selectAll()
+        .where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId)
+        .orderBy('started_at', 'asc').execute()).map((row: any) => ({
+          tenantId: row.tenant_id, runId: row.run_id, attemptId: row.attempt_id,
+          workerId: row.worker_id, leaseToken: BigInt(row.lease_token), kernel: row.kernel,
+          kernelVersion: row.kernel_version, status: row.status, errorCode: row.error_code ?? undefined,
+          errorMessage: row.error_message ?? undefined, startedAt: row.started_at,
+          completedAt: row.completed_at ?? undefined,
+        })),
+  };
+
+  readonly turns = {
+    listCommitted: async (identity: { tenantId: string; runId: string }): Promise<ProductTurnCommit[]> =>
+      (await this.db.selectFrom('agent_turn_commits').selectAll()
+        .where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId)
+        .orderBy('transcript_version', 'asc').execute()).map((row: any) => ({
+          tenantId: row.tenant_id, runId: row.run_id, attemptId: row.attempt_id, turnNo: row.turn_no,
+          commitId: row.commit_id, transcriptVersion: BigInt(row.transcript_version),
+          stopReason: row.stop_reason ?? undefined, usage: parse(row.usage_json),
+          eventSequenceEnd: BigInt(row.event_sequence_end), committedAt: row.committed_at,
+        })),
+  };
+
+  readonly interactions = {
+    put: async (record: DurableInteractionUpdate): Promise<void> => {
+      await this.db.insertInto('agent_interactions').values(interactionValues(record)).onDuplicateKeyUpdate({
+        status: record.status,
+        resolution: record.resolution === undefined ? null : JSON.stringify(record.resolution),
+        resolved_by: record.resolvedBy ?? null, resolved_at: record.resolvedAt ?? null,
+      }).execute();
+    },
+    get: (identity: { tenantId: string; runId: string; interactionId: string }) => this.getInteraction(identity),
+    getById: async (tenantId: string, interactionId: string) => {
+      const row = await this.db.selectFrom('agent_interactions').selectAll()
+        .where('tenant_id', '=', tenantId).where('id', '=', interactionId).executeTakeFirst();
+      return row ? mapInteraction(row) : undefined;
+    },
+    list: async (identity: { tenantId: string; runId: string }) =>
+      (await this.db.selectFrom('agent_interactions').selectAll()
+        .where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId)
+        .orderBy('created_at', 'asc').execute()).map(mapInteraction),
+    listByTenant: async (tenantId: string) =>
+      (await this.db.selectFrom('agent_interactions').selectAll().where('tenant_id', '=', tenantId)
+        .orderBy('created_at', 'asc').execute()).map(mapInteraction),
+  };
+
+  readonly toolLedger = {
+    putIfAbsent: async (record: DurableToolLedgerUpdate): Promise<boolean> => {
+      const result = await this.db.insertInto('agent_tool_executions').values(ledgerValues(record)).ignore().executeTakeFirst();
+      return Number(result.numInsertedOrUpdatedRows ?? 0) > 0;
+    },
+    get: async (identity: { tenantId: string; runId: string; logicalCallId: string }) => {
+      const row = await this.db.selectFrom('agent_tool_executions').selectAll()
+        .where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId)
+        .where('logical_call_id', '=', identity.logicalCallId).executeTakeFirst();
+      return row ? mapLedger(row) : undefined;
+    },
+    update: async (record: DurableToolLedgerUpdate): Promise<void> => {
+      await this.db.updateTable('agent_tool_executions').set({
+        attempt_id: record.attemptId, turn_no: record.turnNo, tool_call_id: record.toolCallId,
+        idempotency_key: record.idempotencyKey, capability: record.capability,
+        external_correlation_id: record.externalCorrelationId ?? null, result_digest: record.resultDigest ?? null,
+        approved_interaction_id: record.approvedInteractionId ?? null, status: record.status,
+        result: record.result === undefined ? null : JSON.stringify(record.result),
+        completed_at: record.status === 'completed' ? record.updatedAt : null, updated_at: record.updatedAt,
+      }).where('tenant_id', '=', record.tenantId).where('run_id', '=', record.runId)
+        .where('logical_call_id', '=', record.logicalCallId).execute();
+    },
+    claimPendingApproval: async (input: import('./types.js').ToolLedgerApprovalClaim): Promise<boolean> => {
+      const result = await this.db.updateTable('agent_tool_executions').set({
+        attempt_id: input.started.attemptId, turn_no: input.started.turnNo,
+        tool_call_id: input.started.toolCallId, idempotency_key: input.started.idempotencyKey,
+        capability: input.started.capability, approved_interaction_id: input.started.approvedInteractionId ?? null,
+        status: input.started.status, updated_at: input.started.updatedAt,
+      }).where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId)
+        .where('logical_call_id', '=', input.logicalCallId).where('status', '=', 'pending_approval')
+        .where('attempt_id', '=', input.attemptId).where('turn_no', '=', input.turnNo)
+        .where('tool_call_id', '=', input.toolCallId).where('tool_name', '=', input.toolName)
+        .where('args_digest', '=', input.argsDigest)
+        .where('approved_interaction_id', '=', input.approvedInteractionId).executeTakeFirst();
+      return Number(result.numUpdatedRows ?? 0) === 1;
+    },
+    list: async (identity: { tenantId: string; runId: string }) =>
+      (await this.db.selectFrom('agent_tool_executions').selectAll()
+        .where('tenant_id', '=', identity.tenantId).where('run_id', '=', identity.runId)
+        .orderBy('started_at', 'asc').execute()).map(mapLedger),
+  };
+
+  readonly events = {
+    append: async (event: Omit<AgentRunEvent, 'sequence'>): Promise<AgentRunEvent> => {
+      const sequence = this.transactionalView
+        ? await this.appendEvent(event)
+        : await this.transaction((store) => store.appendEvent(event));
+      return { ...event, sequence: BigInt(sequence) };
+    },
+    list: (identity: { tenantId: string; runId: string }, after = 0n) => this.listEvents(identity, after),
+  };
+
+  readonly sessions = {
+    create: async (input: { tenantId: string; sessionId: string; createdAt: Date; metadata?: Record<string, unknown> }): Promise<PiSessionRecord> => {
+      await this.db.insertInto('pi_sessions').values({
+        tenant_id: input.tenantId, session_id: input.sessionId, current_leaf_id: null, committed_leaf_id: null,
+        metadata_json: input.metadata ? JSON.stringify(input.metadata) : null, created_at: input.createdAt, updated_at: input.createdAt,
+      }).ignore().execute();
+      return (await this.sessions.get(input.tenantId, input.sessionId))!;
+    },
+    get: async (tenantId: string, sessionId: string): Promise<PiSessionRecord | undefined> => {
+      const row = await this.db.selectFrom('pi_sessions').selectAll().where('tenant_id', '=', tenantId)
+        .where('session_id', '=', sessionId).executeTakeFirst();
+      return row ? mapSession(row) : undefined;
+    },
+    appendEntry: async (tenantId: string, sessionId: string, entry: SessionTreeEntry): Promise<SessionEntryRecord> => this.transaction(async (store) => {
+      await store.db.selectFrom('pi_sessions').select('session_id').where('tenant_id', '=', tenantId)
+        .where('session_id', '=', sessionId).forUpdate().executeTakeFirstOrThrow();
+      if (entry.parentId) {
+        const parent = await store.db.selectFrom('pi_session_entries').select('entry_id').where('tenant_id', '=', tenantId)
+          .where('session_id', '=', sessionId).where('entry_id', '=', entry.parentId).executeTakeFirst();
+        if (!parent) throw conflict('Pi parent is outside tenant/session');
+      }
+      const last = await store.db.selectFrom('pi_session_entries').select(({ fn }) => fn.max<number>('entry_seq').as('sequence'))
+        .where('tenant_id', '=', tenantId).where('session_id', '=', sessionId).executeTakeFirst();
+      const sequence = Number(last?.sequence ?? 0) + 1;
+      await store.db.insertInto('pi_session_entries').values({
+        tenant_id: tenantId, session_id: sessionId, entry_id: entry.id, entry_seq: sequence,
+        parent_id: entry.parentId, entry_type: entry.type, entry_json: JSON.stringify(entry), created_at: new Date(entry.timestamp),
+      }).execute();
+      await store.db.updateTable('pi_sessions').set({
+        current_leaf_id: entry.type === 'leaf' ? entry.targetId : entry.id, updated_at: new Date(entry.timestamp),
+      }).where('tenant_id', '=', tenantId).where('session_id', '=', sessionId).execute();
+      return { tenantId, sessionId, sequence: BigInt(sequence), entry };
+    }),
+    listEntries: async (tenantId: string, sessionId: string, options: { afterSequence?: bigint; committedOnly?: boolean } = {}): Promise<SessionEntryRecord[]> => {
+      let query = this.db.selectFrom('pi_session_entries').selectAll().where('tenant_id', '=', tenantId)
+        .where('session_id', '=', sessionId).where('entry_seq', '>', Number(options.afterSequence ?? 0n)).orderBy('entry_seq', 'asc');
+      const rows = await query.execute();
+      let records = rows.map((row: any) => ({ tenantId, sessionId, sequence: BigInt(row.entry_seq), entry: parse(row.entry_json) as SessionTreeEntry }));
+      if (options.committedOnly) {
+        const leaf = (await this.sessions.get(tenantId, sessionId))?.committedLeafId ?? null;
+        const ids = reachable(records, leaf);
+        records = records.filter((record) => ids.has(record.entry.id));
+      }
+      return records;
+    },
+    getSessionStats: async (tenantId: string, sessionId: string) => sessionStats(
+      (await this.sessions.listEntries(tenantId, sessionId, { committedOnly: true })).map((record) => record.entry),
+    ),
+    setCurrentLeaf: async (tenantId: string, sessionId: string, leafId: string | null): Promise<void> => {
+      if (leafId) {
+        const entry = await this.db.selectFrom('pi_session_entries').select('entry_id').where('tenant_id', '=', tenantId)
+          .where('session_id', '=', sessionId).where('entry_id', '=', leafId).executeTakeFirst();
+        if (!entry) throw conflict('Pi leaf is outside tenant/session');
+      }
+      await this.db.updateTable('pi_sessions').set({ current_leaf_id: leafId, updated_at: this.now() })
+        .where('tenant_id', '=', tenantId).where('session_id', '=', sessionId).execute();
+    },
+  };
+
+  readonly inbox = {
+    enqueue: async (input: EnqueueInboxInput): Promise<RunInboxMessage> => this.transaction(async (store) => {
+      const run = await store.db.selectFrom('agent_runs').selectAll().where('tenant_id', '=', input.tenantId)
+        .where('run_id', '=', input.runId).forUpdate().executeTakeFirst();
+      if (!run || !canManageRun(input.identity, run.user_id)) throw new RunNotFoundError();
+      if (run.append_closed_at || !['queued', 'running', 'waiting', 'recovery_required'].includes(run.status)) {
+        throw conflict('Run no longer accepts appended messages');
+      }
+      const duplicate = await store.db.selectFrom('agent_run_inbox_messages').selectAll()
+        .where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId)
+        .where('idempotency_key', '=', input.idempotencyKey).executeTakeFirst();
+      if (duplicate) return mapInbox(duplicate);
+      const last = await store.db.selectFrom('agent_run_inbox_messages').select(({ fn }) => fn.max<number>('sequence').as('sequence'))
+        .where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId).executeTakeFirst();
+      const message: RunInboxMessage = {
+        ...input, id: randomUUID(), sequence: BigInt(Number(last?.sequence ?? 0) + 1), status: 'pending',
+      };
+      await store.db.insertInto('agent_run_inbox_messages').values(inboxValues(message)).execute();
+      return message;
+    }),
+    claimNext: async (input: ClaimInboxInput): Promise<RunInboxMessage | undefined> => this.transaction(async (store) => {
+      await store.assertLease(input.tenantId, input.runId, input.fencingToken, true, input.workerId, input.now);
+      const row = await store.db.selectFrom('agent_run_inbox_messages').selectAll()
+        .where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId)
+        .where((eb) => eb.or([eb('status', '=', 'pending'), eb.and([eb('status', '=', 'claimed'), eb('claim_expires_at', '<=', input.now)])]))
+        .orderBy('sequence', 'asc').forUpdate().executeTakeFirst();
+      if (!row) return undefined;
+      const claimToken = randomUUID();
+      const claimExpiresAt = new Date(input.now.getTime() + input.claimTtlMs);
+      await store.db.updateTable('agent_run_inbox_messages').set({
+        status: 'claimed', claim_owner: input.workerId, claim_token: claimToken, claim_expires_at: claimExpiresAt,
+      }).where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId)
+        .where('message_id', '=', row.message_id).execute();
+      return mapInbox({ ...row, status: 'claimed', claim_owner: input.workerId, claim_token: claimToken, claim_expires_at: claimExpiresAt });
+    }),
+    markConsumed: async (input: ConsumeInboxInput): Promise<void> => this.transaction(async (store) => {
+      await store.assertLease(input.tenantId, input.runId, input.fencingToken, true, input.workerId, input.consumedAt);
+      const result = await store.db.updateTable('agent_run_inbox_messages').set({
+        status: 'consumed', consumed_at: input.consumedAt, claim_expires_at: null,
+      }).where('tenant_id', '=', input.tenantId).where('run_id', '=', input.runId).where('message_id', '=', input.id)
+        .where('claim_owner', '=', input.workerId).where('claim_token', '=', input.claimToken).executeTakeFirst();
+      if (!affected(result)) throw new LeaseLostError();
+    }),
+    list: async (tenantId: string, runId: string): Promise<RunInboxMessage[]> =>
+      (await this.db.selectFrom('agent_run_inbox_messages').selectAll().where('tenant_id', '=', tenantId)
+        .where('run_id', '=', runId).orderBy('sequence', 'asc').execute()).map(mapInbox),
+  };
+
+  async transaction<T>(work: (store: DurableProductRunStore & MysqlRunStore) => Promise<T>): Promise<T> {
+    if (this.transactionalView) return work(this);
+    return (this.db as Kysely<any>).transaction().execute((tx) => work(new MysqlRunStore(tx, true, this.now)));
+  }
+
+  private async assertLease(
+    tenantId: string, runId: string, token: bigint, lock: boolean, owner?: string, at = this.now(),
+  ): Promise<any> {
+    let query = this.db.selectFrom('agent_runs').selectAll().where('tenant_id', '=', tenantId).where('run_id', '=', runId)
+      .where('lease_token', '=', Number(token)).where('lease_expires_at', '>', at);
+    if (owner) query = query.where('lease_owner', '=', owner);
+    if (lock) query = query.forUpdate();
+    const row = await query.executeTakeFirst();
+    if (!row) throw new LeaseLostError();
+    return row;
+  }
+
+  private async appendEvent(event: Omit<AgentRunEvent, 'sequence'>): Promise<number> {
+    const last = await this.db.selectFrom('agent_run_events').select(({ fn }) => fn.max<number>('sequence').as('sequence'))
+      .where('tenant_id', '=', event.tenantId).where('run_id', '=', event.runId).executeTakeFirst();
+    const sequence = Number(last?.sequence ?? 0) + 1;
+    await this.db.insertInto('agent_run_events').values({
+      tenant_id: event.tenantId, run_id: event.runId, sequence, event_type: event.type, attempt_id: event.attemptId,
+      turn_no: event.turnNo, kernel: event.kernel, kernel_version: event.kernelVersion, correlation_id: event.correlationId,
+      node_name: null, status: null, detail: event.detail === undefined ? null : JSON.stringify(event.detail), created_at: event.createdAt,
+    }).execute();
+    return sequence;
+  }
+}
+
+function mapRun(row: any, commit?: any): StoredRun {
+  return {
+    tenantId: row.tenant_id, runId: row.run_id, actorId: row.user_id, sessionId: row.session_id,
+    kernel: row.kernel, kernelVersion: row.kernel_version, status: row.status, waitingReason: row.waiting_reason ?? undefined,
+    leaseToken: BigInt(row.lease_token), leaseOwner: row.lease_owner ?? undefined, leaseExpiresAt: row.lease_expires_at ?? undefined,
+    limits: row.limits_json === null || row.limits_json === undefined ? undefined : reviveLimits(parse(row.limits_json)),
+    execution: row.execution_json === null || row.execution_json === undefined ? undefined : parse(row.execution_json),
+    usage: usage(row), createdAt: row.created_at, updatedAt: row.updated_at,
+    cancelRequestedAt: row.cancel_requested_at ?? undefined, lastTurnNo: Number(commit?.turn_no ?? 0),
+    checkpoint: commit ? parse(commit.messages_json) : undefined, appendClosedAt: row.append_closed_at ?? undefined,
+    currentNode: row.current_node ?? undefined, stepCount: Number(row.step_count ?? 0),
+    errorMessage: row.error_message ?? undefined, startedAt: row.started_at ?? undefined,
+    completedAt: row.completed_at ?? undefined,
+  };
+}
+function mapSession(row: any): PiSessionRecord { return {
+  tenantId: row.tenant_id, sessionId: row.session_id, currentLeafId: row.current_leaf_id,
+  committedLeafId: row.committed_leaf_id, metadata: row.metadata_json === null ? undefined : parse(row.metadata_json),
+  createdAt: row.created_at, updatedAt: row.updated_at,
+}; }
+function mapInbox(row: any): RunInboxMessage { return {
+  tenantId: row.tenant_id, runId: row.run_id, id: row.message_id, sequence: BigInt(row.sequence),
+  idempotencyKey: row.idempotency_key, mode: row.mode, message: parse(row.message_json), status: row.status,
+  claimOwner: row.claim_owner ?? undefined, claimToken: row.claim_token ?? undefined,
+  claimExpiresAt: row.claim_expires_at ?? undefined, createdAt: row.created_at, consumedAt: row.consumed_at ?? undefined,
+}; }
+function mapEvent(row: any): AgentRunEvent { return {
+  tenantId: row.tenant_id, runId: row.run_id, sequence: BigInt(row.sequence), type: row.event_type,
+  attemptId: row.attempt_id, turnNo: row.turn_no, kernel: row.kernel, kernelVersion: row.kernel_version,
+  correlationId: row.correlation_id, detail: row.detail === null ? undefined : parse(row.detail), createdAt: row.created_at,
+}; }
+function inboxValues(message: RunInboxMessage) { return {
+  tenant_id: message.tenantId, run_id: message.runId, message_id: message.id, sequence: Number(message.sequence),
+  idempotency_key: message.idempotencyKey, mode: message.mode, message_json: JSON.stringify(message.message),
+  status: message.status, claim_owner: null, claim_token: null, claim_expires_at: null,
+  created_at: message.createdAt, consumed_at: null,
+}; }
+function interactionValues(record: DurableInteractionUpdate) { return {
+  id: record.id, tenant_id: record.tenantId, user_id: record.userId ?? '', session_id: record.sessionId ?? '',
+  run_id: record.runId, attempt_id: record.attemptId, turn_no: record.turnNo, kind: record.kind,
+  tool_call_id: record.toolCallId ?? null, payload: JSON.stringify(record.payload), status: record.status,
+  resolution: record.resolution === undefined ? null : JSON.stringify(record.resolution),
+  resolved_by: record.resolvedBy ?? null,
+  expires_at: record.expiresAt ?? new Date('9999-12-31T23:59:59.999Z'), created_at: record.createdAt,
+  resolved_at: record.resolvedAt ?? null,
+}; }
+function ledgerValues(record: DurableToolLedgerUpdate) { return {
+  tenant_id: record.tenantId, run_id: record.runId, attempt_id: record.attemptId, turn_no: record.turnNo,
+  session_id: '', tool_call_id: record.toolCallId, logical_call_id: record.logicalCallId,
+  idempotency_key: record.idempotencyKey, capability: record.capability,
+  external_correlation_id: record.externalCorrelationId ?? null, result_digest: record.resultDigest ?? null,
+  approved_interaction_id: record.approvedInteractionId ?? null, tool_name: record.toolName, args_digest: record.argsDigest,
+  status: record.status, result: record.result === undefined ? null : JSON.stringify(record.result),
+  started_at: record.createdAt, completed_at: record.status === 'completed' ? record.updatedAt : null,
+  updated_at: record.updatedAt,
+}; }
+function mapInteraction(row: any): DurableInteractionUpdate { return {
+  tenantId: row.tenant_id, runId: row.run_id, id: row.id, userId: row.user_id || undefined,
+  sessionId: row.session_id || undefined, attemptId: row.attempt_id ?? '', turnNo: row.turn_no ?? 0,
+  kind: row.kind, toolCallId: row.tool_call_id ?? undefined, status: row.status,
+  payload: parse(row.payload), resolution: row.resolution === null ? undefined : parse(row.resolution),
+  resolvedBy: row.resolved_by ?? undefined, expiresAt: toDate(row.expires_at), createdAt: toDate(row.created_at),
+  resolvedAt: row.resolved_at === null || row.resolved_at === undefined ? undefined : toDate(row.resolved_at),
+}; }
+function mapLedger(row: any): DurableToolLedgerUpdate { return {
+  tenantId: row.tenant_id, runId: row.run_id, attemptId: row.attempt_id ?? '', turnNo: row.turn_no ?? 0,
+  logicalCallId: row.logical_call_id, toolCallId: row.tool_call_id, toolName: row.tool_name,
+  argsDigest: row.args_digest, capability: row.capability, idempotencyKey: row.idempotency_key, status: row.status,
+  externalCorrelationId: row.external_correlation_id ?? undefined, resultDigest: row.result_digest ?? undefined,
+  approvedInteractionId: row.approved_interaction_id ?? undefined,
+  result: row.result === null ? undefined : parse(row.result), createdAt: row.started_at, updatedAt: row.updated_at,
+} as DurableToolLedgerUpdate; }
+function reachable(records: SessionEntryRecord[], leaf: string | null): Set<string> {
+  const byId = new Map(records.map((record) => [record.entry.id, record.entry]));
+  const ids = new Set<string>();
+  while (leaf) { const entry = byId.get(leaf); if (!entry || ids.has(leaf)) break; ids.add(leaf); leaf = entry.parentId; }
+  return ids;
+}
+function usage(row: any): AgentRunUsage { return {
+  inputTokens: row.input_tokens, outputTokens: row.output_tokens,
+  cacheReadTokens: row.cache_read_tokens, cacheCreationTokens: row.cache_creation_tokens,
+  costUsd: row.cost_usd === null || row.cost_usd === undefined ? undefined : Number(row.cost_usd),
+}; }
+function affected(result: any): boolean { return Number(result.numUpdatedRows ?? result.numAffectedRows ?? 0) > 0; }
+function parse(value: unknown): any { return typeof value === 'string' ? JSON.parse(value) : value; }
+function toDate(value: Date | string): Date { return value instanceof Date ? value : new Date(value); }
+function asRecord(value: unknown): Record<string, unknown> { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}; }
+function stringValue(value: unknown): string | null { return typeof value === 'string' ? value : null; }
+function conflict(message: string): AgentPlatformError { return new AgentPlatformError({ code: 'RUN_STATE_CONFLICT', message, retryable: false }); }
+function canManageRun(identity: { actorId: string; roles: readonly string[] }, actorId: string): boolean {
+  return identity.actorId === actorId || identity.roles.includes('tenant_admin') || identity.roles.includes('platform_admin');
+}
+function reviveLimits(value: any): any {
+  return value && typeof value === 'object' && value.deadlineAt
+    ? { ...value, deadlineAt: new Date(value.deadlineAt) }
+    : value;
+}

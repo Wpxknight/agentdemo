@@ -265,7 +265,7 @@ describe('runtime sandbox controller', () => {
         templateCount: 3,
       });
       expect(rt.sandboxProfilesFor?.(ordinaryUser)[0]).toEqual(firstProfile);
-      expect(rt.tools.defs().find((tool) => tool.name === 'sbx__run_code')).toBe(firstRunCode);
+      expect(rt.tools.defs().find((tool) => tool.name === 'sbx__run_code')).toEqual(firstRunCode);
 
       fetch.mockResolvedValueOnce(jsonResponse(200, aiosCatalog('two')));
       await expect(rt.refreshSandboxTemplates?.()).resolves.toMatchObject({
@@ -367,7 +367,7 @@ describe('runtime sandbox controller', () => {
     }
   });
 
-  it('persists bootstrap settings once and restores encrypted settings on restart', async () => {
+  it('persists a startup API key only after an explicit retain update', async () => {
     const store = new MemoryStore();
     const box = new SecretBox('runtime-settings-secret', 'platform-settings');
     const bootstrap: Config = {
@@ -388,8 +388,14 @@ describe('runtime sandbox controller', () => {
         apiKeySet: true,
       });
       const stored = await store.getSandboxSettingsRecord({ tenantId: 'default' });
-      expect(stored?.encryptedApiKey).toBeTypeOf('string');
-      expect(JSON.stringify(stored?.settings)).not.toContain('bootstrap-key');
+      expect(stored).toBeUndefined();
+      await first.updateSandbox?.({
+        settings: { enabled: false, mode: 'standard_e2b', domain: 'bootstrap.example.test' },
+        keyAction: { action: 'retain' },
+      });
+      const saved = await store.getSandboxSettingsRecord({ tenantId: 'default' });
+      expect(saved?.encryptedApiKey).toBeTypeOf('string');
+      expect(JSON.stringify(saved?.settings)).not.toContain('bootstrap-key');
     } finally {
       await first.dispose();
     }
@@ -496,7 +502,7 @@ describe('runtime sandbox controller', () => {
 
       store.releaseFirst();
       await Promise.all([enable, disable]);
-      expect(await store.getSandboxSettings({ tenantId: 'default' })).toEqual({ enabled: false, mode: 'local' });
+      expect((await store.getSandboxSettingsRecord({ tenantId: 'default' }))?.settings).toEqual({ enabled: false, mode: 'local' });
       expect(await rt.getSandboxSettings?.()).toMatchObject({
         settings: { enabled: false, mode: 'local' },
         runtime: { enabled: false, status: 'disabled' },
@@ -539,7 +545,7 @@ describe('runtime sandbox controller', () => {
     await updating;
     await late;
     await disposing;
-    expect(await store.getSandboxSettings({ tenantId: 'default' })).toEqual({ enabled: true, mode: 'local' });
+    expect((await store.getSandboxSettingsRecord({ tenantId: 'default' }))?.settings).toEqual({ enabled: true, mode: 'local' });
   });
 
   it('keeps the active resolver and tools when persistence fails', async () => {
@@ -572,7 +578,7 @@ describe('runtime sandbox controller', () => {
         keyAction: { action: 'replace', apiKey: 'candidate-key' },
       })).rejects.toThrow('persistence failed');
 
-      expect(rt.tools.defs().find((tool) => tool.name === 'sbx__run_code')).toBe(runCode);
+      expect(rt.tools.defs().find((tool) => tool.name === 'sbx__run_code')).toEqual(runCode);
       expect(rt.sandboxSettings).toEqual({ enabled: true, mode: 'local' });
       expect(rt.sandboxProfiles?.map((profile) => profile.name)).toEqual(['default']);
       expect(await rt.getSandboxSettings?.()).toMatchObject({

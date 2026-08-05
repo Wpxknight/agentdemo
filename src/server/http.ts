@@ -1,21 +1,16 @@
 import http from 'node:http';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { chmod, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { basename, join } from 'node:path';
 import { SignJWT, jwtVerify } from 'jose';
 import { logger } from '../logger.js';
 import type { Runtime, RuntimeModelConfig } from '../runtime.js';
-import { COMPACTION_RETRY_GROWTH_TOKENS } from '../agent/core.js';
-import { resolveAgentRuntime } from '../agent/runtime.js';
-import {
-  DEFAULT_CONTEXT_WINDOW_TOKENS,
-  contextBudgetTokens as budgetForWindow,
-  renderForSummary,
-} from '../agent/context.js';
-import type { ChatModel, ToolContentBlock } from '../model/types.js';
-import { InMemoryApprovalStore, InteractiveApprovalGate } from '../agent/approval.js';
+import { piSessionStorageId } from '@aiop/pi-runtime';
+const DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000;
+import type { ToolContentBlock } from '../llm/types.js';
+import { InMemoryApprovalStore } from '../agent/approval.js';
 import { InMemoryQuestionStore } from '../agent/question.js';
-import type { QuestionAnswers, QuestionSpec } from '../agent/question.js';
+import type { QuestionAnswers } from '../agent/question.js';
 import { authenticate } from './context.js';
 import { AuthzError, canManageUsersOf, requirePermission } from '../auth/rbac.js';
 import { LocalAuthProvider } from '../auth/local.js';
@@ -25,29 +20,30 @@ import { softDeleteUser, setUserEnabled } from '../auth/lifecycle.js';
 import { createTenant, createUser, listTenants } from '../auth/admin.js';
 import type { RequestContext, Role } from '../auth/types.js';
 import { DEFAULT_TASK_MAX_RUN_MS, type SandboxSettings, type ScheduledTaskPatch } from '../db/store.js';
-import { boundUserHomeNote, normalizeUserHomeDir } from '../sandbox/userhome.js';
-import { SANDBOX_SERVICE_NOTE } from '../sandbox/notes.js';
+import { normalizeUserHomeDir } from '@aiop/sandbox-runtime';
 import { isValidCron } from '../scheduler/cron.js';
 import { createScheduledTaskRunner } from '../scheduler/runner.js';
-import { createModel } from '../model/factory.js';
-import { estimateCost } from '../model/cost.js';
-import type { JsonValue, Msg, ToolCall } from '../model/types.js';
-import { importSkillZip } from '../skill/import.js';
-import type { Skill, SkillRegistry } from '../skill/registry.js';
+import { createModel } from '../llm/factory.js';
+import type { JsonValue, Msg, ToolCall } from '../llm/types.js';
+import { importSkillZip, MAX_SKILL_ZIP_BYTES } from '../skill/import.js';
+import { SKILL_IMPORT_GLOBAL_CONCURRENCY, SKILL_IMPORT_TENANT_CONCURRENCY } from '../skill/lock.js';
+import type { Skill, SkillProductRecord, SkillRegistry } from '../skill/registry.js';
 import { McpServerSchema } from '../config/schema.js';
 import {
   parseSandboxSettings,
   type SandboxApiKeyUpdate,
-} from '../sandbox/settings.js';
-import { SessionCommitter } from '../agent/services/session-committer.js';
-import { DurableToolLedger } from '../agent/tool-ledger/store.js';
+} from '@aiop/sandbox-runtime';
+import { projectCommittedPiSession, projectPiSessionStats, projectPiUsage } from '../agent/projections.js';
 import { DurableInteractionService } from '../agent/interactions/store.js';
 import {
   RunCenterConflictError,
   RunCenterNotFoundError,
   RunCenterService,
 } from '../agent/run-center.js';
-import type { AgentRunRecord, AgentRunStatus } from '../db/store.js';
+import type { AgentRunRecord, AgentRunStatus, SessionContextUsage } from '../db/store.js';
+import type { AgentRunResult, IdentityContext, RunHandle } from '@aiop/control-contracts';
+import { createAIOPToolRuntime } from '../tools/governance.js';
+import { ResourceConcurrencyController } from '@aiop/pi-runtime';
 
 const log = logger.child({ mod: 'http' });
 
@@ -57,8 +53,6 @@ type ActiveAgentRun = {
   tenantId: string;
   runId: string;
   abort: AbortController;
-  append: (message: Msg) => void;
-  drain: () => Msg[];
 };
 type ActiveAgentRuns = Map<string, Set<ActiveAgentRun>>;
 /** 无效压缩水位（tenant+session → token 数）：摘要后仍超触发线时记录，历史没涨够前跳过重试。 */
@@ -68,15 +62,134 @@ const OIDC_COOKIE = 'aiop_oidc';
 /** 手动“立即执行”的任务 id 去重（本进程内），防止连点重复触发。 */
 const runningManualTasks = new Set<number>();
 const RUN_TERMINATED_MESSAGE = '会话运行已终止';
-const GOAL_MODE_SYSTEM = [
-  '目标模式：用户通过 /goal 授权你自主推进目标任务，直到目标完成、遇到阻塞或需要用户决策。',
-  '在目标模式下，低风险、可逆、只读或纯新增的辅助步骤可直接执行，不要为普通中间步骤反复请求确认。',
-  '涉及不可逆、高风险、破坏性、删除、修改现有系统状态、生产变更、凭据暴露或费用明显增加的操作，仍必须先询问用户并等待明确确认。',
-  '持续记录关键行动和验证结果；完成后用简洁 Markdown 汇报目标是否达成、执行过的关键步骤和遗留风险。',
-].join('\n');
+/** 10MB zip 的 base64 加 JSON 包装；该路由不继承通用大请求攻击面。 */
+const SKILL_IMPORT_MAX_BODY = Math.ceil(MAX_SKILL_ZIP_BYTES * 4 / 3) + 64_000;
 
-/** 技能 zip 以 base64 JSON 上传：44MB 的包编码后约 60MB，导入接口单独放宽到 128MB。 */
-const SKILL_IMPORT_MAX_BODY = 128_000_000;
+async function acquireSkillImport(registry: SkillRegistry, tenantId: string): Promise<() => Promise<void>> {
+  const distributed = await registry.acquireImportPermit(
+    tenantId,
+    SKILL_IMPORT_GLOBAL_CONCURRENCY,
+    SKILL_IMPORT_TENANT_CONCURRENCY,
+  );
+  if (distributed.supported) {
+    if (!distributed.release) {
+      throw new HttpError(429, '技能导入并发已达上限，请稍后重试');
+    }
+    return distributed.release;
+  }
+  const permitRoot = join(registry.importStagingRoot(), '.concurrency');
+  const token = randomUUID();
+  const globalSlot = await acquireImportSlot(join(permitRoot, 'global'), SKILL_IMPORT_GLOBAL_CONCURRENCY, token);
+  if (!globalSlot) throw new HttpError(429, '技能导入并发已达上限，请稍后重试');
+  const tenantKey = createHash('sha256').update(tenantId).digest('hex');
+  const tenantSlot = await acquireImportSlot(
+    join(permitRoot, `tenant-${tenantKey}`),
+    SKILL_IMPORT_TENANT_CONCURRENCY,
+    token,
+  );
+  if (!tenantSlot) {
+    await releaseImportSlot(globalSlot, token);
+    throw new HttpError(429, '技能导入并发已达上限，请稍后重试');
+  }
+  let released = false;
+  return async () => {
+    if (released) return;
+    released = true;
+    await Promise.all([
+      releaseImportSlot(tenantSlot, token),
+      releaseImportSlot(globalSlot, token),
+    ]);
+  };
+}
+
+async function acquireImportSlot(root: string, limit: number, token: string): Promise<string | undefined> {
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  for (let index = 0; index < limit; index += 1) {
+    const slot = join(root, String(index));
+    const candidate = `${slot}.candidate-${token}`;
+    try {
+      const ownerDir = join(candidate, token);
+      await mkdir(ownerDir, { recursive: true });
+      await writeImportSlotOwner(ownerDir, token);
+      await rename(candidate, slot);
+      return slot;
+    } catch (error) {
+      await rm(candidate, { recursive: true, force: true });
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'EEXIST' && code !== 'ENOTEMPTY') {
+        throw error;
+      }
+      if (await recoverOrphanedImportSlot(slot)) index -= 1;
+    }
+  }
+  return undefined;
+}
+
+async function writeImportSlotOwner(ownerDir: string, token: string): Promise<void> {
+  const temp = join(ownerDir, `.owner-${token}.tmp`);
+  await writeFile(temp, `${JSON.stringify({ token })}\n`, { flag: 'w' });
+  await rename(temp, join(ownerDir, 'owner.json'));
+}
+
+async function readImportSlotOwner(ownerDir: string): Promise<{ token: string } | undefined> {
+  try {
+    const value = JSON.parse(await readFile(join(ownerDir, 'owner.json'), 'utf8')) as Record<string, unknown>;
+    if (typeof value.token !== 'string') return undefined;
+    return { token: value.token };
+  } catch {
+    return undefined;
+  }
+}
+
+async function readCurrentImportSlotOwner(
+  slot: string,
+): Promise<{ ownerDir: string; owner: { token: string } } | undefined> {
+  let entries;
+  try {
+    entries = await readdir(slot, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+    const ownerDir = join(slot, entry.name);
+    const owner = await readImportSlotOwner(ownerDir);
+    if (owner?.token === entry.name) return { ownerDir, owner };
+  }
+  return undefined;
+}
+
+async function recoverOrphanedImportSlot(slot: string): Promise<boolean> {
+  const current = await readCurrentImportSlotOwner(slot);
+  // Active permits are deliberately fail-closed: without a connection-scoped
+  // authority we never expire another process's live generation by wall clock.
+  if (current) return false;
+  const retired = `${slot}.expired-${randomUUID()}`;
+  try {
+    await rename(slot, retired);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw error;
+  }
+  await rm(retired, { recursive: true, force: true });
+  return true;
+}
+
+async function releaseImportSlot(slot: string, token: string): Promise<void> {
+  const ownerDir = join(slot, token);
+  const releaseEntry = join(slot, `.released-${token}`);
+  try {
+    await rename(ownerDir, releaseEntry);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if ((await readImportSlotOwner(releaseEntry))?.token !== token) {
+    await rename(releaseEntry, ownerDir).catch(() => undefined);
+    return;
+  }
+  await rm(releaseEntry, { recursive: true, force: true });
+}
 
 /** 读取并解析 JSON 请求体（默认限制 8MB，支持聊天附件以 base64 形式上传）。 */
 async function readJson(req: Req, maxSize = 8_000_000): Promise<Record<string, unknown>> {
@@ -121,7 +234,11 @@ async function sendWebAsset(res: Res, path: string, frameAncestors?: string[]): 
   }
   const cleanPath = decodeURIComponent(path).replace(/^\/+/, '');
   if (cleanPath.includes('..')) return false;
-  const isSpaRoute = path === '/' || path === '/index.html' || path === '/login';
+  const spaRoutes = new Set([
+    '/', '/index.html', '/login', '/chat', '/runs', '/skills', '/mcp',
+    '/schedule', '/sandbox', '/users', '/settings',
+  ]);
+  const isSpaRoute = spaRoutes.has(path.replace(/\/+$/, '') || '/');
   const assetPath = isSpaRoute ? 'index.html' : cleanPath;
   if (!isSpaRoute && !assetPath.startsWith('assets/')) return false;
   const buf = await readWebFile(`dist/${assetPath}`).catch(() => undefined);
@@ -168,7 +285,7 @@ function parseCookies(header: string | undefined): Record<string, string> {
 
 /** 业务错误：携带 HTTP 状态码。 */
 class HttpError extends Error {
-  constructor(public status: number, message: string) {
+  constructor(public status: number, message: string, readonly body?: Record<string, unknown>) {
     super(message);
   }
 }
@@ -213,6 +330,7 @@ function publicModelConfig(config: RuntimeModelConfig): Record<string, unknown> 
     api_key: config.apiKey,
     api_key_set: Boolean(config.apiKey),
     api_key_preview: maskApiKey(config.apiKey),
+    allow_insecure_tls: Boolean(config.allowInsecureTls),
     context_window_tokens: contextWindowTokens(config),
     context_keep_images: keepImagesOf(config),
     effort: config.effort,
@@ -385,6 +503,8 @@ function modelConfigFromBody(
     'api_key',
     'apiKey',
     'model',
+    'allow_insecure_tls',
+    'allowInsecureTls',
     'context_window_tokens',
     'contextWindowTokens',
     'context_keep_images',
@@ -411,10 +531,18 @@ function modelConfigFromBody(
     baseURL,
     apiKey,
     model,
+    allowInsecureTls: parseAllowInsecureTls(body, base.allowInsecureTls),
     contextWindowTokens: parseContextWindowTokens(body, base.contextWindowTokens),
     contextKeepImages: parseContextKeepImages(body, base.contextKeepImages),
     effort: parseEffort(str(body, 'effort'), base.effort),
   };
+}
+
+function parseAllowInsecureTls(body: Record<string, unknown>, current: boolean | undefined): boolean | undefined {
+  const value = body.allow_insecure_tls ?? body.allowInsecureTls;
+  if (value === undefined) return current;
+  if (typeof value !== 'boolean') throw new HttpError(400, 'allow_insecure_tls 必须是 boolean');
+  return value;
 }
 
 function parseContextKeepImages(body: Record<string, unknown>, current: number | undefined): number | undefined {
@@ -445,45 +573,9 @@ function contextWindowTokens(config?: Pick<RuntimeModelConfig, 'contextWindowTok
   return config?.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
 }
 
-/** 发送给模型前压缩历史的 token 预算 = 上下文窗口 − 输出预留 − 安全余量。 */
-function contextBudgetTokens(config?: Pick<RuntimeModelConfig, 'contextWindowTokens'>): number {
-  return budgetForWindow(contextWindowTokens(config));
-}
-
-/** 触发摘要压缩的阈值：历史 token 超过预算的这个比例时，把最旧的消息摘要成一段。 */
-const COMPACTION_TRIGGER_RATIO = 0.85;
-/** 摘要压缩时保留原样的最近消息条数（更早的进摘要）。 */
-const COMPACTION_KEEP_RECENT = 8;
-
-/** 触发摘要压缩的 token 阈值（runAgent 在轮次边界按此检查，含首轮）。 */
-function compactionTriggerTokens(config?: Pick<RuntimeModelConfig, 'contextWindowTokens'>): number {
-  return Math.floor(contextBudgetTokens(config) * COMPACTION_TRIGGER_RATIO);
-}
-
 /** 历史里保留图片的最近带图消息条数（配置可调，默认 1）。 */
 function keepImagesOf(config?: Pick<RuntimeModelConfig, 'contextKeepImages'>): number {
   return config?.contextKeepImages ?? 1;
-}
-
-const SUMMARY_SYSTEM = [
-  '你是对话历史压缩器。把给定的较早对话浓缩成一段简洁摘要，供后续对话继续参考。',
-  '必须保留：用户目标与关键决策、已执行的操作与结论、涉及的资源/文件/命令、尚未完成的事项与已知报错。',
-  '不要编造；不要复述寒暄；用中文，尽量紧凑。',
-].join('\n');
-
-/** 用模型把一段较早的消息摘要成纯文本（图片/超长结果已在渲染时裁剪，避免摘要请求本身超窗）。 */
-async function summarizeMessages(model: ChatModel, stale: Msg[], signal?: AbortSignal): Promise<string> {
-  let text = '';
-  for await (const ev of model.stream({
-    system: SUMMARY_SYSTEM,
-    messages: [{ role: 'user', text: `请压缩以下对话历史：\n\n${renderForSummary(stale)}` }],
-    tools: [],
-    maxTokens: 2000,
-    signal,
-  })) {
-    if (ev.type === 'text_delta') text += ev.text;
-  }
-  return text.trim();
 }
 
 function sessionIdFromBody(body: Record<string, unknown>): string {
@@ -566,13 +658,6 @@ function userMessageFromBody(body: Record<string, unknown>): Msg {
   return { role: 'user', text: userTextFromBody(body), contentBlocks: blocks.length ? blocks : undefined };
 }
 
-function parseGoalTask(text: string): { goalMode: boolean; task: string } {
-  const match = /^\/goal(?:\s+|$)([\s\S]*)$/i.exec(text.trim());
-  if (!match) return { goalMode: false, task: text };
-  const task = match[1]?.trim() || '请自主完成这个目标任务。';
-  return { goalMode: true, task };
-}
-
 function browserStreamView(sessionId: string): string {
   const sid = JSON.stringify(sessionId);
   return `<!doctype html>
@@ -631,9 +716,51 @@ async function dispatchDirectTool(
   name: string,
   args: JsonValue,
 ): Promise<Record<string, unknown>> {
-  if (!rt.tools.has(name)) throw new HttpError(409, `工具未启用：${name}`);
   const call: ToolCall = { id: randomUUID(), name, args };
   const toolCtx = { sessionId, tenantId: ctx.tenantId, userId: ctx.userId, role: ctx.role };
+  if (name.startsWith('mcp__') && rt.mcp) {
+    const identity = mcpIdentity(ctx);
+    const definition = (await rt.mcp.tools(identity)).find((tool) => tool.name === name);
+    if (!definition) throw new HttpError(409, `工具未启用：${name}`);
+    const logicalCallId = call.id;
+    const outcome = await createAIOPToolRuntime({
+      tools: rt.tools,
+      governedTools: [definition],
+      policy: rt.policy,
+      ctx: toolCtx,
+    }, rt.store.durableRunStore().toolLedger,
+    rt.toolConcurrency ?? new ResourceConcurrencyController(), undefined, true).execute({
+      id: call.id,
+      logicalCallId,
+      name,
+      arguments: args,
+    }, {
+      identity,
+      runId: `direct:${sessionId}`,
+      attemptId: call.id,
+      turnNo: 1,
+      sessionId,
+    });
+    if (outcome.kind === 'recovery_required') {
+      throw new HttpError(409, outcome.message, {
+        error: outcome.message,
+        recoveryRequired: true,
+        correlationId: outcome.correlationId,
+      });
+    }
+    if (outcome.kind === 'waiting') {
+      throw new HttpError(409, `工具等待${outcome.reason}`, {
+        error: `工具等待${outcome.reason}`,
+        interactionId: outcome.interactionId,
+      });
+    }
+    if (outcome.result.isError) {
+      const denied = outcome.result.content.startsWith('blocked by policy:');
+      throw new HttpError(denied ? 403 : 409, outcome.result.content);
+    }
+    return { ok: true, sessionId, result: { id: call.id, content: outcome.result.content } };
+  }
+  if (!rt.tools.has(name)) throw new HttpError(409, `工具未启用：${name}`);
   const decision = await rt.policy.check(call, toolCtx);
   if (decision.blocked) throw new HttpError(403, decision.reason ?? '策略阻止了该操作');
   if (decision.needApproval) throw new HttpError(409, decision.reason ?? '该操作需要审批，无法直接执行');
@@ -641,22 +768,20 @@ async function dispatchDirectTool(
   return { ok: !result.isError, sessionId, result };
 }
 
-/** MCP server 增删/重连后，把注册表里的 mcp__ 工具与 manager 当前状态对齐。 */
-function syncMcpTools(rt: Runtime): void {
-  if (!rt.mcp) return;
-  for (const def of rt.tools.defs()) {
-    if (def.name.startsWith('mcp__')) rt.tools.unregister(def.name);
-  }
-  for (const t of rt.mcp.tools()) rt.tools.register(t);
+function mcpIdentity(ctx: RequestContext): IdentityContext {
+  return { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] };
 }
 
-/** 持久化当前 MCP server 配置（平台级，落 default 租户设置；失败仅记日志不阻塞请求）。 */
-async function persistMcpServers(rt: Runtime): Promise<void> {
+/** 持久化当前请求租户的 MCP server 配置；失败仅记日志不阻塞请求。 */
+async function persistMcpServers(rt: Runtime, identity: IdentityContext): Promise<void> {
   if (!rt.mcp) return;
   try {
-    await rt.store.setMcpServers({ tenantId: rt.defaultContext.tenantId }, rt.mcp.configs());
+    await rt.store.setMcpServers(
+      { tenantId: identity.tenantId },
+      await rt.mcp.configs(identity),
+    );
   } catch (err) {
-    log.error({ err: String(err) }, 'MCP 配置持久化失败');
+    log.error({ err: String(err), tenantId: identity.tenantId }, 'MCP 配置持久化失败');
   }
 }
 
@@ -703,19 +828,16 @@ export function createHttpServer(rt: Runtime): http.Server {
   const questions = new InMemoryQuestionStore();
   const interactions = new DurableInteractionService(rt.store);
   const activeRuns: ActiveAgentRuns = new Map();
-  const compactionWatermarks: CompactionWatermarks = new Map();
   const runCenter = new RunCenterService(rt.store, {
     abortLocal: (ctx, runId) => abortActiveRunById(activeRuns, ctx.tenantId, runId),
     recover: (ctx, run) => {
-      void recoverAgentRun(rt, interactions, activeRuns, compactionWatermarks, ctx, run).catch((err) => {
-        log.error({ err, runId: run.runId }, 'Agent Run checkpoint 恢复失败');
-      });
+      void superviseDurableRecovery(rt, ctx, run.runId);
     },
   });
 
   return http.createServer((req, res) => {
-    handle(rt, secret, approvals, questions, interactions, runCenter, activeRuns, compactionWatermarks, req, res).catch((err) => {
-      if (err instanceof HttpError) return sendJson(res, err.status, { error: err.message });
+    handle(rt, secret, approvals, questions, interactions, runCenter, activeRuns, new Map(), req, res).catch((err) => {
+      if (err instanceof HttpError) return sendJson(res, err.status, err.body ?? { error: err.message });
       if (err instanceof RunCenterNotFoundError) return sendJson(res, 404, { error: err.message });
       if (err instanceof RunCenterConflictError) return sendJson(res, 409, { error: err.message });
       if (err instanceof AuthzError) return sendJson(res, 403, { error: err.message });
@@ -724,6 +846,101 @@ export function createHttpServer(rt: Runtime): http.Server {
       else res.end();
     });
   });
+}
+
+async function superviseDurableRecovery(
+  rt: Runtime,
+  ctx: RequestContext,
+  runId: string,
+  resolution?: { interactionId: string; value: JsonValue },
+): Promise<void> {
+  const identity = { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] };
+  let expectedLease: { ownerId: string; token: bigint } | undefined;
+  let handle: RunHandle | undefined;
+  let drainEvents: Promise<void> | undefined;
+  let resultObserved = false;
+  try {
+    await bestEffortAppendRecoveryEvent(rt, ctx, runId, 'started');
+    handle = await rt.durableRunRuntime.resume({
+      identity,
+      runId,
+      ...(resolution ? { resolution } : {}),
+    });
+    drainEvents = (async () => {
+      for await (const _event of handle!.events) {
+        // Recovery is detached from an HTTP response, but its event stream still needs a consumer.
+      }
+    })();
+    const attempt = await handle.attempt();
+    expectedLease = { ownerId: attempt.workerId, token: attempt.fencingToken };
+    await drainEvents;
+    resultObserved = true;
+    const result = await handle.result();
+    if (result.status === 'succeeded' || result.status === 'waiting') {
+      await bestEffortAppendRecoveryEvent(rt, ctx, runId, 'succeeded', { status: result.status });
+      return;
+    }
+    await persistRecoveryFailure(rt, ctx, runId, result.error?.message ?? `Recovery ended with ${result.status}`, expectedLease);
+  } catch (err) {
+    await drainEvents?.catch(() => {});
+    if (!resultObserved) await handle?.result().catch(() => {});
+    if (expectedLease) {
+      await persistRecoveryFailure(rt, ctx, runId, safeRecoveryError(err), expectedLease).catch((persistError) => {
+        log.error({ error: safeRecoveryError(persistError), runId }, 'durable recovery failure persistence failed');
+      });
+    } else {
+      await bestEffortAppendRecoveryEvent(rt, ctx, runId, 'failed', { error: safeRecoveryError(err) });
+    }
+    log.error({ error: safeRecoveryError(err), runId }, 'durable run recovery failed');
+  }
+}
+
+async function bestEffortAppendRecoveryEvent(
+  rt: Runtime,
+  ctx: RequestContext,
+  runId: string,
+  status: 'started' | 'succeeded' | 'failed',
+  detail?: Record<string, unknown>,
+): Promise<void> {
+  await appendRecoveryEvent(rt, ctx, runId, status, detail).catch((error) => {
+    log.warn({ error: safeRecoveryError(error), runId, status }, 'durable recovery event persistence failed');
+  });
+}
+
+async function appendRecoveryEvent(
+  rt: Runtime,
+  ctx: RequestContext,
+  runId: string,
+  status: 'started' | 'succeeded' | 'failed',
+  detail?: Record<string, unknown>,
+): Promise<void> {
+  await rt.store.appendAgentRunEvent({
+    tenantId: ctx.tenantId, runId, type: 'recovery', status,
+    detail: { ...detail, actorId: ctx.userId }, createdAt: new Date(),
+  });
+}
+
+async function persistRecoveryFailure(
+  rt: Runtime,
+  ctx: RequestContext,
+  runId: string,
+  error: string,
+  expectedLease: { ownerId: string; token: bigint },
+): Promise<void> {
+  const message = safeRecoveryError(error);
+  const failedAt = new Date();
+  const identity = { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] };
+  await rt.store.durableRunStore().markRecoveryRequired({
+    identity, runId, errorMessage: message, failedAt, expectedLease,
+  });
+  await bestEffortAppendRecoveryEvent(rt, ctx, runId, 'failed', { error: message });
+}
+
+function safeRecoveryError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error ?? 'Recovery failed');
+  return raw
+    .replace(/(api[-_ ]?key|authorization|password|secret[-_ ]?token|token)\s*[:=]?\s*\S+/gi, '[redacted]')
+    .slice(0, 1_024);
 }
 
 async function handle(
@@ -846,7 +1063,7 @@ async function handle(
   }
 
   // —— 以下均需认证 ——
-  if (route === 'POST /v1/agent') return runAgentSse(rt, approvals, questions, interactions, activeRuns, compactionWatermarks, req, res);
+  if (route === 'POST /v1/agent') return runDurableAgentSse(rt, activeRuns, req, res);
 
   if (route === 'GET /v1/agent/runs') {
     const ctx = await requireAuth(rt, req);
@@ -863,6 +1080,25 @@ async function handle(
     }));
   }
 
+  const runEventsMatch = /^\/v1\/agent\/runs\/([^/]+)\/events$/.exec(path);
+  if (method === 'GET' && runEventsMatch) {
+    const ctx = await requireAuth(rt, req);
+    const header = Array.isArray(req.headers['last-event-id'])
+      ? req.headers['last-event-id'][0]
+      : req.headers['last-event-id'];
+    const after = intParam(url.searchParams.get('after') ?? header ?? null, 0, 0, Number.MAX_SAFE_INTEGER);
+    const events = await runCenter.events(ctx, decodeURIComponent(runEventsMatch[1]!), after);
+    if (!events) throw new RunCenterNotFoundError();
+    res.statusCode = 200;
+    res.setHeader('content-type', 'text/event-stream; charset=utf-8');
+    res.setHeader('cache-control', 'no-cache');
+    for (const event of events) {
+      res.write(`id: ${event.sequence ?? 0}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    }
+    res.end();
+    return;
+  }
+
   const runDetailMatch = /^\/v1\/agent\/runs\/([^/]+)$/.exec(path);
   if (method === 'GET' && runDetailMatch) {
     const ctx = await requireAuth(rt, req);
@@ -874,9 +1110,14 @@ async function handle(
   const runCancelMatch = /^\/v1\/agent\/runs\/([^/]+)\/cancel$/.exec(path);
   if (method === 'POST' && runCancelMatch) {
     const ctx = await requireAuth(rt, req);
+    const runId = decodeURIComponent(runCancelMatch[1]!);
+    const result = await runCenter.cancel(ctx, runId);
+    await rt.durableRunRuntime.cancel({
+      identity: { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] }, runId,
+    });
     return sendJson(res, 200, {
       ok: true,
-      ...await runCenter.cancel(ctx, decodeURIComponent(runCancelMatch[1]!)),
+      ...result,
     });
   }
 
@@ -969,6 +1210,7 @@ async function handle(
 
   if (route === 'GET /v1/tools') {
     const ctx = await requireAuth(rt, req);
+    const mcpTools = rt.mcp ? await rt.mcp.tools(mcpIdentity(ctx)) : [];
     const tools = [
       ...rt.tools.defs()
         .filter((def) => !(rt.skillRegistry && (def.name === 'load_skill' || def.name.startsWith('skill__'))))
@@ -978,8 +1220,16 @@ async function handle(
           category: toolCategory(def.name),
           inputSchema: def.inputSchema,
         })),
+      ...mcpTools.map((def) => ({
+        name: def.name,
+        description: def.description,
+        category: toolCategory(def.name),
+        inputSchema: def.inputSchema,
+      })),
       // 技能按查看者过滤：public ∪ 自己的 ∪ shared（服务端过滤，不信前端）。
-      ...(rt.skillRegistry?.listFor(ctx).map((skill) => publicSkill(skill, rt.skillRegistry!, ctx)) ?? []),
+      ...(rt.skillRegistry
+        ? (await rt.skillRegistry.listLoadedFor(ctx)).map((skill) => publicSkill(skill, rt.skillRegistry!, ctx))
+        : []),
     ];
     const groups = tools.reduce<Record<string, number>>((acc, tool) => {
       const category = typeof tool.category === 'string' ? tool.category : 'builtin';
@@ -990,30 +1240,82 @@ async function handle(
   }
 
   if (route === 'POST /v1/skills/import') {
-    // 上传放开给所有登录用户：管理员 → _public（全员可见）；普通用户 → users/<uid>（默认私有）。
+    // 上传放开给所有登录用户，但统一落 tenant/users/<uid>，并由服务端写入待审核私有元数据。
     const ctx = await requireAuth(rt, req);
     if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
-    const body = await readJson(req, SKILL_IMPORT_MAX_BODY);
-    const filename = str(body, 'filename');
-    const data = str(body, 'data');
-    if (!filename || !data) throw new HttpError(400, 'filename/data 必填');
-    if (!/\.zip$/i.test(filename)) throw new HttpError(400, '仅支持导入 zip 技能包');
+    const releaseImport = await acquireSkillImport(rt.skillRegistry, ctx.tenantId);
+    try {
+      const body = await readJson(req, SKILL_IMPORT_MAX_BODY);
+      const filename = str(body, 'filename');
+      const data = str(body, 'data');
+      if (!filename || !data) throw new HttpError(400, 'filename/data 必填');
+      if (!/\.zip$/i.test(filename)) throw new HttpError(400, '仅支持导入 zip 技能包');
 
-    const imported = await importSkillZip({
-      rootDir: rt.skillRegistry.importRootFor(ctx),
-      filename,
-      data: decodeSkillImportData(data),
-    });
-    await rt.skillRegistry.setOwner(imported.skillDir, ctx.userId);
-    await rt.skillRegistry.scan();
-    rt.systemExtra = rt.skillRegistry.summaries();
-    const skill = rt.skillRegistry.list().find((item) => resolve(item.dir) === resolve(imported.skillDir));
-    if (!skill) throw new HttpError(422, '导入后未发现有效技能');
-    await rt.audit?.record({
-      kind: 'auth', action: 'skill-imported', tenantId: ctx.tenantId,
-      detail: { skill: skill.name, by: ctx.userId, visibility: skill.visibility },
-    });
-    return sendJson(res, 201, { skill: publicSkill(skill, rt.skillRegistry, ctx) });
+      const stagingBase = rt.skillRegistry.importStagingRoot();
+      await mkdir(stagingBase, { recursive: true, mode: 0o750 });
+      await chmod(stagingBase, 0o750);
+      const stagingRoot = join(stagingBase, randomUUID());
+      const uploadRoot = rt.skillRegistry.uploadRootFor(ctx);
+      let imported: Awaited<ReturnType<typeof importSkillZip>>;
+      try {
+        imported = await importSkillZip({
+          rootDir: stagingRoot,
+          filename,
+          data: decodeSkillImportData(data),
+        });
+      } catch (error) {
+        await rm(stagingRoot, { recursive: true, force: true });
+        throw skillArchiveHttpError(error);
+      }
+      const destinationDir = join(uploadRoot, basename(imported.skillDir));
+      let product: SkillProductRecord;
+      try {
+        product = await rt.skillRegistry.installUploadedProduct(imported.skillDir, ctx, { destinationDir });
+      } catch (error) {
+        await rm(imported.skillDir, { recursive: true, force: true });
+        await rt.skillRegistry.scan();
+        throw skillHttpError(error);
+      } finally {
+        await rm(stagingRoot, { recursive: true, force: true });
+      }
+      await rt.audit?.record({
+        kind: 'auth', action: 'skill-imported', tenantId: ctx.tenantId,
+        detail: { skill: product.name, by: ctx.userId, visibility: product.visibility, pendingReview: true },
+      });
+      const { id: _id, path: _path, description: _description, ...publicProduct } = product;
+      return sendJson(res, 201, { product: publicProduct, pendingReview: true });
+    } finally {
+      await releaseImport().catch((error) => {
+        log.warn({ err: String(error) }, 'skill import permit release failed');
+      });
+    }
+  }
+
+  const skillReviewMatch = /^\/v1\/skills\/([^/]+)\/review$/.exec(path);
+  if (method === 'POST' && skillReviewMatch) {
+    const ctx = await requireAuth(rt, req);
+    if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
+    if (ctx.role !== 'tenant_admin' && ctx.role !== 'platform_admin') {
+      throw new HttpError(403, '仅租户或平台管理员可审核技能');
+    }
+    const body = await readJson(req);
+    if (body.reviewed !== true) throw new HttpError(400, 'reviewed 必须为 true');
+    const global = body.global === true;
+    if (global && ctx.role !== 'platform_admin') throw new HttpError(403, '仅平台管理员可全局发布技能');
+    const name = decodeURIComponent(skillReviewMatch[1]!);
+    try {
+      const product = await rt.skillRegistry.review(name, ctx, { global });
+      await rt.audit?.record({
+        kind: 'auth', action: 'skill-reviewed', tenantId: ctx.tenantId,
+        detail: { skill: product.name, by: ctx.userId, global },
+      }).catch((error) => {
+        log.error({ skill: product.name, err: String(error) }, 'published skill audit write failed after commit');
+      });
+      const { id: _id, path: _path, description: _description, ...publicProduct } = product;
+      return sendJson(res, 200, { product: publicProduct });
+    } catch (error) {
+      throw skillHttpError(error);
+    }
   }
 
   // 共享 / 取消共享：仅所有者（private ↔ shared；对应前端"共享"按钮）。
@@ -1022,10 +1324,9 @@ async function handle(
     const ctx = await requireAuth(rt, req);
     if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
     const name = decodeURIComponent(skillShareMatch[1]!);
-    const skill = requireManagedSkill(rt, ctx, name);
+    const skill = await requireManagedSkill(rt, ctx, name);
     try {
-      const updated = await rt.skillRegistry.setShared(skill.name, skillShareMatch[2] === 'share');
-      rt.systemExtra = rt.skillRegistry.summaries();
+      const updated = await rt.skillRegistry.setShared(skill.name, skillShareMatch[2] === 'share', ctx);
       await rt.audit?.record({
         kind: 'auth', action: skillShareMatch[2] === 'share' ? 'skill-shared' : 'skill-unshared',
         tenantId: ctx.tenantId, detail: { skill: skill.name, by: ctx.userId },
@@ -1042,10 +1343,10 @@ async function handle(
     if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
     const name = decodeURIComponent(skillFilesMatch[1]!);
     // 可见性检查：越权技能等同不存在（404，不泄露存在性）。
-    if (!rt.skillRegistry.getFor(name, ctx)) throw new HttpError(404, `未找到技能 ${name}`);
+    if (!await rt.skillRegistry.getForFresh(name, ctx)) throw new HttpError(404, `未找到技能 ${name}`);
     const requestedPath = url.searchParams.get('path') ?? '';
     try {
-      const entries = await rt.skillRegistry.listDir(name, requestedPath);
+      const entries = await rt.skillRegistry.listDir(name, requestedPath, ctx);
       return sendJson(res, 200, {
         path: requestedPath,
         parentPath: requestedPath ? parentSkillPath(requestedPath) : null,
@@ -1054,7 +1355,7 @@ async function handle(
     } catch (err) {
       if (String(err).includes('不是目录')) {
         try {
-          return sendJson(res, 200, await rt.skillRegistry.readFile(name, requestedPath));
+          return sendJson(res, 200, await rt.skillRegistry.readFile(name, requestedPath, ctx));
         } catch (readErr) {
           throw skillHttpError(readErr);
         }
@@ -1068,11 +1369,10 @@ async function handle(
     const ctx = await requireAuth(rt, req);
     if (!rt.skillRegistry) throw new HttpError(409, '未启用技能目录');
     const name = decodeURIComponent(skillActionMatch[1]!);
-    const managed = requireManagedSkill(rt, ctx, name);
+    const managed = await requireManagedSkill(rt, ctx, name, true);
     const enabled = skillActionMatch[2] === 'enable';
     try {
-      const skill = await rt.skillRegistry.setEnabled(managed.name, enabled);
-      rt.systemExtra = rt.skillRegistry.summaries();
+      const skill = await rt.skillRegistry.setEnabled(managed.name, enabled, ctx);
       return sendJson(res, 200, { skill: publicSkill(skill, rt.skillRegistry, ctx) });
     } catch (err) {
       throw skillHttpError(err);
@@ -1086,10 +1386,9 @@ async function handle(
     const body = await readJson(req);
     if (body.confirm !== true) throw new HttpError(400, '删除技能需要 confirm=true');
     const name = decodeURIComponent(skillDeleteMatch[1]!);
-    const managed = requireManagedSkill(rt, ctx, name);
+    const managed = await requireManagedSkill(rt, ctx, name);
     try {
-      await rt.skillRegistry.delete(managed.name);
-      rt.systemExtra = rt.skillRegistry.summaries();
+      await rt.skillRegistry.delete(managed.name, ctx);
       await rt.audit?.record({
         kind: 'auth', action: 'skill-deleted', tenantId: ctx.tenantId,
         detail: { skill: managed.name, by: ctx.userId },
@@ -1102,9 +1401,9 @@ async function handle(
 
   // —— MCP server 管理 ——
   if (route === 'GET /v1/mcp/servers') {
-    await requireAuth(rt, req);
+    const ctx = await requireAuth(rt, req);
     if (!rt.mcp) throw new HttpError(409, '未启用 MCP');
-    return sendJson(res, 200, { servers: rt.mcp.list() });
+    return sendJson(res, 200, { servers: await rt.mcp.list(mcpIdentity(ctx)) });
   }
 
   if (route === 'POST /v1/mcp/servers') {
@@ -1121,10 +1420,10 @@ async function handle(
     const cfg = parsed.data;
     if (cfg.transport === 'stdio' && !cfg.command) throw new HttpError(400, 'stdio 需要 command');
     if (cfg.transport !== 'stdio' && !cfg.url) throw new HttpError(400, `${cfg.transport} 需要 url`);
-    if (rt.mcp.list().some((s) => s.name === name)) throw new HttpError(409, `MCP server 已存在: ${name}`);
-    const info = await rt.mcp.add(name, cfg);
-    syncMcpTools(rt);
-    await persistMcpServers(rt);
+    const identity = mcpIdentity(ctx);
+    if ((await rt.mcp.list(identity)).some((s) => s.name === name)) throw new HttpError(409, `MCP server 已存在: ${name}`);
+    const info = await rt.mcp.add(identity, name, cfg);
+    await persistMcpServers(rt, identity);
     return sendJson(res, 201, { server: info });
   }
 
@@ -1134,9 +1433,9 @@ async function handle(
     requirePermission(ctx, 'tenant:manage');
     if (!rt.mcp) throw new HttpError(409, '未启用 MCP');
     const name = decodeURIComponent(mcpReconnectMatch[1]!);
-    if (!rt.mcp.list().some((s) => s.name === name)) throw new HttpError(404, `MCP server 不存在: ${name}`);
-    const info = await rt.mcp.reconnect(name);
-    syncMcpTools(rt);
+    const identity = mcpIdentity(ctx);
+    if (!(await rt.mcp.list(identity)).some((s) => s.name === name)) throw new HttpError(404, `MCP server 不存在: ${name}`);
+    const info = await rt.mcp.reconnect(identity, name);
     return sendJson(res, 200, { server: info });
   }
 
@@ -1146,10 +1445,10 @@ async function handle(
     requirePermission(ctx, 'tenant:manage');
     if (!rt.mcp) throw new HttpError(409, '未启用 MCP');
     const name = decodeURIComponent(mcpDeleteMatch[1]!);
-    const removed = await rt.mcp.remove(name);
+    const identity = mcpIdentity(ctx);
+    const removed = await rt.mcp.remove(identity, name);
     if (!removed) throw new HttpError(404, `MCP server 不存在: ${name}`);
-    syncMcpTools(rt);
-    await persistMcpServers(rt);
+    await persistMcpServers(rt, identity);
     return sendJson(res, 200, { ok: true });
   }
 
@@ -1418,14 +1717,18 @@ async function handle(
     const id = decodeURIComponent(approvalMatch[1]!);
     const interaction = await rt.store.getInteraction(ctx.tenantId, id);
     if (!interaction || interaction.kind !== 'approval') throw new HttpError(404, '审批不存在或已处理');
+    const wasPending = interaction.status === 'pending';
     const approved = approvalMatch[2] === 'approve';
-    await interactions.resolve(ctx, id, {
+    const resolved = await interactions.resolve(ctx, id, {
       sessionId: interaction.sessionId,
       runId: interaction.runId,
       value: approved,
-    }).catch((error) => { throw new HttpError(404, error instanceof Error ? error.message : '审批不存在或已处理'); });
+    }).catch((error) => { throw interactionResolveHttpError(error, '审批不存在或已处理'); });
     if (approved) await approvals.approve(id, ctx.tenantId);
     else await approvals.deny(id, ctx.tenantId);
+    await scheduleResolvedInteractionRecovery(
+      rt, ctx, resolved, wasPending,
+    );
     return sendJson(res, 200, { ok: true });
   }
 
@@ -1454,12 +1757,16 @@ async function handle(
     if (!interaction || (interaction.kind !== 'question' && interaction.kind !== 'plan')) {
       throw new HttpError(404, '问题不存在或已回答');
     }
-    await interactions.resolve(ctx, id, {
+    const wasPending = interaction.status === 'pending';
+    const resolved = await interactions.resolve(ctx, id, {
       sessionId: interaction.sessionId,
       runId: interaction.runId,
       value: answers,
-    }).catch((error) => { throw new HttpError(404, error instanceof Error ? error.message : '问题不存在或已回答'); });
+    }).catch((error) => { throw interactionResolveHttpError(error, '问题不存在或已回答'); });
     questions.answer(id, ctx.tenantId, answers);
+    await scheduleResolvedInteractionRecovery(
+      rt, ctx, resolved, wasPending,
+    );
     return sendJson(res, 200, { ok: true });
   }
 
@@ -1475,10 +1782,26 @@ async function handle(
   if (method === 'POST' && sessionAppendMatch) {
     const ctx = await requireAuth(rt, req);
     const sessionId = decodeURIComponent(sessionAppendMatch[1]!);
-    const message = userMessageFromBody(await readJson(req));
+    const body = await readJson(req);
+    const message = userMessageFromBody(body);
     const activeRun = findActiveRun(activeRuns, activeRunKey(ctx, sessionId));
-    if (activeRun) {
-      activeRun.append(message);
+    const durableRun = activeRun ?? await findAppendableRun(rt, ctx, sessionId);
+    const mode = body.mode === 'follow_up' ? 'follow_up' : 'steer';
+    const idempotencyKey = req.headers['idempotency-key']?.toString()
+      ?? (typeof body.idempotencyKey === 'string' ? body.idempotencyKey : randomUUID());
+    if (durableRun) {
+      await rt.durableRunRuntime.append({
+        identity: { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] },
+        runId: durableRun.runId,
+        message: {
+          role: 'user', text: message.text,
+          content: message.contentBlocks?.map((block) => block.type === 'text'
+            ? { type: 'text' as const, text: block.text }
+            : { type: 'image' as const, mimeType: block.mimeType, data: block.data }),
+        },
+        mode,
+        idempotencyKey,
+      });
       return sendJson(res, 200, { ok: true, sessionId, queued: true });
     }
     await rt.store.appendMessage(ctx, sessionId, message);
@@ -1489,7 +1812,8 @@ async function handle(
   if (method === 'GET' && sessionContextMatch) {
     const ctx = await requireAuth(rt, req);
     const sessionId = decodeURIComponent(sessionContextMatch[1]!);
-    const usage = await rt.store.getSessionContextUsage(ctx, sessionId, contextWindowTokens(currentModelConfig(rt)));
+    if (!await hasCurrentUserSession(rt, ctx, sessionId)) throw new HttpError(404, '会话不存在');
+    const usage = await readSessionContextProjection(rt, ctx, sessionId, contextWindowTokens(currentModelConfig(rt)));
     return sendJson(res, 200, { sessionId, ...usage });
   }
 
@@ -1497,9 +1821,8 @@ async function handle(
   if (method === 'GET' && sessionUsageMatch) {
     const ctx = await requireAuth(rt, req);
     const sessionId = decodeURIComponent(sessionUsageMatch[1]!);
-    const owned = (await rt.store.listSessions(ctx)).some((session) => session.sessionId === sessionId);
-    if (!owned) throw new HttpError(404, '会话不存在');
-    const usage = await rt.store.getSessionTokenUsage(ctx, sessionId);
+    if (!await hasCurrentUserSession(rt, ctx, sessionId)) throw new HttpError(404, '会话不存在');
+    const usage = await readSessionUsageProjection(rt, ctx, sessionId);
     return sendJson(res, 200, { sessionId, ...usage });
   }
 
@@ -1507,7 +1830,21 @@ async function handle(
   if (method === 'POST' && sessionTerminateMatch) {
     const ctx = await requireAuth(rt, req);
     const sessionId = decodeURIComponent(sessionTerminateMatch[1]!);
-    const aborted = abortActiveRuns(activeRuns, activeRunKey(ctx, sessionId));
+    const activeKey = activeRunKey(ctx, sessionId);
+    const localRunIds = [...(activeRuns.get(activeKey) ?? [])]
+      .filter((run) => !run.abort.signal.aborted)
+      .map((run) => run.runId);
+    const ownerCtx: RequestContext = { ...ctx, role: 'user' };
+    const durableRunIds = (await rt.store.listAgentRuns(ownerCtx, { sessionId, limit: 1_000 }))
+      .filter((run) => run.status === 'queued' || run.status === 'running' || run.status === 'waiting')
+      .map((run) => run.runId);
+    const runIds = [...new Set([...localRunIds, ...durableRunIds])];
+    const aborted = abortActiveRuns(activeRuns, activeKey);
+    await Promise.all(runIds.map((runId) => rt.durableRunRuntime.cancel({
+      identity: { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] },
+      runId,
+      reason: RUN_TERMINATED_MESSAGE,
+    })));
     return sendJson(res, 200, { ok: true, sessionId, aborted });
   }
 
@@ -1703,6 +2040,18 @@ async function handle(
   sendJson(res, 404, { error: `未知路由: ${route}` });
 }
 
+async function findAppendableRun(rt: Runtime, ctx: RequestContext, sessionId: string): Promise<AgentRunRecord | undefined> {
+  const ownerCtx: RequestContext = { ...ctx, role: 'user' };
+  const candidates = (await Promise.all((['running', 'waiting', 'queued'] as const)
+    .map((status) => rt.store.listAgentRuns(ownerCtx, { sessionId, status, limit: 1 })))).flat();
+  return candidates.sort((left, right) => right.updatedAt.getTime() - left.updatedAt.getTime())[0];
+}
+
+async function hasCurrentUserSession(rt: Runtime, ctx: RequestContext, sessionId: string): Promise<boolean> {
+  const count = await rt.store.countSessions(ctx);
+  return (await rt.store.listSessions(ctx, count)).some((session) => session.sessionId === sessionId);
+}
+
 function toolCategory(name: string): string {
   if (name === 'load_skill' || name.startsWith('skill__')) return 'skill';
   if (name.startsWith('mcp__')) return 'mcp';
@@ -1724,9 +2073,26 @@ function decodeSkillImportData(data: string): Buffer {
 function decodeBase64(raw: string): Buffer {
   const compact = raw.replace(/\s+/g, '');
   if (!compact) throw new HttpError(400, '技能包数据为空');
+  if (compact.length % 4 !== 0
+    || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(compact)) {
+    throw new HttpError(400, '技能包数据不是合法 base64');
+  }
   const data = Buffer.from(compact, 'base64');
   if (!data.length) throw new HttpError(400, '技能包数据为空');
+  if (data.length > MAX_SKILL_ZIP_BYTES) throw new HttpError(413, '技能压缩包大小超过 10MB 上限');
   return data;
+}
+
+function skillArchiveHttpError(err: unknown): HttpError {
+  if (err instanceof HttpError) return err;
+  const message = err instanceof Error ? err.message : String(err || '技能压缩包无效');
+  if (message.includes('大小上限') || message.includes('超过上限') || message.includes('maxOutputLength')) {
+    return new HttpError(413, message);
+  }
+  if (message.includes('非法 zip 路径') || message.includes('符号链接') || message.includes('文件类型')) {
+    return new HttpError(400, message);
+  }
+  return new HttpError(422, message);
 }
 
 function publicSkill(skill: Skill, registry: SkillRegistry, viewer?: RequestContext): Record<string, unknown> {
@@ -1750,12 +2116,21 @@ function publicSkill(skill: Skill, registry: SkillRegistry, viewer?: RequestCont
  * 技能管理护栏：不可见 → 404（不泄露存在性）；可见但非所有者 → 403。
  * 只有所有者能启停/删除/共享自己的技能；无主存量技能由 tenant:manage 管理员代管。
  */
-function requireManagedSkill(rt: Runtime, ctx: RequestContext, name: string): Skill {
+async function requireManagedSkill(
+  rt: Runtime,
+  ctx: RequestContext,
+  name: string,
+  preferReviewed = false,
+): Promise<Skill> {
   const registry = rt.skillRegistry;
   if (!registry) throw new HttpError(409, '未启用技能目录');
-  const skill = registry.get(name);
-  if (!skill || !registry.visibleTo(skill, ctx)) throw new HttpError(404, `未找到技能 ${name}`);
-  if (!registry.canManage(skill, ctx)) throw new HttpError(403, '仅技能所有者可执行该操作');
+  const skill = await registry.getManageableForFresh(name, ctx, preferReviewed);
+  if (!skill) {
+    if (await registry.hasVisibleForFresh(name, ctx)) {
+      throw new HttpError(403, '仅技能所有者可执行该操作');
+    }
+    throw new HttpError(404, `未找到技能 ${name}`);
+  }
   return skill;
 }
 
@@ -1768,6 +2143,17 @@ function parentSkillPath(path: string): string | null {
 function skillHttpError(err: unknown): HttpError {
   const message = err instanceof Error ? err.message : String(err || '技能操作失败');
   if (message.includes('未找到技能')) return new HttpError(404, message);
+  if (message.includes('不能审核自己') || message.includes('仅租户或平台管理员') || message.includes('仅平台管理员')) {
+    return new HttpError(403, message);
+  }
+  if (message.includes('已审核') || message.includes('不唯一')) return new HttpError(409, message);
+  if (message.includes('名称冲突')) return new HttpError(409, message);
+  if (message.includes('待审核技能数量配额')) return new HttpError(429, message);
+  if (message.includes('待审核技能字节配额')) return new HttpError(413, message);
+  if (message.includes('技能存储可用空间不足')) return new HttpError(507, message);
+  if (message.includes('Pi Skill 校验产生诊断') || message.includes('SKILL.md name')) {
+    return new HttpError(422, message);
+  }
   if (message.includes('非法技能文件路径') || message.includes('不是目录') || message.includes('不是文件')) {
     return new HttpError(400, message);
   }
@@ -1775,7 +2161,7 @@ function skillHttpError(err: unknown): HttpError {
 }
 
 function activeRunKey(ctx: RequestContext, sessionId: string): string {
-  return JSON.stringify([ctx.tenantId, sessionId]);
+  return JSON.stringify([ctx.tenantId, ctx.userId, sessionId]);
 }
 
 function addActiveRun(activeRuns: ActiveAgentRuns, key: string, run: ActiveAgentRun): void {
@@ -1821,538 +2207,265 @@ function abortActiveRunById(activeRuns: ActiveAgentRuns, tenantId: string, runId
   return aborted;
 }
 
-function abortReasonMessage(reason: unknown): string {
-  if (reason instanceof Error) return reason.message;
-  if (typeof reason === 'string' && reason) return reason;
-  return RUN_TERMINATED_MESSAGE;
-}
-
-async function recoverAgentRun(
+async function scheduleResolvedInteractionRecovery(
   rt: Runtime,
-  interactions: DurableInteractionService,
-  activeRuns: ActiveAgentRuns,
-  compactionWatermarks: CompactionWatermarks,
   requester: RequestContext,
-  run: AgentRunRecord,
+  interaction: Awaited<ReturnType<DurableInteractionService['resolve']>>,
+  newlyResolved: boolean,
 ): Promise<void> {
-  const owner = await rt.store.getUser(run.tenantId, run.userId).catch(() => undefined);
-  const ctx: RequestContext = {
-    tenantId: run.tenantId,
-    userId: run.userId,
-    role: owner?.role ?? (requester.userId === run.userId ? requester.role : 'user'),
+  const run = await rt.store.getAgentRun(requester, interaction.runId);
+  if (!run || run.kernel !== 'pi') return;
+  if (!newlyResolved && run.status !== 'recovery_required') return;
+  await rt.store.appendAgentRunEvent({
+    tenantId: run.tenantId, runId: run.runId, type: 'recovery', status: 'requested',
+    detail: {
+      reason: 'interaction_resolved',
+      kind: interaction.kind,
+      interactionId: interaction.id,
+      requestedBy: requester.userId,
+    },
+    createdAt: new Date(),
+  });
+  const resolution = {
+    interactionId: interaction.id,
+    value: interaction.resolution as JsonValue,
   };
-  const activeKey = activeRunKey(ctx, run.sessionId);
-  if (findActiveRun(activeRuns, activeKey)) {
-    const now = new Date();
-    await rt.store.updateAgentRun(run.tenantId, run.runId, {
-      status: 'recovery_required',
-      errorMessage: '同一会话已有运行中的任务',
-      updatedAt: now,
-    });
-    await rt.store.appendAgentRunEvent({
-      tenantId: run.tenantId,
-      runId: run.runId,
-      type: 'recovery',
-      status: 'blocked',
-      detail: { reason: 'session_busy' },
-      createdAt: now,
-    });
-    return;
+  void superviseDurableRecovery(rt, requester, run.runId, resolution);
+}
+
+function interactionResolveHttpError(error: unknown, fallback: string): HttpError {
+  const message = error instanceof Error ? error.message : fallback;
+  if (message.includes('冲突') || message.includes('已处理') || message.includes('已过期')) {
+    return new HttpError(409, message);
   }
-
-  const abort = new AbortController();
-  const pendingMessages: Msg[] = [];
-  const activeRun: ActiveAgentRun = {
-    tenantId: run.tenantId,
-    runId: run.runId,
-    abort,
-    append: (message) => pendingMessages.push(message),
-    drain: () => pendingMessages.splice(0),
-  };
-  addActiveRun(activeRuns, activeKey, activeRun);
-
-  try {
-    const prior = await rt.store.listMessages(ctx, run.sessionId);
-    const modelConfig = currentModelConfig(rt);
-    const triggerTokens = compactionTriggerTokens(modelConfig);
-    const userHomeNote = rt.sandboxSettings?.enabled && rt.userHome
-      ? await boundUserHomeNote(rt.store, ctx.tenantId, ctx.userId, rt.userHome)
-      : '';
-    const startedAt = Date.now();
-    const durableInteractions = {
-      create: async (input: { kind: 'approval' | 'question' | 'plan'; toolCallId: string; payload: unknown }) => {
-        const id = createHash('sha256')
-          .update(`${run.runId}\0${input.kind}\0${input.toolCallId}`)
-          .digest('hex');
-        const existing = await rt.store.getInteraction(ctx.tenantId, id);
-        if (existing) return { id };
-        const payload = asObject(input.payload);
-        const publicPayload = input.kind === 'plan'
-          ? {
-              ...payload,
-              questions: [{
-                question: `请审批变更方案：${planSummary(payload.plan)}`,
-                header: '变更审批',
-                options: [{ label: '批准' }, { label: '拒绝' }],
-              } satisfies QuestionSpec],
-            }
-          : payload;
-        await interactions.create({
-          id,
-          kind: input.kind,
-          tenantId: ctx.tenantId,
-          userId: ctx.userId,
-          sessionId: run.sessionId,
-          runId: run.runId,
-          toolCallId: input.toolCallId,
-          payload: { id, runId: run.runId, sessionId: run.sessionId, ...publicPayload },
-          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-        });
-        return { id };
-      },
-      wait: async (id: string) => {
-        const record = await interactions.wait(ctx.tenantId, id, abort.signal);
-        if (record.status !== 'resolved') return record.kind === 'question' ? null : false;
-        if (record.kind !== 'plan') return record.resolution;
-        const payload = record.payload as { plan?: { summary?: string }; questions?: QuestionSpec[] };
-        const answers = record.resolution as QuestionAnswers | undefined;
-        const question = payload.questions?.[0]?.question
-          ?? `请审批变更方案：${payload.plan?.summary ?? ''}`;
-        const approved = answers?.[question]?.includes('批准') ?? record.resolution === true;
-        if (approved) rt.planState?.approve(run.sessionId);
-        return approved;
-      },
-    };
-
-    const result = await resolveAgentRuntime(rt.agentRuntime).run({
-      runId: run.runId,
-      resumeFromCheckpoint: true,
-      model: rt.model,
-      tools: rt.tools,
-      policy: rt.policy,
-      filterToolDefs: (defs) => rt.permissionRules?.filterToolDefs(defs) ?? defs,
-      hooks: rt.hooks,
-      toolLedger: new DurableToolLedger(rt.store),
-      durableInteractions,
-      system: [
-        rt.skillRegistry ? rt.skillRegistry.summariesFor(ctx) : rt.systemExtra,
-        rt.sandboxSettings?.enabled ? SANDBOX_SERVICE_NOTE : '',
-        userHomeNote,
-      ].filter(Boolean).join('\n\n'),
-      ctx: { ...ctx, sessionId: run.sessionId },
-      signal: abort.signal,
-      contextBudgetTokens: contextBudgetTokens(modelConfig),
-      keepImages: keepImagesOf(modelConfig),
-      summarize: (stale) => summarizeMessages(rt.model, stale, abort.signal),
-      compactionTriggerTokens: triggerTokens,
-      compactionKeepRecent: COMPACTION_KEEP_RECENT,
-      compactionWatermarkTokens: compactionWatermarks.get(activeKey),
-      drainPendingMessages: activeRun.drain,
-      onEvent: (event) => {
-        if (event.type !== 'context_compacted') return;
-        if (event.afterTokens > triggerTokens) {
-          compactionWatermarks.set(activeKey, event.afterTokens + COMPACTION_RETRY_GROWTH_TOKENS);
-        } else {
-          compactionWatermarks.delete(activeKey);
-        }
-      },
-    });
-    await new SessionCommitter(rt.store).commitSuccess({
-      ctx,
-      sessionId: run.sessionId,
-      priorMessageCount: prior.length,
-      result,
-      durationMs: Math.max(0, Date.now() - startedAt),
-    });
-  } finally {
-    removeActiveRun(activeRuns, activeKey, activeRun);
-    for (const message of activeRun.drain()) {
-      await rt.store.appendMessage(ctx, run.sessionId, message).catch((err) => {
-        log.warn({ err, runId: run.runId }, '恢复运行残留消息落库失败');
-      });
-    }
-  }
+  if (message.includes('无权')) return new HttpError(403, message);
+  return new HttpError(404, message);
 }
 
-function asObject(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : { value };
-}
-
-function planSummary(value: unknown): string {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    && typeof (value as { summary?: unknown }).summary === 'string'
-    ? (value as { summary: string }).summary
-    : '';
-}
-
-/** POST /v1/agent：流式（SSE）运行一次 agent，自动续接会话历史并持久化。 */
-async function runAgentSse(
-  rt: Runtime,
-  approvals: InMemoryApprovalStore,
-  questions: InMemoryQuestionStore,
-  interactions: DurableInteractionService,
-  activeRuns: ActiveAgentRuns,
-  compactionWatermarks: CompactionWatermarks,
-  req: Req,
-  res: Res,
-): Promise<void> {
+async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req: Req, res: Res): Promise<void> {
+  const runtime = rt.durableRunRuntime;
+  const runStartedAt = Date.now();
   const ctx = await requireAuth(rt, req);
   const body = await readJson(req);
-  const userText = userTextFromBody(body);
-  const taskBlocks = attachmentImageBlocks(body);
-  const parsedTask = parseGoalTask(userText);
   const sessionId = sessionIdFromBody(body);
-  const resumeInteractionId = str(body, 'resumeInteractionId') ?? str(body, 'resume_interaction_id');
-  let runId: string = randomUUID();
-  if (resumeInteractionId) {
-    const interaction = await rt.store.getInteraction(ctx.tenantId, resumeInteractionId);
-    if (!interaction
-      || interaction.userId !== ctx.userId
-      || interaction.sessionId !== sessionId
-      || interaction.status !== 'resolved') {
-      throw new HttpError(404, '可恢复交互不存在、未完成或与当前身份/会话不匹配');
-    }
-    runId = interaction.runId;
-  }
-
-  // 同一会话互斥：并发运行会各自加载相同历史再各自落库，导致历史交错重复，
-  // 且压缩落库（replaceMessages）会覆盖对方新写的消息。运行中追加消息请走 /append。
-  if (findActiveRun(activeRuns, activeRunKey(ctx, sessionId))) {
+  const text = userTextFromBody(body);
+  const blocks = attachmentImageBlocks(body);
+  const activeKey = activeRunKey(ctx, sessionId);
+  if (findActiveRun(activeRuns, activeKey) || await findAppendableRun(rt, ctx, sessionId)) {
     throw new HttpError(409, '该会话已有正在运行的任务；可通过 append 追加消息，或先终止当前运行');
   }
-
+  const handle = await runtime.run({
+    runId: randomUUID(),
+    identity: { tenantId: ctx.tenantId, actorId: ctx.userId, roles: [ctx.role] },
+    sessionId,
+    input: [{
+      role: 'user', text,
+      content: blocks.map((block) => block.type === 'text'
+        ? { type: 'text' as const, text: block.text }
+        : { type: 'image' as const, mimeType: block.mimeType, data: block.data }),
+    }],
+    kernel: 'pi',
+  });
+  const abort = new AbortController();
+  const activeRun: ActiveAgentRun = { tenantId: ctx.tenantId, runId: handle.runId, abort };
+  addActiveRun(activeRuns, activeKey, activeRun);
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
     'cache-control': 'no-cache, no-transform',
     connection: 'keep-alive',
   });
-  let closed = false;
   const sse = (event: string, data: unknown): void => {
-    if (closed || res.destroyed || res.writableEnded) return;
+    if (res.destroyed || res.writableEnded) return;
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
-  sse('session', { sessionId, runId });
-  const abort = new AbortController();
-  const pendingMessages: Msg[] = [];
-  const activeKey = activeRunKey(ctx, sessionId);
-  const activeRun: ActiveAgentRun = {
-    tenantId: ctx.tenantId,
-    runId,
-    abort,
-    append: (message) => pendingMessages.push(message),
-    drain: () => pendingMessages.splice(0),
-  };
-  const onClose = () => {
-    closed = true;
-    if (!abort.signal.aborted) abort.abort(new Error('客户端连接已关闭'));
-  };
-  addActiveRun(activeRuns, activeKey, activeRun);
-  res.on('close', onClose);
-  const toolCtx = { sessionId, tenantId: ctx.tenantId, userId: ctx.userId, role: ctx.role };
-  const sessionCommitter = new SessionCommitter(rt.store);
-  const toolLedger = new DurableToolLedger(rt.store);
-  const runStartedAt = Date.now();
-  let streamedText = '';
-  let streamedThinking = '';
-  let agentReturned = false;
-
+  sse('session', { sessionId, runId: handle.runId });
   try {
-    // 续接历史：加载该会话既有消息作为上下文。
-    // 必须在 addActiveRun 之后加载：此后并发 append 都进内存队列走 drain，
-    // 不会在 listMessages 与 replaceMessages 之间直写库被压缩覆盖。
-    const prior = await rt.store.listMessages(ctx, sessionId);
-    // 用户绑定了主目录：在系统提示中告知挂载点，引导交付物默认写入持久化目录。
-    const userHomeNote = rt.sandboxSettings?.enabled && rt.userHome
-      ? await boundUserHomeNote(rt.store, ctx.tenantId, ctx.userId, rt.userHome)
-      : '';
-    const modelConfig = currentModelConfig(rt);
-    const triggerTokens = compactionTriggerTokens(modelConfig);
-    const agentRuntime = resolveAgentRuntime(rt.agentRuntime);
-    const durableInteractions = {
-      create: async (input: { kind: 'approval' | 'question' | 'plan'; toolCallId: string; payload: unknown }) => {
-        const id = createHash('sha256')
-          .update(`${runId}\0${input.kind}\0${input.toolCallId}`)
-          .digest('hex');
-        const existing = await rt.store.getInteraction(ctx.tenantId, id);
-        if (existing) return { id };
-        const createdAt = new Date().toISOString();
-        if (input.kind === 'approval') {
-          const request = input.payload as { call?: ToolCall; reason?: string };
-          let diff: string | undefined;
-          if (request.call?.name === 'kubectl') {
-            try {
-              const args = request.call.args && typeof request.call.args === 'object' && !Array.isArray(request.call.args)
-                ? { ...request.call.args, dryRun: true }
-                : request.call.args;
-              diff = (await rt.tools.dispatch({ ...request.call, id: `${request.call.id}:dry-run`, args }, toolCtx)).content;
-            } catch (error) {
-              diff = `[dry-run error]\n${error instanceof Error ? error.message : String(error)}`;
-            }
-          }
-          const pending = {
-            id, tenantId: ctx.tenantId, sessionId, userId: ctx.userId,
-            runId, call: request.call, reason: request.reason, diff, createdAt,
-          };
-          await interactions.create({
-            id, kind: 'approval', tenantId: ctx.tenantId, userId: ctx.userId,
-            sessionId, runId, toolCallId: input.toolCallId, payload: pending,
-            expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-          });
-          sse('approval_required', pending);
-          return { id };
-        }
-        if (input.kind === 'question') {
-          const questions = (input.payload as { questions?: QuestionSpec[] }).questions ?? [];
-          const pending = { id, tenantId: ctx.tenantId, sessionId, userId: ctx.userId, runId, questions, createdAt };
-          await interactions.create({
-            id, kind: 'question', tenantId: ctx.tenantId, userId: ctx.userId,
-            sessionId, runId, toolCallId: input.toolCallId, payload: pending,
-            expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-          });
-          sse('question_required', pending);
-          return { id };
-        }
-        const plan = (input.payload as { plan?: unknown }).plan;
-        const summary = plan && typeof plan === 'object' && !Array.isArray(plan)
-          && typeof (plan as { summary?: unknown }).summary === 'string'
-          ? (plan as { summary: string }).summary
-          : '';
-        const q: QuestionSpec = {
-          question: `请审批变更方案：${summary}`,
-          header: '变更审批',
-          options: [{ label: '批准' }, { label: '拒绝' }],
-        };
-        const pending = { id, tenantId: ctx.tenantId, sessionId, userId: ctx.userId, runId, questions: [q], createdAt, plan };
-        const durablePending = { ...pending, runId };
-        await interactions.create({
-          id, kind: 'plan', tenantId: ctx.tenantId, userId: ctx.userId,
-          sessionId, runId, toolCallId: input.toolCallId, payload: pending,
-          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-        });
-        sse('change_plan_required', pending);
-        return { id };
-      },
-      wait: async (id: string) => {
-        const record = await interactions.wait(ctx.tenantId, id, abort.signal);
-        if (record.status !== 'resolved') return record.kind === 'question' ? null : false;
-        if (record.kind !== 'plan') return record.resolution;
-        const payload = record.payload as { questions?: QuestionSpec[]; plan?: unknown };
-        const question = payload.questions?.[0]?.question ?? '';
-        const answers = record.resolution as QuestionAnswers | undefined;
-        const approved = answers?.[question]?.includes('批准') ?? false;
-        if (approved) rt.planState.approve(sessionId);
-        await rt.audit?.record({
-          kind: 'policy', action: approved ? 'plan-approved' : 'plan-rejected',
-          tenantId: ctx.tenantId, sessionId, detail: { plan: payload.plan },
-        });
-        return approved;
-      },
-    };
-    const result = await agentRuntime.run({
-      runId,
-      model: rt.model,
-      tools: rt.tools,
-      policy: rt.policy,
-      filterToolDefs: (defs) => rt.permissionRules?.filterToolDefs(defs) ?? defs,
-      hooks: rt.hooks,
-      toolLedger,
-      durableInteractions,
-      askUser: async (qs: QuestionSpec[]): Promise<QuestionAnswers | null> => {
-        if (abort.signal.aborted) return null;
-        const { pending, promise } = questions.create({
-          tenantId: ctx.tenantId ?? '',
-          sessionId,
-          userId: ctx.userId ?? '',
-          questions: qs,
-        });
-        const durablePending = { ...pending, runId };
-        await interactions.create({
-          id: pending.id,
-          kind: 'question',
-          tenantId: ctx.tenantId,
-          userId: ctx.userId,
-          sessionId,
-          runId,
-          payload: durablePending,
-          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-        });
-        const onAbort = () => {
-          questions.cancel(pending.id);
-          void interactions.cancel(ctx.tenantId, pending.id);
-        };
-        abort.signal.addEventListener('abort', onAbort, { once: true });
-        try {
-          sse('question_required', durablePending);
-          return await promise;
-        } finally {
-          abort.signal.removeEventListener('abort', onAbort);
-        }
-      },
-      requestPlanApproval: async (plan): Promise<boolean> => {
-        if (abort.signal.aborted) return false;
-        // 复用问题机制：一道“批准/拒绝”单选题承载变更方案审批。
-        const q: QuestionSpec = {
-          question: `请审批变更方案：${plan.summary}`,
-          header: '变更审批',
-          options: [{ label: '批准' }, { label: '拒绝' }],
-        };
-        const { pending, promise } = questions.create({
-          tenantId: ctx.tenantId ?? '',
-          sessionId,
-          userId: ctx.userId ?? '',
-          questions: [q],
-        });
-        const durablePending = { ...pending, plan, runId };
-        await interactions.create({
-          id: pending.id,
-          kind: 'plan',
-          tenantId: ctx.tenantId,
-          userId: ctx.userId,
-          sessionId,
-          runId,
-          payload: durablePending,
-          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-        });
-        const onAbort = () => {
-          questions.cancel(pending.id);
-          void interactions.cancel(ctx.tenantId, pending.id);
-        };
-        abort.signal.addEventListener('abort', onAbort, { once: true });
-        try {
-          // 附上完整方案供前端渲染（question_required 事件里带 plan）。
-          sse('change_plan_required', durablePending);
-          const answers = await promise;
-          const approved = answers?.[q.question]?.includes('批准') ?? false;
-          if (approved) rt.planState.approve(sessionId);
-          await rt.audit?.record({
-            kind: 'policy', action: approved ? 'plan-approved' : 'plan-rejected',
-            tenantId: ctx.tenantId, sessionId, detail: { plan },
-          });
-          return approved;
-        } finally {
-          abort.signal.removeEventListener('abort', onAbort);
-        }
-      },
-      approval: new InteractiveApprovalGate({
-        store: approvals,
-        emit: async (pending) => {
-          await interactions.create({
-            id: pending.id,
-            kind: 'approval',
-            tenantId: ctx.tenantId,
-            userId: ctx.userId,
-            sessionId,
-            runId,
-            toolCallId: pending.call.id,
-            payload: { ...pending, runId },
-            expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-          });
-          sse('approval_required', { ...pending, runId });
-        },
-        onCancel: async (pending) => { await interactions.cancel(ctx.tenantId, pending.id); },
-        signal: abort.signal,
-        diff: async ({ call, ctx: diffCtx }) => {
-          if (call.name !== 'kubectl') return undefined;
-          const args = call.args && typeof call.args === 'object' && !Array.isArray(call.args)
-            ? { ...call.args, dryRun: true }
-            : call.args;
-          const dryRun = await rt.tools.dispatch({ ...call, id: `${call.id}:dry-run`, args }, diffCtx);
-          return dryRun.content;
-        },
-      }),
-      // 技能摘要按当前用户过滤（他人私有技能对模型也不可见），与列表/执行链路同一套可见性。
-      system: [
-        parsedTask.goalMode ? GOAL_MODE_SYSTEM : '',
-        rt.skillRegistry ? rt.skillRegistry.summariesFor(ctx) : rt.systemExtra,
-        rt.sandboxSettings?.enabled ? SANDBOX_SERVICE_NOTE : '',
-        userHomeNote,
-      ].filter(Boolean).join('\n\n'),
-      ctx: toolCtx,
-      messages: prior,
-      task: parsedTask.task,
-      taskContentBlocks: taskBlocks,
-      signal: abort.signal,
-      // 步数不设限：任务跑到完成为止，由终止接口 / 断连中止兜底，中途摘要压缩保证不超窗。
-      contextBudgetTokens: contextBudgetTokens(modelConfig),
-      keepImages: keepImagesOf(modelConfig),
-      // 摘要压缩：runAgent 在每个轮次边界检查（含首轮，新任务与附件一并计入），长 run 中途也能压缩。
-      summarize: (stale) => summarizeMessages(rt.model, stale, abort.signal),
-      compactionTriggerTokens: triggerTokens,
-      compactionKeepRecent: COMPACTION_KEEP_RECENT,
-      compactionWatermarkTokens: compactionWatermarks.get(activeKey),
-      drainPendingMessages: activeRun.drain,
-      onEvent: (e) => {
-        if (e.type === 'text_delta') streamedText += e.text;
-        else if (e.type === 'thinking_delta') streamedThinking += e.text;
-        else if (e.type === 'model_retry') {
-          if (e.discardTextChars > 0) streamedText = streamedText.slice(0, -e.discardTextChars);
-          if (e.discardThinkingChars > 0) streamedThinking = streamedThinking.slice(0, -e.discardThinkingChars);
-        }
-        if (e.type === 'context_compacted') {
-          // 摘要后仍超触发线：记跨请求水位，历史没涨够前的下一次运行不再白跑摘要。
-          if (e.afterTokens > triggerTokens) compactionWatermarks.set(activeKey, e.afterTokens + COMPACTION_RETRY_GROWTH_TOKENS);
-          else compactionWatermarks.delete(activeKey);
-          log.info({ sessionId, ...e }, '历史摘要压缩');
-        }
-        sse(e.type, e);
-      },
-    });
-    agentReturned = true;
-    const durationMs = Math.max(0, Date.now() - runStartedAt);
-    await sessionCommitter.commitSuccess({
-      ctx,
-      sessionId,
-      priorMessageCount: prior.length,
-      result,
-      durationMs,
-    });
-    const context = await rt.store.getSessionContextUsage(ctx, sessionId, contextWindowTokens(modelConfig));
-    const cost = estimateCost(result.usage, modelConfig.pricing);
-    await rt.audit?.record({
-      kind: 'usage', action: 'agent', tenantId: ctx.tenantId, sessionId,
-      detail: { ...result.usage, steps: result.steps, context, cost },
-    });
-    sse('done', { sessionId, steps: result.steps, text: result.text, usage: { ...result.usage, context, cost }, context, cost });
-  } catch (err) {
-    if (!agentReturned) {
-      const durationMs = Math.max(0, Date.now() - runStartedAt);
+    let emittedText = false;
+    let steps = 0;
+    for await (const event of handle.events) {
+      steps = Math.max(steps, Number.isInteger(event.turnNo) && event.turnNo > 0 ? event.turnNo : 0);
+      const projected = projectDurableHttpEvent(event);
+      if (projected) {
+        sse(projected.event, projected.data);
+        emittedText ||= projected.event === 'text_delta';
+      }
+    }
+    const result = await handle.result();
+    if (rt.piSessionStore && result.status === 'succeeded') {
       try {
-        await sessionCommitter.commitFailure({
+        await projectCommittedPiSession({
+          store: rt.store,
+          sessions: rt.piSessionStore,
           ctx,
           sessionId,
-          task: parsedTask.task,
-          taskContentBlocks: taskBlocks,
-          streamedText,
-          streamedThinking,
-          durationMs,
-          error: err,
-          terminated: abort.signal.aborted,
+          durationMs: Math.max(0, Date.now() - runStartedAt),
         });
-      } catch (persistErr) {
-        log.warn({ err: persistErr, sessionId }, 'agent 失败记录落库失败');
+      } catch (projectionError) {
+        log.warn({ err: projectionError, sessionId, runId: result.runId }, 'durable 会话投影失败');
       }
     }
-    if (abort.signal.aborted) {
-      sse('terminated', { sessionId, reason: abortReasonMessage(abort.signal.reason) });
+    if (result.status === 'cancelled') {
+      sse('terminated', { sessionId, runId: result.runId, reason: result.error?.message });
+    } else if (result.status === 'failed' || result.status === 'recovery_required') {
+      sse('error', { error: result.error?.message ?? '运行失败', runId: result.runId, status: result.status });
     } else {
-      log.error({ err }, 'agent 运行失败');
-      sse('error', { error: err instanceof Error ? err.message : '运行失败' });
+      if (result.status === 'succeeded' && result.text && !emittedText) sse('text_delta', { text: result.text });
+      sse('done', projectDurableHttpDone({
+        sessionId,
+        result,
+        steps,
+        context: await durableContextUsage(rt, ctx, sessionId, result),
+      }));
     }
+  } catch (error) {
+    sse('error', { error: error instanceof Error ? error.message : '运行失败', runId: handle.runId });
   } finally {
-    // 先摘除注册再冲刷残留：摘除后新 append 直写库，不会再进内存队列。
-    // 残留消息（末次 drain 之后 / 运行报错或被终止时入队的）落库，避免用户消息静默丢失。
     removeActiveRun(activeRuns, activeKey, activeRun);
-    const leftover = activeRun.drain();
-    for (const m of leftover) {
-      try {
-        await rt.store.appendMessage(ctx, sessionId, m);
-      } catch (err) {
-        log.warn({ err, sessionId }, '运行结束后残留消息落库失败');
-      }
-    }
-    res.off('close', onClose);
     if (!res.destroyed && !res.writableEnded) res.end();
   }
+}
+
+export function projectDurableHttpEvent(event: { type: string; detail?: unknown }): { event: string; data: unknown } | undefined {
+  if (!event.detail || typeof event.detail !== 'object') return undefined;
+  const detail = event.detail as Record<string, unknown>;
+  if (event.type === 'message_update') {
+    const update = detail.update;
+    if (!update || typeof update !== 'object') return undefined;
+    const value = update as { type?: unknown; delta?: unknown };
+    if ((value.type === 'text_delta' || value.type === 'thinking_delta') && typeof value.delta === 'string') {
+      return { event: value.type, data: { text: value.delta } };
+    }
+    return undefined;
+  }
+  if (event.type === 'tool_call') {
+    const id = stringValue(detail.toolCallId);
+    const name = stringValue(detail.toolName);
+    if (!id || !name) return undefined;
+    return { event: 'tool_call', data: { call: { id, name, args: objectValue(detail.input) ?? redactedArgs(detail.inputKeys) } } };
+  }
+  if (event.type === 'tool_execution_update') {
+    const toolId = stringValue(detail.toolCallId);
+    if (!toolId) return undefined;
+    const text = stringValue(detail.outputText);
+    if (!text) return undefined;
+    return { event: 'tool_output', data: { toolId, stream: 'stdout', text } };
+  }
+  if (event.type === 'tool_execution_end' || event.type === 'tool_result') {
+    const toolId = stringValue(detail.toolCallId);
+    const name = stringValue(detail.toolName);
+    if (!toolId || !name) return undefined;
+    return { event: 'tool_result', data: { toolId, name, isError: detail.isError === true } };
+  }
+  if (event.type === 'session_compact') {
+    const summarizedMessages = finiteOptional(detail.summarizedMessages);
+    const beforeTokens = finiteOptional(detail.tokensBefore);
+    const afterTokens = finiteOptional(detail.tokensAfter);
+    if (summarizedMessages === undefined || beforeTokens === undefined || afterTokens === undefined) return undefined;
+    return { event: 'context_compacted', data: {
+      summarizedMessages,
+      beforeTokens,
+      afterTokens,
+    } };
+  }
+  if (event.type === 'abort') {
+    return { event: 'stop', data: { reason: stringValue(detail.reason) ?? 'aborted' } };
+  }
+  if (event.type !== 'message_end') return undefined;
+  const message = detail.message;
+  if (!message || typeof message !== 'object' || (message as { role?: unknown }).role !== 'assistant') return undefined;
+  const usage = (message as { usage?: unknown }).usage;
+  if (!usage || typeof usage !== 'object') return undefined;
+  const value = usage as Record<string, unknown>;
+  const projected = projectPiUsage({
+    input: finiteNumber(value.input),
+    output: finiteNumber(value.output),
+    cacheRead: finiteNumber(value.cacheRead),
+    cacheWrite: finiteNumber(value.cacheWrite),
+    cost: { total: finiteNumber(value.costTotal) },
+  });
+  return {
+    event: 'usage',
+    data: {
+      inputTokens: projected.inputTokens,
+      outputTokens: projected.outputTokens,
+      cacheReadTokens: projected.cacheReadTokens,
+      cacheCreationTokens: projected.cacheCreationTokens,
+      ...(typeof value.costTotal === 'number' && Number.isFinite(value.costTotal) ? { cost: projected.costUsd } : {}),
+    },
+  };
+}
+
+export function projectDurableHttpDone(input: {
+  sessionId: string;
+  result: AgentRunResult;
+  steps: number;
+  context: SessionContextUsage;
+}): Record<string, unknown> {
+  const cost = finiteCost(input.result.usage.costUsd);
+  return {
+    sessionId: input.sessionId,
+    runId: input.result.runId,
+    steps: input.steps,
+    text: input.result.text ?? '',
+    usage: { ...input.result.usage, context: input.context, cost },
+    context: input.context,
+    cost,
+  };
+}
+
+function redactedArgs(keys: unknown): Record<string, string> {
+  if (!Array.isArray(keys)) return {};
+  return Object.fromEntries(keys.filter((key): key is string => typeof key === 'string').map((key) => [key, '[redacted]']));
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function objectValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function finiteCost(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+async function durableContextUsage(
+  rt: Runtime,
+  ctx: RequestContext,
+  sessionId: string,
+  _result: AgentRunResult,
+): Promise<SessionContextUsage> {
+  return readSessionContextProjection(rt, ctx, sessionId, contextWindowTokens(currentModelConfig(rt)));
+}
+
+export async function readSessionContextProjection(
+  rt: Pick<Runtime, 'piSessionStore' | 'store'>,
+  ctx: RequestContext,
+  sessionId: string,
+  maxTokens: number,
+): Promise<SessionContextUsage> {
+  if (!rt.piSessionStore) return rt.store.getSessionContextUsage(ctx, sessionId, maxTokens);
+  return projectPiSessionStats(await rt.piSessionStore.getSessionStats(
+    ctx.tenantId, piSessionStorageId(ctx.userId, sessionId),
+  ), maxTokens).context;
+}
+
+export async function readSessionUsageProjection(
+  rt: Pick<Runtime, 'piSessionStore' | 'store'>,
+  ctx: RequestContext,
+  sessionId: string,
+): Promise<{ totalTokens: number }> {
+  if (!rt.piSessionStore) return rt.store.getSessionTokenUsage(ctx, sessionId);
+  return projectPiSessionStats(await rt.piSessionStore.getSessionStats(
+    ctx.tenantId, piSessionStorageId(ctx.userId, sessionId),
+  ), 0).usage;
+}
+
+function finiteNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function finiteOptional(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }

@@ -1,0 +1,9 @@
+{
+  "name": "aios-sandbox",
+  "version": "1.0.0",
+  "enabled": true,
+  "reviewed": true,
+  "tenantId": "default",
+  "allowedTenantIds": ["*"],
+  "visibility": "public"
+}

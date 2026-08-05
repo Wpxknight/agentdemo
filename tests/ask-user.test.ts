@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { buildAskUserTool } from '../src/tools/ask-user.js';
 import { InMemoryQuestionStore } from '../src/agent/question.js';
 import type { QuestionAnswers, QuestionSpec } from '../src/agent/question.js';
-import type { JsonValue } from '../src/model/types.js';
+import type { JsonValue } from '../src/llm/types.js';
 
 const validArgs = {
   questions: [
@@ -20,16 +20,16 @@ const validArgs = {
 describe('ask_user tool', () => {
   it('returns an error when no interactive endpoint is available', async () => {
     const tool = buildAskUserTool();
-    const res = await tool.run(validArgs, { sessionId: 's1' });
+    const res = await tool.execute(validArgs, { sessionId: 's1' });
     expect(res.isError).toBe(true);
     expect(res.content).toContain('无交互端');
   });
 
   it('rejects malformed questions', async () => {
     const tool = buildAskUserTool();
-    await expect(tool.run({ questions: [] } as unknown as JsonValue, { sessionId: 's1' })).rejects.toThrow('1-4');
+    await expect(tool.execute({ questions: [] } as unknown as JsonValue, { sessionId: 's1' })).rejects.toThrow('1-4');
     await expect(
-      tool.run({ questions: [{ question: 'x', options: [{ label: 'a' }] }] } as unknown as JsonValue, { sessionId: 's1' }),
+      tool.execute({ questions: [{ question: 'x', options: [{ label: 'a' }] }] } as unknown as JsonValue, { sessionId: 's1' }),
     ).rejects.toThrow('2-4');
   });
 
@@ -40,7 +40,7 @@ describe('ask_user tool', () => {
       captured.push(qs);
       return { '平台地址是哪个？': ['http://10.10.72.20:30001/paas-web'] };
     };
-    const res = await tool.run(validArgs, { sessionId: 's1', askUser });
+    const res = await tool.execute(validArgs, { sessionId: 's1', askUser });
     expect(captured[0]?.[0]?.options).toHaveLength(2);
     expect(res.isError).toBeFalsy();
     expect(res.content).toContain('http://10.10.72.20:30001/paas-web');
@@ -48,7 +48,7 @@ describe('ask_user tool', () => {
 
   it('reports when the user did not answer (null)', async () => {
     const tool = buildAskUserTool();
-    const res = await tool.run(validArgs, { sessionId: 's1', askUser: async () => null });
+    const res = await tool.execute(validArgs, { sessionId: 's1', askUser: async () => null });
     expect(res.isError).toBe(true);
     expect(res.content).toContain('未回答');
   });

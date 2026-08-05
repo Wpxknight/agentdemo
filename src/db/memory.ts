@@ -1,8 +1,8 @@
-import type { Msg } from '../model/types.js';
-import { estimateTokens } from '../agent/context.js';
+import type { Msg } from '../llm/types.js';
+import { estimateTokens } from '../llm/context.js';
 import type { AuditEvent } from '../audit/sink.js';
 import type { RequestContext, Tenant, User } from '../auth/types.js';
-import type { McpServerConfig } from '../mcp/types.js';
+import type { McpServerConfig } from '@aiop/mcp-runtime';
 import type {
   AuditFilter,
   NewUser,
@@ -35,6 +35,11 @@ import type {
 } from './store.js';
 import { DEFAULT_SESSION_TITLE } from './store.js';
 import { nextRunAt } from '../scheduler/cron.js';
+import { MemoryRunStore } from '@aiop/pi-runtime';
+import type { StoredRun } from '@aiop/pi-runtime';
+import type {
+  DurableInteractionUpdate as RuntimeInteractionRecord, DurableToolLedgerUpdate, JsonValue,
+} from '@aiop/control-contracts';
 
 interface MsgRow {
   tenantId: string;
@@ -62,6 +67,11 @@ function summarize(text: string | undefined, max = 48): string {
 
 /** 内存 Store：未配置 MySQL 时的回落实现，亦用于测试。租户隔离同样强制生效。 */
 export class MemoryStore implements Store {
+  private durableStore = new MemoryRunStore();
+
+  durableRunStore() {
+    return this.durableStore;
+  }
   private messages: MsgRow[] = [];
   private sessions = new Map<string, SessionRow>();
   private audit: AuditEvent[] = [];
@@ -74,7 +84,6 @@ export class MemoryStore implements Store {
   private schedulerSettings = new Map<string, SchedulerSettings>();
   private sandboxSettings = new Map<string, SandboxSettingsRecord>();
   private mcpServers = new Map<string, Record<string, McpServerConfig>>();
-  private interactions = new Map<string, InteractionRecord>();
   private toolExecutions = new Map<string, ToolExecutionRecord>();
   private agentRunBindings = new Map<string, AgentRunRecord>();
   private agentRunEvents: AgentRunEvent[] = [];
@@ -242,26 +251,29 @@ export class MemoryStore implements Store {
   }
 
   async putInteraction(record: InteractionRecord): Promise<void> {
-    this.interactions.set(`${record.tenantId}/${record.id}`, cloneInteraction(record));
+    await this.durableStore.interactions.put(toRuntimeInteraction(record));
   }
 
   async getInteraction(tenantId: string, id: string): Promise<InteractionRecord | undefined> {
-    const record = this.interactions.get(`${tenantId}/${id}`);
-    return record ? cloneInteraction(record) : undefined;
+    const record = await this.durableStore.interactions.getById(tenantId, id);
+    return record ? fromRuntimeInteraction(record) : undefined;
   }
 
   async listPendingInteractions(ctx: RequestContext): Promise<InteractionRecord[]> {
-    return [...this.interactions.values()]
+    return (await this.durableStore.interactions.listByTenant(ctx.tenantId))
       .filter((record) => record.tenantId === ctx.tenantId && record.status === 'pending')
-      .map(cloneInteraction);
+      .map(fromRuntimeInteraction);
   }
 
   async resolveInteraction(record: InteractionRecord): Promise<boolean> {
-    const key = `${record.tenantId}/${record.id}`;
-    const current = this.interactions.get(key);
-    if (!current || current.status !== 'pending') return false;
-    this.interactions.set(key, cloneInteraction(record));
-    return true;
+    return this.durableStore.transaction(async (tx) => {
+      const current = await tx.interactions.get({
+        tenantId: record.tenantId, runId: record.runId, interactionId: record.id,
+      });
+      if (!current || current.status !== 'pending') return false;
+      await tx.interactions.put(toRuntimeInteraction(record));
+      return true;
+    });
   }
 
   async putToolExecutionIfAbsent(record: ToolExecutionRecord): Promise<boolean> {
@@ -304,13 +316,17 @@ export class MemoryStore implements Store {
 
   async getAgentRun(ctx: RequestContext, runId: string): Promise<AgentRunRecord | undefined> {
     const record = this.agentRunBindings.get(`${ctx.tenantId}/${runId}`);
-    return record && canReadAgentRun(ctx, record) ? structuredClone(record) : undefined;
+    if (record && canReadAgentRun(ctx, record)) return structuredClone(record);
+    const durable = await this.durableStore.get({ tenantId: ctx.tenantId, runId });
+    const projected = durable ? fromStoredRun(durable) : undefined;
+    return projected && canReadAgentRun(ctx, projected) ? projected : undefined;
   }
 
   async listAgentRuns(ctx: RequestContext, filter: AgentRunFilter = {}): Promise<AgentRunRecord[]> {
     const limit = Math.max(0, filter.limit ?? 50);
     const offset = Math.max(0, filter.offset ?? 0);
-    return [...this.agentRunBindings.values()]
+    const records = await this.allAgentRuns(ctx.tenantId);
+    return records
       .filter((record) => canReadAgentRun(ctx, record))
       .filter((record) => !filter.status || record.status === filter.status)
       .filter((record) => !filter.sessionId || record.sessionId === filter.sessionId)
@@ -320,7 +336,7 @@ export class MemoryStore implements Store {
   }
 
   async countAgentRuns(ctx: RequestContext, filter: AgentRunFilter = {}): Promise<number> {
-    return [...this.agentRunBindings.values()]
+    return (await this.allAgentRuns(ctx.tenantId))
       .filter((record) => canReadAgentRun(ctx, record))
       .filter((record) => !filter.status || record.status === filter.status)
       .filter((record) => !filter.sessionId || record.sessionId === filter.sessionId)
@@ -330,10 +346,11 @@ export class MemoryStore implements Store {
   async updateAgentRun(tenantId: string, runId: string, patch: AgentRunPatch): Promise<boolean> {
     const key = `${tenantId}/${runId}`;
     const current = this.agentRunBindings.get(key);
-    if (!current) return false;
+    if (!current) return this.durableStore.updateProductRun({ tenantId, runId }, productPatch(patch));
     const next: AgentRunRecord = {
       ...current,
       ...(patch.status ? { status: patch.status } : {}),
+      ...(patch.waitingReason !== undefined ? { waitingReason: patch.waitingReason ?? undefined } : {}),
       ...(patch.currentNode !== undefined ? { currentNode: patch.currentNode ?? undefined } : {}),
       ...(patch.stepCount !== undefined ? { stepCount: patch.stepCount } : {}),
       ...(patch.usage ? { usage: structuredClone(patch.usage) } : {}),
@@ -352,31 +369,106 @@ export class MemoryStore implements Store {
   }
 
   async appendAgentRunEvent(event: AgentRunEvent): Promise<void> {
-    this.agentRunEvents.push(structuredClone({ ...event, id: ++this.agentRunEventSeq }));
+    const durableRun = await this.durableStore.get({ tenantId: event.tenantId, runId: event.runId });
+    if (durableRun) {
+      const detail = event.detail && typeof event.detail === 'object' && !Array.isArray(event.detail)
+        ? structuredClone(event.detail as Record<string, unknown>)
+        : event.detail === undefined ? {} : { value: structuredClone(event.detail) };
+      await this.durableStore.events.append({
+        tenantId: event.tenantId, runId: event.runId, type: event.type,
+        attemptId: event.attemptId ?? 'product', turnNo: event.turnNo ?? durableRun.lastTurnNo,
+        kernel: 'pi', kernelVersion: event.kernelVersion ?? durableRun.kernelVersion,
+        correlationId: event.correlationId ?? `product:${event.type}`,
+        detail: {
+          ...detail,
+          ...(event.status ? { productStatus: event.status } : {}),
+          ...(event.type === 'recovery' && event.status ? { recoveryStatus: event.status } : {}),
+          ...(event.node ? { productNode: event.node } : {}),
+        },
+        createdAt: event.createdAt,
+      });
+      return;
+    }
+    const sequence = event.sequence ?? this.agentRunEvents
+      .filter((item) => item.tenantId === event.tenantId && item.runId === event.runId)
+      .reduce((max, item) => Math.max(max, item.sequence ?? 0), 0) + 1;
+    this.agentRunEvents.push(structuredClone({ ...event, id: ++this.agentRunEventSeq, sequence }));
   }
 
   async listAgentRunEvents(ctx: RequestContext, runId: string): Promise<AgentRunEvent[]> {
     if (!await this.getAgentRun(ctx, runId)) return [];
+    const durable = await this.durableStore.events.list({ tenantId: ctx.tenantId, runId });
+    if (durable.length) return durable.map((event) => ({
+      ...(() => {
+        const detail = event.detail && typeof event.detail === 'object' && !Array.isArray(event.detail)
+          ? event.detail as Record<string, unknown> : {};
+        return {
+          status: typeof detail.productStatus === 'string' ? detail.productStatus : undefined,
+          node: typeof detail.productNode === 'string' ? detail.productNode : undefined,
+        };
+      })(),
+      tenantId: event.tenantId,
+      runId: event.runId,
+      sequence: Number(event.sequence),
+      type: event.type,
+      attemptId: event.attemptId,
+      turnNo: event.turnNo,
+      kernel: event.kernel === 'pi' ? 'pi' : undefined,
+      kernelVersion: event.kernelVersion,
+      correlationId: event.correlationId,
+      detail: event.detail,
+      createdAt: event.createdAt,
+    }));
     return this.agentRunEvents
       .filter((event) => event.tenantId === ctx.tenantId && event.runId === runId)
       .sort((a, b) => (a.id ?? 0) - (b.id ?? 0))
       .map((event) => structuredClone(event));
   }
 
+  async listAgentRunAttempts(ctx: RequestContext, runId: string) {
+    if (!await this.getAgentRun(ctx, runId)) return [];
+    return (await this.durableStore.attempts.list({ tenantId: ctx.tenantId, runId })).map((attempt) => ({
+      attemptId: attempt.attemptId,
+      kernel: attempt.kernel,
+      kernelVersion: attempt.kernelVersion,
+      status: attempt.status,
+      errorCode: attempt.errorCode,
+      startedAt: attempt.startedAt,
+      completedAt: attempt.completedAt,
+    }));
+  }
+
+  async listAgentRunTurns(ctx: RequestContext, runId: string) {
+    if (!await this.getAgentRun(ctx, runId)) return [];
+    return (await this.durableStore.turns.listCommitted({ tenantId: ctx.tenantId, runId })).map((turn) => ({
+      attemptId: turn.attemptId,
+      turnNo: turn.turnNo,
+      commitId: turn.commitId,
+      transcriptVersion: Number(turn.transcriptVersion),
+      stopReason: turn.stopReason,
+      usage: turn.usage,
+      eventSequenceEnd: Number(turn.eventSequenceEnd),
+      committedAt: turn.committedAt,
+    }));
+  }
+
   async listAgentRunInteractions(ctx: RequestContext, runId: string): Promise<InteractionRecord[]> {
     if (!await this.getAgentRun(ctx, runId)) return [];
-    return [...this.interactions.values()]
-      .filter((record) => record.tenantId === ctx.tenantId && record.runId === runId)
-      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
-      .map(cloneInteraction);
+    return (await this.durableStore.interactions.list({ tenantId: ctx.tenantId, runId }))
+      .map(fromRuntimeInteraction);
   }
 
   async listAgentRunToolExecutions(ctx: RequestContext, runId: string): Promise<ToolExecutionRecord[]> {
     if (!await this.getAgentRun(ctx, runId)) return [];
-    return [...this.toolExecutions.values()]
+    const direct = [...this.toolExecutions.values()]
       .filter((record) => record.tenantId === ctx.tenantId && record.runId === runId)
       .sort((a, b) => a.startedAt.getTime() - b.startedAt.getTime())
       .map(cloneToolExecution);
+    const durable = (await this.durableStore.toolLedger.list({ tenantId: ctx.tenantId, runId }))
+      .map(fromDurableToolLedger);
+    const durableCalls = new Set(durable.map((record) => record.toolCallId));
+    return [...direct.filter((record) => !durableCalls.has(record.toolCallId)), ...durable]
+      .sort((left, right) => left.startedAt.getTime() - right.startedAt.getTime());
   }
 
   async acquireAgentRunLease(
@@ -434,7 +526,15 @@ export class MemoryStore implements Store {
   }
 
   async isAgentRunCancellationRequested(tenantId: string, runId: string): Promise<boolean> {
-    return Boolean(this.agentRunBindings.get(`${tenantId}/${runId}`)?.cancelRequestedAt);
+    return Boolean(this.agentRunBindings.get(`${tenantId}/${runId}`)?.cancelRequestedAt)
+      || this.durableStore.isCancellationRequested({ tenantId, runId });
+  }
+
+  private async allAgentRuns(tenantId: string): Promise<AgentRunRecord[]> {
+    const durable = (await this.durableStore.listRuns(tenantId)).map(fromStoredRun);
+    const bindingIds = new Set(this.agentRunBindings.keys());
+    return [...this.agentRunBindings.values(), ...durable.filter((record) =>
+      !bindingIds.has(`${record.tenantId}/${record.runId}`))];
   }
 
   async record(event: AuditEvent): Promise<void> {
@@ -668,17 +768,8 @@ export class MemoryStore implements Store {
     if (secret.action === 'replace') next.encryptedApiKey = secret.encryptedApiKey;
     if (secret.action === 'retain') {
       if (current?.encryptedApiKey) next.encryptedApiKey = current.encryptedApiKey;
-      if (current?.legacyApiKey) next.legacyApiKey = current.legacyApiKey;
     }
     this.sandboxSettings.set(ctx.tenantId, next);
-  }
-
-  async getSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<SandboxSettings | undefined> {
-    return (await this.getSandboxSettingsRecord(ctx))?.settings;
-  }
-
-  async setSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SandboxSettings): Promise<void> {
-    await this.setSandboxSettingsRecord(ctx, settings, { action: 'retain' });
   }
 
   async setSchedulerSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SchedulerSettings): Promise<void> {
@@ -708,7 +799,7 @@ export class MemoryStore implements Store {
     this.schedulerSettings.clear();
     this.sandboxSettings.clear();
     this.mcpServers.clear();
-    this.interactions.clear();
+    this.durableStore = new MemoryRunStore();
     this.toolExecutions.clear();
     this.agentRunBindings.clear();
     this.agentRunEvents = [];
@@ -721,8 +812,25 @@ function canReadAgentRun(ctx: RequestContext, record: AgentRunRecord): boolean {
   return ctx.role === 'platform_admin' || ctx.role === 'tenant_admin' || record.userId === ctx.userId;
 }
 
-function cloneInteraction(record: InteractionRecord): InteractionRecord {
-  return structuredClone(record);
+function toRuntimeInteraction(record: InteractionRecord): RuntimeInteractionRecord {
+  return {
+    ...structuredClone(record),
+    attemptId: record.attemptId ?? '',
+    turnNo: record.turnNo ?? 0,
+    payload: structuredClone(record.payload) as JsonValue,
+    resolution: record.resolution === undefined ? undefined : structuredClone(record.resolution) as JsonValue,
+  };
+}
+
+function fromRuntimeInteraction(record: RuntimeInteractionRecord): InteractionRecord {
+  return {
+    ...structuredClone(record),
+    userId: record.userId ?? '',
+    sessionId: record.sessionId ?? '',
+    attemptId: record.attemptId || undefined,
+    turnNo: record.turnNo || undefined,
+    expiresAt: record.expiresAt ?? new Date('9999-12-31T23:59:59.999Z'),
+  };
 }
 
 function toolExecutionKey(tenantId: string, runId: string, toolCallId: string): string {
@@ -731,4 +839,49 @@ function toolExecutionKey(tenantId: string, runId: string, toolCallId: string): 
 
 function cloneToolExecution(record: ToolExecutionRecord): ToolExecutionRecord {
   return structuredClone(record);
+}
+
+function fromStoredRun(run: StoredRun): AgentRunRecord {
+  return {
+    tenantId: run.tenantId, runId: run.runId, userId: run.actorId, sessionId: run.sessionId,
+    kernel: 'pi', kernelVersion: run.kernelVersion, status: run.status,
+    waitingReason: run.waitingReason, currentNode: run.currentNode, stepCount: run.stepCount ?? run.lastTurnNo,
+    usage: structuredClone(run.usage), errorMessage: run.errorMessage, startedAt: run.startedAt,
+    updatedAt: new Date(run.updatedAt), completedAt: run.completedAt,
+    cancelRequestedAt: run.cancelRequestedAt, leaseOwner: run.leaseOwner,
+    leaseToken: Number(run.leaseToken), leaseExpiresAt: run.leaseExpiresAt, createdAt: new Date(run.createdAt),
+  };
+}
+
+function productPatch(patch: AgentRunPatch): Partial<StoredRun> {
+  return {
+    ...(patch.status ? { status: patch.status } : {}),
+    ...(patch.waitingReason !== undefined ? { waitingReason: patch.waitingReason ?? undefined } : {}),
+    ...(patch.currentNode !== undefined ? { currentNode: patch.currentNode ?? undefined } : {}),
+    ...(patch.stepCount !== undefined ? { stepCount: patch.stepCount } : {}),
+    ...(patch.usage ? { usage: structuredClone(patch.usage) } : {}),
+    ...(patch.errorMessage !== undefined ? { errorMessage: patch.errorMessage ?? undefined } : {}),
+    ...(patch.startedAt !== undefined ? { startedAt: patch.startedAt ?? undefined } : {}),
+    updatedAt: patch.updatedAt ?? new Date(),
+    ...(patch.completedAt !== undefined ? { completedAt: patch.completedAt ?? undefined } : {}),
+    ...(patch.cancelRequestedAt !== undefined ? { cancelRequestedAt: patch.cancelRequestedAt ?? undefined } : {}),
+    ...(patch.clearLease ? { leaseOwner: undefined, leaseExpiresAt: undefined } : {}),
+  };
+}
+
+function fromDurableToolLedger(record: DurableToolLedgerUpdate): ToolExecutionRecord {
+  return {
+    tenantId: record.tenantId, runId: record.runId, sessionId: '', attemptId: record.attemptId,
+    turnNo: record.turnNo, toolCallId: record.toolCallId, logicalCallId: record.logicalCallId,
+    idempotencyKey: record.idempotencyKey, capability: record.capability,
+    externalCorrelationId: record.externalCorrelationId, resultDigest: record.resultDigest,
+    approvedInteractionId: record.approvedInteractionId, toolName: record.toolName,
+    argsDigest: record.argsDigest, status: record.status === 'pending_approval' ? 'started' : record.status,
+    result: record.result ? {
+      id: record.result.callId, content: record.result.content, isError: record.result.isError,
+    } : undefined,
+    startedAt: record.createdAt,
+    completedAt: record.status === 'completed' ? record.updatedAt : undefined,
+    updatedAt: record.updatedAt,
+  };
 }

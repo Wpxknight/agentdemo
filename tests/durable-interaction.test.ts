@@ -11,6 +11,43 @@ const owner: RequestContext = {
 };
 
 describe('DurableInteractionService', () => {
+  it('shares one interaction record with the Runtime repository and its transaction boundary', async () => {
+    const store = new MemoryStore();
+    const runtimeStore = store.durableRunStore();
+    const createdAt = new Date('2026-07-27T00:00:00.000Z');
+    const expiresAt = new Date('2026-07-28T00:00:00.000Z');
+    await runtimeStore.interactions.put({
+      tenantId: owner.tenantId, runId: 'run-shared', id: 'interaction-shared',
+      userId: owner.userId, sessionId: 'session-shared', attemptId: 'attempt-a', turnNo: 1,
+      kind: 'question', toolCallId: 'call-shared', status: 'pending', payload: { question: 'Continue?' },
+      expiresAt, createdAt,
+    });
+
+    await expect(store.getInteraction(owner.tenantId, 'interaction-shared')).resolves.toMatchObject({
+      runId: 'run-shared', userId: owner.userId, sessionId: 'session-shared', toolCallId: 'call-shared',
+      expiresAt, createdAt,
+    });
+
+    await store.putInteraction({
+      id: 'interaction-product', tenantId: owner.tenantId, userId: owner.userId,
+      sessionId: 'session-shared', runId: 'run-shared', attemptId: 'attempt-b', turnNo: 2,
+      kind: 'approval', toolCallId: 'call-product', payload: {}, status: 'pending', expiresAt, createdAt,
+    });
+    await expect(runtimeStore.interactions.get({
+      tenantId: owner.tenantId, runId: 'run-shared', interactionId: 'interaction-product',
+    })).resolves.toMatchObject({ userId: owner.userId, sessionId: 'session-shared', toolCallId: 'call-product' });
+
+    await expect(runtimeStore.transaction(async (tx) => {
+      await tx.interactions.put({
+        tenantId: owner.tenantId, runId: 'run-shared', id: 'interaction-rolled-back',
+        userId: owner.userId, sessionId: 'session-shared', attemptId: 'attempt-c', turnNo: 3,
+        kind: 'plan', toolCallId: 'call-rollback', status: 'pending', payload: {}, expiresAt, createdAt,
+      });
+      throw new Error('rollback');
+    })).rejects.toThrow('rollback');
+    await expect(store.getInteraction(owner.tenantId, 'interaction-rolled-back')).resolves.toBeUndefined();
+  });
+
   it('restores pending interactions after service restart and resolves once', async () => {
     const store = new MemoryStore();
     const first = new DurableInteractionService(store);
@@ -32,8 +69,11 @@ describe('DurableInteractionService', () => {
       value: { 'Continue?': ['Yes'] },
     })).resolves.toMatchObject({ status: 'resolved' });
     await expect(restarted.resolve(owner, pending.id, {
+      sessionId: 'session-a', runId: 'run-a', value: { 'Continue?': ['Yes'] },
+    })).resolves.toMatchObject({ status: 'resolved' });
+    await expect(restarted.resolve(owner, pending.id, {
       sessionId: 'session-a', runId: 'run-a', value: {},
-    })).rejects.toThrow('已处理');
+    })).rejects.toThrow('冲突');
   });
 
   it('rejects cross-tenant, cross-user, mismatched run, and expired resolution', async () => {

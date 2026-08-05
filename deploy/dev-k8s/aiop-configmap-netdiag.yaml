@@ -7,14 +7,14 @@ data:
   config.jsonc: |
     {
       "models": {
-        "local-placeholder": {
-          "protocol": "openai",
-          "baseURL": "http://127.0.0.1:9/v1",
+        "glm-5": {
+          "protocol": "anthropic",
+          "baseURL": "http://192.168.10.108:18317",
           "apiKey": "${OPENAI_API_KEY}",
-          "model": "placeholder"
+          "model": "glm-5"
         }
       },
-      "defaultModel": "local-placeholder",
+      "defaultModel": "glm-5",
       "skills": { "dir": "./skills" },
       "auth": {
         "provider": "local",

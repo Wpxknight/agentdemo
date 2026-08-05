@@ -1,16 +1,22 @@
-import { logger } from '../logger.js';
-import { resolveAgentRuntime } from '../agent/runtime.js';
-import { estimateCost } from '../model/cost.js';
-import { contextBudgetTokens } from '../agent/context.js';
-import { AutoDenyGate } from '../agent/approval.js';
-import { boundUserHomeNote } from '../sandbox/userhome.js';
-import { SANDBOX_SERVICE_NOTE } from '../sandbox/notes.js';
-import type { Runtime } from '../runtime.js';
-import { DEFAULT_TASK_MAX_RUN_MS, type ScheduledTask } from '../db/store.js';
-import { Scheduler, type TaskRunner } from './ticker.js';
 import { randomUUID } from 'node:crypto';
-import { DurableToolLedger } from '../agent/tool-ledger/store.js';
-import { SessionCommitter } from '../agent/services/session-committer.js';
+import type { Kysely } from 'kysely';
+import {
+  createRunDispatcher,
+  MysqlSchedulerStore,
+  SchedulerRunner,
+  scheduledFireId,
+  type BoundRunRecovery,
+  type SchedulerMysqlDatabase,
+  type SchedulerStore,
+  type ScheduledRunInput,
+} from '@aiop/scheduler-runtime';
+import { logger } from '../logger.js';
+import type { Runtime } from '../runtime.js';
+import { DEFAULT_TASK_MAX_RUN_MS, type AgentRunRecord, type ScheduledTask } from '../db/store.js';
+import { MysqlStore } from '../db/mysql.js';
+import type { TaskRunner } from './ticker.js';
+
+const log = logger.child({ mod: 'scheduler' });
 
 type Env = Record<string, string | undefined>;
 
@@ -19,82 +25,221 @@ export function shouldEmbedScheduler(env: Env = process.env): boolean {
   return value === 'true' || value === '1';
 }
 
+/** Creates a durable product Run. The scheduler never enters an agent/Pi execution loop. */
 export function createScheduledTaskRunner(rt: Runtime): TaskRunner {
-  return async (t: ScheduledTask) => {
-    logger.info({ taskId: t.id, tenantId: t.tenantId, sessionId: t.sessionId }, 'running scheduled task');
-    const taskCtx = { tenantId: t.tenantId, userId: t.userId, role: 'user' as const };
-    // 最长运行时长兜底：无人值守没人能按终止，超时中止并记录失败（默认 4 小时，租户可在设置页调整）。
-    const maxRunMs = (await rt.store.getSchedulerSettings({ tenantId: t.tenantId }))?.maxRunMs ?? DEFAULT_TASK_MAX_RUN_MS;
-    const abort = new AbortController();
-    const timer = setTimeout(
-      () => abort.abort(new Error(`定时任务超过最长运行时长（${Math.round(maxRunMs / 60000)} 分钟），已中止`)),
-      maxRunMs,
-    );
-    timer.unref?.();
-    try {
-      return await runScheduledTask(rt, t, taskCtx, abort.signal);
-    } finally {
-      clearTimeout(timer);
-    }
+  return async (task: ScheduledTask) => {
+    const dispatcher = createRunDispatcher(rt.durableRunRuntime, scheduledRunLookup(rt));
+    const fireTime = new Date();
+    const result = await dispatcher.startScheduledRun({
+      taskId: String(task.id),
+      fireId: scheduledFireId(String(task.id), fireTime),
+      fireTime,
+      identity: { tenantId: task.tenantId, actorId: task.userId, roles: ['user'] },
+      sessionId: task.sessionId,
+      input: [{ role: 'user', text: task.task }],
+      execution: { unattended: true, preApproved: task.preApproved },
+      limits: {
+        deadlineAt: new Date(fireTime.getTime() + (
+          (await rt.store.getSchedulerSettings({ tenantId: task.tenantId }))?.maxRunMs ?? DEFAULT_TASK_MAX_RUN_MS
+        )),
+      },
+    });
+    return {
+      status: result.result.status === 'succeeded' ? 'success' : 'error',
+      detail: JSON.stringify({
+        runId: result.runId, status: result.result.status, text: result.result.text,
+        error: result.result.error, usage: result.result.usage,
+      }),
+    };
   };
 }
 
-async function runScheduledTask(
-  rt: Runtime,
-  t: ScheduledTask,
-  taskCtx: { tenantId: string; userId: string; role: 'user' },
-  signal: AbortSignal,
-): Promise<{ status: 'success'; detail: string; steps: number }> {
-  const prior = await rt.store.listMessages(taskCtx, t.sessionId);
-  const runId = randomUUID();
-  const startedAt = Date.now();
-  // 用户绑定了主目录：与交互链路一致，告知模型挂载点、交付物默认写入持久化目录。
-  const userHomeNote = rt.sandboxSettings?.enabled && rt.userHome
-    ? await boundUserHomeNote(rt.store, t.tenantId, t.userId, rt.userHome)
-    : '';
-  const result = await resolveAgentRuntime(rt.agentRuntime).run({
-    runId,
-    model: rt.model,
-    tools: rt.tools,
-    policy: t.preApproved ? rt.policyPreApproved : rt.policy,
-    filterToolDefs: (defs) => rt.permissionRules?.filterToolDefs(defs) ?? defs,
-    hooks: rt.hooks,
-    toolLedger: new DurableToolLedger(rt.store),
-    approval: new AutoDenyGate(), // 无人值守：未预批准的审批一律拒绝
-    unattended: true, // 系统提示切换为“确认类操作跳过并汇报”，不对着空气等确认
-    // 技能摘要按任务归属用户过滤（他人私有技能不可见），与交互链路同一套可见性规则。
-    system: [
-      rt.skillRegistry?.summariesFor({ userId: t.userId, role: taskCtx.role }) ?? rt.systemExtra,
-      rt.sandboxSettings?.enabled ? SANDBOX_SERVICE_NOTE : '',
-      userHomeNote,
-    ].filter(Boolean).join('\n\n'),
-    ctx: { sessionId: t.sessionId, ...taskCtx },
-    messages: prior,
-    task: t.task,
-    // 定时任务复用同一会话、历史只增不减，同样必须受上下文预算约束，否则迟早超窗 400。
-    contextBudgetTokens: contextBudgetTokens(rt.modelConfig?.contextWindowTokens),
-    keepImages: rt.modelConfig?.contextKeepImages,
-    signal,
-  });
-  await new SessionCommitter(rt.store).commitSuccess({
-    ctx: taskCtx,
-    sessionId: t.sessionId,
-    priorMessageCount: prior.length,
-    result,
-    durationMs: Math.max(0, Date.now() - startedAt),
-  });
-  await rt.audit.record({
-    kind: 'usage',
-    action: 'scheduled',
-    tenantId: t.tenantId,
-    sessionId: t.sessionId,
-    detail: { ...result.usage, steps: result.steps, taskId: t.id, cost: estimateCost(result.usage, rt.modelConfig?.pricing) },
-  });
-  return { status: 'success' as const, detail: result.text.slice(0, 4000), steps: result.steps };
+export interface RuntimeSchedulerOptions {
+  /** Explicit package-store injection is reserved for tests; production derives MySQL from Runtime. */
+  store?: SchedulerStore;
+  workerId?: string;
+  intervalMs?: number;
+  batch?: number;
+  leaseMs?: number;
+  retryDelayMs?: number;
+  now?: () => Date;
 }
 
-export function startRuntimeScheduler(rt: Runtime): Scheduler {
-  const scheduler = new Scheduler({ store: rt.store, runner: createScheduledTaskRunner(rt) });
+export interface RuntimeScheduler {
+  tick(now?: Date): Promise<number>;
+  start(): void;
+  stop(): Promise<void>;
+}
+
+export function createRuntimeScheduler(
+  rt: Runtime,
+  options: RuntimeSchedulerOptions = {},
+): RuntimeScheduler {
+  const store = options.store ?? productionSchedulerStore(rt);
+  const runner = new SchedulerRunner({
+    store,
+    dispatcher: createRunDispatcher(rt.durableRunRuntime, scheduledRunLookup(rt)),
+    boundRecovery: durableBoundRunRecovery(rt),
+    workerId: options.workerId ?? `scheduler-${randomUUID()}`,
+    leaseMs: options.leaseMs,
+    retryDelayMs: options.retryDelayMs,
+    prepareRun: async (fire, now) => ({
+      limits: {
+        deadlineAt: new Date(now.getTime() + (
+          (await rt.store.getSchedulerSettings({ tenantId: fire.identity.tenantId }))?.maxRunMs ?? DEFAULT_TASK_MAX_RUN_MS
+        )),
+      },
+    }),
+  });
+  return new RuntimeSchedulerLoop(runner, options);
+}
+
+export function startRuntimeScheduler(
+  rt: Runtime,
+  options: RuntimeSchedulerOptions = {},
+): RuntimeScheduler {
+  const scheduler = createRuntimeScheduler(rt, options);
   scheduler.start();
   return scheduler;
+}
+
+class RuntimeSchedulerLoop implements RuntimeScheduler {
+  private readonly intervalMs: number;
+  private readonly batch: number;
+  private readonly now: () => Date;
+  private timer?: ReturnType<typeof setInterval>;
+  private running = false;
+  private stopped = false;
+  private readonly lifecycle = new AbortController();
+  private inFlight?: Promise<number>;
+
+  constructor(
+    private readonly runner: SchedulerRunner,
+    options: RuntimeSchedulerOptions,
+  ) {
+    this.intervalMs = options.intervalMs ?? 30_000;
+    this.batch = options.batch ?? 10;
+    this.now = options.now ?? (() => new Date());
+  }
+
+  tick(now = this.now()): Promise<number> {
+    if (this.stopped) return Promise.resolve(0);
+    if (this.inFlight) return this.inFlight;
+    const execution = this.runner.tick(now, this.batch, this.lifecycle.signal)
+      .finally(() => {
+        if (this.inFlight === execution) this.inFlight = undefined;
+      });
+    this.inFlight = execution;
+    return execution;
+  }
+
+  start(): void {
+    if (this.timer || this.stopped) return;
+    this.timer = setInterval(() => {
+      if (this.running) return;
+      this.running = true;
+      void this.tick()
+        .catch((error) => log.error({ err: String(error) }, 'tick error'))
+        .finally(() => { this.running = false; });
+    }, this.intervalMs);
+    this.timer.unref?.();
+    log.info({ intervalMs: this.intervalMs }, 'scheduler started');
+  }
+
+  async stop(): Promise<void> {
+    if (this.stopped) {
+      await this.inFlight?.catch(() => undefined);
+      return;
+    }
+    this.stopped = true;
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+    this.lifecycle.abort(new Error('scheduler stopped'));
+    await this.inFlight?.catch(() => undefined);
+  }
+}
+
+function productionSchedulerStore(rt: Runtime): SchedulerStore {
+  if (!(rt.store instanceof MysqlStore)) {
+    throw new Error('MysqlStore is required for production scheduler assembly; inject SchedulerStore explicitly in tests');
+  }
+  return new MysqlSchedulerStore(
+    rt.store.database() as unknown as Kysely<SchedulerMysqlDatabase>,
+  );
+}
+
+function scheduledRunLookup(rt: Runtime) {
+  return {
+    findScheduledRun: async (input: ScheduledRunInput) => {
+      const binding = await rt.store.getAgentRunBinding(input.identity.tenantId, input.fireId);
+      if (!binding || binding.userId !== input.identity.actorId || binding.sessionId !== input.sessionId) {
+        return undefined;
+      }
+      const record = await rt.store.getAgentRun({
+        tenantId: input.identity.tenantId, userId: input.identity.actorId, role: 'user',
+      }, input.fireId);
+      if (!record || record.status === 'queued' || record.status === 'running') return undefined;
+      return { runId: record.runId, result: persistedRunResult(record) };
+    },
+  };
+}
+
+function durableBoundRunRecovery(rt: Runtime): BoundRunRecovery {
+  return {
+    async inspect(fire, now) {
+      if (fire.fireId !== fire.runId) {
+        throw new Error(`scheduled fire deterministic Run mismatch: ${fire.fireId}`);
+      }
+      const binding = await rt.store.getAgentRunBinding(fire.identity.tenantId, fire.runId);
+      if (
+        !binding
+        || binding.tenantId !== fire.identity.tenantId
+        || binding.userId !== fire.identity.actorId
+        || binding.sessionId !== fire.sessionId
+        || binding.runId !== fire.runId
+      ) {
+        throw new Error(`scheduled fire Durable Run binding mismatch: ${fire.fireId}`);
+      }
+      const record = await rt.store.getAgentRun({
+        tenantId: fire.identity.tenantId, userId: fire.identity.actorId, role: 'user',
+      }, fire.runId);
+      if (!record) throw new Error(`scheduled fire Durable Run not found: ${fire.fireId}`);
+      if (
+        record.status === 'waiting'
+        || record.status === 'succeeded'
+        || record.status === 'failed'
+        || record.status === 'cancelled'
+        || record.status === 'recovery_required'
+      ) {
+        return { kind: 'terminal', result: persistedRunResult(record) };
+      }
+      if (record.leaseExpiresAt && record.leaseExpiresAt.getTime() > now.getTime()) {
+        return { kind: 'active' };
+      }
+      return { kind: 'recoverable' };
+    },
+    async resume(fire, signal) {
+      const handle = await rt.durableRunRuntime.resume({
+        identity: fire.identity,
+        runId: fire.runId,
+        signal,
+      });
+      return handle.result();
+    },
+  };
+}
+
+function persistedRunResult(record: AgentRunRecord) {
+  return {
+    runId: record.runId,
+    status: record.status as 'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'recovery_required',
+    usage: record.usage,
+    ...(record.errorMessage ? {
+      error: {
+        code: record.status === 'recovery_required' ? 'TOOL_RESULT_UNKNOWN' as const : 'MODEL_PROVIDER_ERROR' as const,
+        message: record.errorMessage,
+        retryable: false,
+      },
+    } : {}),
+  };
 }

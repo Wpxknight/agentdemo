@@ -6,6 +6,8 @@
       "baseURL": "https://api.anthropic.com",
       "apiKey": "${ANTHROPIC_API_KEY}",
       "model": "claude-opus-4-8",
+      // 自签名/不受信任证书的内网 HTTPS 服务可设 true；公网服务请保持 false/不配置。
+      "allowInsecureTls": false,
       // 推理深度：none 关闭思考；low|medium|high|xhigh|max 对应 Anthropic effort。
       // 缺省=思考开启走模型默认深度。也可在设置页调整。仅 anthropic 协议生效。
       "effort": "medium",
@@ -49,11 +51,10 @@
   //   "allowedDomains": ["kubernetes.io", "docs.example.com"]
   //   // "allowPrivate": true  // 仅内网文档站点时开启
   // },
-  // 技能目录。summaryBudget：技能摘要注入 system prompt 的字符预算（默认 4000）。
+  // 技能目录。
   // sandboxEnv：把稳定环境信息（如平台地址）注入会话沙箱环境变量；凭据类键（PASSWORD/TOKEN/SECRET 等）会被 schema 拒绝。
   "skills": {
-    "dir": "./skills"
-    // "summaryBudget": 4000,
+    "dir": "./skills",
     // "sandboxEnv": { "AIOS_BASE_URL": "http://10.10.72.20:30001/paas-web", "AIOS_CLIENT_ID": "..." }
   },
   // 认证：local（默认，用户名口令）或 oidc（SSO）。HTTP 服务接入后生效

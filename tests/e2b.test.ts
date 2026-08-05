@@ -6,6 +6,7 @@ const h = vi.hoisted(() => ({
   runCode: vi.fn(),
   runCommand: vi.fn(),
   readFile: vi.fn(),
+  writeFile: vi.fn(),
   setTimeout: vi.fn(),
   kill: vi.fn(),
 }));
@@ -14,7 +15,7 @@ vi.mock('@e2b/code-interpreter', () => {
   class Sandbox {
     readonly sandboxId = 'sb-e2b';
     readonly commands = { run: h.runCommand };
-    readonly files = { read: h.readFile };
+    readonly files = { read: h.readFile, write: h.writeFile };
     async runCode(code: string, opts?: unknown) {
       return h.runCode(code, opts);
     }
@@ -32,7 +33,7 @@ vi.mock('@e2b/code-interpreter', () => {
   return { Sandbox };
 });
 
-const { E2bProvider } = await import('../src/sandbox/e2b.js');
+const { E2bProvider } = await import('../packages/sandbox-runtime/src/e2b.js');
 
 beforeEach(() => {
   h.created.length = 0;
@@ -40,11 +41,13 @@ beforeEach(() => {
   h.runCode.mockReset();
   h.runCommand.mockReset();
   h.readFile.mockReset();
+  h.writeFile.mockReset();
   h.setTimeout.mockReset();
   h.kill.mockReset();
   h.runCode.mockResolvedValue({ logs: { stdout: [], stderr: [] } });
   h.runCommand.mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 });
   h.readFile.mockResolvedValue(Uint8Array.from([1, 2, 3]));
+  h.writeFile.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -79,6 +82,19 @@ describe('E2bProvider standard SDK mode', () => {
     });
     expect(h.created[0]).not.toHaveProperty('placement');
     expect(h.created[0]).not.toHaveProperty('lifecycleUrl');
+  });
+
+  it('preserves network acquisition and structured command options', async () => {
+    h.runCommand.mockResolvedValue({ stdout: 'ok', stderr: '', exitCode: 0 });
+    const handle = await new E2bProvider({ apiKey: 'key' }).create({
+      key: 'structured', network: 'none', cpu: 2, memoryMb: 2048,
+    });
+    await handle.executeCommand!({ program: 'node', args: ['a b'], cwd: '/workspace', env: { TOKEN: 'x' }, timeoutMs: 1234 });
+
+    expect(h.created[0]).toMatchObject({ allowInternetAccess: false, cpu: 2, memoryMb: 2048 });
+    expect(h.runCommand).toHaveBeenCalledWith("'node' 'a b'", expect.objectContaining({
+      cwd: '/workspace', envs: { TOKEN: 'x' }, timeoutMs: 1234,
+    }));
   });
 
   it('passes the outer apiKey into explicit AIOS mode', async () => {
@@ -175,6 +191,9 @@ describe('E2bProvider standard SDK mode', () => {
     const output: unknown[] = [];
     const p = new E2bProvider({ apiKey: 'key' });
     const handle = await p.create({ key: 'session:dev' });
+    expect(handle.workspacePath?.('skills/demo')).toBe('/workspace/skills/demo');
+    expect(handle.supportsSecretFiles).toBe(true);
+    expect(() => handle.workspacePath?.('../escape')).toThrow('escapes sandbox root');
 
     await expect(handle.runCommand('exit 7', {
       timeoutMs: 4321,
@@ -193,5 +212,18 @@ describe('E2bProvider standard SDK mode', () => {
     await handle.kill();
     expect(h.setTimeout).toHaveBeenLastCalledWith(9876);
     expect(h.kill).toHaveBeenCalledOnce();
+  });
+
+  it('precreates credential files privately and fails when chmod cannot be confirmed', async () => {
+    h.runCommand
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '', stderr: 'denied', exitCode: 1 });
+    const handle = await new E2bProvider({ apiKey: 'key' }).create({ key: 'session:dev' });
+
+    await expect(handle.writeFile?.('/workspace/secret/token.json', Uint8Array.from([1]), { mode: 0o600 }))
+      .rejects.toThrow('denied');
+
+    expect(h.runCommand.mock.calls[0]?.[0]).toContain('install -m 600');
+    expect(h.writeFile).toHaveBeenCalledOnce();
   });
 });

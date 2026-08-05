@@ -1,0 +1,223 @@
+import { createHash } from 'node:crypto';
+import type { JsonValue, ToolExecutionOutcome, ToolRuntime } from '@aiop/control-contracts';
+import {
+  GovernedToolFactory,
+  type GovernedToolDefinition,
+  type ResourceConcurrency,
+  type ToolInteractionStore,
+  type ToolLedgerStore,
+} from '@aiop/pi-runtime';
+import type { StreamEvent, ToolDef } from '../llm/types.js';
+import type { ApprovalGate } from '../agent/approval.js';
+import type { PolicyMiddleware } from '../agent/policy.js';
+import type { ToolContext, ToolRegistry } from '../agent/tools.js';
+import { logger } from '../logger.js';
+
+const GOVERNED_INPUT_BINDING = '__aiopGovernedInput';
+
+export interface AIOPToolRuntimeOptions {
+  tools: ToolRegistry;
+  governedTools?: readonly GovernedToolDefinition[];
+  policy: PolicyMiddleware;
+  ctx: ToolContext;
+  onEvent?: (event: StreamEvent) => void;
+  approval?: ApprovalGate;
+  filterToolDefs?: (definitions: ToolDef[]) => ToolDef[];
+  durableInteractions?: { wait(id: string): Promise<unknown> };
+  askUser?: ToolContext['askUser'];
+  requestPlanApproval?: ToolContext['requestPlanApproval'];
+  runGuard?: () => Promise<void>;
+}
+
+export function createAIOPToolRuntime(
+  options: AIOPToolRuntimeOptions,
+  ledger: ToolLedgerStore,
+  concurrency: ResourceConcurrency,
+  interactions?: ToolInteractionStore,
+  commitLedgerUpdates = false,
+): ToolRuntime {
+  const durableGovernance = Boolean(interactions);
+  const unified = options.tools.unified((call) => ({
+    ...options.ctx,
+    ...(options.onEvent ? {
+      onOutput: ({ stream, text }: { stream: 'stdout' | 'stderr'; text: string }) =>
+        options.onEvent?.({ type: 'tool_output', toolId: call.id, stream, text }),
+      emitEvent: options.onEvent,
+    } : {}),
+    ...(options.askUser ? { askUser: options.askUser } : {}),
+    ...(options.requestPlanApproval ? { requestPlanApproval: options.requestPlanApproval } : {}),
+  }));
+  const sources = [...unified.definitions(), ...(options.governedTools ?? [])];
+  const allowed = new Set((options.filterToolDefs
+    ? options.filterToolDefs(sources.map(({ name, description, inputSchema, capability }) => ({
+        name, description, inputSchema, capability,
+      })))
+    : sources).map((definition) => definition.name));
+  const definitions: GovernedToolDefinition[] = sources
+    .filter((definition) => allowed.has(definition.name))
+    .map((definition) => ({
+    ...definition,
+    interactionKind: durableGovernance ? interactionKind(definition.name) : undefined,
+    execute: async (call, context) => {
+      await options.runGuard?.();
+      const result = await definition.execute(call, context);
+      await options.runGuard?.();
+      return { content: result.content, isError: result.isError };
+    },
+    }));
+  const runtime = new GovernedToolFactory({
+    ledger,
+    concurrency,
+    interactions,
+    audit: {
+      record: async (event) => {
+        logger.info({ mod: 'pi-tool-audit', ...event }, 'governed tool outcome');
+      },
+      failure: (error, event) => {
+        logger.warn({
+          mod: 'pi-tool-audit', err: safeAuditError(error),
+          tenantId: event.tenantId, runId: event.runId,
+          toolCallId: event.toolCallId, status: event.status,
+        }, 'governed tool audit sink failed');
+      },
+    },
+    policy: {
+      check: async (call) => {
+        await options.runGuard?.();
+        const decision = await options.policy.check({
+          id: call.id, name: call.name, args: call.arguments,
+        }, options.ctx);
+        return {
+          allowed: !decision.blocked,
+          reason: decision.reason,
+          needsApproval: decision.needApproval,
+          resourceKey: resourceKey(call.name, call.arguments),
+        };
+      },
+    },
+    approval: {
+      request: async (call, context, decision) => {
+        if (!decision.needsApproval) return { approved: true };
+        if (!durableGovernance) {
+          const approved = options.approval
+            ? await options.approval.request({
+                call: { id: call.id, name: call.name, args: call.arguments },
+                reason: decision.reason,
+                ctx: options.ctx,
+              })
+            : false;
+          return { approved };
+        }
+        const interactionId = createHash('sha256')
+          .update(`${context.runId}\0approval\0${call.id}`)
+          .digest('hex');
+        return {
+          approved: false,
+          pending: true,
+          interactionId,
+          payload: {
+            call: { id: call.id, name: call.name, args: call.arguments },
+            reason: decision.reason ?? null,
+          },
+        };
+      },
+    },
+  }).create(definitions);
+
+  return {
+    execute: async (call, context): Promise<ToolExecutionOutcome> => {
+      const normalizedResolution = context.interactionResolution && options.durableInteractions
+        ? await options.durableInteractions.wait(context.interactionResolution.interactionId)
+        : undefined;
+      const outcome = await runtime.execute(call, normalizedResolution === undefined ? context : {
+        ...context,
+        interactionResolution: {
+          ...context.interactionResolution!,
+          value: toJsonValue(normalizedResolution),
+        },
+      });
+      if (commitLedgerUpdates) {
+        for (const update of outcome.ledgerUpdates ?? []) await commitLedger(ledger, update);
+      }
+      if (!outcome.interactionUpdates?.length) return outcome;
+      return {
+        ...outcome,
+        interactionUpdates: outcome.interactionUpdates.map((interaction) => {
+          const base = {
+            id: interaction.id,
+            tenantId: interaction.tenantId,
+            userId: interaction.userId ?? context.identity.actorId,
+            sessionId: interaction.sessionId ?? context.sessionId ?? '',
+            runId: interaction.runId,
+            createdAt: interaction.createdAt.toISOString(),
+          };
+          const payload = interaction.kind === 'plan'
+            ? {
+                ...base,
+                questions: [{
+                  question: `请审批变更方案：${planSummary(interaction.payload)}`,
+                  header: '变更审批',
+                  options: [{ label: '批准' }, { label: '拒绝' }],
+                }],
+                plan: interaction.payload,
+                [GOVERNED_INPUT_BINDING]: interaction.payload,
+              }
+            : interaction.kind === 'question' ? {
+                ...asObject(interaction.payload),
+                ...base,
+                [GOVERNED_INPUT_BINDING]: interaction.payload,
+              } : { ...base, ...asObject(interaction.payload) };
+          return {
+            ...interaction,
+            userId: interaction.userId ?? context.identity.actorId,
+            sessionId: interaction.sessionId ?? context.sessionId,
+            payload,
+            expiresAt: interaction.expiresAt
+              ?? new Date(interaction.createdAt.getTime() + 24 * 60 * 60 * 1000),
+          };
+        }),
+      };
+    },
+  };
+}
+
+async function commitLedger(
+  ledger: ToolLedgerStore,
+  update: import('@aiop/control-contracts').DurableToolLedgerUpdate,
+): Promise<void> {
+  const existing = await ledger.get(update);
+  if (existing) await ledger.update(update);
+  else await ledger.putIfAbsent(update);
+}
+
+function safeAuditError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function interactionKind(name: string): 'question' | 'plan' | undefined {
+  if (name === 'ask_user') return 'question';
+  if (name === 'submit_change_plan') return 'plan';
+  return undefined;
+}
+
+function resourceKey(toolName: string, args: JsonValue): string | undefined {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return undefined;
+  for (const key of ['resourceKey', 'cluster', 'namespace', 'resource', 'target']) {
+    const value = args[key];
+    if (typeof value === 'string' && value.trim()) return `${toolName}:${key}:${value.trim()}`;
+  }
+  return undefined;
+}
+
+function toJsonValue(value: unknown): JsonValue {
+  return JSON.parse(JSON.stringify(value ?? null)) as JsonValue;
+}
+
+function asObject(value: JsonValue): Record<string, JsonValue> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function planSummary(value: JsonValue): string {
+  const summary = asObject(value).summary;
+  return typeof summary === 'string' ? summary : '';
+}

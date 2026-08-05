@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { CommandDesktopProvider } from '../src/sandbox/command-desktop.js';
-import { OpenSandboxDesktopProvider } from '../src/sandbox/opensandbox-desktop.js';
-import type { SandboxManagerLike } from '../src/sandbox/lifecycle.js';
-import type { ExecResult, SandboxHandle, SandboxSpec } from '../src/sandbox/types.js';
+import { CommandDesktopProvider } from '../packages/sandbox-runtime/src/command-desktop.js';
+import { OpenSandboxDesktopProvider } from '../packages/sandbox-runtime/src/opensandbox-desktop.js';
+import type { SandboxManagerLike } from '../packages/sandbox-runtime/src/lifecycle.js';
+import type { ExecResult, SandboxHandle, SandboxSpec } from '../packages/sandbox-runtime/src/types.js';
 
 const SCREENSHOT = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
 

@@ -1,60 +1,89 @@
 import { logger } from './logger.js';
 import { SandboxConfigSchema, type Config, type SandboxConfig } from './config/schema.js';
-import { createModel, type ModelConfig as FactoryModelConfig } from './model/factory.js';
-import type { ChatModel } from './model/types.js';
+import { createModel, type ModelConfig as FactoryModelConfig } from './llm/factory.js';
+import { llmTlsHeaders } from './llm/insecure-tls.js';
+import type { ChatModel } from './llm/types.js';
 import { ToolRegistry } from './agent/tools.js';
 import { AllowAllPolicy, OpsPolicy } from './agent/policy.js';
 import type { PolicyMiddleware } from './agent/policy.js';
 import { PermissionRules } from './agent/rules.js';
 import { HookRunner } from './agent/hooks.js';
 import { PlanApprovalState } from './agent/plan.js';
-import { AgentRuntime, createConfiguredAgentRuntime } from './agent/runtime.js';
-import { SandboxManager, type SandboxManagerLike } from './sandbox/lifecycle.js';
+import type {
+  DurableRunRuntime,
+  IdentityContext,
+  ResolvedInteraction,
+  RunExecutionProfile,
+  ToolRuntime,
+} from '@aiop/control-contracts';
+import type { DurableProductRunStore, ToolLedgerApprovalClaim, ToolLedgerRepository } from '@aiop/pi-runtime';
+import {
+  InMemoryCredentialStore, createModels, type Api, type Model as PiModel, type Provider as PiProvider,
+} from '@earendil-works/pi-ai';
+import { builtinProviders } from '@earendil-works/pi-ai/providers/all';
+import {
+  bridgeGovernedTools,
+  attachGovernedToolFacts,
+  createMemoryDurablePiRuntime,
+  createMysqlDurablePiRuntime,
+  GovernedToolOutcomeError,
+  FifoModelConcurrencyController,
+  ResourceConcurrencyController,
+  type PiSessionStore,
+  type GovernedToolDefinition,
+  type EventCodecOptions,
+} from '@aiop/pi-runtime';
+import { SandboxManager, type SandboxManagerLike } from '@aiop/sandbox-runtime';
 import {
   SandboxRuntimeController,
   type SandboxGenerationInput,
-} from './sandbox/runtime-controller.js';
-import { E2bProvider } from './sandbox/e2b.js';
-import { OpenSandboxProvider } from './sandbox/opensandbox.js';
-import { LocalSandboxProvider } from './sandbox/local.js';
-import type { SandboxProvider } from './sandbox/types.js';
-import { normalizeUserHomeDir } from './sandbox/userhome.js';
-import { WarmPool } from './sandbox/warmpool.js';
-import { E2bDesktopProvider } from './sandbox/e2b-desktop.js';
-import { LocalDesktopProvider } from './sandbox/local-desktop.js';
-import { OpenSandboxDesktopProvider } from './sandbox/opensandbox-desktop.js';
-import { CommandDesktopProvider } from './sandbox/command-desktop.js';
-import type { DesktopHandle, DesktopProvider } from './sandbox/desktop.js';
+} from '@aiop/sandbox-runtime';
+import { E2bProvider } from '@aiop/sandbox-runtime';
+import { OpenSandboxProvider } from '@aiop/sandbox-runtime';
+import { LocalSandboxProvider } from '@aiop/sandbox-runtime';
+import type { SandboxProvider } from '@aiop/sandbox-runtime';
+import { normalizeUserHomeDir } from '@aiop/sandbox-runtime';
+import { WarmPool } from '@aiop/sandbox-runtime';
+import { E2bDesktopProvider } from '@aiop/sandbox-runtime';
+import { LocalDesktopProvider } from '@aiop/sandbox-runtime';
+import { OpenSandboxDesktopProvider } from '@aiop/sandbox-runtime';
+import { CommandDesktopProvider } from '@aiop/sandbox-runtime';
+import type { DesktopProvider } from '@aiop/sandbox-runtime';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildSandboxTools } from './tools/builtin.js';
-import type { SpecResolver } from './sandbox/acquisition.js';
+import type { SpecResolver } from '@aiop/sandbox-runtime';
 import { buildExportTool } from './tools/export.js';
 import { DownloadStore } from './server/downloads.js';
-import { buildSkillTools } from './tools/skill.js';
+import { buildSkillTools } from './tools/skill/index.js';
 import { buildSandboxProfileTools } from './tools/sandbox-profiles.js';
 import { buildBrowserTools } from './tools/browser.js';
-import { McpManager } from './mcp/manager.js';
-import { connectMcp } from './mcp/client.js';
+import {
+  McpManager,
+  connectMcp,
+  type McpCredentialProvider,
+  type McpCredentials,
+  type McpServerConfig,
+} from '@aiop/mcp-runtime';
 import { SkillRegistry } from './skill/registry.js';
+import { MysqlSkillMutationLock, skillImportPermitPoolSize } from './skill/lock.js';
 import { ClusterRegistry } from './config/clusters.js';
 import { buildKubectlTool } from './tools/kubectl.js';
 import { LogAuditSink } from './audit/sink.js';
 import type { AuditSink } from './audit/sink.js';
 import { readMysqlConfig } from './config/mysql.js';
-import { createStore } from './db/index.js';
+import { createMysqlPool, createStore } from './db/index.js';
 import { MysqlStore } from './db/mysql.js';
-import { MemoryCheckpointStore, MysqlCheckpointSaver } from './agent/checkpoint/mysql.js';
 import type { LlmSettings, SandboxSettings, Store } from './db/store.js';
 import {
   SandboxSettingsPersistence,
   credentialTargetForSandboxSettings,
   parseSandboxSettings,
-  parseStoredSandboxSettings,
+  sandboxConfigToSettings,
   sandboxSettingsToConfig,
   type LoadedSandboxSettings,
   type SandboxApiKeyUpdate,
-} from './sandbox/settings.js';
+} from '@aiop/sandbox-runtime';
 import { createSettingsSecretBox } from './security/secret-box.js';
 import { buildScheduleTools } from './tools/schedule.js';
 import { buildTodoTool } from './tools/todo.js';
@@ -63,23 +92,24 @@ import { buildAskUserTool } from './tools/ask-user.js';
 import { buildChangePlanTool } from './tools/change-plan.js';
 import {
   findSandboxProfile,
-  publicSandboxProfiles,
   resolveSandboxProfiles,
   sandboxSpecForProfile,
   selectBrowserProfile,
   selectDefaultProfile,
-} from './sandbox/profiles.js';
-import type { PublicSandboxProfile, SandboxProfile } from './sandbox/profiles.js';
+} from '@aiop/sandbox-runtime';
+import type { PublicSandboxProfile } from '@aiop/sandbox-runtime';
 import { LocalAuthProvider } from './auth/local.js';
 import { OidcAuthProvider } from './auth/oidc.js';
 import { AiosAuthProvider } from './auth/aios.js';
+import { createAIOPToolRuntime } from './tools/governance.js';
 import { UserCredentials } from './auth/credentials.js';
+import { buildSystemPrompt } from './prompt.js';
 import type { AuthProvider } from './auth/provider.js';
 import type { RequestContext } from './auth/types.js';
 import {
   AiosTemplateCatalog,
   sandboxProfilesFromAiosCatalog,
-} from './sandbox/aios-template-catalog.js';
+} from '@aiop/sandbox-runtime';
 
 /** 当前生效的非敏感 Sandbox 设置（默认 Key 绝不进入该结构）。 */
 export type SandboxConnectionInfo = SandboxSettings;
@@ -112,8 +142,12 @@ export interface SandboxSettingsUpdate {
 }
 
 export interface Runtime {
-  /** Agent 执行 facade；当前默认使用 Legacy Kernel，后续可切换 LangGraph Kernel。 */
-  agentRuntime: AgentRuntime;
+  /** 唯一 Agent 执行入口；HTTP、CLI 与 Scheduler 共享同一个 durable Pi runtime。 */
+  durableRunRuntime: DurableRunRuntime;
+  /** Root-lifecycle controller shared by durable and direct governed tool calls. */
+  toolConcurrency: ResourceConcurrencyController;
+  /** Committed Pi session entries used to rebuild product message projections. */
+  piSessionStore?: PiSessionStore;
   model: ChatModel;
   modelConfig?: RuntimeModelConfig;
   modelOptions?: RuntimeModelConfig[];
@@ -128,7 +162,7 @@ export interface Runtime {
   updateSandbox?(update: SandboxSettingsUpdate): Promise<SandboxSettingsState>;
   tools: ToolRegistry;
   skillRegistry?: SkillRegistry;
-  /** MCP server 管理器（运行期增删/重连，工具同步进 tools）。 */
+  /** MCP server 管理器（按请求身份解析租户隔离的 governed tools）。 */
   mcp?: McpManager;
   /** 稳定的会话 Sandbox facade；禁用时保留 facade 以继续回收 draining generations。 */
   sandboxes?: SandboxManagerLike;
@@ -193,7 +227,243 @@ export async function resolveRuntimeModelConfig(
   return persisted ? toRuntimeModelConfig(persisted) : fallback;
 }
 
-/** 数据库页面设置优先；config.sandbox 仅在数据库尚无记录时作为启动 bootstrap。 */
+export function bridgeDurableGovernedTools(input: {
+  definitions: readonly GovernedToolDefinition[];
+  runtime: ToolRuntime;
+  context: {
+    identity: IdentityContext;
+    runId: string;
+    attemptId: string;
+    turnNo: number;
+    sessionId: string;
+    interactionResolution?: ResolvedInteraction;
+  };
+}) {
+  return bridgeGovernedTools(input.definitions.map((definition) => ({
+    definition,
+    execute: async (call, context) => {
+      const outcome = await input.runtime.execute(call, {
+        identity: input.context.identity,
+        runId: input.context.runId,
+        attemptId: input.context.attemptId,
+        turnNo: input.context.turnNo,
+        sessionId: input.context.sessionId,
+        signal: context.signal,
+        interactionResolution: input.context.interactionResolution,
+      });
+      if (outcome.kind === 'result') return attachGovernedToolFacts(outcome.result, outcome);
+      throw new GovernedToolOutcomeError(outcome);
+    },
+  })));
+}
+
+export function createFencedToolLedger(
+  store: DurableProductRunStore,
+  current: { tenantId: string; runId: string; attemptId: string },
+): ToolLedgerRepository {
+  const mutate = <T>(work: (ledger: ToolLedgerRepository) => Promise<T>): Promise<T> => store.transaction(async (tx) => {
+    const attempt = (await tx.attempts.list(current)).find((candidate) => candidate.attemptId === current.attemptId);
+    if (!attempt || attempt.status !== 'running') throw new Error('Current durable attempt is not active');
+    await tx.runs.assertLease(current, attempt.workerId, attempt.leaseToken, new Date());
+    return work(tx.toolLedger);
+  });
+  return {
+    get: (identity) => store.toolLedger.get(identity),
+    list: (identity) => store.toolLedger.list(identity),
+    putIfAbsent: (record) => mutate((ledger) => ledger.putIfAbsent(record)),
+    update: (record) => mutate((ledger) => ledger.update(record)),
+    claimPendingApproval: (input: ToolLedgerApprovalClaim) => mutate((ledger) => ledger.claimPendingApproval(input)),
+  };
+}
+
+export async function createDefaultDurableRunRuntime(
+  store: Store,
+  modelConfig: RuntimeModelConfig,
+  systemPrompt?: string,
+  enabled = true,
+  mcp?: McpManager,
+  policy?: PolicyMiddleware,
+  tools = new ToolRegistry(),
+  policyPreApproved = policy,
+): Promise<DurableRunRuntime> {
+  return (await createDefaultDurableRunAssembly(
+    store, modelConfig, systemPrompt, enabled, mcp, policy, tools, policyPreApproved,
+  )).runtime;
+}
+
+export function resolveRuntimeSystemPrompt(
+  systemPrompt?: string,
+  execution?: RunExecutionProfile,
+): string {
+  return buildSystemPrompt(systemPrompt, execution?.unattended ?? false);
+}
+
+async function createDefaultDurableRunAssembly(
+  store: Store,
+  modelConfig: RuntimeModelConfig,
+  systemPrompt?: string,
+  enabled = true,
+  mcp?: McpManager,
+  policy?: PolicyMiddleware,
+  tools = new ToolRegistry(),
+  policyPreApproved = policy,
+) {
+  if (!enabled) throw new Error('DurableRunRuntime is mandatory and cannot be disabled');
+  const targetApi = modelConfig.protocol === 'anthropic' ? 'anthropic-messages' : 'openai-completions';
+  const provider = builtinProviders().find((candidate) => candidate.getModels().some((model) => model.api === targetApi));
+  const template = provider?.getModels().find((model) => model.api === targetApi);
+  if (!provider || !template) throw new Error(`Pi provider unavailable for protocol: ${modelConfig.protocol}`);
+  const providerId = `aiop-${modelConfig.protocol}`;
+  const credentials = new InMemoryCredentialStore();
+  await credentials.modify(providerId, async () => ({ type: 'api_key', key: modelConfig.apiKey }));
+  const models = createModels({ credentials });
+  const pricing = modelConfig.pricing;
+  const model: PiModel<Api> = {
+    ...template,
+    id: modelConfig.model,
+    name: modelConfig.id,
+    provider: providerId,
+    baseUrl: modelConfig.baseURL,
+    headers: { ...template.headers, ...llmTlsHeaders(modelConfig.allowInsecureTls) },
+    contextWindow: modelConfig.contextWindowTokens ?? template.contextWindow,
+    cost: pricing ? {
+      input: pricing.input,
+      output: pricing.output,
+      cacheRead: pricing.cacheRead ?? pricing.input,
+      cacheWrite: pricing.cacheWrite ?? pricing.input,
+    } : template.cost,
+  };
+  const configuredProvider: PiProvider = {
+    ...provider,
+    id: providerId,
+    name: `AIOP ${modelConfig.protocol}`,
+    baseUrl: modelConfig.baseURL,
+    getModels: () => [model],
+  };
+  models.setProvider(configuredProvider);
+  const modelConcurrency = new FifoModelConcurrencyController({
+    maxConcurrentPerTenantModel: positiveIntegerEnv(
+      process.env.AIOP_PI_MAX_CONCURRENT_MODEL_CALLS,
+      'AIOP_PI_MAX_CONCURRENT_MODEL_CALLS',
+      4,
+    ),
+  });
+  const toolConcurrency = new ResourceConcurrencyController(positiveIntegerEnv(
+    process.env.AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE,
+    'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE',
+    1,
+  ));
+  const runtimeStore = store.durableRunStore();
+  const assemblyOptions = {
+    models, model, modelConcurrency, systemPrompt,
+    resolveSystemPrompt: ({ execution }: { execution?: RunExecutionProfile }) =>
+      resolveRuntimeSystemPrompt(systemPrompt, execution),
+    resolveTools: async ({ identity, sessionId, events, interactionResolution, execution }: {
+      identity?: IdentityContext;
+      sessionId?: string;
+      events: EventCodecOptions;
+      interactionResolution?: ResolvedInteraction;
+      execution?: RunExecutionProfile;
+    }) => {
+      if (!identity) return [];
+      const definitions = mcp ? await mcp.tools(identity) : [];
+      const durableRun = sessionId?.startsWith('owner-')
+        ? await runtimeStore.get({ tenantId: identity.tenantId, runId: events.runId })
+        : undefined;
+      const toolSessionId = durableRun?.sessionId ?? sessionId ?? events.runId;
+      const toolContext = {
+        tenantId: identity.tenantId,
+        userId: identity.actorId,
+        role: identity.roles.includes('platform_admin') ? 'platform_admin' as const
+          : identity.roles.includes('tenant_admin') ? 'tenant_admin' as const
+            : 'user' as const,
+        sessionId: toolSessionId,
+      };
+      const productDefinitions = tools.unified(toolContext).definitions();
+      const governed = createAIOPToolRuntime({
+        tools,
+        governedTools: definitions,
+        policy: execution?.preApproved
+          ? policyPreApproved ?? policy ?? new AllowAllPolicy()
+          : policy ?? new AllowAllPolicy(),
+        ctx: toolContext,
+      }, createFencedToolLedger(runtimeStore, {
+        tenantId: identity.tenantId, runId: events.runId, attemptId: events.attemptId,
+      }), toolConcurrency, runtimeStore.interactions, false);
+      const resolvedInteraction = interactionResolution
+        ? await runtimeStore.interactions.get({
+            tenantId: identity.tenantId, runId: events.runId,
+            interactionId: interactionResolution.interactionId,
+          })
+        : undefined;
+      return bridgeDurableGovernedTools({
+        definitions: [...productDefinitions, ...definitions],
+        runtime: governed,
+        context: {
+          identity,
+          runId: events.runId,
+          attemptId: events.attemptId,
+          turnNo: events.turnNo,
+          sessionId: toolSessionId,
+          interactionResolution: resolvedInteraction?.status === 'resolved' && resolvedInteraction.toolCallId
+            ? {
+                interactionId: resolvedInteraction.id,
+                kind: resolvedInteraction.kind,
+                toolCallId: resolvedInteraction.toolCallId,
+                value: resolvedInteraction.resolution ?? interactionResolution?.value ?? null,
+              }
+            : undefined,
+        },
+      });
+    },
+  };
+  const assembly = store instanceof MysqlStore
+    ? createMysqlDurablePiRuntime({ db: store.database(), store: runtimeStore as import('@aiop/pi-runtime').MysqlRunStore, ...assemblyOptions })
+    : createMemoryDurablePiRuntime({ store: runtimeStore as import('@aiop/pi-runtime').MemoryRunStore, ...assemblyOptions });
+  return { ...assembly, modelConcurrency, toolConcurrency };
+}
+
+function positiveIntegerEnv(value: string | undefined, name: string, fallback: number): number {
+  if (value === undefined || value.trim() === '') return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) throw new Error(`${name} must be a positive integer: ${value}`);
+  return parsed;
+}
+
+export function resolveMcpBootstrapConfigs(
+  tenantId: string,
+  startup: Record<string, McpServerConfig> | undefined,
+  persisted: Record<string, McpServerConfig> | undefined,
+): Record<string, McpServerConfig> {
+  if (persisted) return persisted;
+  return tenantId === DEFAULT_TENANT ? startup ?? {} : {};
+}
+
+export function createMcpCredentialProvider(
+  credentials: Pick<UserCredentials, 'get'>,
+): McpCredentialProvider {
+  return {
+    async resolve(identity, server) {
+      const stored = await credentials.get<McpCredentials>(
+        identity.tenantId,
+        identity.actorId,
+        `mcp:${server}`,
+      );
+      return normalizeMcpCredentials(stored);
+    },
+  };
+}
+
+function normalizeMcpCredentials(value: McpCredentials | undefined): McpCredentials {
+  const strings = (candidate: Record<string, string> | undefined) => candidate
+    ? Object.fromEntries(Object.entries(candidate).filter((entry) => typeof entry[1] === 'string'))
+    : undefined;
+  const headers = strings(value?.headers);
+  const env = strings(value?.env);
+  return { ...(headers ? { headers } : {}), ...(env ? { env } : {}) };
+}
+
+/** 数据库页面设置优先；未保存页面设置时使用当前启动配置。 */
 export function resolveRuntimeSandboxConfig(
   startup: SandboxConfig | undefined,
   persisted?: SandboxSettings,
@@ -205,7 +475,12 @@ export function resolveRuntimeSandboxConfig(
 /** 组装一次运行所需的全部组件（模型/工具/策略/持久化）。 */
 export async function buildRuntime(
   config: Config,
-  options: { store?: Store; settingsSecretBox?: ReturnType<typeof createSettingsSecretBox> } = {},
+  options: {
+    store?: Store;
+    settingsSecretBox?: ReturnType<typeof createSettingsSecretBox>;
+    durableRunRuntime?: DurableRunRuntime;
+    piSessionStore?: PiSessionStore;
+  } = {},
 ): Promise<Runtime> {
   let modelConfig = defaultRuntimeModelConfig(config);
   const modelOptions: RuntimeModelConfig[] = Object.entries(config.models).map(([id, cfg]) => ({ id, ...cfg }));
@@ -216,7 +491,26 @@ export async function buildRuntime(
   if (!jwtSecretEnv) logger.warn('AIOP_JWT_SECRET 未设置，使用开发占位密钥（勿用于生产）');
   const jwtSecret = jwtSecretEnv ?? 'dev-insecure-secret';
 
-  const store = options.store ?? await createStore(readMysqlConfig());
+  const mysqlConfig = readMysqlConfig();
+  const store = options.store ?? await createStore(mysqlConfig);
+  const skillMutationLock = mysqlConfig && store instanceof MysqlStore
+    ? new MysqlSkillMutationLock(createMysqlPool(mysqlConfig))
+    : undefined;
+  const skillImportPermitLock = mysqlConfig && store instanceof MysqlStore
+    ? new MysqlSkillMutationLock(createMysqlPool({
+      ...mysqlConfig,
+      poolSize: skillImportPermitPoolSize(mysqlConfig.poolSize),
+    }))
+    : undefined;
+  if (config.skills?.requireDistributedLock && !skillMutationLock) {
+    if (!options.store) await store.close();
+    throw new Error('skills.requireDistributedLock requires a MySQL distributed mutation lock');
+  }
+  const initializationCleanups: Array<() => Promise<void>> = [];
+  if (!options.store) initializationCleanups.push(() => store.close());
+  if (skillMutationLock) initializationCleanups.push(() => skillMutationLock.close());
+  if (skillImportPermitLock) initializationCleanups.push(() => skillImportPermitLock.close());
+  try {
   const logSink = new LogAuditSink();
   const audit: AuditSink = {
     async record(e) {
@@ -239,6 +533,7 @@ export async function buildRuntime(
     : new AllowAllPolicy();
 
   const sandboxController = new SandboxRuntimeController();
+  initializationCleanups.push(() => sandboxController.disposeAll());
   const sandboxPersistence = new SandboxSettingsPersistence(store, options.settingsSecretBox ?? createSettingsSecretBox());
   let sandboxState: LoadedSandboxSettings | undefined;
   let sandboxCfg: SandboxConfig | undefined;
@@ -403,11 +698,11 @@ export async function buildRuntime(
       sandboxCfg = sandboxSettingsToConfig(persistedSandbox.settings, persistedSandbox.apiKey);
     } else if (config.sandbox) {
       sandboxCfg = SandboxConfigSchema.parse(config.sandbox);
-      const bootstrap = parseStoredSandboxSettings(config.sandbox as unknown as Record<string, unknown>);
-      sandboxState = await sandboxPersistence.save(
-        bootstrap.settings,
-        config.sandbox.apiKey ? { action: 'replace', apiKey: config.sandbox.apiKey } : { action: 'retain' },
-      );
+      sandboxState = {
+        settings: sandboxConfigToSettings(sandboxCfg),
+        apiKey: sandboxCfg.apiKey,
+        apiKeySet: Boolean(sandboxCfg.apiKey),
+      };
     } else {
       sandboxState = { settings: { enabled: false, mode: 'local' }, apiKeySet: false };
     }
@@ -418,7 +713,7 @@ export async function buildRuntime(
     if (persistedRecord) {
       sandboxState = {
         settings: persistedRecord.settings,
-        apiKeySet: Boolean(persistedRecord.encryptedApiKey || persistedRecord.legacyApiKey),
+        apiKeySet: Boolean(persistedRecord.encryptedApiKey),
       };
     } else {
       sandboxState = { settings: { enabled: false, mode: 'local' }, apiKeySet: false };
@@ -449,7 +744,7 @@ export async function buildRuntime(
     if (!sandboxController.enabled()) return;
     const codeEnabled = sandboxController.codeEnabled();
     if (codeEnabled) {
-      for (const tool of buildSandboxTools(sandboxController)) tools.register(tool);
+      for (const tool of buildSandboxTools(sandboxController)) tools.register(tool, 'sandbox');
     }
     const profileTools = buildSandboxProfileTools(
       sandboxController,
@@ -457,19 +752,19 @@ export async function buildRuntime(
     );
     for (const tool of codeEnabled
       ? profileTools
-      : profileTools.filter((tool) => tool.def.name === 'sandbox_list_profiles')) {
-      tools.register(tool);
+      : profileTools.filter((tool) => tool.name === 'sandbox_list_profiles')) {
+      tools.register(tool, 'sandbox');
     }
     if (codeEnabled && downloads) {
-      tools.register(buildExportTool(sandboxController, async () => ({}), downloads));
+      tools.register(buildExportTool(sandboxController, async () => ({}), downloads), 'sandbox');
     }
     if (codeEnabled && hasClusters && !sandboxCfg?.aios) {
-      tools.register(buildKubectlTool({ clusters, sandboxes: sandboxController, audit }));
+      tools.register(buildKubectlTool({ clusters, sandboxes: sandboxController, audit }), 'sandbox');
     }
     if (sandboxController.desktopEnabled()) {
-      for (const tool of buildBrowserTools((ctx) => sandboxController.desktop(ctx))) tools.register(tool);
+      for (const tool of buildBrowserTools((ctx) => sandboxController.desktop(ctx))) tools.register(tool, 'sandbox');
     }
-    if (codeEnabled && skillSyncTool) tools.register(skillSyncTool);
+    if (codeEnabled && skillSyncTool) tools.register(skillSyncTool, 'sandbox');
   };
 
   if (config.downloads?.enabled ?? true) {
@@ -483,14 +778,33 @@ export async function buildRuntime(
       void downloads?.sweep().catch((err) => logger.warn({ err: String(err) }, 'download sweep failed'));
     }, 60 * 60_000);
     downloadSweepTimer.unref?.();
+    const initializedDownloadSweepTimer = downloadSweepTimer;
+    initializationCleanups.push(async () => clearInterval(initializedDownloadSweepTimer));
   }
   syncSandboxTools();
 
-  // MCP：持久化配置（UI 增删的结果）优先于 config.jsonc；常驻 manager 以支持运行期管理。
-  const persistedMcp = await store.getMcpServers({ tenantId: DEFAULT_TENANT }).catch(() => undefined);
-  const mcp = new McpManager(persistedMcp ?? config.mcpServers ?? {}, connectMcp);
-  await mcp.start();
-  for (const t of mcp.tools()) tools.register(t);
+  const credentials = new UserCredentials(store, jwtSecret);
+
+  // MCP：每个租户按身份加载持久化配置；未持久化时回退 config.jsonc。
+  const mcp = new McpManager({}, connectMcp, {
+    loadConfigs: async (identity) => resolveMcpBootstrapConfigs(
+      identity.tenantId,
+      config.mcpServers,
+      await store.getMcpServers({ tenantId: identity.tenantId }).catch(() => undefined),
+    ),
+    credentials: createMcpCredentialProvider(credentials),
+    audit: {
+      record: (event) => audit.record({
+        kind: 'mcp', action: 'tool-execute', tenantId: event.tenantId,
+        tool: `mcp__${event.server}__${event.tool}`,
+        detail: {
+          actorId: event.actorId, server: event.server, ok: event.ok,
+          durationMs: event.durationMs, ...(event.error ? { error: event.error } : {}),
+        },
+      }),
+    },
+  });
+  initializationCleanups.push(() => mcp.close());
 
   for (const t of buildScheduleTools(store)) tools.register(t);
   tools.register(buildTodoTool());
@@ -504,18 +818,21 @@ export async function buildRuntime(
     }));
   }
 
-  const credentials = new UserCredentials(store, jwtSecret);
   let systemExtra = '';
   let skillRegistry: SkillRegistry | undefined;
   if (config.skills?.dir) {
-    const skills = new SkillRegistry(config.skills.dir, { summaryBudget: config.skills.summaryBudget });
+    const skills = new SkillRegistry(config.skills.dir, {
+      builtinRoots: config.skills.builtinDir ? [config.skills.builtinDir] : [],
+      mutationLock: skillMutationLock,
+      importPermitLock: skillImportPermitLock,
+      pendingQuota: config.skills.pendingQuota,
+    });
     await skills.scan();
     const skillTools = buildSkillTools(skills, sandboxController, undefined, { credentials, audit });
     for (const tool of skillTools) tools.register(tool);
-    skillSyncTool = skillTools.find((tool) => tool.def.name === 'skill__sync_to_sandbox');
+    skillSyncTool = skillTools.find((tool) => tool.name === 'skill__sync_to_sandbox');
     if (!sandboxController.codeEnabled()) tools.unregister('skill__sync_to_sandbox');
     skillRegistry = skills;
-    systemExtra = skills.summaries();
   }
 
   // 认证：本地或 OIDC（复用上方派生的 jwtSecret）
@@ -558,10 +875,25 @@ export async function buildRuntime(
   };
   modelConfig = await resolveRuntimeModelConfig(config, store, DEFAULT_TENANT);
   const model = createModel(modelConfig.id, modelConfig);
-  const checkpointSaver = store instanceof MysqlStore
-    ? store.createCheckpointSaver()
-    : new MysqlCheckpointSaver(new MemoryCheckpointStore());
-
+  const defaultDurableAssembly = options.durableRunRuntime
+    ? undefined
+    : await createDefaultDurableRunAssembly(
+      store,
+      modelConfig,
+      systemExtra,
+      true,
+      mcp,
+      policy,
+      tools,
+      policyPreApproved,
+    );
+  const durableRunRuntime = options.durableRunRuntime ?? defaultDurableAssembly!.runtime;
+  const piSessionStore = options.piSessionStore ?? defaultDurableAssembly?.store.sessions;
+  const toolConcurrency = defaultDurableAssembly?.toolConcurrency ?? new ResourceConcurrencyController(positiveIntegerEnv(
+    process.env.AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE,
+    'AIOP_PI_MAX_CONCURRENT_TOOLS_PER_RESOURCE',
+    1,
+  ));
   const publicSandboxState = (): SandboxSettingsState => {
     const catalog = sandboxController.catalogInfo();
     return {
@@ -663,11 +995,9 @@ export async function buildRuntime(
   };
 
   const runtime: Runtime = {
-    agentRuntime: createConfiguredAgentRuntime(process.env, {
-      checkpointer: checkpointSaver,
-      bindingStore: store,
-      runStore: store,
-    }),
+    durableRunRuntime,
+    toolConcurrency,
+    piSessionStore,
     model,
     modelConfig,
     modelOptions,
@@ -730,9 +1060,12 @@ export async function buildRuntime(
         }
         const nextCfg = sandboxSettingsToConfig(settings, effectiveApiKey);
         const prepared = nextCfg.enabled ? await prepareGeneration(nextCfg) : undefined;
+        const persistenceUpdate = update.keyAction.action === 'retain' && effectiveApiKey
+          ? { action: 'replace' as const, apiKey: effectiveApiKey }
+          : update.keyAction;
         let saved: LoadedSandboxSettings;
         try {
-          saved = await sandboxPersistence.save(settings, update.keyAction);
+          saved = await sandboxPersistence.save(settings, persistenceUpdate);
         } catch (err) {
           await disposePreparedGeneration(
             prepared,
@@ -771,10 +1104,22 @@ export async function buildRuntime(
       await sandboxUpdateTail;
       await sandboxController.disposeAll();
       await mcp?.close();
+      await Promise.all([
+        skillMutationLock?.close?.(),
+        skillImportPermitLock?.close?.(),
+      ]);
       if (!options.store) await store.close();
     },
   };
 
   syncSandboxCatalogRefreshTimer();
   return runtime;
+  } catch (error) {
+    for (const cleanup of initializationCleanups.reverse()) {
+      await cleanup().catch((cleanupError) => {
+        logger.warn({ err: String(cleanupError) }, 'runtime initialization cleanup failed');
+      });
+    }
+    throw error;
+  }
 }

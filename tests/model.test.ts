@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { toAnthropicMessages } from '../src/model/anthropic.js';
-import { normalizeOpenAIBaseURL, toOpenAIMessages } from '../src/model/openai.js';
-import type { Msg } from '../src/model/types.js';
+import { toAnthropicMessages } from '../src/llm/anthropic.js';
+import { normalizeOpenAIBaseURL, toOpenAIMessages } from '../src/llm/openai.js';
+import type { Msg } from '../src/llm/types.js';
 
 const convo: Msg[] = [
   { role: 'user', text: 'hi' },

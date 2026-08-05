@@ -5,7 +5,7 @@
  *   kubectl port-forward -n opensandbox-system svc/opensandbox-server 8899:80
  *   OSB_IMAGE=aiop/opensandbox-browser:dev npx tsx scripts/verify-sandbox-kubectl.ts
  */
-import { OpenSandboxProvider } from '../src/sandbox/opensandbox.js';
+import { OpenSandboxProvider } from '../packages/sandbox-runtime/src/opensandbox.js';
 
 const domain = process.env.OSB_DOMAIN ?? '127.0.0.1:8899';
 const image = process.env.OSB_IMAGE ?? 'aiop/opensandbox-browser:dev';

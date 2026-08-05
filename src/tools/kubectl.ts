@@ -1,10 +1,11 @@
-import type { ToolResult } from '../model/types.js';
-import type { ToolContext, ToolHandler } from '../agent/tools.js';
+import type { ToolResult } from '../llm/types.js';
+import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import type { ClusterRegistry, ClusterInfo } from '../config/clusters.js';
-import type { SandboxManagerLike } from '../sandbox/lifecycle.js';
-import { isSandboxAcquirer } from '../sandbox/acquisition.js';
-import { sandboxIdentityMetadata, sandboxScopedKey, type SandboxIdentity } from '../sandbox/keys.js';
-import type { SandboxSpec } from '../sandbox/types.js';
+import type { SandboxManagerLike } from '@aiop/sandbox-runtime';
+import { isSandboxAcquirer } from '@aiop/sandbox-runtime';
+import { executeAcquiredSandbox } from '@aiop/sandbox-runtime';
+import { sandboxIdentityMetadata, sandboxScopedKey, type SandboxIdentity } from '@aiop/sandbox-runtime';
+import type { SandboxSpec } from '@aiop/sandbox-runtime';
 import type { AuditSink } from '../audit/sink.js';
 import { LogAuditSink } from '../audit/sink.js';
 import { classifyKubectl, parseKubectlArgs } from '../ops/classify.js';
@@ -53,9 +54,9 @@ function shellQuote(arg: string): string {
  */
 export function buildKubectlTool(opts: KubectlToolOptions): ToolHandler {
   const audit = opts.audit ?? new LogAuditSink();
-  return {
-    def: {
+  return defineTool({
       name: 'kubectl',
+      capability: 'non_idempotent_write',
       description:
         '在指定集群执行 kubectl。cluster=集群名，args=参数数组（如 ["get","pods","-A"]），dryRun=true 时变更命令以 --dry-run=server 试运行。只读集群拒绝变更，危险命令被拦截，生产变更需审批。',
       inputSchema: {
@@ -71,8 +72,7 @@ export function buildKubectlTool(opts: KubectlToolOptions): ToolHandler {
         },
         required: ['cluster', 'args'],
       },
-    },
-    async run(rawArgs, ctx: ToolContext): Promise<ToolResult> {
+    async execute(rawArgs, ctx: ToolContext): Promise<ToolResult> {
       const { cluster, args, dryRun } = parseKubectlArgs(rawArgs);
       if (!cluster) return { id: '', content: '缺少 cluster 参数', isError: true };
       const info = opts.clusters.get(cluster);
@@ -86,10 +86,10 @@ export function buildKubectlTool(opts: KubectlToolOptions): ToolHandler {
       const command = `kubectl ${finalArgs.map(shellQuote).join(' ')}`;
 
       const spec = specFor(ctx, info);
-      const sbx = isSandboxAcquirer(opts.sandboxes)
-        ? (await opts.sandboxes.acquireSpec(ctx, spec)).handle
-        : await opts.sandboxes.get(spec);
-      const res = await sbx.runCommand(command, { onOutput: ctx.onOutput });
+      const acquired = isSandboxAcquirer(opts.sandboxes)
+        ? await opts.sandboxes.acquireSpec(ctx, spec)
+        : { handle: await opts.sandboxes.get(spec), spec };
+      const res = await executeAcquiredSandbox(acquired, { command, signal: ctx.signal, onOutput: ctx.onOutput });
 
       await audit.record({
         kind: 'kubectl',
@@ -108,5 +108,5 @@ export function buildKubectlTool(opts: KubectlToolOptions): ToolHandler {
       const isError = Boolean(res.error) || (typeof res.exitCode === 'number' && res.exitCode !== 0);
       return { id: '', content: parts.join('\n\n') || '(no output)', isError };
     },
-  };
+  });
 }

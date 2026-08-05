@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
-import { SandboxManager } from '../src/sandbox/lifecycle.js';
-import { LocalSandboxProvider } from '../src/sandbox/local.js';
-import { OpenSandboxDesktopProvider } from '../src/sandbox/opensandbox-desktop.js';
+import { constants } from 'node:fs';
+import { access, link, mkdir, mkdtemp, readFile, stat, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { SandboxManager } from '../packages/sandbox-runtime/src/lifecycle.js';
+import { LocalSandboxProvider } from '../packages/sandbox-runtime/src/local.js';
+import { SandboxRuntime } from '../packages/sandbox-runtime/src/runtime.js';
+import { OpenSandboxDesktopProvider } from '../packages/sandbox-runtime/src/opensandbox-desktop.js';
 import { buildSandboxTools } from '../src/tools/builtin.js';
 import { buildSandboxProfileTools } from '../src/tools/sandbox-profiles.js';
 import type {
@@ -9,7 +14,7 @@ import type {
   SandboxHandle,
   SandboxProvider,
   SandboxSpec,
-} from '../src/sandbox/types.js';
+} from '../packages/sandbox-runtime/src/types.js';
 
 function deferredHandle() {
   let resolve!: (handle: SandboxHandle) => void;
@@ -20,6 +25,12 @@ function deferredHandle() {
 function deferredVoid() {
   let resolve!: () => void;
   const promise = new Promise<void>((res) => { resolve = res; });
+  return { promise, resolve };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
   return { promise, resolve };
 }
 
@@ -369,6 +380,126 @@ describe('SandboxManager', () => {
   });
 });
 
+describe('production sandbox tools', () => {
+  it('executes through SandboxRuntime controls and aborts the managed handle', async () => {
+    const abort = new AbortController();
+    const kill = vi.fn(async () => undefined);
+    const handle: SandboxHandle = {
+      sandboxId: 'managed',
+      runCode: vi.fn(async () => new Promise<ExecResult>(() => undefined)),
+      runCommand: vi.fn(async () => new Promise<ExecResult>(() => undefined)),
+      readFile: vi.fn(async () => new Uint8Array()),
+      setTimeout: vi.fn(async () => undefined),
+      kill,
+    };
+    const acquisition = { handle, spec: { key: 'tenant:user:session' }, markCredentialInjected() {} };
+    const manager = {
+      acquire: vi.fn(async () => acquisition), acquireSpec: vi.fn(async () => acquisition),
+      get: vi.fn(async () => handle), has: vi.fn(() => true), touch: vi.fn(() => true),
+      use: vi.fn(async (_key, action) => action()), markCredentialInjected: vi.fn(), size: vi.fn(() => 1),
+      list: vi.fn(() => []), dispose: vi.fn(async () => undefined),
+      disposeSession: vi.fn(async () => []), disposeAll: vi.fn(async () => undefined),
+    } as unknown as Parameters<typeof buildSandboxTools>[0];
+    const runCommand = buildSandboxTools(manager).find((tool) => tool.name === 'sbx__run_command')!;
+
+    const execution = runCommand.execute({ command: 'wait' }, {
+      sessionId: 'session', tenantId: 'tenant', userId: 'user', role: 'user', signal: abort.signal,
+    });
+    abort.abort();
+
+    await expect(Promise.race([
+      execution,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('runtime abort missing')), 100)),
+    ])).rejects.toMatchObject({ name: 'AbortError' });
+    expect(kill).toHaveBeenCalledOnce();
+  });
+});
+
+describe('LocalSandboxProvider structured execution', () => {
+  it('keeps argv, cwd, and env separate from shell parsing', async () => {
+    const provider = new LocalSandboxProvider();
+    const handle = await provider.create({ key: 'structured-local' });
+    await handle.writeFile?.('workspace/script.js', new TextEncoder().encode('process.stdout.write(process.argv[2]+":"+process.env.TOKEN)'));
+    await expect(handle.executeCommand!({
+      program: process.execPath, args: ['script.js', 'two words'], cwd: 'workspace', env: { TOKEN: 'secret' },
+    })).resolves.toMatchObject({ stdout: 'two words:secret', exitCode: 0 });
+    await handle.kill();
+  });
+
+  it.each(['abort', 'timeout', 'stop'] as const)('%s terminates the active local process tree promptly', async (mode) => {
+    const runtime = new SandboxRuntime({ providerName: 'local', provider: new LocalSandboxProvider() });
+    const lease = await runtime.acquire({ spec: { key: `local-child-${mode}` } });
+    const started = deferred<{ parentPid: number; descendantPid: number }>();
+    let output = '';
+    const abort = new AbortController();
+    const execution = runtime.execute({
+      lease,
+      command: 'sleep 60 & child=$!; printf "%s %s\\n" "$$" "$child"; wait',
+      ...(mode === 'abort' ? { signal: abort.signal } : {}),
+      ...(mode === 'timeout' ? { timeoutMs: 1000 } : {}),
+      onOutput: ({ text }) => {
+        output += text;
+        const match = /^(\d+) (\d+)$/m.exec(output);
+        if (!match) return;
+        const parentPid = Number.parseInt(match[1]!, 10);
+        const descendantPid = Number.parseInt(match[2]!, 10);
+        if (validTestChildPid(parentPid) && validTestChildPid(descendantPid)) {
+          started.resolve({ parentPid, descendantPid });
+        }
+      },
+    });
+    const pids = await started.promise;
+
+    try {
+      if (mode === 'abort') abort.abort();
+      if (mode === 'stop') await expectSettlesPromptly(runtime.stop({ lease }));
+      if (mode === 'abort') {
+        await expect(expectSettlesPromptly(execution)).rejects.toMatchObject({ name: 'AbortError' });
+      } else {
+        await expectSettlesPromptly(execution, mode === 'timeout' ? 2_000 : 500);
+      }
+
+      await vi.waitFor(() => {
+        expect(processExists(pids.parentPid)).toBe(false);
+        expect(processExists(pids.descendantPid)).toBe(false);
+      });
+    } finally {
+      await Promise.all([cleanupTestChild(pids.parentPid), cleanupTestChild(pids.descendantPid)]);
+      await runtime.release({ lease });
+    }
+  });
+});
+
+async function expectSettlesPromptly<T>(promise: Promise<T>, timeoutMs = 500): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('local process tree did not settle promptly')), timeoutMs)),
+  ]);
+}
+
+function validTestChildPid(pid: number): boolean {
+  return Number.isSafeInteger(pid) && pid > 1 && pid !== process.pid && pid !== process.ppid;
+}
+
+async function cleanupTestChild(pid: number): Promise<void> {
+  if (!validTestChildPid(pid) || !processExists(pid)) return;
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+  }
+  await vi.waitFor(() => expect(processExists(pid)).toBe(false));
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
 describe('sandbox tools', () => {
   const ctx = { sessionId: 'sess-1' };
 
@@ -377,7 +508,7 @@ describe('sandbox tools', () => {
     const mgr = new SandboxManager({ provider });
     const [runCode] = buildSandboxTools(mgr);
 
-    const res = await runCode!.run({ code: 'print(1)' }, ctx);
+    const res = await runCode!.execute({ code: 'print(1)' }, ctx);
 
     expect(res.content).toBe('code:print(1)');
     expect(res.isError).toBeFalsy();
@@ -387,9 +518,9 @@ describe('sandbox tools', () => {
     const { provider } = mockProvider();
     const mgr = new SandboxManager({ provider });
     const tools = buildSandboxTools(mgr);
-    const runCommand = tools.find((t) => t.def.name === 'sbx__run_command')!;
+    const runCommand = tools.find((t) => t.name === 'sbx__run_command')!;
 
-    const res = await runCommand.run({ command: 'do-fail' }, ctx);
+    const res = await runCommand.execute({ command: 'do-fail' }, ctx);
 
     expect(res.isError).toBe(true);
     expect(res.content).toContain('boom');
@@ -401,7 +532,7 @@ describe('sandbox tools', () => {
     const mgr = new SandboxManager({ provider });
     const [runCode] = buildSandboxTools(mgr);
 
-    await expect(runCode!.run({}, ctx)).rejects.toThrow(/code/);
+    await expect(runCode!.execute({}, ctx)).rejects.toThrow(/code/);
   });
 
   it('isolates same-named sessions by tenant and user identity', async () => {
@@ -409,10 +540,10 @@ describe('sandbox tools', () => {
     const mgr = new SandboxManager({ provider });
     const [runCode] = buildSandboxTools(mgr);
 
-    await runCode!.run({ code: 'print("a")' }, {
+    await runCode!.execute({ code: 'print("a")' }, {
       sessionId: 'same', tenantId: 'tenant-a', userId: 'user-a', role: 'user',
     });
-    await runCode!.run({ code: 'print("b")' }, {
+    await runCode!.execute({ code: 'print("b")' }, {
       sessionId: 'same', tenantId: 'tenant-b', userId: 'user-b', role: 'user',
     });
 
@@ -431,8 +562,8 @@ describe('sandbox tools', () => {
     const mgr = new SandboxManager({ provider });
     const [runCode] = buildSandboxTools(mgr);
 
-    await runCode!.run({ code: 'print("a")' }, { sessionId: 'session-a' });
-    await runCode!.run({ code: 'print("b")' }, { sessionId: 'session-b' });
+    await runCode!.execute({ code: 'print("a")' }, { sessionId: 'session-a' });
+    await runCode!.execute({ code: 'print("b")' }, { sessionId: 'session-b' });
 
     expect(provider.create).toHaveBeenCalledTimes(2);
     expect(mgr.list().map((item) => [item.key, item.sessionId, item.id])).toEqual([
@@ -446,30 +577,32 @@ describe('sandbox tools', () => {
     const mgr = new SandboxManager({ provider });
     const tools = buildSandboxProfileTools(mgr, [
       {
-        name: 'code',
+        id: 'code', name: 'code',
         description: '普通代码沙箱',
+        envType: 'code', runtimeRole: 'sandbox-reader',
         image: 'aiop/opensandbox-code:dev',
         desktop: false,
         privileged: false,
         capabilities: ['python', 'shell'],
       },
       {
-        name: 'netdiag',
+        id: 'netdiag', name: 'netdiag',
         description: '网络排查沙箱',
+        envType: 'code', runtimeRole: 'sandbox-diag',
         image: 'aiop/opensandbox-netdiag:dev',
         desktop: false,
         privileged: true,
         capabilities: ['kubectl', 'tcpdump'],
       },
     ]);
-    const listProfiles = tools.find((tool) => tool.def.name === 'sandbox_list_profiles')!;
-    const runCommand = tools.find((tool) => tool.def.name === 'sandbox_run_command')!;
+    const listProfiles = tools.find((tool) => tool.name === 'sandbox_list_profiles')!;
+    const runCommand = tools.find((tool) => tool.name === 'sandbox_run_command')!;
 
-    const listed = await listProfiles.run({}, ctx);
+    const listed = await listProfiles.execute({}, ctx);
     expect(listed.content).toContain('netdiag');
     expect(listed.content).toContain('tcpdump');
 
-    const res = await runCommand.run({ profile: 'netdiag', command: 'kubectl get pods' }, ctx);
+    const res = await runCommand.execute({ profile: 'netdiag', command: 'kubectl get pods' }, ctx);
 
     expect(res.content).toContain('out:kubectl get pods');
     expect(provider.create).toHaveBeenCalledWith(expect.objectContaining({
@@ -483,6 +616,19 @@ describe('sandbox tools', () => {
 });
 
 describe('LocalSandboxProvider', () => {
+  it.each([
+    ['cpu', { cpu: 1 }],
+    ['memoryMb', { memoryMb: 512 }],
+    ['network', { network: 'none' as const }],
+  ])('explicitly rejects unsupported %s isolation for create and connect', async (field, resource) => {
+    const provider = new LocalSandboxProvider();
+    const spec = { key: `local-unsupported-${field}`, ...resource };
+
+    await expect(provider.create(spec)).rejects.toThrow(new RegExp(`LocalSandboxProvider.*${field}.*not support`, 'i'));
+    await expect(provider.connect('local-existing', spec))
+      .rejects.toThrow(new RegExp(`LocalSandboxProvider.*${field}.*not support`, 'i'));
+  });
+
   it('executes shell commands in a disposable local sandbox', async () => {
     const provider = new LocalSandboxProvider();
     const handle = await provider.create({ key: 'local-test' });
@@ -507,6 +653,167 @@ describe('LocalSandboxProvider', () => {
       await handle.kill();
     }
   });
+
+  it('maps sandbox workspace paths inside its disposable root and removes them on kill', async () => {
+    const provider = new LocalSandboxProvider();
+    const handle = await provider.create({ key: 'local-workspace-test' });
+    const sandboxPath = `/workspace/${handle.sandboxId}/credentials/token.json`;
+    const workspaceFile = handle.workspacePath?.(`${handle.sandboxId}/credentials/token.json`);
+    const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
+    expect(handle.supportsSecretFiles).toBe(false);
+    expect(workspaceFile).toBe(`workspace/${handle.sandboxId}/credentials/token.json`);
+    await handle.writeFile?.(sandboxPath, Buffer.from('secret'), { mode: 0o600 });
+
+    const hostFile = join(sandboxRoot, workspaceFile!);
+    expect(await readFile(hostFile, 'utf8')).toBe('secret');
+    expect((await stat(hostFile)).mode & 0o777).toBe(0o600);
+    const command = await handle.runCommand(`test -f '${workspaceFile}' && printf mapped`);
+    expect(command).toMatchObject({ stdout: 'mapped', exitCode: 0 });
+    await expect(access(sandboxPath)).rejects.toThrow();
+
+    await handle.kill();
+    await expect(access(sandboxRoot)).rejects.toThrow();
+  });
+
+  it('rejects local sandbox path traversal and non-workspace host absolute paths', async () => {
+    const provider = new LocalSandboxProvider();
+    const handle = await provider.create({ key: 'local-containment-test' });
+    try {
+      expect(() => handle.workspacePath?.('../escape')).toThrow('escapes sandbox root');
+      await expect(handle.writeFile?.('/workspace/../escape', Buffer.from('no'))).rejects.toThrow('escapes sandbox root');
+      await expect(handle.readFile('/etc/passwd')).rejects.toThrow('unsupported sandbox absolute path');
+    } finally {
+      await handle.kill();
+    }
+  });
+
+  it('rejects parent and final symlinks without changing host files', async () => {
+    const hostRoot = await mkdtemp(join(tmpdir(), 'aiop-local-symlink-host-'));
+    const parentTarget = join(hostRoot, 'parent.txt');
+    const finalTarget = join(hostRoot, 'final.txt');
+    await writeFile(parentTarget, 'parent-original');
+    await writeFile(finalTarget, 'final-original');
+    const handle = await new LocalSandboxProvider().create({ key: 'local-symlink-test' });
+    const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
+    await mkdir(join(sandboxRoot, 'workspace'), { recursive: true });
+    await symlink(hostRoot, join(sandboxRoot, 'workspace', 'parent-link'));
+    await symlink(finalTarget, join(sandboxRoot, 'workspace', 'final-link'));
+    try {
+      await expect(handle.writeFile?.('workspace/parent-link/parent.txt', Buffer.from('changed')))
+        .rejects.toThrow('symbolic link');
+      await expect(handle.readFile('workspace/parent-link/parent.txt')).rejects.toThrow('symbolic link');
+      await expect(handle.writeFile?.('workspace/final-link', Buffer.from('changed')))
+        .rejects.toThrow('symbolic link');
+      await expect(handle.readFile('workspace/final-link')).rejects.toThrow('symbolic link');
+      await expect(readFile(parentTarget, 'utf8')).resolves.toBe('parent-original');
+      await expect(readFile(finalTarget, 'utf8')).resolves.toBe('final-original');
+    } finally {
+      await handle.kill();
+    }
+    await expect(access(sandboxRoot)).rejects.toThrow();
+    await expect(readFile(parentTarget, 'utf8')).resolves.toBe('parent-original');
+    await expect(readFile(finalTarget, 'utf8')).resolves.toBe('final-original');
+  });
+
+  it('keeps file operations anchored when a checked parent is replaced before open', async () => {
+    const hostRoot = await mkdtemp(join(tmpdir(), 'aiop-local-race-host-'));
+    const hostFile = join(hostRoot, 'victim.txt');
+    await writeFile(hostFile, 'host-original');
+    let swapped = false;
+    vi.resetModules();
+    vi.doMock('node:fs/promises', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs/promises')>();
+      return {
+        ...actual,
+        open: async (...args: Parameters<typeof actual.open>) => {
+          const [target, flags] = args;
+          if (!swapped && String(target).includes('/.aiop-write-')
+            && typeof flags === 'number' && (flags & constants.O_EXCL) !== 0) {
+            swapped = true;
+            await actual.rename(sandboxParent, `${sandboxParent}-checked`);
+            await actual.symlink(hostRoot, sandboxParent);
+          }
+          return actual.open(...args);
+        },
+      };
+    });
+    const { LocalSandboxProvider: FreshLocalSandboxProvider } = await import('../packages/sandbox-runtime/src/local.js');
+    const handle = await new FreshLocalSandboxProvider().create({ key: 'local-parent-race-test' });
+    const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
+    const sandboxParent = join(sandboxRoot, 'workspace', 'parent');
+    await mkdir(sandboxParent, { recursive: true });
+    await writeFile(join(sandboxParent, 'victim.txt'), 'sandbox-original');
+    try {
+      await handle.writeFile?.('workspace/parent/victim.txt', Buffer.from('sandbox-changed'));
+
+      expect(swapped).toBe(true);
+      await expect(readFile(hostFile, 'utf8')).resolves.toBe('host-original');
+      await expect(readFile(`${sandboxParent}-checked/victim.txt`, 'utf8')).resolves.toBe('sandbox-changed');
+    } finally {
+      vi.doUnmock('node:fs/promises');
+      vi.resetModules();
+      await handle.kill();
+    }
+    await expect(readFile(hostFile, 'utf8')).resolves.toBe('host-original');
+  });
+
+  it('atomically replaces a sandbox hardlink without truncating the host inode', async () => {
+    const hostRoot = await mkdtemp(join(tmpdir(), 'aiop-local-hardlink-host-'));
+    const hostFile = join(hostRoot, 'host.txt');
+    await writeFile(hostFile, 'host-original');
+    const handle = await new LocalSandboxProvider().create({ key: 'local-hardlink-write' });
+    const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
+    const sandboxFile = join(sandboxRoot, 'workspace', 'hard.txt');
+    await mkdir(join(sandboxRoot, 'workspace'), { recursive: true });
+    await link(hostFile, sandboxFile);
+    const originalInode = (await stat(hostFile)).ino;
+    try {
+      await handle.writeFile?.('workspace/hard.txt', Buffer.from('sandbox-new'));
+
+      await expect(readFile(hostFile, 'utf8')).resolves.toBe('host-original');
+      await expect(readFile(sandboxFile, 'utf8')).resolves.toBe('sandbox-new');
+      expect((await stat(sandboxFile)).ino).not.toBe(originalInode);
+    } finally {
+      await handle.kill();
+    }
+  });
+
+  it('runCode replaces a hardlinked code entry without modifying the host file', async () => {
+    const hostRoot = await mkdtemp(join(tmpdir(), 'aiop-local-hardlink-code-host-'));
+    const hostFile = join(hostRoot, 'main.py');
+    await writeFile(hostFile, 'print("host-original")\n');
+    const handle = await new LocalSandboxProvider().create({ key: 'local-hardlink-code' });
+    const sandboxRoot = (await handle.runCommand('pwd')).stdout.trim();
+    await link(hostFile, join(sandboxRoot, 'main.py'));
+    const originalInode = (await stat(hostFile)).ino;
+    try {
+      const result = await handle.runCode('print("sandbox-new")', { language: 'python' });
+
+      expect(result).toMatchObject({ stdout: 'sandbox-new\n', exitCode: 0 });
+      await expect(readFile(hostFile, 'utf8')).resolves.toBe('print("host-original")\n');
+      await expect(readFile(join(sandboxRoot, 'main.py'), 'utf8')).resolves.toBe('print("sandbox-new")');
+      expect((await stat(join(sandboxRoot, 'main.py'))).ino).not.toBe(originalInode);
+    } finally {
+      await handle.kill();
+    }
+  });
+
+  it('rejects unsupported platforms and missing procfs before creating a local sandbox', async () => {
+    type TestOptions = {
+      platform: NodeJS.Platform;
+      procFdAvailable: () => Promise<boolean>;
+    };
+    const Provider = LocalSandboxProvider as unknown as new (options: TestOptions) => LocalSandboxProvider;
+    const createAndCleanup = async (options: TestOptions) => {
+      const handle = await new Provider(options).create({ key: 'local-platform-check' });
+      await handle.kill();
+    };
+
+    await expect(createAndCleanup({ platform: 'darwin', procFdAvailable: async () => true }))
+      .rejects.toThrow(/Linux.*procfs|支持.*Linux/i);
+    await expect(createAndCleanup({ platform: 'linux', procFdAvailable: async () => false }))
+      .rejects.toThrow(/procfs|\/proc\/self\/fd/i);
+  });
 });
 
 describe('OpenSandboxDesktopProvider', () => {
@@ -526,7 +833,7 @@ describe('OpenSandboxDesktopProvider', () => {
     const manager = new SandboxManager({ provider });
     const [runCode] = buildSandboxTools(manager);
 
-    await runCode!.run({ code: 'print("same")' }, { sessionId: 'sess-k8s' });
+    await runCode!.execute({ code: 'print("same")' }, { sessionId: 'sess-k8s' });
     const desktops = new OpenSandboxDesktopProvider(manager);
     const desktop = await desktops.create({ key: 'sess-k8s', timeoutMs: 60_000 });
     await desktop.launch('google-chrome', 'https://example.com');

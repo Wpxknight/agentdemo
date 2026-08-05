@@ -35,35 +35,57 @@ export function createKysely(pool: Pool): Kysely<Database> {
  * 已应用记录在 schema_migrations 表（幂等、可演进，对既有库追加 ALTER）。
  */
 export async function runMigrations(pool: Pool): Promise<void> {
-  const conn = pool.promise();
-  await conn.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
-    version    INT          NOT NULL,
-    name       VARCHAR(128) NOT NULL,
-    applied_at TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (version)
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`);
-
-  const dir = new URL('./migrations/', import.meta.url);
-  const files = (await readdir(dir)).filter((f) => f.endsWith('.sql')).sort();
-
-  const [rows] = await conn.query('SELECT version FROM schema_migrations');
-  const applied = new Set((rows as { version: number }[]).map((r) => r.version));
-
-  let count = 0;
-  for (const file of files) {
-    const version = Number(file.split('_')[0]);
-    if (!Number.isInteger(version)) {
-      log.warn({ file }, '迁移文件名无版本号前缀，跳过');
-      continue;
+  const conn = await pool.promise().getConnection();
+  const lockName = 'aiop:schema-migrations';
+  let lockAcquired = false;
+  try {
+    const [lockRows] = await conn.query('SELECT GET_LOCK(?, ?) AS acquired', [lockName, 60]);
+    if (Number((lockRows as Array<{ acquired: number | null }>)[0]?.acquired) !== 1) {
+      throw new Error('Timed out waiting for the schema migration lock');
     }
-    if (applied.has(version)) continue;
-    const sql = await readFile(new URL(file, dir), 'utf8');
-    await conn.query(sql);
-    await conn.query('INSERT INTO schema_migrations (version, name) VALUES (?, ?)', [version, file]);
-    log.info({ version, file }, 'migration applied');
-    count++;
+    lockAcquired = true;
+    await conn.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
+      version    INT          NOT NULL,
+      name       VARCHAR(128) NOT NULL,
+      applied_at TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (version)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`);
+
+    const dir = new URL('./migrations/', import.meta.url);
+    const files = (await readdir(dir)).filter((f) => f.endsWith('.sql')).sort();
+
+    const [rows] = await conn.query('SELECT version FROM schema_migrations');
+    const applied = new Set((rows as { version: number }[]).map((r) => r.version));
+
+    let count = 0;
+    for (const file of files) {
+      const version = Number(file.split('_')[0]);
+      if (!Number.isInteger(version)) {
+        log.warn({ file }, '迁移文件名无版本号前缀，跳过');
+        continue;
+      }
+      if (applied.has(version)) continue;
+      const sql = await readFile(new URL(file, dir), 'utf8');
+      await conn.query(sql);
+      await conn.query('INSERT INTO schema_migrations (version, name) VALUES (?, ?)', [version, file]);
+      log.info({ version, file }, 'migration applied');
+      count++;
+    }
+    log.info({ applied: count, total: files.length }, 'migrations up to date');
+  } finally {
+    let reusable = !lockAcquired;
+    if (lockAcquired) {
+      try {
+        const [releaseRows] = await conn.query('SELECT RELEASE_LOCK(?) AS released', [lockName]);
+        reusable = Number((releaseRows as Array<{ released: number | null }>)[0]?.released) === 1;
+        if (!reusable) log.warn('schema migration lock release was not confirmed; destroying connection');
+      } catch (error) {
+        log.warn({ err: String(error) }, 'failed to release schema migration lock');
+      }
+    }
+    if (reusable) conn.release();
+    else conn.destroy();
   }
-  log.info({ applied: count, total: files.length }, 'migrations up to date');
 }
 
 /** 按配置创建 Store：有 MySQL 则迁移+MysqlStore，否则回落 MemoryStore。 */

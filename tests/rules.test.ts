@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { PermissionRules, subjectsFor } from '../src/agent/rules.js';
-import type { ToolCall } from '../src/model/types.js';
+import type { ToolCall } from '../src/llm/types.js';
 
 function call(name: string, args: unknown): ToolCall {
   return { id: 'c1', name, args: args as ToolCall['args'] };

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { OpsPolicy } from '../src/agent/policy.js';
 import { ClusterRegistry } from '../src/config/clusters.js';
 import { MemoryAuditSink } from '../src/audit/sink.js';
-import type { ToolCall } from '../src/model/types.js';
+import type { ToolCall } from '../src/llm/types.js';
 
 function registry() {
   return new ClusterRegistry({

@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
-import { sandboxIdentityKey } from '../src/sandbox/keys.js';
-import { SandboxRuntimeController } from '../src/sandbox/runtime-controller.js';
-import type { DesktopHandle } from '../src/sandbox/desktop.js';
+import { sandboxIdentityKey } from '../packages/sandbox-runtime/src/keys.js';
+import { SandboxRuntimeController } from '../packages/sandbox-runtime/src/runtime-controller.js';
+import { executeAcquiredSandbox } from '../packages/sandbox-runtime/src/runtime.js';
+import type { DesktopHandle } from '../packages/sandbox-runtime/src/desktop.js';
 import { buildSandboxProfileTools } from '../src/tools/sandbox-profiles.js';
-import type { SandboxProfile } from '../src/sandbox/profiles.js';
-import type { SandboxHandle, SandboxProvider, SandboxSpec } from '../src/sandbox/types.js';
+import type { SandboxProfile } from '../packages/sandbox-runtime/src/profiles.js';
+import type { SandboxHandle, SandboxProvider, SandboxSpec } from '../packages/sandbox-runtime/src/types.js';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -82,6 +83,116 @@ const spec = (sessionId: string) => ({
 });
 
 describe('SandboxRuntimeController', () => {
+  it.each(['timeout', 'abort'] as const)('evicts a managed handle killed by execution %s', async (control) => {
+    const backend = provider('controlled');
+    vi.mocked(backend.instance.create).mockImplementation(async (sandboxSpec) => {
+      const handle = await provider('handle').instance.create(sandboxSpec);
+      vi.mocked(handle.runCommand).mockImplementation(async () => new Promise(() => undefined));
+      return handle;
+    });
+    const controller = new SandboxRuntimeController();
+    await controller.commit({ manager: { provider: backend.instance }, profiles: [] });
+    const sandboxSpec = spec(`killed-${control}`);
+    const acquired = await controller.acquireSpec({ ...userA, sessionId: `killed-${control}` }, sandboxSpec);
+    const abort = new AbortController();
+    const execution = executeAcquiredSandbox(acquired, {
+      command: 'wait',
+      ...(control === 'timeout' ? { timeoutMs: 5 } : { signal: abort.signal }),
+    });
+    if (control === 'abort') abort.abort();
+
+    if (control === 'timeout') {
+      await expect(execution).resolves.toMatchObject({ exitCode: 124, timedOut: true });
+    } else {
+      await expect(execution).rejects.toMatchObject({ name: 'AbortError' });
+    }
+    await vi.waitFor(() => expect(acquired.handle.kill).toHaveBeenCalledOnce());
+
+    const replacement = await controller.acquireSpec(
+      { ...userA, sessionId: `killed-${control}` },
+      sandboxSpec,
+    );
+    expect(replacement.handle).not.toBe(acquired.handle);
+    expect(backend.instance.create).toHaveBeenCalledTimes(2);
+    acquired.invalidate?.();
+    await expect(controller.acquireSpec(
+      { ...userA, sessionId: `killed-${control}` },
+      sandboxSpec,
+    )).resolves.toMatchObject({ handle: replacement.handle });
+    expect(backend.instance.create).toHaveBeenCalledTimes(2);
+    await controller.disposeAll();
+  });
+
+  it.each(['acquire', 'acquireSpec'] as const)('propagates ToolContext.signal through %s acquisition', async (method) => {
+    const pending = deferred<SandboxHandle>();
+    let receivedSignal: AbortSignal | undefined;
+    let attempts = 0;
+    const fresh = await provider('fresh').instance.create({ key: 'fresh' });
+    const backend: SandboxProvider = {
+      create: vi.fn(async (_spec: SandboxSpec, options?: { signal?: AbortSignal }) => {
+        receivedSignal = options?.signal;
+        attempts += 1;
+        return attempts === 1 ? pending.promise : fresh;
+      }),
+      connect: vi.fn(async () => pending.promise),
+    } as SandboxProvider;
+    const controller = new SandboxRuntimeController();
+    await controller.commit({
+      manager: { provider: backend },
+      profiles: [],
+      resolveSpec: () => spec('signal'),
+    });
+    const abort = new AbortController();
+    const ctx = { ...userA, sessionId: 'signal', signal: abort.signal };
+    const acquisition = method === 'acquire'
+      ? controller.acquire(ctx)
+      : controller.acquireSpec(ctx, spec('signal'));
+
+    await vi.waitFor(() => expect(receivedSignal).toBe(abort.signal));
+    abort.abort();
+    await expect(Promise.race([
+      acquisition,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('controller abort was not prompt')), 100)),
+    ])).rejects.toMatchObject({ name: 'AbortError' });
+    const late = await provider('late').instance.create({ key: 'late' });
+    pending.resolve(late);
+    await vi.waitFor(() => expect(late.kill).toHaveBeenCalledOnce());
+    await expect(controller.acquireSpec(
+      { ...userA, sessionId: 'signal' },
+      spec('signal'),
+    )).resolves.toMatchObject({ handle: fresh });
+    expect(backend.create).toHaveBeenCalledTimes(2);
+    await controller.disposeAll();
+  });
+
+  it.each(['acquire', 'acquireSpec'] as const)('aborts %s while its spec source is still pending', async (method) => {
+    const resolving = deferred<Partial<SandboxSpec>>();
+    const backend = provider('unreached');
+    const controller = new SandboxRuntimeController();
+    await controller.commit({
+      manager: { provider: backend.instance },
+      profiles: [],
+      resolveSpec: () => resolving.promise,
+    });
+    const abort = new AbortController();
+    const ctx = { ...userA, sessionId: 'pending-spec', signal: abort.signal };
+    const acquisition = method === 'acquire'
+      ? controller.acquire(ctx)
+      : controller.acquireSpec(ctx, () => resolving.promise as Promise<SandboxSpec>);
+
+    abort.abort();
+    await expect(Promise.race([
+      acquisition,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('spec resolution abort was not prompt')), 100)),
+    ])).rejects.toMatchObject({ name: 'AbortError' });
+    expect(backend.instance.create).not.toHaveBeenCalled();
+
+    resolving.resolve(spec('pending-spec'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(backend.instance.create).not.toHaveBeenCalled();
+    await controller.disposeAll();
+  });
+
   it('routes new sessions to the new generation while retaining old handles for disposal', async () => {
     const first = provider('first');
     const second = provider('second');
@@ -378,6 +489,45 @@ describe('SandboxRuntimeController', () => {
     await controller.disposeAll();
   });
 
+  it('does not evict a replacement handle when a stale acquire continuation observes a disposed epoch', async () => {
+    const backend = provider('epoch');
+    const controller = new SandboxRuntimeController();
+    await controller.commit({
+      manager: { provider: backend.instance },
+      profiles: [],
+      resolveSpec: (ctx) => ({ key: sandboxIdentityKey(ctx) }),
+    });
+    const generation = controller as unknown as {
+      current: { manager: { get: (spec: SandboxSpec, options?: { signal?: AbortSignal }) => Promise<SandboxHandle> } };
+    };
+    const originalGet = generation.current.manager.get.bind(generation.current.manager);
+    const staleReturned = deferred<void>();
+    const resumeStale = deferred<void>();
+    let calls = 0;
+    generation.current.manager.get = async (spec, options) => {
+      const handle = await originalGet(spec, options);
+      calls += 1;
+      if (calls === 1) {
+        staleReturned.resolve();
+        await resumeStale.promise;
+      }
+      return handle;
+    };
+
+    const ctx = { ...userA, sessionId: 'epoch-race' };
+    const stale = controller.acquire(ctx);
+    await staleReturned.promise;
+    await controller.disposeSession(userA, ctx.sessionId);
+    const replacement = await controller.acquire(ctx);
+    resumeStale.resolve();
+
+    await expect(stale).rejects.toThrow(/disposed/);
+    expect(replacement.handle.sandboxId).not.toBe('epoch-1');
+    expect(controller.has(replacement.spec.key)).toBe(true);
+    expect(backend.killed).not.toContain(replacement.handle.sandboxId);
+    await controller.disposeAll();
+  });
+
   it('does not block hard shutdown on a hung desktop create and kills a late result', async () => {
     const backend = provider('desktop');
     const creating = deferred<DesktopHandle>();
@@ -446,10 +596,10 @@ describe('SandboxRuntimeController', () => {
       controller,
       (ctx) => controller.profileDefinitions({ role: ctx.role ?? 'user' }),
     );
-    const list = tools.find((tool) => tool.def.name === 'sandbox_list_profiles')!;
+    const list = tools.find((tool) => tool.name === 'sandbox_list_profiles')!;
 
-    const userResult = await list.run({}, { ...userA, sessionId: 'user-list' });
-    const adminResult = await list.run({}, { ...platformAdmin, sessionId: 'admin-list' });
+    const userResult = await list.execute({}, { ...userA, sessionId: 'user-list' });
+    const adminResult = await list.execute({}, { ...platformAdmin, sessionId: 'admin-list' });
 
     expect(userResult.content).toContain('Reader profile');
     expect(userResult.content).not.toContain('Diagnostic profile');
@@ -499,7 +649,8 @@ describe('SandboxRuntimeController', () => {
     await controller.commit({
       manager: { provider: first.instance },
       profiles: [{
-        name: 'browser', description: 'browser', desktop: true, privileged: false, capabilities: ['browser'],
+        id: 'browser', name: 'browser', description: 'browser', envType: 'browser',
+        runtimeRole: 'sandbox-reader', desktop: true, privileged: false, capabilities: ['browser'],
       }],
       drainWarmPool: drainFirst,
     });
@@ -508,8 +659,8 @@ describe('SandboxRuntimeController', () => {
     await controller.commit({
       manager: { provider: second.instance },
       profiles: [{
-        name: 'code', description: 'AIOS code', image: 'code-interpreter', desktop: false,
-        privileged: false, capabilities: ['python', 'node', 'shell'],
+        id: 'code', name: 'code', description: 'AIOS code', image: 'code-interpreter', envType: 'code',
+        runtimeRole: 'sandbox-reader', desktop: false, privileged: false, capabilities: ['python', 'node', 'shell'],
       }],
       drainWarmPool: drainSecond,
     });

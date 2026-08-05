@@ -1,10 +1,11 @@
-import type { JsonValue, ToolResult } from '../model/types.js';
-import type { ToolContext, ToolHandler } from '../agent/tools.js';
-import type { SandboxManagerLike } from '../sandbox/lifecycle.js';
-import { isSandboxAcquirer } from '../sandbox/acquisition.js';
-import type { SandboxProfile } from '../sandbox/profiles.js';
-import { findSandboxProfile, publicSandboxProfiles, sandboxSpecForProfile } from '../sandbox/profiles.js';
-import type { ExecResult } from '../sandbox/types.js';
+import type { JsonValue, ToolResult } from '../llm/types.js';
+import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
+import type { SandboxManagerLike } from '@aiop/sandbox-runtime';
+import { executeAcquiredSandbox } from '@aiop/sandbox-runtime';
+import { isSandboxAcquirer } from '@aiop/sandbox-runtime';
+import type { SandboxProfile } from '@aiop/sandbox-runtime';
+import { findSandboxProfile, publicSandboxProfiles, sandboxSpecForProfile } from '@aiop/sandbox-runtime';
+import type { ExecResult } from '@aiop/sandbox-runtime';
 
 function asObject(args: JsonValue): Record<string, JsonValue> {
   return args && typeof args === 'object' && !Array.isArray(args) ? args : {};
@@ -55,16 +56,16 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
     if (isSandboxAcquirer(manager)) return manager.acquire(ctx, profileName);
     const profile = findSandboxProfile(profiles(ctx), profileName, ctx.role);
     const spec = sandboxSpecForProfile(profile, ctx);
-    return { handle: await manager.get(spec), spec };
+    const handle = await manager.get(spec, { signal: ctx.signal });
+    return { handle, spec, invalidate: () => manager.evict?.(spec.key, handle) };
   };
   return [
-    {
-      def: {
+    defineTool({
         name: 'sandbox_list_profiles',
+        capability: 'read',
         description: '列出当前支持的沙箱模板/profile，便于根据任务选择 code/browser/netdiag 等沙箱。',
         inputSchema: { type: 'object', properties: {} },
-      },
-      async run(_args, ctx: ToolContext): Promise<ToolResult> {
+      async execute(_args, ctx: ToolContext): Promise<ToolResult> {
         const visible = profiles(ctx);
         return {
           id: '',
@@ -72,10 +73,10 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
           contentBlocks: [{ type: 'text', text: JSON.stringify({ profiles: publicSandboxProfiles(visible) }) }],
         };
       },
-    },
-    {
-      def: {
+    }),
+    defineTool({
         name: 'sandbox_ensure',
+        capability: 'retryable_write',
         description: '按指定 profile 拉起或复用当前会话的沙箱。profile 省略时使用默认代码沙箱。',
         inputSchema: {
           type: 'object',
@@ -83,8 +84,7 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
             profile: { type: 'string', description: '稳定的沙箱 Profile ID；可先用 sandbox_list_profiles 查询' },
           },
         },
-      },
-      async run(args, ctx: ToolContext): Promise<ToolResult> {
+      async execute(args, ctx: ToolContext): Promise<ToolResult> {
         const profileName = optString(asObject(args), 'profile');
         const acquired = await acquire(ctx, profileName);
         return {
@@ -92,10 +92,10 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
           content: `沙箱已就绪：profile=${acquired.spec.profile ?? profileName ?? 'default'}，sandboxId=${acquired.handle.sandboxId}，key=${acquired.spec.key}`,
         };
       },
-    },
-    {
-      def: {
+    }),
+    defineTool({
         name: 'sandbox_run_code',
+        capability: 'non_idempotent_write',
         description: '在指定 profile 沙箱中执行代码。先用 sandbox_list_profiles 判断任务该使用哪种沙箱。',
         inputSchema: {
           type: 'object',
@@ -106,18 +106,17 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
           },
           required: ['code'],
         },
-      },
-      async run(args, ctx: ToolContext): Promise<ToolResult> {
+      async execute(args, ctx: ToolContext): Promise<ToolResult> {
         const o = asObject(args);
         const code = reqString(o, 'code');
         const language = optString(o, 'language');
-        const sbx = (await acquire(ctx, optString(o, 'profile'))).handle;
-        return formatExec(await sbx.runCode(code, { language, onOutput: ctx.onOutput }));
+        const acquired = await acquire(ctx, optString(o, 'profile'));
+        return formatExec(await executeAcquiredSandbox(acquired, { code, language, signal: ctx.signal, onOutput: ctx.onOutput }));
       },
-    },
-    {
-      def: {
+    }),
+    defineTool({
         name: 'sandbox_run_command',
+        capability: 'non_idempotent_write',
         description: '在指定 profile 沙箱中执行 shell 命令。网络/运维排查应选择 netdiag 等运维 profile。',
         inputSchema: {
           type: 'object',
@@ -127,13 +126,12 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
           },
           required: ['command'],
         },
-      },
-      async run(args, ctx: ToolContext): Promise<ToolResult> {
+      async execute(args, ctx: ToolContext): Promise<ToolResult> {
         const o = asObject(args);
         const command = reqString(o, 'command');
-        const sbx = (await acquire(ctx, optString(o, 'profile'))).handle;
-        return formatExec(await sbx.runCommand(command, { onOutput: ctx.onOutput }));
+        const acquired = await acquire(ctx, optString(o, 'profile'));
+        return formatExec(await executeAcquiredSandbox(acquired, { command, signal: ctx.signal, onOutput: ctx.onOutput }));
       },
-    },
+    }),
   ];
 }

@@ -17,6 +17,8 @@ metadata:
   labels: { app: mysql }
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels: { app: mysql }
   template:
@@ -33,7 +35,7 @@ spec:
             - name: MYSQL_ROOT_PASSWORD
               valueFrom: { secretKeyRef: { name: aiop-dev-secrets, key: MYSQL_ROOT_PASSWORD } }
             - name: MYSQL_DATABASE
-              value: ai_ops
+              value: aiop
             - name: MYSQL_USER
               value: ai_ops
             - name: MYSQL_PASSWORD
@@ -43,7 +45,7 @@ spec:
               mountPath: /var/lib/mysql
           readinessProbe:
             exec:
-              command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-paiop-root-pass"]
+              command: ["sh", "-c", "MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" exec mysqladmin ping -h 127.0.0.1 -uroot --silent"]
             initialDelaySeconds: 20
             periodSeconds: 10
           resources:

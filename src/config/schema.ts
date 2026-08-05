@@ -5,6 +5,8 @@ export const ModelConfigSchema = z.object({
   baseURL: z.string(),
   apiKey: z.string(),
   model: z.string(),
+  /** 仅该 LLM 请求跳过 HTTPS 服务端证书校验；默认严格校验。 */
+  allowInsecureTls: z.boolean().optional(),
   contextWindowTokens: z.number().int().positive().optional(),
   /** 历史里保留图片的最近带图消息条数（更早的替换占位符），默认 1；0 表示一张不留。 */
   contextKeepImages: z.number().int().min(0).optional(),
@@ -27,6 +29,15 @@ export const McpServerSchema = z.object({
   args: z.array(z.string()).optional(),
   url: z.string().optional(),
   headers: z.record(z.string(), z.string()).optional(),
+  env: z.record(z.string(), z.string()).optional(),
+  timeoutMs: z.number().int().positive().optional(),
+  reconnect: z.object({
+    maxAttempts: z.number().int().nonnegative().optional(),
+    backoffMs: z.number().int().nonnegative().optional(),
+    retryOnTimeout: z.boolean().optional(),
+    retryOnDisconnect: z.boolean().optional(),
+  }).optional(),
+  toolCapabilities: z.record(z.string(), z.enum(['read', 'retryable_write', 'non_idempotent_write'])).optional(),
 });
 
 export const SandboxProfileSchema = z.object({
@@ -281,8 +292,18 @@ export const ConfigSchema = z.object({
   skills: z
     .object({
       dir: z.string(),
-      /** summaries() 注入 system prompt 的总字符预算（默认 4000）。 */
-      summaryBudget: z.number().int().positive().optional(),
+      /** Optional read-only image root for built-in skills. */
+      builtinDir: z.string().optional(),
+      /** Refuse startup unless a cross-process skill mutation lock is configured. */
+      requireDistributedLock: z.boolean().optional(),
+      pendingQuota: z.object({
+        perUserMaxCount: z.number().int().positive().optional(),
+        perUserMaxBytes: z.number().int().positive().optional(),
+        perTenantMaxCount: z.number().int().positive().optional(),
+        perTenantMaxBytes: z.number().int().positive().optional(),
+        minFreeBytes: z.number().int().nonnegative().optional(),
+        retentionMs: z.number().int().positive().optional(),
+      }).optional(),
       /** 注入会话沙箱的稳定环境信息（如 AIOS_BASE_URL）；凭据禁止走此通道。 */
       sandboxEnv: z.record(z.string(), z.string()).optional(),
     })

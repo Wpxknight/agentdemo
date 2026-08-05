@@ -1,10 +1,7 @@
 import { logger } from './logger.js';
 import { loadConfig } from './config/load.js';
 import { buildRuntime } from './runtime.js';
-import { AutoApproveGate } from './agent/approval.js';
 import { randomUUID } from 'node:crypto';
-import { DurableToolLedger } from './agent/tool-ledger/store.js';
-import { SessionCommitter } from './agent/services/session-committer.js';
 import { createHttpServer } from './server/http.js';
 import { LocalAuthProvider } from './auth/local.js';
 import type { Config } from './config/schema.js';
@@ -42,7 +39,7 @@ async function runServer(config: Config) {
   const shutdown = async () => {
     logger.info('正在关闭 HTTP 服务…');
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    scheduler?.stop();
+    await scheduler?.stop();
     await rt.dispose();
     process.exit(0);
   };
@@ -57,36 +54,23 @@ async function runOnce(config: Config, task: string) {
 
   const { tenantId, userId, role } = rt.defaultContext;
   const sessionId = 'cli';
-  const prior = await rt.store.listMessages(rt.defaultContext, sessionId);
-  const startedAt = Date.now();
-  const result = await rt.agentRuntime.run({
+  const handle = await rt.durableRunRuntime.run({
     runId: randomUUID(),
-    model: rt.model,
-    tools: rt.tools,
-    policy: rt.policy,
-    approval: new AutoApproveGate(),
-    toolLedger: new DurableToolLedger(rt.store),
-    system: rt.systemExtra,
-    ctx: { sessionId, tenantId, userId, role },
-    messages: prior,
-    task,
-    onEvent: (e) => {
-      if (e.type === 'text_delta') process.stdout.write(e.text);
-    },
-  });
-
-  process.stdout.write('\n');
-  logger.info({ steps: result.steps, usage: result.usage }, 'done');
-  await new SessionCommitter(rt.store).commitSuccess({
-    ctx: rt.defaultContext,
+    identity: { tenantId, actorId: userId, roles: [role] },
     sessionId,
-    priorMessageCount: prior.length,
-    result,
-    durationMs: Math.max(0, Date.now() - startedAt),
+    input: [{ role: 'user', text: task }],
+    kernel: 'pi',
+    execution: { preApproved: true },
   });
+  for await (const _event of handle.events) {
+    // The durable result is the canonical CLI output; draining events keeps execution supervised.
+  }
+  const result = await handle.result();
+  process.stdout.write(`${result.text ?? ''}\n`);
+  logger.info({ status: result.status, usage: result.usage }, 'done');
   await rt.audit.record({
     kind: 'usage', action: 'agent', tenantId: rt.defaultContext.tenantId, sessionId,
-    detail: { ...result.usage, steps: result.steps },
+    detail: { ...result.usage },
   });
   await rt.dispose();
 }
@@ -98,7 +82,7 @@ async function runScheduler(config: Config) {
   logger.info('scheduler running; Ctrl-C to stop');
 
   const shutdown = async () => {
-    scheduler.stop();
+    await scheduler.stop();
     await rt.dispose();
     process.exit(0);
   };

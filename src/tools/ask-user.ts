@@ -1,6 +1,6 @@
-import type { JsonValue, ToolResult } from '../model/types.js';
+import type { JsonValue, ToolResult } from '../llm/types.js';
 import type { QuestionSpec } from '../agent/question.js';
-import type { ToolContext, ToolHandler } from '../agent/tools.js';
+import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 
 /**
  * ask_user 工具（借鉴 Claude Code AskUserQuestionTool）：
@@ -43,9 +43,9 @@ function parseQuestions(args: JsonValue): QuestionSpec[] {
 }
 
 export function buildAskUserTool(): ToolHandler {
-  return {
-    def: {
+  return defineTool({
       name: 'ask_user',
+      capability: 'read',
       description:
         '向用户提结构化选择题以澄清需求、获取偏好或让其决策（如缺少平台地址/参数时）。'
         + '1-4 题，每题 2-4 个选项；用户还可自由输入“其他”。仅在确有必要时使用，不要用于可自行判断的问题。',
@@ -80,8 +80,7 @@ export function buildAskUserTool(): ToolHandler {
         },
         required: ['questions'],
       },
-    },
-    async run(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
+    async execute(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
       const questions = parseQuestions(args);
       if (!ctx.askUser) {
         return {
@@ -100,5 +99,5 @@ export function buildAskUserTool(): ToolHandler {
       });
       return { id: '', content: `用户回答：\n${lines.join('\n\n')}` };
     },
-  };
+  });
 }

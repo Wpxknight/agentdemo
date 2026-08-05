@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { boundUserHomeNote, normalizeUserHomeDir } from '../src/sandbox/userhome.js';
+import { boundUserHomeNote, normalizeUserHomeDir } from '../packages/sandbox-runtime/src/userhome.js';
 
 describe('normalizeUserHomeDir', () => {
   it('接受绝对路径并归一化多余斜杠', () => {

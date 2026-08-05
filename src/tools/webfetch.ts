@@ -1,6 +1,6 @@
 import { assertPublicUrl } from '../net/ssrf.js';
-import type { JsonValue, ToolResult } from '../model/types.js';
-import type { ToolContext, ToolHandler } from '../agent/tools.js';
+import type { JsonValue, ToolResult } from '../llm/types.js';
+import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 
 /**
  * WebFetch 工具（借鉴 Claude Code WebFetchTool）：
@@ -57,11 +57,17 @@ function asObject(args: JsonValue): Record<string, JsonValue> {
   return args && typeof args === 'object' && !Array.isArray(args) ? args : {};
 }
 
+function errorCode(err: unknown): string | undefined {
+  if (!(err instanceof Error) || !err.cause || typeof err.cause !== 'object') return undefined;
+  const code = Reflect.get(err.cause, 'code');
+  return typeof code === 'string' && code ? code : undefined;
+}
+
 export function buildWebFetchTool(opts: WebFetchOptions = {}): ToolHandler {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  return {
-    def: {
+  return defineTool({
       name: 'web_fetch',
+      capability: 'read',
       description:
         '抓取指定 URL 的网页内容并返回纯文本（用于查阅文档、读取页面）。'
         + '仅支持 http/https，遵守域名白名单与私网防护。'
@@ -73,8 +79,7 @@ export function buildWebFetchTool(opts: WebFetchOptions = {}): ToolHandler {
         },
         required: ['url'],
       },
-    },
-    async run(args: JsonValue, _ctx: ToolContext): Promise<ToolResult> {
+    async execute(args: JsonValue, _ctx: ToolContext): Promise<ToolResult> {
       const url = typeof asObject(args).url === 'string' ? (asObject(args).url as string) : '';
       if (!url) return { id: '', content: '参数 url 必填', isError: true };
 
@@ -106,8 +111,14 @@ export function buildWebFetchTool(opts: WebFetchOptions = {}): ToolHandler {
         return { id: '', content: `# ${target.href}\n${note}\n${text}` };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        return { id: '', content: `抓取失败：${msg}`, isError: true };
+        const code = errorCode(err);
+        const detail = code ? `${msg}（${code}）` : msg;
+        return {
+          id: '',
+          content: `抓取失败：${detail}。这仅表示当前目标访问失败，不代表整体网络不可用；可尝试不同域名的数据源。`,
+          isError: true,
+        };
       }
     },
-  };
+  });
 }

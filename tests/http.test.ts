@@ -1,9 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, mkdir } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { once } from 'node:events';
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Server } from 'node:http';
+import { request as httpRequest, type IncomingMessage, type Server } from 'node:http';
 import { createHttpServer } from '../src/server/http.js';
 import { MemoryStore } from '../src/db/memory.js';
 import type { SandboxSettings } from '../src/db/store.js';
@@ -11,14 +13,25 @@ import { LocalAuthProvider } from '../src/auth/local.js';
 import { ToolRegistry } from '../src/agent/tools.js';
 import { AllowAllPolicy } from '../src/agent/policy.js';
 import type { Runtime } from '../src/runtime.js';
-import type { ChatModel, Msg, StreamEvent } from '../src/model/types.js';
-import { SkillRegistry } from '../src/skill/registry.js';
-import { McpManager } from '../src/mcp/manager.js';
-import type { McpClientLike } from '../src/mcp/types.js';
-import { SandboxManager } from '../src/sandbox/lifecycle.js';
+import type { ChatModel, Msg, StreamEvent } from '../src/llm/types.js';
+import { SkillRegistry, type SkillProductRecord } from '../src/skill/registry.js';
+import type { ProductSkillLoader } from '../src/skill/service.js';
+import { McpManager } from '../packages/mcp-runtime/src/index.js';
+import type { McpClientLike } from '../packages/mcp-runtime/src/index.js';
+import { SandboxManager } from '../packages/sandbox-runtime/src/lifecycle.js';
 import { buildSandboxTools } from '../src/tools/builtin.js';
 import { buildSandboxProfileTools } from '../src/tools/sandbox-profiles.js';
-import type { ExecResult, SandboxHandle, SandboxProvider, SandboxSpec } from '../src/sandbox/types.js';
+import type { ExecResult, SandboxHandle, SandboxProvider, SandboxSpec } from '../packages/sandbox-runtime/src/types.js';
+import type {
+  AgentRunEvent,
+  AgentRunResult,
+  AppendRunMessageInput,
+  DurableRunRuntime,
+  StartRunInput,
+} from '@aiop/control-contracts';
+import { loadSourcedSkills } from '@earendil-works/pi-agent-core';
+import { EventCodec } from '../packages/pi-runtime/src/index.js';
+import { DurableRunManager, type ManagedPiSession } from '../packages/pi-runtime/src/index.js';
 
 /** 纯文本回答的 mock 模型（不发起工具调用）。 */
 const model: ChatModel = {
@@ -28,6 +41,111 @@ const model: ChatModel = {
     yield { type: 'stop', reason: 'end_turn' };
   },
 };
+
+function createHttpTestDurableRuntime(
+  store: MemoryStore,
+  getModel: () => ChatModel,
+): DurableRunRuntime {
+  const controllers = new Map<string, AbortController>();
+  let sequence = 0;
+  const event = (runId: string, type: string, detail: AgentRunEvent['detail'], turnNo = 1): AgentRunEvent => ({
+    tenantId: 'default', runId, sequence: BigInt(++sequence), type,
+    attemptId: `${runId}:attempt`, turnNo, kernel: 'pi', kernelVersion: 'test',
+    correlationId: `${runId}:correlation`, detail, createdAt: new Date(),
+  });
+  return {
+    async run(input: StartRunInput) {
+      const runId = input.runId ?? `http-test-run-${sequence + 1}`;
+      const controller = new AbortController();
+      controllers.set(runId, controller);
+      let resolveResult!: (value: AgentRunResult) => void;
+      const resultPromise = new Promise<AgentRunResult>((resolve) => {
+        resolveResult = resolve;
+      });
+      const ctx = {
+        tenantId: input.identity.tenantId,
+        userId: input.identity.actorId,
+        role: input.identity.roles.includes('platform_admin') ? 'platform_admin' as const
+          : input.identity.roles.includes('tenant_admin') ? 'tenant_admin' as const : 'user' as const,
+      };
+      const request = input.input[0];
+      const userMessage: Msg = {
+        role: 'user',
+        text: request?.text ?? '',
+        contentBlocks: request?.content?.filter((block) => block.type === 'image')
+          .map((block) => ({ type: 'image' as const, mimeType: block.mimeType, data: block.data })),
+      };
+      return {
+        runId,
+        status: 'running' as const,
+        attempt: async () => ({
+          attemptId: `${runId}:attempt`, workerId: 'http-test-worker', fencingToken: 1n,
+        }),
+        events: {
+          async *[Symbol.asyncIterator]() {
+            const prior = await store.listMessages(ctx, input.sessionId);
+            let text = '';
+            let thinking = '';
+            try {
+              for await (const streamed of getModel().stream({
+                system: '', messages: [...prior, userMessage], tools: [], signal: controller.signal,
+              })) {
+                if (streamed.type === 'text_delta') {
+                  text += streamed.text;
+                  yield event(runId, 'message_update', { update: { type: 'text_delta', delta: streamed.text } });
+                } else if (streamed.type === 'thinking_delta') {
+                  thinking += streamed.text;
+                  yield event(runId, 'message_update', { update: { type: 'thinking_delta', delta: streamed.text } });
+                } else if (streamed.type === 'context_compacted') {
+                  yield event(runId, 'session_compact', {
+                    summarizedMessages: streamed.summarizedMessages,
+                    tokensBefore: streamed.beforeTokens,
+                    tokensAfter: streamed.afterTokens,
+                  });
+                }
+                if (controller.signal.aborted) break;
+              }
+              await store.appendMessage(ctx, input.sessionId, userMessage);
+              if (controller.signal.aborted) {
+                await store.appendMessage(ctx, input.sessionId, {
+                  role: 'assistant', text: `${text}\n\n已终止当前运行。`.trim(), thinking,
+                  durationMs: 0,
+                });
+                resolveResult({
+                  runId, status: 'cancelled', text,
+                  usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+                });
+              } else {
+                await store.appendMessage(ctx, input.sessionId, { role: 'assistant', text, thinking, durationMs: 0 });
+                resolveResult({
+                  runId, status: 'succeeded', text,
+                  usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+                });
+              }
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              await store.appendMessage(ctx, input.sessionId, userMessage);
+              await store.appendMessage(ctx, input.sessionId, {
+                role: 'assistant', text: `${text}\n\n运行失败：${message}`.trim(), thinking, durationMs: 0,
+              });
+              resolveResult({
+                runId, status: 'failed', text,
+                usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+                error: { code: 'MODEL_PROVIDER_ERROR', message, retryable: false },
+              });
+            } finally {
+              controllers.delete(runId);
+            }
+          },
+        },
+        result: () => resultPromise,
+      };
+    },
+    async resume() { throw new Error('resume is not configured for this HTTP test'); },
+    async cancel(input) { controllers.get(input.runId)?.abort(input.reason); },
+    async append() {},
+  };
+}
 
 function mockSandboxProvider() {
   let seq = 0;
@@ -112,12 +230,13 @@ let server: Server;
 let base: string;
 let store: MemoryStore;
 let token: string;
+let runtime: Runtime;
 
 beforeAll(async () => {
   store = new MemoryStore();
   await store.createTenant({ id: 'default', name: 'Default' });
   const auth = new LocalAuthProvider({ store, secret: 'test-secret' });
-  await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+  const adminUser = await auth.createUser('default', 'admin', 'pw', 'platform_admin');
   await auth.createUser('default', 'bob', 'pw', 'user');
 
   // MCP：mock connect（server 名以 down 开头则连接失败），暴露一个 echo 工具
@@ -130,7 +249,7 @@ beforeAll(async () => {
     };
   };
   const mcp = new McpManager({ fs: { transport: 'stdio', command: 'fake' } }, mcpConnect);
-  await mcp.start();
+  await mcp.start({ tenantId: 'default', actorId: adminUser.id, roles: ['platform_admin'] });
 
   let activeModel = model;
   let activeModelConfig: NonNullable<Runtime['modelConfig']> = {
@@ -140,7 +259,7 @@ beforeAll(async () => {
     apiKey: 'initial-key',
     model: 'mock-model',
   };
-  const rt = {
+  runtime = {
     get model() {
       return activeModel;
     },
@@ -188,12 +307,11 @@ beforeAll(async () => {
     authProvider: auth,
     jwtSecret: 'test-secret',
     systemExtra: '',
+    durableRunRuntime: createHttpTestDurableRuntime(store, () => activeModel),
     defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
   } as unknown as Runtime;
 
-  for (const t of mcp.tools()) rt.tools.register(t);
-
-  server = createHttpServer(rt);
+  server = createHttpServer(runtime);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
@@ -327,6 +445,7 @@ describe('HTTP server', () => {
       authProvider: auth,
       jwtSecret: 'thinking-secret',
       systemExtra: '',
+      durableRunRuntime: createHttpTestDurableRuntime(localStore, () => thinkingModel),
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
 
@@ -395,6 +514,7 @@ describe('HTTP server', () => {
       authProvider: auth,
       jwtSecret: 'context-secret',
       systemExtra: '',
+      durableRunRuntime: createHttpTestDurableRuntime(localStore, () => contextModel),
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
 
@@ -465,6 +585,7 @@ describe('HTTP server', () => {
       authProvider: auth,
       jwtSecret: 'terminate-secret',
       systemExtra: '',
+      durableRunRuntime: createHttpTestDurableRuntime(localStore, () => slowModel),
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
 
@@ -511,6 +632,144 @@ describe('HTTP server', () => {
     }
   });
 
+  it.each(['queued', 'waiting'] as const)(
+    'terminates a durable %s run discovered after the server-local active map is lost',
+    async (status) => {
+      const localStore = new MemoryStore();
+      await localStore.createTenant({ id: 'default', name: 'Default' });
+      const auth = new LocalAuthProvider({ store: localStore, secret: `remote-${status}-secret` });
+      const owner = await auth.createUser('default', `owner-${status}`, 'pw', 'user');
+      const ownerToken = (await auth.login('default', `owner-${status}`, 'pw'))!;
+      const now = new Date('2026-07-29T11:00:00.000Z');
+      const runId = `remote-${status}-run`;
+      await localStore.durableRunStore().create({ record: {
+        tenantId: 'default', runId, actorId: owner.id, sessionId: 'remote-session', kernel: 'pi',
+        kernelVersion: '0.82.1', status, waitingReason: status === 'waiting' ? 'approval' : undefined,
+        leaseToken: 0n, usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+        createdAt: now, updatedAt: now,
+      } });
+      const durableRunRuntime = new DurableRunManager({
+        store: localStore.durableRunStore(), heartbeatMs: 0,
+        sessions: {
+          create: async () => { throw new Error('terminate must not create a session'); },
+          load: async () => { throw new Error('terminate must not load a session'); },
+        },
+        eventOptions: () => ({}), now: () => new Date(now.getTime() + 1),
+      });
+      const rt = {
+        model, tools: new ToolRegistry(), store: localStore,
+        policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(),
+        authProvider: auth, jwtSecret: `remote-${status}-secret`, systemExtra: '', durableRunRuntime,
+        defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+      } as unknown as Runtime;
+      const remoteServer = createHttpServer(rt);
+      await new Promise<void>((resolve) => remoteServer.listen(0, '127.0.0.1', resolve));
+      const remoteBase = `http://127.0.0.1:${(remoteServer.address() as AddressInfo).port}`;
+
+      try {
+        const response = await fetch(`${remoteBase}/v1/sessions/remote-session/terminate`, {
+          method: 'POST', headers: { authorization: `Bearer ${ownerToken}` },
+        });
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({ ok: true, sessionId: 'remote-session', aborted: 0 });
+        expect(await localStore.durableRunStore().get({ tenantId: 'default', runId })).toMatchObject({
+          status: 'cancelled', cancelRequestedAt: expect.any(Date),
+        });
+      } finally {
+        await new Promise<void>((resolve) => remoteServer.close(() => resolve()));
+      }
+    },
+  );
+
+  it('detaches a closed SSE response while the durable run continues and remains replayable', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'sse-detach-secret' });
+    await auth.createUser('default', 'sse-owner', 'pw', 'user');
+    const ownerToken = (await auth.login('default', 'sse-owner', 'pw'))!;
+    let sessionStarted!: () => void;
+    const started = new Promise<void>((resolve) => { sessionStarted = resolve; });
+    let finishSession!: () => void;
+    const finish = new Promise<void>((resolve) => { finishSession = resolve; });
+    const session: ManagedPiSession = {
+      async *continue(signal): AsyncIterable<AgentRunEvent> {
+        sessionStarted();
+        yield {
+          tenantId: '', runId: '', sequence: 1n, type: 'message_update', attemptId: '', turnNo: 0,
+          kernel: 'pi', kernelVersion: '0.82.1', correlationId: 'before-disconnect', createdAt: new Date(),
+          detail: { update: { type: 'text_delta', delta: 'before disconnect' } },
+        };
+        await finish;
+        signal?.throwIfAborted();
+        yield {
+          tenantId: '', runId: '', sequence: 2n, type: 'message_end', attemptId: '', turnNo: 0,
+          kernel: 'pi', kernelVersion: '0.82.1', correlationId: 'after-disconnect', createdAt: new Date(),
+          detail: { message: { usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } } },
+        };
+      },
+      async replayInteraction() {},
+      async entries() { return []; },
+      async leafId() { return null; },
+      async metadata() { return { id: 'sse-detach-session', tenantId: 'default', createdAt: new Date().toISOString() }; },
+      async abort() {}, async close() {}, async steer() {}, async followUp() {},
+      async appendCustomEntry() { return 'marker'; },
+    };
+    const durableRunRuntime = new DurableRunManager({
+      store: localStore.durableRunStore(), heartbeatMs: 0,
+      sessions: { create: async () => session, load: async () => session }, eventOptions: () => ({}),
+    });
+    const rt = {
+      model, tools: new ToolRegistry(), store: localStore,
+      policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(), authProvider: auth,
+      jwtSecret: 'sse-detach-secret', systemExtra: '', durableRunRuntime,
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+    const detachServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => detachServer.listen(0, '127.0.0.1', resolve));
+    const detachBase = `http://127.0.0.1:${(detachServer.address() as AddressInfo).port}`;
+
+    try {
+      let clientResponse!: IncomingMessage;
+      const firstChunkPromise = new Promise<string>((resolve, reject) => {
+        const request = httpRequest(`${detachBase}/v1/agent`, {
+          method: 'POST', headers: { authorization: `Bearer ${ownerToken}`, 'content-type': 'application/json' },
+        }, (response) => {
+          clientResponse = response;
+          response.once('data', (chunk) => resolve(String(chunk)));
+          response.once('error', reject);
+        });
+        request.once('error', reject);
+        request.end(JSON.stringify({ sessionId: 'sse-detach-session', task: 'continue after disconnect' }));
+      });
+      const firstChunk = await firstChunkPromise;
+      const runId = /"runId":"([^"]+)"/.exec(firstChunk)?.[1];
+      expect(runId).toBeTruthy();
+      await started;
+      const closed = once(clientResponse, 'close');
+      clientResponse.destroy();
+      await closed;
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      expect(await localStore.durableRunStore().isCancellationRequested({ tenantId: 'default', runId: runId! }))
+        .toBe(false);
+      finishSession();
+
+      await vi.waitFor(async () => {
+        expect(await localStore.durableRunStore().get({ tenantId: 'default', runId: runId! }))
+          .toMatchObject({ status: 'succeeded' });
+      });
+      const replay = await fetch(`${detachBase}/v1/agent/runs/${runId}/events`, {
+        headers: { authorization: `Bearer ${ownerToken}`, 'last-event-id': '1' },
+      });
+      expect(replay.status).toBe(200);
+      const replayBody = await replay.text();
+      expect(replayBody).toContain('after-disconnect');
+      expect(replayBody).not.toContain('before-disconnect');
+    } finally {
+      finishSession();
+      await new Promise<void>((resolve) => detachServer.close(() => resolve()));
+    }
+  });
+
   it('persists duration for a failed agent run with partial output', async () => {
     const localStore = new MemoryStore();
     await localStore.createTenant({ id: 'default', name: 'Default' });
@@ -534,6 +793,7 @@ describe('HTTP server', () => {
       authProvider: auth,
       jwtSecret: 'failed-run-secret',
       systemExtra: '',
+      durableRunRuntime: createHttpTestDurableRuntime(localStore, () => failingModel),
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
     const failedServer = createHttpServer(rt);
@@ -694,6 +954,20 @@ describe('HTTP server', () => {
       maxTokens: 200000,
       estimated: true,
     });
+
+    const missingContext = await fetch(`${base}/v1/sessions/not-owned/context`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(missingContext.status).toBe(404);
+
+    await store.appendMessage(ctx, 'context-beyond-first-page', { role: 'user', text: 'older owned session' });
+    for (let index = 0; index < 51; index += 1) {
+      await store.createSession(ctx, { sessionId: `newer-context-session-${index}` });
+    }
+    const olderContext = await fetch(`${base}/v1/sessions/context-beyond-first-page/context`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(olderContext.status).toBe(200);
   });
 
   it('exposes current-user session cumulative token usage', async () => {
@@ -745,7 +1019,78 @@ describe('HTTP server', () => {
     expect(msgs[0]?.text).toContain('note.txt');
   });
 
-  it('queues active session appends into the current agent run', async () => {
+  it('finds a cross-worker active run even when a newer terminal run exists', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'cross-worker-secret' });
+    const admin = await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    const sessionId = 'cross-worker-session';
+    const older = new Date('2026-07-28T00:00:00.000Z');
+    await localStore.putAgentRunBindingIfAbsent({
+      tenantId: 'default', userId: admin.id, sessionId, runId: 'run-active-older', kernel: 'pi',
+      createdAt: older,
+    });
+    await localStore.updateAgentRun('default', 'run-active-older', { status: 'running', updatedAt: older });
+    const newer = new Date(older.getTime() + 1000);
+    await localStore.putAgentRunBindingIfAbsent({
+      tenantId: 'default', userId: admin.id, sessionId, runId: 'run-terminal-newer', kernel: 'pi',
+      createdAt: newer,
+    });
+    await localStore.updateAgentRun('default', 'run-terminal-newer', { status: 'succeeded', updatedAt: newer, completedAt: newer });
+    const append = vi.fn(async () => {});
+    const rt = {
+      model, tools: new ToolRegistry(), store: localStore, policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth, jwtSecret: 'cross-worker-secret', systemExtra: '', durableRunRuntime: { append },
+    } as unknown as Runtime;
+    const server = createHttpServer(rt);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const localBase = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const response = await fetch(`${localBase}/v1/sessions/${sessionId}/append`, {
+        method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${adminToken}` },
+        body: JSON.stringify({ task: 'cross worker steer' }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ queued: true });
+      expect(append).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-active-older' }));
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('rejects a durable run when another worker already owns the session', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'cross-worker-run-secret' });
+    const admin = await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    await localStore.putAgentRunBindingIfAbsent({
+      tenantId: 'default', userId: admin.id, sessionId: 'shared-session', runId: 'remote-running', kernel: 'pi',
+      createdAt: new Date(),
+    });
+    await localStore.updateAgentRun('default', 'remote-running', { status: 'running', updatedAt: new Date() });
+    const run = vi.fn(async () => { throw new Error('must not start a competing run'); });
+    const rt = {
+      model, tools: new ToolRegistry(), store: localStore, policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth, jwtSecret: 'cross-worker-run-secret', systemExtra: '', durableRunRuntime: { run },
+    } as unknown as Runtime;
+    const server = createHttpServer(rt);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const localBase = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const response = await fetch(`${localBase}/v1/agent`, {
+        method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${adminToken}` },
+        body: JSON.stringify({ sessionId: 'shared-session', task: 'competing request' }),
+      });
+      expect(response.status).toBe(409);
+      expect(run).not.toHaveBeenCalled();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('routes active session appends through the durable runtime inbox', async () => {
     const localStore = new MemoryStore();
     await localStore.createTenant({ id: 'default', name: 'Default' });
     const auth = new LocalAuthProvider({ store: localStore, secret: 'append-secret' });
@@ -754,22 +1099,42 @@ describe('HTTP server', () => {
 
     let firstStarted!: () => void;
     const started = new Promise<void>((resolve) => { firstStarted = resolve; });
-    let releaseFirst!: () => void;
-    const release = new Promise<void>((resolve) => { releaseFirst = resolve; });
-    const seenMessages: Msg[][] = [];
+    let appended!: (input: AppendRunMessageInput) => void;
+    const appendedInput = new Promise<AppendRunMessageInput>((resolve) => { appended = resolve; });
+    const appendDurably = vi.fn(async (input: AppendRunMessageInput) => appended(input));
+    const runDurably = vi.fn(async () => {
+      firstStarted();
+      let sequence = 0n;
+      const codec = new EventCodec({
+        tenantId: 'default', runId: 'durable-active-run', attemptId: 'attempt-a', turnNo: 1,
+        correlationId: 'http-compat', sequence: () => ++sequence,
+      });
+      const update = (delta: string) => codec.fromPi({
+        type: 'message_update',
+        message: { role: 'assistant', content: [{ type: 'text', text: delta }], stopReason: 'stop' },
+        assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta },
+      } as never);
+      return {
+        runId: 'durable-active-run', status: 'running' as const,
+        events: {
+          async *[Symbol.asyncIterator]() {
+            yield update('第一段回答');
+            const input = await appendedInput;
+            yield update(`已纳入：${input.message.text}`);
+          },
+        },
+        async result() {
+          const input = await appendedInput;
+          return {
+            runId: 'durable-active-run', status: 'succeeded' as const, text: `已纳入：${input.message.text}`,
+            usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0 },
+          };
+        },
+      };
+    });
     const queueModel: ChatModel = {
       id: 'queue',
-      async *stream(input): AsyncIterable<StreamEvent> {
-        seenMessages.push(input.messages.map((message) => ({ ...message })));
-        if (seenMessages.length === 1) {
-          firstStarted();
-          yield { type: 'text_delta', text: '第一段回答' };
-          await release;
-        } else {
-          yield { type: 'text_delta', text: `已纳入：${input.messages.at(-1)?.text ?? ''}` };
-        }
-        yield { type: 'stop', reason: 'end_turn' };
-      },
+      async *stream(): AsyncIterable<StreamEvent> { throw new Error('legacy runtime must not execute'); },
     };
     const rt = {
       model: queueModel,
@@ -780,6 +1145,7 @@ describe('HTTP server', () => {
       authProvider: auth,
       jwtSecret: 'append-secret',
       systemExtra: '',
+      durableRunRuntime: { run: runDurably, append: appendDurably } as unknown as DurableRunRuntime,
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
 
@@ -796,6 +1162,12 @@ describe('HTTP server', () => {
       });
       await started;
 
+      const competing = await fetch(`${appendBase}/v1/agent`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ task: '并发启动另一个任务', sessionId: 'active-append' }),
+      });
+
       const appended = await fetch(`${appendBase}/v1/sessions/active-append/append`, {
         method: 'POST',
         headers,
@@ -803,61 +1175,142 @@ describe('HTTP server', () => {
       });
       expect(appended.status).toBe(200);
       expect(await appended.json()).toEqual({ ok: true, sessionId: 'active-append', queued: true });
-      expect(seenMessages).toHaveLength(1);
+      expect(runDurably).toHaveBeenCalledOnce();
+      expect(appendDurably).toHaveBeenCalledWith(expect.objectContaining({
+        runId: expect.any(String), mode: 'steer',
+        message: expect.objectContaining({ role: 'user', text: expect.stringContaining('中途修正') }),
+      }));
 
-      releaseFirst();
       const runResponse = await run;
       expect(runResponse.status).toBe(200);
-      const body = await runResponse.text();
-      expect(body).toContain('已纳入：中途修正');
-      expect(seenMessages).toHaveLength(2);
-      expect(seenMessages[1]!.at(-1)).toMatchObject({ role: 'user', text: expect.stringContaining('中途修正') });
-
-      const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
-      const stored = await localStore.listMessages(ctx, 'active-append');
-      expect(stored.map((message) => message.role)).toEqual(['user', 'assistant', 'user', 'assistant']);
-      expect(stored[2]?.text).toContain('中途修正');
+      const runBody = await runResponse.text();
+      expect(runBody).toContain('event: text_delta');
+      expect(runBody).toContain('已纳入：中途修正');
+      expect(competing.status).toBe(409);
+      await competing.text();
     } finally {
       await new Promise<void>((resolve) => appendServer.close(() => resolve()));
     }
   });
 
-  it('runs /goal with an autonomous prompt and extended step budget', async () => {
+  it('projects durable terminal results into legacy success, error, and terminated SSE semantics', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'durable-result-secret' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    const ownerCtx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+    for (const sessionId of ['result-failed', 'result-cancelled']) {
+      await localStore.appendMessage(ownerCtx, sessionId, { role: 'user', text: 'prior question' });
+      await localStore.appendMessage(ownerCtx, sessionId, { role: 'assistant', text: 'prior answer', durationMs: 77 });
+    }
+    const run = vi.fn(async (input: { input: Array<{ text?: string }> }) => {
+      const mode = input.input[0]?.text;
+      const status = mode === 'fail' ? 'failed' as const : mode === 'cancel' ? 'cancelled' as const : 'succeeded' as const;
+      return {
+        runId: `run-${mode}`, status: 'running' as const,
+        events: { async *[Symbol.asyncIterator]() {} },
+        async result() {
+          return {
+            runId: `run-${mode}`, status,
+            ...(status === 'succeeded' ? { text: 'fallback durable answer' } : {}),
+            ...(status === 'failed' ? { error: { code: 'MODEL_PROVIDER_ERROR' as const, message: 'provider failed', retryable: false } } : {}),
+            usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+          };
+        },
+      };
+    });
+    const rt = {
+      model, tools: new ToolRegistry(), store: localStore, policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth, jwtSecret: 'durable-result-secret', systemExtra: '', durableRunRuntime: { run },
+      piSessionStore: {
+        async getSessionStats() {
+          return { messageCount: 2, cachedTokens: 0, uncachedTokens: 2, totalTokens: 2, costTotal: 0 };
+        },
+        async get() {
+          return { tenantId: 'default', sessionId: 'stored', createdAt: new Date(), updatedAt: new Date(),
+            currentLeafId: 'assistant-prior', committedLeafId: 'assistant-prior' };
+        },
+        async listEntries() {
+          return [
+            { tenantId: 'default', sessionId: 'stored', sequence: 1n, entry: {
+              type: 'message', id: 'user-prior', parentId: null, timestamp: '2026-07-29T00:00:00.000Z',
+              message: { role: 'user', content: 'prior question', timestamp: 1 },
+            } },
+            { tenantId: 'default', sessionId: 'stored', sequence: 2n, entry: {
+              type: 'message', id: 'assistant-prior', parentId: 'user-prior', timestamp: '2026-07-29T00:00:01.000Z',
+              message: { role: 'assistant', content: [{ type: 'text', text: 'prior answer' }], timestamp: 2,
+                api: 'openai-completions', provider: 'aiop', model: 'm', stopReason: 'stop', usage: {
+                  input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+                } },
+            } },
+          ];
+        },
+      },
+    } as unknown as Runtime;
+    const server = createHttpServer(rt);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const localBase = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const request = async (task: string, sessionId: string) => {
+      const response = await fetch(`${localBase}/v1/agent`, {
+        method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${adminToken}` },
+        body: JSON.stringify({ task, sessionId }),
+      });
+      return response.text();
+    };
+    try {
+      const success = await request('success', 'result-success');
+      expect(success).toContain('event: text_delta');
+      expect(success).toContain('fallback durable answer');
+      expect(success).toContain('event: done');
+
+      const projectionFailure = vi.spyOn(localStore, 'replaceMessages')
+        .mockRejectedValueOnce(new Error('projection store unavailable'));
+      const succeededDespiteProjectionFailure = await request('success', 'result-projection-failure');
+      expect(projectionFailure).toHaveBeenCalledOnce();
+      expect(succeededDespiteProjectionFailure).toContain('event: done');
+      expect(succeededDespiteProjectionFailure).not.toContain('event: error');
+
+      const failed = await request('fail', 'result-failed');
+      expect(failed).toContain('event: error');
+      expect(failed).toContain('provider failed');
+      expect((await localStore.listMessages(ownerCtx, 'result-failed')).at(-1)?.durationMs).toBe(77);
+
+      const cancelled = await request('cancel', 'result-cancelled');
+      expect(cancelled).toContain('event: terminated');
+      expect((await localStore.listMessages(ownerCtx, 'result-cancelled')).at(-1)?.durationMs).toBe(77);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('routes /goal requests through the mandatory durable Pi runtime', async () => {
     const localStore = new MemoryStore();
     await localStore.createTenant({ id: 'default', name: 'Default' });
     const auth = new LocalAuthProvider({ store: localStore, secret: 'goal-secret' });
     await auth.createUser('default', 'admin', 'pw', 'platform_admin');
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
-    const tools = new ToolRegistry();
-    tools.register({
-      def: { name: 'noop', description: 'noop', inputSchema: { type: 'object' } },
-      run: async () => ({ id: '', content: 'ok' }),
-    });
-
-    const seenSystems: string[] = [];
-    let calls = 0;
-    const goalModel: ChatModel = {
-      id: 'goal',
-      async *stream(input): AsyncIterable<StreamEvent> {
-        calls++;
-        seenSystems.push(input.system);
-        if (calls <= 21) {
-          yield { type: 'tool_call', call: { id: `tool-${calls}`, name: 'noop', args: {} } };
-        } else {
-          yield { type: 'text_delta', text: '目标完成' };
-        }
-        yield { type: 'stop', reason: 'end_turn' };
+    const runDurably = vi.fn(async (_input: StartRunInput) => ({
+      runId: 'goal-run', status: 'running' as const,
+      events: { async *[Symbol.asyncIterator]() {} },
+      async result() {
+        return {
+          runId: 'goal-run', status: 'succeeded' as const, text: '目标完成',
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0 },
+        };
       },
-    };
+    }));
     const rt = {
-      model: goalModel,
-      tools,
+      model,
+      tools: new ToolRegistry(),
       store: localStore,
       policy: new AllowAllPolicy(),
       policyPreApproved: new AllowAllPolicy(),
       authProvider: auth,
       jwtSecret: 'goal-secret',
       systemExtra: '',
+      durableRunRuntime: { run: runDurably },
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
 
@@ -874,9 +1327,10 @@ describe('HTTP server', () => {
       expect(run.status).toBe(200);
       const body = await run.text();
       expect(body).toContain('目标完成');
-      expect(body).toContain('"steps":22');
-      expect(seenSystems[0]).toContain('目标模式');
-      expect(seenSystems[0]).toContain('不可逆');
+      expect(runDurably).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: 'goal-sess', kernel: 'pi',
+        input: [expect.objectContaining({ role: 'user', text: '/goal 完成巡检并整理结果' })],
+      }));
     } finally {
       await new Promise<void>((resolve) => goalServer.close(() => resolve()));
     }
@@ -898,6 +1352,15 @@ describe('HTTP server', () => {
     expect(await r.text()).toContain('/app.js');
   });
 
+  it('serves the frontend shell for every menu route', async () => {
+    for (const path of ['/chat', '/runs', '/skills', '/mcp', '/schedule', '/sandbox', '/users', '/settings']) {
+      const r = await fetch(`${base}${path}`);
+      expect(r.status, path).toBe(200);
+      expect(r.headers.get('content-type'), path).toContain('text/html');
+      expect(await r.text(), path).toContain('/app.js');
+    }
+  });
+
   it('reads, updates, and tests runtime LLM settings', async () => {
     const initial = await fetch(`${base}/v1/settings/llm`, {
       headers: { authorization: `Bearer ${token}` },
@@ -912,6 +1375,7 @@ describe('HTTP server', () => {
         api_key: 'initial-key',
         api_key_set: true,
         api_key_preview: 'ini...key',
+        allow_insecure_tls: false,
         context_window_tokens: 200000,
         context_keep_images: 1,
       },
@@ -924,6 +1388,7 @@ describe('HTTP server', () => {
           api_key: 'initial-key',
           api_key_set: true,
           api_key_preview: 'ini...key',
+          allow_insecure_tls: false,
           context_window_tokens: 200000,
           context_keep_images: 1,
         },
@@ -935,6 +1400,7 @@ describe('HTTP server', () => {
           api_key: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
           api_key_set: true,
           api_key_preview: 'tes...aZ3',
+          allow_insecure_tls: false,
           context_window_tokens: 200000,
           context_keep_images: 1,
         },
@@ -948,6 +1414,7 @@ describe('HTTP server', () => {
         base_url: 'http://192.168.10.108:18317',
         api_key: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
         model: 'glm-5',
+        allow_insecure_tls: true,
         context_window_tokens: 128000,
       }),
     });
@@ -961,6 +1428,7 @@ describe('HTTP server', () => {
         api_key: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
         api_key_set: true,
         api_key_preview: 'tes...aZ3',
+        allow_insecure_tls: true,
         context_window_tokens: 128000,
       },
     });
@@ -970,8 +1438,16 @@ describe('HTTP server', () => {
       baseURL: 'http://192.168.10.108:18317',
       apiKey: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
       model: 'glm-5',
+      allowInsecureTls: true,
       contextWindowTokens: 128000,
     });
+
+    const invalidTls = await fetch(`${base}/v1/settings/llm`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ allow_insecure_tls: 'true' }),
+    });
+    expect(invalidTls.status).toBe(400);
 
     const probe = await fetch(`${base}/v1/settings/llm/test`, {
       method: 'POST',
@@ -1045,37 +1521,37 @@ describe('HTTP server', () => {
     const calls: string[] = [];
     const tools = new ToolRegistry();
     tools.register({
-      def: { name: 'sbx__run_code', description: 'run code', inputSchema: { type: 'object' } },
-      run: async (args) => ({ id: '', content: `code:${(args as { code: string }).code}` }),
+      name: 'sbx__run_code', description: 'run code', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async (args) => ({ id: '', content: `code:${(args as { code: string }).code}` }),
     });
     tools.register({
-      def: { name: 'browser_navigate', description: 'navigate', inputSchema: { type: 'object' } },
-      run: async (args) => {
+      name: 'browser_navigate', description: 'navigate', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async (args) => {
         calls.push(`navigate:${(args as { url: string }).url}`);
         return { id: '', content: 'navigated' };
       },
     });
     tools.register({
-      def: { name: 'desktop_stream_url', description: 'stream', inputSchema: { type: 'object' } },
-      run: async () => ({ id: '', content: '浏览器预览地址：http://stream.local/session' }),
+      name: 'desktop_stream_url', description: 'stream', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async () => ({ id: '', content: '浏览器预览地址：http://stream.local/session' }),
     });
     tools.register({
-      def: { name: 'browser_click', description: 'click', inputSchema: { type: 'object' } },
-      run: async (args) => {
+      name: 'browser_click', description: 'click', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async (args) => {
         calls.push(`click:${(args as { x: number; y: number }).x},${(args as { x: number; y: number }).y}`);
         return { id: '', content: 'clicked' };
       },
     });
     tools.register({
-      def: { name: 'browser_type', description: 'type', inputSchema: { type: 'object' } },
-      run: async (args) => {
+      name: 'browser_type', description: 'type', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async (args) => {
         calls.push(`type:${(args as { text: string }).text}`);
         return { id: '', content: 'typed' };
       },
     });
     tools.register({
-      def: { name: 'browser_screenshot', description: 'screenshot', inputSchema: { type: 'object' } },
-      run: async () => ({
+      name: 'browser_screenshot', description: 'screenshot', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async () => ({
         id: '',
         content: 'screenshot',
         contentBlocks: [{ type: 'image', mimeType: 'image/png', data: 'AQID' }],
@@ -1286,8 +1762,8 @@ describe('HTTP server', () => {
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
     const tools = new ToolRegistry();
     tools.register({
-      def: { name: 'desktop_stream_url', description: 'stream', inputSchema: { type: 'object' } },
-      run: async () => ({ id: '', content: '浏览器预览地址：data:text/html;charset=utf-8,%3Chtml%3E%3C%2Fhtml%3E' }),
+      name: 'desktop_stream_url', description: 'stream', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async () => ({ id: '', content: '浏览器预览地址：data:text/html;charset=utf-8,%3Chtml%3E%3C%2Fhtml%3E' }),
     });
 
     const rt = {
@@ -1338,12 +1814,12 @@ describe('HTTP server', () => {
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
     const tools = new ToolRegistry();
     tools.register({
-      def: { name: 'load_skill', description: '加载技能', inputSchema: { type: 'object' } },
-      run: async (args) => ({ id: '', content: `skill:${(args as { name: string }).name}` }),
+      name: 'load_skill', description: '加载技能', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async (args) => ({ id: '', content: `skill:${(args as { name: string }).name}` }),
     });
     tools.register({
-      def: { name: 'mcp__fs__read_file', description: '读取文件', inputSchema: { type: 'object' } },
-      run: async (args) => ({ id: '', content: `file:${(args as { path: string }).path}` }),
+      name: 'mcp__fs__read_file', description: '读取文件', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async (args) => ({ id: '', content: `file:${(args as { path: string }).path}` }),
     });
 
     const rt = {
@@ -1387,12 +1863,25 @@ describe('HTTP server', () => {
   it('imports a zipped skill and exposes it in the tools list', async () => {
     const localStore = new MemoryStore();
     await localStore.createTenant({ id: 'default', name: 'Default' });
+    await localStore.createTenant({ id: 'other', name: 'Other' });
     const auth = new LocalAuthProvider({ store: localStore, secret: 'skill-import-secret' });
     await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    await auth.createUser('default', 'tenant-admin', 'pw', 'tenant_admin');
+    const uploader = await auth.createUser('default', 'uploader', 'pw', 'user');
+    await auth.createUser('default', 'second-uploader', 'pw', 'user');
+    await auth.createUser('other', 'other-user', 'pw', 'user');
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    const tenantAdminToken = (await auth.login('default', 'tenant-admin', 'pw'))!;
+    const uploaderToken = (await auth.login('default', 'uploader', 'pw'))!;
+    const secondUploaderToken = (await auth.login('default', 'second-uploader', 'pw'))!;
+    const otherToken = (await auth.login('other', 'other-user', 'pw'))!;
     const skillRoot = await mkdtemp(join(tmpdir(), 'aiop-http-skill-import-'));
     await mkdir(skillRoot, { recursive: true });
-    const skills = new SkillRegistry(skillRoot);
+    await mkdir(join(skillRoot, '.aiop-imports'), { mode: 0o777 });
+    const piSkillLoader: ProductSkillLoader = vi.fn(async (env, sources) => (
+      loadSourcedSkills<SkillProductRecord>(env, sources)
+    ));
+    const skills = new SkillRegistry(skillRoot, { loader: piSkillLoader });
     await skills.scan();
     const tools = new ToolRegistry();
     tools.register(skills.tool());
@@ -1405,7 +1894,7 @@ describe('HTTP server', () => {
       policyPreApproved: new AllowAllPolicy(),
       authProvider: auth,
       jwtSecret: 'skill-import-secret',
-      systemExtra: skills.summaries(),
+      systemExtra: '',
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
 
@@ -1414,32 +1903,104 @@ describe('HTTP server', () => {
     const importBase = `http://127.0.0.1:${(importServer.address() as AddressInfo).port}`;
     const data = storedZip({
       'SKILL.md': '---\nname: imported\ndescription: Imported skill\n---\n# Imported',
+      '.product.json': JSON.stringify({
+        name: 'imported', version: '1', enabled: true, reviewed: true,
+        tenantId: 'evil', allowedTenantIds: ['*'], ownerUserId: 'attacker',
+        visibility: 'public', allowedRoles: ['platform_admin'],
+        credentials: ['aios'], credentialFile: '../../escape.json',
+      }),
       'scripts/run.sh': 'echo imported',
     }).toString('base64');
 
     try {
+      for (const [message, status] of [
+        ['用户待审核技能数量配额已满', 429],
+        ['用户待审核技能字节配额已满', 413],
+        ['技能存储可用空间不足', 507],
+      ] as const) {
+        const quotaSpy = vi.spyOn(skills, 'installUploadedProduct').mockRejectedValueOnce(new Error(message));
+        const response = await fetch(`${importBase}/v1/skills/import`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
+          body: JSON.stringify({
+            filename: `quota-${status}.zip`,
+            data: storedZip({
+              'SKILL.md': `---\nname: quota-${status}\ndescription: Quota probe\n---\nbody`,
+            }).toString('base64'),
+          }),
+        });
+        expect(response.status).toBe(status);
+        quotaSpy.mockRestore();
+      }
+
+      const originalInstall = skills.installUploadedProduct.bind(skills);
+      const installSpy = vi.spyOn(skills, 'installUploadedProduct').mockImplementationOnce(async (...args) => {
+        expect(args[0].startsWith(`${join(skillRoot, '.aiop-imports')}/`)).toBe(true);
+        await skills.scan();
+        expect(skills.list()).not.toContainEqual(expect.objectContaining({ name: 'staging-bypass' }));
+        return originalInstall(...args);
+      });
+      const stagingProbeData = storedZip({
+        'SKILL.md': '---\nname: staging-bypass\ndescription: Must remain pending\n---\nbody',
+        '.product.json': JSON.stringify({
+          name: 'staging-bypass', version: '1', enabled: true, reviewed: true,
+          tenantId: 'default', ownerUserId: uploader.id, visibility: 'public', allowedTenantIds: ['*'],
+        }),
+      }).toString('base64');
+      const stagingProbeImport = await fetch(`${importBase}/v1/skills/import`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ filename: 'staging-bypass.zip', data: `data:application/zip;base64,${stagingProbeData}` }),
+      });
+      expect(stagingProbeImport.status).toBe(201);
+      expect(installSpy).toHaveBeenCalledOnce();
+      expect((await stat(join(skillRoot, '.aiop-imports'))).mode & 0o777).toBe(0o750);
+      installSpy.mockRestore();
+
       const imported = await fetch(`${importBase}/v1/skills/import`, {
         method: 'POST',
-        headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+        headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
         body: JSON.stringify({ filename: 'imported.zip', data: `data:application/zip;base64,${data}` }),
       });
       expect(imported.status).toBe(201);
       expect(await imported.json()).toMatchObject({
-        skill: {
+        pendingReview: true,
+        product: {
           name: 'imported',
-          description: 'Imported skill',
+          version: '1',
           enabled: true,
-          status: '已启用',
-          fileEntries: expect.arrayContaining([
-            expect.objectContaining({ path: 'SKILL.md', isDirectory: false, size: expect.any(Number), updatedAt: expect.any(String) }),
-            expect.objectContaining({ path: 'scripts', isDirectory: true }),
-            expect.objectContaining({ path: 'scripts/run.sh', isDirectory: false, size: expect.any(Number), updatedAt: expect.any(String) }),
-          ]),
+          reviewed: false,
+          tenantId: 'default',
+          ownerUserId: uploader.id,
+          visibility: 'private',
         },
       });
 
+      const persisted = JSON.parse(await readFile(
+        join(skillRoot, 'users', uploader.id, 'imported', '.product.json'), 'utf8',
+      )) as Record<string, unknown>;
+      expect(persisted).toEqual({
+        name: 'imported', version: '1', enabled: true, reviewed: false,
+        tenantId: 'default', ownerUserId: uploader.id, visibility: 'private',
+        schemaVersion: 2, revision: 0,
+      });
+      expect(await skills.summariesFor({ tenantId: 'default', userId: uploader.id, role: 'user' })).not.toContain('imported');
+      expect(piSkillLoader).not.toHaveBeenCalled();
+
+      const conflictingData = storedZip({
+        'SKILL.md': '---\nname: imported\ndescription: Conflicting upload\n---\nbody',
+        '.product.json': JSON.stringify({ name: 'imported', version: '2' }),
+      }).toString('base64');
+      const conflictingImport = await fetch(`${importBase}/v1/skills/import`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${secondUploaderToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ filename: 'imported-copy.zip', data: `data:application/zip;base64,${conflictingData}` }),
+      });
+      expect(conflictingImport.status).toBe(409);
+      await expect(stat(join(skillRoot, 'users', 'u_default_second-uploader', 'imported-copy'))).rejects.toThrow();
+
       const listed = await fetch(`${importBase}/v1/tools`, {
-        headers: { authorization: `Bearer ${adminToken}` },
+        headers: { authorization: `Bearer ${uploaderToken}` },
       });
       expect(listed.status).toBe(200);
       const body = await listed.json() as {
@@ -1452,7 +2013,54 @@ describe('HTTP server', () => {
           fileEntries?: Array<{ path: string; isDirectory: boolean; size: number; updatedAt: string }>;
         }>;
       };
-      expect(body.tools).toContainEqual(expect.objectContaining({
+      expect(body.tools).not.toContainEqual(expect.objectContaining({ name: 'imported' }));
+
+      const selfReview = await fetch(`${importBase}/v1/skills/imported/review`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ reviewed: true }),
+      });
+      expect(selfReview.status).toBe(403);
+
+      const adminUploadData = storedZip({
+        'SKILL.md': '---\nname: admin-owned\ndescription: Admin owned\n---\nbody',
+      }).toString('base64');
+      const adminUpload = await fetch(`${importBase}/v1/skills/import`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ filename: 'admin-owned.zip', data: `data:application/zip;base64,${adminUploadData}` }),
+      });
+      expect(adminUpload.status).toBe(201);
+      const adminSelfReview = await fetch(`${importBase}/v1/skills/admin-owned/review`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ reviewed: true }),
+      });
+      expect(adminSelfReview.status).toBe(403);
+      expect(piSkillLoader).not.toHaveBeenCalled();
+
+      const tenantGlobal = await fetch(`${importBase}/v1/skills/imported/review`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${tenantAdminToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ reviewed: true, global: true }),
+      });
+      expect(tenantGlobal.status).toBe(403);
+
+      const localReview = await fetch(`${importBase}/v1/skills/imported/review`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${tenantAdminToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ reviewed: true }),
+      });
+      expect(localReview.status).toBe(200);
+      expect(piSkillLoader).toHaveBeenCalledTimes(1);
+      expect(await localReview.json()).toMatchObject({
+        product: { name: 'imported', reviewed: true, tenantId: 'default', visibility: 'private' },
+      });
+
+      const listedAfterReview = await fetch(`${importBase}/v1/tools`, {
+        headers: { authorization: `Bearer ${uploaderToken}` },
+      }).then((response) => response.json()) as typeof body;
+      expect(listedAfterReview.tools).toContainEqual(expect.objectContaining({
         name: 'imported',
         description: 'Imported skill',
         category: 'skill',
@@ -1464,9 +2072,133 @@ describe('HTTP server', () => {
           expect.objectContaining({ path: 'scripts/run.sh', isDirectory: false }),
         ]),
       }));
+      const otherBeforeGlobal = await fetch(`${importBase}/v1/tools`, {
+        headers: { authorization: `Bearer ${otherToken}` },
+      }).then((response) => response.json()) as typeof body;
+      expect(otherBeforeGlobal.tools).not.toContainEqual(expect.objectContaining({ name: 'imported' }));
+
+      const repeatedLocalReview = await fetch(`${importBase}/v1/skills/imported/review`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${tenantAdminToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ reviewed: true }),
+      });
+      expect(repeatedLocalReview.status).toBe(409);
+
+      const globalData = storedZip({
+        'SKILL.md': '---\nname: globalized\ndescription: Global skill\n---\nbody',
+      }).toString('base64');
+      const globalImport = await fetch(`${importBase}/v1/skills/import`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ filename: 'globalized.zip', data: `data:application/zip;base64,${globalData}` }),
+      });
+      expect(globalImport.status).toBe(201);
+      const previousAudit = rt.audit;
+      rt.audit = { record: vi.fn(async () => { throw new Error('audit unavailable'); }) };
+      const globalReview = await fetch(`${importBase}/v1/skills/globalized/review`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ reviewed: true, global: true }),
+      });
+      expect(globalReview.status).toBe(200);
+      rt.audit = previousAudit;
+      expect(await globalReview.json()).toMatchObject({
+        product: { reviewed: true, allowedTenantIds: ['*'], visibility: 'public' },
+      });
+      const otherAfterGlobal = await fetch(`${importBase}/v1/tools`, {
+        headers: { authorization: `Bearer ${otherToken}` },
+      }).then((response) => response.json()) as typeof body;
+      expect(otherAfterGlobal.tools).toContainEqual(expect.objectContaining({ name: 'globalized' }));
+      expect(otherAfterGlobal.tools).not.toContainEqual(expect.objectContaining({ name: 'imported' }));
+
+      const malformedBase64 = await fetch(`${importBase}/v1/skills/import`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ filename: 'bad.zip', data: '%%%not-base64%%%' }),
+      });
+      expect(malformedBase64.status).toBe(400);
+
+      const malformedArchive = await fetch(`${importBase}/v1/skills/import`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ filename: 'bad.zip', data: Buffer.from('not a zip').toString('base64') }),
+      });
+      expect(malformedArchive.status).toBe(422);
+
+      const originalConcurrentInstall = skills.installUploadedProduct.bind(skills);
+      const permitRoot = join(skillRoot, '.aiop-imports', '.concurrency');
+      const tenantPermitRoot = join(
+        permitRoot,
+        `tenant-${createHash('sha256').update('default').digest('hex')}`,
+      );
+      for (const slot of [join(permitRoot, 'global', '0'), join(tenantPermitRoot, '0')]) {
+        await rm(slot, { recursive: true, force: true });
+        const ownerDir = join(slot, '.released-owner');
+        await mkdir(ownerDir, { recursive: true });
+        await writeFile(join(ownerDir, 'owner.json'), JSON.stringify({
+          token: 'released-owner',
+        }));
+      }
+      const concurrentSpy = vi.spyOn(skills, 'installUploadedProduct').mockImplementation(async (...args) => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return originalConcurrentInstall(...args);
+      });
+      const replicaSkills = new SkillRegistry(skillRoot, { loader: piSkillLoader });
+      await replicaSkills.scan();
+      const replicaTools = new ToolRegistry();
+      replicaTools.register(replicaSkills.tool());
+      const replicaRuntime = {
+        ...rt,
+        tools: replicaTools,
+        skillRegistry: replicaSkills,
+      } as unknown as Runtime;
+      const replicaServer = createHttpServer(replicaRuntime);
+      await new Promise<void>((resolve) => replicaServer.listen(0, '127.0.0.1', resolve));
+      const replicaBase = `http://127.0.0.1:${(replicaServer.address() as AddressInfo).port}`;
+      const originalReplicaInstall = replicaSkills.installUploadedProduct.bind(replicaSkills);
+      const replicaSpy = vi.spyOn(replicaSkills, 'installUploadedProduct').mockImplementation(async (...args) => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return originalReplicaInstall(...args);
+      });
+      const concurrentImports = await Promise.all(['quota-a', 'quota-b', 'quota-c'].map((name, index) => fetch(`${index % 2 ? replicaBase : importBase}/v1/skills/import`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          filename: `${name}.zip`,
+          data: storedZip({ 'SKILL.md': `---\nname: ${name}\ndescription: quota\n---\nbody` }).toString('base64'),
+        }),
+      })));
+      expect(concurrentImports.map((response) => response.status).sort()).toEqual([201, 201, 429]);
+      concurrentSpy.mockRestore();
+      replicaSpy.mockRestore();
+      await new Promise<void>((resolve, reject) => replicaServer.close((err) => err ? reject(err) : resolve()));
+
+      const invalidData = storedZip({
+        'SKILL.md': '---\nname: bad_name\ndescription: Invalid Pi name\n---\nbody',
+        '.product.json': JSON.stringify({ name: 'bad_name', version: '1' }),
+      }).toString('base64');
+      const invalidImport = await fetch(`${importBase}/v1/skills/import`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ filename: 'bad_name.zip', data: `data:application/zip;base64,${invalidData}` }),
+      });
+      expect(invalidImport.status).toBe(201);
+      const invalidReview = await fetch(`${importBase}/v1/skills/bad_name/review`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${tenantAdminToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ reviewed: true }),
+      });
+      expect(invalidReview.status).toBe(422);
+      expect(JSON.parse(await readFile(
+        join(skillRoot, 'users', uploader.id, 'bad_name', '.product.json'), 'utf8',
+      ))).toMatchObject({ reviewed: false });
+      const toolsAfterInvalidReview = await fetch(`${importBase}/v1/tools`, {
+        headers: { authorization: `Bearer ${uploaderToken}` },
+      }).then((response) => response.json()) as typeof body;
+      expect(toolsAfterInvalidReview.tools).not.toContainEqual(expect.objectContaining({ name: 'bad_name' }));
 
       const rootFiles = await fetch(`${importBase}/v1/skills/imported/files`, {
-        headers: { authorization: `Bearer ${adminToken}` },
+        headers: { authorization: `Bearer ${uploaderToken}` },
       });
       expect(rootFiles.status).toBe(200);
       expect(await rootFiles.json()).toMatchObject({
@@ -1479,7 +2211,7 @@ describe('HTTP server', () => {
       });
 
       const skillMd = await fetch(`${importBase}/v1/skills/imported/files?path=SKILL.md`, {
-        headers: { authorization: `Bearer ${adminToken}` },
+        headers: { authorization: `Bearer ${uploaderToken}` },
       });
       expect(skillMd.status).toBe(200);
       expect(await skillMd.json()).toMatchObject({
@@ -1490,14 +2222,18 @@ describe('HTTP server', () => {
 
       const disabled = await fetch(`${importBase}/v1/skills/imported/disable`, {
         method: 'POST',
-        headers: { authorization: `Bearer ${adminToken}` },
+        headers: { authorization: `Bearer ${uploaderToken}` },
       });
-      expect(disabled.status).toBe(200);
-      expect(await disabled.json()).toMatchObject({ skill: { name: 'imported', enabled: false, status: '已禁用' } });
+      expect(disabled.status).toBe(403);
+      const adminDisabled = await fetch(`${importBase}/v1/skills/imported/disable`, {
+        method: 'POST', headers: { authorization: `Bearer ${tenantAdminToken}` },
+      });
+      expect(adminDisabled.status).toBe(200);
+      expect(await adminDisabled.json()).toMatchObject({ skill: { name: 'imported', enabled: false, status: '已禁用' } });
 
       const disabledLoad = await fetch(`${importBase}/v1/tools/call`, {
         method: 'POST',
-        headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+        headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
         body: JSON.stringify({ sessionId: 's1', name: 'load_skill', args: { name: 'imported' } }),
       });
       expect(disabledLoad.status).toBe(200);
@@ -1505,28 +2241,28 @@ describe('HTTP server', () => {
 
       const enabled = await fetch(`${importBase}/v1/skills/imported/enable`, {
         method: 'POST',
-        headers: { authorization: `Bearer ${adminToken}` },
+        headers: { authorization: `Bearer ${tenantAdminToken}` },
       });
       expect(enabled.status).toBe(200);
       expect(await enabled.json()).toMatchObject({ skill: { name: 'imported', enabled: true, status: '已启用' } });
 
       const rejectedDelete = await fetch(`${importBase}/v1/skills/imported`, {
         method: 'DELETE',
-        headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+        headers: { authorization: `Bearer ${uploaderToken}`, 'content-type': 'application/json' },
         body: JSON.stringify({ confirm: false }),
       });
       expect(rejectedDelete.status).toBe(400);
 
       const deleted = await fetch(`${importBase}/v1/skills/imported`, {
         method: 'DELETE',
-        headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+        headers: { authorization: `Bearer ${tenantAdminToken}`, 'content-type': 'application/json' },
         body: JSON.stringify({ confirm: true }),
       });
       expect(deleted.status).toBe(200);
       expect(await deleted.json()).toEqual({ ok: true });
 
       const afterDelete = await fetch(`${importBase}/v1/tools`, {
-        headers: { authorization: `Bearer ${adminToken}` },
+        headers: { authorization: `Bearer ${uploaderToken}` },
       });
       expect(afterDelete.status).toBe(200);
       const afterDeleteBody = await afterDelete.json() as { tools: Array<{ name: string }> };
@@ -1536,46 +2272,48 @@ describe('HTTP server', () => {
     }
   });
 
-  it('pauses an SSE agent run for approval and resumes after approve', async () => {
+  it('authorizes approval resolution and resumes the durable run', async () => {
     const localStore = new MemoryStore();
     await localStore.createTenant({ id: 'default', name: 'Default' });
     const auth = new LocalAuthProvider({ store: localStore, secret: 'approval-secret' });
-    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const admin = await auth.createUser('default', 'admin', 'pw', 'platform_admin');
     await auth.createUser('default', 'user', 'pw', 'user');
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
     const userToken = (await auth.login('default', 'user', 'pw'))!;
-
-    const run = vi.fn(async () => ({ id: '', content: 'approved tool result' }));
-    const tools = new ToolRegistry();
-    tools.register({
-      def: { name: 'act', description: 'act', inputSchema: { type: 'object' } },
-      run,
+    const runId = 'approval-run';
+    const approvalId = 'approval-interaction';
+    await localStore.putAgentRunBindingIfAbsent({
+      tenantId: 'default', userId: admin.id, sessionId: 'approval-sess', runId, kernel: 'pi',
+      createdAt: new Date(),
     });
-
-    let turn = 0;
-    const approvalModel: ChatModel = {
-      id: 'approval-model',
-      async *stream(): AsyncIterable<StreamEvent> {
-        turn++;
-        if (turn === 1) {
-          yield { type: 'tool_call', call: { id: 'c1', name: 'act', args: {} } };
-          yield { type: 'stop', reason: 'tool_use' };
-          return;
-        }
-        yield { type: 'text_delta', text: 'finished after approval' };
-        yield { type: 'stop', reason: 'end_turn' };
+    await localStore.updateAgentRun('default', runId, { status: 'waiting', updatedAt: new Date() });
+    await localStore.putInteraction({
+      id: approvalId, tenantId: 'default', userId: admin.id, sessionId: 'approval-sess', runId,
+      kind: 'approval', toolCallId: 'call-a', payload: { id: approvalId, reason: 'prod write' },
+      status: 'pending', expiresAt: new Date(Date.now() + 60_000), createdAt: new Date(),
+    });
+    const resume = vi.fn(async () => ({
+      runId, status: 'running' as const,
+      attempt: async () => ({ attemptId: 'approval-attempt', workerId: 'approval-worker', fencingToken: 1n }),
+      events: { async *[Symbol.asyncIterator]() {} },
+      async result() {
+        return {
+          runId, status: 'succeeded' as const, text: 'finished after approval',
+          usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+        };
       },
-    };
+    }));
 
     const rt = {
-      model: approvalModel,
-      tools,
+      model,
+      tools: new ToolRegistry(),
       store: localStore,
-      policy: { check: async () => ({ blocked: false, needApproval: true, reason: 'prod write' }) },
+      policy: new AllowAllPolicy(),
       policyPreApproved: new AllowAllPolicy(),
       authProvider: auth,
       jwtSecret: 'approval-secret',
       systemExtra: '',
+      durableRunRuntime: { resume },
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
 
@@ -1584,26 +2322,6 @@ describe('HTTP server', () => {
     const approvalBase = `http://127.0.0.1:${(approvalServer.address() as AddressInfo).port}`;
 
     try {
-      const r = await fetch(`${approvalBase}/v1/agent`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${adminToken}` },
-        body: JSON.stringify({ task: 'needs approval', sessionId: 'approval-sess' }),
-      });
-      expect(r.status).toBe(200);
-      const reader = r.body!.getReader();
-      const decoder = new TextDecoder();
-      let stream = '';
-      let approvalId = '';
-
-      while (!approvalId) {
-        const next = await reader.read();
-        expect(next.done).toBe(false);
-        stream += decoder.decode(next.value, { stream: true });
-        const m = /event: approval_required\ndata: ([^\n]+)/.exec(stream);
-        if (m) approvalId = (JSON.parse(m[1]!) as { id: string }).id;
-      }
-
-      expect(run).not.toHaveBeenCalled();
       const deniedByRbac = await fetch(`${approvalBase}/v1/approvals/${approvalId}/approve`, {
         method: 'POST',
         headers: { authorization: `Bearer ${userToken}` },
@@ -1615,16 +2333,14 @@ describe('HTTP server', () => {
         headers: { authorization: `Bearer ${adminToken}` },
       });
       expect(approved.status).toBe(200);
-
-      while (!stream.includes('event: done')) {
-        const next = await reader.read();
-        if (next.done) break;
-        stream += decoder.decode(next.value, { stream: true });
-      }
-
-      expect(run).toHaveBeenCalledOnce();
-      expect(stream).toContain('event: done');
-      expect(stream).toContain('finished after approval');
+      await vi.waitFor(() => expect(resume).toHaveBeenCalledOnce());
+      expect(resume).toHaveBeenCalledWith(expect.objectContaining({
+        runId,
+        resolution: { interactionId: approvalId, value: true },
+      }));
+      expect(await localStore.getInteraction('default', approvalId)).toMatchObject({
+        status: 'resolved', resolution: true,
+      });
     } finally {
       await new Promise<void>((resolve) => approvalServer.close(() => resolve()));
     }
@@ -1638,6 +2354,8 @@ describe('HTTP server 会话互斥与自动压缩', () => {
     const auth = new LocalAuthProvider({ store: localStore, secret: 'mutex-secret' });
     await auth.createUser('default', 'admin', 'pw', 'platform_admin');
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
+    await auth.createUser('default', 'other', 'pw', 'user');
+    const otherToken = (await auth.login('default', 'other', 'pw'))!;
     const rt = {
       model: chatModel,
       tools: new ToolRegistry(),
@@ -1647,13 +2365,15 @@ describe('HTTP server 会话互斥与自动压缩', () => {
       authProvider: auth,
       jwtSecret: 'mutex-secret',
       systemExtra: '',
+      durableRunRuntime: createHttpTestDurableRuntime(localStore, () => chatModel),
       defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
     } as unknown as Runtime;
     const srv = createHttpServer(rt);
     await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve));
     const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
     const headers = { 'content-type': 'application/json', authorization: `Bearer ${adminToken}` };
-    return { srv, url, headers, localStore };
+    const otherHeaders = { 'content-type': 'application/json', authorization: `Bearer ${otherToken}` };
+    return { srv, url, headers, otherHeaders, localStore };
   }
 
   it('rejects a concurrent run on the same session with 409', async () => {
@@ -1672,7 +2392,7 @@ describe('HTTP server 会话互斥与自动压缩', () => {
         yield { type: 'stop', reason: 'end_turn' };
       },
     };
-    const { srv, url, headers } = await makeServer(slowModel);
+    const { srv, url, headers, otherHeaders } = await makeServer(slowModel);
     try {
       const run = fetch(`${url}/v1/agent`, {
         method: 'POST',
@@ -1688,6 +2408,14 @@ describe('HTTP server 会话互斥与自动压缩', () => {
       });
       expect(second.status).toBe(409);
       expect(((await second.json()) as { error: string }).error).toContain('正在运行');
+
+      const sameNameForOtherOwner = await fetch(`${url}/v1/agent`, {
+        method: 'POST',
+        headers: otherHeaders,
+        body: JSON.stringify({ task: '另一个用户的同名会话', sessionId: 'mutex-sess' }),
+      });
+      expect(sameNameForOtherOwner.status).toBe(200);
+      await sameNameForOtherOwner.text();
 
       // 其他会话不受影响
       const other = await fetch(`${url}/v1/agent`, {
@@ -1705,11 +2433,11 @@ describe('HTTP server 会话互斥与自动压缩', () => {
     }
   });
 
-  it('auto-compacts a long history, emits context_compacted, and persists the rewritten history', async () => {
+  it('projects durable session compaction events over SSE', async () => {
     const chatModel: ChatModel = {
       id: 'mock',
       async *stream(): AsyncIterable<StreamEvent> {
-        // 同一模型也承接摘要请求：返回的文本即摘要内容
+        yield { type: 'context_compacted', summarizedMessages: 52, beforeTokens: 180_000, afterTokens: 24_000 };
         yield { type: 'text_delta', text: '模拟摘要或回答' };
         yield { type: 'stop', reason: 'end_turn' };
       },
@@ -1730,19 +2458,14 @@ describe('HTTP server 会话互斥与自动压缩', () => {
       expect(r.status).toBe(200);
       const body = await r.text();
       expect(body).toContain('event: context_compacted');
+      expect(body).toContain('"summarizedMessages":52');
+      expect(body).toContain('"beforeTokens":180000');
+      expect(body).toContain('"afterTokens":24000');
       expect(body).toContain('event: done');
 
       const messages = await localStore.listMessages(ctx, 'compact-sess');
-      // 用户输入永不吞掉：压缩区间的 27 条用户消息原样保留在摘要之前
-      // + 摘要 1 条 + 保留的最近 8 条（含本轮 task）+ 本轮 assistant 1 条 = 37
-      expect(messages).toHaveLength(37);
-      expect(messages[0]!.role).toBe('user');
-      expect(messages[0]!.text).toContain('问题0');
-      const summaryIdx = messages.findIndex((m) => m.text?.includes('历史对话摘要'));
-      expect(summaryIdx).toBeGreaterThan(0);
-      expect(messages[summaryIdx]!.text).toContain('模拟摘要或回答');
-      expect(messages.slice(0, summaryIdx).every((m) => m.role === 'user')).toBe(true);
       expect(messages.at(-2)!.text).toBe('继续任务');
+      expect(messages.at(-1)!.text).toBe('模拟摘要或回答');
     } finally {
       await new Promise<void>((resolve) => srv.close(() => resolve()));
     }
@@ -1789,6 +2512,116 @@ describe('HTTP server MCP 管理', () => {
     });
     return ((await r.json()) as { token: string }).token;
   }
+
+  it('resolves listed and directly called MCP tools from the authenticated tenant', async () => {
+    const tenantStore = new MemoryStore();
+    await tenantStore.createTenant({ id: 'tenant-a', name: 'Tenant A' });
+    await tenantStore.createTenant({ id: 'tenant-b', name: 'Tenant B' });
+    const auth = new LocalAuthProvider({ store: tenantStore, secret: 'mcp-tenant-secret' });
+    await auth.createUser('tenant-a', 'admin-a', 'pw', 'tenant_admin');
+    await auth.createUser('tenant-b', 'admin-b', 'pw', 'tenant_admin');
+    await tenantStore.setMcpServers({ tenantId: 'tenant-a' }, {
+      alpha: { transport: 'http', url: 'https://alpha.example' },
+    });
+    await tenantStore.setMcpServers({ tenantId: 'tenant-b' }, {
+      beta: { transport: 'http', url: 'https://beta.example' },
+    });
+    const connectedTenants: string[] = [];
+    const tenantMcp = new McpManager({}, async (_name, _config, connectContext) => {
+      connectedTenants.push(connectContext.identity.tenantId);
+      return {
+        listTools: async () => ({ tools: [{ name: 'whoami', inputSchema: { type: 'object' } }] }),
+        callTool: async () => ({
+          content: [{ type: 'text', text: connectContext.identity.tenantId }],
+        }),
+        close: async () => undefined,
+      };
+    }, {
+      loadConfigs: (identity) => tenantStore.getMcpServers({ tenantId: identity.tenantId }),
+    });
+    const rt = {
+      model,
+      tools: new ToolRegistry(),
+      mcp: tenantMcp,
+      store: tenantStore,
+      audit: { record: async () => undefined },
+      policy: new AllowAllPolicy(),
+      policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth,
+      jwtSecret: 'mcp-tenant-secret',
+      systemExtra: '',
+      defaultContext: { tenantId: 'tenant-a', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+    const tenantServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => tenantServer.listen(0, '127.0.0.1', resolve));
+    const tenantBase = `http://127.0.0.1:${(tenantServer.address() as AddressInfo).port}`;
+    const tokenA = (await auth.login('tenant-a', 'admin-a', 'pw'))!;
+    const tokenB = (await auth.login('tenant-b', 'admin-b', 'pw'))!;
+
+    try {
+      const toolsA = await fetch(`${tenantBase}/v1/tools`, {
+        headers: { authorization: `Bearer ${tokenA}` },
+      });
+      const toolsB = await fetch(`${tenantBase}/v1/tools`, {
+        headers: { authorization: `Bearer ${tokenB}` },
+      });
+      expect((await toolsA.json()) as { tools: Array<{ name: string }> }).toMatchObject({
+        tools: [{ name: 'mcp__alpha__whoami' }],
+      });
+      expect((await toolsB.json()) as { tools: Array<{ name: string }> }).toMatchObject({
+        tools: [{ name: 'mcp__beta__whoami' }],
+      });
+
+      const call = await fetch(`${tenantBase}/v1/tools/call`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${tokenB}` },
+        body: JSON.stringify({ sessionId: 'tenant-session', name: 'mcp__beta__whoami', args: {} }),
+      });
+      expect(call.status).toBe(200);
+      expect(await call.json()).toMatchObject({ ok: true, result: { content: 'tenant-b' } });
+      expect(connectedTenants).toEqual(['tenant-a', 'tenant-b']);
+    } finally {
+      await tenantMcp.close();
+      await new Promise<void>((resolve) => tenantServer.close(() => resolve()));
+    }
+  });
+
+  it('reports non-idempotent direct MCP failures as governed recovery instead of raw execution errors', async () => {
+    const directStore = new MemoryStore();
+    await directStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: directStore, secret: 'mcp-recovery-secret' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const directMcp = new McpManager({
+      ops: { transport: 'http', url: 'https://ops.example' },
+    }, async () => ({
+      listTools: async () => ({ tools: [{ name: 'deploy', inputSchema: {} }] }),
+      callTool: async () => { throw new Error('write outcome unknown'); },
+      close: async () => undefined,
+    }));
+    const rt = {
+      model, tools: new ToolRegistry(), mcp: directMcp, store: directStore,
+      audit: { record: async () => undefined }, policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth, jwtSecret: 'mcp-recovery-secret', systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+    const directServer = createHttpServer(rt);
+    await new Promise<void>((resolve) => directServer.listen(0, '127.0.0.1', resolve));
+    const directBase = `http://127.0.0.1:${(directServer.address() as AddressInfo).port}`;
+    const directToken = (await auth.login('default', 'admin', 'pw'))!;
+
+    try {
+      const response = await fetch(`${directBase}/v1/tools/call`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${directToken}` },
+        body: JSON.stringify({ sessionId: 'direct-recovery', name: 'mcp__ops__deploy', args: {} }),
+      });
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ recoveryRequired: true });
+    } finally {
+      await directMcp.close();
+      await new Promise<void>((resolve) => directServer.close(() => resolve()));
+    }
+  });
 
   it('lists servers with status and tools', async () => {
     const admin = await login('admin');
@@ -1980,24 +2813,44 @@ describe('HTTP server 定时任务管理', () => {
   it('POST /run triggers an immediate run recorded in task_runs', async () => {
     const token = await adminToken();
     const id = await createTask(token);
+    const originalDurableRunRuntime = runtime.durableRunRuntime;
+    runtime.durableRunRuntime = {
+      run: async (input: { runId?: string }) => {
+        const runId = input.runId ?? 'scheduled-run';
+        return {
+          runId,
+          status: 'running',
+          events: { async *[Symbol.asyncIterator]() {} },
+          result: async () => ({
+            runId,
+            status: 'succeeded',
+            usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+          }),
+        };
+      },
+    } as unknown as DurableRunRuntime;
 
-    const run = await fetch(`${base}/v1/schedule/${id}/run`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${token}` },
-    });
-    expect(run.status).toBe(202);
-    expect(await run.json()).toMatchObject({ ok: true, taskId: id, started: true });
+    try {
+      const run = await fetch(`${base}/v1/schedule/${id}/run`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(run.status).toBe(202);
+      expect(await run.json()).toMatchObject({ ok: true, taskId: id, started: true });
 
-    // 异步执行：轮询 task_runs 直到出现结果
-    let runs: Array<{ status: string; detail?: string }> = [];
-    for (let i = 0; i < 50 && !runs.length; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      const r = await fetch(`${base}/v1/schedule/${id}/runs`, { headers: { authorization: `Bearer ${token}` } });
-      runs = ((await r.json()) as { runs: typeof runs }).runs;
+      // 异步执行：轮询 task_runs 直到出现结果
+      let runs: Array<{ status: string; detail?: string }> = [];
+      for (let i = 0; i < 50 && !runs.length; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        const r = await fetch(`${base}/v1/schedule/${id}/runs`, { headers: { authorization: `Bearer ${token}` } });
+        runs = ((await r.json()) as { runs: typeof runs }).runs;
+      }
+      expect(runs.length).toBeGreaterThan(0);
+      expect(runs[0]!.status).toBe('success');
+      expect(runs[0]!.detail).toBeTruthy();
+    } finally {
+      runtime.durableRunRuntime = originalDurableRunRuntime;
     }
-    expect(runs.length).toBeGreaterThan(0);
-    expect(runs[0]!.status).toBe('success');
-    expect(runs[0]!.detail).toBeTruthy(); // mock 模型输出（具体内容取决于当前激活的 mock 模型）
 
     const missing = await fetch(`${base}/v1/schedule/99999/run`, {
       method: 'POST',
@@ -2475,7 +3328,7 @@ describe('HTTP server 平台 Sandbox 设置', () => {
     } finally {
       await fixture.close();
     }
-  });
+  }, 10_000);
 
   it('maps endpoint-binding validation to 400 and audits only non-sensitive details on success', async () => {
     const fixture = await createSandboxSettingsHttpServer({

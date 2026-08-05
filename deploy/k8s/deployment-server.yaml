@@ -12,6 +12,9 @@ spec:
     metadata:
       labels: { app: aiop, component: server }
     spec:
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: aiop-web
           image: aiop-web:latest
@@ -44,10 +47,16 @@ spec:
               value: "true"
           envFrom:
             - secretRef: { name: aiop-secrets }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
           volumeMounts:
             - name: config
               mountPath: /config
               readOnly: true
+            - name: skills
+              mountPath: /skills-data
           readinessProbe:
             httpGet: { path: /readyz, port: 8081 }
             initialDelaySeconds: 5
@@ -62,3 +71,6 @@ spec:
       volumes:
         - name: config
           configMap: { name: aiop-config }
+        - name: skills
+          persistentVolumeClaim:
+            claimName: aiop-skills

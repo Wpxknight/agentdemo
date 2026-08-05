@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { sql, type Kysely, type Selectable } from 'kysely';
-import type { Msg, Role as MsgRole } from '../model/types.js';
+import type { Msg, Role as MsgRole } from '../llm/types.js';
 import type { AuditEvent } from '../audit/sink.js';
 import type { RequestContext, Role, Tenant, User } from '../auth/types.js';
 import type { Database } from './schema.js';
@@ -24,6 +24,7 @@ import type {
   AgentRunLease,
   AgentRunPatch,
   AgentRunRecord,
+  AgentRunUsage,
   InteractionKind,
   InteractionStatus,
   ScheduledTask,
@@ -39,11 +40,11 @@ import type {
 } from './store.js';
 import { DEFAULT_SESSION_TITLE } from './store.js';
 import { McpServerSchema } from '../config/schema.js';
-import type { McpServerConfig } from '../mcp/types.js';
+import type { McpServerConfig } from '@aiop/mcp-runtime';
 import { nextRunAt } from '../scheduler/cron.js';
-import { estimateTokens } from '../agent/context.js';
-import { parseStoredSandboxSettings } from '../sandbox/settings.js';
-import { KyselyCheckpointStore, MysqlCheckpointSaver } from '../agent/checkpoint/mysql.js';
+import { estimateTokens } from '../llm/context.js';
+import { parseSandboxSettings } from '@aiop/sandbox-runtime';
+import { MysqlRunStore } from '@aiop/pi-runtime';
 
 interface TaskRow {
   id: number;
@@ -115,16 +116,21 @@ function toOptionalDate(value: Date | string | null): Date | undefined {
   return value === null ? undefined : toDate(value);
 }
 
+function piKernel(value: string): 'pi' {
+  if (value !== 'pi') throw new Error(`Unexpected retired Agent Kernel in database: ${value}`);
+  return 'pi';
+}
+
 function toAgentRun(row: Selectable<Database['agent_runs']>): AgentRunRecord {
   return {
     tenantId: row.tenant_id,
     runId: row.run_id,
     userId: row.user_id,
     sessionId: row.session_id,
-    kernel: row.kernel as AgentRunBinding['kernel'],
-    graphName: row.graph_name,
-    graphVersion: row.graph_version,
+    kernel: piKernel(row.kernel),
+    kernelVersion: row.kernel_version,
     status: row.status as AgentRunRecord['status'],
+    waitingReason: row.waiting_reason as AgentRunRecord['waitingReason'] ?? undefined,
     currentNode: row.current_node ?? undefined,
     stepCount: row.step_count,
     usage: {
@@ -177,6 +183,7 @@ function parseLlmSettings(value: unknown): LlmSettings | undefined {
     baseURL: o.baseURL,
     apiKey: o.apiKey,
     model: o.model,
+    ...(typeof o.allowInsecureTls === 'boolean' ? { allowInsecureTls: o.allowInsecureTls } : {}),
     ...(typeof o.contextWindowTokens === 'number' && Number.isFinite(o.contextWindowTokens) && o.contextWindowTokens > 0
       ? { contextWindowTokens: Math.floor(o.contextWindowTokens) }
       : {}),
@@ -210,10 +217,18 @@ function parseSchedulerSettings(value: unknown): SchedulerSettings | undefined {
 
 /** 基于 Kysely + mysql2 的持久化实现（租户由 ctx 强制过滤）。 */
 export class MysqlStore implements Store {
-  constructor(private readonly db: Kysely<Database>) {}
+  private readonly durableStore: MysqlRunStore;
 
-  createCheckpointSaver(): MysqlCheckpointSaver {
-    return new MysqlCheckpointSaver(new KyselyCheckpointStore(this.db));
+  constructor(private readonly db: Kysely<Database>) {
+    this.durableStore = new MysqlRunStore(db);
+  }
+
+  database(): Kysely<Database> {
+    return this.db;
+  }
+
+  durableRunStore() {
+    return this.durableStore;
   }
 
   async createSession(ctx: RequestContext, input: SessionInput): Promise<SessionSummary> {
@@ -473,6 +488,8 @@ export class MysqlStore implements Store {
       user_id: record.userId,
       session_id: record.sessionId,
       run_id: record.runId,
+      attempt_id: record.attemptId ?? null,
+      turn_no: record.turnNo ?? null,
       kind: record.kind,
       tool_call_id: record.toolCallId ?? null,
       payload: JSON.stringify(record.payload),
@@ -529,8 +546,16 @@ export class MysqlStore implements Store {
     const result = await this.db.insertInto('agent_tool_executions').values({
       tenant_id: record.tenantId,
       run_id: record.runId,
+      attempt_id: record.attemptId ?? null,
+      turn_no: record.turnNo ?? null,
       session_id: record.sessionId,
       tool_call_id: record.toolCallId,
+      logical_call_id: record.logicalCallId ?? record.toolCallId,
+      idempotency_key: record.idempotencyKey ?? `${record.tenantId}:${record.runId}:${record.toolCallId}`,
+      capability: record.capability ?? 'non_idempotent_write',
+      external_correlation_id: record.externalCorrelationId ?? null,
+      result_digest: record.resultDigest ?? null,
+      approved_interaction_id: record.approvedInteractionId ?? null,
       tool_name: record.toolName,
       args_digest: record.argsDigest,
       status: record.status,
@@ -549,8 +574,16 @@ export class MysqlStore implements Store {
     return row ? {
       tenantId: row.tenant_id,
       runId: row.run_id,
+      attemptId: row.attempt_id ?? undefined,
+      turnNo: row.turn_no ?? undefined,
       sessionId: row.session_id,
       toolCallId: row.tool_call_id,
+      logicalCallId: row.logical_call_id,
+      idempotencyKey: row.idempotency_key,
+      capability: row.capability as ToolExecutionRecord['capability'],
+      externalCorrelationId: row.external_correlation_id ?? undefined,
+      resultDigest: row.result_digest ?? undefined,
+      approvedInteractionId: row.approved_interaction_id ?? undefined,
       toolName: row.tool_name,
       argsDigest: row.args_digest,
       status: row.status as ToolExecutionStatus,
@@ -579,9 +612,8 @@ export class MysqlStore implements Store {
       runId: row.run_id,
       userId: row.user_id,
       sessionId: row.session_id,
-      kernel: row.kernel as AgentRunBinding['kernel'],
-      graphName: row.graph_name,
-      graphVersion: row.graph_version,
+      kernel: piKernel(row.kernel),
+      kernelVersion: row.kernel_version,
       createdAt: toDate(row.created_at),
     } : undefined;
   }
@@ -593,9 +625,9 @@ export class MysqlStore implements Store {
       user_id: binding.userId,
       session_id: binding.sessionId,
       kernel: binding.kernel,
-      graph_name: binding.graphName,
-      graph_version: binding.graphVersion,
+      kernel_version: binding.kernelVersion ?? `${binding.kernel}-v1`,
       status: 'queued',
+      waiting_reason: null,
       current_node: null,
       step_count: 0,
       input_tokens: 0,
@@ -646,6 +678,7 @@ export class MysqlStore implements Store {
   async updateAgentRun(tenantId: string, runId: string, patch: AgentRunPatch): Promise<boolean> {
     const result = await this.db.updateTable('agent_runs').set({
       status: patch.status,
+      waiting_reason: patch.waitingReason,
       current_node: patch.currentNode,
       step_count: patch.stepCount,
       input_tokens: patch.usage?.inputTokens,
@@ -663,15 +696,29 @@ export class MysqlStore implements Store {
   }
 
   async appendAgentRunEvent(event: AgentRunEvent): Promise<void> {
-    await this.db.insertInto('agent_run_events').values({
-      tenant_id: event.tenantId,
-      run_id: event.runId,
-      event_type: event.type,
-      node_name: event.node ?? null,
-      status: event.status ?? null,
-      detail: event.detail === undefined ? null : JSON.stringify(event.detail),
-      created_at: event.createdAt,
-    }).execute();
+    await this.db.transaction().execute(async (transaction) => {
+      await transaction.selectFrom('agent_runs').select('lease_token')
+        .where('tenant_id', '=', event.tenantId).where('run_id', '=', event.runId)
+        .forUpdate().executeTakeFirstOrThrow();
+      const last = await transaction.selectFrom('agent_run_events')
+        .select(({ fn }) => fn.max<number>('sequence').as('sequence'))
+        .where('tenant_id', '=', event.tenantId).where('run_id', '=', event.runId).executeTakeFirst();
+      await transaction.insertInto('agent_run_events').values({
+        tenant_id: event.tenantId,
+        run_id: event.runId,
+        sequence: event.sequence ?? Number(last?.sequence ?? 0) + 1,
+        attempt_id: event.attemptId ?? null,
+        turn_no: event.turnNo ?? null,
+        kernel: event.kernel ?? null,
+        kernel_version: event.kernelVersion ?? null,
+        correlation_id: event.correlationId ?? null,
+        event_type: event.type,
+        node_name: event.node ?? null,
+        status: event.status ?? null,
+        detail: event.detail === undefined ? null : JSON.stringify(event.detail),
+        created_at: event.createdAt,
+      }).execute();
+    });
   }
 
   async listAgentRunEvents(ctx: RequestContext, runId: string): Promise<AgentRunEvent[]> {
@@ -679,9 +726,43 @@ export class MysqlStore implements Store {
     const rows = await this.db.selectFrom('agent_run_events').selectAll()
       .where('tenant_id', '=', ctx.tenantId).where('run_id', '=', runId).orderBy('id', 'asc').execute();
     return rows.map((row) => ({
-      id: Number(row.id), tenantId: row.tenant_id, runId: row.run_id, type: row.event_type,
+      id: Number(row.id), tenantId: row.tenant_id, runId: row.run_id, sequence: Number(row.sequence), type: row.event_type,
+      attemptId: row.attempt_id ?? undefined, turnNo: row.turn_no ?? undefined,
+      kernel: row.kernel === 'pi' ? 'pi' : undefined,
+      kernelVersion: row.kernel_version ?? undefined, correlationId: row.correlation_id ?? undefined,
       node: row.node_name ?? undefined, status: row.status ?? undefined,
       detail: parseJson(row.detail), createdAt: toDate(row.created_at),
+    }));
+  }
+
+  async listAgentRunAttempts(ctx: RequestContext, runId: string) {
+    if (!await this.getAgentRun(ctx, runId)) return [];
+    const rows = await this.db.selectFrom('agent_run_attempts').selectAll()
+      .where('tenant_id', '=', ctx.tenantId).where('run_id', '=', runId).orderBy('started_at', 'asc').execute();
+    return rows.map((row) => ({
+      attemptId: row.attempt_id,
+      kernel: row.kernel,
+      kernelVersion: row.kernel_version,
+      status: row.status,
+      errorCode: row.error_code ?? undefined,
+      startedAt: toDate(row.started_at),
+      completedAt: row.completed_at ? toDate(row.completed_at) : undefined,
+    }));
+  }
+
+  async listAgentRunTurns(ctx: RequestContext, runId: string) {
+    if (!await this.getAgentRun(ctx, runId)) return [];
+    const rows = await this.db.selectFrom('agent_turn_commits').selectAll()
+      .where('tenant_id', '=', ctx.tenantId).where('run_id', '=', runId).orderBy('transcript_version', 'asc').execute();
+    return rows.map((row) => ({
+      attemptId: row.attempt_id,
+      turnNo: row.turn_no,
+      commitId: row.commit_id,
+      transcriptVersion: row.transcript_version,
+      stopReason: row.stop_reason ?? undefined,
+      usage: parseJson(row.usage_json) as AgentRunUsage,
+      eventSequenceEnd: row.event_sequence_end,
+      committedAt: toDate(row.committed_at),
     }));
   }
 
@@ -704,7 +785,12 @@ export class MysqlStore implements Store {
       .where('tenant_id', '=', ctx.tenantId).where('run_id', '=', runId).orderBy('started_at', 'asc').execute();
     return rows.map((row) => ({
       tenantId: row.tenant_id, runId: row.run_id, sessionId: row.session_id,
-      toolCallId: row.tool_call_id, toolName: row.tool_name, argsDigest: row.args_digest,
+      attemptId: row.attempt_id ?? undefined, turnNo: row.turn_no ?? undefined,
+      toolCallId: row.tool_call_id, logicalCallId: row.logical_call_id, idempotencyKey: row.idempotency_key,
+      capability: row.capability as ToolExecutionRecord['capability'],
+      externalCorrelationId: row.external_correlation_id ?? undefined, resultDigest: row.result_digest ?? undefined,
+      approvedInteractionId: row.approved_interaction_id ?? undefined,
+      toolName: row.tool_name, argsDigest: row.args_digest,
       status: row.status as ToolExecutionStatus,
       result: row.result === null ? undefined : parseJson(row.result) as ToolExecutionRecord['result'],
       startedAt: toDate(row.started_at), completedAt: row.completed_at ? toDate(row.completed_at) : undefined,
@@ -912,7 +998,7 @@ export class MysqlStore implements Store {
     return true;
   }
 
-  /** 系统级：事务内 FOR UPDATE SKIP LOCKED 领取并推进，保证多副本不重复执行。 */
+  /** 系统级：事务内 FOR UPDATE 领取并推进，兼容 MariaDB 10.2，并保证多副本不重复执行。 */
   async claimDueTasks(now: Date, limit: number): Promise<ScheduledTask[]> {
     return this.db.transaction().execute(async (trx) => {
       const rows = await trx
@@ -923,7 +1009,6 @@ export class MysqlStore implements Store {
         .orderBy('next_run_at', 'asc')
         .limit(limit)
         .forUpdate()
-        .skipLocked()
         .execute();
 
       const tasks = rows.map(toTask);
@@ -1185,11 +1270,10 @@ export class MysqlStore implements Store {
         .where('tenant_id', '=', ctx.tenantId)
         .where('setting_key', '=', 'sandbox.default.api_key')
         .executeTakeFirst();
-      const parsed = parseStoredSandboxSettings(parseJson(configRow.config));
+      const settings = parseSandboxSettings(parseJson(configRow.config));
       return {
-        settings: parsed.settings,
+        settings,
         ...(secretRow?.payload ? { encryptedApiKey: secretRow.payload } : {}),
-        ...(!secretRow?.payload && parsed.legacyApiKey ? { legacyApiKey: parsed.legacyApiKey } : {}),
       };
     });
   }
@@ -1224,14 +1308,6 @@ export class MysqlStore implements Store {
           .execute();
       }
     });
-  }
-
-  async getSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<SandboxSettings | undefined> {
-    return (await this.getSandboxSettingsRecord(ctx))?.settings;
-  }
-
-  async setSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SandboxSettings): Promise<void> {
-    await this.setSandboxSettingsRecord(ctx, settings, { action: 'retain' });
   }
 
   async setLlmSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: LlmSettings): Promise<void> {

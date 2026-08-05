@@ -23,7 +23,7 @@ vi.mock('@alibaba-group/opensandbox', () => {
   return { Sandbox };
 });
 
-const { OpenSandboxProvider } = await import('../src/sandbox/opensandbox.js');
+const { OpenSandboxProvider } = await import('../packages/sandbox-runtime/src/opensandbox.js');
 
 const exec = (stdout: string, extra: Record<string, unknown> = {}) => ({
   logs: { stdout: [{ text: stdout }], stderr: [] },
@@ -74,6 +74,21 @@ describe('OpenSandboxProvider', () => {
       serviceAccount: 'aiop-ops',
     });
     expect(opts.connectionConfig.domain).toBe('host:8080');
+  });
+
+  it('preserves resource/network acquisition and structured command options', async () => {
+    h.run.mockResolvedValue(exec('ok'));
+    const handle = await new OpenSandboxProvider().create({
+      key: 'structured', cpu: 2, memoryMb: 2048, network: 'restricted',
+    });
+    await handle.executeCommand!({ program: 'node', args: ['a b'], cwd: '/workspace', env: { TOKEN: 'x' }, timeoutMs: 1234 });
+
+    expect(h.created[0]).toMatchObject({
+      resource: { cpu: '2', memory: '2048Mi' }, networkPolicy: { defaultAction: 'deny' },
+    });
+    expect(h.run).toHaveBeenCalledWith("'node' 'a b'", expect.objectContaining({
+      workingDirectory: '/workspace', envs: { TOKEN: 'x' }, timeoutSeconds: 2,
+    }), undefined);
   });
 
   it('sanitizes metadata values before passing them to Kubernetes-backed OpenSandbox', async () => {
@@ -140,6 +155,9 @@ describe('OpenSandboxProvider', () => {
     h.run.mockResolvedValue(exec('2'));
     const p = new OpenSandboxProvider();
     const handle = await p.create({ key: 'k' });
+    expect(handle.workspacePath?.('skills/demo')).toBe('/workspace/skills/demo');
+    expect(handle.supportsSecretFiles).toBe(true);
+    expect(() => handle.workspacePath?.('../escape')).toThrow('escapes sandbox root');
     await handle.runCode('print(1+1)', { language: 'python' });
     const b64 = Buffer.from('print(1+1)', 'utf8').toString('base64');
     expect(h.run).toHaveBeenCalledWith(`echo ${b64} | base64 -d | python3`, undefined, undefined);

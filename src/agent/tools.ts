@@ -1,8 +1,9 @@
-import type { JsonValue, StreamEvent, ToolCall, ToolDef, ToolResult } from '../model/types.js';
+import type { JsonValue, StreamEvent, ToolCall, ToolDef, ToolResult } from '../llm/types.js';
 import type { RequestContext, Role } from '../auth/types.js';
-import type { OutputSink } from '../sandbox/types.js';
+import type { OutputSink } from '@aiop/sandbox-runtime';
 import type { QuestionAnswers, QuestionSpec } from './question.js';
 import type { ChangePlan } from './plan.js';
+import { UnifiedToolRegistry, type ToolSource } from '@aiop/pi-runtime';
 
 /** 工具执行时可用的运行上下文（含租户身份，用于隔离与鉴权）。 */
 export interface ToolContext {
@@ -10,6 +11,7 @@ export interface ToolContext {
   tenantId?: string;
   userId?: string;
   role?: Role;
+  signal?: AbortSignal;
   /** 实时输出回调：工具执行期把 stdout/stderr 分片回传（由 agent loop 注入，按工具调用归集）。 */
   onOutput?: OutputSink;
   /** 流式事件回调：工具主动推送结构化事件（如 todo_updated），由 agent loop 注入转发到 SSE。 */
@@ -33,8 +35,15 @@ export function reqContext(ctx: ToolContext): RequestContext {
 }
 
 export interface ToolHandler {
-  def: ToolDef;
-  run(args: JsonValue, ctx: ToolContext): Promise<ToolResult>;
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  capability: 'read' | 'retryable_write' | 'non_idempotent_write';
+  execute(args: JsonValue, ctx: ToolContext): Promise<ToolResult>;
+}
+
+export function defineTool(input: ToolHandler): ToolHandler {
+  return input;
 }
 
 /**
@@ -42,13 +51,13 @@ export interface ToolHandler {
  * 统一对外暴露 defs() 并按名字 dispatch。
  */
 export class ToolRegistry {
-  private handlers = new Map<string, ToolHandler>();
+  private handlers = new Map<string, { tool: ToolHandler; source: Exclude<ToolSource, 'pi'> }>();
 
-  register(handler: ToolHandler): this {
-    if (this.handlers.has(handler.def.name)) {
-      throw new Error(`duplicate tool: ${handler.def.name}`);
+  register(tool: ToolHandler, source: Exclude<ToolSource, 'pi'> = 'aiop'): this {
+    if (this.handlers.has(tool.name)) {
+      throw new Error(`duplicate tool: ${tool.name}`);
     }
-    this.handlers.set(handler.def.name, handler);
+    this.handlers.set(tool.name, { tool, source });
     return this;
   }
 
@@ -61,19 +70,53 @@ export class ToolRegistry {
   }
 
   defs(): ToolDef[] {
-    return [...this.handlers.values()].map((h) => h.def);
+    return [...this.handlers.values()].map(({ tool }) => ({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+      capability: tool.capability,
+    }));
+  }
+
+  unified(
+    context: ToolContext | ((call: ToolCall) => ToolContext),
+    filter?: (defs: ToolDef[]) => ToolDef[],
+  ): UnifiedToolRegistry {
+    const allowed = new Set((filter ? filter(this.defs()) : this.defs()).map((definition) => definition.name));
+    const registry = new UnifiedToolRegistry();
+    for (const { tool, source } of this.handlers.values()) {
+      if (!allowed.has(tool.name)) continue;
+      registry.register(source, {
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema,
+        capability: tool.capability,
+        execute: async (call, executionContext) => {
+          const ctx = typeof context === 'function'
+            ? context({ id: call.id, name: call.name, args: call.arguments })
+            : context;
+          const output = await tool.execute(call.arguments, {
+            ...ctx,
+            idempotencyKey: executionContext.idempotencyKey,
+            signal: executionContext.signal,
+          });
+          return { content: output.content, isError: output.isError };
+        },
+      });
+    }
+    return registry;
   }
 
   async dispatch(call: ToolCall, ctx: ToolContext): Promise<ToolResult> {
-    const handler = this.handlers.get(call.name);
-    if (!handler) {
+    const registered = this.handlers.get(call.name);
+    if (!registered) {
       return { id: call.id, content: `unknown tool: ${call.name}`, isError: true };
     }
     try {
-      const result = await handler.run(call.args, ctx);
+      const result = await registered.tool.execute(call.args, ctx);
       return { ...result, id: call.id };
     } catch (err) {
-      // LangGraph interrupt/drain 等控制流异常必须穿透工具边界，不能被降级为普通 ToolResult。
+      // Runtime interrupt/drain 等控制流异常必须穿透工具边界，不能被降级为普通 ToolResult。
       if (err && typeof err === 'object' && (err as { is_bubble_up?: unknown }).is_bubble_up === true) throw err;
       return {
         id: call.id,

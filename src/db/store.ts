@@ -1,8 +1,9 @@
-import type { Msg } from '../model/types.js';
+import type { Msg } from '../llm/types.js';
 import type { AuditEvent, AuditSink } from '../audit/sink.js';
 import type { AuthProviderKind, Role, RequestContext, Tenant, User, UserStatus } from '../auth/types.js';
-import type { McpServerConfig } from '../mcp/types.js';
-import type { ToolResult } from '../model/types.js';
+import type { McpServerConfig } from '@aiop/mcp-runtime';
+import type { ToolResult } from '../llm/types.js';
+import type { DurableProductRunStore } from '@aiop/pi-runtime';
 
 export interface LlmSettings {
   id: string;
@@ -10,6 +11,8 @@ export interface LlmSettings {
   baseURL: string;
   apiKey: string;
   model: string;
+  /** 仅该 LLM 请求跳过 HTTPS 服务端证书校验。 */
+  allowInsecureTls?: boolean;
   contextWindowTokens?: number;
   /** 历史里保留图片的最近带图消息条数（更早的替换占位符），默认 1；0 表示一张不留。 */
   contextKeepImages?: number;
@@ -34,11 +37,10 @@ export interface SandboxSettings {
   placement?: { clusterId: string; namespace: string };
 }
 
-/** Store 内部的 Sandbox 配置和不透明密文；legacyApiKey 只用于一次性旧数据迁移。 */
+/** Store 内部的 Sandbox 配置和不透明密文。 */
 export interface SandboxSettingsRecord {
   settings: SandboxSettings;
   encryptedApiKey?: string;
-  legacyApiKey?: string;
 }
 
 export type SandboxSettingsSecretUpdate =
@@ -83,6 +85,8 @@ export interface InteractionRecord {
   userId: string;
   sessionId: string;
   runId: string;
+  attemptId?: string;
+  turnNo?: number;
   kind: InteractionKind;
   toolCallId?: string;
   payload: unknown;
@@ -99,8 +103,16 @@ export type ToolExecutionStatus = 'started' | 'completed' | 'unknown' | 'recover
 export interface ToolExecutionRecord {
   tenantId: string;
   runId: string;
+  attemptId?: string;
+  turnNo?: number;
   sessionId: string;
   toolCallId: string;
+  logicalCallId?: string;
+  idempotencyKey?: string;
+  capability?: 'read' | 'retryable_write' | 'non_idempotent_write';
+  externalCorrelationId?: string;
+  resultDigest?: string;
+  approvedInteractionId?: string;
   toolName: string;
   argsDigest: string;
   status: ToolExecutionStatus;
@@ -115,9 +127,8 @@ export interface AgentRunBinding {
   userId: string;
   sessionId: string;
   runId: string;
-  kernel: 'legacy' | 'langgraph';
-  graphName: string;
-  graphVersion: string;
+  kernel: 'pi';
+  kernelVersion?: string;
   createdAt: Date;
 }
 
@@ -135,10 +146,12 @@ export interface AgentRunUsage {
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
+  costUsd?: number;
 }
 
 export interface AgentRunRecord extends AgentRunBinding {
   status: AgentRunStatus;
+  waitingReason?: 'approval' | 'question' | 'plan' | 'external';
   currentNode?: string;
   stepCount: number;
   usage: AgentRunUsage;
@@ -154,6 +167,7 @@ export interface AgentRunRecord extends AgentRunBinding {
 
 export interface AgentRunPatch {
   status?: AgentRunStatus;
+  waitingReason?: AgentRunRecord['waitingReason'] | null;
   currentNode?: string | null;
   stepCount?: number;
   usage?: AgentRunUsage;
@@ -176,11 +190,38 @@ export interface AgentRunEvent {
   id?: number;
   tenantId: string;
   runId: string;
+  sequence?: number;
   type: string;
+  attemptId?: string;
+  turnNo?: number;
+  kernel?: 'pi';
+  kernelVersion?: string;
+  correlationId?: string;
   node?: string;
   status?: string;
   detail?: unknown;
   createdAt: Date;
+}
+
+export interface AgentRunAttemptSummary {
+  attemptId: string;
+  kernel: string;
+  kernelVersion: string;
+  status: string;
+  errorCode?: string;
+  startedAt: Date;
+  completedAt?: Date;
+}
+
+export interface AgentRunTurnSummary {
+  attemptId: string;
+  turnNo: number;
+  commitId: string;
+  transcriptVersion: number;
+  stopReason?: string;
+  usage: AgentRunUsage;
+  eventSequenceEnd: number;
+  committedAt: Date;
 }
 
 export interface AgentRunLease {
@@ -286,6 +327,7 @@ export interface UserCredentialRecord {
  * 业务读写均需 RequestContext 并按 tenantId 强制过滤，实现租户隔离。
  */
 export interface Store extends AuditSink {
+  durableRunStore(): DurableProductRunStore;
   // —— 会话消息 ——
   createSession(ctx: RequestContext, input: SessionInput): Promise<SessionSummary>;
   touchSession(ctx: RequestContext, sessionId: string, input?: SessionTouchInput): Promise<void>;
@@ -317,6 +359,8 @@ export interface Store extends AuditSink {
   updateAgentRun(tenantId: string, runId: string, patch: AgentRunPatch): Promise<boolean>;
   appendAgentRunEvent(event: AgentRunEvent): Promise<void>;
   listAgentRunEvents(ctx: RequestContext, runId: string): Promise<AgentRunEvent[]>;
+  listAgentRunAttempts(ctx: RequestContext, runId: string): Promise<AgentRunAttemptSummary[]>;
+  listAgentRunTurns(ctx: RequestContext, runId: string): Promise<AgentRunTurnSummary[]>;
   listAgentRunInteractions(ctx: RequestContext, runId: string): Promise<InteractionRecord[]>;
   listAgentRunToolExecutions(ctx: RequestContext, runId: string): Promise<ToolExecutionRecord[]>;
   acquireAgentRunLease(
@@ -377,9 +421,6 @@ export interface Store extends AuditSink {
     settings: SandboxSettings,
     secret: SandboxSettingsSecretUpdate,
   ): Promise<void>;
-  /** 兼容旧调用：仅读写非敏感配置，不得写 API key。 */
-  getSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<SandboxSettings | undefined>;
-  setSandboxSettings(ctx: Pick<RequestContext, 'tenantId'>, settings: SandboxSettings): Promise<void>;
   /** MCP server 配置（UI 动态增删后持久化；存在时覆盖 config.jsonc 的 mcpServers）。 */
   getMcpServers(ctx: Pick<RequestContext, 'tenantId'>): Promise<Record<string, McpServerConfig> | undefined>;
   setMcpServers(ctx: Pick<RequestContext, 'tenantId'>, servers: Record<string, McpServerConfig>): Promise<void>;

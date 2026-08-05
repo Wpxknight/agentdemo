@@ -1,0 +1,20 @@
+{
+  "name": "@aiop/sandbox-runtime",
+  "version": "0.1.0-preview.1",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./bin/index.js",
+  "types": "./bin/index.d.ts",
+  "exports": { ".": { "types": "./bin/index.d.ts", "import": "./bin/index.js" } },
+  "files": ["bin"],
+  "dependencies": {
+    "@aiop/control-contracts": "0.1.0-preview.1",
+    "@aiop/pi-runtime": "0.1.0-preview.1",
+    "@alibaba-group/opensandbox": "0.1.9",
+    "@e2b/code-interpreter": "2.6.0",
+    "@e2b/desktop": "2.3.1",
+    "pino": "10.3.1",
+    "zod": "4.4.3"
+  },
+  "engines": { "node": ">=22.19.0" }
+}

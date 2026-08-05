@@ -1,7 +1,7 @@
-import type { JsonValue, ToolResult } from '../model/types.js';
+import type { JsonValue, ToolResult } from '../llm/types.js';
 import type { ChangePlan } from '../agent/plan.js';
 import { parseChangePlan, renderChangePlan } from '../agent/plan.js';
-import type { ToolContext, ToolHandler } from '../agent/tools.js';
+import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 
 /**
  * submit_change_plan 工具（借鉴 Claude Code 计划模式）：
@@ -10,9 +10,9 @@ import type { ToolContext, ToolHandler } from '../agent/tools.js';
  * 被拒则模型据反馈调整或终止。需交互端（ctx.requestPlanApproval）。
  */
 export function buildChangePlanTool(): ToolHandler {
-  return {
-    def: {
+  return defineTool({
       name: 'submit_change_plan',
+      capability: 'read',
       description:
         '提交结构化变更方案供用户审批（用于生产环境变更前）。'
         + '包含 summary、changes[]、impact（影响面）、rollback（回滚方式）。'
@@ -39,8 +39,7 @@ export function buildChangePlanTool(): ToolHandler {
         },
         required: ['summary', 'changes', 'impact', 'rollback'],
       },
-    },
-    async run(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
+    async execute(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
       let plan: ChangePlan;
       try {
         plan = parseChangePlan(args);
@@ -61,5 +60,5 @@ export function buildChangePlanTool(): ToolHandler {
       }
       return { id: '', content: `变更方案已批准，本会话内生产变更将批量放行。\n\n${rendered}` };
     },
-  };
+  });
 }

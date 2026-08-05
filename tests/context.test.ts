@@ -5,8 +5,8 @@ import {
   estimateTokens,
   planCompaction,
   renderForSummary,
-} from '../src/agent/context.js';
-import type { Msg } from '../src/model/types.js';
+} from '../src/llm/context.js';
+import type { Msg } from '../src/llm/types.js';
 
 function imageMsg(id: string, data: string): Msg {
   return {

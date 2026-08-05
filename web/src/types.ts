@@ -6,6 +6,8 @@ export interface NavItem {
   id: PageId;
   label: string;
   icon: 'chat' | 'runs' | 'skills' | 'mcp' | 'schedule' | 'sandbox' | 'users' | 'settings';
+  /** 菜单对应的独立浏览器路径。 */
+  url: string;
   /** 仅管理员可见的一级菜单（前端隐藏只是 UX，真正的防线是后端 RBAC）。 */
   adminOnly?: boolean;
 }
@@ -123,18 +125,47 @@ export interface TaskRun {
 
 export type AgentRunStatus = 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'recovery_required';
 
+export interface AgentRunUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  costUsd?: number;
+}
+
+export interface AgentRunAttemptSummary {
+  attemptId: string;
+  kernel: string;
+  kernelVersion: string;
+  status: string;
+  errorCode?: string;
+  startedAt: string;
+  completedAt?: string;
+}
+
+export interface AgentRunTurnSummary {
+  attemptId: string;
+  turnNo: number;
+  commitId: string;
+  transcriptVersion: number;
+  stopReason?: string;
+  usage: AgentRunUsage;
+  eventSequenceEnd: number;
+  committedAt: string;
+}
+
 export interface AgentRunSummary {
   tenantId: string;
   userId: string;
   sessionId: string;
   runId: string;
-  kernel: 'legacy' | 'langgraph';
-  graphName: string;
-  graphVersion: string;
+  kernel: 'pi';
+  kernelVersion?: string;
   status: AgentRunStatus;
+  waitingReason?: 'approval' | 'question' | 'plan' | 'external';
   currentNode?: string;
   stepCount: number;
-  usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number };
+  usage: AgentRunUsage;
   errorMessage?: string;
   createdAt: string;
   startedAt?: string;
@@ -144,6 +175,8 @@ export interface AgentRunSummary {
   leaseToken: number;
   leaseExpiresAt?: string;
   leaseActive: boolean;
+  attemptSummary?: { count: number; latest?: AgentRunAttemptSummary };
+  turnSummary?: { count: number; latest?: AgentRunTurnSummary };
 }
 
 export interface AgentRunEventBody {
@@ -168,6 +201,8 @@ export interface AgentRunDetailBody {
   events: AgentRunEventBody[];
   interactions: Array<{ id: string; kind: string; status: string; createdAt: string; resolvedAt?: string }>;
   tools: Array<{ toolCallId: string; toolName: string; status: string; startedAt: string; completedAt?: string }>;
+  attempts: AgentRunAttemptSummary[];
+  turns: AgentRunTurnSummary[];
   canCancel: boolean;
   canResume: boolean;
   recoveryBlockedReason?: string;
@@ -221,6 +256,8 @@ export interface RuntimeModelConfig {
   api_key: string;
   api_key_set: boolean;
   api_key_preview: string;
+  /** 允许该 LLM 访问使用自签名或不受信任证书的 HTTPS 服务。 */
+  allow_insecure_tls?: boolean;
   context_window_tokens: number;
   /** 历史里保留图片的最近带图消息条数（更早的替换占位符），默认 1。 */
   context_keep_images?: number;

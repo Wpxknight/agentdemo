@@ -7,7 +7,6 @@ import type { ColumnType, Generated } from 'kysely';
 
 type JsonColumn = ColumnType<unknown, string, string>;
 type NullableJsonColumn = ColumnType<unknown, string | null, string | null>;
-type BinaryColumn = ColumnType<Uint8Array, Uint8Array | Buffer, Uint8Array | Buffer>;
 
 export interface MessagesTable {
   id: Generated<number>;
@@ -62,10 +61,39 @@ export interface ScheduledTasksTable {
 export interface TaskRunsTable {
   id: Generated<number>;
   task_id: number;
+  fire_id: Generated<string | null>;
+  run_id: Generated<string | null>;
   status: string;
   detail: string | null;
   steps: number | null;
   created_at: Generated<Date>;
+}
+
+export interface TaskAgentRunsTable {
+  tenant_id: string;
+  task_id: number;
+  run_id: string;
+  created_at: Date;
+}
+
+export interface SchedulerFiresTable {
+  fire_id: string;
+  task_id: number;
+  tenant_id: string;
+  actor_id: string;
+  session_id: string;
+  fire_time: Date;
+  input_json: JsonColumn;
+  state: string;
+  attempts: number;
+  run_id: string | null;
+  claim_token: string | null;
+  claim_owner: string | null;
+  lease_expires_at: Date | null;
+  retry_at: Date | null;
+  last_error: string | null;
+  created_at: Date;
+  updated_at: Date;
 }
 
 export interface TenantsTable {
@@ -117,41 +145,14 @@ export interface SettingSecretsTable {
   updated_at: Generated<Date>;
 }
 
-export interface LangGraphCheckpointsTable {
-  tenant_id: string;
-  thread_id: string;
-  checkpoint_ns: string;
-  checkpoint_id: string;
-  parent_checkpoint_id: string | null;
-  checkpoint_type: string;
-  checkpoint_data: BinaryColumn;
-  metadata_type: string;
-  metadata_data: BinaryColumn;
-  run_id: string;
-  graph_name: string;
-  graph_version: string;
-  expires_at: Date | null;
-  created_at: Date;
-}
-
-export interface LangGraphCheckpointWritesTable {
-  tenant_id: string;
-  thread_id: string;
-  checkpoint_ns: string;
-  checkpoint_id: string;
-  task_id: string;
-  write_index: number;
-  channel: string;
-  value_type: string;
-  value_data: BinaryColumn;
-}
-
 export interface AgentInteractionsTable {
   id: string;
   tenant_id: string;
   user_id: string;
   session_id: string;
   run_id: string;
+  attempt_id: string | null;
+  turn_no: number | null;
   kind: string;
   tool_call_id: string | null;
   payload: JsonColumn;
@@ -166,8 +167,16 @@ export interface AgentInteractionsTable {
 export interface AgentToolExecutionsTable {
   tenant_id: string;
   run_id: string;
+  attempt_id: string | null;
+  turn_no: number | null;
   session_id: string;
   tool_call_id: string;
+  logical_call_id: string;
+  idempotency_key: string;
+  capability: string;
+  external_correlation_id: string | null;
+  result_digest: string | null;
+  approved_interaction_id: string | null;
   tool_name: string;
   args_digest: string;
   status: string;
@@ -183,15 +192,18 @@ export interface AgentRunsTable {
   user_id: string;
   session_id: string;
   kernel: string;
-  graph_name: string;
-  graph_version: string;
+  kernel_version: string;
   status: string;
+  waiting_reason: string | null;
   current_node: string | null;
   step_count: number;
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
   cache_creation_tokens: number;
+  cost_usd: string | number | null;
+  limits_json: NullableJsonColumn;
+  execution_json: NullableJsonColumn;
   error_message: string | null;
   started_at: Date | null;
   updated_at: Date;
@@ -200,6 +212,7 @@ export interface AgentRunsTable {
   lease_owner: string | null;
   lease_token: number;
   lease_expires_at: Date | null;
+  append_closed_at: Date | null;
   created_at: Date;
 }
 
@@ -207,11 +220,105 @@ export interface AgentRunEventsTable {
   id: Generated<number>;
   tenant_id: string;
   run_id: string;
+  sequence: number;
+  attempt_id: string | null;
+  turn_no: number | null;
+  kernel: string | null;
+  kernel_version: string | null;
+  correlation_id: string | null;
   event_type: string;
   node_name: string | null;
   status: string | null;
   detail: NullableJsonColumn;
   created_at: Date;
+}
+
+export interface AgentRunAttemptsTable {
+  tenant_id: string;
+  run_id: string;
+  attempt_id: string;
+  worker_id: string;
+  lease_token: number;
+  kernel: string;
+  kernel_version: string;
+  status: string;
+  error_code: string | null;
+  error_message: string | null;
+  started_at: Date;
+  completed_at: Date | null;
+}
+
+export interface AgentTurnSnapshotsTable {
+  tenant_id: string;
+  run_id: string;
+  attempt_id: string;
+  turn_no: number;
+  session_version: number;
+  parent_commit_id: string | null;
+  identity_json: JsonColumn;
+  model_binding_json: JsonColumn;
+  prompt_version: string;
+  skill_set_version: string | null;
+  tool_set_version: string;
+  policy_version: string;
+  limits_json: NullableJsonColumn;
+  messages_json: JsonColumn;
+  deadline_at: Date | null;
+  created_at: Date;
+}
+
+export interface AgentTurnCommitsTable {
+  tenant_id: string;
+  run_id: string;
+  attempt_id: string;
+  turn_no: number;
+  pi_session_id: string | null;
+  pi_leaf_id: string | null;
+  pi_entry_seq: number | null;
+  commit_id: string;
+  transcript_version: number;
+  stop_reason: string | null;
+  usage_json: JsonColumn;
+  messages_json: JsonColumn;
+  event_sequence_end: number;
+  committed_at: Date;
+}
+
+export interface PiSessionsTable {
+  tenant_id: string;
+  session_id: string;
+  current_leaf_id: string | null;
+  committed_leaf_id: string | null;
+  metadata_json: NullableJsonColumn;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface PiSessionEntriesTable {
+  tenant_id: string;
+  session_id: string;
+  entry_id: string;
+  entry_seq: number;
+  parent_id: string | null;
+  entry_type: string;
+  entry_json: JsonColumn;
+  created_at: Date;
+}
+
+export interface AgentRunInboxMessagesTable {
+  tenant_id: string;
+  run_id: string;
+  message_id: string;
+  sequence: number;
+  idempotency_key: string;
+  mode: string;
+  message_json: JsonColumn;
+  status: string;
+  claim_owner: string | null;
+  claim_token: string | null;
+  claim_expires_at: Date | null;
+  created_at: Date;
+  consumed_at: Date | null;
 }
 
 export interface Database {
@@ -220,15 +327,21 @@ export interface Database {
   audit_events: AuditEventsTable;
   scheduled_tasks: ScheduledTasksTable;
   task_runs: TaskRunsTable;
+  task_agent_runs: TaskAgentRunsTable;
+  scheduler_fires: SchedulerFiresTable;
   tenants: TenantsTable;
   users: UsersTable;
   user_credentials: UserCredentialsTable;
   tenant_settings: TenantSettingsTable;
   setting_secrets: SettingSecretsTable;
-  langgraph_checkpoints: LangGraphCheckpointsTable;
-  langgraph_checkpoint_writes: LangGraphCheckpointWritesTable;
   agent_interactions: AgentInteractionsTable;
   agent_tool_executions: AgentToolExecutionsTable;
   agent_runs: AgentRunsTable;
   agent_run_events: AgentRunEventsTable;
+  agent_run_attempts: AgentRunAttemptsTable;
+  agent_turn_snapshots: AgentTurnSnapshotsTable;
+  agent_turn_commits: AgentTurnCommitsTable;
+  pi_sessions: PiSessionsTable;
+  pi_session_entries: PiSessionEntriesTable;
+  agent_run_inbox_messages: AgentRunInboxMessagesTable;
 }

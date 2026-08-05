@@ -1,0 +1,16 @@
+{
+  "name": "@aiop/mcp-runtime",
+  "version": "0.1.0-preview.1",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./bin/index.js",
+  "types": "./bin/index.d.ts",
+  "exports": { ".": { "types": "./bin/index.d.ts", "import": "./bin/index.js" } },
+  "files": ["bin"],
+  "dependencies": {
+    "@aiop/control-contracts": "0.1.0-preview.1",
+    "@aiop/pi-runtime": "0.1.0-preview.1",
+    "@modelcontextprotocol/sdk": "1.29.0"
+  },
+  "engines": { "node": ">=22.19.0" }
+}

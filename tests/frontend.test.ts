@@ -8,7 +8,7 @@ import { LocalAuthProvider } from '../src/auth/local.js';
 import { ToolRegistry } from '../src/agent/tools.js';
 import { AllowAllPolicy } from '../src/agent/policy.js';
 import type { Runtime } from '../src/runtime.js';
-import type { ChatModel, StreamEvent } from '../src/model/types.js';
+import type { ChatModel, StreamEvent } from '../src/llm/types.js';
 
 describe('React frontend stack', () => {
   it('uses the AIOP logo as the browser tab icon', async () => {
@@ -55,6 +55,22 @@ describe('React frontend stack', () => {
     expect(data).toContain('hasSessionHistoryDrawer: true');
     expect(data).toContain('hasSandboxWorkspace: true');
     expect(data).toContain('hasSandboxWorkspace: false');
+    expect(data).toContain("url: '/chat'");
+    expect(data).toContain("url: '/runs'");
+    expect(data).toContain("url: '/skills'");
+    expect(data).toContain("url: '/mcp'");
+    expect(data).toContain("url: '/schedule'");
+    expect(data).toContain("url: '/sandbox'");
+    expect(data).toContain("url: '/users'");
+    expect(data).toContain("url: '/settings'");
+  });
+
+  it('keeps browser history in sync with menu navigation', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(app).toContain('pageFromUrl(window.location.pathname)');
+    expect(app).toContain("window.addEventListener('popstate', handlePopState)");
+    expect(app).toContain("window.history.pushState({}, '', pageUrl(next))");
   });
 });
 
@@ -74,6 +90,10 @@ describe('frontend container proxy', () => {
     const dockerfile = await readFile('web/Dockerfile', 'utf8');
 
     expect(dockerfile).toContain('FROM node:24-slim AS build');
+    expect(dockerfile).toContain('COPY web/package.json web/package-lock.json ./');
+    expect(dockerfile).toContain('RUN npm ci');
+    expect(dockerfile).not.toContain('package-lock.json*');
+    expect(dockerfile).not.toContain('npm install');
     expect(dockerfile).toContain('npm run build');
     expect(dockerfile).toContain('COPY --from=build /app/dist /usr/share/nginx/html');
   });
@@ -97,6 +117,8 @@ describe('frontend API wiring', () => {
     expect(app).toContain("api.get<SandboxesBody>('/v1/sandboxes");
     expect(app).toContain('setSandboxProfiles(body.profiles || [])');
     expect(app).toContain("api.get<ModelSettingsBody>('/v1/settings/llm");
+    expect(app).toContain('允许不安全 HTTPS（忽略证书校验）');
+    expect(app).toContain('allow_insecure_tls: Boolean(llm.allow_insecure_tls)');
   });
 
   it('lets operators select scheduled tasks and inspect retained run results', async () => {
@@ -200,7 +222,7 @@ describe('frontend API wiring', () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
     const css = await readFile('web/src/index.css', 'utf8');
 
-    expect(app).toContain('BrowserPreviewPanel');
+    expect(app).toContain('PrototypeSandboxPanel');
     expect(app).toContain('PrototypeChatShell');
     expect(app).toContain('prototype-chat-page');
     expect(app).toContain('prototype-sidebar-nav');
@@ -430,6 +452,7 @@ describe('frontend API wiring', () => {
     expect(app).toContain("api.post<{ session: SessionsBody['sessions'][number] }>('/v1/sessions'");
     expect(app).toContain('await fetchSessionsPage(0);');
     expect(app).toContain('api.get<ContextUsageBody>(`/v1/sessions/${encodeURIComponent(nextSessionId)}/context`)');
+    expect(app).toContain('if (!token || !isPersistedSession(sessionId, sessions)) return;');
     expect(app).toContain('api.post<{ ok: boolean; sessionId: string; queued: boolean }>(`/v1/sessions/${encodeURIComponent(sessionId)}/append`');
     expect(app).toContain('activeRunSessionIds.has(sessionId)');
     expect(app).toContain('event.data?.context');
@@ -670,14 +693,11 @@ describe('frontend API wiring', () => {
     expect(app).toContain('message.id === assistantId');
     expect(app).not.toContain('message === assistant');
     expect(app).toContain('<time className="prototype-message-time">{message.time}</time>');
-    expect(app).toContain('<time className="message-time">{message.time}</time>');
     expect(app).not.toContain('<time>{message.time}</time>');
     expect(css).toContain('.prototype-message-stack');
     expect(css).toContain('.prototype-message-time');
-    expect(css).toContain('.message-time');
     expect(css).toContain('.thinking-block');
     expect(css).not.toContain('.prototype-bubble time');
-    expect(css).not.toContain('.bubble time');
   });
 
   it('shows live and final assistant execution duration beside the message time', async () => {
@@ -842,6 +862,15 @@ describe('frontend API wiring', () => {
     expect(app).toContain('readFileAsDataUrl(file)');
     expect(app).toContain('await onImported()');
     expect(app).toContain("setSelectedFile('SKILL.md')");
+    expect(app).toContain('<SkillsPage');
+    expect(app).toContain('tools={skillTools}');
+    expect(app).toContain('暂无可用技能');
+    expect(app).toContain('setDirectoryEntries([])');
+    expect(app).toContain('setFileBody(null)');
+    expect(app).not.toContain("fallbackTools.filter((tool) => tool.category === 'skill')");
+    expect(app).not.toContain('const entries = skillFileEntries(selected)');
+    expect(app).not.toContain('content: `${skillPreview(selected, path)}');
+    expect(app).not.toContain('fileBody?.content || skillPreview(selected, selectedFile)');
     expect(app).toContain('导入技能');
     expect(app).toContain('文件大小');
     expect(app).toContain('更新时间');
@@ -1055,16 +1084,16 @@ describe('frontend data APIs', () => {
 
     const tools = new ToolRegistry();
     tools.register({
-      def: { name: 'load_skill', description: '加载技能', inputSchema: { type: 'object' } },
-      run: async () => ({ id: '', content: 'ok' }),
+      name: 'load_skill', description: '加载技能', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async () => ({ id: '', content: 'ok' }),
     });
     tools.register({
-      def: { name: 'mcp__filesystem__read_file', description: '读取文件', inputSchema: { type: 'object' } },
-      run: async () => ({ id: '', content: 'ok' }),
+      name: 'mcp__filesystem__read_file', description: '读取文件', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async () => ({ id: '', content: 'ok' }),
     });
     tools.register({
-      def: { name: 'sbx__run_command', description: '执行命令', inputSchema: { type: 'object' } },
-      run: async () => ({ id: '', content: 'ok' }),
+      name: 'sbx__run_command', description: '执行命令', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute: async () => ({ id: '', content: 'ok' }),
     });
 
     const model: ChatModel = {
@@ -1180,6 +1209,37 @@ describe('kubernetes frontend deployment', () => {
     expect(service).toMatch(/targetPort:\s+8080/);
   });
 
+  it('keeps image built-ins read-only and mounts one writable RWX product root', async () => {
+    const deployment = await readFile('deploy/k8s/deployment-server.yaml', 'utf8');
+    const config = await readFile('deploy/k8s/configmap.yaml', 'utf8');
+    const secret = await readFile('deploy/k8s/secret.example.yaml', 'utf8');
+    const pvc = await readFile('deploy/k8s/pvc-skills.yaml', 'utf8');
+    const readme = await readFile('deploy/k8s/README.md', 'utf8');
+
+    expect(deployment).toMatch(/replicas:\s+[2-9]/);
+    expect(pvc).toMatch(/kind:\s+PersistentVolumeClaim/);
+    expect(pvc).toMatch(/name:\s+aiop-skills/);
+    expect(pvc).toContain('ReadWriteMany');
+    expect(pvc).toMatch(/storage:\s+5Gi/);
+    expect(pvc).not.toContain('storageClassName:');
+    expect(deployment.match(/image:\s+aiop:latest/g)).toHaveLength(1);
+    expect(deployment).not.toContain('initContainers:');
+    expect(deployment).not.toContain('seed-skills');
+    expect(deployment).not.toContain('cp -an');
+    expect(deployment).not.toContain('chown');
+    expect(deployment).toMatch(/fsGroup:\s+1000/);
+    expect(deployment).toMatch(/name:\s+skills\s*\n\s+mountPath:\s+\/skills-data/);
+    expect(deployment).not.toMatch(/name:\s+skills\s*\n\s+mountPath:\s+\/app\/skills/);
+    expect(deployment).toMatch(/persistentVolumeClaim:\s*\n\s+claimName:\s+aiop-skills/);
+    expect(config).toContain('"skills": { "dir": "/skills-data", "builtinDir": "/app/skills"');
+    expect(config).toContain('"requireDistributedLock": true');
+    expect(deployment).toMatch(/envFrom:[\s\S]*secretRef:\s*\{ name:\s*aiop-secrets \}/);
+    expect(secret).toContain('MYSQL_HOST:');
+    expect(readme).toContain('ReadWriteMany');
+    expect(readme).toMatch(/StorageClass/i);
+    expect(readme).toContain('pvc-skills.yaml');
+  });
+
   it('applies the same sidecar layout to the dev deployment', async () => {
     const deployment = await readFile('deploy/dev-k8s/aiop-deployment.yaml', 'utf8');
 
@@ -1188,6 +1248,40 @@ describe('kubernetes frontend deployment', () => {
     expect(deployment).toMatch(/name:\s+PORT\s*\n\s+value:\s+"8081"/);
     expect(deployment).toContain('containerPort: 8080');
     expect(deployment).toContain('containerPort: 8081');
+  });
+
+  it('publishes multi-architecture images and deploys AIOP into aios-system', async () => {
+    const makefile = await readFile('Makefile', 'utf8');
+    const deployment = await readFile('deploy/aiop/deployment.yaml', 'utf8');
+    const service = await readFile('deploy/aiop/service-nodeport.yaml', 'utf8');
+    const pvc = await readFile('deploy/aiop/pvc-skills.yaml', 'utf8');
+
+    expect(makefile).toContain('IMAGE_PREFIX ?= deploy.bocloud.k8s:40443/aios');
+    expect(makefile).toContain('PLATFORMS ?= linux/amd64,linux/arm64');
+    expect(makefile).toMatch(/pipeline:[\s\S]*docker buildx build[\s\S]*--push/);
+    expect(makefile).toContain('docker manifest inspect --insecure $(PUBLISH_IMAGE)');
+    expect(makefile).toContain('AIOP_NAMESPACE ?= aios-system');
+    expect(makefile).toContain('deploy-aiop:');
+    expect(makefile).not.toMatch(/deploy-aiop:[\s\S]*deploy\/dev-k8s\/mysql\.yaml/);
+    expect(deployment).toMatch(/namespace:\s+aios-system/);
+    expect(deployment).toContain('deploy.bocloud.k8s:40443/aios/aiop-web:dev');
+    expect(deployment).toContain('deploy.bocloud.k8s:40443/aios/aiop:dev');
+    expect(service).toMatch(/nodePort:\s+30084/);
+    expect(pvc).toContain('storageClassName: nfs-csi');
+    expect(pvc).toContain('ReadWriteMany');
+  });
+
+  it('uses aiop as the default database name in deployment examples', async () => {
+    const files = await Promise.all([
+      readFile('deploy/dev-k8s/aiop-secret.example.yaml', 'utf8'),
+      readFile('deploy/dev-k8s/mysql.yaml', 'utf8'),
+      readFile('deploy/k8s/secret.example.yaml', 'utf8'),
+    ]);
+
+    for (const source of files) {
+      expect(source).toMatch(/MYSQL_DATABASE(?:\s*:\s*|\s*\n\s+value:\s*)"?aiop"?/);
+      expect(source).not.toMatch(/MYSQL_DATABASE(?:\s*:\s*|\s*\n\s+value:\s*)"?ai_ops"?/);
+    }
   });
 });
 

@@ -1,8 +1,9 @@
 import { posix } from 'node:path';
-import type { JsonValue, ToolResult } from '../model/types.js';
-import type { ToolContext, ToolHandler } from '../agent/tools.js';
-import type { SandboxManagerLike } from '../sandbox/lifecycle.js';
-import { isSandboxAcquirer } from '../sandbox/acquisition.js';
+import type { JsonValue, ToolResult } from '../llm/types.js';
+import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
+import type { SandboxManagerLike } from '@aiop/sandbox-runtime';
+import { isSandboxAcquirer } from '@aiop/sandbox-runtime';
+import { downloadAcquiredSandbox } from '@aiop/sandbox-runtime';
 import type { ExportSink } from '../server/downloads.js';
 import { resolveSandboxSpec, type SpecResolver } from './builtin.js';
 
@@ -81,9 +82,9 @@ export function buildExportTool(
   resolve: SpecResolver,
   sink: ExportSink,
 ): ToolHandler {
-  return {
-    def: {
+  return defineTool({
       name: 'sbx__export_file',
+      capability: 'retryable_write',
       description:
         '把沙箱中已生成的文件（Excel/CSV/Markdown/PDF/图片/压缩包等）导出为用户可下载的链接。'
         + '当用户要“下载/导出/保存到本地”某个生成结果时使用。返回一个有时效的下载链接，'
@@ -97,19 +98,22 @@ export function buildExportTool(
         },
         required: ['path'],
       },
-    },
-    async run(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
+    async execute(args: JsonValue, ctx: ToolContext): Promise<ToolResult> {
       const o = asObject(args);
       const path = reqString(o, 'path');
       const name = safeDownloadName(typeof o.filename === 'string' && o.filename ? o.filename : path);
       const mime = typeof o.mime === 'string' && o.mime ? o.mime : guessMime(name);
 
-      const sbx = isSandboxAcquirer(manager)
-        ? (await manager.acquire(ctx)).handle
-        : await manager.get(await resolveSandboxSpec(resolve, ctx));
+      const acquired = isSandboxAcquirer(manager)
+        ? await manager.acquire(ctx)
+        : await (async () => {
+            const spec = await resolveSandboxSpec(resolve, ctx);
+            const handle = await manager.get(spec, { signal: ctx.signal });
+            return { handle, spec, invalidate: () => manager.evict?.(spec.key, handle) };
+          })();
       let bytes: Uint8Array;
       try {
-        bytes = await sbx.readFile(path);
+        bytes = (await downloadAcquiredSandbox(acquired, { path, signal: ctx.signal })).content;
       } catch (err) {
         return { id: '', content: `读取文件失败：${path}（${String(err)}）。请确认文件已在沙箱中生成。`, isError: true };
       }
@@ -145,5 +149,5 @@ export function buildExportTool(
         return { id: '', content: `导出失败：${String(err)}`, isError: true };
       }
     },
-  };
+  });
 }

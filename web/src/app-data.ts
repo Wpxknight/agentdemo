@@ -1,15 +1,25 @@
-import type { NavItem, PageMeta, RuntimeModelConfig, SandboxSummary, ScheduledTask, SessionSummary, ToolSummary } from './types';
+import type { NavItem, PageId, PageMeta, RuntimeModelConfig, SandboxSummary, ScheduledTask, SessionSummary, ToolSummary } from './types';
 
 export const NAV_ITEMS: NavItem[] = [
-  { id: 'chat', label: '聊天', icon: 'chat' },
-  { id: 'runs', label: '运行中心', icon: 'runs' },
-  { id: 'skills', label: '技能', icon: 'skills' },
-  { id: 'mcp', label: 'MCP', icon: 'mcp' },
-  { id: 'schedule', label: '定时任务', icon: 'schedule' },
-  { id: 'sandbox', label: '沙箱环境', icon: 'sandbox' },
-  { id: 'users', label: '用户管理', icon: 'users', adminOnly: true },
-  { id: 'settings', label: '设置', icon: 'settings' },
+  { id: 'chat', label: '聊天', icon: 'chat', url: '/chat' },
+  { id: 'runs', label: '运行中心', icon: 'runs', url: '/runs' },
+  { id: 'skills', label: '技能', icon: 'skills', url: '/skills' },
+  { id: 'mcp', label: 'MCP', icon: 'mcp', url: '/mcp' },
+  { id: 'schedule', label: '定时任务', icon: 'schedule', url: '/schedule' },
+  { id: 'sandbox', label: '沙箱环境', icon: 'sandbox', url: '/sandbox' },
+  { id: 'users', label: '用户管理', icon: 'users', url: '/users', adminOnly: true },
+  { id: 'settings', label: '设置', icon: 'settings', url: '/settings' },
 ];
+
+export function pageUrl(page: PageId): string {
+  return NAV_ITEMS.find((item) => item.id === page)?.url ?? '/chat';
+}
+
+export function pageFromUrl(pathname: string): PageId | undefined {
+  const normalized = pathname !== '/' ? pathname.replace(/\/+$/, '') : pathname;
+  if (normalized === '/') return 'chat';
+  return NAV_ITEMS.find((item) => item.url === normalized)?.id;
+}
 
 export const PAGES: Record<string, PageMeta> = {
   chat: { title: 'AI 助手', hasSandboxWorkspace: true, hasSessionHistoryDrawer: true },

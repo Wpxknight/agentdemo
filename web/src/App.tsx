@@ -44,11 +44,12 @@ import {
   Users,
   X,
 } from 'lucide-react';
-import { NAV_ITEMS, defaultLlmConfig, fallbackTools } from './app-data';
+import { NAV_ITEMS, defaultLlmConfig, pageFromUrl, pageUrl } from './app-data';
 import { MermaidDiagram } from './components/mermaid-diagram';
 import { RunCenterPage } from './components/run-center-page';
 import { createApi, numericSessionId, randomId, readStorage, writeStorage } from './api';
 import { formatSandboxOutputChunk, parseSandboxOutput, sandboxOutputClassNames, sandboxOutputCommand, sandboxOutputLabels } from './sandbox-output';
+import { isPersistedSession } from './session-context';
 import {
   appendSessionTerminal,
   removeSessionTerminals,
@@ -193,7 +194,7 @@ const initialMessages: ChatMessage[] = [
 
 function initialPage(): PageId | 'login' {
   if (typeof window !== 'undefined' && window.location.pathname === '/login') return 'login';
-  return 'chat';
+  return typeof window !== 'undefined' ? pageFromUrl(window.location.pathname) ?? 'chat' : 'chat';
 }
 
 function formatTime(value?: string): string {
@@ -963,6 +964,23 @@ export default function App() {
   const sessionIdRef = useRef(sessionId);
   const sessionOffsetRef = useRef(0);
   const messagesRef = useRef(messages);
+  const requestedPageRef = useRef<PageId>(
+    typeof window !== 'undefined' ? pageFromUrl(window.location.pathname) ?? 'chat' : 'chat',
+  );
+
+  useEffect(() => {
+    const handlePopState = () => {
+      if (window.location.pathname === '/login') {
+        setPage('login');
+        return;
+      }
+      const next = pageFromUrl(window.location.pathname) ?? 'chat';
+      requestedPageRef.current = next;
+      setPage(next);
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
 
   useEffect(() => {
     sessionIdRef.current = sessionId;
@@ -1017,6 +1035,10 @@ export default function App() {
   }
 
   const redirectToLogin = useCallback(() => {
+    if (typeof window !== 'undefined') {
+      const requestedPage = pageFromUrl(window.location.pathname);
+      if (requestedPage) requestedPageRef.current = requestedPage;
+    }
     setPage('login');
     setToken('');
     writeStorage('aiop_token', '');
@@ -1030,10 +1052,9 @@ export default function App() {
   }, []);
 
   const routeAfterLogin = useCallback(() => {
-    setPage('chat');
-    if (typeof window !== 'undefined' && window.location.pathname === '/login') {
-      window.history.replaceState({}, '', '/');
-    }
+    const next = requestedPageRef.current;
+    setPage(next);
+    if (typeof window !== 'undefined') window.history.replaceState({}, '', pageUrl(next));
   }, []);
 
   const api = useMemo(() => createApi(token, redirectToLogin), [token, redirectToLogin]);
@@ -1188,11 +1209,9 @@ export default function App() {
   }, [api]);
 
   useEffect(() => {
-    if (!token || !sessionId) return;
+    if (!token || !isPersistedSession(sessionId, sessions)) return;
     void loadContextUsage(sessionId);
-    if (sessions.some((session) => session.sessionId === sessionId)) {
-      void loadSessionTokenUsage(sessionId);
-    }
+    void loadSessionTokenUsage(sessionId);
   }, [loadContextUsage, loadSessionTokenUsage, sessionId, sessions, token]);
 
   const loadPageData = useCallback(async (target: PageId | 'login' = page) => {
@@ -1263,8 +1282,11 @@ export default function App() {
       redirectToLogin();
       return;
     }
+    requestedPageRef.current = next;
     setPage(next);
-    if (typeof window !== 'undefined') window.history.replaceState({}, '', '/');
+    if (typeof window !== 'undefined' && window.location.pathname !== pageUrl(next)) {
+      window.history.pushState({}, '', pageUrl(next));
+    }
   }
 
   async function selectSession(session: SessionSummary) {
@@ -1975,7 +1997,7 @@ export default function App() {
           <section className="content-shell content-wide">
             {activePage === 'skills' && (
               <SkillsPage
-                tools={skillTools.length ? skillTools : fallbackTools.filter((tool) => tool.category === 'skill')}
+                tools={skillTools}
                 api={api}
                 onImported={() => loadPageData('skills')}
                 onRequestConfirm={requestConfirmDialog}
@@ -1998,40 +2020,6 @@ export default function App() {
         onCancel={cancelConfirmDialog}
       />
     </TooltipProvider>
-  );
-}
-
-function Sidebar({ page, token, onNavigate, onLogout }: {
-  page: PageId;
-  token: string;
-  onNavigate: (page: PageId) => void;
-  onLogout: () => void;
-}) {
-  return (
-    <aside className="sidebar" aria-label="主导航">
-      <BrandLogo className="brand-logo-rail" />
-      <nav className="nav-rail">
-        {NAV_ITEMS.map((item) => {
-          const Icon = iconMap[item.icon];
-          return (
-            <Tooltip key={item.id}>
-              <TooltipTrigger asChild>
-                <button
-                  className={cn('nav-btn', page === item.id && 'active')}
-                  type="button"
-                  aria-label={item.label}
-                  onClick={() => onNavigate(item.id)}
-                >
-                  <Icon />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent side="right">{item.label}</TooltipContent>
-            </Tooltip>
-          );
-        })}
-      </nav>
-      <SidebarAccountMenu token={token} onLogout={onLogout} />
-    </aside>
   );
 }
 
@@ -2653,6 +2641,42 @@ function RunningIndicator() {
   );
 }
 
+function AttachmentChips({ attachments, onRemove }: { attachments: Attachment[]; onRemove?: (id: string) => void }) {
+  const images = attachments.filter((file) => file.type.startsWith('image/') && file.data);
+  const files = attachments.filter((file) => !file.type.startsWith('image/') || !file.data);
+  return (
+    <div className="attachment-list">
+      {images.map((file) => (
+        <figure className="attachment-image-card" key={`img-${file.id}`} title={file.name}>
+          <ZoomableImage src={file.data} alt={file.name} />
+          <figcaption>{file.name}</figcaption>
+          {onRemove ? (
+            <IconTooltip label={`移除 ${file.name}`}>
+              <button className="attachment-image-remove" type="button" onClick={() => onRemove(file.id)} aria-label={`移除 ${file.name}`}>
+                <Trash2 />
+              </button>
+            </IconTooltip>
+          ) : null}
+        </figure>
+      ))}
+      {files.map((file) => (
+        <span className="attachment-chip" key={file.id} title={file.name}>
+          <Paperclip />
+          <span>{file.name}</span>
+          <small>{file.type || 'file'} · {formatFileSize(file.size)}</small>
+          {onRemove ? (
+            <IconTooltip label={`移除 ${file.name}`}>
+              <button type="button" onClick={() => onRemove(file.id)} aria-label={`移除 ${file.name}`}>
+                <Trash2 />
+              </button>
+            </IconTooltip>
+          ) : null}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function PrototypeComposer(props: {
   attachments: Attachment[];
   value: string;
@@ -2891,364 +2915,12 @@ function renderSandboxOutputSegments(entry: ReturnType<typeof parseSandboxOutput
   ));
 }
 
-function ChatWorkbench(props: {
-  historyOpen: boolean;
-  previewOpen: boolean;
-  previewWidth: number;
-  sessions: SessionSummary[];
-  messages: ChatMessage[];
-  attachments: Attachment[];
-  llm: RuntimeModelConfig;
-  settingsStatus: string;
-  sandboxOutput: string;
-  browserStreamUrl: string;
-  composerRef: React.RefObject<HTMLTextAreaElement | null>;
-  fileInputRef: React.RefObject<HTMLInputElement | null>;
-  onToggleHistory: () => void;
-  onTogglePreview: () => void;
-  onNewSession: () => void;
-  onChooseAttachment: () => void;
-  onAddAttachments: (files: FileList | null) => void;
-  onRemoveAttachment: (id: string) => void;
-  onComposerKeydown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
-  onSubmitComposer: (event: FormEvent<HTMLFormElement>) => void;
-  onModelSwitch: (id: string) => void;
-  onRunSandbox: (code: string, language: string) => void;
-  onOpenPreview: () => void;
-  onRefreshPreview: () => void;
-  onStartResize: (event: PointerEvent<HTMLButtonElement>) => void;
-}) {
-  const layoutClass = cn('chat-layout', !props.historyOpen && 'history-closed', !props.previewOpen && 'preview-closed');
-  return (
-    <div className={layoutClass} style={{ '--sandbox-width': `${props.previewWidth}px` } as CSSProperties}>
-      {props.historyOpen && <SessionHistory sessions={props.sessions} onCollapse={props.onToggleHistory} />}
-      <section className="chat-panel">
-        <div className="panel-header">
-          <div className="page-heading">
-            <h1>AI 运维助手</h1>
-            <p className="page-subtitle">查询集群、分析告警、执行变更和管理沙箱。</p>
-          </div>
-        <div className="header-actions">
-            <IconTooltip label="切换会话列表">
-              <Button variant="outline" size="icon" aria-label="切换会话列表" onClick={props.onToggleHistory}>
-                <PanelLeftClose />
-              </Button>
-            </IconTooltip>
-            <IconTooltip label="切换浏览器预览">
-              <Button variant="outline" size="icon" aria-label="切换浏览器预览" onClick={props.onTogglePreview}>
-                <PanelRightClose />
-              </Button>
-            </IconTooltip>
-            <Button onClick={props.onNewSession}>
-              <MessageSquare data-icon="inline-start" />
-              新建会话
-            </Button>
-          </div>
-        </div>
-        <Messages messages={props.messages} />
-        <ComposerInput
-          attachments={props.attachments}
-          composerRef={props.composerRef}
-          fileInputRef={props.fileInputRef}
-          onChooseAttachment={props.onChooseAttachment}
-          onAddAttachments={props.onAddAttachments}
-          onRemoveAttachment={props.onRemoveAttachment}
-          onComposerKeydown={props.onComposerKeydown}
-          onSubmitComposer={props.onSubmitComposer}
-        />
-      </section>
-      {props.previewOpen && (
-        <BrowserPreviewPanel
-          sandboxOutput={props.sandboxOutput}
-          browserStreamUrl={props.browserStreamUrl}
-          onRunSandbox={props.onRunSandbox}
-          onOpenPreview={props.onOpenPreview}
-          onRefreshPreview={props.onRefreshPreview}
-          onStartResize={props.onStartResize}
-          onClose={props.onTogglePreview}
-        />
-      )}
-    </div>
-  );
-}
-
-function SessionHistory({ sessions, onCollapse }: { sessions: SessionSummary[]; onCollapse: () => void }) {
-  const recentSessions = sessions.slice(0, 10);
-  return (
-    <aside className="session-drawer">
-      <div className="drawer-head">
-        <div>
-          <h2>最近会话</h2>
-          <span>按更新时间排序</span>
-        </div>
-        <IconTooltip label="收起最近会话">
-          <Button variant="ghost" size="icon" aria-label="收起最近会话" onClick={onCollapse}>
-            <X />
-          </Button>
-        </IconTooltip>
-      </div>
-      <ScrollArea className="session-scroll">
-        <div className="session-list">
-          {recentSessions.length ? recentSessions.map((session, index) => {
-            const category = sessionCategoryFor(session);
-            const SessionIcon = category.Icon;
-            return (
-              <button key={`${session.sessionId || session.title}-${index}`} className={cn('session-row', index === 0 && 'active')} type="button">
-                <span className={cn('session-row-icon', category.tone)}>
-                  <SessionIcon />
-                </span>
-                <strong>{session.title}</strong>
-                <time>{session.time}</time>
-                <span className="session-desc">{session.desc}</span>
-              </button>
-            );
-          }) : (
-            <div className="session-empty">
-              <MessageSquare />
-              <strong>暂无会话记录</strong>
-              <span>开始一次对话后，这里会显示最近会话。</span>
-            </div>
-          )}
-        </div>
-      </ScrollArea>
-    </aside>
-  );
-}
-
-function Messages({ messages }: { messages: ChatMessage[] }) {
-  return (
-    <ScrollArea className="messages-scroll">
-      <div className="messages-grid">
-        {messages.map((message, index) => {
-          // 历史摘要虽以 user 角色落库（模型协议要求），但内容是 aiop 生成的，展示在助手侧。
-          const isUser = message.role === 'user' && !message.summary;
-          return (
-            <article key={message.id || `${message.role}-${index}`} className={cn('message', isUser && 'message-user')}>
-              <MessageAvatar isUser={isUser} />
-              <div className="message-stack">
-                <div className="bubble">
-                  <MessageContent message={message} />
-                  {message.attachments?.length ? <AttachmentChips attachments={message.attachments} /> : null}
-                  {message.tools?.length ? (
-                    <div className="tool-chips">
-                      {message.tools.map((tool) => <Badge key={tool} variant="secondary">{tool}</Badge>)}
-                    </div>
-                  ) : null}
-                  {message.running ? <RunningIndicator /> : null}
-                </div>
-                <div className="message-meta">
-                  <time className="message-time">{message.time}</time>
-                  {message.role === 'assistant' && message.durationMs !== undefined ? (
-                    <span className="message-duration">执行 {formatElapsedTime(message.durationMs)}</span>
-                  ) : null}
-                </div>
-              </div>
-            </article>
-          );
-        })}
-      </div>
-    </ScrollArea>
-  );
-}
-
-function AttachmentChips({ attachments, onRemove }: { attachments: Attachment[]; onRemove?: (id: string) => void }) {
-  const images = attachments.filter((file) => file.type.startsWith('image/') && file.data);
-  const files = attachments.filter((file) => !file.type.startsWith('image/') || !file.data);
-  return (
-    <div className="attachment-list">
-      {/* 图片附件直接内联缩略图（可点击放大）；其余仍以文件名 chip 展示 */}
-      {images.map((file) => (
-        <figure className="attachment-image-card" key={`img-${file.id}`} title={file.name}>
-          <ZoomableImage src={file.data} alt={file.name} />
-          <figcaption>{file.name}</figcaption>
-          {onRemove ? (
-            <IconTooltip label={`移除 ${file.name}`}>
-              <button className="attachment-image-remove" type="button" onClick={() => onRemove(file.id)} aria-label={`移除 ${file.name}`}>
-                <Trash2 />
-              </button>
-            </IconTooltip>
-          ) : null}
-        </figure>
-      ))}
-      {files.map((file) => (
-        <span className="attachment-chip" key={file.id} title={file.name}>
-          <Paperclip />
-          <span>{file.name}</span>
-          <small>{file.type || 'file'} · {formatFileSize(file.size)}</small>
-          {onRemove ? (
-            <IconTooltip label={`移除 ${file.name}`}>
-              <button type="button" onClick={() => onRemove(file.id)} aria-label={`移除 ${file.name}`}>
-                <Trash2 />
-              </button>
-            </IconTooltip>
-          ) : null}
-        </span>
-      ))}
-    </div>
-  );
-}
-
-function ComposerInput(props: {
-  attachments: Attachment[];
-  composerRef: React.RefObject<HTMLTextAreaElement | null>;
-  fileInputRef: React.RefObject<HTMLInputElement | null>;
-  onChooseAttachment: () => void;
-  onAddAttachments: (files: FileList | null) => void;
-  onRemoveAttachment: (id: string) => void;
-  onComposerKeydown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
-  onSubmitComposer: (event: FormEvent<HTMLFormElement>) => void;
-}) {
-  return (
-    <form className="composer-shell" onSubmit={props.onSubmitComposer}>
-      <input
-        ref={props.fileInputRef}
-        id="attachment-input"
-        type="file"
-        multiple
-        hidden
-        onChange={(event) => props.onAddAttachments(event.currentTarget.files)}
-      />
-      {props.attachments.length ? <AttachmentChips attachments={props.attachments} onRemove={props.onRemoveAttachment} /> : null}
-      <div className="composer-main">
-        <Textarea
-          ref={props.composerRef}
-          name="task"
-          rows={2}
-          placeholder="输入运维问题或指令，Enter 发送"
-          onKeyDown={props.onComposerKeydown}
-        />
-        <div className="composer-action-row">
-          <IconTooltip label="添加附件">
-            <Button variant="outline" size="icon" type="button" aria-label="添加附件" onClick={props.onChooseAttachment}>
-              <Paperclip />
-            </Button>
-          </IconTooltip>
-          <Button className="send-button" type="submit">
-            <Send data-icon="inline-start" />
-            发送
-          </Button>
-        </div>
-      </div>
-    </form>
-  );
-}
-
-function BrowserPreviewPanel(props: {
-  sandboxOutput: string;
-  browserStreamUrl: string;
-  onRunSandbox: (code: string, language: string) => void;
-  onOpenPreview: () => void;
-  onRefreshPreview: () => void;
-  onStartResize: (event: PointerEvent<HTMLButtonElement>) => void;
-  onClose: () => void;
-}) {
-  const [code, setCode] = useState('print("hello from sandbox")');
-  const [language, setLanguage] = useState('python');
-  return (
-    <aside className="browser-preview-panel">
-      <button className="resize-handle" type="button" aria-label="拖动调整浏览器预览宽度" onPointerDown={props.onStartResize} />
-      <div className="sandbox-head">
-        <div>
-          <h2>当前沙箱</h2>
-          <p><span className="muted-dot" />未绑定</p>
-        </div>
-        <IconTooltip label="收起当前沙箱">
-          <Button variant="ghost" size="icon" aria-label="收起当前沙箱" onClick={props.onClose}>
-            <X />
-          </Button>
-        </IconTooltip>
-      </div>
-      <Card className="sandbox-tool">
-        <CardHeader>
-          <div className="tool-title">
-            <CardTitle>运行代码</CardTitle>
-            <Select value={language} onValueChange={setLanguage}>
-              <SelectTrigger className="language-select" aria-label="选择语言">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectGroup>
-                  <SelectItem value="python">Python</SelectItem>
-                  <SelectItem value="javascript">JavaScript</SelectItem>
-                  <SelectItem value="bash">Bash</SelectItem>
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-          </div>
-        </CardHeader>
-        <CardContent className="sandbox-code">
-          <Textarea value={code} onChange={(event) => setCode(event.target.value)} spellCheck={false} />
-          <Button type="button" onClick={() => props.onRunSandbox(code, language)}>
-            <Play data-icon="inline-start" />
-            运行代码
-          </Button>
-        </CardContent>
-      </Card>
-      <Card className="preview-tool">
-        <CardHeader>
-          <div className="tool-title">
-            <CardTitle>浏览器预览</CardTitle>
-            <div className="tool-actions">
-              <Button variant="outline" size="sm" type="button" onClick={props.onOpenPreview}>
-                <Monitor data-icon="inline-start" />
-                加载预览
-              </Button>
-              <Button variant="ghost" size="sm" type="button" onClick={props.onRefreshPreview}>
-                <RefreshCcw data-icon="inline-start" />
-                刷新截图
-              </Button>
-            </div>
-          </div>
-          <CardDescription>这里只展示远端浏览器画面，不提供打开 URL、点击、输入等操作控件。</CardDescription>
-        </CardHeader>
-        <CardContent>
-          {props.browserStreamUrl ? (
-            <iframe className="browser-preview-frame" src={props.browserStreamUrl} title="浏览器预览" />
-          ) : (
-            <div className="preview-empty">
-              <Monitor />
-              <strong>预览当前沙箱浏览器画面</strong>
-              <span>加载后会在这里显示截图流。</span>
-            </div>
-          )}
-        </CardContent>
-      </Card>
-      <div className="terminal">
-        {parseSandboxOutput(props.sandboxOutput).map((entry) => (
-          <div key={entry.id} className={sandboxOutputClassNames[entry.kind]}>
-            <span className="sandbox-output-label">{sandboxOutputLabels[entry.kind]}</span>
-            <code>{renderSandboxOutputSegments(entry)}</code>
-          </div>
-        ))}
-      </div>
-    </aside>
-  );
-}
-
 function skillFileEntries(tool?: ToolSummary): SkillFileEntry[] {
-  if (tool?.fileEntries?.length) return tool.fileEntries;
-  const paths = ['SKILL.md', ...(tool?.files || [])];
-  return paths.map((path) => ({
-    path,
-    name: path.split('/').pop() || path,
-    isDirectory: false,
-    size: 0,
-    updatedAt: '',
-  }));
+  return tool?.fileEntries ?? [];
 }
 
 function skillFiles(tool?: ToolSummary): string[] {
   return skillFileEntries(tool).filter((file) => !file.isDirectory).map((file) => file.path);
-}
-
-function skillPreview(tool?: ToolSummary, selectedFile = 'SKILL.md'): string {
-  const name = toolDisplayName(tool?.name || 'skill');
-  const description = tool?.description || '后端已注册的 AI 助手技能。';
-  const files = skillFiles(tool).map((file) => `- ${file}`).join('\n');
-  if (selectedFile && selectedFile !== 'SKILL.md') {
-    return `# ${selectedFile}\n\n该文件来自技能 ${name} 的目录。\n\n文件内容需要通过后端技能导入或文件浏览能力读取。`;
-  }
-  return `# ${name}\n\n${description}\n\n## Files\n${files}`;
 }
 
 function skillIconFor(tool?: ToolSummary) {
@@ -3513,10 +3185,7 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
   onImported: () => Promise<void>;
   onRequestConfirm: (request: ConfirmDialogRequest) => void;
 }) {
-  const sourceTools = useMemo(
-    () => (tools.length ? tools : fallbackTools.filter((tool) => tool.category === 'skill')),
-    [tools],
-  );
+  const sourceTools = useMemo(() => tools, [tools]);
   const [selectedName, setSelectedName] = useState(sourceTools[0]?.name || '');
   const [selectedFile, setSelectedFile] = useState('SKILL.md');
   const [currentDir, setCurrentDir] = useState('');
@@ -3528,8 +3197,7 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
   const importInputRef = useRef<HTMLInputElement | null>(null);
 
   const selected = sourceTools.find((tool) => tool.name === selectedName) || sourceTools[0];
-  const files = useMemo(() => skillFiles(selected), [selected]);
-  const selectedEntry = fileBody?.entry || skillFileEntries(selected).find((file) => file.path === selectedFile);
+  const selectedEntry = fileBody?.entry;
   const filteredTools = sourceTools.filter((tool) => {
     const value = `${toolDisplayName(tool.name)} ${tool.description || ''}`.toLowerCase();
     return value.includes(query.trim().toLowerCase());
@@ -3544,10 +3212,11 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
   }, [selectedName, sourceTools]);
 
   useEffect(() => {
-    if (!selectedName) return;
     setSelectedFile('SKILL.md');
     setCurrentDir('');
+    setDirectoryEntries([]);
     setFileBody(null);
+    if (!selectedName) return;
     void loadSkillDirectory('');
     void loadSkillFile('SKILL.md');
   }, [selectedName]);
@@ -3560,11 +3229,8 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
       setCurrentDir(body.path || path);
       setDirectoryEntries(body.entries || []);
     } catch (err) {
-      const entries = skillFileEntries(selected)
-        .filter((entry) => parentPathOf(entry.path) === path)
-        .sort((a, b) => Number(b.isDirectory) - Number(a.isDirectory) || a.name.localeCompare(b.name, 'zh-CN'));
       setCurrentDir(path);
-      setDirectoryEntries(entries);
+      setDirectoryEntries([]);
       setImportStatus(`目录加载失败：${formatError(err)}`);
     }
   }
@@ -3572,18 +3238,13 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
   async function loadSkillFile(path = 'SKILL.md') {
     if (!selectedName) return;
     setSelectedFile(path);
+    setFileBody(null);
     try {
       const body = await api.get<SkillFileBody>(`/v1/skills/${encodeURIComponent(selectedName)}/files?path=${encodeURIComponent(path)}`);
       setSelectedFile(body.path || path);
       setFileBody(body);
     } catch (err) {
-      const entry = skillFileEntries(selected).find((file) => file.path === path);
-      setFileBody({
-        path,
-        parentPath: parentPathOf(path),
-        entry,
-        content: `${skillPreview(selected, path)}\n\n读取失败：${formatError(err)}`,
-      });
+      setImportStatus(`读取失败：${formatError(err)}`);
     }
   }
 
@@ -3734,10 +3395,11 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
                   </button>
                 );
               })}
+              {!filteredTools.length ? <div className="skill-list-empty">暂无可用技能</div> : null}
             </div>
           </ScrollArea>
         </aside>
-        {showSkillFiles ? (
+        {showSkillFiles && selected ? (
           <aside className="skill-file-tree-panel">
             <div className="skill-panel-title">
               <strong>文件目录</strong>
@@ -3772,7 +3434,8 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
             </div>
           </aside>
         ) : null}
-        <main className="skill-detail-panel">
+        {selected ? (
+          <main className="skill-detail-panel">
           <div className="skill-detail-head">
             <div className="skill-title-block">
               <span className="skill-detail-icon"><SkillIcon /></span>
@@ -3814,14 +3477,21 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
             <span>更新时间 <strong>{formatDateTime(selectedEntry?.updatedAt)}</strong></span>
             <span>当前文件 <strong>{selectedFile}</strong></span>
           </div>
-          {selectedFile.toLowerCase().endsWith('.md') ? (
-            <div className="skill-preview-markdown">
-              <MarkdownMessage content={fileBody?.content || skillPreview(selected, selectedFile)} />
-            </div>
+          {typeof fileBody?.content === 'string' ? (
+            selectedFile.toLowerCase().endsWith('.md') ? (
+              <div className="skill-preview-markdown">
+                <MarkdownMessage content={fileBody.content} />
+              </div>
+            ) : (
+              <pre className="skill-preview">{fileBody.content}</pre>
+            )
           ) : (
-            <pre className="skill-preview">{fileBody?.content || skillPreview(selected, selectedFile)}</pre>
+            <div className="skill-preview-empty">暂无可显示的文件内容</div>
           )}
-        </main>
+          </main>
+        ) : (
+          <main className="skill-detail-panel skill-detail-empty">暂无可用技能，请导入 Skill 后重试。</main>
+        )}
       </div>
     </section>
   );
@@ -4124,23 +3794,6 @@ function ManagementPage({ title, desc, actionLabel, onAction, search, onSearchCh
   );
 }
 
-function DetailPanel({ title, status, icon, children }: { title: string; status: string; icon: React.ReactNode; children: React.ReactNode }) {
-  return (
-    <div className="detail-panel">
-      <div className="detail-title">
-        <div className="large-icon">{icon}</div>
-        <div>
-          <h2>{title}</h2>
-          <Badge variant="secondary">{status}</Badge>
-        </div>
-      </div>
-      {children}
-    </div>
-  );
-}
-
-const RUNS_PAGE_SIZE = 5;
-
 const CRON_PRESETS = [
   { label: '每天 02:00', value: '0 2 * * *' },
   { label: '每天 01:00', value: '0 1 * * *' },
@@ -4148,6 +3801,8 @@ const CRON_PRESETS = [
   { label: '每 5 分钟', value: '*/5 * * * *' },
   { label: '每周一 09:00', value: '0 9 * * 1' },
 ];
+
+const RUNS_PAGE_SIZE = 5;
 
 function ScheduleTaskForm({
   title,
@@ -4783,11 +4438,11 @@ function SettingsPage({ llm, status, api, me, onLlmChange, onStatus, onRequestCo
   // 隐藏只是 UX，权限边界在后端 RBAC：普通用户只保留我的主目录；全局沙箱仅平台管理员可见。
   const isAdmin = me?.role === 'platform_admin' || me?.role === 'tenant_admin';
   const isPlatformAdmin = me?.role === 'platform_admin';
-  const [form, setForm] = useState(() => ({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) }));
+  const [form, setForm] = useState(() => ({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', allow_insecure_tls: Boolean(llm.allow_insecure_tls), effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) }));
 
   useEffect(() => {
-    setForm({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) });
-  }, [llm.api_key, llm.base_url, llm.model, llm.protocol, llm.effort, llm.context_window_tokens]);
+    setForm({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', allow_insecure_tls: Boolean(llm.allow_insecure_tls), effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) });
+  }, [llm.api_key, llm.allow_insecure_tls, llm.base_url, llm.model, llm.protocol, llm.effort, llm.context_window_tokens]);
 
   // 上下文窗口仅在填了合法正整数时提交，避免编辑中间态触发后端 400。
   function formPayload() {
@@ -4838,6 +4493,11 @@ function SettingsPage({ llm, status, api, me, onLlmChange, onStatus, onRequestCo
               <CardContent className="settings-form">
                 <Label>协议<Select value={form.protocol} onValueChange={(protocol) => setForm((current) => ({ ...current, protocol: protocol as RuntimeModelConfig['protocol'] }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="anthropic">Anthropic</SelectItem><SelectItem value="openai">OpenAI Compatible</SelectItem></SelectGroup></SelectContent></Select></Label>
                 <Label>Base URL<Input value={form.base_url} onChange={(event) => setForm((current) => ({ ...current, base_url: event.target.value }))} /></Label>
+                <Label className="settings-checkbox-row">
+                  <input type="checkbox" checked={form.allow_insecure_tls} onChange={(event) => setForm((current) => ({ ...current, allow_insecure_tls: event.target.checked }))} />
+                  <span>允许不安全 HTTPS（忽略证书校验）</span>
+                </Label>
+                {form.allow_insecure_tls ? <div className="settings-status">仅用于自签名或证书链不受信任的内网 LLM 服务；会降低中间人攻击防护。</div> : null}
                 <Label>API Key<Input placeholder="输入 API Key" value={form.api_key} onChange={(event) => setForm((current) => ({ ...current, api_key: event.target.value }))} /></Label>
                 <Label>Model<Input value={form.model} onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))} /></Label>
                 <Label>上下文窗口（tokens）<Input type="number" min={20000} step={1000} placeholder="200000" value={form.context_window_tokens} onChange={(event) => setForm((current) => ({ ...current, context_window_tokens: event.target.value }))} /></Label>
