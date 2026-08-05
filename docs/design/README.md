@@ -5,7 +5,7 @@
 > 最后核对：2026-08-03
 > 适用范围：`pi-agent-platform-integration` 当前实现
 
-本目录描述当前实现，不以迁移过程或目标蓝图代替源码事实。系统级术语、唯一模块职责表和唯一全量目录树见 [01 系统总览](./01-system-overview.md)。
+本目录以当前实现为主，不以迁移过程或目标蓝图代替源码事实；明确标记为“目标设计”的文档除外。系统级术语、唯一模块职责表和唯一全量目录树见 [01 系统总览](./01-system-overview.md)。
 
 ## 事实优先级
 
@@ -15,12 +15,12 @@
 2. 公共契约：`packages/control-contracts/` 与各工作区包的 `package.json`、`src/index.ts`。
 3. 当前实现：`src/`、`packages/`、`web/src/`。
 4. 自动化测试：`tests/`。
-5. 当前设计文档：`docs/design/01`～`13`（不含已删除的旧第 12 篇）。
+5. 当前实现设计文档：`docs/design/01`～`13`（不含已删除的旧第 12 篇）；目标蓝图见明确标记状态的后续文档。
 6. 历史文档与生成物只作背景或快照，不作为当前行为的首要证据。
 
 依赖版本以根目录及 `web/` 的 lockfile 为准；API 行为以 `src/server/http.ts` 和 HTTP tests 为准；部署事实以 `deploy/k8s/`、`deploy/dev-k8s/` 与 `Makefile` 为准。
 
-## 01～13 文档职责
+## 01～14 文档职责
 
 | 编号 | 文档 | 唯一职责 |
 | --- | --- | --- |
@@ -37,12 +37,14 @@
 | 11 | [演进路线与已知限制](./11-evolution-roadmap.md) | 未实现能力、已知风险、验证缺口与渐进演进项 |
 | 12 | [HTTP API Reference](./12-http-api-reference.md) | HTTP 路由、认证、请求/响应、SSE 和错误契约的字段级参考 |
 | 13 | [Configuration Reference](./13-configuration-reference.md) | 环境变量、配置文件与部署参数的字段级参考 |
+| 14 | [AIOS 嵌入与统一权限体系](./14-aios-unified-auth.md) | AIOS 单点登录、影子用户、角色映射和 UPMS 定期对账的目标设计 |
 
 旧 `12-pi-integration-plan.md` 已删除；其历史版本由 Git 保留，不作为当前架构入口。
 
 ## 文档状态
 
 - **current**：`docs/design/01`～`13`（不含已删除的旧第 12 篇），描述本页验证基线上的当前实现或明确标记的演进项。
+- **target design**：`docs/design/14-aios-unified-auth.md`，描述已确认但尚未全部实现的 AIOS 统一权限目标蓝图。
 - **historical**：`docs/superpowers/specs/`、`docs/superpowers/plans/` 等迁移设计和实施记录，只用于理解决策背景；其中旧组件名不代表当前组件。
 - **generated**：`docs/public-api/` 等由工具生成或校验的公共 API snapshot，用于发布面比对，不替代实现、契约源码或设计说明。
 
