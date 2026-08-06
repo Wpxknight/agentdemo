@@ -35,18 +35,18 @@ const AiosMetadataSchema = z.object({
   defaultTimeoutHours: z.number().int().nonnegative(),
 }).strict();
 
-const TemplateSchema = z.object({
+const BaseTemplateSchema = z.object({
   templateID: z.string().trim().min(1),
   names: z.array(z.string()),
   aliases: z.array(z.string()),
   buildStatus: z.string(),
-  aios: AiosMetadataSchema,
 }).passthrough();
 
 const MAX_SAFE_TIMEOUT_HOURS = Math.floor(Number.MAX_SAFE_INTEGER / 3_600_000);
 const REDACTED_TEMPLATE_ID = '[redacted]';
 
-type ValidTemplate = z.infer<typeof TemplateSchema>;
+type ValidTemplate = z.infer<typeof BaseTemplateSchema>;
+type ValidAiosMetadata = z.infer<typeof AiosMetadataSchema>;
 
 function warningTemplateId(value: unknown): string | undefined {
   if (!value || typeof value !== 'object') return undefined;
@@ -61,6 +61,13 @@ function warnIgnoredTemplate(index: number, value: unknown, validationClass: str
     ...(warningTemplateId(value) ? { templateId: REDACTED_TEMPLATE_ID } : {}),
     validationClass,
   }, 'ignoring AIOS template catalog entry');
+}
+
+function warnLegacyTemplates(count: number): void {
+  logger.warn({
+    count,
+    validationClass: 'legacy_compatibility',
+  }, 'using least-privilege defaults for AIOS template catalog entries');
 }
 
 function trimmedUniqueStrings(values: readonly string[]): string[] {
@@ -79,20 +86,24 @@ function canonicalStrings(values: readonly string[]): string[] {
   return trimmedUniqueStrings(values).sort(compareText);
 }
 
-function normalizeTemplate(template: ValidTemplate): AiosTemplateCatalogEntry | undefined {
+function normalizeTemplate(
+  template: ValidTemplate,
+  metadata?: ValidAiosMetadata,
+): AiosTemplateCatalogEntry | undefined {
   const names = trimmedUniqueStrings(template.names);
-  if (!names.length || template.aios.defaultTimeoutHours > MAX_SAFE_TIMEOUT_HOURS) return undefined;
+  if (!names.length || (metadata && metadata.defaultTimeoutHours > MAX_SAFE_TIMEOUT_HOURS)) return undefined;
+  const name = names[0]!;
 
   return {
     templateId: template.templateID,
-    name: names[0]!,
+    name,
     aliases: canonicalStrings(template.aliases),
-    description: template.aios.description,
-    envType: template.aios.envType,
-    runtimeRole: template.aios.runtimeRole,
-    image: template.aios.image,
-    ...(template.aios.defaultTimeoutHours > 0
-      ? { defaultTimeoutMs: template.aios.defaultTimeoutHours * 3_600_000 }
+    description: metadata?.description ?? name,
+    envType: metadata?.envType ?? 'code',
+    runtimeRole: metadata?.runtimeRole ?? 'sandbox-reader',
+    image: metadata?.image ?? '',
+    ...(metadata && metadata.defaultTimeoutHours > 0
+      ? { defaultTimeoutMs: metadata.defaultTimeoutHours * 3_600_000 }
       : {}),
   };
 }
@@ -147,11 +158,37 @@ export class AiosTemplateCatalog {
       throw new Error('AIOS Lifecycle returned an invalid template catalog');
     }
 
+    const explicitMetadataTemplateIds = new Set<string>();
+    const malformedMetadataTemplateIds = new Set<string>();
+    for (const value of body) {
+      const parsed = BaseTemplateSchema.safeParse(value);
+      if (!parsed.success || !Object.prototype.hasOwnProperty.call(value, 'aios')) continue;
+      const metadata = AiosMetadataSchema.safeParse((value as Record<string, unknown>).aios);
+      if (metadata.success) explicitMetadataTemplateIds.add(parsed.data.templateID);
+      else malformedMetadataTemplateIds.add(parsed.data.templateID);
+    }
+
     const seenTemplateIds = new Set<string>();
     const templates: AiosTemplateCatalogEntry[] = [];
+    let legacyTemplateCount = 0;
     body.forEach((value, index) => {
-      const parsed = TemplateSchema.safeParse(value);
+      const parsed = BaseTemplateSchema.safeParse(value);
       if (!parsed.success) {
+        warnIgnoredTemplate(index, value, 'schema');
+        return;
+      }
+      const hasAiosMetadata = Object.prototype.hasOwnProperty.call(value, 'aios');
+      if (!hasAiosMetadata && (
+        explicitMetadataTemplateIds.has(parsed.data.templateID)
+        || malformedMetadataTemplateIds.has(parsed.data.templateID)
+      )) {
+        warnIgnoredTemplate(index, value, 'duplicate');
+        return;
+      }
+      const metadata = hasAiosMetadata
+        ? AiosMetadataSchema.safeParse((value as Record<string, unknown>).aios)
+        : undefined;
+      if (metadata && !metadata.success) {
         warnIgnoredTemplate(index, value, 'schema');
         return;
       }
@@ -159,7 +196,7 @@ export class AiosTemplateCatalog {
         warnIgnoredTemplate(index, value, 'build_status');
         return;
       }
-      const normalized = normalizeTemplate(parsed.data);
+      const normalized = normalizeTemplate(parsed.data, metadata?.data);
       if (!normalized) {
         warnIgnoredTemplate(index, value, 'normalization');
         return;
@@ -170,8 +207,10 @@ export class AiosTemplateCatalog {
       }
       seenTemplateIds.add(normalized.templateId);
       templates.push(normalized);
+      if (!hasAiosMetadata) legacyTemplateCount++;
     });
 
+    if (legacyTemplateCount) warnLegacyTemplates(legacyTemplateCount);
     templates.sort(compareEntries);
     if (!templates.length) {
       throw new Error('AIOS Lifecycle template catalog has no usable templates');
