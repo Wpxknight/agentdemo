@@ -26,6 +26,28 @@ function template(overrides: Record<string, unknown> = {}): Record<string, unkno
   };
 }
 
+function legacyTemplate(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    templateID: 'legacy-code-id',
+    names: ['legacy-code'],
+    aliases: ['legacy'],
+    buildStatus: 'ready',
+    buildCount: 1,
+    buildID: 'build-id',
+    cpuCount: 2,
+    createdAt: '2026-08-05T00:00:00Z',
+    createdBy: 'tester',
+    diskSizeMB: 1024,
+    envdVersion: '1.0.0',
+    lastSpawnedAt: null,
+    memoryMB: 2048,
+    public: false,
+    spawnCount: 0,
+    updatedAt: '2026-08-05T00:00:00Z',
+    ...overrides,
+  };
+}
+
 function jsonResponse(status: number, body: unknown, headers?: Record<string, string>): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -110,7 +132,7 @@ describe('AiosTemplateCatalog', () => {
           unexpected: true,
         },
       }),
-      { templateID: 'missing-metadata', names: ['invalid'], aliases: [], buildStatus: 'ready' },
+      { templateID: 'invalid-metadata', names: ['invalid'], aliases: [], buildStatus: 'ready', aios: null },
     ]);
 
     const snapshot = await catalog.load();
@@ -146,6 +168,161 @@ describe('AiosTemplateCatalog', () => {
         .toEqual(expect.not.arrayContaining(['apiKey', 'body', 'issues']));
     }
     warn.mockRestore();
+  });
+
+  it('accepts the current AIOS template shape with least-privilege defaults', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const { catalog } = catalogWithResponse([
+      legacyTemplate({
+        templateID: 'legacy-browser-name-id',
+        names: ['browser'],
+        aliases: ['web'],
+      }),
+      legacyTemplate(),
+    ]);
+
+    const snapshot = await catalog.load();
+
+    expect(snapshot.templates).toEqual([
+      {
+        templateId: 'legacy-browser-name-id',
+        name: 'browser',
+        aliases: ['web'],
+        description: 'browser',
+        envType: 'code',
+        runtimeRole: 'sandbox-reader',
+        image: '',
+      },
+      {
+        templateId: 'legacy-code-id',
+        name: 'legacy-code',
+        aliases: ['legacy'],
+        description: 'legacy-code',
+        envType: 'code',
+        runtimeRole: 'sandbox-reader',
+        image: '',
+      },
+    ]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      { count: 2, validationClass: 'legacy_compatibility' },
+      'using least-privilege defaults for AIOS template catalog entries',
+    );
+    warn.mockRestore();
+  });
+
+  it('keeps explicit AIOS metadata semantics in a mixed legacy catalog', async () => {
+    const { catalog } = catalogWithResponse([
+      legacyTemplate(),
+      template({
+        templateID: 'browser-id',
+        names: ['browser'],
+        aios: {
+          description: 'Browser sandbox',
+          envType: 'browser',
+          runtimeRole: 'sandbox-reader',
+          image: 'browser:latest',
+          defaultTimeoutHours: 2,
+        },
+      }),
+    ]);
+
+    await expect(catalog.load()).resolves.toMatchObject({
+      templates: [
+        expect.objectContaining({
+          templateId: 'browser-id',
+          envType: 'browser',
+          image: 'browser:latest',
+          defaultTimeoutMs: 7_200_000,
+        }),
+        expect.objectContaining({
+          templateId: 'legacy-code-id',
+          envType: 'code',
+          runtimeRole: 'sandbox-reader',
+          image: '',
+        }),
+      ],
+    });
+  });
+
+  it('rejects present malformed AIOS metadata instead of applying compatibility defaults', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const { catalog } = catalogWithResponse([
+      legacyTemplate({
+        templateID: 'malformed-id',
+        aios: {
+          description: 'Must not be downgraded',
+          envType: 'code',
+          runtimeRole: 'sandbox-diag',
+        },
+      }),
+      legacyTemplate(),
+    ]);
+
+    const snapshot = await catalog.load();
+
+    expect(snapshot.templates.map((entry) => entry.templateId)).toEqual(['legacy-code-id']);
+    expect(warn.mock.calls.some(([details]) => (
+      details as Record<string, unknown>
+    ).validationClass === 'schema')).toBe(true);
+    expect(warn.mock.calls.some(([details]) => (
+      details as Record<string, unknown>
+    ).validationClass === 'legacy_compatibility')).toBe(true);
+    warn.mockRestore();
+  });
+
+  it('does not downgrade malformed explicit metadata through a legacy duplicate in either order', async () => {
+    const malformed = legacyTemplate({
+      templateID: 'shared-id',
+      aios: {
+        description: 'Must not be downgraded',
+        envType: 'code',
+        runtimeRole: 'sandbox-diag',
+      },
+    });
+    const legacyDuplicate = legacyTemplate({ templateID: 'shared-id' });
+
+    const snapshots = await Promise.all([
+      catalogWithResponse([malformed, legacyDuplicate, legacyTemplate()]).catalog.load(),
+      catalogWithResponse([legacyDuplicate, malformed, legacyTemplate()]).catalog.load(),
+    ]);
+
+    for (const snapshot of snapshots) {
+      expect(snapshot.templates.map((entry) => entry.templateId)).toEqual(['legacy-code-id']);
+    }
+  });
+
+  it('prefers valid explicit metadata over a legacy duplicate in either order', async () => {
+    const explicit = template({
+      templateID: 'shared-id',
+      names: ['shared'],
+      aios: {
+        description: 'Diagnostic sandbox',
+        envType: 'code',
+        runtimeRole: 'sandbox-diag',
+        image: 'diag:latest',
+        defaultTimeoutHours: 1,
+      },
+    });
+    const legacyDuplicate = legacyTemplate({ templateID: 'shared-id', names: ['legacy-shared'] });
+
+    const snapshots = await Promise.all([
+      catalogWithResponse([explicit, legacyDuplicate]).catalog.load(),
+      catalogWithResponse([legacyDuplicate, explicit]).catalog.load(),
+    ]);
+
+    for (const snapshot of snapshots) {
+      expect(snapshot.templates).toEqual([{
+        templateId: 'shared-id',
+        name: 'shared',
+        aliases: ['code'],
+        description: 'Diagnostic sandbox',
+        envType: 'code',
+        runtimeRole: 'sandbox-diag',
+        image: 'diag:latest',
+        defaultTimeoutMs: 3_600_000,
+      }]);
+    }
   });
 
   it('computes the same fingerprint for canonical entries in a different order', async () => {

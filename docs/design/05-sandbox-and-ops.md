@@ -114,6 +114,11 @@ Profile `id` 是稳定 selector 和资源 key 的组成部分，`name` 是显示
 
 ordinary code sandbox 用于代码与命令执行。默认 profile 是 `sandbox-reader`、非 privileged。可选用户主目录挂载只适用于非 AIOS 配置，并需经过路径规范化；非法 home path 会被拒绝或跳过。带 volume 的 Sandbox 不进入 warm pool，因为 volume 必须在创建时生效。
 
+AIOS catalog 兼容原生 E2B 模板结构：ready 模板缺少 `aios` 扩展时，只按
+`envType=code`、`runtimeRole=sandbox-reader`、非 privileged 的最小权限 profile 接入，且不从
+名称或 alias 猜测 browser/diagnostics 能力。若响应显式提供 `aios`，该对象仍需通过严格校验；
+畸形扩展不会回退为普通用户可见模板。
+
 Sandbox 内可运行命令并不授予平台权限：`kubectl` 工具还要通过 AIoP policy、RBAC 与集群 registry。文件导出和 Skill 同步使用受控路径、大小及凭据注入边界。
 
 ### 5.3 browser sandbox
