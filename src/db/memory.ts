@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { Msg } from '../llm/types.js';
 import { estimateTokens } from '../llm/context.js';
 import type { AuditEvent } from '../audit/sink.js';
@@ -26,15 +27,16 @@ import type {
   ScheduledTask,
   ScheduledTaskInput,
   ScheduledTaskPatch,
+  ScheduledExecution,
+  ManualFire,
   Store,
-  TaskRun,
   ToolExecutionRecord,
   UserCredentialRecord,
   UserPatch,
   UserWithSecret,
 } from './store.js';
 import { DEFAULT_SESSION_TITLE } from './store.js';
-import { nextRunAt } from '../scheduler/cron.js';
+import { assertValidCron, DEFAULT_SCHEDULER_TIMEZONE, nextRunAt } from '../scheduler/cron.js';
 import { MemoryRunStore } from '@aiop/pi-runtime';
 import type { StoredRun } from '@aiop/pi-runtime';
 import type {
@@ -59,6 +61,10 @@ interface SessionRow {
   updatedAt: Date;
 }
 
+function manualFireId(taskId: number, idempotencyKey: string): string {
+  return `manual:${taskId}:${createHash('sha256').update(idempotencyKey).digest('hex')}`;
+}
+
 function summarize(text: string | undefined, max = 48): string {
   if (!text) return '';
   const compact = text.replace(/\s+/g, ' ').trim();
@@ -76,7 +82,8 @@ export class MemoryStore implements Store {
   private sessions = new Map<string, SessionRow>();
   private audit: AuditEvent[] = [];
   private tasks = new Map<number, ScheduledTask>();
-  private runs: TaskRun[] = [];
+  private deletedTasks = new Map<number, ScheduledTask>();
+  private manualFires = new Map<string, ManualFire & { taskId: number; createdAt: Date; updatedAt: Date }>();
   private tenants = new Map<string, Tenant>();
   private users = new Map<string, UserWithSecret>(); // key: tenantId/username
   private credentials = new Map<string, UserCredentialRecord>(); // key: tenantId/userId/provider
@@ -88,7 +95,6 @@ export class MemoryStore implements Store {
   private agentRunBindings = new Map<string, AgentRunRecord>();
   private agentRunEvents: AgentRunEvent[] = [];
   private taskSeq = 0;
-  private runSeq = 0;
   private agentRunEventSeq = 0;
   private userSeq = 0;
 
@@ -550,6 +556,8 @@ export class MemoryStore implements Store {
   }
 
   async createScheduledTask(ctx: RequestContext, input: ScheduledTaskInput): Promise<ScheduledTask> {
+    const timezone = input.timezone ?? DEFAULT_SCHEDULER_TIMEZONE;
+    assertValidCron(input.cron, timezone);
     const id = ++this.taskSeq;
     const task: ScheduledTask = {
       id,
@@ -557,11 +565,12 @@ export class MemoryStore implements Store {
       userId: ctx.userId,
       sessionId: input.sessionId,
       cron: input.cron,
+      timezone,
       title: input.title ?? '',
       task: input.task,
       preApproved: input.preApproved ?? false,
       enabled: input.enabled ?? true,
-      nextRunAt: nextRunAt(input.cron, new Date()),
+      nextRunAt: nextRunAt(input.cron, new Date(), timezone),
     };
     this.tasks.set(id, task);
     return { ...task };
@@ -587,13 +596,17 @@ export class MemoryStore implements Store {
   async updateScheduledTask(ctx: RequestContext, id: number, patch: ScheduledTaskPatch): Promise<ScheduledTask | undefined> {
     const t = this.tasks.get(id);
     if (!t || !this.canSeeTask(ctx, t)) return undefined;
+    const timezone = patch.timezone ?? t.timezone;
+    const cron = patch.cron ?? t.cron;
+    assertValidCron(cron, timezone);
     if (patch.title !== undefined) t.title = patch.title;
     if (patch.task !== undefined) t.task = patch.task;
     if (patch.preApproved !== undefined) t.preApproved = patch.preApproved;
     if (patch.enabled !== undefined) t.enabled = patch.enabled;
-    if (patch.cron !== undefined && patch.cron !== t.cron) {
-      t.cron = patch.cron;
-      t.nextRunAt = nextRunAt(patch.cron, new Date());
+    if (patch.cron !== undefined) t.cron = patch.cron;
+    if (patch.timezone !== undefined) t.timezone = patch.timezone;
+    if (patch.cron !== undefined || patch.timezone !== undefined) {
+      t.nextRunAt = nextRunAt(cron, new Date(), timezone);
     }
     return { ...t };
   }
@@ -602,44 +615,48 @@ export class MemoryStore implements Store {
     const t = this.tasks.get(id);
     if (!t || !this.canSeeTask(ctx, t)) return false;
     this.tasks.delete(id);
-    this.runs = this.runs.filter((r) => r.taskId !== id);
+    this.deletedTasks.set(id, { ...t });
     return true;
   }
 
-  async setTaskEnabled(ctx: RequestContext, id: number, enabled: boolean): Promise<void> {
+  async setTaskEnabled(ctx: RequestContext, id: number, enabled: boolean): Promise<boolean> {
     const t = this.tasks.get(id);
-    if (t && this.canSeeTask(ctx, t)) t.enabled = enabled;
+    if (!t || !this.canSeeTask(ctx, t)) return false;
+    t.enabled = enabled;
+    return true;
   }
 
-  // 单进程内 JS 单线程：select→推进之间无 await，天然原子，并发 tick 不会重复领取。
-  async claimDueTasks(now: Date, limit: number): Promise<ScheduledTask[]> {
-    const due = [...this.tasks.values()]
-      .filter((t) => t.enabled && t.nextRunAt.getTime() <= now.getTime())
-      .sort((a, b) => a.nextRunAt.getTime() - b.nextRunAt.getTime())
-      .slice(0, limit);
-    const claimed = due.map((t) => ({ ...t }));
-    for (const t of due) {
-      t.lastRunAt = now;
-      t.nextRunAt = nextRunAt(t.cron, now);
-    }
-    return claimed;
+  async createManualFire(
+    ctx: RequestContext,
+    taskId: number,
+    idempotencyKey: string,
+    now = new Date(),
+  ): Promise<ManualFire | undefined> {
+    const task = this.tasks.get(taskId);
+    if (!task || !this.canSeeTask(ctx, task)) return undefined;
+    const key = `${ctx.tenantId}/${taskId}/${idempotencyKey}`;
+    const existing = this.manualFires.get(key);
+    if (existing) return { ...existing, replayed: true };
+    const fireId = manualFireId(taskId, idempotencyKey);
+    const fire: ManualFire & { taskId: number; createdAt: Date; updatedAt: Date } = {
+      fireId, runId: fireId, state: 'pending', replayed: false, taskId,
+      createdAt: new Date(now), updatedAt: new Date(now),
+    };
+    this.manualFires.set(key, fire);
+    return { ...fire };
   }
 
-  async recordTaskRun(run: TaskRun): Promise<void> {
-    this.runs.push({
-      ...run,
-      id: run.id ?? ++this.runSeq,
-      createdAt: run.createdAt ?? new Date(),
-    });
-  }
-
-  async listTaskRuns(ctx: RequestContext, taskId: number): Promise<TaskRun[]> {
-    const t = this.tasks.get(taskId);
-    if (!t || !this.canSeeTask(ctx, t)) return [];
-    return this.runs
-      .filter((r) => r.taskId === taskId)
-      .sort((a, b) => (b.id ?? 0) - (a.id ?? 0))
-      .map((r) => ({ ...r }));
+  async listScheduledExecutions(ctx: RequestContext, taskId: number): Promise<ScheduledExecution[]> {
+    const task = this.tasks.get(taskId) ?? this.deletedTasks.get(taskId);
+    if (!task || !this.canSeeTask(ctx, task)) return [];
+    return [...this.manualFires.values()]
+      .filter((fire) => fire.taskId === taskId)
+      .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime())
+      .map((fire) => ({
+        fireId: fire.fireId, runId: fire.runId, triggerKind: 'manual', fireTime: new Date(fire.createdAt),
+        fireState: fire.state, attempts: 0, createdAt: new Date(fire.createdAt), updatedAt: new Date(fire.updatedAt),
+        run: null,
+      }));
   }
 
   async createTenant(tenant: Tenant): Promise<void> {
@@ -790,8 +807,8 @@ export class MemoryStore implements Store {
     this.sessions.clear();
     this.audit = [];
     this.tasks.clear();
-    this.runs = [];
-    this.runSeq = 0;
+    this.deletedTasks.clear();
+    this.manualFires.clear();
     this.tenants.clear();
     this.users.clear();
     this.credentials.clear();

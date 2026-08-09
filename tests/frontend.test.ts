@@ -72,6 +72,24 @@ describe('React frontend stack', () => {
     expect(app).toContain("window.addEventListener('popstate', handlePopState)");
     expect(app).toContain("window.history.pushState({}, '', pageUrl(next))");
   });
+
+  it('uses the backend product contract for pending skill imports', async () => {
+    const types = await readFile('web/src/types.ts', 'utf8');
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(types).toMatch(/interface SkillsImportBody\s*{[\s\S]*product: ToolSummary;[\s\S]*pendingReview: boolean;/);
+    expect(types).not.toContain('skill: ToolSummary;');
+    expect(app).toContain('body.product.name');
+    expect(app).toContain('等待管理员审核');
+    expect(app).not.toContain('setSelectedName(body.product.name)');
+  });
+
+  it('shows the persisted timezone in the schedule detail summary', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(app).toContain("{selectedTask.timezone || 'UTC'}");
+    expect(app).not.toContain('{humanizeCron(selectedTask.cron)}，UTC）');
+  });
 });
 
 describe('frontend container proxy', () => {
@@ -126,14 +144,14 @@ describe('frontend API wiring', () => {
     const css = await readFile('web/src/index.css', 'utf8');
     const types = await readFile('web/src/types.ts', 'utf8');
 
-    expect(types).toContain('export interface TaskRun');
+    expect(types).toContain('export interface ScheduledExecution');
     expect(types).toContain('export interface ScheduleRunsBody');
-    expect(app).toContain('useState<TaskRun[]>([])');
+    expect(app).toContain('useState<ScheduledExecution[]>([])');
     expect(app).toContain('<SchedulePage tasks={tasks} api={api} onChanged={() => void loadPageData(\'schedule\')} onRequestConfirm={requestConfirmDialog} />');
     expect(app).toContain('selectedTaskId');
     expect(app).toContain('selectedRunId');
     expect(app).toContain('setSelectedTaskId(task.id)');
-    expect(app).toContain('setSelectedRunId(run.id)');
+    expect(app).toContain('setSelectedRunId(run.fireId)');
     expect(app).toContain('className="schedule-task-cell"');
     expect(app).toContain('<TabsTrigger value="runs">执行记录</TabsTrigger>');
     expect(app).toContain('title="执行记录详情"');
@@ -1069,18 +1087,15 @@ describe('frontend data APIs', () => {
     const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
     await store.appendMessage(ctx, 'sess-a', { role: 'user', text: '检查 Pod 异常' });
     await store.appendMessage(ctx, 'sess-a', { role: 'assistant', text: '发现 OOMKilled' });
-    await store.createScheduledTask(ctx, {
+    const scheduledTask = await store.createScheduledTask(ctx, {
       sessionId: 'sess-a',
       cron: '0 2 * * *',
       task: '每日巡检 aiop 命名空间',
       enabled: true,
     });
-    await store.recordTaskRun({
-      taskId: 1,
-      status: 'success',
-      detail: '巡检完成：所有 Pod 正常',
-      steps: 3,
-    });
+    await store.createManualFire(
+      ctx, scheduledTask.id, 'frontend-data-api-pending', new Date('2026-08-08T02:00:00.000Z'),
+    );
 
     const tools = new ToolRegistry();
     tools.register({
@@ -1145,20 +1160,35 @@ describe('frontend data APIs', () => {
       const schedule = await getJson<{ tasks: Array<{ id: number }> }>(`${base}/v1/schedule`, authed);
       expect(schedule.tasks).toHaveLength(1);
 
-      const runs = await getJson<{ runs: Array<{ id: number; taskId: number; status: string; detail: string; steps: number; createdAt: string }> }>(
-        `${base}/v1/schedule/${schedule.tasks[0]!.id}/runs`,
-        authed,
-      );
-      expect(runs.runs).toEqual([
-        expect.objectContaining({
-          id: 1,
-          taskId: schedule.tasks[0]!.id,
-          status: 'success',
-          detail: '巡检完成：所有 Pod 正常',
-          steps: 3,
-        }),
-      ]);
-      expect(new Date(runs.runs[0]!.createdAt).getTime()).not.toBeNaN();
+      const runs = await getJson<{ runs: Array<{
+        fireId: string;
+        runId: string;
+        triggerKind: string;
+        fireTime: string;
+        fireState: string;
+        attempts: number;
+        createdAt: string;
+        updatedAt: string;
+        run: null | {
+          status: string;
+          startedAt?: string;
+          completedAt?: string;
+          errorMessage?: string;
+          stepCount: number;
+          usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; costUsd?: number };
+        };
+      }> }>(`${base}/v1/schedule/${schedule.tasks[0]!.id}/runs`, authed);
+      expect(runs.runs).toHaveLength(1);
+      expect(runs.runs[0]).toMatchObject({
+        fireId: expect.stringContaining(`manual:${schedule.tasks[0]!.id}:`),
+        runId: expect.stringContaining(`manual:${schedule.tasks[0]!.id}:`),
+        triggerKind: 'manual', fireState: 'pending', attempts: 0, run: null,
+      });
+      for (const execution of runs.runs) {
+        expect(new Date(execution.fireTime).getTime()).not.toBeNaN();
+        expect(new Date(execution.createdAt).getTime()).not.toBeNaN();
+        expect(new Date(execution.updatedAt).getTime()).not.toBeNaN();
+      }
 
       const sandboxes = await getJson<{ sandboxes: Array<{ id: string; status: string; actions: string[] }>; profiles: unknown[] }>(
         `${base}/v1/sandboxes`,

@@ -50,30 +50,14 @@ export interface ScheduledTasksTable {
   session_id: string;
   title: string;
   cron: string;
+  timezone: string;
   task: string;
   pre_approved: number;
   enabled: number;
+  deleted_at: Date | null;
   next_run_at: Date;
   last_run_at: Date | null;
   created_at: Generated<Date>;
-}
-
-export interface TaskRunsTable {
-  id: Generated<number>;
-  task_id: number;
-  fire_id: Generated<string | null>;
-  run_id: Generated<string | null>;
-  status: string;
-  detail: string | null;
-  steps: number | null;
-  created_at: Generated<Date>;
-}
-
-export interface TaskAgentRunsTable {
-  tenant_id: string;
-  task_id: number;
-  run_id: string;
-  created_at: Date;
 }
 
 export interface SchedulerFiresTable {
@@ -84,6 +68,8 @@ export interface SchedulerFiresTable {
   session_id: string;
   fire_time: Date;
   input_json: JsonColumn;
+  trigger_kind: string;
+  idempotency_key: string | null;
   state: string;
   attempts: number;
   run_id: string | null;
@@ -326,8 +312,6 @@ export interface Database {
   messages: MessagesTable;
   audit_events: AuditEventsTable;
   scheduled_tasks: ScheduledTasksTable;
-  task_runs: TaskRunsTable;
-  task_agent_runs: TaskAgentRunsTable;
   scheduler_fires: SchedulerFiresTable;
   tenants: TenantsTable;
   users: UsersTable;

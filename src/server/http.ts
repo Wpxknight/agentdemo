@@ -21,8 +21,7 @@ import { createTenant, createUser, listTenants } from '../auth/admin.js';
 import type { RequestContext, Role } from '../auth/types.js';
 import { DEFAULT_TASK_MAX_RUN_MS, type SandboxSettings, type ScheduledTaskPatch } from '../db/store.js';
 import { normalizeUserHomeDir } from '@aiop/sandbox-runtime';
-import { isValidCron } from '../scheduler/cron.js';
-import { createScheduledTaskRunner } from '../scheduler/runner.js';
+import { DEFAULT_SCHEDULER_TIMEZONE, isValidCron, isValidTimezone } from '../scheduler/cron.js';
 import { createModel } from '../llm/factory.js';
 import type { JsonValue, Msg, ToolCall } from '../llm/types.js';
 import { importSkillZip, MAX_SKILL_ZIP_BYTES } from '../skill/import.js';
@@ -60,7 +59,6 @@ type CompactionWatermarks = Map<string, number>;
 
 const OIDC_COOKIE = 'aiop_oidc';
 /** 手动“立即执行”的任务 id 去重（本进程内），防止连点重复触发。 */
-const runningManualTasks = new Set<number>();
 const RUN_TERMINATED_MESSAGE = '会话运行已终止';
 /** 10MB zip 的 base64 加 JSON 包装；该路由不继承通用大请求攻击面。 */
 const SKILL_IMPORT_MAX_BODY = Math.ceil(MAX_SKILL_ZIP_BYTES * 4 / 3) + 64_000;
@@ -1871,27 +1869,31 @@ async function handle(
     const body = await readJson(req);
     const sessionId = sessionIdFromBody(body);
     const cron = str(body, 'cron');
+    const timezone = str(body, 'timezone') ?? DEFAULT_SCHEDULER_TIMEZONE;
     const task = str(body, 'task');
     if (!cron || !task) throw new HttpError(400, 'cron/task 必填');
+    if (!isValidTimezone(timezone)) throw new HttpError(400, `非法 IANA 时区: ${timezone}`);
+    if (!isValidCron(cron, timezone)) throw new HttpError(400, `非法 cron 表达式: ${cron}`);
     const title = str(body, 'title')?.trim() ?? '';
     const preApproved = body.preApproved === true;
     if (preApproved) requirePermission(ctx, 'approve'); // 预批准属审批权
     const created = await rt.store.createScheduledTask(ctx, {
-      sessionId, cron, title, task, preApproved, enabled: body.enabled !== false,
+      sessionId, cron, timezone, title, task, preApproved, enabled: body.enabled !== false,
     });
     return sendJson(res, 201, { task: created });
   }
   const schedRunsMatch = /^\/v1\/schedule\/(\d+)\/runs$/.exec(path);
   if (method === 'GET' && schedRunsMatch) {
     const ctx = await requireAuth(rt, req);
-    const runs = await rt.store.listTaskRuns(ctx, Number(schedRunsMatch[1]));
+    const runs = await rt.store.listScheduledExecutions(ctx, Number(schedRunsMatch[1]));
     return sendJson(res, 200, { runs });
   }
   const schedMatch = /^\/v1\/schedule\/(\d+)\/(enable|disable)$/.exec(path);
   if (method === 'POST' && schedMatch) {
     const ctx = await requireAuth(rt, req);
     requirePermission(ctx, 'task:create');
-    await rt.store.setTaskEnabled(ctx, Number(schedMatch[1]), schedMatch[2] === 'enable');
+    const changed = await rt.store.setTaskEnabled(ctx, Number(schedMatch[1]), schedMatch[2] === 'enable');
+    if (!changed) throw new HttpError(404, '定时任务不存在');
     return sendJson(res, 200, { ok: true });
   }
   const schedUpdateMatch = /^\/v1\/schedule\/(\d+)$/.exec(path);
@@ -1901,8 +1903,15 @@ async function handle(
     const body = await readJson(req);
     const patch: ScheduledTaskPatch = {};
     const cron = str(body, 'cron');
+    const timezone = str(body, 'timezone');
+    if (timezone !== undefined) {
+      if (!isValidTimezone(timezone)) throw new HttpError(400, `非法 IANA 时区: ${timezone}`);
+      patch.timezone = timezone;
+    }
     if (cron !== undefined) {
-      if (!isValidCron(cron)) throw new HttpError(400, `非法 cron 表达式: ${cron}`);
+      if (!isValidCron(cron, timezone ?? DEFAULT_SCHEDULER_TIMEZONE)) {
+        throw new HttpError(400, `非法 cron 表达式: ${cron}`);
+      }
       patch.cron = cron;
     }
     const task = str(body, 'task');
@@ -1921,7 +1930,7 @@ async function handle(
       if (typeof body.enabled !== 'boolean') throw new HttpError(400, 'enabled 必须是布尔值');
       patch.enabled = body.enabled;
     }
-    if (!Object.keys(patch).length) throw new HttpError(400, '没有可更新的字段（cron/title/task/preApproved/enabled）');
+    if (!Object.keys(patch).length) throw new HttpError(400, '没有可更新的字段（cron/timezone/title/task/preApproved/enabled）');
     const updated = await rt.store.updateScheduledTask(ctx, Number(schedUpdateMatch[1]), patch);
     if (!updated) throw new HttpError(404, '定时任务不存在');
     return sendJson(res, 200, { task: updated });
@@ -1938,18 +1947,13 @@ async function handle(
     const ctx = await requireAuth(rt, req);
     requirePermission(ctx, 'task:create');
     const id = Number(schedRunNowMatch[1]);
-    const task = await rt.store.getScheduledTask(ctx, id);
-    if (!task) throw new HttpError(404, '定时任务不存在');
-    if (runningManualTasks.has(id)) throw new HttpError(409, '该任务正在手动执行中');
-    // 异步执行（任务可能跑很久），结果照常写入 task_runs；前端轮询执行记录即可。
-    runningManualTasks.add(id);
-    const runner = createScheduledTaskRunner(rt);
-    void runner(task)
-      .then((result) => rt.store.recordTaskRun({ taskId: id, ...result }))
-      .catch((err) => rt.store.recordTaskRun({ taskId: id, status: 'error', detail: String(err) }))
-      .catch((err) => log.error({ taskId: id, err: String(err) }, '手动执行记录失败'))
-      .finally(() => runningManualTasks.delete(id));
-    return sendJson(res, 202, { ok: true, taskId: id, started: true });
+    const idempotencyKey = req.headers['idempotency-key']?.toString().trim();
+    if (!idempotencyKey) throw new HttpError(400, 'Idempotency-Key 必填');
+    if (idempotencyKey.length > 128) throw new HttpError(400, 'Idempotency-Key 不能超过 128 个字符');
+    const fire = await rt.store.createManualFire(ctx, id, idempotencyKey);
+    if (!fire) throw new HttpError(404, '定时任务不存在');
+    if (!fire.replayed) rt.requestSchedulerTick?.();
+    return sendJson(res, 202, { ok: true, taskId: id, ...fire });
   }
 
   // —— 审计 ——

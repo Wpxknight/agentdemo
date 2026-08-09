@@ -2,7 +2,7 @@ import type { JsonValue, ToolResult } from '../llm/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import { reqContext } from '../agent/tools.js';
 import type { Store } from '../db/store.js';
-import { isValidCron } from '../scheduler/cron.js';
+import { DEFAULT_SCHEDULER_TIMEZONE, isValidCron, isValidTimezone } from '../scheduler/cron.js';
 import { can } from '../auth/rbac.js';
 
 function asObject(args: JsonValue): Record<string, JsonValue> {
@@ -24,6 +24,7 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
           type: 'object',
           properties: {
             cron: { type: 'string', description: '标准 5 段 cron 表达式，如 "0 1 * * *"' },
+            timezone: { type: 'string', description: 'IANA 时区，如 "Asia/Shanghai"；默认 UTC' },
             title: { type: 'string', description: '任务标题（列表展示用的简短名称，如"每日集群巡检"）' },
             task: { type: 'string', description: '到点要执行的任务描述（自然语言）' },
             preApproved: { type: 'boolean', description: '无人值守预批准（默认 false）' },
@@ -33,9 +34,11 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
       async execute(args, ctx: ToolContext): Promise<ToolResult> {
         const o = asObject(args);
         const cron = typeof o.cron === 'string' ? o.cron : '';
+        const timezone = typeof o.timezone === 'string' ? o.timezone : DEFAULT_SCHEDULER_TIMEZONE;
         const task = typeof o.task === 'string' ? o.task : '';
         if (!cron || !task) return { id: '', content: 'cron 与 task 均必填', isError: true };
-        if (!isValidCron(cron)) return { id: '', content: `非法 cron 表达式: ${cron}`, isError: true };
+        if (!isValidTimezone(timezone)) return { id: '', content: `非法 IANA 时区: ${timezone}`, isError: true };
+        if (!isValidCron(cron, timezone)) return { id: '', content: `非法 cron 表达式: ${cron}`, isError: true };
 
         const rc = reqContext(ctx);
         const preApproved = o.preApproved === true;
@@ -47,6 +50,7 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
         const created = await store.createScheduledTask(rc, {
           sessionId: ctx.sessionId,
           cron,
+          timezone,
           title,
           task,
           preApproved,
@@ -85,7 +89,9 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
         const o = asObject(args);
         const id = typeof o.id === 'number' ? o.id : Number(o.id);
         if (!Number.isInteger(id)) return { id: '', content: 'id 必须是整数', isError: true };
-        await store.setTaskEnabled(reqContext(ctx), id, false);
+        if (!await store.setTaskEnabled(reqContext(ctx), id, false)) {
+          return { id: '', content: `定时任务 #${id} 不存在`, isError: true };
+        }
         return { id: '', content: `已停用定时任务 #${id}` };
       },
     }),
@@ -98,6 +104,7 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
           properties: {
             id: { type: 'number', description: '任务 id' },
             cron: { type: 'string', description: '新的 5 段 cron 表达式' },
+            timezone: { type: 'string', description: '新的 IANA 时区，如 "America/New_York"' },
             title: { type: 'string', description: '新的任务标题' },
             task: { type: 'string', description: '新的任务描述' },
             enabled: { type: 'boolean', description: '启用/停用' },
@@ -111,9 +118,15 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
         if (!Number.isInteger(id)) return { id: '', content: 'id 必须是整数', isError: true };
 
         const rc = reqContext(ctx);
-        const patch: { cron?: string; title?: string; task?: string; enabled?: boolean; preApproved?: boolean } = {};
+        const patch: { cron?: string; timezone?: string; title?: string; task?: string; enabled?: boolean; preApproved?: boolean } = {};
+        if (typeof o.timezone === 'string') {
+          if (!isValidTimezone(o.timezone)) return { id: '', content: `非法 IANA 时区: ${o.timezone}`, isError: true };
+          patch.timezone = o.timezone;
+        }
         if (typeof o.cron === 'string') {
-          if (!isValidCron(o.cron)) return { id: '', content: `非法 cron 表达式: ${o.cron}`, isError: true };
+          if (!isValidCron(o.cron, patch.timezone ?? DEFAULT_SCHEDULER_TIMEZONE)) {
+            return { id: '', content: `非法 cron 表达式: ${o.cron}`, isError: true };
+          }
           patch.cron = o.cron;
         }
         if (typeof o.title === 'string') patch.title = o.title.trim();
@@ -150,7 +163,7 @@ export function buildScheduleTools(store: Store): ToolHandler[] {
         if (!Number.isInteger(id)) return { id: '', content: 'id 必须是整数', isError: true };
         const ok = await store.deleteScheduledTask(reqContext(ctx), id);
         if (!ok) return { id: '', content: `定时任务 #${id} 不存在`, isError: true };
-        return { id: '', content: `已删除定时任务 #${id} 及其执行记录` };
+        return { id: '', content: `已删除定时任务 #${id}；执行记录已保留` };
       },
     }),
   ];

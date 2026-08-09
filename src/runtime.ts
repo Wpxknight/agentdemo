@@ -200,6 +200,8 @@ export interface Runtime {
   jwtSecret: string;
   /** 无认证（CLI）场景的默认身份。 */
   defaultContext: RequestContext;
+  /** 请求 Scheduler 尽快处理已持久化的 Fire；未启用嵌入式 Worker 时不存在。 */
+  requestSchedulerTick?(): void;
   dispose(): Promise<void>;
 }
 

@@ -247,14 +247,16 @@ CREATE TABLE `scheduled_tasks` (
   `session_id` varchar(128) NOT NULL,
   `title` varchar(200) NOT NULL DEFAULT '',
   `cron` varchar(128) NOT NULL,
+  `timezone` varchar(64) NOT NULL DEFAULT 'UTC',
   `task` text NOT NULL,
   `pre_approved` tinyint(1) NOT NULL DEFAULT '0',
   `enabled` tinyint(1) NOT NULL DEFAULT '1',
+  `deleted_at` datetime(3) DEFAULT NULL,
   `next_run_at` timestamp NOT NULL,
   `last_run_at` timestamp NULL DEFAULT NULL,
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
-  KEY `idx_due` (`enabled`,`next_run_at`),
+  KEY `idx_due` (`enabled`,`deleted_at`,`next_run_at`),
   KEY `idx_tenant` (`tenant_id`,`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -266,6 +268,8 @@ CREATE TABLE `scheduler_fires` (
   `session_id` varchar(128) NOT NULL,
   `fire_time` datetime(3) NOT NULL,
   `input_json` json NOT NULL,
+  `trigger_kind` varchar(16) NOT NULL DEFAULT 'cron',
+  `idempotency_key` varchar(128) DEFAULT NULL,
   `state` varchar(16) NOT NULL,
   `attempts` int NOT NULL DEFAULT '0',
   `run_id` varchar(128) DEFAULT NULL,
@@ -280,7 +284,10 @@ CREATE TABLE `scheduler_fires` (
   KEY `idx_scheduler_fires_claim` (`state`,`retry_at`,`fire_time`),
   KEY `idx_scheduler_fires_lease` (`state`,`lease_expires_at`),
   KEY `idx_scheduler_fires_task` (`tenant_id`,`task_id`,`fire_time`),
-  KEY `idx_scheduler_fires_run` (`tenant_id`,`run_id`)
+  KEY `idx_scheduler_fires_run` (`tenant_id`,`run_id`),
+  KEY `idx_scheduler_fires_task_history` (`tenant_id`,`task_id`,`fire_time`,`fire_id`),
+  KEY `idx_scheduler_fires_retention` (`state`,`updated_at`),
+  UNIQUE KEY `uq_scheduler_fires_manual_idempotency` (`tenant_id`,`task_id`,`trigger_kind`,`idempotency_key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `sessions` (
@@ -302,29 +309,6 @@ CREATE TABLE `setting_secrets` (
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`tenant_id`,`setting_key`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE `task_agent_runs` (
-  `tenant_id` varchar(64) NOT NULL,
-  `task_id` bigint NOT NULL,
-  `run_id` varchar(128) NOT NULL,
-  `created_at` datetime(3) NOT NULL,
-  PRIMARY KEY (`tenant_id`,`task_id`,`run_id`),
-  KEY `idx_task_agent_runs_run` (`tenant_id`,`run_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE `task_runs` (
-  `id` bigint NOT NULL AUTO_INCREMENT,
-  `task_id` bigint NOT NULL,
-  `fire_id` varchar(255) DEFAULT NULL,
-  `run_id` varchar(128) DEFAULT NULL,
-  `status` varchar(16) NOT NULL,
-  `detail` text,
-  `steps` int DEFAULT NULL,
-  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uniq_task_runs_fire` (`fire_id`),
-  KEY `idx_runs_task` (`task_id`,`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `tenant_settings` (

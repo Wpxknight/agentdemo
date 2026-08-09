@@ -7,7 +7,7 @@ describe('runtime refactor staging rollout source boundary', () => {
   it('builds immutable backend and web images from the current commit', async () => {
     const makefile = await readFile(new URL('Makefile', root), 'utf8');
 
-    expect(makefile).toContain('IMAGE_TAG ?= $(shell git rev-parse --short HEAD)');
+    expect(makefile).toContain('IMAGE_TAG := $(shell git rev-parse --short HEAD)-w4-$(shell date +%Y%m%d%H%M%S)');
     expect(makefile).toContain('IMAGE ?= aiop:$(IMAGE_TAG)');
     expect(makefile).toContain('WEB_IMAGE ?= aiop-web:$(IMAGE_TAG)');
     expect(makefile).toContain('docker build -t $(IMAGE) .');

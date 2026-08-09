@@ -241,6 +241,8 @@ export interface AuditFilter {
 export interface ScheduledTaskInput {
   sessionId: string;
   cron: string;
+  /** IANA 时区；缺省为 UTC。 */
+  timezone?: string;
   /** 列表展示用的简短标题（可空，展示层回退到 task）。 */
   title?: string;
   /** 触发时下发给 agent 的任务描述（自然语言）。 */
@@ -256,6 +258,7 @@ export interface ScheduledTask {
   userId: string;
   sessionId: string;
   cron: string;
+  timezone: string;
   title: string;
   task: string;
   preApproved: boolean;
@@ -267,19 +270,34 @@ export interface ScheduledTask {
 /** 更新定时任务的可改字段（cron 变更时实现方需重算 nextRunAt）。 */
 export interface ScheduledTaskPatch {
   cron?: string;
+  /** IANA 时区；与 cron 一同决定下次执行时间。 */
+  timezone?: string;
   title?: string;
   task?: string;
   preApproved?: boolean;
   enabled?: boolean;
 }
 
-export interface TaskRun {
-  id?: number;
-  taskId: number;
-  status: 'success' | 'error';
-  detail?: string;
-  steps?: number;
-  createdAt?: Date;
+export type SchedulerTriggerKind = 'cron' | 'manual';
+
+export interface ScheduledExecution {
+  fireId: string;
+  runId: string;
+  triggerKind: SchedulerTriggerKind;
+  fireTime: Date;
+  fireState: 'pending' | 'claimed' | 'bound' | 'recovering' | 'completed';
+  attempts: number;
+  lastError?: string;
+  createdAt: Date;
+  updatedAt: Date;
+  run?: Pick<AgentRunRecord, 'status' | 'startedAt' | 'completedAt' | 'errorMessage' | 'stepCount' | 'usage'> | null;
+}
+
+export interface ManualFire {
+  fireId: string;
+  runId: string;
+  state: ScheduledExecution['fireState'];
+  replayed: boolean;
 }
 
 export interface SessionSummary {
@@ -323,7 +341,7 @@ export interface UserCredentialRecord {
 }
 
 /**
- * 持久化抽象。除系统级方法（claimDueTasks/recordTaskRun/租户用户管理）外，
+ * 持久化抽象。除系统级调度、租户和用户管理方法外，
  * 业务读写均需 RequestContext 并按 tenantId 强制过滤，实现租户隔离。
  */
 export interface Store extends AuditSink {
@@ -384,13 +402,14 @@ export interface Store extends AuditSink {
   getScheduledTask(ctx: RequestContext, id: number): Promise<ScheduledTask | undefined>;
   /** 局部更新；cron 变更时重算 nextRunAt。任务不存在（或跨租户）返回 undefined。 */
   updateScheduledTask(ctx: RequestContext, id: number, patch: ScheduledTaskPatch): Promise<ScheduledTask | undefined>;
-  /** 删除任务及其全部执行记录。返回是否存在。 */
+  /** 软删除任务；保留既有执行记录。返回是否存在。 */
   deleteScheduledTask(ctx: RequestContext, id: number): Promise<boolean>;
-  setTaskEnabled(ctx: RequestContext, id: number, enabled: boolean): Promise<void>;
-  /** 系统级：原子领取到点任务（跨租户），返回任务含 tenantId/userId 供执行构造 ctx。 */
-  claimDueTasks(now: Date, limit: number): Promise<ScheduledTask[]>;
-  recordTaskRun(run: TaskRun): Promise<void>;
-  listTaskRuns(ctx: RequestContext, taskId: number): Promise<TaskRun[]>;
+  /** 变更任务启停状态；任务不存在（或无权限）返回 false。 */
+  setTaskEnabled(ctx: RequestContext, id: number, enabled: boolean): Promise<boolean>;
+  /** 为手动请求持久化 Fire；同一任务和幂等键始终返回同一 Fire。 */
+  createManualFire(ctx: RequestContext, taskId: number, idempotencyKey: string, now?: Date): Promise<ManualFire | undefined>;
+  /** 返回任务的 Fire 及其关联 Durable Run；软删除任务仍保留其可授权历史。 */
+  listScheduledExecutions(ctx: RequestContext, taskId: number): Promise<ScheduledExecution[]>;
 
   // —— 租户 / 用户（平台 / 租户管理用；鉴权在 S8）——
   createTenant(tenant: Tenant): Promise<void>;

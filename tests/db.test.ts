@@ -47,14 +47,14 @@ describe('readMysqlConfig', () => {
 });
 
 describe('MysqlStore session summaries', () => {
-  it('uses MariaDB 10.2-compatible row locking for scheduled task claims', async () => {
+  it('uses MariaDB 10.2-compatible row locking for manual Fire creation', async () => {
     const source = await readFile('src/db/mysql.ts', 'utf8');
-    const start = source.indexOf('async claimDueTasks(');
-    const end = source.indexOf('async recordTaskRun(', start);
-    const claimDueTasksSource = source.slice(start, end);
+    const start = source.indexOf('async createManualFire(');
+    const end = source.indexOf('async listScheduledExecutions(', start);
+    const createManualFireSource = source.slice(start, end);
 
-    expect(claimDueTasksSource).toContain('.forUpdate()');
-    expect(claimDueTasksSource).not.toContain('.skipLocked()');
+    expect(createManualFireSource).toContain('.forUpdate()');
+    expect(createManualFireSource).not.toContain('.skipLocked()');
   });
 
   it('sorts wide message rows in application memory instead of MySQL filesort', async () => {
@@ -292,6 +292,85 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlStore (integration)', () =
     expect((await store.listMessages(ctx, sid)).map((m) => m.text)).toEqual(['ping', 'pong']);
     expect(await store.listAudit(ctx, { sessionId: sid })).toHaveLength(1);
     await store.close();
+  });
+
+  it('projects explicit scheduler Fire lifecycle and tenant-scoped Durable Run data', async () => {
+    const store = await createStore(readMysqlConfig());
+    const mysqlStore = store as import('../src/db/mysql.js').MysqlStore;
+    const db = mysqlStore.database();
+    const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const tenantId = `sched-it-${suffix}`;
+    const otherTenantId = `sched-other-${suffix}`;
+    const userId = `user-${suffix}`;
+    const taskId = Number((await db.insertInto('scheduled_tasks').values({
+      tenant_id: tenantId, user_id: userId, session_id: `session-${suffix}`, title: 'projection',
+      cron: '0 1 * * *', timezone: 'UTC', task: 'projection', pre_approved: 0, enabled: 1,
+      deleted_at: null, next_run_at: new Date('2026-08-09T01:00:00.000Z'), last_run_at: null,
+    }).executeTakeFirstOrThrow()).insertId);
+    const pendingAt = new Date('2026-08-08T01:00:00.000Z');
+    const fireAt = new Date('2026-08-08T02:00:00.000Z');
+    const createdAt = new Date('2026-08-08T02:00:01.000Z');
+    const updatedAt = new Date('2026-08-08T02:00:10.000Z');
+    const startedAt = new Date('2026-08-08T02:00:03.000Z');
+    const completedAt = new Date('2026-08-08T02:00:09.000Z');
+    const runId = `run-${suffix}`;
+    const pendingFireId = `pending-${suffix}`;
+    const completedFireId = `completed-${suffix}`;
+
+    try {
+      await db.insertInto('scheduler_fires').values([{
+        fire_id: pendingFireId, task_id: taskId, tenant_id: tenantId, actor_id: userId,
+        session_id: `session-${suffix}`, fire_time: pendingAt, input_json: JSON.stringify([]),
+        trigger_kind: 'manual', idempotency_key: `pending-${suffix}`, state: 'pending', attempts: 0,
+        run_id: null, claim_token: null, claim_owner: null, lease_expires_at: null, retry_at: null,
+        last_error: null, created_at: pendingAt, updated_at: pendingAt,
+      }, {
+        fire_id: completedFireId, task_id: taskId, tenant_id: tenantId, actor_id: userId,
+        session_id: `session-${suffix}`, fire_time: fireAt, input_json: JSON.stringify([]),
+        trigger_kind: 'cron', idempotency_key: null, state: 'completed', attempts: 4,
+        run_id: runId, claim_token: null, claim_owner: null, lease_expires_at: null, retry_at: null,
+        last_error: 'scheduler retry detail', created_at: createdAt, updated_at: updatedAt,
+      }]).execute();
+      await db.insertInto('agent_runs').values([{
+        tenant_id: tenantId, run_id: runId, user_id: userId, session_id: `session-${suffix}`,
+        kernel: 'pi', kernel_version: 'test', status: 'failed', waiting_reason: null, current_node: null,
+        step_count: 7, input_tokens: 101, output_tokens: 23, cache_read_tokens: 11,
+        cache_creation_tokens: 5, cost_usd: '0.125', limits_json: null, execution_json: null,
+        error_message: 'durable run failed', started_at: startedAt, updated_at: completedAt,
+        completed_at: completedAt, cancel_requested_at: null, lease_owner: null, lease_token: 2,
+        lease_expires_at: null, append_closed_at: completedAt, created_at: createdAt,
+      }, {
+        tenant_id: otherTenantId, run_id: runId, user_id: `other-${userId}`, session_id: `other-${suffix}`,
+        kernel: 'pi', kernel_version: 'test', status: 'succeeded', waiting_reason: null, current_node: null,
+        step_count: 999, input_tokens: 999, output_tokens: 999, cache_read_tokens: 999,
+        cache_creation_tokens: 999, cost_usd: '9.99', limits_json: null, execution_json: null,
+        error_message: null, started_at: startedAt, updated_at: completedAt, completed_at: completedAt,
+        cancel_requested_at: null, lease_owner: null, lease_token: 0, lease_expires_at: null,
+        append_closed_at: completedAt, created_at: createdAt,
+      }]).execute();
+
+      const executions = await store.listScheduledExecutions({ tenantId, userId, role: 'user' }, taskId);
+      expect(executions).toEqual([
+        expect.objectContaining({
+          fireId: completedFireId, runId, triggerKind: 'cron', fireTime: fireAt,
+          fireState: 'completed', attempts: 4, lastError: 'scheduler retry detail',
+          createdAt, updatedAt,
+          run: {
+            status: 'failed', startedAt, completedAt, errorMessage: 'durable run failed', stepCount: 7,
+            usage: { inputTokens: 101, outputTokens: 23, cacheReadTokens: 11, cacheCreationTokens: 5, costUsd: 0.125 },
+          },
+        }),
+        expect.objectContaining({
+          fireId: pendingFireId, runId: pendingFireId, triggerKind: 'manual', fireTime: pendingAt,
+          fireState: 'pending', attempts: 0, createdAt: pendingAt, updatedAt: pendingAt, run: null,
+        }),
+      ]);
+    } finally {
+      await db.deleteFrom('agent_runs').where('run_id', '=', runId).where('tenant_id', 'in', [tenantId, otherTenantId]).execute();
+      await db.deleteFrom('scheduler_fires').where('task_id', '=', taskId).execute();
+      await db.deleteFrom('scheduled_tasks').where('id', '=', taskId).execute();
+      await store.close();
+    }
   });
 });
 

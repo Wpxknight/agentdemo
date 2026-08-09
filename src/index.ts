@@ -10,7 +10,6 @@ import { shouldEmbedScheduler, startRuntimeScheduler } from './scheduler/runner.
 /**
  * 入口：
  *   tsx src/index.ts serve                 → HTTP + SSE 服务（前端 / API 接入）
- *   tsx src/index.ts scheduler             → 常驻调度器，到点执行定时任务
  *   tsx src/index.ts seed-admin <t> <u> <p>→ 引导首个平台管理员
  *   tsx src/index.ts "任务文本"            → 本地单次跑一个 agent 任务（CLI）
  */
@@ -19,7 +18,6 @@ async function main() {
   const argv = process.argv.slice(2);
 
   if (argv[0] === 'serve') return runServer(config);
-  if (argv[0] === 'scheduler') return runScheduler(config);
   if (argv[0] === 'seed-admin') return seedAdmin(config, argv.slice(1));
 
   await runOnce(config, argv.join(' ') || '你好，做个自我介绍。');
@@ -29,7 +27,12 @@ async function main() {
 async function runServer(config: Config) {
   const rt = await buildRuntime(config);
   const scheduler = shouldEmbedScheduler() ? startRuntimeScheduler(rt) : undefined;
-  if (scheduler) logger.info('scheduler embedded in HTTP server');
+  if (scheduler) {
+    rt.requestSchedulerTick = () => {
+      void scheduler.tick().catch((error) => logger.error({ err: String(error) }, 'scheduler wake tick error'));
+    };
+    logger.info('scheduler embedded in HTTP server');
+  }
 
   const server = createHttpServer(rt);
   const port = Number(process.env.PORT ?? 8080);
@@ -73,21 +76,6 @@ async function runOnce(config: Config, task: string) {
     detail: { ...result.usage },
   });
   await rt.dispose();
-}
-
-/** 常驻调度器模式：周期 tick 领取并执行到点定时任务。 */
-async function runScheduler(config: Config) {
-  const rt = await buildRuntime(config);
-  const scheduler = startRuntimeScheduler(rt);
-  logger.info('scheduler running; Ctrl-C to stop');
-
-  const shutdown = async () => {
-    await scheduler.stop();
-    await rt.dispose();
-    process.exit(0);
-  };
-  process.on('SIGINT', () => void shutdown());
-  process.on('SIGTERM', () => void shutdown());
 }
 
 /** 引导首个平台管理员（绕过 RBAC，仅限本地认证 + 运维直接执行）。 */

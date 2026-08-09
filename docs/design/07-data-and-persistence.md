@@ -24,7 +24,7 @@ AIoP 以 MySQL 作为生产持久化前提。未配置 `MYSQL_HOST` 时会回退
 | Product Session Projection | `sessions`、`messages` | 面向产品查询的会话与 committed 消息投影 |
 | Durable Run Control Plane | `agent_runs`、`agent_run_attempts`、`agent_run_events`、`agent_turn_snapshots`、`agent_turn_commits`、`agent_run_inbox_messages`、`agent_interactions`、`agent_tool_executions` | lease/fencing、Turn 接受边界、事件、交互、工具副作用与恢复 |
 | Pi Session Tree | `pi_sessions`、`pi_session_entries` | Pi 树条目、current leaf、committed leaf |
-| Scheduler | `scheduled_tasks`、`scheduler_fires`、`task_runs`、`task_agent_runs` | 产品任务、durable fire、执行结果和 Run 查询关联 |
+| Scheduler | `scheduled_tasks`、`scheduler_fires`、`agent_runs` | 产品任务、durable Fire 与执行历史关联；历史查询以 Fire 左连接 Run 为准 |
 | Audit | `audit_events` | policy、运维和工具等结构化审计事件 |
 
 `agent_turn_snapshots` 已存在于 baseline 与 Kysely schema，但当前未发现运行时写入或读取路径；它是已建模的预留表，不应描述为当前已工作的 Turn snapshot 流程。
@@ -52,10 +52,7 @@ erDiagram
   AGENT_TURN_COMMITS }o--o| PI_SESSIONS : references
 
   SCHEDULED_TASKS ||--o{ SCHEDULER_FIRES : fires
-  SCHEDULED_TASKS ||--o{ TASK_RUNS : records
-  SCHEDULED_TASKS ||--o{ TASK_AGENT_RUNS : links
   SCHEDULER_FIRES }o--o| AGENT_RUNS : binds
-  TASK_AGENT_RUNS }o--|| AGENT_RUNS : references
 
   AUDIT_EVENTS {
     bigint id PK
@@ -114,12 +111,10 @@ baseline 没有声明上述表之间的外键。上述 `status` 列均为 varcha
 
 | 表 | 主键与逻辑关联 | 唯一约束与关键索引 | 状态与生命周期 |
 | --- | --- | --- | --- |
-| `scheduled_tasks` | AUTO PK `id`；绑定 tenant/user/session | due、tenant 索引 | cron、enabled、next/last run、pre-approved |
-| `scheduler_fires` | PK `fire_id`；关联 task，可绑定 run | claim、lease、task、run 索引 | 应用状态精确为 `pending/claimed/bound/recovering/started`；claim/recovery 使用 token、owner、lease、retry/error |
-| `task_runs` | AUTO PK `id`；关联 task/fire/run | unique `fire_id`；task 索引 | 产品执行历史状态、detail、steps |
-| `task_agent_runs` | PK `(tenant_id,task_id,run_id)` | run 反查索引 | task 与 Durable Agent Run 的多次执行关联 |
+| `scheduled_tasks` | AUTO PK `id`；绑定 tenant/user/session | `(enabled,deleted_at,next_run_at)`、tenant 索引 | cron、enabled、`deleted_at`、next/last run、pre-approved |
+| `scheduler_fires` | PK `fire_id`；关联 task，可绑定 run | claim、lease、task/history、tenant/run 及手动幂等索引 | 应用状态精确为 `pending/claimed/bound/recovering/completed`；记录 cron/manual trigger、claim/recovery token、owner、lease、retry/error |
 
-`scheduler_fires.state` 是 varchar，baseline 没有 `CHECK`；五态联合由 scheduler-runtime 合同和条件更新维护。`scheduler_fires.task_id`、`task_runs.task_id` 与 `task_agent_runs.run_id` 都是逻辑关联，没有 baseline 外键。
+`scheduler_fires.state` 是 varchar，baseline 没有 `CHECK`；五态联合由 scheduler-runtime 合同和条件更新维护。`scheduler_fires.task_id` 与 `scheduler_fires.run_id` 都是逻辑关联，没有 baseline 外键。产品 Scheduler 执行历史通过 `scheduler_fires LEFT JOIN agent_runs` 查询，保留未绑定 Run 的 Fire 和软删除任务的授权历史。
 
 ### 4.6 Audit
 

@@ -1,4 +1,6 @@
-IMAGE_TAG ?= $(shell git rev-parse --short HEAD)
+ifeq ($(origin IMAGE_TAG), undefined)
+IMAGE_TAG := $(shell git rev-parse --short HEAD)-w4-$(shell date +%Y%m%d%H%M%S)
+endif
 IMAGE ?= aiop:$(IMAGE_TAG)
 WEB_IMAGE ?= aiop-web:$(IMAGE_TAG)
 IMAGE_PREFIX ?= deploy.bocloud.k8s:40443/aios
@@ -9,10 +11,11 @@ KUBECTL ?= kubectl
 AIOP_KUBECONFIG ?= /home/lb/.kube/config-10.241.0.166
 AIOP_NAMESPACE ?= aios-system
 AIOP_KUBECTL = $(KUBECTL) --kubeconfig $(AIOP_KUBECONFIG)
+AIOP_IMAGE_PULL_POLICY ?= Always
 ROLLBACK_REVISION ?=
 ROLLBACK_TO_REVISION = $(if $(strip $(ROLLBACK_REVISION)),--to-revision=$(ROLLBACK_REVISION),)
 
-.PHONY: verify-node test-agent-platform test-runtime-refactor verify-runtime-refactor image pipeline deploy-staging rollback-staging deploy-aiop rollback-aiop
+.PHONY: verify-node test-agent-platform test-runtime-refactor verify-runtime-refactor image pipeline deploy-staging rollback-staging deploy-aiop rollback-aiop backup-aiop-staging-k8s-settings backup-aiop-staging-db-settings rebuild-aiop-staging-db deploy-aiop-staging deploy-aiop-staging-workload deploy-aiop-staging-fresh
 
 verify-node:
 	npm run verify:node
@@ -34,8 +37,17 @@ image:
 	docker run --rm $(IMAGE) npm run verify:node
 
 pipeline: verify-node
+ifeq ($(USE_EXISTING_IMAGES),1)
+	docker image inspect $(IMAGE) >/dev/null
+	docker image inspect $(WEB_IMAGE) >/dev/null
+	docker tag $(IMAGE) $(PUBLISH_IMAGE)
+	docker tag $(WEB_IMAGE) $(PUBLISH_WEB_IMAGE)
+	docker push $(PUBLISH_IMAGE)
+	docker push $(PUBLISH_WEB_IMAGE)
+else
 	docker buildx build --platform $(PLATFORMS) --tag $(PUBLISH_IMAGE) --push .
 	docker buildx build --platform $(PLATFORMS) --file web/Dockerfile --tag $(PUBLISH_WEB_IMAGE) --push .
+endif
 	docker manifest inspect --insecure $(PUBLISH_IMAGE)
 	docker manifest inspect --insecure $(PUBLISH_WEB_IMAGE)
 
@@ -63,6 +75,32 @@ deploy-aiop:
 	$(AIOP_KUBECTL) apply -f deploy/aiop/service-nodeport.yaml
 	$(AIOP_KUBECTL) set image -f deploy/aiop/deployment.yaml aiop=$(PUBLISH_IMAGE) aiop-web=$(PUBLISH_WEB_IMAGE) --local -o yaml | $(AIOP_KUBECTL) apply -f -
 	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) rollout status deployment/aiop-server --timeout=300s
+
+backup-aiop-staging-k8s-settings:
+	AIOP_KUBECONFIG=$(AIOP_KUBECONFIG) AIOP_NAMESPACE=$(AIOP_NAMESPACE) AIOP_BACKUP_DIR=$(AIOP_BACKUP_DIR) ./scripts/backup-aiop-k8s-settings.sh
+
+backup-aiop-staging-db-settings:
+	AIOP_KUBECONFIG=$(AIOP_KUBECONFIG) AIOP_NAMESPACE=$(AIOP_NAMESPACE) AIOP_BACKUP_DIR=$(AIOP_BACKUP_DIR) AIOP_VERIFIED_MYSQL_HOST=$(AIOP_VERIFIED_MYSQL_HOST) AIOP_VERIFIED_MYSQL_PORT=$(AIOP_VERIFIED_MYSQL_PORT) AIOP_VERIFIED_MYSQL_DATABASE=$(AIOP_VERIFIED_MYSQL_DATABASE) ./scripts/backup-aiop-staging-db-settings.sh
+
+rebuild-aiop-staging-db:
+	AIOP_KUBECONFIG=$(AIOP_KUBECONFIG) AIOP_NAMESPACE=$(AIOP_NAMESPACE) AIOP_BACKUP_DIR=$(AIOP_BACKUP_DIR) DB_REBUILD_MODE=$(DB_REBUILD_MODE) AIOP_VERIFIED_MYSQL_HOST=$(AIOP_VERIFIED_MYSQL_HOST) AIOP_VERIFIED_MYSQL_PORT=$(AIOP_VERIFIED_MYSQL_PORT) AIOP_VERIFIED_MYSQL_DATABASE=$(AIOP_VERIFIED_MYSQL_DATABASE) ./scripts/rebuild-aiop-staging-db.sh
+
+deploy-aiop-staging:
+	$(AIOP_KUBECTL) apply -f deploy/aiop/configmap.yaml
+	$(MAKE) deploy-aiop-staging-workload
+
+deploy-aiop-staging-workload:
+	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) get configmap aiop-config -o name >/dev/null
+	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) get secret aiop-secrets -o name >/dev/null
+	$(AIOP_KUBECTL) apply -f deploy/aiop/pvc-skills.yaml
+	$(AIOP_KUBECTL) apply -f deploy/aiop/service-nodeport.yaml
+	$(AIOP_KUBECTL) set image -f deploy/aiop/deployment.yaml aiop=$(PUBLISH_IMAGE) aiop-web=$(PUBLISH_WEB_IMAGE) --local -o yaml | $(AIOP_KUBECTL) apply -f -
+	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) set env deployment/aiop-server AIOP_DEPLOY_IMAGE=$(PUBLISH_IMAGE) AIOP_DEPLOY_WEB_IMAGE=$(PUBLISH_WEB_IMAGE)
+	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) patch deployment aiop-server --type=strategic --patch='{"spec":{"template":{"spec":{"containers":[{"name":"aiop","imagePullPolicy":"$(AIOP_IMAGE_PULL_POLICY)"},{"name":"aiop-web","imagePullPolicy":"$(AIOP_IMAGE_PULL_POLICY)"}]}}}}'
+	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) rollout status deployment/aiop-server --timeout=300s
+
+deploy-aiop-staging-fresh:
+	IMAGE_TAG=$(IMAGE_TAG) AIOP_KUBECONFIG=$(AIOP_KUBECONFIG) AIOP_NAMESPACE=$(AIOP_NAMESPACE) ./scripts/deploy-aiop-staging-fresh.sh
 
 rollback-aiop:
 	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) rollout undo deployment/aiop-server $(ROLLBACK_TO_REVISION)

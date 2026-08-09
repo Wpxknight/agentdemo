@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { sql, type Kysely, type Selectable } from 'kysely';
 import type { Msg, Role as MsgRole } from '../llm/types.js';
 import type { AuditEvent } from '../audit/sink.js';
@@ -30,8 +30,9 @@ import type {
   ScheduledTask,
   ScheduledTaskInput,
   ScheduledTaskPatch,
+  ScheduledExecution,
+  ManualFire,
   Store,
-  TaskRun,
   ToolExecutionRecord,
   ToolExecutionStatus,
   UserCredentialRecord,
@@ -41,7 +42,7 @@ import type {
 import { DEFAULT_SESSION_TITLE } from './store.js';
 import { McpServerSchema } from '../config/schema.js';
 import type { McpServerConfig } from '@aiop/mcp-runtime';
-import { nextRunAt } from '../scheduler/cron.js';
+import { assertValidCron, DEFAULT_SCHEDULER_TIMEZONE, nextRunAt } from '../scheduler/cron.js';
 import { estimateTokens } from '../llm/context.js';
 import { parseSandboxSettings } from '@aiop/sandbox-runtime';
 import { MysqlRunStore } from '@aiop/pi-runtime';
@@ -53,9 +54,11 @@ interface TaskRow {
   session_id: string;
   title: string;
   cron: string;
+  timezone: string;
   task: string;
   pre_approved: number;
   enabled: number;
+  deleted_at: Date | null;
   next_run_at: Date;
   last_run_at: Date | null;
 }
@@ -81,6 +84,7 @@ function toTask(r: TaskRow): ScheduledTask {
     userId: r.user_id,
     sessionId: r.session_id,
     cron: r.cron,
+    timezone: r.timezone,
     title: r.title ?? '',
     task: r.task,
     preApproved: Boolean(r.pre_approved),
@@ -100,6 +104,10 @@ function parseJson(v: unknown): unknown {
     }
   }
   return v;
+}
+
+function manualFireId(taskId: number, idempotencyKey: string): string {
+  return `manual:${taskId}:${createHash('sha256').update(idempotencyKey).digest('hex')}`;
 }
 
 function summarize(text: string | undefined, max = 48): string {
@@ -902,7 +910,9 @@ export class MysqlStore implements Store {
   }
 
   async createScheduledTask(ctx: RequestContext, input: ScheduledTaskInput): Promise<ScheduledTask> {
-    const next = nextRunAt(input.cron, new Date());
+    const timezone = input.timezone ?? DEFAULT_SCHEDULER_TIMEZONE;
+    assertValidCron(input.cron, timezone);
+    const next = nextRunAt(input.cron, new Date(), timezone);
     const res = await this.db
       .insertInto('scheduled_tasks')
       .values({
@@ -910,6 +920,7 @@ export class MysqlStore implements Store {
         user_id: ctx.userId,
         session_id: input.sessionId,
         cron: input.cron,
+        timezone,
         title: input.title ?? '',
         task: input.task,
         pre_approved: input.preApproved ? 1 : 0,
@@ -923,6 +934,7 @@ export class MysqlStore implements Store {
       userId: ctx.userId,
       sessionId: input.sessionId,
       cron: input.cron,
+      timezone,
       title: input.title ?? '',
       task: input.task,
       preApproved: input.preApproved ?? false,
@@ -936,20 +948,23 @@ export class MysqlStore implements Store {
     let q = this.db
       .selectFrom('scheduled_tasks')
       .selectAll()
-      .where('tenant_id', '=', ctx.tenantId);
+      .where('tenant_id', '=', ctx.tenantId)
+      .where('deleted_at', 'is', null);
     if (ctx.role === 'user') q = q.where('user_id', '=', ctx.userId);
     const rows = await q.orderBy('id', 'asc').execute();
     return rows.map(toTask);
   }
 
-  async setTaskEnabled(ctx: RequestContext, id: number, enabled: boolean): Promise<void> {
+  async setTaskEnabled(ctx: RequestContext, id: number, enabled: boolean): Promise<boolean> {
     let q = this.db
       .updateTable('scheduled_tasks')
       .set({ enabled: enabled ? 1 : 0 })
       .where('id', '=', id)
-      .where('tenant_id', '=', ctx.tenantId);
+      .where('tenant_id', '=', ctx.tenantId)
+      .where('deleted_at', 'is', null);
     if (ctx.role === 'user') q = q.where('user_id', '=', ctx.userId);
-    await q.execute();
+    const result = await q.executeTakeFirst();
+    return Number(result.numUpdatedRows) === 1;
   }
 
   async getScheduledTask(ctx: RequestContext, id: number): Promise<ScheduledTask | undefined> {
@@ -957,7 +972,8 @@ export class MysqlStore implements Store {
       .selectFrom('scheduled_tasks')
       .selectAll()
       .where('id', '=', id)
-      .where('tenant_id', '=', ctx.tenantId);
+      .where('tenant_id', '=', ctx.tenantId)
+      .where('deleted_at', 'is', null);
     if (ctx.role === 'user') q = q.where('user_id', '=', ctx.userId);
     const row = await q.executeTakeFirst();
     return row ? toTask(row) : undefined;
@@ -966,14 +982,18 @@ export class MysqlStore implements Store {
   async updateScheduledTask(ctx: RequestContext, id: number, patch: ScheduledTaskPatch): Promise<ScheduledTask | undefined> {
     const current = await this.getScheduledTask(ctx, id);
     if (!current) return undefined;
+    const timezone = patch.timezone ?? current.timezone;
+    const cron = patch.cron ?? current.cron;
+    assertValidCron(cron, timezone);
     const set: Record<string, unknown> = {};
     if (patch.title !== undefined) set.title = patch.title;
     if (patch.task !== undefined) set.task = patch.task;
     if (patch.preApproved !== undefined) set.pre_approved = patch.preApproved ? 1 : 0;
     if (patch.enabled !== undefined) set.enabled = patch.enabled ? 1 : 0;
-    if (patch.cron !== undefined && patch.cron !== current.cron) {
-      set.cron = patch.cron;
-      set.next_run_at = nextRunAt(patch.cron, new Date());
+    if (patch.cron !== undefined) set.cron = patch.cron;
+    if (patch.timezone !== undefined) set.timezone = patch.timezone;
+    if (patch.cron !== undefined || patch.timezone !== undefined) {
+      set.next_run_at = nextRunAt(cron, new Date(), timezone);
     }
     if (Object.keys(set).length) {
       await this.db
@@ -988,76 +1008,92 @@ export class MysqlStore implements Store {
 
   async deleteScheduledTask(ctx: RequestContext, id: number): Promise<boolean> {
     let q = this.db
-      .deleteFrom('scheduled_tasks')
+      .updateTable('scheduled_tasks')
+      .set({ enabled: 0, deleted_at: new Date() })
       .where('id', '=', id)
-      .where('tenant_id', '=', ctx.tenantId);
+      .where('tenant_id', '=', ctx.tenantId)
+      .where('deleted_at', 'is', null);
     if (ctx.role === 'user') q = q.where('user_id', '=', ctx.userId);
-    const res = await q.executeTakeFirst();
-    if (Number(res.numDeletedRows) === 0) return false;
-    await this.db.deleteFrom('task_runs').where('task_id', '=', id).execute();
-    return true;
+    const result = await q.executeTakeFirst();
+    return Number(result.numUpdatedRows) === 1;
   }
 
-  /** 系统级：事务内 FOR UPDATE 领取并推进，兼容 MariaDB 10.2，并保证多副本不重复执行。 */
-  async claimDueTasks(now: Date, limit: number): Promise<ScheduledTask[]> {
+  async createManualFire(
+    ctx: RequestContext,
+    taskId: number,
+    idempotencyKey: string,
+    now = new Date(),
+  ): Promise<ManualFire | undefined> {
     return this.db.transaction().execute(async (trx) => {
-      const rows = await trx
-        .selectFrom('scheduled_tasks')
-        .selectAll()
-        .where('enabled', '=', 1)
-        .where('next_run_at', '<=', now)
-        .orderBy('next_run_at', 'asc')
-        .limit(limit)
-        .forUpdate()
-        .execute();
+      let taskQuery = trx.selectFrom('scheduled_tasks').selectAll()
+        .where('id', '=', taskId).where('tenant_id', '=', ctx.tenantId)
+        .where('deleted_at', 'is', null).forUpdate();
+      if (ctx.role === 'user') taskQuery = taskQuery.where('user_id', '=', ctx.userId);
+      const task = await taskQuery.executeTakeFirst();
+      if (!task) return undefined;
 
-      const tasks = rows.map(toTask);
-      for (const t of tasks) {
-        await trx
-          .updateTable('scheduled_tasks')
-          .set({ last_run_at: now, next_run_at: nextRunAt(t.cron, now) })
-          .where('id', '=', t.id)
-          .execute();
-      }
-      return tasks;
+      const fireId = manualFireId(taskId, idempotencyKey);
+      const result = await trx.insertInto('scheduler_fires').values({
+        fire_id: fireId, task_id: task.id, tenant_id: task.tenant_id, actor_id: task.user_id,
+        session_id: task.session_id, fire_time: now,
+        input_json: JSON.stringify({
+          input: [{ role: 'user', text: task.task }],
+          execution: { unattended: true, preApproved: Boolean(task.pre_approved) },
+        }),
+        trigger_kind: 'manual', idempotency_key: idempotencyKey,
+        state: 'pending', attempts: 0, run_id: null, claim_token: null, claim_owner: null,
+        lease_expires_at: null, retry_at: null, last_error: null, created_at: now, updated_at: now,
+      }).ignore().executeTakeFirst();
+      const fire = await trx.selectFrom('scheduler_fires').select(['fire_id', 'state'])
+        .where('tenant_id', '=', ctx.tenantId).where('task_id', '=', taskId)
+        .where('trigger_kind', '=', 'manual').where('idempotency_key', '=', idempotencyKey)
+        .executeTakeFirstOrThrow();
+      return {
+        fireId: fire.fire_id, runId: fire.fire_id,
+        state: fire.state as ManualFire['state'],
+        replayed: Number(result.numInsertedOrUpdatedRows ?? 0) === 0,
+      };
     });
   }
 
-  async recordTaskRun(run: TaskRun): Promise<void> {
-    await this.db
-      .insertInto('task_runs')
-      .values({
-        task_id: run.taskId,
-        status: run.status,
-        detail: run.detail ?? null,
-        steps: run.steps ?? null,
-      })
-      .execute();
-  }
-
-  async listTaskRuns(ctx: RequestContext, taskId: number): Promise<TaskRun[]> {
-    let q = this.db
-      .selectFrom('task_runs')
-      .innerJoin('scheduled_tasks', 'scheduled_tasks.id', 'task_runs.task_id')
+  async listScheduledExecutions(ctx: RequestContext, taskId: number): Promise<ScheduledExecution[]> {
+    let query = this.db.selectFrom('scheduler_fires')
+      .innerJoin('scheduled_tasks', 'scheduled_tasks.id', 'scheduler_fires.task_id')
+      .leftJoin('agent_runs', (join) => join
+        .onRef('agent_runs.tenant_id', '=', 'scheduler_fires.tenant_id')
+        .onRef('agent_runs.run_id', '=', 'scheduler_fires.run_id'))
       .select([
-        'task_runs.id as id',
-        'task_runs.task_id as task_id',
-        'task_runs.status as status',
-        'task_runs.detail as detail',
-        'task_runs.steps as steps',
-        'task_runs.created_at as created_at',
+        'scheduler_fires.fire_id as fire_id', 'scheduler_fires.run_id as run_id',
+        'scheduler_fires.trigger_kind as trigger_kind', 'scheduler_fires.fire_time as fire_time',
+        'scheduler_fires.state as fire_state', 'scheduler_fires.attempts as attempts',
+        'scheduler_fires.last_error as last_error', 'scheduler_fires.created_at as created_at',
+        'scheduler_fires.updated_at as updated_at', 'agent_runs.status as run_status',
+        'agent_runs.started_at as run_started_at', 'agent_runs.completed_at as run_completed_at',
+        'agent_runs.error_message as run_error_message', 'agent_runs.step_count as run_step_count',
+        'agent_runs.input_tokens as run_input_tokens', 'agent_runs.output_tokens as run_output_tokens',
+        'agent_runs.cache_read_tokens as run_cache_read_tokens',
+        'agent_runs.cache_creation_tokens as run_cache_creation_tokens', 'agent_runs.cost_usd as run_cost_usd',
       ])
-      .where('scheduled_tasks.tenant_id', '=', ctx.tenantId)
-      .where('task_runs.task_id', '=', taskId);
-    if (ctx.role === 'user') q = q.where('scheduled_tasks.user_id', '=', ctx.userId);
-    const rows = await q.orderBy('task_runs.id', 'desc').execute();
-    return rows.map((r): TaskRun => ({
-      id: r.id,
-      taskId: r.task_id,
-      status: r.status as TaskRun['status'],
-      detail: r.detail ?? undefined,
-      steps: r.steps ?? undefined,
-      createdAt: r.created_at instanceof Date ? r.created_at : new Date(String(r.created_at)),
+      .where('scheduler_fires.tenant_id', '=', ctx.tenantId)
+      .where('scheduler_fires.task_id', '=', taskId);
+    if (ctx.role === 'user') query = query.where('scheduled_tasks.user_id', '=', ctx.userId);
+    const rows = await query.orderBy('scheduler_fires.fire_time', 'desc').orderBy('scheduler_fires.fire_id', 'desc').execute();
+    return rows.map((row): ScheduledExecution => ({
+      fireId: row.fire_id, runId: row.run_id ?? row.fire_id,
+      triggerKind: row.trigger_kind as ScheduledExecution['triggerKind'], fireTime: toDate(row.fire_time),
+      fireState: row.fire_state as ScheduledExecution['fireState'], attempts: row.attempts,
+      lastError: row.last_error ?? undefined, createdAt: toDate(row.created_at), updatedAt: toDate(row.updated_at),
+      run: row.run_status ? {
+        status: row.run_status as AgentRunRecord['status'],
+        startedAt: row.run_started_at ? toDate(row.run_started_at) : undefined,
+        completedAt: row.run_completed_at ? toDate(row.run_completed_at) : undefined,
+        errorMessage: row.run_error_message ?? undefined, stepCount: row.run_step_count ?? 0,
+        usage: {
+          inputTokens: row.run_input_tokens ?? 0, outputTokens: row.run_output_tokens ?? 0,
+          cacheReadTokens: row.run_cache_read_tokens ?? 0, cacheCreationTokens: row.run_cache_creation_tokens ?? 0,
+          ...(row.run_cost_usd === null ? {} : { costUsd: Number(row.run_cost_usd) }),
+        },
+      } : null,
     }));
   }
 

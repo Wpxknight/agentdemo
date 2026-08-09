@@ -88,7 +88,7 @@ import type {
   SessionTokenUsageBody,
   SessionSummary,
   SessionsBody,
-  TaskRun,
+  ScheduledExecution,
   PendingQuestion,
   QuestionSpec,
   TaskStep,
@@ -3321,10 +3321,13 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
         data: await readFileAsDataUrl(file),
       });
       await onImported();
-      setSelectedName(body.skill.name);
       setSelectedFile('SKILL.md');
       setShowSkillFiles(false);
-      setImportStatus(`已导入 ${toolDisplayName(body.skill.name)}。`);
+      setImportStatus(
+        body.pendingReview
+          ? `已上传 ${toolDisplayName(body.product.name)}，等待管理员审核。`
+          : `已导入 ${toolDisplayName(body.product.name)}。`,
+      );
     } catch (err) {
       setImportStatus(`导入失败：${formatError(err)}`);
     }
@@ -3808,6 +3811,7 @@ function ScheduleTaskForm({
   title,
   task,
   cron,
+  timezone,
   preApproved,
   busy,
   status,
@@ -3815,6 +3819,7 @@ function ScheduleTaskForm({
   onTitleChange,
   onTaskChange,
   onCronChange,
+  onTimezoneChange,
   onPreApprovedChange,
   onSubmit,
   onCancel,
@@ -3822,6 +3827,7 @@ function ScheduleTaskForm({
   title: string;
   task: string;
   cron: string;
+  timezone: string;
   preApproved: boolean;
   busy: boolean;
   status?: string;
@@ -3829,6 +3835,7 @@ function ScheduleTaskForm({
   onTitleChange: (value: string) => void;
   onTaskChange: (value: string) => void;
   onCronChange: (value: string) => void;
+  onTimezoneChange: (value: string) => void;
   onPreApprovedChange: (value: boolean) => void;
   onSubmit: () => void;
   onCancel: () => void;
@@ -3837,7 +3844,7 @@ function ScheduleTaskForm({
     <div className="schedule-task-form">
       <Label>任务标题<Input placeholder="如：每日集群巡检" value={title} disabled={busy} onChange={(event) => onTitleChange(event.target.value)} /></Label>
       <Label>任务描述<Textarea placeholder="描述你要定时执行的任务..." value={task} disabled={busy} onChange={(event) => onTaskChange(event.target.value)} /></Label>
-      <Label>执行计划（cron，UTC）
+      <Label>执行计划（cron）
         <Select disabled={busy} value={CRON_PRESETS.some((preset) => preset.value === cron) ? cron : 'custom'} onValueChange={(value) => { if (value !== 'custom') onCronChange(value); }}>
           <SelectTrigger><SelectValue /></SelectTrigger>
           <SelectContent>
@@ -3848,6 +3855,9 @@ function ScheduleTaskForm({
           </SelectContent>
         </Select>
         <Input value={cron} disabled={busy} spellCheck={false} placeholder='如 "0 2 * * *"' onChange={(event) => onCronChange(event.target.value)} />
+      </Label>
+      <Label>时区（IANA）
+        <Input value={timezone} disabled={busy} spellCheck={false} placeholder="如 Asia/Shanghai" onChange={(event) => onTimezoneChange(event.target.value)} />
       </Label>
       <label className="schedule-preapproved">
         <input type="checkbox" checked={preApproved} disabled={busy} onChange={(event) => onPreApprovedChange(event.target.checked)} />
@@ -3871,13 +3881,14 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
   // 默认展示任务列表；点击“创建”进入表单，点击某行进入执行详情页
   const [view, setView] = useState<'list' | 'create' | 'detail'>('list');
   const [selectedTaskId, setSelectedTaskId] = useState<number | undefined>();
-  const [runs, setRuns] = useState<TaskRun[]>([]);
-  const [selectedRunId, setSelectedRunId] = useState<number | undefined>();
+  const [runs, setRuns] = useState<ScheduledExecution[]>([]);
+  const [selectedRunId, setSelectedRunId] = useState<string | undefined>();
   const [runsPage, setRunsPage] = useState(1);
   const [runsStatus, setRunsStatus] = useState('');
   const [newTitle, setNewTitle] = useState('');
   const [newTask, setNewTask] = useState('');
   const [newCron, setNewCron] = useState('0 2 * * *');
+  const [newTimezone, setNewTimezone] = useState('UTC');
   const [newPreApproved, setNewPreApproved] = useState(false);
   const [pageStatus, setPageStatus] = useState('');
   const [busy, setBusy] = useState(false);
@@ -3885,10 +3896,11 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
   const [editTitle, setEditTitle] = useState('');
   const [editTask, setEditTask] = useState('');
   const [editCron, setEditCron] = useState('');
+  const [editTimezone, setEditTimezone] = useState('UTC');
   const [editPreApproved, setEditPreApproved] = useState(false);
   const pollTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const selectedTask = tasks.find((task) => task.id === selectedTaskId);
-  const selectedRun = runs.find((run) => run.id === selectedRunId);
+  const selectedRun = runs.find((run) => run.fireId === selectedRunId);
   // 执行记录客户端分页：默认每页 5 条
   const runsPageCount = Math.max(1, Math.ceil(runs.length / RUNS_PAGE_SIZE));
   const pagedRuns = runs.slice((runsPage - 1) * RUNS_PAGE_SIZE, runsPage * RUNS_PAGE_SIZE);
@@ -3906,7 +3918,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
     setView('list');
   }, [selectedTaskId, tasks]);
 
-  const loadRuns = useCallback(async (): Promise<TaskRun[]> => {
+  const loadRuns = useCallback(async (): Promise<ScheduledExecution[]> => {
     if (!selectedTask || selectedTask.id === undefined) {
       setRuns([]);
       setSelectedRunId(undefined);
@@ -3917,7 +3929,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
       const body = await api.get<ScheduleRunsBody>(`/v1/schedule/${selectedTask.id}/runs`);
       const next = body.runs || [];
       setRuns(next);
-      setSelectedRunId((current) => (current !== undefined && next.some((run) => run.id === current) ? current : undefined));
+      setSelectedRunId((current) => (current !== undefined && next.some((run) => run.fireId === current) ? current : undefined));
       setRunsStatus(next.length ? '' : '暂无执行结果');
       return next;
     } catch (err) {
@@ -3958,11 +3970,13 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
         title: newTitle.trim(),
         task: newTask.trim(),
         cron: newCron.trim(),
+        timezone: newTimezone.trim(),
         preApproved: newPreApproved,
       });
       setPageStatus(`已创建定时任务 #${body.task.id}，下次执行 ${formatDateTime(body.task.nextRunAt)}`);
       setNewTitle('');
       setNewTask('');
+      setNewTimezone('UTC');
       setNewPreApproved(false);
       setView('list');
       onChanged();
@@ -3991,18 +4005,19 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
     if (task.id === undefined || busy) return;
     setBusy(true);
     try {
-      await api.post(`/v1/schedule/${task.id}/run`);
-      setRunsStatus('已触发立即执行，等待结果...');
-      const before = runs[0]?.id;
+      const response = await api.post<{ fireId: string }>(`/v1/schedule/${task.id}/run`, undefined, {
+        'Idempotency-Key': crypto.randomUUID(),
+      });
+      setRunsStatus('已持久化立即执行请求，等待调度器领取...');
       let attempts = 0;
       const poll = async () => {
         const next = await loadRuns();
-        const latest = next[0]?.id;
-        if ((latest !== undefined && latest !== before) || attempts++ >= 40) {
-          if (latest !== undefined && latest !== before) onChanged(); // 刷新 lastRunAt / 下次执行
+        const current = next.find((run) => run.fireId === response.fireId);
+        if (current?.fireState === 'completed' || attempts++ >= 40) {
+          if (current?.fireState === 'completed') onChanged();
           return;
         }
-        setRunsStatus('已触发立即执行，等待结果...');
+        setRunsStatus('已持久化立即执行请求，等待调度器领取...');
         pollTimer.current = setTimeout(() => void poll(), 3000);
       };
       pollTimer.current = setTimeout(() => void poll(), 2000);
@@ -4018,7 +4033,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
     const id = task.id;
     onRequestConfirm({
       title: '删除定时任务',
-      description: `将删除「${task.title || task.task}」及其全部执行记录，不可恢复。若只想暂停请用“暂停”。`,
+      description: `将删除「${task.title || task.task}」并停止后续计划触发；既有执行记录会保留。若只想暂停请用“暂停”。`,
       confirmLabel: '确认删除',
       busyLabel: '正在删除...',
       tone: 'danger',
@@ -4036,6 +4051,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
     setEditTitle(task.title || '');
     setEditTask(task.task);
     setEditCron(task.cron);
+    setEditTimezone(task.timezone || 'UTC');
     setEditPreApproved(Boolean(task.preApproved));
     setEditing(true);
   }
@@ -4052,6 +4068,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
         title: editTitle.trim(),
         task: editTask.trim(),
         cron: editCron.trim(),
+        timezone: editTimezone.trim(),
         preApproved: editPreApproved,
       });
       setPageStatus(`已更新任务 #${task.id}`);
@@ -4067,7 +4084,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
   if (view === 'create') {
     return (
       <>
-        <PageTitle title="创建定时任务" desc="按 cron 周期自动执行的运维任务（cron 以 UTC 时区解释）" />
+        <PageTitle title="创建定时任务" desc="按 cron 周期自动执行的运维任务（按任务时区解释）" />
         <div className="toolbar">
           <Button variant="outline" type="button" onClick={() => { setPageStatus(''); setView('list'); }}>
             <ChevronLeft data-icon="inline-start" />
@@ -4080,6 +4097,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
               title={newTitle}
               task={newTask}
               cron={newCron}
+              timezone={newTimezone}
               preApproved={newPreApproved}
               busy={busy}
               status={pageStatus}
@@ -4087,6 +4105,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
               onTitleChange={setNewTitle}
               onTaskChange={setNewTask}
               onCronChange={setNewCron}
+              onTimezoneChange={setNewTimezone}
               onPreApprovedChange={setNewPreApproved}
               onSubmit={() => void createTask()}
               onCancel={() => { setPageStatus(''); setView('list'); }}
@@ -4100,7 +4119,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
   if (view === 'detail' && selectedTask) {
     return (
       <>
-        <PageTitle title="定时任务详情" desc={`#${selectedTask.id} · ${humanizeCron(selectedTask.cron)}（UTC）`} />
+        <PageTitle title="定时任务详情" desc={`#${selectedTask.id} · ${humanizeCron(selectedTask.cron)}（${selectedTask.timezone || 'UTC'}）`} />
         <div className="toolbar">
           <Button variant="outline" type="button" onClick={() => { setPageStatus(''); setEditing(false); setView('list'); }}>
             <ChevronLeft data-icon="inline-start" />
@@ -4128,7 +4147,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
                 <div className="schedule-task-summary kv">
                   <span>任务标题</span><strong>{selectedTask.title || '-'}</strong>
                   <span>任务描述</span><strong>{selectedTask.task}</strong>
-                  <span>执行计划</span><strong>{selectedTask.cron}（{humanizeCron(selectedTask.cron)}，UTC）</strong>
+                  <span>执行计划</span><strong>{selectedTask.cron}（{humanizeCron(selectedTask.cron)}，{selectedTask.timezone || 'UTC'}）</strong>
                   <span>预批准</span><strong>{selectedTask.preApproved ? '是' : '否'}</strong>
                   <span>状态</span><strong>{selectedTask.enabled ? '启用中' : '已暂停'}</strong>
                   <span>下次执行</span><strong>{formatDateTime(selectedTask.nextRunAt)}</strong>
@@ -4156,12 +4175,14 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
                     title={editTitle}
                     task={editTask}
                     cron={editCron}
+                    timezone={editTimezone}
                     preApproved={editPreApproved}
                     busy={busy}
                     submitLabel="保存修改"
                     onTitleChange={setEditTitle}
                     onTaskChange={setEditTask}
                     onCronChange={setEditCron}
+                    onTimezoneChange={setEditTimezone}
                     onPreApprovedChange={setEditPreApproved}
                     onSubmit={() => void saveEdit(selectedTask)}
                     onCancel={() => setEditing(false)}
@@ -4181,22 +4202,22 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
                     <TableRow>{['时间', '状态', '步骤'].map((header) => <TableHead key={header}>{header}</TableHead>)}</TableRow>
                   </TableHeader>
                   <TableBody>
-                    {pagedRuns.map((run, index) => (
+                    {pagedRuns.map((run) => (
                       <TableRow
-                        key={run.id ?? `${run.taskId}-${index}`}
-                        className={run.id === undefined ? undefined : 'clickable-row'}
-                        role={run.id === undefined ? undefined : 'button'}
-                        tabIndex={run.id === undefined ? undefined : 0}
-                        onClick={() => { if (run.id !== undefined) setSelectedRunId(run.id); }}
+                        key={run.fireId}
+                        className="clickable-row"
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => setSelectedRunId(run.fireId)}
                         onKeyDown={(event) => {
-                          if (run.id === undefined || (event.key !== 'Enter' && event.key !== ' ')) return;
+                          if (event.key !== 'Enter' && event.key !== ' ') return;
                           event.preventDefault();
-                          setSelectedRunId(run.id);
+                          setSelectedRunId(run.fireId);
                         }}
                       >
                         <TableCell>{formatDateTime(run.createdAt)}</TableCell>
-                        <TableCell>{formatCell(run.status === 'success' ? '成功' : '异常')}</TableCell>
-                        <TableCell>{run.steps === undefined ? '-' : String(run.steps)}</TableCell>
+                        <TableCell>{formatCell(run.run?.status ?? run.fireState)}</TableCell>
+                        <TableCell>{run.run ? String(run.run.stepCount) : '-'}</TableCell>
                       </TableRow>
                     ))}
                     {!runs.length ? (
@@ -4218,15 +4239,17 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
           </CardContent>
         </Card>
         {selectedRun ? (
-          <ModalDialog title="执行记录详情" status={selectedRun.status === 'success' ? '成功' : '异常'} icon={<Activity />} onClose={() => setSelectedRunId(undefined)}>
+          <ModalDialog title="执行记录详情" status={selectedRun.run?.status ?? selectedRun.fireState} icon={<Activity />} onClose={() => setSelectedRunId(undefined)}>
             <div className="schedule-run-modal">
               <div className="kv">
-                <span>执行时间</span><strong>{formatDateTime(selectedRun.createdAt)}</strong>
-                <span>执行状态</span><strong>{selectedRun.status === 'success' ? '成功' : '异常'}</strong>
-                <span>执行步骤</span><strong>{selectedRun.steps === undefined ? '-' : String(selectedRun.steps)}</strong>
+                <span>触发时间</span><strong>{formatDateTime(selectedRun.fireTime)}</strong>
+                <span>触发来源</span><strong>{selectedRun.triggerKind === 'manual' ? '立即执行' : '计划触发'}</strong>
+                <span>调度状态</span><strong>{selectedRun.fireState}</strong>
+                <span>运行状态</span><strong>{selectedRun.run?.status ?? '尚未创建 Run'}</strong>
+                <span>执行步骤</span><strong>{selectedRun.run ? String(selectedRun.run.stepCount) : '-'}</strong>
               </div>
               <h3>执行结果</h3>
-              <pre>{selectedRun.detail || '暂无执行结果'}</pre>
+              <pre>{selectedRun.run?.errorMessage || selectedRun.lastError || '暂无执行结果'}</pre>
             </div>
           </ModalDialog>
         ) : null}
@@ -4236,7 +4259,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
 
   return (
     <>
-      <PageTitle title="定时任务" desc="按 cron 周期自动执行的运维任务（cron 以 UTC 时区解释）" />
+      <PageTitle title="定时任务" desc="按 cron 周期自动执行的运维任务（按任务时区解释）" />
       <div className="toolbar">
         <Button type="button" onClick={() => { setPageStatus(''); setView('create'); }}>
           <Plus data-icon="inline-start" />

@@ -1,9 +1,9 @@
 node_modules
 dist
-web/dist
 packages/*/bin
 coverage
 .git
+.playwright-mcp/
 .env
 .env.local
 *.log

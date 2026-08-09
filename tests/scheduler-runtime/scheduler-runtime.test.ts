@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   type BoundRunRecovery,
+  InMemorySchedulerObserver,
   MemorySchedulerStore,
   MysqlSchedulerStore,
   SchedulerRunner,
@@ -75,6 +76,58 @@ function managedSession(
 }
 
 describe('SchedulerRunner', () => {
+  it('records low-cardinality scheduler observations with a Fire correlation ID', async () => {
+    const observer = new InMemorySchedulerObserver();
+    const store = new MemorySchedulerStore([{ ...task, nextFireAt: fireTime }]);
+    const runner = new SchedulerRunner({
+      store,
+      dispatcher: { startScheduledRun: async (_input, onStarted) => dispatchSucceeded('run-a', onStarted) },
+      boundRecovery: activeBoundRecovery,
+      workerId: 'worker-a',
+      observer,
+    });
+
+    await runner.tick(new Date(fireTime.getTime() + 5_000), 1);
+
+    expect(observer.snapshot()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'backlog' }),
+      expect.objectContaining({ name: 'due_lag_ms', value: 5_000, fireId: 'task-a:2026-07-29T01:00:00.000Z' }),
+      expect.objectContaining({ name: 'completion', fireId: 'task-a:2026-07-29T01:00:00.000Z', state: 'completed' }),
+      expect.objectContaining({ name: 'duration_ms', fireId: 'task-a:2026-07-29T01:00:00.000Z' }),
+    ]));
+  });
+
+  it('cleans only completed Fires older than the retention threshold', async () => {
+    const old = new Date('2026-01-01T00:00:00.000Z');
+    const store = new MemorySchedulerStore([{ ...task, nextFireAt: old }]);
+    const [fire] = await store.claimDue({ now: old, limit: 1, workerId: 'worker-a', leaseMs: 30_000 });
+    await store.bindRun({ fireId: fire!.fireId, claimToken: fire!.claimToken, runId: fire!.fireId, boundAt: old });
+    await store.completeFire({
+      fireId: fire!.fireId, claimToken: fire!.claimToken, runId: fire!.fireId,
+      result: succeeded(fire!.fireId).result, completedAt: old,
+    });
+
+    expect(await store.cleanupCompleted({ before: new Date('2026-01-02T00:00:00.000Z'), limit: 100 })).toBe(1);
+    expect(await store.listFires()).toHaveLength(0);
+  });
+
+  it('materializes the next fire using the task IANA timezone', async () => {
+    const store = new MemorySchedulerStore([{
+      taskId: 'new-york', tenantId: 'tenant-a', actorId: 'user-a', sessionId: 'session-a',
+      cron: '0 2 * * *', timezone: 'America/New_York', input: [{ role: 'user', text: 'diagnose' }],
+      nextFireAt: new Date('2026-03-08T06:00:00.000Z'),
+    }]);
+
+    await store.claimDue({
+      now: new Date('2026-03-08T06:00:00.000Z'), limit: 1, workerId: 'worker-a', leaseMs: 30_000,
+    });
+
+    const second = await store.claimDue({
+      now: new Date('2026-03-08T07:00:00.000Z'), limit: 1, workerId: 'worker-b', leaseMs: 30_000,
+    });
+    expect(second[0]?.fireTime.toISOString()).toBe('2026-03-08T07:00:00.000Z');
+  });
+
   it('binds the durable Run before waiting for its final result', async () => {
     const base = new MemorySchedulerStore([task]);
     const realBindRun = base.bindRun.bind(base);
@@ -108,7 +161,90 @@ describe('SchedulerRunner', () => {
     await tick;
     expect(completeFire).toHaveBeenCalledOnce();
     expect((await base.listFires())[0]).toMatchObject({
-      state: 'started', runId: 'run-bound', result: { runId: 'run-bound', status: 'succeeded' },
+      state: 'completed', runId: 'run-bound', result: { runId: 'run-bound', status: 'succeeded' },
+    });
+  });
+
+  it('defers a newly bound Fire when direct dispatch returns waiting', async () => {
+    const observer = new InMemorySchedulerObserver();
+    const store = new MemorySchedulerStore([task]);
+    const bindRun = vi.spyOn(store, 'bindRun');
+    const deferBound = vi.spyOn(store, 'deferBound');
+    const completeFire = vi.spyOn(store, 'completeFire');
+    const completed = vi.fn(async () => {});
+    const waitingResult = {
+      runId: 'run-waiting', status: 'waiting' as const,
+      usage: { inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 0 },
+    };
+    const runner = new SchedulerRunner({
+      store,
+      dispatcher: {
+        startScheduledRun: async (_input, onStarted) => {
+          await onStarted?.(waitingResult.runId);
+          return { runId: waitingResult.runId, result: waitingResult };
+        },
+      },
+      boundRecovery: activeBoundRecovery,
+      workerId: 'worker-a',
+      retryDelayMs: 250,
+      observer,
+      completed,
+    });
+
+    expect(await runner.tick(fireTime, 1)).toBe(1);
+
+    const boundToken = bindRun.mock.calls[0]![0].claimToken;
+    expect(deferBound).toHaveBeenCalledWith({
+      fireId: 'task-a:2026-07-29T01:00:00.000Z',
+      claimToken: boundToken,
+      retryAt: new Date(fireTime.getTime() + 250),
+      error: 'durable Run remains waiting',
+    });
+    expect(completeFire).not.toHaveBeenCalled();
+    expect(completed).not.toHaveBeenCalled();
+    expect(observer.snapshot()).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'completion' }),
+    ]));
+    expect((await store.listFires())[0]).toMatchObject({
+      state: 'bound', runId: waitingResult.runId, claimToken: boundToken,
+      retryAt: new Date(fireTime.getTime() + 250), lastError: 'durable Run remains waiting',
+    });
+  });
+
+  it('defers a lookup-compensated waiting Run after binding its deterministic ID', async () => {
+    const store = new MemorySchedulerStore([task]);
+    const deferBound = vi.spyOn(store, 'deferBound');
+    const completeFire = vi.spyOn(store, 'completeFire');
+    const completed = vi.fn(async () => {});
+    const run = vi.fn(async () => { throw new Error('Run creation result unknown'); });
+    const waitingResult = {
+      runId: 'task-a:2026-07-29T01:00:00.000Z', status: 'waiting' as const,
+      usage: { inputTokens: 1, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+    };
+    const findScheduledRun = vi.fn(async () => ({ runId: waitingResult.runId, result: waitingResult }));
+    const runner = new SchedulerRunner({
+      store,
+      dispatcher: createRunDispatcher(
+        { run } as unknown as DurableRunRuntime,
+        { findScheduledRun },
+      ),
+      boundRecovery: activeBoundRecovery,
+      workerId: 'worker-a', retryDelayMs: 80, completed,
+    });
+
+    expect(await runner.tick(fireTime, 1)).toBe(1);
+
+    expect(findScheduledRun).toHaveBeenCalledOnce();
+    expect(deferBound).toHaveBeenCalledWith(expect.objectContaining({
+      fireId: waitingResult.runId,
+      retryAt: new Date(fireTime.getTime() + 80),
+      error: 'durable Run remains waiting',
+    }));
+    expect(completeFire).not.toHaveBeenCalled();
+    expect(completed).not.toHaveBeenCalled();
+    expect((await store.listFires())[0]).toMatchObject({
+      state: 'bound', runId: waitingResult.runId,
+      retryAt: new Date(fireTime.getTime() + 80),
     });
   });
 
@@ -133,6 +269,21 @@ describe('SchedulerRunner', () => {
       input: [{ role: 'user', text: 'diagnose' }],
       execution: { unattended: true, preApproved: false },
     }), expect.any(Function));
+  });
+
+  it('materializes only one missed fire after a prolonged outage', async () => {
+    const overdue = new Date('2026-07-29T01:00:00.000Z');
+    const resumedAt = new Date('2026-07-29T05:30:00.000Z');
+    const store = new MemorySchedulerStore([{ ...task, nextFireAt: overdue }]);
+    const startScheduledRun = vi.fn(async (_input, onStarted) => dispatchSucceeded('run-a', onStarted));
+    const runner = new SchedulerRunner({
+      store, dispatcher: { startScheduledRun }, boundRecovery: activeBoundRecovery, workerId: 'worker-a',
+    });
+
+    expect(await runner.tick(resumedAt, 10)).toBe(1);
+    expect(await runner.tick(resumedAt, 10)).toBe(0);
+    expect(startScheduledRun).toHaveBeenCalledOnce();
+    expect(startScheduledRun).toHaveBeenCalledWith(expect.objectContaining({ fireTime: overdue }), expect.any(Function));
   });
 
   it('does not dispatch the same fire time twice', async () => {
@@ -164,7 +315,7 @@ describe('SchedulerRunner', () => {
     expect(await runner.tick(new Date(fireTime.getTime() + 999), 10)).toBe(0);
     expect(await runner.tick(new Date(fireTime.getTime() + 1_000), 10)).toBe(1);
     expect(startScheduledRun).toHaveBeenCalledTimes(2);
-    expect((await store.listFires())[0]).toMatchObject({ state: 'started', runId: 'run-b', attempts: 2 });
+    expect((await store.listFires())[0]).toMatchObject({ state: 'completed', runId: 'run-b', attempts: 2 });
   });
 
   it('defers a bound fire after its Run result rejects and continues later fires', async () => {
@@ -197,7 +348,7 @@ describe('SchedulerRunner', () => {
       state: 'bound', retryAt: new Date(fireTime.getTime() + 100), lastError: String(resultError),
     });
     expect((await base.listFires()).find((fire) => fire.fireId.startsWith('task-b:'))).toMatchObject({
-      state: 'started', attempts: 1,
+      state: 'completed', attempts: 1,
     });
   });
 
@@ -226,7 +377,7 @@ describe('SchedulerRunner', () => {
       lastError: 'Error: temporary completion failure',
     });
     expect((await base.listFires()).find((fire) => fire.fireId.startsWith('task-b:'))).toMatchObject({
-      state: 'started', attempts: 1,
+      state: 'completed', attempts: 1,
     });
   });
 
@@ -242,7 +393,100 @@ describe('SchedulerRunner', () => {
     });
     expect(await runner.tick(recoveredAt, 10)).toBe(1);
     expect(startScheduledRun).toHaveBeenCalledOnce();
-    expect((await store.listFires())[0]).toMatchObject({ state: 'started', runId: 'run-recovered', attempts: 2 });
+    expect((await store.listFires())[0]).toMatchObject({ state: 'completed', runId: 'run-recovered', attempts: 2 });
+  });
+
+  it('counts an active bound fire against the shared batch limit', async () => {
+    const store = new MemorySchedulerStore([task, { ...task, taskId: 'task-b' }]);
+    const [claimed] = await store.claimDue({ now: fireTime, limit: 1, workerId: 'worker-a', leaseMs: 1 });
+    await store.bindRun({
+      fireId: claimed!.fireId,
+      claimToken: claimed!.claimToken,
+      runId: claimed!.fireId,
+      boundAt: fireTime,
+    });
+    const claimDue = vi.spyOn(store, 'claimDue');
+    const runner = new SchedulerRunner({
+      store,
+      dispatcher: { startScheduledRun: vi.fn() },
+      boundRecovery: activeBoundRecovery,
+      workerId: 'worker-b',
+      retryDelayMs: 100,
+    });
+
+    expect(await runner.tick(new Date(fireTime.getTime() + 2), 1)).toBe(0);
+    expect(claimDue).toHaveBeenLastCalledWith(expect.objectContaining({ limit: 0 }));
+  });
+
+  it.each(['active', 'waiting'] as const)('defers a %s bound fire before inspecting later candidates', async (kind) => {
+    const store = new MemorySchedulerStore([task]);
+    const [claimed] = await store.claimDue({ now: fireTime, limit: 1, workerId: 'worker-a', leaseMs: 1 });
+    await store.bindRun({ fireId: claimed!.fireId, claimToken: claimed!.claimToken, runId: claimed!.fireId, boundAt: fireTime });
+    const deferBound = vi.spyOn(store, 'deferBound');
+    const runner = new SchedulerRunner({
+      store,
+      dispatcher: { startScheduledRun: vi.fn() },
+      boundRecovery: { inspect: async () => ({ kind }), resume: vi.fn() },
+      workerId: 'worker-b',
+      retryDelayMs: 100,
+    });
+    const now = new Date(fireTime.getTime() + 2);
+
+    expect(await runner.tick(now, 1)).toBe(0);
+    expect(deferBound).toHaveBeenCalledWith({
+      fireId: claimed!.fireId,
+      claimToken: claimed!.claimToken,
+      retryAt: new Date(now.getTime() + 100),
+      error: `durable Run remains ${kind}`,
+    });
+    expect((await store.listFires())[0]).toMatchObject({
+      state: 'bound', runId: claimed!.fireId, attempts: 1,
+      retryAt: new Date(now.getTime() + 100),
+    });
+  });
+
+  it('lets a later recoverable bound fire advance while an older active fire is deferred', async () => {
+    const laterFireTime = new Date(fireTime.getTime() + 1);
+    const store = new MemorySchedulerStore([task, { ...task, taskId: 'task-b', nextFireAt: laterFireTime }]);
+    const claimed = await store.claimDue({ now: laterFireTime, limit: 2, workerId: 'worker-a', leaseMs: 1 });
+    for (const fire of claimed) {
+      await store.bindRun({
+        fireId: fire.fireId,
+        claimToken: fire.claimToken,
+        runId: fire.fireId,
+        boundAt: fireTime,
+      });
+    }
+    const inspect = vi.fn(async (fire: (typeof claimed)[number]) => (
+      fire.fireId.startsWith('task-a:')
+        ? { kind: 'active' as const }
+        : { kind: 'recoverable' as const }
+    ));
+    const resume = vi.fn(async (fire: (typeof claimed)[number]) => succeeded(fire.runId!).result);
+    const runner = new SchedulerRunner({
+      store,
+      dispatcher: { startScheduledRun: vi.fn() },
+      boundRecovery: { inspect: inspect as never, resume: resume as never },
+      workerId: 'worker-b',
+      retryDelayMs: 100,
+    });
+    const firstTickAt = new Date(fireTime.getTime() + 2);
+
+    expect(await runner.tick(firstTickAt, 1)).toBe(0);
+    expect(inspect).toHaveBeenCalledTimes(1);
+    expect(inspect.mock.calls[0]![0].fireId).toBe(claimed[0]!.fireId);
+    expect(resume).not.toHaveBeenCalled();
+
+    expect(await runner.tick(new Date(firstTickAt.getTime() + 1), 1)).toBe(1);
+    expect(inspect).toHaveBeenCalledTimes(2);
+    expect(inspect.mock.calls[1]![0].fireId).toBe(claimed[1]!.fireId);
+    expect(resume).toHaveBeenCalledOnce();
+    expect((await store.listFires()).find((fire) => fire.fireId === claimed[0]!.fireId)).toMatchObject({
+      state: 'bound', attempts: 1, retryAt: new Date(firstTickAt.getTime() + 100),
+    });
+    expect((await store.listFires()).find((fire) => fire.fireId === claimed[1]!.fireId)).toMatchObject({
+      state: 'completed', attempts: 1,
+    });
   });
 
   it('does not re-dispatch a durable Run bound before the worker crashed', async () => {
@@ -386,14 +630,14 @@ describe('SchedulerRunner', () => {
     }));
     expect(await durableStore.countAttempts({ tenantId: task.tenantId, runId })).toBe(2);
     expect((await schedulerStore.listFires())[0]).toMatchObject({
-      state: 'started', runId, attempts: 1, result: { runId, status: 'succeeded' },
+      state: 'completed', runId, attempts: 1, result: { runId, status: 'succeeded' },
     });
     abort.abort(new Error('test cleanup'));
     unblock();
     await firstTick.catch(() => undefined);
   });
 
-  it.each(['succeeded', 'failed', 'cancelled', 'recovery_required', 'waiting'] as const)(
+  it.each(['succeeded', 'failed', 'cancelled', 'recovery_required'] as const)(
     'completes a terminal bound Durable %s fire without dispatch or resume',
     async (status) => {
       const store = new MemorySchedulerStore([task]);
@@ -410,9 +654,84 @@ describe('SchedulerRunner', () => {
       expect(await runner.tick(new Date(fireTime.getTime() + 10), 1)).toBe(1);
       expect(startScheduledRun).not.toHaveBeenCalled();
       expect(resume).not.toHaveBeenCalled();
-      expect((await store.listFires())[0]).toMatchObject({ state: 'started', attempts: 1, result: { status } });
+      expect((await store.listFires())[0]).toMatchObject({ state: 'completed', attempts: 1, result: { status } });
     },
   );
+
+  it('runs the completion projection after recovering a terminal bound Fire', async () => {
+    const store = new MemorySchedulerStore([task]);
+    const [fire] = await store.claimDue({ now: fireTime, limit: 1, workerId: 'dead', leaseMs: 10 });
+    await store.bindRun({ fireId: fire!.fireId, claimToken: fire!.claimToken, runId: fire!.fireId, boundAt: fireTime });
+    const completed = vi.fn(async () => {});
+    const result = succeeded(fire!.fireId).result;
+    const runner = new SchedulerRunner({
+      store, dispatcher: { startScheduledRun: vi.fn() }, workerId: 'recovery', leaseMs: 10,
+      boundRecovery: { inspect: async () => ({ kind: 'terminal', result }), resume: vi.fn() }, completed,
+    });
+
+    await runner.tick(new Date(fireTime.getTime() + 10), 1);
+
+    expect(completed).toHaveBeenCalledWith(expect.objectContaining({
+      fireId: fire!.fireId, runId: fire!.fireId,
+    }), result);
+  });
+
+  it('preserves a waiting bound Fire without dispatch or completion', async () => {
+    const store = new MemorySchedulerStore([task]);
+    const [fire] = await store.claimDue({ now: fireTime, limit: 1, workerId: 'dead', leaseMs: 10 });
+    await store.bindRun({ fireId: fire!.fireId, claimToken: fire!.claimToken, runId: fire!.fireId, boundAt: fireTime });
+    const startScheduledRun = vi.fn();
+    const resume = vi.fn();
+    const runner = new SchedulerRunner({
+      store, dispatcher: { startScheduledRun }, workerId: 'observer', leaseMs: 10,
+      boundRecovery: { inspect: async () => ({ kind: 'waiting' }), resume },
+    });
+
+    expect(await runner.tick(new Date(fireTime.getTime() + 10), 1)).toBe(0);
+    expect(startScheduledRun).not.toHaveBeenCalled();
+    expect(resume).not.toHaveBeenCalled();
+    expect((await store.listFires())[0]).toMatchObject({ state: 'bound', runId: fire!.fireId });
+  });
+
+  it('releases a recovering Fire when resumed Run returns waiting', async () => {
+    const store = new MemorySchedulerStore([task]);
+    const [fire] = await store.claimDue({ now: fireTime, limit: 1, workerId: 'dead', leaseMs: 10 });
+    await store.bindRun({ fireId: fire!.fireId, claimToken: fire!.claimToken, runId: fire!.fireId, boundAt: fireTime });
+    const releaseBound = vi.spyOn(store, 'releaseBound');
+    const completeFire = vi.spyOn(store, 'completeFire');
+    const completed = vi.fn(async () => {});
+    const resumedWaiting = {
+      runId: fire!.fireId, status: 'waiting' as const,
+      usage: { inputTokens: 1, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+    };
+    const runner = new SchedulerRunner({
+      store,
+      dispatcher: { startScheduledRun: vi.fn() },
+      boundRecovery: {
+        inspect: async () => ({ kind: 'recoverable' }),
+        resume: async () => resumedWaiting,
+      },
+      workerId: 'recovery', leaseMs: 10, retryDelayMs: 125, completed,
+    });
+    const resumedAt = new Date(fireTime.getTime() + 10);
+
+    expect(await runner.tick(resumedAt, 1)).toBe(1);
+
+    const recoveryToken = releaseBound.mock.calls[0]![0].claimToken;
+    expect(recoveryToken).not.toBe(fire!.claimToken);
+    expect(releaseBound).toHaveBeenCalledWith({
+      fireId: fire!.fireId,
+      claimToken: recoveryToken,
+      retryAt: new Date(resumedAt.getTime() + 125),
+      error: 'durable Run remains waiting',
+    });
+    expect(completeFire).not.toHaveBeenCalled();
+    expect(completed).not.toHaveBeenCalled();
+    expect((await store.listFires())[0]).toMatchObject({
+      state: 'bound', runId: fire!.fireId, claimToken: recoveryToken,
+      retryAt: new Date(resumedAt.getTime() + 125), lastError: 'durable Run remains waiting',
+    });
+  });
 
   it('releases a bound resume race into a future observation window without a busy loop', async () => {
     const store = new MemorySchedulerStore([task]);
@@ -482,7 +801,7 @@ describe('SchedulerRunner', () => {
       state: 'bound', attempts: 1, retryAt: new Date(observedAt.getTime() + 100),
       lastError: 'Error: corrupt Durable binding',
     });
-    expect((await store.listFires()).filter((fire) => fire.state === 'started')).toHaveLength(2);
+    expect((await store.listFires()).filter((fire) => fire.state === 'completed')).toHaveLength(2);
 
     expect(await runner.tick(new Date(observedAt.getTime() + 99), 3)).toBe(0);
     expect(inspect).toHaveBeenCalledTimes(2);
@@ -543,7 +862,7 @@ describe('SchedulerRunner', () => {
     expect((await base.listFires()).find((candidate) => candidate.fireId === fire!.fireId))
       .toMatchObject({ state: 'recovering', attempts: 1 });
     expect((await base.listFires()).find((candidate) => candidate.fireId.startsWith('task-b:')))
-      .toMatchObject({ state: 'started', attempts: 1 });
+      .toMatchObject({ state: 'completed', attempts: 1 });
   });
 
   it('keeps a resume failure primary when releasing the recovery fence is stale', async () => {
@@ -760,7 +1079,7 @@ describe('SchedulerRunner', () => {
     });
   });
 
-  it('completes bound and recovering fires and fences started replays by Run identity', async () => {
+  it('completes bound and recovering fires and fences completed replays by Run identity', async () => {
     const boundStore = new MemorySchedulerStore([task]);
     const [boundFire] = await boundStore.claimDue({ now: fireTime, limit: 1, workerId: 'worker-a', leaseMs: 1_000 });
     await boundStore.bindRun({
@@ -779,7 +1098,7 @@ describe('SchedulerRunner', () => {
       ...completion, result: succeeded('different-result-run').result,
     })).rejects.toThrow();
     expect((await boundStore.listFires())[0]).toMatchObject({
-      state: 'started', runId: boundFire!.fireId,
+      state: 'completed', runId: boundFire!.fireId,
       result: { runId: boundFire!.fireId, status: 'succeeded' }, attempts: 1,
     });
 
@@ -798,7 +1117,7 @@ describe('SchedulerRunner', () => {
       result: succeeded(recovering!.runId).result, completedAt: fireTime,
     });
     expect((await recoveringStore.listFires())[0]).toMatchObject({
-      state: 'started', runId: recovering!.runId,
+      state: 'completed', runId: recovering!.runId,
       result: { runId: recovering!.runId, status: 'succeeded' }, attempts: 1,
     });
   });
@@ -965,26 +1284,20 @@ describe('scheduler runtime boundaries', () => {
     expect(MysqlSchedulerStore).toBeTypeOf('function');
   });
 
-  it('binds the durable Run and completes legacy history in separate MySQL transactions', async () => {
+  it('uses scheduler_fires as the only Fire lifecycle record', async () => {
     const source = await readFile(new URL('../../packages/scheduler-runtime/src/mysql.ts', import.meta.url), 'utf8');
     const bindRun = source.slice(source.indexOf('async bindRun'), source.indexOf('async completeFire'));
     const completeFire = source.slice(source.indexOf('async completeFire'), source.indexOf('async listBound'));
 
     expect(bindRun).toContain('transaction().execute');
-    expect(bindRun).toContain("insertInto('task_agent_runs')");
     expect(bindRun).toContain("updateTable('scheduler_fires')");
+    expect(bindRun).not.toContain('task_agent_runs');
     expect(completeFire).toContain('transaction().execute');
-    expect(completeFire).toContain("insertInto('task_runs')");
     expect(completeFire).toContain("updateTable('scheduler_fires')");
-    expect(completeFire).not.toContain("insertInto('task_agent_runs')");
-    expect(completeFire).toContain('onDuplicateKeyUpdate');
-    expect(completeFire).toContain('taskRunStatus(input.result)');
-    expect(completeFire).toContain('taskRunDetail(input.result)');
-    expect(completeFire).not.toContain("status: 'success', detail: input.runId");
-    const taskRunDetail = source.slice(
-      source.indexOf('function taskRunDetail'), source.indexOf('function parsePayload'),
-    );
-    expect(taskRunDetail).not.toContain('durableStatus');
+    expect(completeFire).not.toContain('task_runs');
+    expect(source).not.toContain('task_agent_runs');
+    expect(source).not.toContain('taskRunStatus');
+    expect(source).not.toContain('taskRunDetail');
   });
 
   it('MySQL persists bound Runs with exact-token recovery fencing', async () => {
@@ -1031,6 +1344,19 @@ describe('scheduler runtime boundaries', () => {
     expect(releaseFire).toContain("where('state', '=', 'claimed')");
   });
 
+  it('claims materialized pending fires without filtering the current task deletion state', async () => {
+    const mysqlSource = await readFile('packages/scheduler-runtime/src/mysql.ts', 'utf8');
+    const claimSection = mysqlSource.slice(
+      mysqlSource.indexOf("const rows = await tx.selectFrom('scheduler_fires')"),
+      mysqlSource.indexOf('const claimed: ClaimedScheduledFire[]'),
+    );
+
+    expect(claimSection).not.toContain("innerJoin('scheduled_tasks'");
+    expect(claimSection).not.toContain('scheduled_tasks.deleted_at');
+    expect(claimSection).toContain("where('state', '=', 'pending')");
+    expect(mysqlSource).not.toContain('.skipLocked()');
+  });
+
   it('dispatches product Runs without importing or entering the Pi loop', async () => {
     const sourceRoot = join(process.cwd(), 'packages/scheduler-runtime/src');
     const files = await sourceFiles(sourceRoot);
@@ -1055,7 +1381,7 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlSchedulerStore production 
     const insertTask = async (label: string): Promise<number> => {
       const inserted = await db.insertInto('scheduled_tasks').values({
         tenant_id: tenantId, user_id: 'user-a', session_id: `session-${label}`,
-        title: label, cron: '* * * * *', task: label, pre_approved: 1, enabled: 1,
+        title: label, cron: '* * * * *', timezone: 'UTC', task: label, pre_approved: 1, enabled: 1,
         next_run_at: fireAt, last_run_at: null,
       }).executeTakeFirstOrThrow();
       const id = Number(inserted.insertId);
@@ -1075,10 +1401,9 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlSchedulerStore production 
       expect(startScheduledRun).toHaveBeenCalledOnce();
       expect(await db.selectFrom('scheduler_fires').selectAll().where('task_id', '=', firstTaskId).execute())
         .toHaveLength(1);
-      expect(await db.selectFrom('task_agent_runs').selectAll().where('task_id', '=', firstTaskId).execute())
-        .toHaveLength(1);
-      expect(await db.selectFrom('task_runs').selectAll().where('task_id', '=', firstTaskId).execute())
-        .toEqual([expect.objectContaining({ status: 'success', run_id: expect.any(String), fire_id: expect.any(String) })]);
+      expect(await db.selectFrom('scheduler_fires').select(['state', 'run_id'])
+        .where('task_id', '=', firstTaskId).execute())
+        .toEqual([expect.objectContaining({ state: 'completed', run_id: expect.any(String) })]);
 
       const failedTaskId = await insertTask('retry');
       const retryDispatcher = vi.fn()
@@ -1108,8 +1433,6 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlSchedulerStore production 
       expect(recoveredDispatcher).toHaveBeenCalledOnce();
     } finally {
       if (taskIds.length) {
-        await db.deleteFrom('task_runs').where('task_id', 'in', taskIds).execute();
-        await db.deleteFrom('task_agent_runs').where('tenant_id', '=', tenantId).execute();
         await db.deleteFrom('scheduler_fires').where('tenant_id', '=', tenantId).execute();
         await db.deleteFrom('scheduled_tasks').where('tenant_id', '=', tenantId).execute();
       }
@@ -1131,7 +1454,7 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlSchedulerStore production 
     try {
       const inserted = await db.insertInto('scheduled_tasks').values({
         tenant_id: tenantId, user_id: 'user-a', session_id: 'session-bound', title: 'bound',
-        cron: '* * * * *', task: 'bound', pre_approved: 1, enabled: 1, next_run_at: fireAt, last_run_at: null,
+        cron: '* * * * *', timezone: 'UTC', task: 'bound', pre_approved: 1, enabled: 1, next_run_at: fireAt, last_run_at: null,
       }).executeTakeFirstOrThrow();
       taskId = Number(inserted.insertId);
       expect(await db.selectFrom('scheduled_tasks').select('id')
@@ -1201,11 +1524,10 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlSchedulerStore production 
         fireId: claimed!.fireId, claimToken: finalRecovery!.claimToken, runId: claimed!.fireId,
         result: succeeded(claimed!.fireId).result, completedAt: recoveryExpiredAt,
       })).resolves.toBeUndefined();
-      expect(await db.selectFrom('task_runs').selectAll().where('task_id', '=', taskId).execute()).toHaveLength(1);
+      expect(await db.selectFrom('scheduler_fires').selectAll().where('task_id', '=', taskId).execute())
+        .toEqual([expect.objectContaining({ state: 'completed', run_id: claimed!.fireId })]);
     } finally {
       if (taskId !== undefined) {
-        await db.deleteFrom('task_runs').where('task_id', '=', taskId).execute();
-        await db.deleteFrom('task_agent_runs').where('tenant_id', '=', tenantId).execute();
         await db.deleteFrom('scheduler_fires').where('tenant_id', '=', tenantId).execute();
         await db.deleteFrom('scheduled_tasks').where('tenant_id', '=', tenantId).execute();
       }

@@ -10,6 +10,7 @@ coverage/
 .idea/
 .codegraph/
 .worktrees/
+.playwright-mcp/
 .aios-team.txt
 __pycache__/
 *.py[cod]

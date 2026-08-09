@@ -3,11 +3,10 @@ import { readFile } from 'node:fs/promises';
 import { MemoryStore } from '../src/db/memory.js';
 import { MysqlStore } from '../src/db/mysql.js';
 import { MemorySchedulerStore } from '../packages/scheduler-runtime/src/index.js';
-import { Scheduler } from '../src/scheduler/ticker.js';
 import { isValidCron, nextRunAt } from '../src/scheduler/cron.js';
 import {
   createRuntimeScheduler,
-  createScheduledTaskRunner,
+  schedulerRetentionOptions,
   shouldEmbedScheduler,
   startRuntimeScheduler,
 } from '../src/scheduler/runner.js';
@@ -27,6 +26,16 @@ describe('cron', () => {
     expect(isValidCron('*/5 * * * *')).toBe(true);
     expect(isValidCron('nonsense')).toBe(false);
   });
+
+  it('computes a task cron in its IANA timezone across DST', () => {
+    const next = nextRunAt('0 2 * * *', new Date('2026-03-08T06:59:00Z'), 'America/New_York');
+    // 02:00 不存在的 spring-forward 日由 cron-parser 顺延至当地 03:00。
+    expect(next.toISOString()).toBe('2026-03-08T07:00:00.000Z');
+  });
+
+  it('rejects an invalid IANA timezone', () => {
+    expect(isValidCron('0 1 * * *', 'Not/A_Zone')).toBe(false);
+  });
 });
 
 describe('schedule tools', () => {
@@ -39,7 +48,27 @@ describe('schedule tools', () => {
 
     const ok = await schedule!.execute({ cron: '0 1 * * *', task: '巡检' }, ctx);
     expect(ok.isError).toBeFalsy();
-    expect(await store.listScheduledTasks(rctx)).toHaveLength(1);
+    expect(await store.listScheduledTasks(rctx)).toEqual([
+      expect.objectContaining({ timezone: 'UTC' }),
+    ]);
+  });
+
+  it('schedule tools persist and validate IANA task timezones', async () => {
+    const store = new MemoryStore();
+    const tools = buildScheduleTools(store);
+    const create = tools.find((tool) => tool.name === 'schedule_task')!;
+    const update = tools.find((tool) => tool.name === 'update_scheduled_task')!;
+
+    const invalid = await create.execute({ cron: '0 1 * * *', timezone: 'Not/A_Zone', task: '巡检' }, ctx);
+    expect(invalid.isError).toBe(true);
+    const created = await create.execute({ cron: '0 1 * * *', timezone: 'Asia/Shanghai', task: '巡检' }, ctx);
+    expect(created.isError).toBeFalsy();
+    const [task] = await store.listScheduledTasks(rctx);
+    expect(task!.timezone).toBe('Asia/Shanghai');
+
+    const updated = await update.execute({ id: task!.id, timezone: 'America/New_York' }, ctx);
+    expect(updated.isError).toBeFalsy();
+    expect((await store.getScheduledTask(rctx, task!.id))?.timezone).toBe('America/New_York');
   });
 
   it('only admins may create preApproved tasks', async () => {
@@ -93,17 +122,18 @@ describe('schedule tools', () => {
     expect(missing.isError).toBe(true);
   });
 
-  it('delete_scheduled_task removes the task and its runs', async () => {
+  it('delete_scheduled_task hides the task and preserves Fire history', async () => {
     const store = new MemoryStore();
     const tools = buildScheduleTools(store);
     const created = await store.createScheduledTask(rctx, { sessionId: 's1', cron: '0 1 * * *', task: 't' });
-    await store.recordTaskRun({ taskId: created.id, status: 'success', detail: 'ok' });
+    await store.createManualFire(rctx, created.id, 'history-key');
     const del = tools.find((t) => t.name === 'delete_scheduled_task')!;
 
     const ok = await del.execute({ id: created.id }, ctx);
     expect(ok.isError).toBeFalsy();
     expect(await store.listScheduledTasks(rctx)).toHaveLength(0);
-    expect(await store.listTaskRuns(rctx, created.id)).toHaveLength(0);
+    expect(await store.getScheduledTask(rctx, created.id)).toBeUndefined();
+    expect(await store.listScheduledExecutions(rctx, created.id)).toHaveLength(1);
 
     const missing = await del.execute({ id: created.id }, ctx);
     expect(missing.isError).toBe(true);
@@ -111,6 +141,14 @@ describe('schedule tools', () => {
 });
 
 describe('MemoryStore 定时任务 get/update/delete', () => {
+  it('rejects invalid cron at the Store boundary without writing a task', async () => {
+    const store = new MemoryStore();
+
+    await expect(store.createScheduledTask(rctx, { sessionId: 's1', cron: 'nope', task: 't' }))
+      .rejects.toThrow('非法 cron 表达式: nope');
+    expect(await store.listScheduledTasks(rctx)).toHaveLength(0);
+  });
+
   it('enforces tenant isolation', async () => {
     const store = new MemoryStore();
     const created = await store.createScheduledTask(rctx, { sessionId: 's1', cron: '0 1 * * *', task: 't' });
@@ -123,135 +161,16 @@ describe('MemoryStore 定时任务 get/update/delete', () => {
   });
 });
 
-describe('Scheduler', () => {
-  it('runs due tasks and records runs', async () => {
-    const store = new MemoryStore();
-    await store.createScheduledTask(rctx, { sessionId: 's1', cron: '* * * * *', task: 'do it' });
-    const runner = vi.fn(async () => ({ status: 'success' as const, detail: 'ok', steps: 2 }));
-
-    // 当前时间设在创建后 +1 分钟，使任务到点
-    const now = () => new Date(Date.now() + 90_000);
-    const sched = new Scheduler({ store, runner, now });
-
-    const handled = await sched.tick();
-
-    expect(handled).toBe(1);
-    expect(runner).toHaveBeenCalledOnce();
-    expect(runner).toHaveBeenCalledWith(expect.objectContaining({ task: 'do it', sessionId: 's1' }));
-    const runs = await store.listTaskRuns(rctx, 1);
-    expect(runs).toEqual([
-      expect.objectContaining({ id: 1, taskId: 1, status: 'success', detail: 'ok', steps: 2 }),
-    ]);
-    expect(runs[0]!.createdAt).toBeInstanceOf(Date);
-  });
-
-  it('does not run tasks that are not yet due', async () => {
-    const store = new MemoryStore();
-    await store.createScheduledTask(rctx, { sessionId: 's1', cron: '0 1 * * *', task: 'later' });
-    const runner = vi.fn(async () => ({ status: 'success' as const }));
-    // 不注入 now：用真实当前时间，距离次日 1 点尚未到点
-    const sched = new Scheduler({ store, runner });
-
-    expect(await sched.tick()).toBe(0);
-    expect(runner).not.toHaveBeenCalled();
-  });
-
-  it('concurrent ticks do not double-run a task', async () => {
-    const store = new MemoryStore();
-    await store.createScheduledTask(rctx, { sessionId: 's1', cron: '* * * * *', task: 't' });
-    const runner = vi.fn(async () => ({ status: 'success' as const }));
-    const now = () => new Date(Date.now() + 90_000);
-    const sched = new Scheduler({ store, runner, now });
-
-    const [a, b] = await Promise.all([sched.tick(), sched.tick()]);
-
-    expect(a + b).toBe(1); // 仅一次领取
-    expect(runner).toHaveBeenCalledOnce();
-  });
-
-  it('records error when runner throws', async () => {
-    const store = new MemoryStore();
-    await store.createScheduledTask(rctx, { sessionId: 's1', cron: '* * * * *', task: 't' });
-    const runner = vi.fn(async () => {
-      throw new Error('boom');
-    });
-    const now = () => new Date(Date.now() + 90_000);
-    const sched = new Scheduler({ store, runner, now });
-
-    await sched.tick();
-
-    const runs = await store.listTaskRuns(rctx, 1);
-    expect(runs[0]!.status).toBe('error');
-    expect(runs[0]!.detail).toContain('boom');
-  });
-});
-
-describe('createScheduledTaskRunner', () => {
-  it.each(['failed', 'cancelled', 'recovery_required', 'waiting'] as const)(
-    'records final durable %s state as a compatible error detail',
-    async (status) => {
-      const store = new MemoryStore();
-      await store.setSchedulerSettings({ tenantId: 't1' }, { maxRunMs: 5 * 60_000 });
-      const run = vi.fn(async () => ({
-        runId: `scheduled-${status}`, status: 'running' as const,
-        events: { async *[Symbol.asyncIterator]() {} },
-        result: async () => ({
-          runId: `scheduled-${status}`, status,
-          usage: { inputTokens: 1, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
-        }),
-      }));
-      const result = await createScheduledTaskRunner({ store, durableRunRuntime: { run } } as unknown as Runtime)({
-        id: 1, tenantId: 't1', userId: 'u1', sessionId: 'cron-sess', cron: '* * * * *',
-        title: '巡检', task: '巡检', preApproved: false, enabled: true, nextRunAt: new Date(),
-      });
-
-      expect(result.status).toBe('error');
-      expect(JSON.parse(result.detail ?? '{}')).toMatchObject({ runId: `scheduled-${status}`, status });
-    },
-  );
-
-  it('creates a product Run through DurableRunRuntime.run', async () => {
-    const store = new MemoryStore();
-    await store.setSchedulerSettings({ tenantId: 't1' }, { maxRunMs: 5 * 60_000 });
-    const run = vi.fn(async () => ({
-      runId: 'scheduled-run', status: 'running' as const,
-      events: { async *[Symbol.asyncIterator]() {} },
-      result: async () => ({
-        runId: 'scheduled-run', status: 'succeeded' as const,
-        usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
-      }),
-    }));
-    const rt = {
-      store,
-      durableRunRuntime: { run },
-    } as unknown as Runtime;
-
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date('2026-07-29T02:00:00.000Z'));
-    let result;
-    try {
-      result = await createScheduledTaskRunner(rt)({
-        id: 1, tenantId: 't1', userId: 'u1', sessionId: 'cron-sess',
-        cron: '* * * * *', title: '巡检', task: '巡检', preApproved: true, enabled: true,
-        nextRunAt: new Date('2026-07-29T01:00:00.000Z'),
-      });
-    } finally {
-      vi.useRealTimers();
-    }
-
-    expect(result.status).toBe('success');
-    expect(JSON.parse(result.detail ?? '{}')).toMatchObject({ runId: 'scheduled-run', status: 'succeeded' });
-    expect(run).toHaveBeenCalledWith(expect.objectContaining({
-      identity: { tenantId: 't1', actorId: 'u1', roles: ['user'] },
-      sessionId: 'cron-sess',
-      input: [{ role: 'user', text: '巡检' }],
-      execution: { unattended: true, preApproved: true },
-      limits: { deadlineAt: new Date('2026-07-29T02:05:00.000Z') },
-    }));
-  });});
 
 describe('embedded scheduler deployment', () => {
-  it('maps a waiting bound Durable Run to compatibility error detail without run or resume', async () => {
+  it('keeps completed Fire cleanup disabled unless retention is explicitly configured', () => {
+    expect(schedulerRetentionOptions({})).toBeUndefined();
+    expect(schedulerRetentionOptions({ AIOP_SCHEDULER_FIRE_RETENTION_DAYS: '30' })).toEqual({
+      retentionMs: 30 * 24 * 60 * 60 * 1000,
+      batch: 100,
+    });
+  });
+  it('keeps a waiting bound Durable Run bound without run or resume', async () => {
     const fireTime = new Date('2026-07-29T01:00:00.000Z');
     const schedulerStore = new MemorySchedulerStore([{
       taskId: 'task-waiting', tenantId: 'tenant-a', actorId: 'user-a', sessionId: 'session-a',
@@ -270,6 +189,7 @@ describe('embedded scheduler deployment', () => {
       status: 'waiting', usage: { inputTokens: 3, outputTokens: 2, cacheReadTokens: 1, cacheCreationTokens: 0 },
       updatedAt: fireTime, clearLease: true,
     });
+    expect((await store.getAgentRun({ tenantId: 'tenant-a', userId: 'user-a', role: 'user' }, fire!.fireId))?.status).toBe('waiting');
     const run = vi.fn();
     const resume = vi.fn();
     const scheduler = createRuntimeScheduler({
@@ -278,12 +198,11 @@ describe('embedded scheduler deployment', () => {
       store: schedulerStore, workerId: 'observer', leaseMs: 10, batch: 1,
     });
 
-    expect(await scheduler.tick(new Date(fireTime.getTime() + 10))).toBe(1);
+    expect(await scheduler.tick(new Date(fireTime.getTime() + 10))).toBe(0);
     expect(run).not.toHaveBeenCalled();
     expect(resume).not.toHaveBeenCalled();
     expect((await schedulerStore.listFires())[0]).toMatchObject({
-      state: 'started', runId: fire!.fireId,
-      result: { runId: fire!.fireId, status: 'waiting', usage: { inputTokens: 3, outputTokens: 2 } },
+      state: 'bound', runId: fire!.fireId,
     });
   });
 
@@ -315,7 +234,7 @@ describe('embedded scheduler deployment', () => {
 
     expect(await scheduler.tick(new Date(fireTime.getTime() + 10))).toBe(1);
     expect((await schedulerStore.listFires())[0]).toMatchObject({
-      state: 'started',
+      state: 'completed',
       result: {
         status: 'recovery_required',
         error: { code: 'TOOL_RESULT_UNKNOWN', message: 'tool result is unknown', retryable: false },
@@ -360,7 +279,7 @@ describe('embedded scheduler deployment', () => {
     const scheduler = createRuntimeScheduler({
       store: runtimeStore, durableRunRuntime: { run, resume },
     } as unknown as Runtime, {
-      store: schedulerStore, workerId: 'observer', leaseMs: 10, batch: 1,
+      store: schedulerStore, workerId: 'observer', leaseMs: 10, retryDelayMs: 0, batch: 1,
     });
 
     expect(await scheduler.tick(observedAt)).toBe(0);
@@ -375,14 +294,14 @@ describe('embedded scheduler deployment', () => {
       signal: expect.any(AbortSignal),
     });
     expect((await schedulerStore.listFires())[0]).toMatchObject({
-      state: 'started', result: { status: 'succeeded' },
+      state: 'completed', result: { status: 'succeeded' },
     });
   });
 
   it('awaits scheduler shutdown before disposing the runtime in production entrypoints', async () => {
     const source = await readFile('src/index.ts', 'utf8');
     expect(source).toContain('await scheduler?.stop()');
-    expect(source).toContain('await scheduler.stop()');
+    expect(source).not.toContain('runScheduler(');
   });
 
   it('aborts and awaits an in-flight tick before stopping permanently', async () => {

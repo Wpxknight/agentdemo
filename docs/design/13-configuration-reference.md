@@ -127,7 +127,19 @@ flowchart LR
 
 **非真实示例**：`MYSQL_PASSWORD_BASE64=<base64-encoded-password>`。
 
-## 5. 认证、JWT 与设置 Secret
+## 5. Scheduler
+
+**来源**：`src/scheduler/runner.ts`、`packages/scheduler-runtime/src/cron.ts`。
+
+| 环境变量 / 字段 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| 任务 `timezone` | IANA 时区字符串 | `UTC` | 定义任务 cron 的解释时区；HTTP、Tool 和 Store 均验证。DST 依 `cron-parser`。 |
+| `AIOP_SCHEDULER_FIRE_RETENTION_DAYS` | 正数天数 | 未设置（关闭） | 启用后删除该时间窗口之前、且仅为 `completed` 的 Fire。不会删除 Durable Run。 |
+| `AIOP_SCHEDULER_CLEANUP_BATCH` | 正整数 | `100` | 启用 Fire 清理时单 tick 最大删除条数；非法值回退 100。 |
+
+**保留约束**：由于 fresh baseline 已加入 `scheduled_tasks.timezone` 与 Fire retention 索引，已有数据库在部署前必须确认重建或已具备兼容 schema；迁移版本已记录的库不会因重跑 baseline 自动变更。
+
+## 6. 认证、JWT 与设置 Secret
 
 **来源**：`src/config/schema.ts`、`src/runtime.ts`、`src/security/secret-box.ts`、认证 providers。
 
@@ -297,8 +309,7 @@ flowchart LR
 
 | 配置键 / 环境变量 | 类型 | 必填条件 | 默认值 | 生效范围 | 敏感性 | 说明 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `AIOP_EMBED_SCHEDULER` | 字符串布尔 | 否 | disabled | `serve` | 普通 | 仅小写化后的 `true` 或 `1` 启用。 |
-| CLI `scheduler` | 入口参数 | standalone 模式 | 无 | 独立进程 | 普通 | `npm run scheduler` 总是启动 Scheduler。 |
+| `AIOP_EMBED_SCHEDULER` | 字符串布尔 | 否 | disabled | `serve` | 普通 | 仅小写化后的 `true` 或 `1` 启用。启用后手动 Fire 写入会 best-effort 唤醒本机 Worker。 |
 | tenant setting `maxRunMs` / API `max_run_minutes` | 正时长 | 否 | `4h` | tenant Scheduled Run deadline | 普通 | API 最小 1 分钟，取整后持久化。 |
 | loop `intervalMs` | 正常为 number option | 仅程序化注入/测试 | `30000` | Scheduler 实例 | 测试/内部 | 没有生产环境变量。 |
 | loop `batch` | number option | 程序化注入/测试 | `10` | 每 tick | 测试/内部 | 没有生产环境变量。 |
@@ -307,7 +318,7 @@ flowchart LR
 
 **组合约束**：生产 Scheduler assembly 要求 `MysqlStore`；MemoryStore 仅可通过测试显式注入 `SchedulerStore`。通用 K8s manifest 将 embedded=true 且 server replicas=2，这会启动两个竞争 lease 的 Scheduler；持久化/lease 正确性依赖 MySQL。dev/aiop manifest 当前 replicas=1。
 
-**失败/降级**：embedded/standalone 在非 MysqlStore 下创建 Scheduler 会失败；tick 错误记录日志并等待下一 tick。重复 tick 在同实例内被合并。
+**失败/降级**：内嵌 Scheduler 在非 MysqlStore 下创建会失败；tick 错误记录日志并等待下一 tick。重复 tick 在同实例内被合并。未启用嵌入式 Worker 时，手动 Fire 仍会持久化，但只能由其他可用 Worker 的轮询领取。
 
 **非真实示例**：`AIOP_EMBED_SCHEDULER=true`。
 
@@ -366,7 +377,7 @@ flowchart LR
 | --- | --- | --- | --- | --- | --- | --- |
 | backend `NODE_ENV` | Docker `ENV` | — | `production` | Node 运行时/依赖 | 普通 | Dockerfile 唯一显式 ENV；仓库业务代码无直接读取。 |
 | backend exposed port | 固定 | — | `8080` | image metadata | 普通 | K8s 实际后端通过 `PORT=8081` 监听；EXPOSE 不改变监听。 |
-| backend command | 固定 | — | `npm run serve` | container | 普通 | Scheduler 可用 command 覆盖为 `npm run scheduler`。 |
+| backend command | 固定 | — | `npm run serve` | container | 普通 | Scheduler 仅以 `AIOP_EMBED_SCHEDULER=true` 内嵌在服务进程中运行。 |
 | web base image | 固定 | — | `nginx:1.27-alpine` | image | 普通 | Nginx 官方 entrypoint 对 templates 做 envsubst。 |
 | Docker `ARG` | — | — | 当前无 | build | — | 两个主 Dockerfile 都没有 ARG。 |
 

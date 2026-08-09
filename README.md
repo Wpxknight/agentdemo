@@ -78,9 +78,8 @@ npm start -- seed-admin default admin 'change-this-password'
 
 | 模式 | 命令 | 用途 |
 | --- | --- | --- |
-| HTTP/SSE 服务 | `npm run serve` | 提供认证、Agent、管理 API 和流式事件 |
-| 开发监听 | `npm run dev -- serve` | 监听后端源码变化并重启服务 |
-| 独立调度器 | `npm run scheduler` | 领取并执行到期的 Cron 任务 |
+| HTTP/SSE 服务 | `AIOP_EMBED_SCHEDULER=true npm run serve` | 提供认证、Agent、管理 API、流式事件和内嵌 Scheduler |
+| 开发监听 | `AIOP_EMBED_SCHEDULER=true npm run dev -- serve` | 监听后端源码变化并重启服务，可内嵌 Scheduler |
 | CLI 单次任务 | `npm start -- "检查当前环境"` | 在本地直接执行一次 Agent 任务 |
 | 管理员引导 | `npm start -- seed-admin <tenant> <user> <password>` | 为 Local 认证创建首个平台管理员 |
 
