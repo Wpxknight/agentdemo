@@ -43,6 +43,7 @@ export interface PiAgentSessionFactoryOptions<
   repository: SessionRepo<TMetadata, TCreateOptions, TListOptions>;
   models: Models;
   model: Model<any>;
+  resolveModel?(): Model<any>;
   modelConcurrency?: ModelConcurrencyController;
   systemPrompt?: string;
   resolveSystemPrompt?(input: { execution?: RunExecutionProfile }): string | undefined;
@@ -127,11 +128,12 @@ export class PiAgentSessionFactory<
     const models = identity && this.options.modelConcurrency
       ? createConcurrentModels(this.options.models, this.options.modelConcurrency, identity)
       : this.options.models;
+    const model = this.options.resolveModel?.() ?? this.options.model;
     const systemPrompt = this.options.resolveSystemPrompt?.({ execution }) ?? this.options.systemPrompt;
     const harness = new AgentHarness({
       session,
       models,
-      model: this.options.model,
+      model,
       systemPrompt,
       tools: governedTools.tools,
       resources: this.options.resources,

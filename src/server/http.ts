@@ -1670,7 +1670,7 @@ async function handle(
     const current = await rt.store.getLlmSettings(ctx) ?? currentModelConfig(rt);
     const next = modelConfigFromBody(await readJson(req), current, rt.modelOptions);
     await rt.store.setLlmSettings(ctx, next);
-    if (rt.updateModel) rt.updateModel(next);
+    if (rt.updateModel) await rt.updateModel(next);
     else {
       rt.model = createModel(next.id, next);
       rt.modelConfig = { ...next };

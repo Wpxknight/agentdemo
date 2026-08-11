@@ -71,6 +71,7 @@ export interface PiAgentSessionFactoryOptions<TMetadata extends SessionMetadata,
     repository: SessionRepo<TMetadata, TCreateOptions, TListOptions>;
     models: Models;
     model: Model<any>;
+    resolveModel?(): Model<any>;
     modelConcurrency?: ModelConcurrencyController;
     systemPrompt?: string;
     resolveSystemPrompt?(input: {
@@ -494,6 +495,7 @@ import { DurableRunManager } from './manager.js';
 export interface MemoryDurablePiRuntimeOptions {
     models: Models;
     model: Model<any>;
+    resolveModel?: PiAgentSessionFactoryOptions<any, any, any>['resolveModel'];
     store?: MemoryRunStore;
     modelConcurrency?: PiAgentSessionFactoryOptions<any, any, any>['modelConcurrency'];
     systemPrompt?: string;
@@ -528,6 +530,7 @@ export interface MysqlDurablePiRuntimeOptions {
     store?: MysqlRunStore;
     models: Models;
     model: Model<any>;
+    resolveModel?: PiAgentSessionFactoryOptions<any, any, any>['resolveModel'];
     modelConcurrency?: PiAgentSessionFactoryOptions<any, any, any>['modelConcurrency'];
     systemPrompt?: string;
     resolveSystemPrompt?: PiAgentSessionFactoryOptions<any, any, any>['resolveSystemPrompt'];

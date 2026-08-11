@@ -153,7 +153,7 @@ export interface Runtime {
   model: ChatModel;
   modelConfig?: RuntimeModelConfig;
   modelOptions?: RuntimeModelConfig[];
-  updateModel?(config: RuntimeModelConfig): void;
+  updateModel?(config: RuntimeModelConfig): void | Promise<void>;
   /** 当前生效的非敏感 Sandbox 设置。 */
   sandboxSettings?: SandboxConnectionInfo;
   /** 页面读取的平台级设置状态，不返回完整 Key 或密文。 */
@@ -313,38 +313,9 @@ async function createDefaultDurableRunAssembly(
   policyPreApproved = policy,
 ) {
   if (!enabled) throw new Error('DurableRunRuntime is mandatory and cannot be disabled');
-  const targetApi = modelConfig.protocol === 'anthropic' ? 'anthropic-messages' : 'openai-completions';
-  const provider = builtinProviders().find((candidate) => candidate.getModels().some((model) => model.api === targetApi));
-  const template = provider?.getModels().find((model) => model.api === targetApi);
-  if (!provider || !template) throw new Error(`Pi provider unavailable for protocol: ${modelConfig.protocol}`);
-  const providerId = `aiop-${modelConfig.protocol}`;
   const credentials = new InMemoryCredentialStore();
-  await credentials.modify(providerId, async () => ({ type: 'api_key', key: modelConfig.apiKey }));
   const models = createModels({ credentials });
-  const pricing = modelConfig.pricing;
-  const model: PiModel<Api> = {
-    ...template,
-    id: modelConfig.model,
-    name: modelConfig.id,
-    provider: providerId,
-    baseUrl: modelConfig.baseURL,
-    headers: { ...template.headers, ...llmTlsHeaders(modelConfig.allowInsecureTls) },
-    contextWindow: modelConfig.contextWindowTokens ?? template.contextWindow,
-    cost: pricing ? {
-      input: pricing.input,
-      output: pricing.output,
-      cacheRead: pricing.cacheRead ?? pricing.input,
-      cacheWrite: pricing.cacheWrite ?? pricing.input,
-    } : template.cost,
-  };
-  const configuredProvider: PiProvider = {
-    ...provider,
-    id: providerId,
-    name: `AIOP ${modelConfig.protocol}`,
-    baseUrl: modelConfig.baseURL,
-    getModels: () => [model],
-  };
-  models.setProvider(configuredProvider);
+  let currentModel = await configureDurableModel(models, credentials, modelConfig);
   const modelConcurrency = new FifoModelConcurrencyController({
     maxConcurrentPerTenantModel: positiveIntegerEnv(
       process.env.AIOP_PI_MAX_CONCURRENT_MODEL_CALLS,
@@ -359,7 +330,7 @@ async function createDefaultDurableRunAssembly(
   ));
   const runtimeStore = store.durableRunStore();
   const assemblyOptions = {
-    models, model, modelConcurrency, systemPrompt,
+    models, model: currentModel, resolveModel: () => currentModel, modelConcurrency, systemPrompt,
     resolveSystemPrompt: ({ execution }: { execution?: RunExecutionProfile }) =>
       resolveRuntimeSystemPrompt(systemPrompt, execution),
     resolveTools: async ({ identity, sessionId, events, interactionResolution, execution }: {
@@ -424,7 +395,52 @@ async function createDefaultDurableRunAssembly(
   const assembly = store instanceof MysqlStore
     ? createMysqlDurablePiRuntime({ db: store.database(), store: runtimeStore as import('@aiop/pi-runtime').MysqlRunStore, ...assemblyOptions })
     : createMemoryDurablePiRuntime({ store: runtimeStore as import('@aiop/pi-runtime').MemoryRunStore, ...assemblyOptions });
-  return { ...assembly, modelConcurrency, toolConcurrency };
+  return {
+    ...assembly,
+    modelConcurrency,
+    toolConcurrency,
+    async updateModel(next: RuntimeModelConfig) {
+      currentModel = await configureDurableModel(models, credentials, next);
+    },
+  };
+}
+
+async function configureDurableModel(
+  models: ReturnType<typeof createModels>,
+  credentials: InMemoryCredentialStore,
+  modelConfig: RuntimeModelConfig,
+): Promise<PiModel<Api>> {
+  const targetApi = modelConfig.protocol === 'anthropic' ? 'anthropic-messages' : 'openai-completions';
+  const provider = builtinProviders().find((candidate) => candidate.getModels().some((model) => model.api === targetApi));
+  const template = provider?.getModels().find((model) => model.api === targetApi);
+  if (!provider || !template) throw new Error(`Pi provider unavailable for protocol: ${modelConfig.protocol}`);
+  const providerId = `aiop-${modelConfig.protocol}`;
+  await credentials.modify(providerId, async () => ({ type: 'api_key', key: modelConfig.apiKey }));
+  const pricing = modelConfig.pricing;
+  const model: PiModel<Api> = {
+    ...template,
+    id: modelConfig.model,
+    name: modelConfig.id,
+    provider: providerId,
+    baseUrl: modelConfig.baseURL,
+    headers: { ...template.headers, ...llmTlsHeaders(modelConfig.allowInsecureTls) },
+    contextWindow: modelConfig.contextWindowTokens ?? template.contextWindow,
+    cost: pricing ? {
+      input: pricing.input,
+      output: pricing.output,
+      cacheRead: pricing.cacheRead ?? pricing.input,
+      cacheWrite: pricing.cacheWrite ?? pricing.input,
+    } : template.cost,
+  };
+  const configuredProvider: PiProvider = {
+    ...provider,
+    id: providerId,
+    name: `AIOP ${modelConfig.protocol}`,
+    baseUrl: modelConfig.baseURL,
+    getModels: () => [model],
+  };
+  models.setProvider(configuredProvider);
+  return model;
 }
 
 function positiveIntegerEnv(value: string | undefined, name: string, fallback: number): number {
@@ -1029,7 +1045,8 @@ export async function buildRuntime(
     model,
     modelConfig,
     modelOptions,
-    updateModel(next: RuntimeModelConfig) {
+    async updateModel(next: RuntimeModelConfig) {
+      await defaultDurableAssembly?.updateModel(next);
       runtime.model = createModel(next.id, next);
       runtime.modelConfig = { ...next };
     },
