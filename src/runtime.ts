@@ -511,8 +511,13 @@ export async function buildRuntime(
   if (!jwtSecretEnv) logger.warn('AIOP_JWT_SECRET 未设置，使用开发占位密钥（勿用于生产）');
   const jwtSecret = jwtSecretEnv ?? 'dev-insecure-secret';
 
+  const deploymentMode = config.deploymentMode ?? 'standalone';
+  const providerKind = config.auth?.provider ?? 'local';
   const mysqlConfig = readMysqlConfig();
-  const store = options.store ?? await createStore(mysqlConfig);
+  const store = options.store ?? await createStore(mysqlConfig, {
+    deploymentMode,
+    authProvider: providerKind,
+  });
   const skillMutationLock = mysqlConfig && store instanceof MysqlStore
     ? new MysqlSkillMutationLock(createMysqlPool(mysqlConfig))
     : undefined;
@@ -532,7 +537,6 @@ export async function buildRuntime(
   if (skillImportPermitLock) initializationCleanups.push(() => skillImportPermitLock.close());
   try {
   const logSink = new LogAuditSink();
-  const deploymentMode = config.deploymentMode ?? 'standalone';
   const audit: AuditSink = {
     async record(e) {
       const enriched = { deploymentMode, ...e };
@@ -859,7 +863,6 @@ export async function buildRuntime(
 
   // 认证 Provider 由部署模式显式决定，非法组合由 ConfigSchema 失败关闭。
   const ttl = config.auth?.jwtTtl;
-  const providerKind = config.auth?.provider ?? 'local';
   let authProvider: AuthProvider;
   let aiosAuth: AiosAuthProvider | undefined;
   if (providerKind === 'oidc') {

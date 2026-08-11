@@ -11,6 +11,9 @@ spec:
   template:
     metadata:
       labels: { app: aiop, component: server }
+      annotations:
+        aiop.bocloud.com/schema-compatibility: positive-user-ids-v1
+        aiop.bocloud.com/deployment-mode: aios-integrated
     spec:
       securityContext:
         fsGroup: 1000

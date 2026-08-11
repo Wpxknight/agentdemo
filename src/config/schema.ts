@@ -214,10 +214,7 @@ export const AiosFieldMapSchema = z.object({
   roles: z.string().default('roles'),
 });
 
-/**
- * AIOS 嵌入登录（token exchange）配置。配置即启用（与 local/oidc 并存，aiop 用户体系不依赖它）。
- * 见 docs/DESIGN-aios-integration.md §2。
- */
+/** AIOS direct identity/token exchange 配置；仅 aios-integrated + provider=aios 使用。 */
 export const AiosConfigSchema = z
   .object({
     /** token 校验方式：userinfo=回调 AIOS 用户信息接口；jwks=本地验签（AIOS token 是标准 JWT 时）。 */
@@ -261,7 +258,7 @@ export const AuthConfigSchema = z.object({
   /** 本地开发/部署引导管理员；仅 local 认证模式生效，已存在则跳过。 */
   bootstrapAdmin: BootstrapAdminSchema.optional(),
   oidc: OidcConfigSchema.optional(),
-  /** AIOS 嵌入登录；配置即在 provider 之外追加启用（token exchange 通道）。 */
+  /** AIOS direct identity 配置；仅 auth.provider=aios 时启用。 */
   aios: AiosConfigSchema.optional(),
 });
 
@@ -373,6 +370,12 @@ export const ConfigSchema = z.object({
   }
   if (provider === 'aios' && !value.auth?.aios) {
     ctx.addIssue({ code: 'custom', path: ['auth', 'aios'], message: 'auth.provider=aios requires auth.aios' });
+  }
+  if (provider !== 'aios' && value.auth?.aios) {
+    ctx.addIssue({
+      code: 'custom', path: ['auth', 'aios'],
+      message: 'auth.aios is only valid with auth.provider=aios in aios-integrated mode',
+    });
   }
 });
 

@@ -37,6 +37,16 @@ describe('dual deployment identity configuration', () => {
   it('requires an explicit provider in integrated mode', () => {
     expect(() => config('"deploymentMode":"aios-integrated","auth":{}')).toThrow(/provider/);
   });
+
+  it.each(['local', 'oidc'] as const)('rejects ignored auth.aios alongside %s', (provider) => {
+    const oidc = provider === 'oidc'
+      ? ',"oidc":{"issuer":"https://idp.example.com","clientId":"aiop","redirectUri":"https://app/cb","mapping":{}}'
+      : '';
+    expect(() => config(
+      `"deploymentMode":"standalone","auth":{"provider":"${provider}"${oidc},`
+      + '"aios":{"verify":"userinfo","userinfoUrl":"https://aios.example.com/userinfo"}}',
+    )).toThrow(/auth\.aios.*provider=aios/);
+  });
 });
 
 describe('OIDC public origin configuration', () => {

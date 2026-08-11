@@ -90,10 +90,12 @@ image-check: verify-web-core-package
 
 deploy-standalone:
 	@test "$(DEPLOYMENT_MODE)" = "standalone" || (printf '%s\n' 'Set DEPLOYMENT_MODE=standalone' >&2; exit 1)
-	$(MAKE) deploy-aiop
+	@test "$(AUTH_PROVIDER)" = "local" -o "$(AUTH_PROVIDER)" = "oidc" || (printf '%s\n' 'Set AUTH_PROVIDER=local or AUTH_PROVIDER=oidc' >&2; exit 1)
+	$(MAKE) deploy-aiop DEPLOYMENT_MODE=standalone AUTH_PROVIDER=$(AUTH_PROVIDER)
 
 deploy-aios-integrated:
 	@test "$(DEPLOYMENT_MODE)" = "aios-integrated" || (printf '%s\n' 'Set DEPLOYMENT_MODE=aios-integrated' >&2; exit 1)
+	$(MAKE) check-user-id-migration DEPLOYMENT_MODE=aios-integrated AUTH_PROVIDER=aios
 	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) get secret aiop-secrets -o name >/dev/null
 	$(AIOP_KUBECTL) apply -f deploy/aiop/configmap-aios-integrated.yaml
 	$(AIOP_KUBECTL) apply -f deploy/aiop/pvc-skills.yaml
@@ -154,6 +156,9 @@ rollback-staging:
 	$(KUBECTL) -n aiop-dev rollout status deployment/aiop-server --timeout=180s
 
 deploy-aiop:
+	@test "$(DEPLOYMENT_MODE)" = "standalone" || (printf '%s\n' 'Set DEPLOYMENT_MODE=standalone' >&2; exit 1)
+	@test "$(AUTH_PROVIDER)" = "local" -o "$(AUTH_PROVIDER)" = "oidc" || (printf '%s\n' 'Set AUTH_PROVIDER=local or AUTH_PROVIDER=oidc' >&2; exit 1)
+	$(MAKE) check-user-id-migration DEPLOYMENT_MODE=standalone AUTH_PROVIDER=$(AUTH_PROVIDER)
 	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) get secret aiop-secrets -o name >/dev/null
 	$(AIOP_KUBECTL) apply -f deploy/aiop/configmap.yaml
 	$(AIOP_KUBECTL) apply -f deploy/aiop/pvc-skills.yaml
@@ -188,5 +193,5 @@ deploy-aiop-staging-fresh:
 	IMAGE_TAG=$(IMAGE_TAG) AIOP_KUBECONFIG=$(AIOP_KUBECONFIG) AIOP_NAMESPACE=$(AIOP_NAMESPACE) ./scripts/deploy-aiop-staging-fresh.sh
 
 rollback-aiop:
-	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) rollout undo deployment/aiop-server $(ROLLBACK_TO_REVISION)
-	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) rollout status deployment/aiop-server --timeout=300s
+	AIOP_KUBECONFIG=$(AIOP_KUBECONFIG) AIOP_NAMESPACE=$(AIOP_NAMESPACE) KUBECTL=$(KUBECTL) \
+		ROLLBACK_REVISION=$(ROLLBACK_REVISION) ./scripts/rollback-aiop-compatible.sh

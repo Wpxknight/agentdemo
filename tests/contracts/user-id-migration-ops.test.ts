@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 
 const scriptUrl = new URL('../../scripts/migrate-user-id-staging.sh', import.meta.url);
+const rollbackScriptUrl = new URL('../../scripts/rollback-aiop-compatible.sh', import.meta.url);
 
 function position(source: string, marker: string): number {
   const value = source.indexOf(`migration-step:${marker}`);
@@ -65,5 +66,28 @@ describe('staging user-id migration operational contract', () => {
     expect(source.indexOf('Deployment environment annotation mismatch')).toBeLessThan(scale);
     expect(source.indexOf('Deployment database annotation mismatch')).toBeLessThan(scale);
     expect(source).toContain('Deployment replicas mismatch');
+  });
+});
+
+describe('AIoP rollback compatibility contract', () => {
+  it('dry-runs the target revision and rejects schema or ConfigMap mode mismatches', async () => {
+    const source = await readFile(rollbackScriptUrl, 'utf8');
+    expect(source).toContain('rollout undo deployment/aiop-server');
+    expect(source.match(/--dry-run=server/g)).toHaveLength(2);
+    expect(source).toContain('schema-compatibility');
+    expect(source).toContain('positive-user-ids-v1');
+    expect(source).toContain('configmap/aiop-config');
+    expect(source).toContain('target_mode" != "$config_mode');
+    expect(source.indexOf('target_schema=')).toBeLessThan(source.lastIndexOf('kube rollout undo deployment/aiop-server'));
+  });
+
+  it('marks both deployment modes with the same schema compatibility and explicit mode', async () => {
+    const standalone = await readFile(new URL('../../deploy/aiop/deployment.yaml', import.meta.url), 'utf8');
+    const integrated = await readFile(new URL('../../deploy/aiop/deployment-aios-integrated.yaml', import.meta.url), 'utf8');
+    for (const manifest of [standalone, integrated]) {
+      expect(manifest).toContain('aiop.bocloud.com/schema-compatibility: positive-user-ids-v1');
+    }
+    expect(standalone).toContain('aiop.bocloud.com/deployment-mode: standalone');
+    expect(integrated).toContain('aiop.bocloud.com/deployment-mode: aios-integrated');
   });
 });

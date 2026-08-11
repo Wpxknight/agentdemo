@@ -282,7 +282,7 @@ describe('MemoryStore', () => {
 // 集成测试：仅在配置了真实 MySQL 时运行（如 docker）。
 describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlStore (integration)', () => {
   it('migrates and roundtrips messages + audit', async () => {
-    const store = await createStore(readMysqlConfig());
+    const store = await createStore(readMysqlConfig(), { deploymentMode: 'standalone', authProvider: 'local' });
     const sid = `it-${Date.now()}`;
     const ctx: RequestContext = { tenantId: 'it', userId: 'u', role: 'user' };
     await store.appendMessage(ctx, sid, { role: 'user', text: 'ping' });
@@ -295,7 +295,7 @@ describe.runIf(Boolean(process.env.MYSQL_HOST))('MysqlStore (integration)', () =
   });
 
   it('projects explicit scheduler Fire lifecycle and tenant-scoped Durable Run data', async () => {
-    const store = await createStore(readMysqlConfig());
+    const store = await createStore(readMysqlConfig(), { deploymentMode: 'standalone', authProvider: 'local' });
     const mysqlStore = store as import('../src/db/mysql.js').MysqlStore;
     const db = mysqlStore.database();
     const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`;

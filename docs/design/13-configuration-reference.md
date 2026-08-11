@@ -166,20 +166,22 @@ flowchart LR
 | `auth.oidc.mapping.roleClaim` | 字符串 | 否 | 无 | claims 映射 | 普通 | 值可为 string/string[]。 |
 | `auth.oidc.mapping.roleMap` | map | 否 | 无 | claims 映射 | 普通 | IdP 值映射本系统角色。 |
 | `auth.oidc.mapping.defaultRole` | role | 否 | `user` | claims 映射 | 普通 | — |
-| `auth.aios.verify` | `userinfo/jwks` | 否 | `userinfo` | AIOS token exchange | 普通 | 与 local/OIDC 并存。 |
+| `auth.aios.verify` | `userinfo/jwks` | `provider=aios` | `userinfo` | AIOS token exchange | 普通 | 仅 `aios-integrated + provider=aios` 有效；与 local/OIDC 配置并存会被 schema 拒绝。 |
 | `auth.aios.userinfoUrl` | 字符串 | `verify=userinfo` | 无 | AIOS | 普通 | 缺失导致 schema 失败。 |
 | `auth.aios.systemId` | 字符串 | 否 | `1` | userinfo 请求 | 普通 | — |
 | `auth.aios.jwks.url` | 字符串 | `verify=jwks` | 无 | AIOS | 普通 | `jwks` 对象缺失导致 schema 失败。 |
 | `auth.aios.jwks.issuer` / `audience` | 字符串 | 否 | 无 | 本地 JWT 校验 | 普通 | 配置时增加 issuer/audience 校验。 |
-| `auth.aios.tenantId` | 字符串 | 否 | `default` | AIOS 用户落租户 | 普通 | — |
+| `auth.aios.tenantId` | 字符串 | 否 | `default` | AIOS 用户租户 | 普通 | 未配置 `fields.tenantId` 时作为服务端固定租户。 |
 | `auth.aios.allowedParentOrigins` | string[] | 否 | `[]` | 后端直出 `index.html` 的 CSP `frame-ancestors` | 安全配置 | 仅限制哪些 origin 可嵌入后端直出的页面；不参与前端 `postMessage` 消息校验。与 Web 容器 `AIOP_FRAME_ANCESTORS` 是两个独立 CSP 配置面。 |
-| `auth.aios.fields.userId` | 点路径 | 否 | `userId` | userinfo 映射 | 普通 | 应指向稳定唯一 ID。 |
+| `auth.aios.fields.userId` | 点路径 | 否 | `accountId` | userinfo 映射 | 普通 | 必须指向规范正整数 accountId。 |
+| `auth.aios.fields.tenantId` | 点路径 | 否 | 无 | userinfo 映射 | 普通 | 配置后覆盖固定 `auth.aios.tenantId`。 |
+| `auth.aios.fields.status` | 点路径 | 否 | `status` | userinfo 映射 | 普通 | 只接受 `active/disabled`，缺失或非法时 fail closed。 |
 | `auth.aios.fields.displayName` | 点路径 | 否 | `displayName` | userinfo 映射 | 普通 | — |
 | `auth.aios.fields.roles` | 点路径 | 否 | `roles` | userinfo 映射 | 普通 | — |
 | `auth.aios.adminRoles` | string[] | 否 | `[]` | AIOS role 映射 | 普通 | 命中只映射 `tenant_admin`，不会成为 `platform_admin`。 |
 | `auth.aios.credentialTtlMs` | 正整数毫秒 | 否 | `12h` | AIOS 下游凭据缓存兜底 | 普通 | 仅 AIOS 未返回过期时间时使用。 |
 
-**优先级**：AIOS 是附加登录通道，不覆盖 `auth.provider`。后端 `allowedParentOrigins` 不读取 Nginx 环境变量；Web CSP 也不读取 JSONC。两者都只配置 CSP `frame-ancestors`，不是 `postMessage` 来源白名单。
+**优先级**：AIOS 是 `aios-integrated` 的唯一主认证 Provider，不再作为 Local/OIDC 的附加登录通道。后端 `allowedParentOrigins` 不读取 Nginx 环境变量；Web CSP 也不读取 JSONC。
 
 **嵌入消息边界**：当前 Web `message` listener 只检查 payload 的 `type/token`，未校验 `event.origin` 或 `event.source`；向父窗口发送 `aiop:ready` 时使用 `targetOrigin="*"`。因此 CSP 允许谁嵌入与消息接收方校验并未闭环，不能把 `allowedParentOrigins` 描述为 postMessage 安全校验。
 

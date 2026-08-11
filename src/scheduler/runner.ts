@@ -79,6 +79,8 @@ export function createRuntimeScheduler(
     observer: options.observer ?? schedulerObserver(),
     prepareRun: async (fire, now) => {
       if (rt.deploymentMode === 'aios-integrated') {
+        // TODO(aios-token-renewal): 接入 AIOS 内部受控续约接口后，在这里按 tenantId + actorId
+        // 加载/续约用户 Token、复核账号状态，并以 CAS/互斥避免并发续约覆盖；完成前禁止离线代跑。
         throw new TerminalScheduledFireError('aios_offline_scheduling_unavailable');
       }
       if (rt.deploymentMode === 'standalone') {

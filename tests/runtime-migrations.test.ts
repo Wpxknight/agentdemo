@@ -2,10 +2,54 @@ import { mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { runMigrations, runPositiveUserIdMigration } from '../src/db/index.js';
+import {
+  assertIdentityModeCompatibility,
+  runMigrations,
+  runPositiveUserIdMigration,
+} from '../src/db/index.js';
 import { verifyBackupChecksum } from '../scripts/verify-backup-checksum.js';
 
 const migrations = new URL('../src/db/migrations/', import.meta.url);
+
+function fakeIdentityModePool(counts: number[]) {
+  const seen: string[] = [];
+  let index = 0;
+  const connection = {
+    async query(sql: string) {
+      seen.push(sql);
+      return [[{ count: counts[index++] ?? 0 }], []];
+    },
+    release() {},
+  };
+  return {
+    pool: { promise: () => ({ getConnection: async () => connection }) },
+    seen,
+  };
+}
+
+describe('deployment identity database gate', () => {
+  it('rejects mounting a standalone user database as AIOS direct identity', async () => {
+    const { pool } = fakeIdentityModePool([1]);
+    await expect(assertIdentityModeCompatibility(pool as never, {
+      deploymentMode: 'aios-integrated', authProvider: 'aios',
+    })).rejects.toThrow(/another identity namespace/);
+  });
+
+  it('rejects direct or unmapped business identities in standalone mode', async () => {
+    const { pool } = fakeIdentityModePool([0, 0, 1]);
+    await expect(assertIdentityModeCompatibility(pool as never, {
+      deploymentMode: 'standalone', authProvider: 'local',
+    })).rejects.toThrow(/messages\.user_id.*direct or unmapped identities/);
+  });
+
+  it('accepts a clean database for the selected identity mode', async () => {
+    const { pool, seen } = fakeIdentityModePool(Array(9).fill(0));
+    await expect(assertIdentityModeCompatibility(pool as never, {
+      deploymentMode: 'standalone', authProvider: 'oidc',
+    })).resolves.toBeUndefined();
+    expect(seen).toHaveLength(9);
+  });
+});
 
 function fakeIdentityConnection(options: {
   usersType: string;

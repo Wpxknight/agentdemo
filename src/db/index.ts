@@ -4,6 +4,7 @@ import { createPool } from 'mysql2';
 import type { Pool } from 'mysql2';
 import { logger } from '../logger.js';
 import type { MysqlConfig } from '../config/mysql.js';
+import type { AuthProviderKind, DeploymentMode } from '../auth/types.js';
 import type { Database } from './schema.js';
 import type { Store } from './store.js';
 import { MysqlStore } from './mysql.js';
@@ -227,15 +228,106 @@ export async function runMigrations(pool: Pool): Promise<void> {
   }
 }
 
-/** 按配置创建 Store：有 MySQL 则迁移+MysqlStore，否则回落 MemoryStore。 */
-export async function createStore(cfg: MysqlConfig | undefined): Promise<Store> {
+export interface IdentityModeCompatibility {
+  deploymentMode: DeploymentMode;
+  authProvider: AuthProviderKind;
+}
+
+async function assertExistingIdentitySourceCompatibility(
+  pool: Pool,
+  identity: IdentityModeCompatibility,
+): Promise<void> {
+  const conn = await pool.promise().getConnection();
+  try {
+    const [tableRows] = await conn.query(
+      "SELECT COUNT(*) count FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='users'",
+    );
+    if (Number((tableRows as Array<{ count: string | number }>)[0]?.count ?? 0) === 0) return;
+    const expectedProvider = identity.deploymentMode === 'aios-integrated' ? undefined : identity.authProvider;
+    const [userRows] = await conn.query(
+      expectedProvider
+        ? 'SELECT COUNT(*) count FROM users WHERE auth_provider <> ?'
+        : "SELECT COUNT(*) count FROM users WHERE auth_provider IN ('local','oidc','aios')",
+      expectedProvider ? [expectedProvider] : [],
+    );
+    const incompatibleUsers = BigInt(String((userRows as Array<{ count: string | number }>)[0]?.count ?? 0));
+    if (incompatibleUsers !== 0n) {
+      throw new Error(
+        `Database identity mode is incompatible with ${identity.deploymentMode}/${identity.authProvider}: `
+        + `${incompatibleUsers} user rows belong to another identity namespace`,
+      );
+    }
+  } finally {
+    conn.release();
+  }
+}
+
+/**
+ * 业务数据只以 tenant_id + user_id 归属；因此本地/OIDC 用户和 AIOS direct accountId
+ * 不能在未经显式数据迁移的情况下复用同一数据库。
+ */
+export async function assertIdentityModeCompatibility(
+  pool: Pool,
+  identity: IdentityModeCompatibility,
+): Promise<void> {
+  const conn = await pool.promise().getConnection();
+  try {
+    const expectedProvider = identity.deploymentMode === 'aios-integrated' ? undefined : identity.authProvider;
+    const [userRows] = await conn.query(
+      expectedProvider
+        ? 'SELECT COUNT(*) count FROM users WHERE auth_provider <> ?'
+        : "SELECT COUNT(*) count FROM users WHERE auth_provider IN ('local','oidc','aios')",
+      expectedProvider ? [expectedProvider] : [],
+    );
+    const incompatibleUsers = BigInt(String((userRows as Array<{ count: string | number }>)[0]?.count ?? 0));
+    if (incompatibleUsers !== 0n) {
+      throw new Error(
+        `Database identity mode is incompatible with ${identity.deploymentMode}/${identity.authProvider}: `
+        + `${incompatibleUsers} user rows belong to another identity namespace`,
+      );
+    }
+
+    if (identity.deploymentMode === 'standalone') {
+      for (const [table, column, nullable] of identityReferences) {
+        const [rows] = await conn.query(
+          `SELECT COUNT(*) count FROM \`${table}\` x LEFT JOIN users u
+            ON u.tenant_id=x.tenant_id AND u.id=x.\`${column}\`
+            WHERE ${nullable ? `x.\`${column}\` IS NOT NULL AND ` : ''}u.id IS NULL`,
+        );
+        const orphans = BigInt(String((rows as Array<{ count: string | number }>)[0]?.count ?? 0));
+        if (orphans !== 0n) {
+          throw new Error(
+            `Database identity mode is incompatible with standalone/${identity.authProvider}: `
+            + `${table}.${column} contains ${orphans} direct or unmapped identities`,
+          );
+        }
+      }
+    }
+  } finally {
+    conn.release();
+  }
+}
+
+/** 按配置创建 Store：有 MySQL 则迁移、校验身份模式并创建 MysqlStore，否则回落 MemoryStore。 */
+export async function createStore(
+  cfg: MysqlConfig | undefined,
+  identity: IdentityModeCompatibility,
+): Promise<Store> {
   if (!cfg) {
     log.warn('MySQL 未配置，使用内存 Store（进程重启丢失数据）');
     return new MemoryStore();
   }
   const pool = createMysqlPool(cfg);
-  await runMigrations(pool);
-  const db = createKysely(pool);
-  log.info({ host: cfg.host, database: cfg.database }, 'MySQL Store 就绪');
-  return new MysqlStore(db);
+  try {
+    // Check existing user provenance before any migration can rewrite the database.
+    await assertExistingIdentitySourceCompatibility(pool, identity);
+    await runMigrations(pool);
+    await assertIdentityModeCompatibility(pool, identity);
+    const db = createKysely(pool);
+    log.info({ host: cfg.host, database: cfg.database, ...identity }, 'MySQL Store 就绪');
+    return new MysqlStore(db);
+  } catch (error) {
+    await pool.promise().end();
+    throw error;
+  }
 }
