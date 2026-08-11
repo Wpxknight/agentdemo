@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiop-server
+  namespace: aios-system
+  labels: { app: aiop, component: server }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: aiop, component: server }
+  template:
+    metadata:
+      labels: { app: aiop, component: server }
+    spec:
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: aiop
+          image: deploy.bocloud.k8s:40443/aios/aiop:dev
+          imagePullPolicy: IfNotPresent
+          command: ["npm", "run", "serve"]
+          ports:
+            - containerPort: 8081
+          env:
+            - name: AIOP_CONFIG
+              value: /config/config.jsonc
+            - name: PORT
+              value: "8081"
+            - name: AIOP_EMBED_SCHEDULER
+              value: "true"
+            - name: AIOP_PI_MODE
+              value: full
+          envFrom:
+            - secretRef: { name: aiop-secrets }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: skills
+              mountPath: /skills-data
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8081 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8081 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+      volumes:
+        - name: config
+          configMap: { name: aiop-config }
+        - name: skills
+          persistentVolumeClaim: { claimName: aiop-skills }

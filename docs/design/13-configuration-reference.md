@@ -156,7 +156,8 @@ flowchart LR
 | `auth.oidc.issuer` | 字符串 | OIDC 对象存在时 | 无 | OIDC | 普通 | 生产应 HTTPS。 |
 | `auth.oidc.clientId` | 字符串 | 是 | 无 | OIDC | 普通 | — |
 | `auth.oidc.clientSecret` | 字符串 | 否 | 无 | OIDC | **Secret** | 可由 JSONC `${OIDC_CLIENT_SECRET}` 注入。 |
-| `auth.oidc.redirectUri` | 字符串 | 是 | 无 | OIDC callback | 普通 | 必须与 IdP client 配置一致。 |
+| `auth.oidc.redirectUri` | HTTP(S) URL | 是 | 无 | OIDC callback、API/Web public origin | 普通 | 必须与 IdP client 配置一致；其 origin 是服务端回调/API 的规范 public origin。 |
+| `auth.oidc.webCallbackUrl` | HTTP(S) URL | 否 | `redirectUri` origin 的 `/` | OIDC 登录完成跳转 | 普通 | 必须与 `redirectUri` 同源；跨 origin 配置在启动解析时拒绝，避免 CORS/cross-site cookie。 |
 | `auth.oidc.scopes` | string[] | 否 | provider 默认 scopes | OIDC | 普通 | — |
 | `auth.oidc.allowInsecureHttp` | boolean | 否 | `false` | OIDC discovery | 安全开关 | 仅 dev/test；生产 HTTP issuer 应拒绝。 |
 | `auth.oidc.mapping.tenantClaim` | 字符串 | 否 | 无 | claims 映射 | 普通 | 缺省使用 `defaultTenant`。 |

@@ -31,6 +31,9 @@ import type {
   ManualFire,
   Store,
   ToolExecutionRecord,
+  OidcExchangeCode,
+  OidcExchangeCodeClaim,
+  ConsumedOidcExchangeCode,
   UserCredentialRecord,
   UserPatch,
   UserWithSecret,
@@ -87,6 +90,7 @@ export class MemoryStore implements Store {
   private tenants = new Map<string, Tenant>();
   private users = new Map<string, UserWithSecret>(); // key: tenantId/username
   private credentials = new Map<string, UserCredentialRecord>(); // key: tenantId/userId/provider
+  private oidcExchangeCodes = new Map<string, OidcExchangeCode & { consumedAt?: Date }>();
   private llmSettings = new Map<string, LlmSettings>();
   private schedulerSettings = new Map<string, SchedulerSettings>();
   private sandboxSettings = new Map<string, SandboxSettingsRecord>();
@@ -96,7 +100,7 @@ export class MemoryStore implements Store {
   private agentRunEvents: AgentRunEvent[] = [];
   private taskSeq = 0;
   private agentRunEventSeq = 0;
-  private userSeq = 0;
+  private userSeq = 0n;
 
   // 会话/消息按 (tenant, user) 双重隔离：不同用户的同名 sessionId 互不可见、互不冲突。
   private sessionKey(ctx: Pick<RequestContext, 'tenantId' | 'userId'>, sessionId: string): string {
@@ -668,11 +672,8 @@ export class MemoryStore implements Store {
   }
 
   async createUser(user: NewUser): Promise<User> {
-    // 确定性 id（便于测试与排查）；墓碑改名后重建同名用户时追加序号保证唯一。
-    const base = `u_${user.tenantId}_${user.username}`;
-    const taken = new Set([...this.users.values()].map((u) => u.id));
-    let id = base;
-    while (taken.has(id)) id = `${base}_${++this.userSeq}`;
+    // 模拟 MySQL BIGINT UNSIGNED AUTO_INCREMENT；字符串返回避免 JS 精度损失。
+    const id = (++this.userSeq).toString();
     const rec: UserWithSecret = {
       id,
       tenantId: user.tenantId,
@@ -756,6 +757,35 @@ export class MemoryStore implements Store {
     }
   }
 
+  private cleanupOidcExchangeCodes(now: Date, limit = 100): void {
+    let deleted = 0;
+    for (const [codeHash, record] of this.oidcExchangeCodes) {
+      if (deleted >= limit) break;
+      if (record.consumedAt || record.expiresAt.getTime() <= now.getTime()) {
+        this.oidcExchangeCodes.delete(codeHash);
+        deleted += 1;
+      }
+    }
+  }
+
+  async putOidcExchangeCode(record: OidcExchangeCode): Promise<void> {
+    this.cleanupOidcExchangeCodes(new Date());
+    if (this.oidcExchangeCodes.has(record.codeHash)) throw new Error('OIDC exchange code hash collision');
+    this.oidcExchangeCodes.set(record.codeHash, structuredClone(record));
+  }
+
+  async consumeOidcExchangeCode(claim: OidcExchangeCodeClaim): Promise<ConsumedOidcExchangeCode | undefined> {
+    this.cleanupOidcExchangeCodes(claim.now);
+    // JavaScript 的同步检查+删除在同一事件循环临界区内完成，供开发和单元测试使用。
+    const record = this.oidcExchangeCodes.get(claim.codeHash);
+    if (!record || record.expiresAt.getTime() <= claim.now.getTime()
+      || record.provider !== claim.provider
+      || (claim.tenantId !== undefined && record.tenantId !== claim.tenantId)
+      || record.browserNonceHash !== claim.browserNonceHash) return undefined;
+    this.oidcExchangeCodes.delete(claim.codeHash);
+    return { tenantId: record.tenantId, provider: record.provider, sessionToken: record.sessionToken };
+  }
+
   async getLlmSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<LlmSettings | undefined> {
     const settings = this.llmSettings.get(ctx.tenantId);
     return settings ? { ...settings } : undefined;
@@ -812,6 +842,7 @@ export class MemoryStore implements Store {
     this.tenants.clear();
     this.users.clear();
     this.credentials.clear();
+    this.oidcExchangeCodes.clear();
     this.llmSettings.clear();
     this.schedulerSettings.clear();
     this.sandboxSettings.clear();

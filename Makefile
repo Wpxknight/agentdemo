@@ -15,7 +15,7 @@ AIOP_IMAGE_PULL_POLICY ?= Always
 ROLLBACK_REVISION ?=
 ROLLBACK_TO_REVISION = $(if $(strip $(ROLLBACK_REVISION)),--to-revision=$(ROLLBACK_REVISION),)
 
-.PHONY: verify-node test-agent-platform test-runtime-refactor verify-runtime-refactor image pipeline deploy-staging rollback-staging deploy-aiop rollback-aiop backup-aiop-staging-k8s-settings backup-aiop-staging-db-settings rebuild-aiop-staging-db deploy-aiop-staging deploy-aiop-staging-workload deploy-aiop-staging-fresh
+.PHONY: verify-node test-agent-platform test-runtime-refactor verify-runtime-refactor test-dual-auth test-migrations-mariadb check-dual-deploy-config package-web-core verify-web-core-package test-web-core-consumer image-check check-user-id-migration migrate-user-id-staging image pipeline deploy-staging rollback-staging deploy-aiop deploy-standalone deploy-aios-integrated rollback-aiop backup-aiop-staging-k8s-settings backup-aiop-staging-db-settings rebuild-aiop-staging-db deploy-aiop-staging deploy-aiop-staging-workload deploy-aiop-staging-fresh
 
 verify-node:
 	npm run verify:node
@@ -30,7 +30,92 @@ verify-runtime-refactor: test-runtime-refactor
 	npm --prefix web run build
 	$(MAKE) image
 
-image:
+test-dual-auth:
+	npm run typecheck
+	npm test -- --run tests/auth.test.ts tests/oidc.test.ts tests/aios-integration.test.ts tests/rbac.test.ts tests/config.test.ts tests/http.test.ts
+	npm --prefix web run build
+	$(MAKE) verify-web-core-package
+	$(MAKE) check-dual-deploy-config
+
+package-web-core:
+	@mkdir -p dist
+	rm -f dist/aiop-web-*.tgz
+	npm --prefix web run package:lib
+
+verify-web-core-package: package-web-core
+	@set -eu; archive=$$(ls dist/aiop-web-*.tgz); \
+		tar -tzf "$$archive" > dist/web-core-package-all-files; \
+		grep -q '^package/dist-lib/web-core.js$$' dist/web-core-package-all-files; \
+		grep -q '^package/dist-lib/web-core.d.ts$$' dist/web-core-package-all-files; \
+		grep -q '^package/dist-lib/style.css$$' dist/web-core-package-all-files; \
+		grep -q '^package/package.json$$' dist/web-core-package-all-files; \
+		(cd web && tar -cf - dist-lib) | tar -tf - | sed 's#/$##' | sort > dist/web-core-build-files; \
+		grep '^package/dist-lib' dist/web-core-package-all-files | sed 's#^package/##; s#/$##' | sort > dist/web-core-package-files; \
+		diff -u dist/web-core-build-files dist/web-core-package-files; \
+		rm -f dist/web-core-package-all-files dist/web-core-build-files dist/web-core-package-files
+
+# Install the local tgz into an isolated consumer and prove JS, explicit CSS, dynamic chunks and bundled assets resolve.
+test-web-core-consumer: package-web-core
+	@set -eu; root="$$PWD/dist/web-core-consumer"; archive=$$(ls "$$PWD"/dist/aiop-web-*.tgz); \
+		rm -rf "$$root"; mkdir -p "$$root/src" "$$root/dist" "$$PWD/dist/npm-cache"; \
+		printf '%s\n' '{"private":true,"type":"module","scripts":{"build":"vite build"}}' > "$$root/package.json"; \
+		printf '%s\n' '{"compilerOptions":{"target":"ES2022","lib":["ES2022","DOM","DOM.Iterable"],"module":"ESNext","moduleResolution":"Bundler","strict":true,"skipLibCheck":true,"jsx":"react-jsx","noEmit":true},"include":["src"]}' > "$$root/tsconfig.json"; \
+		printf '%s\n' '<div id="root"></div><script type="module" src="/src/main.tsx"></script>' > "$$root/index.html"; \
+		printf '%s\n' "declare module '*.css';" > "$$root/src/env.d.ts"; \
+		printf '%s\n' "import React from 'react'; import {createRoot} from 'react-dom/client'; import {WebCore} from 'aiop-web'; import 'aiop-web/style.css'; const host={deploymentMode:'standalone',authProvider:'local',apiBase:'',getToken:()=>'',setToken:()=>{},onUnauthorized:()=>{}} as const; createRoot(document.getElementById('root')!).render(<WebCore host={host}/>);" > "$$root/src/main.tsx"; \
+		cd "$$root"; npm_config_cache="$$PWD/../npm-cache" npm install --offline --legacy-peer-deps --no-save "$$archive"; ln -s "$$OLDPWD/web/node_modules/react" node_modules/react; ln -s "$$OLDPWD/web/node_modules/react-dom" node_modules/react-dom; mkdir -p node_modules/@types; ln -s "$$OLDPWD/web/node_modules/@types/react" node_modules/@types/react; ln -s "$$OLDPWD/web/node_modules/@types/react-dom" node_modules/@types/react-dom; "$$OLDPWD/node_modules/.bin/tsc" -p tsconfig.json --noEmit; "$$OLDPWD/node_modules/.bin/vite" build; \
+		test -n "$$(ls dist/assets/*.js)"; test -n "$$(ls dist/assets/*.css)"; \
+		test -f node_modules/aiop-web/dist-lib/assets/logo.jpg; test -f node_modules/aiop-web/dist-lib/assets/user-avatar.jpg; \
+		test "$$(ls dist/assets/*.js | wc -l)" -gt 1; cd ..; rm -rf web-core-consumer
+
+test-migrations-mariadb:
+	@mkdir -p dist
+	@set -eu; name=aiop-migrations-mariadb-$$$$; cleanup() { docker rm -f "$$name" >/dev/null 2>&1 || true; }; trap cleanup EXIT INT TERM; \
+		docker run -d --rm --name "$$name" -e MARIADB_ROOT_PASSWORD=aiop-integration \
+			--health-cmd='healthcheck.sh --connect --innodb_initialized' --health-interval=1s --health-timeout=5s --health-retries=60 \
+			-p 127.0.0.1::3306 mariadb:11.4 >dist/mariadb-migration-container-id; \
+		port=$$(docker port "$$name" 3306/tcp | cut -d: -f2); \
+		for attempt in $$(seq 1 60); do status=$$(docker inspect -f '{{.State.Health.Status}}' "$$name"); test "$$status" = healthy && break; test "$$status" != unhealthy -a "$$attempt" -lt 60 || { docker logs "$$name"; exit 1; }; sleep 1; done; \
+		AIOP_MARIADB_INTEGRATION=1 MARIADB_HOST=127.0.0.1 MARIADB_PORT="$$port" MARIADB_USER=root MARIADB_PASSWORD=aiop-integration \
+			npm exec -- vitest run tests/integration/runtime-migrations.mariadb.test.ts 2>&1 | tee dist/mariadb-migration-test.log
+
+check-dual-deploy-config:
+	npm exec -- tsx scripts/check-dual-deploy-config.ts
+
+image-check: verify-web-core-package
+	docker image inspect $(IMAGE) >/dev/null
+	docker image inspect $(WEB_IMAGE) >/dev/null
+	docker run --rm $(IMAGE) npm run verify:node
+	docker run --rm $(IMAGE) npm exec -- tsx -e "import('@aiop/pi-runtime').then(() => console.log('workspace-ok'))"
+
+deploy-standalone:
+	@test "$(DEPLOYMENT_MODE)" = "standalone" || (printf '%s\n' 'Set DEPLOYMENT_MODE=standalone' >&2; exit 1)
+	$(MAKE) deploy-aiop
+
+deploy-aios-integrated:
+	@test "$(DEPLOYMENT_MODE)" = "aios-integrated" || (printf '%s\n' 'Set DEPLOYMENT_MODE=aios-integrated' >&2; exit 1)
+	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) get secret aiop-secrets -o name >/dev/null
+	$(AIOP_KUBECTL) apply -f deploy/aiop/configmap-aios-integrated.yaml
+	$(AIOP_KUBECTL) apply -f deploy/aiop/pvc-skills.yaml
+	$(AIOP_KUBECTL) apply -f deploy/aiop/service-aios-integrated.yaml
+	$(AIOP_KUBECTL) set image -f deploy/aiop/deployment-aios-integrated.yaml aiop=$(PUBLISH_IMAGE) --local -o yaml | $(AIOP_KUBECTL) apply -f -
+	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) rollout status deployment/aiop-server --timeout=300s
+
+check-user-id-migration:
+	@test -n "$(DEPLOYMENT_MODE)" -a -n "$(AUTH_PROVIDER)" || (printf '%s\n' 'Set explicit DEPLOYMENT_MODE and AUTH_PROVIDER' >&2; exit 1)
+	DEPLOYMENT_MODE="$(DEPLOYMENT_MODE)" AUTH_PROVIDER="$(AUTH_PROVIDER)" npm exec -- tsx scripts/check-user-id-migration.ts
+
+migrate-user-id-staging:
+	@CONFIRM_USER_ID_MIGRATION="$(CONFIRM_USER_ID_MIGRATION)" \
+		USER_ID_MIGRATION_BACKUP="$(USER_ID_MIGRATION_BACKUP)" \
+		MIGRATION_NAMESPACE="$(MIGRATION_NAMESPACE)" MIGRATION_DEPLOYMENT="$(MIGRATION_DEPLOYMENT)" \
+		MIGRATION_EXPECTED_REPLICAS="$(MIGRATION_EXPECTED_REPLICAS)" MIGRATION_KUBECONFIG="$(MIGRATION_KUBECONFIG)" \
+		AIOP_EXPECTED_KUBE_CONTEXT="$(AIOP_EXPECTED_KUBE_CONTEXT)" \
+		DEPLOYMENT_MODE="$(DEPLOYMENT_MODE)" AUTH_PROVIDER="$(AUTH_PROVIDER)" \
+		MYSQL_HOST="$(MYSQL_HOST)" MYSQL_DATABASE="$(MYSQL_DATABASE)" MYSQL_USER="$(MYSQL_USER)" \
+		KUBECTL="$(KUBECTL)" ./scripts/migrate-user-id-staging.sh
+
+image: verify-web-core-package
 	docker build -t $(IMAGE) .
 	docker build -f web/Dockerfile -t $(WEB_IMAGE) .
 	docker run --rm $(IMAGE) npm exec -- tsx -e "import('@aiop/pi-runtime').then(() => console.log('workspace-ok'))"

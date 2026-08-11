@@ -44,36 +44,30 @@ function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 }
 
-describe('AiosAuthProvider（token exchange + JIT）', () => {
-  it('exchange 验证 token、JIT 建号、缓存凭据并签发可校验的 aiop JWT', async () => {
+describe('AiosAuthProvider（token exchange + direct identity）', () => {
+  it('exchange 验证 accountId、保持 users 不变、缓存凭据并签发可校验 JWT', async () => {
     const store = new MemoryStore();
     const credentials = new UserCredentials(store, SECRET);
     const provider = aiosProvider(store, credentials, async () =>
-      jsonResponse({ code: 0, data: { userId: 'e1001', displayName: '张三', roles: ['admin'] } }));
+      jsonResponse({ code: 0, data: { accountId: '1001', displayName: '张三', status: 'active', roles: ['admin'] } }));
 
     const tokenData = { token: 'aios-tk-1', refreshToken: 'rf-1', expiredTime: '2099-01-01T00:00:00+0800' };
-    const { token, ctx, user } = await provider.exchange(tokenData);
+    const before = await store.listUsers('default');
+    const { token, ctx } = await provider.exchange(tokenData);
 
-    // JIT：用户以 AIOS 稳定标识为 username、来源 aios、角色映射 tenant_admin
-    expect(user.username).toBe('e1001');
-    expect(user.authProvider).toBe('aios');
-    expect(user.displayName).toBe('张三');
-    expect(ctx.role).toBe('tenant_admin');
+    expect(ctx).toMatchObject({ tenantId: 'default', userId: '1001', provider: 'aios', role: 'tenant_admin', displayName: '张三' });
+    expect(await store.listUsers('default')).toEqual(before);
+    expect(await provider.authenticate(token)).toMatchObject(ctx);
+    expect(await provider.authenticate(token)).toMatchObject(ctx); // 每请求都重新调用可信 userinfo
 
-    // aiop JWT 可被 authenticate 还原
-    const restored = await provider.authenticate(token);
-    expect(restored).toMatchObject({ tenantId: 'default', userId: user.id, role: 'tenant_admin' });
-
-    // AIOS token 已入加密凭据缓存（P3 注入用），且可解密还原
-    const cached = await credentials.get<typeof tokenData>('default', user.id, 'aios');
+    const cached = await credentials.get<typeof tokenData>('default', '1001', 'aios');
     expect(cached).toMatchObject({ token: 'aios-tk-1', refreshToken: 'rf-1' });
-    // 底层存的是密文，不含明文 token
-    const raw = await store.getUserCredential('default', user.id, 'aios');
+    const raw = await store.getUserCredential('default', '1001', 'aios');
     expect(raw!.payload).not.toContain('aios-tk-1');
 
-    // 再次 exchange 复用同一账号（不重复建号）
     const again = await provider.exchange(tokenData);
-    expect(again.ctx.userId).toBe(user.id);
+    expect(again.ctx.userId).toBe('1001');
+    expect(await store.listUsers('default')).toEqual(before);
   });
 
   it('普通角色映射 user；AIOS 校验失败则拒绝', async () => {
@@ -81,7 +75,7 @@ describe('AiosAuthProvider（token exchange + JIT）', () => {
     const credentials = new UserCredentials(store, SECRET);
     let ok = true;
     const provider = aiosProvider(store, credentials, async () =>
-      ok ? jsonResponse({ data: { userId: 'e2', roles: ['dev'] } }) : jsonResponse({ error: 'x' }, 401));
+      ok ? jsonResponse({ data: { accountId: '2', status: 'active', roles: ['dev'] } }) : jsonResponse({ error: 'x' }, 401));
 
     const { ctx } = await provider.exchange({ token: 't' });
     expect(ctx.role).toBe('user');
@@ -90,20 +84,38 @@ describe('AiosAuthProvider（token exchange + JIT）', () => {
     await expect(provider.exchange({ token: 'bad' })).rejects.toThrow(AiosAuthError);
   });
 
-  it('disabled 行占用 username 即封禁：exchange 被拒，无法经 JIT 复活；墓碑后可建新号', async () => {
+  it('accountId 非规范十进制或可信状态 disabled 时 fail closed', async () => {
+    const store = new MemoryStore();
+    const credentials = new UserCredentials(store, SECRET);
+    let body: unknown = { data: { accountId: '03', status: 'active', roles: [] } };
+    const provider = aiosProvider(store, credentials, async () => jsonResponse(body));
+
+    await expect(provider.exchange({ token: 't' })).rejects.toThrow('合法 accountId');
+    body = { data: { accountId: '3', status: 'disabled', roles: [] } };
+    const configured = new AiosAuthProvider({
+      store,
+      credentials,
+      secret: SECRET,
+      config: AiosConfigSchema.parse({
+        verify: 'userinfo', userinfoUrl: 'http://aios.test/userinfo', fields: { status: 'status' },
+      }),
+      fetchImpl: (async () => jsonResponse(body)) as typeof fetch,
+    });
+    await expect(configured.exchange({ token: 't' })).rejects.toThrow('已被禁用');
+  });
+
+  it('exchange 在签发 session 前拒绝非法或已过期 expiredTime，缺失时使用服务端 TTL', async () => {
     const store = new MemoryStore();
     const credentials = new UserCredentials(store, SECRET);
     const provider = aiosProvider(store, credentials, async () =>
-      jsonResponse({ data: { userId: 'e3', roles: [] } }));
+      jsonResponse({ data: { accountId: '8', status: 'active', roles: [] } }));
 
-    const first = await provider.exchange({ token: 't' });
-    await store.updateUser('default', first.ctx.userId, { status: 'disabled' });
-    await expect(provider.exchange({ token: 't' })).rejects.toThrow('已被禁用');
+    await expect(provider.exchange({ token: 't', expiredTime: 'not-a-date' })).rejects.toThrow('格式非法');
+    await expect(provider.exchange({ token: 't', expiredTime: '2000-01-01T00:00:00Z' })).rejects.toThrow('已过期');
+    expect(await credentials.get('default', '8', 'aios')).toBeUndefined();
 
-    // 打墓碑释放用户名 → 同名 AIOS 用户 JIT 建干净新号
-    await store.updateUser('default', first.ctx.userId, { username: 'e3#deleted#1' });
-    const second = await provider.exchange({ token: 't' });
-    expect(second.ctx.userId).not.toBe(first.ctx.userId);
+    const exchanged = await provider.exchange({ token: 't' });
+    expect(await provider.authenticate(exchanged.token)).toMatchObject({ userId: '8' });
   });
 
   it('parseAiosExpiry 兼容 +0800 时区写法', () => {
@@ -331,6 +343,7 @@ describe('HTTP 越权防护（A/B 用户）', () => {
   let bobToken: string;
   let bobId: string;
   let skillDir: string;
+  let auditEvents: Array<Record<string, unknown>>;
 
   async function login(username: string): Promise<string> {
     const r = await fetch(`${base}/auth/login`, {
@@ -354,7 +367,7 @@ describe('HTTP 越权防护（A/B 用户）', () => {
 
     const credentials = new UserCredentials(store, SECRET);
     const aiosAuth = aiosProvider(store, credentials, async () =>
-      jsonResponse({ data: { userId: 'aios-9', displayName: '平台用户', roles: [] } }));
+      jsonResponse({ data: { accountId: '9', displayName: '平台用户', status: 'active', roles: [] } }));
 
     skillDir = await mkdtemp(join(tmpdir(), 'aiop-http-skill-'));
     await mkdir(join(skillDir, 'users', bob.id, 'bobskill'), { recursive: true });
@@ -369,12 +382,14 @@ describe('HTTP 越权防护（A/B 用户）', () => {
     const skillRegistry = new SkillRegistry(skillDir);
     await skillRegistry.scan();
 
+    auditEvents = [];
     const rt = {
       tools: new ToolRegistry(),
       store,
-      audit: { record: async () => {} },
+      audit: { record: async (event: Record<string, unknown>) => { auditEvents.push(event); } },
       policy: new AllowAllPolicy(),
       policyPreApproved: new AllowAllPolicy(),
+      deploymentMode: 'standalone',
       authProvider: auth,
       aiosAuth,
       credentials,
@@ -412,7 +427,18 @@ describe('HTTP 越权防护（A/B 用户）', () => {
 
     const me = await fetch(`${base}/v1/me`, { headers: authed(body.token) });
     expect(me.status).toBe(200);
-    expect(await me.json()).toMatchObject({ tenantId: 'default', role: 'user', username: 'aios-9' });
+    expect(await me.json()).toMatchObject({
+      tenantId: 'default', userId: '9', role: 'user', authProvider: 'aios', displayName: '平台用户',
+      deploymentMode: 'standalone',
+      permissions: ['task:create'],
+      features: { localLogin: true, localUserManagement: true },
+    });
+    const exchangeAudit = auditEvents.find((event) => event.action === 'aios-exchange');
+    expect(exchangeAudit).toMatchObject({
+      kind: 'auth', tenantId: 'default', userId: '9', provider: 'aios', deploymentMode: 'standalone',
+    });
+    expect(exchangeAudit?.correlationId).toEqual(expect.any(String));
+    expect(JSON.stringify(exchangeAudit)).not.toContain('platform-token');
   });
 
   it('缺 token / 无效 token 的 exchange 被拒', async () => {
@@ -420,6 +446,25 @@ describe('HTTP 越权防护（A/B 用户）', () => {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
     });
     expect(missing.status).toBe(400);
+  });
+
+  it.each([null, 123, {}, '', 'not-a-date', '2000-01-01T00:00:00Z'])(
+    'HTTP exchange 拒绝已提供但无效的 expiredTime: %j',
+    async (expiredTime) => {
+      const response = await fetch(`${base}/auth/aios/exchange`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token: 'platform-token', expiredTime }),
+      });
+      expect([400, 401]).toContain(response.status);
+    },
+  );
+
+  it('HTTP exchange 仅在 expiredTime 未提供时使用服务端 TTL', async () => {
+    const response = await fetch(`${base}/auth/aios/exchange`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: 'platform-token' }),
+    });
+    expect(response.status).toBe(200);
   });
 
   it('index.html 带 frame-ancestors CSP（仅同源 + 白名单宿主可嵌入）', async () => {

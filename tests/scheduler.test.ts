@@ -341,10 +341,33 @@ describe('embedded scheduler deployment', () => {
     expect(claimDue).toHaveBeenCalledOnce();
   });
 
+  it('rejects AIOS integrated offline Fires without starting a Run', async () => {
+    const fireTime = new Date('2026-07-29T01:00:00.000Z');
+    const schedulerStore = new MemorySchedulerStore([{
+      taskId: 'aios-task', tenantId: 'tenant-a', actorId: '1001', sessionId: 'session-a',
+      cron: '0 * * * *', input: [{ role: 'user', text: 'diagnose' }], nextFireAt: fireTime,
+    }]);
+    const run = vi.fn();
+    const scheduler = createRuntimeScheduler({
+      deploymentMode: 'aios-integrated', store: new MemoryStore(), durableRunRuntime: { run },
+    } as unknown as Runtime, { store: schedulerStore, workerId: 'aios-worker', retryDelayMs: 1_000 });
+
+    expect(await scheduler.tick(fireTime)).toBe(1);
+    expect(run).not.toHaveBeenCalled();
+    expect((await schedulerStore.listFires())[0]).toMatchObject({
+      state: 'completed',
+      result: { status: 'failed', error: { message: 'aios_offline_scheduling_unavailable', retryable: false } },
+    });
+  });
+
   it('uses an explicitly injected MemorySchedulerStore only for tests', async () => {
     const fireTime = new Date('2026-07-29T01:00:00.000Z');
+    const runtimeStore = new MemoryStore();
+    const actor = await runtimeStore.createUser({
+      tenantId: 'tenant-a', username: 'scheduler-user', role: 'user', passwordHash: 'x', authProvider: 'local',
+    });
     const store = new MemorySchedulerStore([{
-      taskId: 'task-a', tenantId: 'tenant-a', actorId: 'user-a', sessionId: 'session-a',
+      taskId: 'task-a', tenantId: 'tenant-a', actorId: actor.id, sessionId: 'session-a',
       cron: '0 * * * *', input: [{ role: 'user', text: 'diagnose' }], nextFireAt: fireTime,
       preApproved: true,
     }]);
@@ -356,10 +379,9 @@ describe('embedded scheduler deployment', () => {
         usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
       }),
     }));
-    const runtimeStore = new MemoryStore();
     await runtimeStore.setSchedulerSettings({ tenantId: 'tenant-a' }, { maxRunMs: 5 * 60_000 });
     const scheduler = createRuntimeScheduler({
-      store: runtimeStore, durableRunRuntime: { run },
+      deploymentMode: 'standalone', store: runtimeStore, durableRunRuntime: { run },
     } as unknown as Runtime, { store, workerId: 'test-worker' });
 
     expect(await scheduler.tick(fireTime)).toBe(1);

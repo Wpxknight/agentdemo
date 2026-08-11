@@ -99,10 +99,10 @@ curl -X POST /auth/login -H 'content-type: application/json' \
 `GET /auth/oidc/start`
 
 - 认证：匿名
-- 行为：同步；设置 10 分钟、HttpOnly、SameSite=Lax 的 state/PKCE 签名 cookie
-- 实现：`src/server/http.ts:1019`
+- 行为：同步；设置 10 分钟、HttpOnly、SameSite=Lax、`Path=/auth/callback` 的 state/PKCE 签名 cookie
+- 实现：`src/server/http.ts`
 - Request Body：不适用
-- Response：`200 {url}`，并返回 `Set-Cookie`
+- Response：`200 {url}`，并返回 `Set-Cookie`；`Cache-Control: no-store`
 - 错误：`400` 未启用 OIDC；provider 错误未定义为稳定契约
 
 ### OIDC 回调

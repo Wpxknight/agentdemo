@@ -32,7 +32,12 @@ describe('new-project compatibility boundary', () => {
       .filter((name) => name.endsWith('.sql'))
       .sort();
 
-    expect(migrations).toEqual(['0001_baseline.sql', '0002_scheduler_schema_upgrade.sql']);
+    expect(migrations).toEqual([
+      '0001_baseline.sql',
+      '0002_scheduler_schema_upgrade.sql',
+      '0003_positive_user_ids.sql',
+      '0004_oidc_exchange_codes.sql',
+    ]);
     const sources = await Promise.all(migrations.map((migration) => readFile(join(directory, migration), 'utf8')));
     expect(sources.join('\n')).not.toMatch(/legacy-v1|compat-v1|langgraph/i);
   });

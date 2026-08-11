@@ -4,6 +4,7 @@ import {
   createRunDispatcher,
   MysqlSchedulerStore,
   SchedulerRunner,
+  TerminalScheduledFireError,
   type BoundRunRecovery,
   type SchedulerMysqlDatabase,
   type SchedulerObserver,
@@ -76,13 +77,24 @@ export function createRuntimeScheduler(
     leaseMs: options.leaseMs,
     retryDelayMs: options.retryDelayMs,
     observer: options.observer ?? schedulerObserver(),
-    prepareRun: async (fire, now) => ({
-      limits: {
-        deadlineAt: new Date(now.getTime() + (
-          (await rt.store.getSchedulerSettings({ tenantId: fire.identity.tenantId }))?.maxRunMs ?? DEFAULT_TASK_MAX_RUN_MS
-        )),
-      },
-    }),
+    prepareRun: async (fire, now) => {
+      if (rt.deploymentMode === 'aios-integrated') {
+        throw new TerminalScheduledFireError('aios_offline_scheduling_unavailable');
+      }
+      if (rt.deploymentMode === 'standalone') {
+        const user = await rt.store.getUser(fire.identity.tenantId, fire.identity.actorId);
+        if (!user || user.status !== 'active' || (user.authProvider !== 'local' && user.authProvider !== 'oidc')) {
+          throw new Error('scheduled_actor_unavailable');
+        }
+      }
+      return {
+        limits: {
+          deadlineAt: new Date(now.getTime() + (
+            (await rt.store.getSchedulerSettings({ tenantId: fire.identity.tenantId }))?.maxRunMs ?? DEFAULT_TASK_MAX_RUN_MS
+          )),
+        },
+      };
+    },
     completed: async (fire, result) => {
       if (result.status !== 'succeeded' || !rt.piSessionStore) return;
       try {

@@ -1,5 +1,5 @@
 import { SignJWT, jwtVerify } from 'jose';
-import type { RequestContext, Role } from './types.js';
+import { parsePrincipalId, type AuthProviderKind, type RequestContext, type Role } from './types.js';
 
 /** 颁发会话 JWT（HS256），携带 tenant/role，sub=userId。 */
 export async function signSession(
@@ -7,7 +7,12 @@ export async function signSession(
   ctx: RequestContext,
   ttl: string,
 ): Promise<string> {
-  return new SignJWT({ tenant: ctx.tenantId, role: ctx.role })
+  return new SignJWT({
+    tenant: ctx.tenantId,
+    role: ctx.role,
+    provider: ctx.provider ?? 'local',
+    ...(ctx.displayName ? { displayName: ctx.displayName } : {}),
+  })
     .setProtectedHeader({ alg: 'HS256' })
     .setSubject(ctx.userId)
     .setIssuedAt()
@@ -25,10 +30,18 @@ export async function verifySession(
     const userId = payload.sub;
     const tenantId = payload.tenant;
     const role = payload.role;
-    if (typeof userId !== 'string' || typeof tenantId !== 'string' || typeof role !== 'string') {
-      return undefined;
-    }
-    return { userId, tenantId, role: role as Role };
+    const provider = payload.provider;
+    const displayName = payload.displayName;
+    if (
+      typeof tenantId !== 'string'
+      || (role !== 'platform_admin' && role !== 'tenant_admin' && role !== 'user')
+      || (provider !== 'local' && provider !== 'oidc' && provider !== 'aios')
+      || (displayName !== undefined && typeof displayName !== 'string')
+    ) return undefined;
+    return {
+      userId: parsePrincipalId(userId), tenantId, provider: provider as AuthProviderKind, role: role as Role,
+      ...(displayName ? { displayName } : {}),
+    };
   } catch {
     return undefined;
   }

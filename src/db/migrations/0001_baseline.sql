@@ -1,7 +1,7 @@
 CREATE TABLE `agent_interactions` (
   `id` varchar(64) NOT NULL,
   `tenant_id` varchar(64) NOT NULL,
-  `user_id` varchar(128) NOT NULL,
+  `user_id` bigint unsigned NOT NULL,
   `session_id` varchar(128) NOT NULL,
   `run_id` varchar(128) NOT NULL,
   `attempt_id` varchar(64) DEFAULT NULL,
@@ -11,7 +11,7 @@ CREATE TABLE `agent_interactions` (
   `payload` json NOT NULL,
   `status` varchar(32) NOT NULL,
   `resolution` json DEFAULT NULL,
-  `resolved_by` varchar(128) DEFAULT NULL,
+  `resolved_by` bigint unsigned DEFAULT NULL,
   `expires_at` timestamp NOT NULL,
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `resolved_at` timestamp NULL DEFAULT NULL,
@@ -85,7 +85,7 @@ CREATE TABLE `agent_run_inbox_messages` (
 CREATE TABLE `agent_runs` (
   `tenant_id` varchar(64) NOT NULL,
   `run_id` varchar(128) NOT NULL,
-  `user_id` varchar(128) NOT NULL,
+  `user_id` bigint unsigned NOT NULL,
   `session_id` varchar(128) NOT NULL,
   `kernel` varchar(32) NOT NULL DEFAULT 'pi',
   `kernel_version` varchar(64) NOT NULL DEFAULT '0.82.1',
@@ -207,11 +207,26 @@ CREATE TABLE `messages` (
   `role` varchar(16) NOT NULL,
   `content` json NOT NULL,
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  `user_id` varchar(64) NOT NULL DEFAULT '',
+  `user_id` bigint unsigned NOT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_messages_session` (`tenant_id`,`session_id`,`id`),
   KEY `idx_messages_tenant_id` (`tenant_id`,`id`),
   KEY `idx_messages_session_user` (`tenant_id`,`user_id`,`session_id`,`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `oidc_exchange_codes` (
+  `code_hash` char(64) NOT NULL,
+  `tenant_id` varchar(64) NOT NULL,
+  `provider` varchar(16) NOT NULL,
+  `session_token` text NOT NULL,
+  `browser_nonce_hash` char(64) DEFAULT NULL,
+  `expires_at` datetime(3) NOT NULL,
+  `consumed_at` datetime(3) DEFAULT NULL,
+  `created_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (`code_hash`),
+  KEY `idx_oidc_exchange_expiry` (`expires_at`),
+  KEY `idx_oidc_exchange_consumed_expiry` (`consumed_at`,`expires_at`),
+  KEY `idx_oidc_exchange_tenant` (`tenant_id`,`provider`,`consumed_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `pi_session_entries` (
@@ -243,7 +258,7 @@ CREATE TABLE `pi_sessions` (
 CREATE TABLE `scheduled_tasks` (
   `id` bigint NOT NULL AUTO_INCREMENT,
   `tenant_id` varchar(64) NOT NULL,
-  `user_id` varchar(64) NOT NULL,
+  `user_id` bigint unsigned NOT NULL,
   `session_id` varchar(128) NOT NULL,
   `title` varchar(200) NOT NULL DEFAULT '',
   `cron` varchar(128) NOT NULL,
@@ -257,14 +272,15 @@ CREATE TABLE `scheduled_tasks` (
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   KEY `idx_due` (`enabled`,`deleted_at`,`next_run_at`),
-  KEY `idx_tenant` (`tenant_id`,`id`)
+  KEY `idx_tenant` (`tenant_id`,`id`),
+  KEY `idx_scheduled_tasks_user` (`tenant_id`,`user_id`,`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `scheduler_fires` (
   `fire_id` varchar(255) NOT NULL,
   `task_id` bigint NOT NULL,
   `tenant_id` varchar(64) NOT NULL,
-  `actor_id` varchar(128) NOT NULL,
+  `actor_id` bigint unsigned NOT NULL,
   `session_id` varchar(128) NOT NULL,
   `fire_time` datetime(3) NOT NULL,
   `input_json` json NOT NULL,
@@ -296,7 +312,7 @@ CREATE TABLE `sessions` (
   `title` varchar(255) NOT NULL,
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  `user_id` varchar(64) NOT NULL DEFAULT '',
+  `user_id` bigint unsigned NOT NULL,
   PRIMARY KEY (`tenant_id`,`user_id`,`session_id`),
   KEY `idx_sessions_updated` (`tenant_id`,`updated_at`),
   KEY `idx_sessions_tenant_user` (`tenant_id`,`user_id`,`updated_at`)
@@ -329,7 +345,7 @@ CREATE TABLE `tenants` (
 
 CREATE TABLE `user_credentials` (
   `tenant_id` varchar(64) NOT NULL,
-  `user_id` varchar(64) NOT NULL,
+  `user_id` bigint unsigned NOT NULL,
   `provider` varchar(32) NOT NULL,
   `payload` text NOT NULL,
   `expires_at` timestamp NULL DEFAULT NULL,
@@ -338,7 +354,7 @@ CREATE TABLE `user_credentials` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `users` (
-  `id` varchar(64) NOT NULL,
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
   `tenant_id` varchar(64) NOT NULL,
   `username` varchar(128) NOT NULL,
   `role` varchar(32) NOT NULL,

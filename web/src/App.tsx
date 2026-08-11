@@ -48,6 +48,7 @@ import { NAV_ITEMS, defaultLlmConfig, pageFromUrl, pageUrl } from './app-data';
 import { MermaidDiagram } from './components/mermaid-diagram';
 import { RunCenterPage } from './components/run-center-page';
 import { createApi, numericSessionId, randomId, readStorage, writeStorage } from './api';
+import { useWebHost } from './web-core';
 import { formatSandboxOutputChunk, parseSandboxOutput, sandboxOutputClassNames, sandboxOutputCommand, sandboxOutputLabels } from './sandbox-output';
 import { isPersistedSession } from './session-context';
 import {
@@ -125,22 +126,8 @@ const iconMap = {
   settings: Settings,
 };
 
-/** 是否运行在 iframe 内（嵌入 AIOS 等宿主页）。 */
-const inIframe = typeof window !== 'undefined' && window.self !== window.top;
-
-/** 解析 JWT 过期时间（毫秒）；解析失败返回 undefined。 */
-function jwtExpiryMs(token: string): number | undefined {
-  try {
-    const payload = JSON.parse(atob(token.split('.')[1]!.replace(/-/g, '+').replace(/_/g, '/'))) as { exp?: number };
-    return typeof payload.exp === 'number' ? payload.exp * 1000 : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-const logoUrl = '/assets/logo.jpg';
-const aiAvatarUrl = logoUrl;
-const userAvatarUrl = '/assets/user-avatar.jpg';
+const FALLBACK_LOGO_URL = new URL('./assets/logo.jpg', import.meta.url).href;
+const FALLBACK_USER_AVATAR_URL = new URL('./assets/user-avatar.jpg', import.meta.url).href;
 const SESSION_PAGE_SIZE = 8;
 
 type ConfirmDialogTone = 'danger' | 'warning' | 'info';
@@ -899,7 +886,18 @@ function MessageContent({ message }: { message: ChatMessage }) {
   );
 }
 
+function useAssetUrls() {
+  const host = useWebHost();
+  const logoUrl = host.assets?.logo ?? FALLBACK_LOGO_URL;
+  return {
+    logoUrl,
+    aiAvatarUrl: logoUrl,
+    userAvatarUrl: host.assets?.userAvatar ?? FALLBACK_USER_AVATAR_URL,
+  };
+}
+
 function BrandLogo({ className }: { className?: string }) {
+  const { logoUrl } = useAssetUrls();
   return (
     <span className={cn('brand-logo', className)} aria-hidden="true">
       <img src={logoUrl} alt="" />
@@ -917,6 +915,7 @@ function IconTooltip({ label, children }: { label: string; children: ReactNode }
 }
 
 function MessageAvatar({ isUser }: { isUser: boolean }) {
+  const { aiAvatarUrl, userAvatarUrl } = useAssetUrls();
   return (
     <div className={cn('avatar', 'message-avatar-image', isUser && 'user-avatar')}>
       <img src={isUser ? userAvatarUrl : aiAvatarUrl} alt="" />
@@ -926,8 +925,9 @@ function MessageAvatar({ isUser }: { isUser: boolean }) {
 }
 
 export default function App() {
+  const host = useWebHost();
   const [page, setPage] = useState<PageId | 'login'>(initialPage);
-  const [token, setToken] = useState(() => readStorage('aiop_token'));
+  const [token, setToken] = useState(() => host.getToken());
   const [sessionId, setSessionId] = useState(() => readStorage('aiop_session_id') || numericSessionId());
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [contextUsage, setContextUsage] = useState<Record<string, ContextUsageBody>>({});
@@ -1041,15 +1041,12 @@ export default function App() {
     }
     setPage('login');
     setToken('');
-    writeStorage('aiop_token', '');
-    if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
+    host.setToken('');
+    void host.onUnauthorized();
+    if (host.deploymentMode === 'standalone' && host.authProvider === 'local' && typeof window !== 'undefined' && window.location.pathname !== '/login') {
       window.history.replaceState({}, '', '/login');
     }
-    // 嵌入模式下向宿主页重新请求授权（宿主监听到 ready 会回发新 token）。
-    if (inIframe && typeof window !== 'undefined') {
-      window.parent.postMessage({ type: 'aiop:ready' }, '*');
-    }
-  }, []);
+  }, [host]);
 
   const routeAfterLogin = useCallback(() => {
     const next = requestedPageRef.current;
@@ -1057,7 +1054,32 @@ export default function App() {
     if (typeof window !== 'undefined') window.history.replaceState({}, '', pageUrl(next));
   }, []);
 
-  const api = useMemo(() => createApi(token, redirectToLogin), [token, redirectToLogin]);
+  const api = useMemo(() => createApi(host, token, redirectToLogin), [host, token, redirectToLogin]);
+
+  useEffect(() => {
+    if (!host.subscribeToken) return;
+    return host.subscribeToken((nextToken) => {
+      setToken(nextToken);
+      if (nextToken) routeAfterLogin();
+    });
+  }, [host, routeAfterLogin]);
+
+  useEffect(() => {
+    if (token || host.authProvider !== 'oidc' || !host.consumeOidcSession) return;
+    let cancelled = false;
+    void host.consumeOidcSession().then((nextToken) => {
+      if (cancelled) return;
+      if (!nextToken) {
+        void host.startOidcLogin?.();
+        return;
+      }
+      setToken(nextToken);
+      routeAfterLogin();
+    }).catch(() => {
+      if (!cancelled) void host.startOidcLogin?.();
+    });
+    return () => { cancelled = true; };
+  }, [host, routeAfterLogin, token]);
 
   // 当前登录身份（角色驱动管理员菜单的显隐；服务端 RBAC 才是权限边界）。
   const [me, setMe] = useState<MeBody | null>(null);
@@ -1099,60 +1121,6 @@ export default function App() {
     });
     return () => { cancelled = true; };
   }, [api, token]);
-
-  // AIOS token exchange：宿主页 postMessage 传来的平台 token 换 aiop JWT。
-  const exchangeAiosToken = useCallback(async (data: { token: string; refreshToken?: string; expiredTime?: string }) => {
-    setAuthStatus('正在通过 AIOS 平台登录...');
-    try {
-      const response = await fetch('/auth/aios/exchange', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(data),
-      });
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({})) as { error?: string };
-        setAuthStatus(`AIOS 登录失败：${body.error || response.status}`);
-        return;
-      }
-      const body = await response.json() as { token: string };
-      setToken(body.token);
-      writeStorage('aiop_token', body.token);
-      setAuthStatus('');
-      routeAfterLogin();
-    } catch {
-      setAuthStatus('AIOS 登录失败：网络错误');
-    }
-  }, [routeAfterLogin]);
-
-  // 嵌入模式握手：iframe 就绪后向宿主页发 ready，宿主回发 {type:'aiop:auth', token}。
-  // token 不走 URL（防日志/历史泄露）；宿主真伪由后端 CSP frame-ancestors 白名单 + exchange 服务端校验兜底。
-  useEffect(() => {
-    if (!inIframe || typeof window === 'undefined') return;
-    const onMessage = (event: MessageEvent) => {
-      const data = event.data as { type?: string; token?: string; refreshToken?: string; expiredTime?: string } | null;
-      if (!data || data.type !== 'aiop:auth' || typeof data.token !== 'string' || !data.token) return;
-      void exchangeAiosToken({
-        token: data.token,
-        refreshToken: typeof data.refreshToken === 'string' ? data.refreshToken : undefined,
-        expiredTime: typeof data.expiredTime === 'string' ? data.expiredTime : undefined,
-      });
-    };
-    window.addEventListener('message', onMessage);
-    window.parent.postMessage({ type: 'aiop:ready' }, '*');
-    return () => window.removeEventListener('message', onMessage);
-  }, [exchangeAiosToken]);
-
-  // 静默续期：JWT 到期前 5 分钟重新向宿主页要 token（仅嵌入模式；AIOS 侧已登出则 exchange 失败自然退出）。
-  useEffect(() => {
-    if (!inIframe || !token || typeof window === 'undefined') return;
-    const exp = jwtExpiryMs(token);
-    if (!exp) return;
-    const delay = Math.max(30_000, exp - Date.now() - 5 * 60_000);
-    const timer = window.setTimeout(() => {
-      window.parent.postMessage({ type: 'aiop:ready' }, '*');
-    }, delay);
-    return () => window.clearTimeout(timer);
-  }, [token]);
 
   const loadLlmSettings = useCallback(async () => {
     const body = await api.get<ModelSettingsBody>('/v1/settings/llm');
@@ -1261,20 +1229,15 @@ export default function App() {
       return;
     }
     setAuthStatus('正在登录...');
-    const response = await fetch('/auth/login', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ tenantId, username, password }),
-    });
-    if (!response.ok) {
-      setAuthStatus('登录失败，请检查用户名或密码。');
-      return;
+    try {
+      if (!host.login) throw new Error('当前宿主不支持本地登录');
+      const nextToken = await host.login({ tenantId, username, password });
+      setToken(nextToken);
+      setAuthStatus('');
+      routeAfterLogin();
+    } catch (error) {
+      setAuthStatus(error instanceof Error ? error.message : '登录失败，请检查用户名或密码。');
     }
-    const body = await response.json() as { token: string };
-    setToken(body.token);
-    writeStorage('aiop_token', body.token);
-    setAuthStatus('');
-    routeAfterLogin();
   }
 
   function navigate(next: PageId) {
@@ -1901,7 +1864,10 @@ export default function App() {
   }
 
   if (page === 'login') {
-    return <LoginPage authStatus={authStatus} onSubmit={submitLogin} />;
+    if (host.deploymentMode === 'standalone' && host.authProvider === 'local') {
+      return <LoginPage authStatus={authStatus} onSubmit={submitLogin} />;
+    }
+    return <HostAuthenticationPending mode={host.deploymentMode === 'standalone' ? 'redirect' : 'waiting'} />;
   }
 
   const activePage = page as PageId;
@@ -2025,6 +1991,7 @@ export default function App() {
 
 function SidebarAccountMenu({ token, me, onLogout }: { token: string; me?: MeBody | null; onLogout: () => void }) {
   const [open, setOpen] = useState(false);
+  const { userAvatarUrl } = useAssetUrls();
   return (
     <div className="sidebar-account">
       <IconTooltip label="用户菜单">
@@ -2197,7 +2164,11 @@ function PrototypeSidebarNav({ page, token, me, onNavigate, onLogout }: {
   return (
     <aside className="prototype-sidebar-nav" aria-label="主导航">
       <BrandLogo className="prototype-sidebar-logo" />
-      {NAV_ITEMS.filter((item) => !item.adminOnly || isAdmin).map((item) => {
+      {NAV_ITEMS.filter((item) => {
+        if (item.adminOnly && !isAdmin) return false;
+        if (item.id === 'users' && me?.features?.localUserManagement === false) return false;
+        return true;
+      }).map((item) => {
         const Icon = iconMap[item.icon];
         return (
           <Tooltip key={item.id}>
@@ -4968,24 +4939,23 @@ function PageTitle({ title, desc }: { title: string; desc?: string }) {
   );
 }
 
-function LoginPage({ authStatus, onSubmit }: { authStatus: string; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
-  // 嵌入模式：等待宿主页（AIOS）postMessage 授权，不展示本地登录表单。
-  if (inIframe) {
-    return (
-      <main className="login-page">
-        <section className="login-card">
-          <div className="login-brand">
-            <BrandLogo className="brand-logo-login" />
-            <div>
-              <h1>AIOP</h1>
-              <p>正在等待 AIOS 平台授权...</p>
-            </div>
+function HostAuthenticationPending({ mode }: { mode: 'redirect' | 'waiting' }) {
+  return (
+    <main className="login-page">
+      <section className="login-card">
+        <div className="login-brand">
+          <BrandLogo className="brand-logo-login" />
+          <div>
+            <h1>AIOP</h1>
+            <p>{mode === 'redirect' ? '正在跳转到统一登录...' : '等待宿主平台提供授权凭据'}</p>
           </div>
-          {authStatus ? <div className="settings-status">{authStatus}</div> : null}
-        </section>
-      </main>
-    );
-  }
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function LoginPage({ authStatus, onSubmit }: { authStatus: string; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
   return (
     <main className="login-page">
       <section className="login-card">

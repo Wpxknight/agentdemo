@@ -340,6 +340,31 @@ export interface UserCredentialRecord {
   expiresAt?: Date;
 }
 
+/** OIDC callback 生成的一次性交换码；code 本身绝不持久化，仅保存其摘要。 */
+export interface OidcExchangeCode {
+  codeHash: string;
+  tenantId: string;
+  provider: 'oidc';
+  sessionToken: string;
+  browserNonceHash?: string;
+  expiresAt: Date;
+}
+
+export interface OidcExchangeCodeClaim {
+  codeHash: string;
+  provider: 'oidc';
+  /** 已知租户时必须匹配；HTTP 兑换由随机 code 唯一定位后返回记录所属租户。 */
+  tenantId?: string;
+  browserNonceHash?: string;
+  now: Date;
+}
+
+export interface ConsumedOidcExchangeCode {
+  tenantId: string;
+  provider: 'oidc';
+  sessionToken: string;
+}
+
 /**
  * 持久化抽象。除系统级调度、租户和用户管理方法外，
  * 业务读写均需 RequestContext 并按 tenantId 强制过滤，实现租户隔离。
@@ -427,6 +452,11 @@ export interface Store extends AuditSink {
   setUserCredential(tenantId: string, userId: string, provider: string, record: UserCredentialRecord): Promise<void>;
   getUserCredential(tenantId: string, userId: string, provider: string): Promise<UserCredentialRecord | undefined>;
   deleteUserCredentials(tenantId: string, userId: string): Promise<void>;
+
+  // —— OIDC 一次性交换码 ——
+  putOidcExchangeCode(record: OidcExchangeCode): Promise<void>;
+  /** 仅一个并发调用可成功；实现必须原子设置 consumed_at 后返回会话。 */
+  consumeOidcExchangeCode(claim: OidcExchangeCodeClaim): Promise<ConsumedOidcExchangeCode | undefined>;
 
   // —— 租户设置 ——
   getLlmSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<LlmSettings | undefined>;

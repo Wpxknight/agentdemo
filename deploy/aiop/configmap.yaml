@@ -6,6 +6,7 @@ metadata:
 data:
   config.jsonc: |
     {
+      "deploymentMode": "standalone",
       "models": {
         "glm-5": {
           "protocol": "anthropic",

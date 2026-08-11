@@ -36,6 +36,11 @@ export function can(role: Role, perm: Permission): boolean {
   return MATRIX[role]?.has(perm) ?? false;
 }
 
+/** 返回服务端授权后的权限快照，供 Web 菜单做一致的 UX 裁剪。 */
+export function permissionsFor(role: Role): Permission[] {
+  return [...(MATRIX[role] ?? [])];
+}
+
 /** 是否管理员角色（租户/平台）；技能上传落 public、无主存量技能代管等按此判定。 */
 export function isAdminRole(role: Role): boolean {
   return role === 'platform_admin' || role === 'tenant_admin';

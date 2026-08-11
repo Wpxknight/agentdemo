@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { can, canManageUsersOf, requirePermission, AuthzError } from '../src/auth/rbac.js';
+import { can, canManageUsersOf, permissionsFor, requirePermission, AuthzError } from '../src/auth/rbac.js';
 import { createTenant, createUser } from '../src/auth/admin.js';
 import { LocalAuthProvider } from '../src/auth/local.js';
 import { MemoryStore } from '../src/db/memory.js';
@@ -16,6 +16,8 @@ describe('permission matrix', () => {
     expect(can('tenant_admin', 'approve')).toBe(true);
     expect(can('user', 'cluster:write')).toBe(false);
     expect(can('user', 'task:create')).toBe(true);
+    expect(permissionsFor('tenant_admin')).toContain('audit:read');
+    expect(permissionsFor('user')).not.toContain('user:manage:own');
   });
 
   it('requirePermission throws on denial', () => {

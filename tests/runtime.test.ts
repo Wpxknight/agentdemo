@@ -228,6 +228,29 @@ describe('production durable runtime assembly', () => {
       .rejects.toThrow('distributed mutation lock');
   });
 
+  it('builds an AIOS-integrated MysqlStore runtime without resolving a CLI principal at startup', async () => {
+    const parsed = ConfigSchema.parse({
+      ...config,
+      deploymentMode: 'aios-integrated',
+      auth: {
+        provider: 'aios',
+        aios: { verify: 'userinfo', userinfoUrl: 'https://aios.example.com/userinfo' },
+      },
+    });
+    const mysql = new MysqlStore({} as never);
+    const createTenant = vi.spyOn(mysql, 'createTenant').mockResolvedValue(undefined);
+    vi.spyOn(mysql, 'getSandboxSettingsRecord').mockResolvedValue(undefined);
+    vi.spyOn(mysql, 'getLlmSettings').mockResolvedValue(undefined);
+    const runtime = await buildRuntime(parsed, { store: mysql, durableRunRuntime: { run: vi.fn() } as never });
+    try {
+      expect(createTenant).toHaveBeenCalled();
+      expect(runtime.store).toBe(mysql);
+      expect(runtime.deploymentMode).toBe('aios-integrated');
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
   it('constructs the MysqlStore durable primary path by default', async () => {
     const runtime = await createDefaultDurableRunRuntime(
       new MysqlStore({} as never),
@@ -372,6 +395,7 @@ describe('production durable runtime assembly', () => {
     const runtime = await buildRuntime(config, { store: new MemoryStore(), durableRunRuntime: injected });
     try {
       expect(runtime.durableRunRuntime).toBe(injected);
+      expect(runtime.defaultContext.userId).toBe('18446744073709551615');
     } finally {
       await runtime.dispose();
     }

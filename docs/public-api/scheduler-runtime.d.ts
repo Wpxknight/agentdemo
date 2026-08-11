@@ -192,6 +192,10 @@ import type { AgentRunResult, DurableRunRuntime } from '@aiop/control-contracts'
 import type { BoundRunRecovery, ClaimedScheduledFire, RunDispatcher, ScheduledRunInput, ScheduledRunLookup } from './domain.js';
 import type { SchedulerStore } from './store.js';
 import type { SchedulerObserver } from './observation.js';
+export declare class TerminalScheduledFireError extends Error {
+    readonly code: string;
+    constructor(code: string, message?: string);
+}
 export interface SchedulerRunnerOptions {
     store: SchedulerStore;
     dispatcher: RunDispatcher;

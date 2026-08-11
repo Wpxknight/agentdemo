@@ -24,6 +24,7 @@ data:
           "clientId": "aiop",
           "clientSecret": "${OIDC_CLIENT_SECRET}",
           "redirectUri": "http://192.168.10.108:30083/auth/callback",
+          "webCallbackUrl": "http://192.168.10.108:30083/",
           "allowInsecureHttp": true,
           "scopes": ["openid", "profile", "email"],
           "mapping": {

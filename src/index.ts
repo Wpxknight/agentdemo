@@ -6,6 +6,8 @@ import { createHttpServer } from './server/http.js';
 import { LocalAuthProvider } from './auth/local.js';
 import type { Config } from './config/schema.js';
 import { shouldEmbedScheduler, startRuntimeScheduler } from './scheduler/runner.js';
+import { MysqlStore } from './db/mysql.js';
+import { resolveCliPrincipalId } from './runtime.js';
 
 /**
  * 入口：
@@ -50,12 +52,22 @@ async function runServer(config: Config) {
   process.on('SIGTERM', () => void shutdown());
 }
 
-/** 本地单次任务（CLI 为可信操作者，自动批准；续接 'cli' 会话历史）。 */
+/** 本地单次任务（CLI 为可信系统主体，使用保留正整数身份并自动批准）。 */
 async function runOnce(config: Config, task: string) {
+  if (config.deploymentMode === 'aios-integrated') {
+    throw new Error('aios-integrated mode does not support standalone CLI execution; use the authenticated Host API');
+  }
   const rt = await buildRuntime(config);
   logger.info({ model: rt.model.id, task }, 'running agent');
 
-  const { tenantId, userId, role } = rt.defaultContext;
+  const durableMysql = rt.store instanceof MysqlStore;
+  const userId = await resolveCliPrincipalId(
+    process.env.AIOP_CLI_USER_ID,
+    durableMysql,
+    durableMysql ? (candidate) => rt.store.getUser('default', candidate) : undefined,
+  );
+  const tenantId = 'default';
+  const role = 'platform_admin' as const;
   const sessionId = 'cli';
   const handle = await rt.durableRunRuntime.run({
     runId: randomUUID(),

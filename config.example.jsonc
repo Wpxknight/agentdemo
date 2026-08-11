@@ -28,6 +28,8 @@
     }
   },
   "defaultModel": "my-claude",
+  // standalone: Local/OIDC 独立部署；aios-integrated: AIOS 主身份源（禁止隐式回退 Local）。
+  "deploymentMode": "standalone",
   // 工具权限规则（叠加在运维策略之上，覆盖所有工具）。语法：`工具名` 或 `工具名(子模式)`。
   // deny > ask > allow；deny 且不带子模式的工具在发给模型前即被剥离。
   // 子模式对 kubectl 是 `<verb>` / `<verb>:<资源名>`，对 sbx__run_command 是命令文本（shell 通配 * ?）。
@@ -57,16 +59,17 @@
     "dir": "./skills",
     // "sandboxEnv": { "AIOS_BASE_URL": "http://10.10.72.20:30001/paas-web", "AIOS_CLIENT_ID": "..." }
   },
-  // 认证：local（默认，用户名口令）或 oidc（SSO）。HTTP 服务接入后生效
+  // 认证：standalone 使用 local 或 oidc；aios-integrated 必须使用 aios。HTTP 服务接入后生效
   "auth": {
     "provider": "local"
-    // "provider": "oidc",
+    // To use OIDC, replace the provider value above and enable the oidc block below.
     // "jwtTtl": "12h",
     // "oidc": {
     //   "issuer": "https://keycloak.example.com/realms/aiop",
     //   "clientId": "aiop",
     //   "clientSecret": "${OIDC_CLIENT_SECRET}",
-    //   "redirectUri": "https://aiop.example.com/auth/callback",
+    //   "redirectUri": "https://aiop.example.com/auth/callback", // 同时定义 API/Web public origin
+    //   "webCallbackUrl": "https://aiop.example.com/chat",       // 可选；必须与 redirectUri 同源
     //   "scopes": ["openid", "profile", "email"],
     //   "mapping": {
     //     "tenantClaim": "tenant", "defaultTenant": "default",

@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { sql, type Kysely, type Selectable } from 'kysely';
 import type { Msg, Role as MsgRole } from '../llm/types.js';
 import type { AuditEvent } from '../audit/sink.js';
@@ -36,6 +36,9 @@ import type {
   ToolExecutionRecord,
   ToolExecutionStatus,
   UserCredentialRecord,
+  OidcExchangeCode,
+  OidcExchangeCodeClaim,
+  ConsumedOidcExchangeCode,
   UserPatch,
   UserWithSecret,
 } from './store.js';
@@ -1110,12 +1113,9 @@ export class MysqlStore implements Store {
   }
 
   async createUser(user: NewUser): Promise<User> {
-    // id 带随机后缀去关联 username：墓碑改名释放用户名后，新建同名用户不会撞旧行主键。
-    const id = `u_${user.tenantId}_${user.username}_${randomUUID().slice(0, 8)}`;
-    await this.db
+    const result = await this.db
       .insertInto('users')
       .values({
-        id,
         tenant_id: user.tenantId,
         username: user.username,
         role: user.role,
@@ -1125,7 +1125,9 @@ export class MysqlStore implements Store {
         display_name: user.displayName ?? null,
         home_dir: null,
       })
-      .execute();
+      .executeTakeFirstOrThrow();
+    const id = result.insertId?.toString();
+    if (!id || id === '0') throw new Error('MySQL did not return a positive user insertId');
     return {
       id,
       tenantId: user.tenantId,
@@ -1254,6 +1256,55 @@ export class MysqlStore implements Store {
       .where('tenant_id', '=', tenantId)
       .where('user_id', '=', userId)
       .execute();
+  }
+
+  private async cleanupOidcExchangeCodes(now: Date): Promise<void> {
+    // 拆分为两个命中专用索引的固定批次，避免认证请求触发 OR 条件全表重扫或无界删除。
+    await sql`DELETE FROM oidc_exchange_codes
+      WHERE expires_at <= ${now}
+      ORDER BY expires_at
+      LIMIT 100`.execute(this.db);
+    await sql`DELETE FROM oidc_exchange_codes
+      WHERE consumed_at IS NOT NULL
+      ORDER BY consumed_at, expires_at
+      LIMIT 100`.execute(this.db);
+  }
+
+  async putOidcExchangeCode(record: OidcExchangeCode): Promise<void> {
+    await this.cleanupOidcExchangeCodes(new Date());
+    await this.db.insertInto('oidc_exchange_codes').values({
+      code_hash: record.codeHash,
+      tenant_id: record.tenantId,
+      provider: record.provider,
+      session_token: record.sessionToken,
+      browser_nonce_hash: record.browserNonceHash ?? null,
+      expires_at: record.expiresAt,
+      consumed_at: null,
+    }).execute();
+  }
+
+  async consumeOidcExchangeCode(claim: OidcExchangeCodeClaim): Promise<ConsumedOidcExchangeCode | undefined> {
+    await this.cleanupOidcExchangeCodes(claim.now);
+    return this.db.transaction().execute(async (trx) => {
+      let update = trx.updateTable('oidc_exchange_codes')
+        .set({ consumed_at: claim.now })
+        .where('code_hash', '=', claim.codeHash)
+        .where('provider', '=', claim.provider)
+        .where('consumed_at', 'is', null)
+        .where('expires_at', '>', claim.now);
+      if (claim.tenantId !== undefined) update = update.where('tenant_id', '=', claim.tenantId);
+      update = claim.browserNonceHash === undefined
+        ? update.where('browser_nonce_hash', 'is', null)
+        : update.where('browser_nonce_hash', '=', claim.browserNonceHash);
+      const updated = await update.executeTakeFirst();
+      if (Number(updated.numUpdatedRows) !== 1) return undefined;
+      const row = await trx.selectFrom('oidc_exchange_codes')
+        .select(['tenant_id', 'provider', 'session_token'])
+        .where('code_hash', '=', claim.codeHash)
+        .executeTakeFirst();
+      if (!row || row.provider !== 'oidc') throw new Error('Consumed OIDC exchange code disappeared');
+      return { tenantId: row.tenant_id, provider: 'oidc', sessionToken: row.session_token };
+    });
   }
 
   async getLlmSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<LlmSettings | undefined> {

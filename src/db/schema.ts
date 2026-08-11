@@ -89,7 +89,8 @@ export interface TenantsTable {
 }
 
 export interface UsersTable {
-  id: string;
+  /** mysql2/Kysely returns BIGINT as a precision-safe decimal string. */
+  id: Generated<string>;
   tenant_id: string;
   username: string;
   role: string;
@@ -112,6 +113,17 @@ export interface UserCredentialsTable {
   payload: string;
   expires_at: Date | null;
   updated_at: Generated<Date>;
+}
+
+export interface OidcExchangeCodesTable {
+  code_hash: string;
+  tenant_id: string;
+  provider: string;
+  session_token: string;
+  browser_nonce_hash: string | null;
+  expires_at: Date;
+  consumed_at: Date | null;
+  created_at: Generated<Date>;
 }
 
 export interface TenantSettingsTable {
@@ -316,6 +328,7 @@ export interface Database {
   tenants: TenantsTable;
   users: UsersTable;
   user_credentials: UserCredentialsTable;
+  oidc_exchange_codes: OidcExchangeCodesTable;
   tenant_settings: TenantSettingsTable;
   setting_secrets: SettingSecretsTable;
   agent_interactions: AgentInteractionsTable;

@@ -10,6 +10,13 @@ import type {
 import type { SchedulerStore } from './store.js';
 import type { SchedulerObserver } from './observation.js';
 
+export class TerminalScheduledFireError extends Error {
+  constructor(readonly code: string, message = code) {
+    super(message);
+    this.name = 'TerminalScheduledFireError';
+  }
+}
+
 export interface SchedulerRunnerOptions {
   store: SchedulerStore;
   dispatcher: RunDispatcher;
@@ -227,17 +234,33 @@ export class SchedulerRunner {
           await this.options.completed?.(fire, result);
         }
       } catch (error) {
-        this.observe({ name: 'retry', value: 1, fireId: fire.fireId, state: 'failed' });
-        const retry = {
-          fireId: fire.fireId,
-          claimToken: fire.claimToken,
-          retryAt: new Date(now.getTime() + this.retryDelayMs),
-          error: String(error),
-        };
-        if (bound) {
-          await this.options.store.deferBound(retry).catch(() => undefined);
+        if (error instanceof TerminalScheduledFireError && !bound) {
+          const result: AgentRunResult = {
+            runId: fire.fireId,
+            status: 'failed',
+            usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+            error: { code: 'MODEL_PROVIDER_ERROR', message: error.code, retryable: false },
+          };
+          await this.options.store.bindRun({
+            fireId: fire.fireId, claimToken: fire.claimToken, runId: fire.fireId, boundAt: now,
+          });
+          await this.options.store.completeFire({
+            fireId: fire.fireId, claimToken: fire.claimToken, runId: fire.fireId, result, completedAt: now,
+          });
+          this.observe({ name: 'completion', value: 1, fireId: fire.fireId, state: 'completed' });
         } else {
-          await this.options.store.releaseFire(retry).catch(() => undefined);
+          this.observe({ name: 'retry', value: 1, fireId: fire.fireId, state: 'failed' });
+          const retry = {
+            fireId: fire.fireId,
+            claimToken: fire.claimToken,
+            retryAt: new Date(now.getTime() + this.retryDelayMs),
+            error: String(error),
+          };
+          if (bound) {
+            await this.options.store.deferBound(retry).catch(() => undefined);
+          } else {
+            await this.options.store.releaseFire(retry).catch(() => undefined);
+          }
         }
       }
       this.observe({ name: 'duration_ms', value: Math.max(0, Date.now() - startedAt), fireId: fire.fireId });

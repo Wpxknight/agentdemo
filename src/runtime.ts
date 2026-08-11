@@ -105,7 +105,7 @@ import { createAIOPToolRuntime } from './tools/governance.js';
 import { UserCredentials } from './auth/credentials.js';
 import { buildSystemPrompt } from './prompt.js';
 import type { AuthProvider } from './auth/provider.js';
-import type { RequestContext } from './auth/types.js';
+import { DEFAULT_MEMORY_CLI_PRINCIPAL_ID, parsePrincipalId, type RequestContext } from './auth/types.js';
 import {
   AiosTemplateCatalog,
   sandboxProfilesFromAiosCatalog,
@@ -142,6 +142,8 @@ export interface SandboxSettingsUpdate {
 }
 
 export interface Runtime {
+  /** 部署拓扑决定认证和离线调度门禁。 */
+  deploymentMode?: 'standalone' | 'aios-integrated';
   /** 唯一 Agent 执行入口；HTTP、CLI 与 Scheduler 共享同一个 durable Pi runtime。 */
   durableRunRuntime: DurableRunRuntime;
   /** Root-lifecycle controller shared by durable and direct governed tool calls. */
@@ -198,7 +200,7 @@ export interface Runtime {
   frameAncestors?: string[];
   /** 会话 JWT 密钥（HTTP 层签发 OIDC 临时 state cookie 等用）。 */
   jwtSecret: string;
-  /** 无认证（CLI）场景的默认身份。 */
+  /** 无认证（仅内存 CLI）场景的默认身份；durable CLI 在执行边界解析真实用户。 */
   defaultContext: RequestContext;
   /** 请求 Scheduler 尽快处理已持久化的 Fire；未启用嵌入式 Worker 时不存在。 */
   requestSchedulerTick?(): void;
@@ -474,6 +476,22 @@ export function resolveRuntimeSandboxConfig(
   return persisted ? sandboxSettingsToConfig(persisted) : startup;
 }
 
+export async function resolveCliPrincipalId(
+  configured: string | undefined,
+  durableMysql: boolean,
+  lookup?: (userId: string) => Promise<{ status: string } | undefined>,
+): Promise<string> {
+  if (durableMysql && !configured) throw new Error('AIOP_CLI_USER_ID is required for durable MySQL runtime');
+  const userId = parsePrincipalId(configured ?? DEFAULT_MEMORY_CLI_PRINCIPAL_ID);
+  if (durableMysql) {
+    const principal = await lookup?.(userId);
+    if (!principal || principal.status !== 'active') {
+      throw new Error('AIOP_CLI_USER_ID must identify an existing active user in the default tenant');
+    }
+  }
+  return userId;
+}
+
 /** 组装一次运行所需的全部组件（模型/工具/策略/持久化）。 */
 export async function buildRuntime(
   config: Config,
@@ -514,9 +532,11 @@ export async function buildRuntime(
   if (skillImportPermitLock) initializationCleanups.push(() => skillImportPermitLock.close());
   try {
   const logSink = new LogAuditSink();
+  const deploymentMode = config.deploymentMode ?? 'standalone';
   const audit: AuditSink = {
     async record(e) {
-      await Promise.all([logSink.record(e), store.record(e)]);
+      const enriched = { deploymentMode, ...e };
+      await Promise.all([logSink.record(enriched), store.record(enriched)]);
     },
   };
 
@@ -837,20 +857,22 @@ export async function buildRuntime(
     skillRegistry = skills;
   }
 
-  // 认证：本地或 OIDC（复用上方派生的 jwtSecret）
+  // 认证 Provider 由部署模式显式决定，非法组合由 ConfigSchema 失败关闭。
   const ttl = config.auth?.jwtTtl;
+  const providerKind = config.auth?.provider ?? 'local';
   let authProvider: AuthProvider;
-  if (config.auth?.provider === 'oidc' && config.auth.oidc) {
+  let aiosAuth: AiosAuthProvider | undefined;
+  if (providerKind === 'oidc') {
+    if (!config.auth?.oidc) throw new Error('auth.provider=oidc requires auth.oidc');
     authProvider = new OidcAuthProvider({ store, secret: jwtSecret, ttl, config: config.auth.oidc });
     logger.info({ issuer: config.auth.oidc.issuer }, 'OIDC SSO 已启用');
+  } else if (providerKind === 'aios') {
+    if (!config.auth?.aios) throw new Error('auth.provider=aios requires auth.aios');
+    aiosAuth = new AiosAuthProvider({ store, secret: jwtSecret, ttl, config: config.auth.aios, credentials });
+    authProvider = aiosAuth;
+    logger.info({ verify: config.auth.aios.verify }, 'AIOS 主认证已启用');
   } else {
     authProvider = new LocalAuthProvider({ store, secret: jwtSecret, ttl });
-  }
-  // AIOS 嵌入登录：与 local/oidc 并存的第三种登录方式（aiop 用户体系不依赖它，可独立部署）。
-  let aiosAuth: AiosAuthProvider | undefined;
-  if (config.auth?.aios) {
-    aiosAuth = new AiosAuthProvider({ store, secret: jwtSecret, ttl, config: config.auth.aios, credentials });
-    logger.info({ verify: config.auth.aios.verify }, 'AIOS 嵌入登录已启用');
   }
 
   // CLI 默认身份：确保默认租户存在
@@ -870,9 +892,10 @@ export async function buildRuntime(
       logger.warn('auth.bootstrapAdmin 仅在 local 认证模式生效，当前已忽略');
     }
   }
+  // Server、HTTP 与 Scheduler 不使用 CLI 主体。Durable CLI 必须在实际执行边界解析并校验真实用户。
   const defaultContext: RequestContext = {
     tenantId: DEFAULT_TENANT,
-    userId: 'cli',
+    userId: DEFAULT_MEMORY_CLI_PRINCIPAL_ID,
     role: 'platform_admin',
   };
   modelConfig = await resolveRuntimeModelConfig(config, store, DEFAULT_TENANT);
@@ -1029,6 +1052,7 @@ export async function buildRuntime(
     clusters,
     audit,
     store,
+    deploymentMode: config.deploymentMode ?? 'standalone',
     systemExtra,
     policy,
     policyPreApproved,

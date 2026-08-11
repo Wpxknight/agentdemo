@@ -53,10 +53,16 @@ export class LocalAuthProvider implements AuthProvider {
       log.warn({ tenantId, username }, 'login: 口令错误');
       return undefined;
     }
-    return signSession(this.secret, { tenantId: user.tenantId, userId: user.id, role: user.role }, this.ttl);
+    return signSession(this.secret, {
+      tenantId: user.tenantId, userId: user.id, provider: 'local', role: user.role,
+    }, this.ttl);
   }
 
   async authenticate(token: string): Promise<RequestContext | undefined> {
-    return verifySession(this.secret, token);
+    const ctx = await verifySession(this.secret, token);
+    if (!ctx || ctx.provider !== 'local') return undefined;
+    const user = await this.store.getUser(ctx.tenantId, ctx.userId);
+    if (!user || user.status !== 'active' || user.authProvider !== 'local' || user.role !== ctx.role) return undefined;
+    return ctx;
   }
 }

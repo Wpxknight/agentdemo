@@ -6,6 +6,7 @@ import { bearerToken, authenticate } from '../src/server/context.js';
 import { parseConfig } from '../src/config/load.js';
 import { buildRuntime } from '../src/runtime.js';
 import type { Config } from '../src/config/schema.js';
+import { signSession } from '../src/auth/session.js';
 
 describe('password hashing', () => {
   it('verifies correct password and rejects wrong', async () => {
@@ -34,7 +35,8 @@ describe('LocalAuthProvider', () => {
     expect(token).toBeTypeOf('string');
 
     const ctx = await auth.authenticate(token!);
-    expect(ctx).toEqual({ tenantId: 't1', userId: user.id, role: 'tenant_admin' });
+    expect(ctx).toEqual({ tenantId: 't1', userId: user.id, provider: 'local', role: 'tenant_admin' });
+    expect(user.id).toMatch(/^[1-9][0-9]*$/);
   });
 
   it('rejects wrong password and unknown user', async () => {
@@ -43,13 +45,25 @@ describe('LocalAuthProvider', () => {
     expect(await auth.login('t1', 'bob', 'pw')).toBeUndefined();
   });
 
-  it('rejects tampered / foreign tokens', async () => {
-    const { auth } = await setup();
+  it('rejects tampered, foreign-provider, invalid-role and stale-role tokens', async () => {
+    const { auth, store, user } = await setup();
     expect(await auth.authenticate('not-a-jwt')).toBeUndefined();
 
     const other = new LocalAuthProvider({ store: new MemoryStore(), secret: 'different' });
     const token = await auth.login('t1', 'alice', 'pw');
     expect(await other.authenticate(token!)).toBeUndefined(); // 不同密钥签名校验失败
+    const secret = new TextEncoder().encode('test-secret');
+    expect(await auth.authenticate(await signSession(secret, {
+      tenantId: 't1', userId: user.id, provider: 'oidc', role: user.role,
+    }, '1h'))).toBeUndefined();
+    expect(await auth.authenticate(await signSession(secret, {
+      tenantId: 't1', userId: user.id, provider: 'local', role: 'user',
+    }, '1h'))).toBeUndefined();
+    const invalidRole = await new (await import('jose')).SignJWT({ tenant: 't1', provider: 'local', role: 'root' })
+      .setProtectedHeader({ alg: 'HS256' }).setSubject(user.id).setExpirationTime('1h').sign(secret);
+    expect(await auth.authenticate(invalidRole)).toBeUndefined();
+    await store.updateUser('t1', user.id, { status: 'disabled' });
+    expect(await auth.authenticate(token!)).toBeUndefined();
   });
 
   it('scopes users by tenant (same username, different tenant)', async () => {
