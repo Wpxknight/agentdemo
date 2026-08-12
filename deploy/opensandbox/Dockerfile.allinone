@@ -1,0 +1,57 @@
+# All-in-one OpenSandbox runtime for code, browser automation and netdiag.
+# Pod privileges, host networking and hostPath mounts remain controlled by the
+# OpenSandbox server template and are only enabled for the netdiag profile.
+FROM node:24-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN sed -i 's#https\?://deb.debian.org/debian-security#http://mirrors.aliyun.com/debian-security#g; s#https\?://deb.debian.org/debian#http://mirrors.aliyun.com/debian#g' /etc/apt/sources.list.d/debian.sources \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends \
+       bind9-host \
+       ca-certificates \
+       chromium \
+       conntrack \
+       curl \
+       dnsutils \
+       ethtool \
+       iproute2 \
+       ipset \
+       iptables \
+       iputils-ping \
+       iputils-tracepath \
+       jq \
+       less \
+       mtr-tiny \
+       net-tools \
+       netcat-openbsd \
+       nftables \
+       openvswitch-switch \
+       procps \
+       python3-pip \
+       socat \
+       tcpdump \
+       tcptraceroute \
+       traceroute \
+       util-linux \
+       vim-tiny \
+  && rm -rf /var/lib/apt/lists/* \
+  && pip3 install --no-cache-dir --break-system-packages \
+       requests \
+       PyYAML \
+       cryptography \
+       openpyxl
+
+# Prepared by `make sandbox-prepare-kubectl`; ignored by git.
+COPY deploy/opensandbox/kubectl /usr/local/bin/kubectl
+
+RUN chmod +x /usr/local/bin/kubectl \
+  && python3 -c "import requests, yaml, cryptography, openpyxl" \
+  && node -e "if (typeof fetch !== 'function' || typeof WebSocket !== 'function') process.exit(1)" \
+  && chromium --version \
+  && kubectl version --client \
+  && for binary in python3 node chromium kubectl tcpdump conntrack dig nslookup ping \
+       netstat ss ip iptables nft curl jq nsenter ovs-ofctl ovs-vsctl; do \
+       command -v "$binary" >/dev/null || { echo "missing: $binary" >&2; exit 1; }; \
+     done \
+  && echo "all-in-one sandbox image OK"
