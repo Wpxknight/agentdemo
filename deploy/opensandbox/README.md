@@ -75,11 +75,17 @@ kubectl get pods -n opensandbox-system   # controller-manager + server 均 1/1 R
 
 如果只需要代码/命令执行，可以把 `desktop` 设为 `false` 并使用普通解释器镜像。
 
-仓库提供了一个基于 Playwright Ubuntu Noble 镜像的浏览器沙箱示例镜像：
+仓库提供统一的 all-in-one 沙箱镜像，同时包含浏览器、代码执行、kubectl 与 netdiag 工具：
 
 ```sh
-docker build -f deploy/opensandbox/Dockerfile.browser -t aiop/opensandbox-browser:latest .
+make sandbox-pipeline
 ```
+
+默认构建并推送 `deploy.bocloud.k8s:40443/aios/aiop-sandbox:latest`。可通过
+`SANDBOX_IMAGE`、`SANDBOX_PLATFORM`、`SANDBOX_KUBECTL_VERSION` 覆盖镜像、平台和 kubectl 版本。
+普通 code/browser 与 netdiag profile 可以引用同一个运行时镜像；netdiag 所需的 privileged、
+hostNetwork、RBAC 和宿主目录挂载仍由 `netdiag-sandbox.yaml` 与 patched OpenSandbox server
+按 profile 条件注入，镜像本身不会授予这些权限。
 
 集群外联调用 port-forward：
 

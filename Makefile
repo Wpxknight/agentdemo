@@ -12,10 +12,15 @@ AIOP_KUBECONFIG ?= /home/lb/.kube/config-10.241.0.166
 AIOP_NAMESPACE ?= aios-system
 AIOP_KUBECTL = $(KUBECTL) --kubeconfig $(AIOP_KUBECONFIG)
 AIOP_IMAGE_PULL_POLICY ?= Always
+SANDBOX_IMAGE ?= deploy.bocloud.k8s:40443/aios/aiop-sandbox:latest
+SANDBOX_PLATFORM ?= linux/amd64
+SANDBOX_KUBECTL_VERSION ?= v1.32.4
+SANDBOX_KUBECTL_ARCH ?= amd64
+SANDBOX_KUBECTL_DIST ?= dist/opensandbox/kubectl-$(SANDBOX_KUBECTL_VERSION)-linux-$(SANDBOX_KUBECTL_ARCH)
 ROLLBACK_REVISION ?=
 ROLLBACK_TO_REVISION = $(if $(strip $(ROLLBACK_REVISION)),--to-revision=$(ROLLBACK_REVISION),)
 
-.PHONY: verify-node test-agent-platform test-runtime-refactor verify-runtime-refactor test-dual-auth test-migrations-mariadb check-dual-deploy-config package-web-core verify-web-core-package test-web-core-consumer image-check check-user-id-migration migrate-user-id-staging image pipeline deploy-staging rollback-staging deploy-aiop deploy-standalone deploy-aios-integrated rollback-aiop backup-aiop-staging-k8s-settings backup-aiop-staging-db-settings rebuild-aiop-staging-db deploy-aiop-staging deploy-aiop-staging-workload deploy-aiop-staging-fresh
+.PHONY: verify-node test-agent-platform test-runtime-refactor verify-runtime-refactor test-dual-auth test-migrations-mariadb check-dual-deploy-config package-web-core verify-web-core-package test-web-core-consumer image-check check-user-id-migration migrate-user-id-staging image pipeline sandbox-prepare-kubectl sandbox-image sandbox-image-check sandbox-image-push sandbox-pipeline deploy-staging rollback-staging deploy-aiop deploy-standalone deploy-aios-integrated rollback-aiop backup-aiop-staging-k8s-settings backup-aiop-staging-db-settings rebuild-aiop-staging-db deploy-aiop-staging deploy-aiop-staging-workload deploy-aiop-staging-fresh
 
 verify-node:
 	npm run verify:node
@@ -137,6 +142,28 @@ else
 endif
 	docker manifest inspect --insecure $(PUBLISH_IMAGE)
 	docker manifest inspect --insecure $(PUBLISH_WEB_IMAGE)
+
+sandbox-prepare-kubectl:
+	@mkdir -p dist/opensandbox
+	@test -f $(SANDBOX_KUBECTL_DIST) || curl -fL --retry 3 -o $(SANDBOX_KUBECTL_DIST) https://dl.k8s.io/release/$(SANDBOX_KUBECTL_VERSION)/bin/linux/$(SANDBOX_KUBECTL_ARCH)/kubectl
+	@test -f $(SANDBOX_KUBECTL_DIST).sha256 || curl -fL --retry 3 -o $(SANDBOX_KUBECTL_DIST).sha256 https://dl.k8s.io/release/$(SANDBOX_KUBECTL_VERSION)/bin/linux/$(SANDBOX_KUBECTL_ARCH)/kubectl.sha256
+	@printf '%s  %s\n' "$$(cat $(SANDBOX_KUBECTL_DIST).sha256)" "$(SANDBOX_KUBECTL_DIST)" | sha256sum --check
+	install -m 0755 $(SANDBOX_KUBECTL_DIST) deploy/opensandbox/kubectl
+	deploy/opensandbox/kubectl version --client
+
+sandbox-image: sandbox-prepare-kubectl
+	docker build --platform $(SANDBOX_PLATFORM) --network host \
+		-f deploy/opensandbox/Dockerfile.allinone -t $(SANDBOX_IMAGE) .
+
+sandbox-image-check:
+	docker image inspect $(SANDBOX_IMAGE) >/dev/null
+	docker run --rm --platform $(SANDBOX_PLATFORM) $(SANDBOX_IMAGE) sh -ec 'python3 -c "import requests, yaml, cryptography, openpyxl"; node -e "if (typeof fetch !== \"function\" || typeof WebSocket !== \"function\") process.exit(1)"; chromium --version; kubectl version --client; for binary in tcpdump conntrack dig iptables nft nsenter ovs-ofctl ovs-vsctl; do command -v "$$binary" >/dev/null; done'
+
+sandbox-image-push: sandbox-image-check
+	docker push $(SANDBOX_IMAGE)
+	docker manifest inspect --insecure $(SANDBOX_IMAGE) >/dev/null
+
+sandbox-pipeline: sandbox-image sandbox-image-push
 
 deploy-staging:
 	$(KUBECTL) apply -f deploy/dev-k8s/namespace.yaml
