@@ -13,12 +13,9 @@
 
 根目录 `Dockerfile` 使用 Node 24 slim。构建阶段安装根 workspace 依赖并执行 `npm run build:packages`，将内部 `packages/*` 构建结果带入 runtime 阶段。runtime 仍保留开发依赖，通过 `tsx` 直接执行 TypeScript，而不是运行 `tsc` 生成的应用 JavaScript。
 
-同一镜像支持两个常驻入口：
+镜像的常驻入口为 `npm run serve`：启动 HTTP/SSE 服务；设置 `AIOP_EMBED_SCHEDULER=true` 时在服务进程内嵌 Scheduler。
 
-- `npm run serve`：启动 HTTP/SSE 服务；设置 `AIOP_EMBED_SCHEDULER=true` 时在服务进程内嵌 Scheduler。
-- `npm run scheduler`：启动独立 Scheduler 进程。
-
-当前 Kubernetes 清单使用 `serve` 并内嵌 Scheduler，没有部署独立 Scheduler workload。
+当前 Kubernetes 清单使用内嵌 Scheduler；不再提供独立 Scheduler 进程或 workload。
 
 ### 1.2 Web
 
@@ -130,8 +127,11 @@ flowchart LR
 | 审计事件 | `AuditSink` 同时写 Pino audit log 与 Store；覆盖 policy、kubectl、sandbox、usage、auth、MCP 类别 | 谁在何租户执行了受治理动作 |
 | Run Center | Store 持久化并查询 Run、Attempt、Turn、Event、Interaction、Tool execution、usage、取消与人工 resume 事实 | 单个 Durable Run 的时间线、消耗、等待和恢复状态 |
 | 健康端点 | `/healthz`、`/readyz` | HTTP 进程是否可响应；不覆盖依赖健康 |
+| Scheduler 测量日志 | 每个 tick 输出低基数 `scheduler measurement` 结构化日志 | Fire backlog、到期滞后、状态、重试、耗时、完成和长时间 bound Fire；单 Fire 以 `fireId`/`correlationId` 关联 |
 
 日志、审计与 Run Center 是不同证据面：日志面向运行诊断，审计面向治理事实，Run Center 面向 Durable Run 的业务执行事实；三者不能互相替代。
+
+Scheduler 观测字段不携带 tenant、task 或 session 标签，避免高基数。`fireId` 仅作为单次执行的关联字段；Cron 和手动 Fire 都将其作为 Durable `runId`，因此可与 Run Center 事件关联。当前只有进程内测量接口及 Pino 输出，不提供指标抓取端点。
 
 ## 7. 尚未实现的观测与恢复能力
 

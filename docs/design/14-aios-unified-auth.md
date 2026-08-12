@@ -27,10 +27,10 @@ AIoP 为访问过系统的 AIOS 用户创建影子用户，保存 AIoP 内部身
 | 嵌入方式 | AIoP Web 作为 iframe 嵌入 AIOS `paas-web` |
 | 登录态传递 | `postMessage` 传递 AIOS Access Token、过期时间和角色，不传递 Refresh Token |
 | Token 校验 | AIoP 后端校验 AIOS Token；登录时不查询 UPMS 数据库 |
-| 初始角色 | `paas-web` 传递平台管理员、租户管理员或普通用户；缺失、未知或格式错误时按普通用户处理 |
+| 初始角色 | `paas-web` 可传递角色提示，但管理员角色必须由 AIOS Token 签名 claims 或 UPMS 后端接口验证；无法验证时按普通用户处理 |
 | 角色模型 | AIOS 平台管理员、租户管理员、普通用户分别映射为 AIoP `platform_admin`、`tenant_admin`、`user` |
 | 下游权限 | 智能体通过 Skill 携带用户 Token 调用 `bocloud-route`；AIOS 对推理、训练等操作执行最终鉴权 |
-| Token 续约 | `paas-web` 首次传入的 Access Token 暂以明文存库；实时和定时任务执行前由 `AiosTokenService` 通过 UPMS 内部接口按需续约 |
+| Token 续约 | `paas-web` 首次传入的 Access Token 使用 AES-256-GCM 应用层加密后存库；实时和定时任务执行前由 `AiosTokenService` 通过 UPMS 内部接口按需续约 |
 | 用户来源 | 后台复用 AIoP 的共享 MySQL 连接，通过 `MYSQL_UPMS_DATABASE` 指定的库读取 UPMS 用户和角色 |
 | 同步范围 | 查询 UPMS 全部正常用户，不依赖 AIoP `system_id` 或 Label |
 | 影子用户范围 | 只维护已经登录过的 `auth_provider='aios'` 用户 |
@@ -121,7 +121,7 @@ AIOS Access Token 存在有效期，本设计将 Token 持久化，并在每次�
 ### 5.1 总体方案
 
 1. `paas-web` 加载 AIoP iframe 后，主动通过 `postMessage` 传递 Access Token、过期时间和角色；AIoP Web 不发起 Token 请求，也不接收 Refresh Token。
-2. AIoP 验证 Token，创建或更新影子用户，并将 Access Token 暂以明文存入共享 MySQL 的用户凭据表。
+2. AIoP 验证 Token 和管理员角色，创建或更新影子用户，并将 Access Token 使用 AES-256-GCM 应用层加密后存入共享 MySQL 的用户凭据表。
 3. 实时对话任务或定时任务执行前，统一调用 `AiosTokenService.getValidToken()`。
 4. Token 剩余有效期充足时直接返回已存 Token。
 5. Token 已过期或即将过期时，AIoP 后端携带服务身份、用户 `accountId` 和当前 Access Token，调用 UPMS 内部续约接口取得新 Token。该接口必须支持已过期 Access Token 的受控续约。
@@ -131,7 +131,7 @@ AIOS Access Token 存在有效期，本设计将 Token 持久化，并在每次�
 ```mermaid
 flowchart LR
   P[paas-web] -->|首次传入 Access Token<br/>过期时间和角色| A[AiosAuthProvider]
-  A -->|明文保存 Access Token| C[UserCredentials]
+  A -->|加密保存 Access Token| C[UserCredentials]
   C --> DB[(共享 MySQL)]
 
   RT[实时对话任务] --> TS[AiosTokenService]
@@ -165,8 +165,8 @@ flowchart LR
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `token` | 是 | 当前用户 AIOS Access Token |
-| `expiredTime` | 是 | Access Token 过期时间，统一转换为 UTC 时间存储 |
-| `roles` | 否 | 平台管理员、租户管理员或普通用户；缺失时按普通用户处理 |
+| `expiredTime` | 是 | Access Token 过期时间提示；后端必须与已验证 Token claims 或 UPMS 响应核对后存储 |
+| `roles` | 否 | 角色提示，不直接作为管理员授权依据；无法由 Token claims 或 UPMS 后端验证时按普通用户处理 |
 
 `paas-web` 应在 iframe 的 `load` 事件后发送消息；如果 AIoP Web 尚未完成监听，可在短时间内按固定上限重发，AIoP 后端以用户和凭据版本保证幂等。AIoP Web 不主动请求 Token。
 
@@ -175,9 +175,9 @@ AIoP Web 只接受 `event.source === window.parent` 且 `event.origin` 命中白
 `AiosAuthProvider` 完成以下操作：
 
 1. 验证 Access Token，并从已验证身份中取得 `accountId`、登录名和显示名。
-2. 根据 `paas-web` 传入的角色创建或更新影子用户。
+2. 从 AIOS Token 签名 claims 或 UPMS 后端接口取得可信角色并创建或更新影子用户；`paas-web` 传入的角色只作为提示。
 3. 将 `{ token, expiredTime }` 交给 `UserCredentials`。
-4. `UserCredentials` 暂时以明文保存 Access Token，并以 `tenantId + userId + provider='aios'` 为唯一键写入共享 MySQL。数据库字段和访问权限仍按敏感凭据管理。
+4. `UserCredentials` 使用 AES-256-GCM 加密 Access Token，并以 `tenantId + userId + provider='aios'` 为唯一键写入共享 MySQL；加密密钥由 Kubernetes Secret 独立注入，不与 JWT Secret 共用。
 5. 再次进入 AIoP 时，以最新 Token 覆盖旧 Token，不创建重复记录。
 
 ### 5.3 有效 Token 获取服务
@@ -242,9 +242,13 @@ Authorization: Bearer <AIoP_SERVICE_CREDENTIAL>
 - 请求必须同时携带当前或已过期的用户 Access Token；服务身份不能脱离该 Token 任意签发用户 Token。
 - UPMS 必须校验 Access Token 的签名和用户归属。允许忽略过期状态仅用于本续约接口，其他签名、签发方、受众和用户绑定校验不能跳过。
 - UPMS 必须校验用户未删除、状态正常，并返回与请求一致的 `accountId`。
+- 已过期 Token 只能在配置的绝对续约窗口内续约；超过窗口、用户已登出或会话已撤销时必须要求重新登录。
+- 同一旧 Token 不能重复换取多个新 Token，接口必须限制续约频率并防止重放。
 - 续约事件写入 UPMS 和 AIoP 双侧审计，至少包含用户、调用方、时间、结果和关联 ID。
 
 如果 UPMS 当前没有满足以上要求的内部续约能力，不能通过直接读写 UPMS 会话表、复制签名密钥或模拟用户登录实现续约。应先补充受控续约接口。
+
+上述续约签发、会话撤销和防重放能力由 UPMS 负责实现，不属于 AIoP 开发范围；AIoP 只负责携带服务身份和用户 Token 调用接口，并在续约失败时终止任务。
 
 ### 5.5 实时对话任务
 
@@ -267,7 +271,7 @@ sequenceDiagram
   else Token 即将过期或已过期
     T->>P: 携带服务身份和当前或已过期 Token 请求续约
     P-->>T: 返回新 Token 和过期时间
-    T->>T: 原子更新明文 Token
+    T->>T: 原子更新加密 Token
     T-->>R: 返回新 Token
   end
   R->>S: 加载 Skill 并注入 Token
@@ -294,7 +298,7 @@ sequenceDiagram
   alt Token 需要续约
     T->>P: 请求续约
     P-->>T: 返回新 Token
-    T->>T: 更新明文 Token 和过期时间
+    T->>T: 更新加密 Token 和过期时间
   end
   T-->>R: 返回有效 Token
   R->>K: 加载 Skill 并注入 Token
@@ -319,14 +323,14 @@ sequenceDiagram
 
 ### 5.8 数据保护与审计
 
-- 当前阶段只保存 Access Token，不保存 Refresh Token；Access Token 暂以明文存储。
+- 当前阶段只保存 Access Token，不保存 Refresh Token；Access Token 使用 AES-256-GCM 应用层加密存储。
 - Token 字段必须与普通业务字段隔离，数据库账号遵循最小权限，非 AIoP 后端服务不得查询该字段。
 - 数据库查询输出、备份导出、管理工具展示、应用日志、Run 事件、Transcript、Skill 参数和工具结果均不得包含完整 Token。
 - 生产数据库和备份介质应启用静态加密，AIoP 与 MySQL 之间应启用 TLS；这些措施不能替代后续应用层加密。
 - 用户禁用、删除、重新登录或 Token 续约被拒绝时清除已存 Token。
 - 审计记录 Token 首次入库、续约成功、续约失败、凭据清除和强制重新登录，但只记录凭据指纹或末尾摘要。
 - 指标至少包括续约次数、续约失败数、续约耗时、并发合并次数和因凭据问题失败的任务数。
-- 明文存储是阶段性方案。后续引入独立凭据密钥后，应迁移为 AES-256-GCM 应用层加密。
+- 凭据加密密钥必须独立管理并支持轮换；密钥不可写入数据库或普通配置文件。
 
 ## 6. 影子用户模型
 
@@ -349,7 +353,7 @@ sequenceDiagram
 | --- | --- |
 | `external_id` | AIOS Token / UPMS，不允许本地修改 |
 | `username`、`display_name` | AIOS/UPMS 可更新 |
-| `external_roles` | 登录时由 `paas-web` 初始化，后台由 UPMS 覆盖 |
+| `external_roles` | 登录时由 Token claims 或 UPMS 后端验证结果初始化，后台由 UPMS 覆盖 |
 | `role` | AIoP 根据角色映射规则计算 |
 | `status`、`status_reason` | AIoP 生命周期服务维护 |
 | 会话、Skill、Run、定时任务、用户目录 | AIoP 自主管理，用户失效时保留 |
@@ -438,21 +442,16 @@ sequenceDiagram
 
 ### 7.3 防误禁用护栏
 
-同步任务只有在获得完整、可信快照后才能执行禁用阶段。出现以下任一情况时，本轮只能更新已经明确读取到的用户，不能按“未出现”禁用用户：
+同步代码必须先构造完整 UPMS 用户快照，再执行差异对账。只有满足以下条件，快照才可标记为 `complete`：
 
-- 任一分页查询失败或超时；
-- 数据库连接中断；
-- 行扫描或角色聚合失败；
-- 返回数量异常下降并触发安全阈值；
-- 同步被取消；
-- 无法确认快照结束。
+- 使用 UPMS API 时，所有分页的 HTTP 状态和业务状态均成功，已明确到达最后一页；接口返回总数时，分页累计去重后的用户数必须与总数一致；
+- 直接查询 UPMS 数据库时，完整查询或一致性快照事务正常结束，期间没有连接中断、超时、行扫描或角色聚合错误；
+- 每条用户记录都包含合法且唯一的 `external_id`，无法解析的记录会使整个快照不完整；
+- 同步过程未被取消，并且当前 Worker 仍持有有效 claim token。
 
-建议提供两个配置化护栏：
+只有 `complete` 快照可以把“影子用户未出现在 UPMS 结果中”判定为用户已删除或停用，并执行禁用、凭据清理和任务暂停。任何查询或分页异常都必须将快照标记为不完整；本轮只能更新已经明确读取到的用户，不能根据缺失记录禁用用户。
 
-- **最小快照比例**：本轮正常用户数量相对上次成功轮次下降超过阈值时停止禁用；
-- **单轮最大禁用数**：超过阈值时将 Fire 标记失败并告警。
-
-首次运行没有上次成功水位时，只更新匹配用户，不因快照缺失禁用影子用户。首次完整成功后才建立禁用基线。
+首次运行没有成功快照水位时，只更新明确匹配的用户，不根据缺失记录禁用用户；首次完整成功后建立对账基线。
 
 ### 7.4 幂等性
 
@@ -507,12 +506,12 @@ data:
   "auth": {
     "aios": {
       // 复用现有字段
-      "allowedParentOrigins": ["http://10.241.0.166:30001"],
+      "allowedParentOrigins": ["https://aios.example.com"],
 
       // 新增字段
       "platformAdminRoles": ["Platform_Admin"],
       "tenantAdminRoles": ["Tenant_Admin"],
-      "tokenRenewUrl": "http://upms/internal/auth/token/renew"
+      "tokenRenewUrl": "https://upms/internal/auth/token/renew"
     }
   }
 }
@@ -538,7 +537,6 @@ data:
 | 人工禁用用户登录 | 返回 401，不自动恢复 |
 | UPMS 连接失败 | 当前 Fire 失败并重试；不禁用任何用户 |
 | 部分页读取失败 | 当前快照无效；不执行缺失用户禁用 |
-| 单轮禁用超过阈值 | 中止禁用、Fire 失败并告警 |
 | 同步过程中进程退出 | 由 Scheduler 租约过期后接管，同一 Fire 幂等重试 |
 | 角色映射配置错误 | 未识别角色降级为 `user`，并记录配置告警 |
 | `bocloud-route` 返回 401 | 标记用户 Token 失效，要求 `paas-web` 重新传递 Token |
@@ -553,78 +551,6 @@ data:
 
 | 威胁 | 控制 |
 | --- | --- |
-| 非 AIOS 页面伪造 `postMessage` | CSP `frame-ancestors`、origin 白名单、`event.source` 校验、精确 `targetOrigin` |
-| 浏览器伪造用户身份 | 身份只来自后端验证后的 AIOS Token claims |
-| 浏览器伪造管理员角色 | 仅可信父页面可传角色、两类管理员角色白名单、未知角色降级、UPMS 周期覆盖 |
-| 普通或租户用户提升为平台管理员 | 只有明确命中平台管理员白名单才能产生 `platform_admin` |
-| AIoP 越权创建 AIOS 任务 | Skill 调用 `bocloud-route` 时携带用户 Token，由 `bocloud-route` 执行最终权限校验 |
-| 用户 Token 被跨用户复用 | Token 按 `tenantId + userId + provider` 隔离存储；`AiosTokenService` 按当前 Run 的用户身份读取，注入后仅用于单次 Skill 调用 |
-| 已降权用户继续使用旧 JWT | 每次请求读取影子用户最新角色 |
-| 已停用用户继续访问 | 每次请求读取最新状态；同步禁用后下一请求返回 401 |
-| UPMS 查询故障导致批量封禁 | 只有完整快照可执行缺失用户禁用，另加比例和数量护栏 |
-| 多副本重复同步 | Scheduler Fire 唯一键、共享租约、claim token 和 fencing |
-| 数据库凭据泄露 | 数据库密码通过 Secret 注入，限制 AIoP 数据库账号的使用范围，日志脱敏，可用时启用 TLS |
-| 用户删除破坏审计链 | 只软禁用，不硬删除影子用户和关联数据 |
-
-### 10.2 剩余风险
-
-初始角色没有被 AIOS Token 签名保护，仍依赖可信 `paas-web` 正确传递。origin 校验能阻止其他站点发消息，但不能防止可信 AIOS 页面自身被攻陷或脚本供应链被篡改。
-
-该风险由平台/租户管理员白名单、未知角色降级、请求期最新角色和每小时 UPMS 覆盖降低，但不能完全消除。对于创建推理、训练等 AIOS 操作，AIOS 仍会使用用户 Token 做最终鉴权，因此 `paas-web` 角色声明不能绕过 AIOS 的下游权限检查。长期最优方案是让 AIOS Token 携带签名角色，或提供 AIoP 后端可调用的角色验证接口。
-
-## 11. 测试与验收
-
-### 11.1 单元测试
-
-- AIOS Token claims 到 `external_id/username/display_name` 的映射；
-- 空角色、未知角色、管理员角色和恶意超长角色输入；
-- 三类 AIOS 角色到 `platform_admin/tenant_admin/user` 的映射；
-- 未知角色不能生成管理员权限；
-- 只保存 Access Token，并按租户、用户和 provider 隔离；验证数据库中暂存的明文 Token 不会进入日志、审计和普通查询输出；
-- `AiosTokenService` 的有效期判断、续约、并发合并和身份一致性校验；
-- `manual/upms_missing/upms_disabled` 状态转换；
-- 快照完整性与禁用护栏；
-- 同一 Fire 重试的幂等性；
-- 用户改名和登录名回收场景。
-
-### 11.2 HTTP 与浏览器测试
-
-- 白名单父页面可以完成 `ready/auth` 握手；
-- 非白名单 origin、非父窗口和错误协议版本被拒绝；
-- Token 不进入 URL；
-- 角色缺失时登录为 `user`；
-- AIOS 平台管理员、租户管理员和普通用户分别映射到对应 AIoP 角色；
-- 对话任务经过 Agent Runtime 和对应 AIOS Skill；
-- Skill 调用 `bocloud-route` 时使用当前用户 AIOS Token；
-- `bocloud-route` 返回 401 时要求重新获取 Token，返回 403 时展示权限不足；
-- 人工禁用用户无法通过有效 AIOS Token 恢复；
-- 同步降权后，旧 JWT 的下一次请求立即按新角色返回结果；
-- 同步禁用后，旧 JWT 的下一次请求返回 401。
-
-### 11.3 同步集成测试
-
-- 多页 UPMS 快照完整读取；
-- 中间页失败时不禁用缺失用户；
-- 正常用户更新展示名和角色；
-- UPMS 删除/停用触发软禁用、凭据清理和任务暂停；
-- UPMS 恢复触发自动启用；
-- 人工禁用不自动恢复；
-- 两个 Scheduler Worker 只允许一个领取同一 Fire；
-- Worker 中途退出后由其他 Worker 接管；
-- 单轮禁用数和快照比例护栏生效。
-
-### 11.4 验收标准
-
-1. `paas-web` 能嵌入 AIoP，用户无需再次登录。
-2. 平台管理员、租户管理员和普通用户分别获得对应 AIoP 角色。
-3. 角色缺失或未知时只能获得普通用户权限。
-4. 对话中的推理、训练等任务由智能体通过对应 Skill 执行。
-5. Skill 使用当前用户 Token 调用 `bocloud-route`，后者执行最终鉴权；401 和 403 不得通过服务账号绕过。
-6. 后台任务默认每小时完成一次 UPMS 对账。
-7. 从未访问过 AIoP 的 UPMS 用户不会被预创建。
-8. UPMS 删除或停用用户只被软禁用，历史数据完整保留。
-9. UPMS 恢复后，非人工禁用用户自动恢复。
-10. 同步后的状态和角色在下一次请求生效，不等待 JWT 过期。
-11. UPMS 查询不完整时不会批量误禁用用户。
-12. 多副本环境中同一小时 Fire 只产生一次有效提交。
-
+| 用户降权或停用后继续操作 | 每次请求和任务执行前读取影子用户最新状态和角色，不信任旧 JWT 中的角色；用户停用后清除凭据、暂停定时任务，后续请求和任务均拒绝执行 |
+| AIoP 越权调用 AIOS API | Skill 只能携带当前 Run 所属用户的 Token 调用允许的 `bocloud-route` API，由 AIOS 执行最终鉴权；401、403 或续约失败时禁止使用服务账号绕过 |
+| UPMS 异常导致批量误禁用 | 同步代码只有在 UPMS API 全部分页成功或数据库完整查询成功后才生成 `complete` 快照；仅当完整快照中不存在目标用户时才执行禁用，不完整快照禁止按缺失记录禁用用户 |

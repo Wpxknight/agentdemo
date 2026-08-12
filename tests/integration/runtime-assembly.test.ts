@@ -92,6 +92,7 @@ describe('final runtime assembly boundary', () => {
         if (sql === 'SELECT version FROM schema_migrations') {
           return [[{ version: 1 }], []];
         }
+        if (sql.includes('information_schema.COLUMNS')) return [[{ columnType: 'bigint unsigned' }], []];
         return [[], []];
       },
       release: () => statements.push({ sql: 'connection.release()' }),
@@ -135,6 +136,7 @@ describe('final runtime assembly boundary', () => {
           if (sql === 'SELECT version FROM schema_migrations') {
             return [[...Array.from({ length: 26 }, (_, index) => ({ version: index + 1 }))], []];
           }
+          if (sql.includes('information_schema.COLUMNS')) return [[{ columnType: 'bigint unsigned' }], []];
           return [[], []];
         },
         release: () => lifecycle.push('release'),
@@ -157,6 +159,7 @@ describe('final runtime assembly boundary', () => {
         if (sql === 'SELECT version FROM schema_migrations') {
           return [[...Array.from({ length: 26 }, (_, index) => ({ version: index + 1 }))], []];
         }
+        if (sql.includes('information_schema.COLUMNS')) return [[{ columnType: 'bigint unsigned' }], []];
         return [[], []];
       },
       release: () => lifecycle.push('release'),

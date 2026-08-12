@@ -105,7 +105,7 @@ import { createAIOPToolRuntime } from './tools/governance.js';
 import { UserCredentials } from './auth/credentials.js';
 import { buildSystemPrompt } from './prompt.js';
 import type { AuthProvider } from './auth/provider.js';
-import type { RequestContext } from './auth/types.js';
+import { DEFAULT_MEMORY_CLI_PRINCIPAL_ID, parsePrincipalId, type RequestContext } from './auth/types.js';
 import {
   AiosTemplateCatalog,
   sandboxProfilesFromAiosCatalog,
@@ -142,6 +142,8 @@ export interface SandboxSettingsUpdate {
 }
 
 export interface Runtime {
+  /** 部署拓扑决定认证和离线调度门禁。 */
+  deploymentMode?: 'standalone' | 'aios-integrated';
   /** 唯一 Agent 执行入口；HTTP、CLI 与 Scheduler 共享同一个 durable Pi runtime。 */
   durableRunRuntime: DurableRunRuntime;
   /** Root-lifecycle controller shared by durable and direct governed tool calls. */
@@ -151,7 +153,7 @@ export interface Runtime {
   model: ChatModel;
   modelConfig?: RuntimeModelConfig;
   modelOptions?: RuntimeModelConfig[];
-  updateModel?(config: RuntimeModelConfig): void;
+  updateModel?(config: RuntimeModelConfig): void | Promise<void>;
   /** 当前生效的非敏感 Sandbox 设置。 */
   sandboxSettings?: SandboxConnectionInfo;
   /** 页面读取的平台级设置状态，不返回完整 Key 或密文。 */
@@ -198,8 +200,10 @@ export interface Runtime {
   frameAncestors?: string[];
   /** 会话 JWT 密钥（HTTP 层签发 OIDC 临时 state cookie 等用）。 */
   jwtSecret: string;
-  /** 无认证（CLI）场景的默认身份。 */
+  /** 无认证（仅内存 CLI）场景的默认身份；durable CLI 在执行边界解析真实用户。 */
   defaultContext: RequestContext;
+  /** 请求 Scheduler 尽快处理已持久化的 Fire；未启用嵌入式 Worker 时不存在。 */
+  requestSchedulerTick?(): void;
   dispose(): Promise<void>;
 }
 
@@ -309,38 +313,9 @@ async function createDefaultDurableRunAssembly(
   policyPreApproved = policy,
 ) {
   if (!enabled) throw new Error('DurableRunRuntime is mandatory and cannot be disabled');
-  const targetApi = modelConfig.protocol === 'anthropic' ? 'anthropic-messages' : 'openai-completions';
-  const provider = builtinProviders().find((candidate) => candidate.getModels().some((model) => model.api === targetApi));
-  const template = provider?.getModels().find((model) => model.api === targetApi);
-  if (!provider || !template) throw new Error(`Pi provider unavailable for protocol: ${modelConfig.protocol}`);
-  const providerId = `aiop-${modelConfig.protocol}`;
   const credentials = new InMemoryCredentialStore();
-  await credentials.modify(providerId, async () => ({ type: 'api_key', key: modelConfig.apiKey }));
   const models = createModels({ credentials });
-  const pricing = modelConfig.pricing;
-  const model: PiModel<Api> = {
-    ...template,
-    id: modelConfig.model,
-    name: modelConfig.id,
-    provider: providerId,
-    baseUrl: modelConfig.baseURL,
-    headers: { ...template.headers, ...llmTlsHeaders(modelConfig.allowInsecureTls) },
-    contextWindow: modelConfig.contextWindowTokens ?? template.contextWindow,
-    cost: pricing ? {
-      input: pricing.input,
-      output: pricing.output,
-      cacheRead: pricing.cacheRead ?? pricing.input,
-      cacheWrite: pricing.cacheWrite ?? pricing.input,
-    } : template.cost,
-  };
-  const configuredProvider: PiProvider = {
-    ...provider,
-    id: providerId,
-    name: `AIOP ${modelConfig.protocol}`,
-    baseUrl: modelConfig.baseURL,
-    getModels: () => [model],
-  };
-  models.setProvider(configuredProvider);
+  let currentModel = await configureDurableModel(models, credentials, modelConfig);
   const modelConcurrency = new FifoModelConcurrencyController({
     maxConcurrentPerTenantModel: positiveIntegerEnv(
       process.env.AIOP_PI_MAX_CONCURRENT_MODEL_CALLS,
@@ -355,7 +330,7 @@ async function createDefaultDurableRunAssembly(
   ));
   const runtimeStore = store.durableRunStore();
   const assemblyOptions = {
-    models, model, modelConcurrency, systemPrompt,
+    models, model: currentModel, resolveModel: () => currentModel, modelConcurrency, systemPrompt,
     resolveSystemPrompt: ({ execution }: { execution?: RunExecutionProfile }) =>
       resolveRuntimeSystemPrompt(systemPrompt, execution),
     resolveTools: async ({ identity, sessionId, events, interactionResolution, execution }: {
@@ -420,7 +395,52 @@ async function createDefaultDurableRunAssembly(
   const assembly = store instanceof MysqlStore
     ? createMysqlDurablePiRuntime({ db: store.database(), store: runtimeStore as import('@aiop/pi-runtime').MysqlRunStore, ...assemblyOptions })
     : createMemoryDurablePiRuntime({ store: runtimeStore as import('@aiop/pi-runtime').MemoryRunStore, ...assemblyOptions });
-  return { ...assembly, modelConcurrency, toolConcurrency };
+  return {
+    ...assembly,
+    modelConcurrency,
+    toolConcurrency,
+    async updateModel(next: RuntimeModelConfig) {
+      currentModel = await configureDurableModel(models, credentials, next);
+    },
+  };
+}
+
+async function configureDurableModel(
+  models: ReturnType<typeof createModels>,
+  credentials: InMemoryCredentialStore,
+  modelConfig: RuntimeModelConfig,
+): Promise<PiModel<Api>> {
+  const targetApi = modelConfig.protocol === 'anthropic' ? 'anthropic-messages' : 'openai-completions';
+  const provider = builtinProviders().find((candidate) => candidate.getModels().some((model) => model.api === targetApi));
+  const template = provider?.getModels().find((model) => model.api === targetApi);
+  if (!provider || !template) throw new Error(`Pi provider unavailable for protocol: ${modelConfig.protocol}`);
+  const providerId = `aiop-${modelConfig.protocol}`;
+  await credentials.modify(providerId, async () => ({ type: 'api_key', key: modelConfig.apiKey }));
+  const pricing = modelConfig.pricing;
+  const model: PiModel<Api> = {
+    ...template,
+    id: modelConfig.model,
+    name: modelConfig.id,
+    provider: providerId,
+    baseUrl: modelConfig.baseURL,
+    headers: { ...template.headers, ...llmTlsHeaders(modelConfig.allowInsecureTls) },
+    contextWindow: modelConfig.contextWindowTokens ?? template.contextWindow,
+    cost: pricing ? {
+      input: pricing.input,
+      output: pricing.output,
+      cacheRead: pricing.cacheRead ?? pricing.input,
+      cacheWrite: pricing.cacheWrite ?? pricing.input,
+    } : template.cost,
+  };
+  const configuredProvider: PiProvider = {
+    ...provider,
+    id: providerId,
+    name: `AIOP ${modelConfig.protocol}`,
+    baseUrl: modelConfig.baseURL,
+    getModels: () => [model],
+  };
+  models.setProvider(configuredProvider);
+  return model;
 }
 
 function positiveIntegerEnv(value: string | undefined, name: string, fallback: number): number {
@@ -472,6 +492,22 @@ export function resolveRuntimeSandboxConfig(
   return persisted ? sandboxSettingsToConfig(persisted) : startup;
 }
 
+export async function resolveCliPrincipalId(
+  configured: string | undefined,
+  durableMysql: boolean,
+  lookup?: (userId: string) => Promise<{ status: string } | undefined>,
+): Promise<string> {
+  if (durableMysql && !configured) throw new Error('AIOP_CLI_USER_ID is required for durable MySQL runtime');
+  const userId = parsePrincipalId(configured ?? DEFAULT_MEMORY_CLI_PRINCIPAL_ID);
+  if (durableMysql) {
+    const principal = await lookup?.(userId);
+    if (!principal || principal.status !== 'active') {
+      throw new Error('AIOP_CLI_USER_ID must identify an existing active user in the default tenant');
+    }
+  }
+  return userId;
+}
+
 /** 组装一次运行所需的全部组件（模型/工具/策略/持久化）。 */
 export async function buildRuntime(
   config: Config,
@@ -491,8 +527,13 @@ export async function buildRuntime(
   if (!jwtSecretEnv) logger.warn('AIOP_JWT_SECRET 未设置，使用开发占位密钥（勿用于生产）');
   const jwtSecret = jwtSecretEnv ?? 'dev-insecure-secret';
 
+  const deploymentMode = config.deploymentMode ?? 'standalone';
+  const providerKind = config.auth?.provider ?? 'local';
   const mysqlConfig = readMysqlConfig();
-  const store = options.store ?? await createStore(mysqlConfig);
+  const store = options.store ?? await createStore(mysqlConfig, {
+    deploymentMode,
+    authProvider: providerKind,
+  });
   const skillMutationLock = mysqlConfig && store instanceof MysqlStore
     ? new MysqlSkillMutationLock(createMysqlPool(mysqlConfig))
     : undefined;
@@ -514,7 +555,8 @@ export async function buildRuntime(
   const logSink = new LogAuditSink();
   const audit: AuditSink = {
     async record(e) {
-      await Promise.all([logSink.record(e), store.record(e)]);
+      const enriched = { deploymentMode, ...e };
+      await Promise.all([logSink.record(enriched), store.record(enriched)]);
     },
   };
 
@@ -835,20 +877,21 @@ export async function buildRuntime(
     skillRegistry = skills;
   }
 
-  // 认证：本地或 OIDC（复用上方派生的 jwtSecret）
+  // 认证 Provider 由部署模式显式决定，非法组合由 ConfigSchema 失败关闭。
   const ttl = config.auth?.jwtTtl;
   let authProvider: AuthProvider;
-  if (config.auth?.provider === 'oidc' && config.auth.oidc) {
+  let aiosAuth: AiosAuthProvider | undefined;
+  if (providerKind === 'oidc') {
+    if (!config.auth?.oidc) throw new Error('auth.provider=oidc requires auth.oidc');
     authProvider = new OidcAuthProvider({ store, secret: jwtSecret, ttl, config: config.auth.oidc });
     logger.info({ issuer: config.auth.oidc.issuer }, 'OIDC SSO 已启用');
+  } else if (providerKind === 'aios') {
+    if (!config.auth?.aios) throw new Error('auth.provider=aios requires auth.aios');
+    aiosAuth = new AiosAuthProvider({ store, secret: jwtSecret, ttl, config: config.auth.aios, credentials });
+    authProvider = aiosAuth;
+    logger.info({ verify: config.auth.aios.verify }, 'AIOS 主认证已启用');
   } else {
     authProvider = new LocalAuthProvider({ store, secret: jwtSecret, ttl });
-  }
-  // AIOS 嵌入登录：与 local/oidc 并存的第三种登录方式（aiop 用户体系不依赖它，可独立部署）。
-  let aiosAuth: AiosAuthProvider | undefined;
-  if (config.auth?.aios) {
-    aiosAuth = new AiosAuthProvider({ store, secret: jwtSecret, ttl, config: config.auth.aios, credentials });
-    logger.info({ verify: config.auth.aios.verify }, 'AIOS 嵌入登录已启用');
   }
 
   // CLI 默认身份：确保默认租户存在
@@ -868,9 +911,10 @@ export async function buildRuntime(
       logger.warn('auth.bootstrapAdmin 仅在 local 认证模式生效，当前已忽略');
     }
   }
+  // Server、HTTP 与 Scheduler 不使用 CLI 主体。Durable CLI 必须在实际执行边界解析并校验真实用户。
   const defaultContext: RequestContext = {
     tenantId: DEFAULT_TENANT,
-    userId: 'cli',
+    userId: DEFAULT_MEMORY_CLI_PRINCIPAL_ID,
     role: 'platform_admin',
   };
   modelConfig = await resolveRuntimeModelConfig(config, store, DEFAULT_TENANT);
@@ -1001,7 +1045,8 @@ export async function buildRuntime(
     model,
     modelConfig,
     modelOptions,
-    updateModel(next: RuntimeModelConfig) {
+    async updateModel(next: RuntimeModelConfig) {
+      await defaultDurableAssembly?.updateModel(next);
       runtime.model = createModel(next.id, next);
       runtime.modelConfig = { ...next };
     },
@@ -1027,6 +1072,7 @@ export async function buildRuntime(
     clusters,
     audit,
     store,
+    deploymentMode: config.deploymentMode ?? 'standalone',
     systemExtra,
     policy,
     policyPreApproved,

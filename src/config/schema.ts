@@ -176,26 +176,45 @@ export const OidcConfigSchema = z.object({
   issuer: z.string(),
   clientId: z.string(),
   clientSecret: z.string().optional(),
-  redirectUri: z.string(),
+  /** 服务端 OIDC callback；其 origin 同时作为 standalone Web/API public origin。 */
+  redirectUri: z.string().url(),
+  /** OIDC callback 完成后跳转的 standalone Web 固定地址；必须与 redirectUri 同源。 */
+  webCallbackUrl: z.string().url().optional(),
   scopes: z.array(z.string()).optional(),
   /** 仅用于 dev/test IdP；生产必须使用 HTTPS issuer。 */
   allowInsecureHttp: z.boolean().default(false),
   mapping: OidcMappingSchema,
+}).superRefine((value, ctx) => {
+  const redirect = new URL(value.redirectUri);
+  if (!['http:', 'https:'].includes(redirect.protocol) || redirect.username || redirect.password) {
+    ctx.addIssue({ code: 'custom', path: ['redirectUri'], message: 'redirectUri 必须是无用户信息的 HTTP(S) URL' });
+  }
+  if (!value.webCallbackUrl) return;
+  const webCallback = new URL(value.webCallbackUrl);
+  if (!['http:', 'https:'].includes(webCallback.protocol) || webCallback.username || webCallback.password) {
+    ctx.addIssue({ code: 'custom', path: ['webCallbackUrl'], message: 'webCallbackUrl 必须是无用户信息的 HTTP(S) URL' });
+  } else if (webCallback.origin !== redirect.origin) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['webCallbackUrl'],
+      message: 'webCallbackUrl 必须与 redirectUri 同源，以保证 OIDC cookie 和浏览器兑换安全',
+    });
+  }
 });
 
 /** AIOS userinfo/claims 字段映射（支持 a.b.c 点路径；顶层取不到时自动回退 data.<path>）。 */
 export const AiosFieldMapSchema = z.object({
-  /** 稳定唯一标识（工号/userId）——作为 aiop username，禁止用可变显示名。 */
-  userId: z.string().default('userId'),
+  /** 稳定正整数 accountId；只从服务端可信 userinfo/JWT claims 读取。 */
+  userId: z.string().default('accountId'),
+  /** 若配置则 tenantId 和状态同样来自可信响应；未配置时分别使用固定租户和 active。 */
+  tenantId: z.string().optional(),
+  status: z.string().default('status'),
   displayName: z.string().default('displayName'),
   /** 角色/组字段（值可为 string 或 string[]）。 */
   roles: z.string().default('roles'),
 });
 
-/**
- * AIOS 嵌入登录（token exchange）配置。配置即启用（与 local/oidc 并存，aiop 用户体系不依赖它）。
- * 见 docs/DESIGN-aios-integration.md §2。
- */
+/** AIOS direct identity/token exchange 配置；仅 aios-integrated + provider=aios 使用。 */
 export const AiosConfigSchema = z
   .object({
     /** token 校验方式：userinfo=回调 AIOS 用户信息接口；jwks=本地验签（AIOS token 是标准 JWT 时）。 */
@@ -203,6 +222,8 @@ export const AiosConfigSchema = z
     /** userinfo 模式：校验 token 并返回用户信息的端点（请求头带 token/systemId）。 */
     userinfoUrl: z.string().optional(),
     systemId: z.string().default('1'),
+    /** userinfo 请求的硬超时，避免认证请求无限悬挂。 */
+    userinfoTimeoutMs: z.number().int().positive().max(30_000).default(5_000),
     /** jwks 模式：AIOS 的 JWKS 公钥端点。 */
     jwks: z
       .object({
@@ -215,7 +236,7 @@ export const AiosConfigSchema = z
     tenantId: z.string().default('default'),
     /** 允许嵌入 aiop 的宿主页 origin 白名单（CSP frame-ancestors + postMessage 校验）。 */
     allowedParentOrigins: z.array(z.string()).default([]),
-    fields: AiosFieldMapSchema.default({ userId: 'userId', displayName: 'displayName', roles: 'roles' }),
+    fields: AiosFieldMapSchema.default({ userId: 'accountId', status: 'status', displayName: 'displayName', roles: 'roles' }),
     /** AIOS 角色值命中任一项 → tenant_admin；否则 user。AIOS 用户永不映射 platform_admin。 */
     adminRoles: z.array(z.string()).default([]),
     /** 凭据缓存兜底 TTL（毫秒）；AIOS 未返回 expiredTime 时使用，默认 12h。 */
@@ -231,13 +252,13 @@ export const AiosConfigSchema = z
   });
 
 export const AuthConfigSchema = z.object({
-  provider: z.enum(['local', 'oidc']).default('local'),
+  provider: z.enum(['local', 'oidc', 'aios']).default('local'),
   /** 会话 token 有效期（jose 时间串），默认 12h。 */
   jwtTtl: z.string().optional(),
   /** 本地开发/部署引导管理员；仅 local 认证模式生效，已存在则跳过。 */
   bootstrapAdmin: BootstrapAdminSchema.optional(),
   oidc: OidcConfigSchema.optional(),
-  /** AIOS 嵌入登录；配置即在 provider 之外追加启用（token exchange 通道）。 */
+  /** AIOS direct identity 配置；仅 auth.provider=aios 时启用。 */
   aios: AiosConfigSchema.optional(),
 });
 
@@ -272,6 +293,7 @@ export const HooksConfigSchema = z.object({
 });
 
 export const ConfigSchema = z.object({
+  deploymentMode: z.enum(['standalone', 'aios-integrated']).default('standalone'),
   models: z.record(z.string(), ModelConfigSchema),
   defaultModel: z.string(),
   /** 工具权限规则引擎（叠加在运维策略之上，覆盖所有工具）。 */
@@ -335,8 +357,30 @@ export const ConfigSchema = z.object({
   sandbox: SandboxConfigSchema.optional(),
   mcpServers: z.record(z.string(), McpServerSchema).optional(),
   clusters: z.record(z.string(), ClusterSchema).optional(),
+}).superRefine((value, ctx) => {
+  const provider = value.auth?.provider ?? 'local';
+  if (value.deploymentMode === 'aios-integrated' && provider !== 'aios') {
+    ctx.addIssue({ code: 'custom', path: ['auth', 'provider'], message: 'aios-integrated deploymentMode requires auth.provider=aios' });
+  }
+  if (value.deploymentMode === 'standalone' && provider === 'aios') {
+    ctx.addIssue({ code: 'custom', path: ['auth', 'provider'], message: 'standalone deploymentMode only supports auth.provider=local|oidc' });
+  }
+  if (provider === 'oidc' && !value.auth?.oidc) {
+    ctx.addIssue({ code: 'custom', path: ['auth', 'oidc'], message: 'auth.provider=oidc requires auth.oidc' });
+  }
+  if (provider === 'aios' && !value.auth?.aios) {
+    ctx.addIssue({ code: 'custom', path: ['auth', 'aios'], message: 'auth.provider=aios requires auth.aios' });
+  }
+  if (provider !== 'aios' && value.auth?.aios) {
+    ctx.addIssue({
+      code: 'custom', path: ['auth', 'aios'],
+      message: 'auth.aios is only valid with auth.provider=aios in aios-integrated mode',
+    });
+  }
 });
 
-export type Config = z.infer<typeof ConfigSchema>;
+type ParsedConfig = z.infer<typeof ConfigSchema>;
+/** Programmatic callers may omit the standalone default; parseConfig always materializes it. */
+export type Config = Omit<ParsedConfig, 'deploymentMode'> & { deploymentMode?: ParsedConfig['deploymentMode'] };
 export type ModelConfig = z.infer<typeof ModelConfigSchema>;
 export type SandboxConfig = z.infer<typeof SandboxConfigSchema>;

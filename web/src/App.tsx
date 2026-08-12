@@ -48,6 +48,7 @@ import { NAV_ITEMS, defaultLlmConfig, pageFromUrl, pageUrl } from './app-data';
 import { MermaidDiagram } from './components/mermaid-diagram';
 import { RunCenterPage } from './components/run-center-page';
 import { createApi, numericSessionId, randomId, readStorage, writeStorage } from './api';
+import { useWebHost } from './web-core';
 import { formatSandboxOutputChunk, parseSandboxOutput, sandboxOutputClassNames, sandboxOutputCommand, sandboxOutputLabels } from './sandbox-output';
 import { isPersistedSession } from './session-context';
 import {
@@ -88,7 +89,7 @@ import type {
   SessionTokenUsageBody,
   SessionSummary,
   SessionsBody,
-  TaskRun,
+  ScheduledExecution,
   PendingQuestion,
   QuestionSpec,
   TaskStep,
@@ -125,22 +126,8 @@ const iconMap = {
   settings: Settings,
 };
 
-/** 是否运行在 iframe 内（嵌入 AIOS 等宿主页）。 */
-const inIframe = typeof window !== 'undefined' && window.self !== window.top;
-
-/** 解析 JWT 过期时间（毫秒）；解析失败返回 undefined。 */
-function jwtExpiryMs(token: string): number | undefined {
-  try {
-    const payload = JSON.parse(atob(token.split('.')[1]!.replace(/-/g, '+').replace(/_/g, '/'))) as { exp?: number };
-    return typeof payload.exp === 'number' ? payload.exp * 1000 : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-const logoUrl = '/assets/logo.jpg';
-const aiAvatarUrl = logoUrl;
-const userAvatarUrl = '/assets/user-avatar.jpg';
+const FALLBACK_LOGO_URL = new URL('./assets/logo.jpg', import.meta.url).href;
+const FALLBACK_USER_AVATAR_URL = new URL('./assets/user-avatar.jpg', import.meta.url).href;
 const SESSION_PAGE_SIZE = 8;
 
 type ConfirmDialogTone = 'danger' | 'warning' | 'info';
@@ -899,7 +886,18 @@ function MessageContent({ message }: { message: ChatMessage }) {
   );
 }
 
+function useAssetUrls() {
+  const host = useWebHost();
+  const logoUrl = host.assets?.logo ?? FALLBACK_LOGO_URL;
+  return {
+    logoUrl,
+    aiAvatarUrl: logoUrl,
+    userAvatarUrl: host.assets?.userAvatar ?? FALLBACK_USER_AVATAR_URL,
+  };
+}
+
 function BrandLogo({ className }: { className?: string }) {
+  const { logoUrl } = useAssetUrls();
   return (
     <span className={cn('brand-logo', className)} aria-hidden="true">
       <img src={logoUrl} alt="" />
@@ -917,6 +915,7 @@ function IconTooltip({ label, children }: { label: string; children: ReactNode }
 }
 
 function MessageAvatar({ isUser }: { isUser: boolean }) {
+  const { aiAvatarUrl, userAvatarUrl } = useAssetUrls();
   return (
     <div className={cn('avatar', 'message-avatar-image', isUser && 'user-avatar')}>
       <img src={isUser ? userAvatarUrl : aiAvatarUrl} alt="" />
@@ -926,8 +925,9 @@ function MessageAvatar({ isUser }: { isUser: boolean }) {
 }
 
 export default function App() {
+  const host = useWebHost();
   const [page, setPage] = useState<PageId | 'login'>(initialPage);
-  const [token, setToken] = useState(() => readStorage('aiop_token'));
+  const [token, setToken] = useState(() => host.getToken());
   const [sessionId, setSessionId] = useState(() => readStorage('aiop_session_id') || numericSessionId());
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [contextUsage, setContextUsage] = useState<Record<string, ContextUsageBody>>({});
@@ -1041,15 +1041,12 @@ export default function App() {
     }
     setPage('login');
     setToken('');
-    writeStorage('aiop_token', '');
-    if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
+    host.setToken('');
+    void host.onUnauthorized();
+    if (host.deploymentMode === 'standalone' && host.authProvider === 'local' && typeof window !== 'undefined' && window.location.pathname !== '/login') {
       window.history.replaceState({}, '', '/login');
     }
-    // 嵌入模式下向宿主页重新请求授权（宿主监听到 ready 会回发新 token）。
-    if (inIframe && typeof window !== 'undefined') {
-      window.parent.postMessage({ type: 'aiop:ready' }, '*');
-    }
-  }, []);
+  }, [host]);
 
   const routeAfterLogin = useCallback(() => {
     const next = requestedPageRef.current;
@@ -1057,7 +1054,32 @@ export default function App() {
     if (typeof window !== 'undefined') window.history.replaceState({}, '', pageUrl(next));
   }, []);
 
-  const api = useMemo(() => createApi(token, redirectToLogin), [token, redirectToLogin]);
+  const api = useMemo(() => createApi(host, token, redirectToLogin), [host, token, redirectToLogin]);
+
+  useEffect(() => {
+    if (!host.subscribeToken) return;
+    return host.subscribeToken((nextToken) => {
+      setToken(nextToken);
+      if (nextToken) routeAfterLogin();
+    });
+  }, [host, routeAfterLogin]);
+
+  useEffect(() => {
+    if (token || host.authProvider !== 'oidc' || !host.consumeOidcSession) return;
+    let cancelled = false;
+    void host.consumeOidcSession().then((nextToken) => {
+      if (cancelled) return;
+      if (!nextToken) {
+        void host.startOidcLogin?.();
+        return;
+      }
+      setToken(nextToken);
+      routeAfterLogin();
+    }).catch(() => {
+      if (!cancelled) void host.startOidcLogin?.();
+    });
+    return () => { cancelled = true; };
+  }, [host, routeAfterLogin, token]);
 
   // 当前登录身份（角色驱动管理员菜单的显隐；服务端 RBAC 才是权限边界）。
   const [me, setMe] = useState<MeBody | null>(null);
@@ -1099,60 +1121,6 @@ export default function App() {
     });
     return () => { cancelled = true; };
   }, [api, token]);
-
-  // AIOS token exchange：宿主页 postMessage 传来的平台 token 换 aiop JWT。
-  const exchangeAiosToken = useCallback(async (data: { token: string; refreshToken?: string; expiredTime?: string }) => {
-    setAuthStatus('正在通过 AIOS 平台登录...');
-    try {
-      const response = await fetch('/auth/aios/exchange', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(data),
-      });
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({})) as { error?: string };
-        setAuthStatus(`AIOS 登录失败：${body.error || response.status}`);
-        return;
-      }
-      const body = await response.json() as { token: string };
-      setToken(body.token);
-      writeStorage('aiop_token', body.token);
-      setAuthStatus('');
-      routeAfterLogin();
-    } catch {
-      setAuthStatus('AIOS 登录失败：网络错误');
-    }
-  }, [routeAfterLogin]);
-
-  // 嵌入模式握手：iframe 就绪后向宿主页发 ready，宿主回发 {type:'aiop:auth', token}。
-  // token 不走 URL（防日志/历史泄露）；宿主真伪由后端 CSP frame-ancestors 白名单 + exchange 服务端校验兜底。
-  useEffect(() => {
-    if (!inIframe || typeof window === 'undefined') return;
-    const onMessage = (event: MessageEvent) => {
-      const data = event.data as { type?: string; token?: string; refreshToken?: string; expiredTime?: string } | null;
-      if (!data || data.type !== 'aiop:auth' || typeof data.token !== 'string' || !data.token) return;
-      void exchangeAiosToken({
-        token: data.token,
-        refreshToken: typeof data.refreshToken === 'string' ? data.refreshToken : undefined,
-        expiredTime: typeof data.expiredTime === 'string' ? data.expiredTime : undefined,
-      });
-    };
-    window.addEventListener('message', onMessage);
-    window.parent.postMessage({ type: 'aiop:ready' }, '*');
-    return () => window.removeEventListener('message', onMessage);
-  }, [exchangeAiosToken]);
-
-  // 静默续期：JWT 到期前 5 分钟重新向宿主页要 token（仅嵌入模式；AIOS 侧已登出则 exchange 失败自然退出）。
-  useEffect(() => {
-    if (!inIframe || !token || typeof window === 'undefined') return;
-    const exp = jwtExpiryMs(token);
-    if (!exp) return;
-    const delay = Math.max(30_000, exp - Date.now() - 5 * 60_000);
-    const timer = window.setTimeout(() => {
-      window.parent.postMessage({ type: 'aiop:ready' }, '*');
-    }, delay);
-    return () => window.clearTimeout(timer);
-  }, [token]);
 
   const loadLlmSettings = useCallback(async () => {
     const body = await api.get<ModelSettingsBody>('/v1/settings/llm');
@@ -1261,20 +1229,15 @@ export default function App() {
       return;
     }
     setAuthStatus('正在登录...');
-    const response = await fetch('/auth/login', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ tenantId, username, password }),
-    });
-    if (!response.ok) {
-      setAuthStatus('登录失败，请检查用户名或密码。');
-      return;
+    try {
+      if (!host.login) throw new Error('当前宿主不支持本地登录');
+      const nextToken = await host.login({ tenantId, username, password });
+      setToken(nextToken);
+      setAuthStatus('');
+      routeAfterLogin();
+    } catch (error) {
+      setAuthStatus(error instanceof Error ? error.message : '登录失败，请检查用户名或密码。');
     }
-    const body = await response.json() as { token: string };
-    setToken(body.token);
-    writeStorage('aiop_token', body.token);
-    setAuthStatus('');
-    routeAfterLogin();
   }
 
   function navigate(next: PageId) {
@@ -1901,7 +1864,10 @@ export default function App() {
   }
 
   if (page === 'login') {
-    return <LoginPage authStatus={authStatus} onSubmit={submitLogin} />;
+    if (host.deploymentMode === 'standalone' && host.authProvider === 'local') {
+      return <LoginPage authStatus={authStatus} onSubmit={submitLogin} />;
+    }
+    return <HostAuthenticationPending mode={host.deploymentMode === 'standalone' ? 'redirect' : 'waiting'} />;
   }
 
   const activePage = page as PageId;
@@ -2025,6 +1991,7 @@ export default function App() {
 
 function SidebarAccountMenu({ token, me, onLogout }: { token: string; me?: MeBody | null; onLogout: () => void }) {
   const [open, setOpen] = useState(false);
+  const { userAvatarUrl } = useAssetUrls();
   return (
     <div className="sidebar-account">
       <IconTooltip label="用户菜单">
@@ -2197,7 +2164,11 @@ function PrototypeSidebarNav({ page, token, me, onNavigate, onLogout }: {
   return (
     <aside className="prototype-sidebar-nav" aria-label="主导航">
       <BrandLogo className="prototype-sidebar-logo" />
-      {NAV_ITEMS.filter((item) => !item.adminOnly || isAdmin).map((item) => {
+      {NAV_ITEMS.filter((item) => {
+        if (item.adminOnly && !isAdmin) return false;
+        if (item.id === 'users' && me?.features?.localUserManagement === false) return false;
+        return true;
+      }).map((item) => {
         const Icon = iconMap[item.icon];
         return (
           <Tooltip key={item.id}>
@@ -3321,10 +3292,13 @@ function SkillsPage({ tools, api, onImported, onRequestConfirm }: {
         data: await readFileAsDataUrl(file),
       });
       await onImported();
-      setSelectedName(body.skill.name);
       setSelectedFile('SKILL.md');
       setShowSkillFiles(false);
-      setImportStatus(`已导入 ${toolDisplayName(body.skill.name)}。`);
+      setImportStatus(
+        body.pendingReview
+          ? `已上传 ${toolDisplayName(body.product.name)}，等待管理员审核。`
+          : `已导入 ${toolDisplayName(body.product.name)}。`,
+      );
     } catch (err) {
       setImportStatus(`导入失败：${formatError(err)}`);
     }
@@ -3808,6 +3782,7 @@ function ScheduleTaskForm({
   title,
   task,
   cron,
+  timezone,
   preApproved,
   busy,
   status,
@@ -3815,6 +3790,7 @@ function ScheduleTaskForm({
   onTitleChange,
   onTaskChange,
   onCronChange,
+  onTimezoneChange,
   onPreApprovedChange,
   onSubmit,
   onCancel,
@@ -3822,6 +3798,7 @@ function ScheduleTaskForm({
   title: string;
   task: string;
   cron: string;
+  timezone: string;
   preApproved: boolean;
   busy: boolean;
   status?: string;
@@ -3829,6 +3806,7 @@ function ScheduleTaskForm({
   onTitleChange: (value: string) => void;
   onTaskChange: (value: string) => void;
   onCronChange: (value: string) => void;
+  onTimezoneChange: (value: string) => void;
   onPreApprovedChange: (value: boolean) => void;
   onSubmit: () => void;
   onCancel: () => void;
@@ -3837,7 +3815,7 @@ function ScheduleTaskForm({
     <div className="schedule-task-form">
       <Label>任务标题<Input placeholder="如：每日集群巡检" value={title} disabled={busy} onChange={(event) => onTitleChange(event.target.value)} /></Label>
       <Label>任务描述<Textarea placeholder="描述你要定时执行的任务..." value={task} disabled={busy} onChange={(event) => onTaskChange(event.target.value)} /></Label>
-      <Label>执行计划（cron，UTC）
+      <Label>执行计划（cron）
         <Select disabled={busy} value={CRON_PRESETS.some((preset) => preset.value === cron) ? cron : 'custom'} onValueChange={(value) => { if (value !== 'custom') onCronChange(value); }}>
           <SelectTrigger><SelectValue /></SelectTrigger>
           <SelectContent>
@@ -3848,6 +3826,9 @@ function ScheduleTaskForm({
           </SelectContent>
         </Select>
         <Input value={cron} disabled={busy} spellCheck={false} placeholder='如 "0 2 * * *"' onChange={(event) => onCronChange(event.target.value)} />
+      </Label>
+      <Label>时区（IANA）
+        <Input value={timezone} disabled={busy} spellCheck={false} placeholder="如 Asia/Shanghai" onChange={(event) => onTimezoneChange(event.target.value)} />
       </Label>
       <label className="schedule-preapproved">
         <input type="checkbox" checked={preApproved} disabled={busy} onChange={(event) => onPreApprovedChange(event.target.checked)} />
@@ -3871,13 +3852,14 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
   // 默认展示任务列表；点击“创建”进入表单，点击某行进入执行详情页
   const [view, setView] = useState<'list' | 'create' | 'detail'>('list');
   const [selectedTaskId, setSelectedTaskId] = useState<number | undefined>();
-  const [runs, setRuns] = useState<TaskRun[]>([]);
-  const [selectedRunId, setSelectedRunId] = useState<number | undefined>();
+  const [runs, setRuns] = useState<ScheduledExecution[]>([]);
+  const [selectedRunId, setSelectedRunId] = useState<string | undefined>();
   const [runsPage, setRunsPage] = useState(1);
   const [runsStatus, setRunsStatus] = useState('');
   const [newTitle, setNewTitle] = useState('');
   const [newTask, setNewTask] = useState('');
   const [newCron, setNewCron] = useState('0 2 * * *');
+  const [newTimezone, setNewTimezone] = useState('UTC');
   const [newPreApproved, setNewPreApproved] = useState(false);
   const [pageStatus, setPageStatus] = useState('');
   const [busy, setBusy] = useState(false);
@@ -3885,10 +3867,11 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
   const [editTitle, setEditTitle] = useState('');
   const [editTask, setEditTask] = useState('');
   const [editCron, setEditCron] = useState('');
+  const [editTimezone, setEditTimezone] = useState('UTC');
   const [editPreApproved, setEditPreApproved] = useState(false);
   const pollTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const selectedTask = tasks.find((task) => task.id === selectedTaskId);
-  const selectedRun = runs.find((run) => run.id === selectedRunId);
+  const selectedRun = runs.find((run) => run.fireId === selectedRunId);
   // 执行记录客户端分页：默认每页 5 条
   const runsPageCount = Math.max(1, Math.ceil(runs.length / RUNS_PAGE_SIZE));
   const pagedRuns = runs.slice((runsPage - 1) * RUNS_PAGE_SIZE, runsPage * RUNS_PAGE_SIZE);
@@ -3906,7 +3889,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
     setView('list');
   }, [selectedTaskId, tasks]);
 
-  const loadRuns = useCallback(async (): Promise<TaskRun[]> => {
+  const loadRuns = useCallback(async (): Promise<ScheduledExecution[]> => {
     if (!selectedTask || selectedTask.id === undefined) {
       setRuns([]);
       setSelectedRunId(undefined);
@@ -3917,7 +3900,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
       const body = await api.get<ScheduleRunsBody>(`/v1/schedule/${selectedTask.id}/runs`);
       const next = body.runs || [];
       setRuns(next);
-      setSelectedRunId((current) => (current !== undefined && next.some((run) => run.id === current) ? current : undefined));
+      setSelectedRunId((current) => (current !== undefined && next.some((run) => run.fireId === current) ? current : undefined));
       setRunsStatus(next.length ? '' : '暂无执行结果');
       return next;
     } catch (err) {
@@ -3958,11 +3941,13 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
         title: newTitle.trim(),
         task: newTask.trim(),
         cron: newCron.trim(),
+        timezone: newTimezone.trim(),
         preApproved: newPreApproved,
       });
       setPageStatus(`已创建定时任务 #${body.task.id}，下次执行 ${formatDateTime(body.task.nextRunAt)}`);
       setNewTitle('');
       setNewTask('');
+      setNewTimezone('UTC');
       setNewPreApproved(false);
       setView('list');
       onChanged();
@@ -3991,18 +3976,19 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
     if (task.id === undefined || busy) return;
     setBusy(true);
     try {
-      await api.post(`/v1/schedule/${task.id}/run`);
-      setRunsStatus('已触发立即执行，等待结果...');
-      const before = runs[0]?.id;
+      const response = await api.post<{ fireId: string }>(`/v1/schedule/${task.id}/run`, undefined, {
+        'Idempotency-Key': crypto.randomUUID(),
+      });
+      setRunsStatus('已持久化立即执行请求，等待调度器领取...');
       let attempts = 0;
       const poll = async () => {
         const next = await loadRuns();
-        const latest = next[0]?.id;
-        if ((latest !== undefined && latest !== before) || attempts++ >= 40) {
-          if (latest !== undefined && latest !== before) onChanged(); // 刷新 lastRunAt / 下次执行
+        const current = next.find((run) => run.fireId === response.fireId);
+        if (current?.fireState === 'completed' || attempts++ >= 40) {
+          if (current?.fireState === 'completed') onChanged();
           return;
         }
-        setRunsStatus('已触发立即执行，等待结果...');
+        setRunsStatus('已持久化立即执行请求，等待调度器领取...');
         pollTimer.current = setTimeout(() => void poll(), 3000);
       };
       pollTimer.current = setTimeout(() => void poll(), 2000);
@@ -4018,7 +4004,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
     const id = task.id;
     onRequestConfirm({
       title: '删除定时任务',
-      description: `将删除「${task.title || task.task}」及其全部执行记录，不可恢复。若只想暂停请用“暂停”。`,
+      description: `将删除「${task.title || task.task}」并停止后续计划触发；既有执行记录会保留。若只想暂停请用“暂停”。`,
       confirmLabel: '确认删除',
       busyLabel: '正在删除...',
       tone: 'danger',
@@ -4036,6 +4022,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
     setEditTitle(task.title || '');
     setEditTask(task.task);
     setEditCron(task.cron);
+    setEditTimezone(task.timezone || 'UTC');
     setEditPreApproved(Boolean(task.preApproved));
     setEditing(true);
   }
@@ -4052,6 +4039,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
         title: editTitle.trim(),
         task: editTask.trim(),
         cron: editCron.trim(),
+        timezone: editTimezone.trim(),
         preApproved: editPreApproved,
       });
       setPageStatus(`已更新任务 #${task.id}`);
@@ -4067,7 +4055,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
   if (view === 'create') {
     return (
       <>
-        <PageTitle title="创建定时任务" desc="按 cron 周期自动执行的运维任务（cron 以 UTC 时区解释）" />
+        <PageTitle title="创建定时任务" desc="按 cron 周期自动执行的运维任务（按任务时区解释）" />
         <div className="toolbar">
           <Button variant="outline" type="button" onClick={() => { setPageStatus(''); setView('list'); }}>
             <ChevronLeft data-icon="inline-start" />
@@ -4080,6 +4068,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
               title={newTitle}
               task={newTask}
               cron={newCron}
+              timezone={newTimezone}
               preApproved={newPreApproved}
               busy={busy}
               status={pageStatus}
@@ -4087,6 +4076,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
               onTitleChange={setNewTitle}
               onTaskChange={setNewTask}
               onCronChange={setNewCron}
+              onTimezoneChange={setNewTimezone}
               onPreApprovedChange={setNewPreApproved}
               onSubmit={() => void createTask()}
               onCancel={() => { setPageStatus(''); setView('list'); }}
@@ -4100,7 +4090,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
   if (view === 'detail' && selectedTask) {
     return (
       <>
-        <PageTitle title="定时任务详情" desc={`#${selectedTask.id} · ${humanizeCron(selectedTask.cron)}（UTC）`} />
+        <PageTitle title="定时任务详情" desc={`#${selectedTask.id} · ${humanizeCron(selectedTask.cron)}（${selectedTask.timezone || 'UTC'}）`} />
         <div className="toolbar">
           <Button variant="outline" type="button" onClick={() => { setPageStatus(''); setEditing(false); setView('list'); }}>
             <ChevronLeft data-icon="inline-start" />
@@ -4128,7 +4118,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
                 <div className="schedule-task-summary kv">
                   <span>任务标题</span><strong>{selectedTask.title || '-'}</strong>
                   <span>任务描述</span><strong>{selectedTask.task}</strong>
-                  <span>执行计划</span><strong>{selectedTask.cron}（{humanizeCron(selectedTask.cron)}，UTC）</strong>
+                  <span>执行计划</span><strong>{selectedTask.cron}（{humanizeCron(selectedTask.cron)}，{selectedTask.timezone || 'UTC'}）</strong>
                   <span>预批准</span><strong>{selectedTask.preApproved ? '是' : '否'}</strong>
                   <span>状态</span><strong>{selectedTask.enabled ? '启用中' : '已暂停'}</strong>
                   <span>下次执行</span><strong>{formatDateTime(selectedTask.nextRunAt)}</strong>
@@ -4156,12 +4146,14 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
                     title={editTitle}
                     task={editTask}
                     cron={editCron}
+                    timezone={editTimezone}
                     preApproved={editPreApproved}
                     busy={busy}
                     submitLabel="保存修改"
                     onTitleChange={setEditTitle}
                     onTaskChange={setEditTask}
                     onCronChange={setEditCron}
+                    onTimezoneChange={setEditTimezone}
                     onPreApprovedChange={setEditPreApproved}
                     onSubmit={() => void saveEdit(selectedTask)}
                     onCancel={() => setEditing(false)}
@@ -4181,22 +4173,22 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
                     <TableRow>{['时间', '状态', '步骤'].map((header) => <TableHead key={header}>{header}</TableHead>)}</TableRow>
                   </TableHeader>
                   <TableBody>
-                    {pagedRuns.map((run, index) => (
+                    {pagedRuns.map((run) => (
                       <TableRow
-                        key={run.id ?? `${run.taskId}-${index}`}
-                        className={run.id === undefined ? undefined : 'clickable-row'}
-                        role={run.id === undefined ? undefined : 'button'}
-                        tabIndex={run.id === undefined ? undefined : 0}
-                        onClick={() => { if (run.id !== undefined) setSelectedRunId(run.id); }}
+                        key={run.fireId}
+                        className="clickable-row"
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => setSelectedRunId(run.fireId)}
                         onKeyDown={(event) => {
-                          if (run.id === undefined || (event.key !== 'Enter' && event.key !== ' ')) return;
+                          if (event.key !== 'Enter' && event.key !== ' ') return;
                           event.preventDefault();
-                          setSelectedRunId(run.id);
+                          setSelectedRunId(run.fireId);
                         }}
                       >
                         <TableCell>{formatDateTime(run.createdAt)}</TableCell>
-                        <TableCell>{formatCell(run.status === 'success' ? '成功' : '异常')}</TableCell>
-                        <TableCell>{run.steps === undefined ? '-' : String(run.steps)}</TableCell>
+                        <TableCell>{formatCell(run.run?.status ?? run.fireState)}</TableCell>
+                        <TableCell>{run.run ? String(run.run.stepCount) : '-'}</TableCell>
                       </TableRow>
                     ))}
                     {!runs.length ? (
@@ -4218,15 +4210,17 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
           </CardContent>
         </Card>
         {selectedRun ? (
-          <ModalDialog title="执行记录详情" status={selectedRun.status === 'success' ? '成功' : '异常'} icon={<Activity />} onClose={() => setSelectedRunId(undefined)}>
+          <ModalDialog title="执行记录详情" status={selectedRun.run?.status ?? selectedRun.fireState} icon={<Activity />} onClose={() => setSelectedRunId(undefined)}>
             <div className="schedule-run-modal">
               <div className="kv">
-                <span>执行时间</span><strong>{formatDateTime(selectedRun.createdAt)}</strong>
-                <span>执行状态</span><strong>{selectedRun.status === 'success' ? '成功' : '异常'}</strong>
-                <span>执行步骤</span><strong>{selectedRun.steps === undefined ? '-' : String(selectedRun.steps)}</strong>
+                <span>触发时间</span><strong>{formatDateTime(selectedRun.fireTime)}</strong>
+                <span>触发来源</span><strong>{selectedRun.triggerKind === 'manual' ? '立即执行' : '计划触发'}</strong>
+                <span>调度状态</span><strong>{selectedRun.fireState}</strong>
+                <span>运行状态</span><strong>{selectedRun.run?.status ?? '尚未创建 Run'}</strong>
+                <span>执行步骤</span><strong>{selectedRun.run ? String(selectedRun.run.stepCount) : '-'}</strong>
               </div>
               <h3>执行结果</h3>
-              <pre>{selectedRun.detail || '暂无执行结果'}</pre>
+              <pre>{selectedRun.run?.errorMessage || selectedRun.lastError || '暂无执行结果'}</pre>
             </div>
           </ModalDialog>
         ) : null}
@@ -4236,7 +4230,7 @@ function SchedulePage({ tasks, api, onChanged, onRequestConfirm }: {
 
   return (
     <>
-      <PageTitle title="定时任务" desc="按 cron 周期自动执行的运维任务（cron 以 UTC 时区解释）" />
+      <PageTitle title="定时任务" desc="按 cron 周期自动执行的运维任务（按任务时区解释）" />
       <div className="toolbar">
         <Button type="button" onClick={() => { setPageStatus(''); setView('create'); }}>
           <Plus data-icon="inline-start" />
@@ -4945,24 +4939,23 @@ function PageTitle({ title, desc }: { title: string; desc?: string }) {
   );
 }
 
-function LoginPage({ authStatus, onSubmit }: { authStatus: string; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
-  // 嵌入模式：等待宿主页（AIOS）postMessage 授权，不展示本地登录表单。
-  if (inIframe) {
-    return (
-      <main className="login-page">
-        <section className="login-card">
-          <div className="login-brand">
-            <BrandLogo className="brand-logo-login" />
-            <div>
-              <h1>AIOP</h1>
-              <p>正在等待 AIOS 平台授权...</p>
-            </div>
+function HostAuthenticationPending({ mode }: { mode: 'redirect' | 'waiting' }) {
+  return (
+    <main className="login-page">
+      <section className="login-card">
+        <div className="login-brand">
+          <BrandLogo className="brand-logo-login" />
+          <div>
+            <h1>AIOP</h1>
+            <p>{mode === 'redirect' ? '正在跳转到统一登录...' : '等待宿主平台提供授权凭据'}</p>
           </div>
-          {authStatus ? <div className="settings-status">{authStatus}</div> : null}
-        </section>
-      </main>
-    );
-  }
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function LoginPage({ authStatus, onSubmit }: { authStatus: string; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
   return (
     <main className="login-page">
       <section className="login-card">

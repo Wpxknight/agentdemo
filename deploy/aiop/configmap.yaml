@@ -3,9 +3,12 @@ kind: ConfigMap
 metadata:
   name: aiop-config
   namespace: aios-system
+  annotations:
+    aiop.bocloud.com/deployment-mode: standalone
 data:
   config.jsonc: |
     {
+      "deploymentMode": "standalone",
       "models": {
         "glm-5": {
           "protocol": "anthropic",

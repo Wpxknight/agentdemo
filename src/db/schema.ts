@@ -50,30 +50,14 @@ export interface ScheduledTasksTable {
   session_id: string;
   title: string;
   cron: string;
+  timezone: string;
   task: string;
   pre_approved: number;
   enabled: number;
+  deleted_at: Date | null;
   next_run_at: Date;
   last_run_at: Date | null;
   created_at: Generated<Date>;
-}
-
-export interface TaskRunsTable {
-  id: Generated<number>;
-  task_id: number;
-  fire_id: Generated<string | null>;
-  run_id: Generated<string | null>;
-  status: string;
-  detail: string | null;
-  steps: number | null;
-  created_at: Generated<Date>;
-}
-
-export interface TaskAgentRunsTable {
-  tenant_id: string;
-  task_id: number;
-  run_id: string;
-  created_at: Date;
 }
 
 export interface SchedulerFiresTable {
@@ -84,6 +68,8 @@ export interface SchedulerFiresTable {
   session_id: string;
   fire_time: Date;
   input_json: JsonColumn;
+  trigger_kind: string;
+  idempotency_key: string | null;
   state: string;
   attempts: number;
   run_id: string | null;
@@ -103,7 +89,8 @@ export interface TenantsTable {
 }
 
 export interface UsersTable {
-  id: string;
+  /** mysql2/Kysely returns BIGINT as a precision-safe decimal string. */
+  id: Generated<string>;
   tenant_id: string;
   username: string;
   role: string;
@@ -126,6 +113,17 @@ export interface UserCredentialsTable {
   payload: string;
   expires_at: Date | null;
   updated_at: Generated<Date>;
+}
+
+export interface OidcExchangeCodesTable {
+  code_hash: string;
+  tenant_id: string;
+  provider: string;
+  session_token: string;
+  browser_nonce_hash: string | null;
+  expires_at: Date;
+  consumed_at: Date | null;
+  created_at: Generated<Date>;
 }
 
 export interface TenantSettingsTable {
@@ -326,12 +324,11 @@ export interface Database {
   messages: MessagesTable;
   audit_events: AuditEventsTable;
   scheduled_tasks: ScheduledTasksTable;
-  task_runs: TaskRunsTable;
-  task_agent_runs: TaskAgentRunsTable;
   scheduler_fires: SchedulerFiresTable;
   tenants: TenantsTable;
   users: UsersTable;
   user_credentials: UserCredentialsTable;
+  oidc_exchange_codes: OidcExchangeCodesTable;
   tenant_settings: TenantSettingsTable;
   setting_secrets: SettingSecretsTable;
   agent_interactions: AgentInteractionsTable;

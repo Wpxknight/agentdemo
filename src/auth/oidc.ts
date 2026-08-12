@@ -14,6 +14,8 @@ export interface OidcProviderConfig {
   clientId: string;
   clientSecret?: string;
   redirectUri: string;
+  /** 服务端固定的 standalone Web 登录完成地址。 */
+  webCallbackUrl?: string;
   scopes?: string[];
   allowInsecureHttp?: boolean;
   mapping: OidcMapping;
@@ -45,10 +47,29 @@ export class OidcAuthProvider implements AuthProvider {
   private discovered?: oidc.Configuration;
 
   constructor(opts: OidcAuthOptions) {
+    const redirect = new URL(opts.config.redirectUri);
+    const webCallback = new URL(opts.config.webCallbackUrl ?? new URL('/', redirect));
+    if (!['http:', 'https:'].includes(redirect.protocol) || redirect.username || redirect.password) {
+      throw new Error('OIDC redirectUri 必须是无用户信息的 HTTP(S) URL');
+    }
+    if (!['http:', 'https:'].includes(webCallback.protocol) || webCallback.username || webCallback.password) {
+      throw new Error('OIDC webCallbackUrl 必须是无用户信息的 HTTP(S) URL');
+    }
+    if (webCallback.origin !== redirect.origin) {
+      throw new Error('OIDC webCallbackUrl 必须与 redirectUri 同源');
+    }
     this.store = opts.store;
     this.secret = new TextEncoder().encode(opts.secret);
     this.cfg = opts.config;
     this.ttl = opts.ttl ?? '12h';
+  }
+
+  webCallbackUrl(): URL {
+    return new URL(this.cfg.webCallbackUrl ?? new URL('/', this.cfg.redirectUri));
+  }
+
+  usesSecureCallback(): boolean {
+    return new URL(this.cfg.redirectUri).protocol === 'https:';
   }
 
   private async config(): Promise<oidc.Configuration> {
@@ -80,10 +101,14 @@ export class OidcAuthProvider implements AuthProvider {
     return { url: url.href, state, codeVerifier };
   }
 
-  /** 处理回调：换取 token → claims → JIT → 本系统会话 token。 */
+  /** 处理回调：只信任配置的 callback origin/path，请求 URL 仅提供已解析的 OIDC query。 */
   async handleCallback(currentUrl: string, checks: { state: string; codeVerifier: string }): Promise<string> {
     const config = await this.config();
-    const tokens = await oidc.authorizationCodeGrant(config, new URL(currentUrl), {
+    const requestUrl = new URL(currentUrl);
+    const callbackUrl = new URL(this.cfg.redirectUri);
+    callbackUrl.search = new URLSearchParams(requestUrl.searchParams).toString();
+    callbackUrl.hash = '';
+    const tokens = await oidc.authorizationCodeGrant(config, callbackUrl, {
       pkceCodeVerifier: checks.codeVerifier,
       expectedState: checks.state,
     });
@@ -107,12 +132,20 @@ export class OidcAuthProvider implements AuthProvider {
         authProvider: 'oidc',
       });
       log.info({ tenantId, username }, 'JIT 建号');
-      return { tenantId, userId: created.id, role };
+      return { tenantId, userId: created.id, provider: 'oidc', role };
     }
     // 软删除/封禁的行仍占用 username：命中即拒绝，防止经 JIT 复活（§8.5 护栏）。
     if (user.status === 'disabled') throw new Error('账号已被禁用，请联系管理员');
-    // 角色以 IdP 最新映射为准（反映 IdP 侧变更）
-    return { tenantId, userId: user.id, role };
+    if (user.authProvider !== 'oidc') throw new Error('账号认证来源与 OIDC 不匹配');
+    // IdP 是 OIDC 用户角色的可信来源；登录时同步本地状态，使新会话可通过 authenticate 的防降权校验。
+    if (user.role !== role) {
+      const updated = await this.store.updateUser(tenantId, user.id, { role });
+      if (!updated || updated.status !== 'active' || updated.authProvider !== 'oidc') {
+        throw new Error('OIDC 用户角色同步失败');
+      }
+      log.info({ tenantId, username, previousRole: user.role, role }, 'OIDC 用户角色已同步');
+    }
+    return { tenantId, userId: user.id, provider: 'oidc', role };
   }
 
   /** SSO 不走密码登录。 */
@@ -121,6 +154,10 @@ export class OidcAuthProvider implements AuthProvider {
   }
 
   async authenticate(token: string): Promise<RequestContext | undefined> {
-    return verifySession(this.secret, token);
+    const ctx = await verifySession(this.secret, token);
+    if (!ctx || ctx.provider !== 'oidc') return undefined;
+    const user = await this.store.getUser(ctx.tenantId, ctx.userId);
+    if (!user || user.status !== 'active' || user.authProvider !== 'oidc' || user.role !== ctx.role) return undefined;
+    return ctx;
   }
 }

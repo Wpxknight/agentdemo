@@ -1,6 +1,9 @@
 // file: cron.d.ts
-export declare function nextFireAt(cron: string, after: Date): Date;
-export declare function isValidCron(cron: string): boolean;
+export declare const DEFAULT_SCHEDULER_TIMEZONE = "UTC";
+export declare function nextFireAt(cron: string, after: Date, timezone?: string): Date;
+export declare function isValidTimezone(timezone: string): boolean;
+export declare function isValidCron(cron: string, timezone?: string): boolean;
+export declare function assertValidCron(cron: string, timezone?: string): void;
 
 // file: domain.d.ts
 import type { AgentRunResult, AgentInputMessage, IdentityContext, RunExecutionProfile, RunLimits } from '@aiop/control-contracts';
@@ -11,6 +14,7 @@ export interface ScheduledTask {
     roles?: readonly string[];
     sessionId: string;
     cron: string;
+    timezone?: string;
     input: readonly AgentInputMessage[];
     nextFireAt: Date;
     preApproved?: boolean;
@@ -39,12 +43,13 @@ export interface ScheduledRunLookup {
         result: AgentRunResult;
     } | undefined>;
 }
-export type ScheduledFireState = 'pending' | 'claimed' | 'bound' | 'recovering' | 'started';
+export type ScheduledFireState = 'pending' | 'claimed' | 'bound' | 'recovering' | 'completed';
 export interface ScheduledFire extends ScheduledRunInput {
     state: ScheduledFireState;
     attempts: number;
     runId?: string;
     result?: AgentRunResult;
+    completedAt?: Date;
     claimToken?: string;
     claimedBy?: string;
     leaseExpiresAt?: Date;
@@ -73,6 +78,8 @@ export interface RecoveringScheduledFire extends ScheduledFire {
 export type BoundRunInspection = {
     kind: 'active';
 } | {
+    kind: 'waiting';
+} | {
     kind: 'terminal';
     result: AgentRunResult;
 } | {
@@ -90,6 +97,7 @@ export * from './store.js';
 export * from './runner.js';
 export * from './recovery.js';
 export * from './mysql.js';
+export * from './observation.js';
 
 // file: mysql.d.ts
 import type { Generated, Kysely } from 'kysely';
@@ -103,9 +111,11 @@ export interface SchedulerMysqlDatabase {
         session_id: string;
         title: string;
         cron: string;
+        timezone: string;
         task: string;
         pre_approved: number;
         enabled: number;
+        deleted_at: Date | null;
         next_run_at: Date;
         last_run_at: Date | null;
         created_at: Generated<Date>;
@@ -118,6 +128,8 @@ export interface SchedulerMysqlDatabase {
         session_id: string;
         fire_time: Date;
         input_json: string;
+        trigger_kind: string;
+        idempotency_key: string | null;
         state: string;
         attempts: number;
         run_id: string | null;
@@ -129,22 +141,6 @@ export interface SchedulerMysqlDatabase {
         created_at: Date;
         updated_at: Date;
     };
-    task_agent_runs: {
-        tenant_id: string;
-        task_id: number;
-        run_id: string;
-        created_at: Date;
-    };
-    task_runs: {
-        id: Generated<number>;
-        task_id: number;
-        fire_id: Generated<string | null>;
-        run_id: Generated<string | null>;
-        status: string;
-        detail: string | null;
-        steps: number | null;
-        created_at: Generated<Date>;
-    };
 }
 export declare class MysqlSchedulerStore implements SchedulerStore {
     private readonly db;
@@ -152,12 +148,35 @@ export declare class MysqlSchedulerStore implements SchedulerStore {
     claimDue(input: ClaimDueInput): Promise<ClaimedScheduledFire[]>;
     bindRun(input: BindRunInput): Promise<void>;
     completeFire(input: CompleteFireInput): Promise<void>;
+    cleanupCompleted(input: {
+        before: Date;
+        limit: number;
+    }): Promise<number>;
     listBound(input: ListBoundInput): Promise<BoundScheduledFire[]>;
     claimBound(input: ClaimBoundInput): Promise<RecoveringScheduledFire | undefined>;
     releaseBound(input: ReleaseBoundInput): Promise<void>;
     deferBound(input: DeferBoundInput): Promise<void>;
     releaseFire(input: ReleaseFireInput): Promise<void>;
     recoverExpired(now: Date): Promise<number>;
+}
+
+// file: observation.d.ts
+export type SchedulerObservationName = 'backlog' | 'due_lag_ms' | 'state_count' | 'retry' | 'duration_ms' | 'completion' | 'long_stuck';
+/** Low-cardinality scheduler measurements. Fire IDs are correlation fields, not metric labels. */
+export interface SchedulerObservation {
+    name: SchedulerObservationName;
+    value: number;
+    fireId?: string;
+    state?: 'claimed' | 'bound' | 'completed' | 'failed';
+}
+export interface SchedulerObserver {
+    record(observation: SchedulerObservation): void;
+}
+/** Dependency-free observer for embedding and tests; callers may export its snapshot as desired. */
+export declare class InMemorySchedulerObserver implements SchedulerObserver {
+    private readonly observations;
+    record(observation: SchedulerObservation): void;
+    snapshot(): readonly SchedulerObservation[];
 }
 
 // file: recovery.d.ts
@@ -169,9 +188,14 @@ export declare class SchedulerRecovery {
 }
 
 // file: runner.d.ts
-import type { DurableRunRuntime } from '@aiop/control-contracts';
+import type { AgentRunResult, DurableRunRuntime } from '@aiop/control-contracts';
 import type { BoundRunRecovery, ClaimedScheduledFire, RunDispatcher, ScheduledRunInput, ScheduledRunLookup } from './domain.js';
 import type { SchedulerStore } from './store.js';
+import type { SchedulerObserver } from './observation.js';
+export declare class TerminalScheduledFireError extends Error {
+    readonly code: string;
+    constructor(code: string, message?: string);
+}
 export interface SchedulerRunnerOptions {
     store: SchedulerStore;
     dispatcher: RunDispatcher;
@@ -179,7 +203,9 @@ export interface SchedulerRunnerOptions {
     workerId: string;
     leaseMs?: number;
     retryDelayMs?: number;
+    observer?: SchedulerObserver;
     prepareRun?(fire: ClaimedScheduledFire, now: Date): Promise<Pick<ScheduledRunInput, 'limits' | 'signal'>>;
+    completed?(fire: ScheduledRunInput, result: AgentRunResult): Promise<void>;
 }
 export declare function createRunDispatcher(runtime: Pick<DurableRunRuntime, 'run'>, lookup?: ScheduledRunLookup): RunDispatcher;
 export declare class SchedulerRunner {
@@ -188,6 +214,7 @@ export declare class SchedulerRunner {
     private readonly retryDelayMs;
     constructor(options: SchedulerRunnerOptions);
     tick(now: Date, limit: number, signal?: AbortSignal): Promise<number>;
+    private observe;
 }
 
 // file: store.d.ts
@@ -241,6 +268,10 @@ export interface DeferBoundInput {
     retryAt: Date;
     error: string;
 }
+export interface CleanupCompletedInput {
+    before: Date;
+    limit: number;
+}
 export interface SchedulerStore {
     claimDue(input: ClaimDueInput): Promise<ClaimedScheduledFire[]>;
     listBound(input: ListBoundInput): Promise<BoundScheduledFire[]>;
@@ -251,6 +282,8 @@ export interface SchedulerStore {
     completeFire(input: CompleteFireInput): Promise<void>;
     releaseFire(input: ReleaseFireInput): Promise<void>;
     recoverExpired(now: Date): Promise<number>;
+    /** 删除过期 completed Fire；不触碰关联 Durable Run。 */
+    cleanupCompleted(input: CleanupCompletedInput): Promise<number>;
 }
 export declare class MemorySchedulerStore implements SchedulerStore {
     private readonly tasks;
@@ -267,6 +300,7 @@ export declare class MemorySchedulerStore implements SchedulerStore {
     deferBound(input: DeferBoundInput): Promise<void>;
     releaseFire(input: ReleaseFireInput): Promise<void>;
     recoverExpired(now: Date): Promise<number>;
+    cleanupCompleted(input: CleanupCompletedInput): Promise<number>;
     listFires(): Promise<ScheduledFire[]>;
     private materializeDueFires;
     private requireClaim;

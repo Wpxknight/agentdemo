@@ -35,17 +35,19 @@ const model: Model<'pi-runtime-test'> = {
 function testModels() {
   const models = createModels();
   const contexts: Context[] = [];
+  const requestedModels: Model<'pi-runtime-test'>[] = [];
   let release: (() => void) | undefined;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   let calls = 0;
-  const stream = (_model: Model<'pi-runtime-test'>, context: Context) => {
+  const stream = (requestedModel: Model<'pi-runtime-test'>, context: Context) => {
+    requestedModels.push(requestedModel);
     contexts.push(structuredClone(context));
     const output = createAssistantMessageEventStream();
     void (async () => {
       if (calls++ === 0) await gate;
       const message: AssistantMessage = {
         role: 'assistant', content: [{ type: 'text', text: `answer-${calls}` }],
-        api: model.api, provider: model.provider, model: model.id,
+        api: requestedModel.api, provider: requestedModel.provider, model: requestedModel.id,
         usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
         stopReason: 'stop', timestamp: Date.now(),
@@ -60,10 +62,41 @@ function testModels() {
     auth: { apiKey: { name: 'test', resolve: async () => ({ auth: { apiKey: 'test' } }) } },
     models: [model], api: { stream, streamSimple: stream },
   }));
-  return { models, contexts, release: () => release?.() };
+  return { models, contexts, requestedModels, release: () => release?.() };
 }
 
 describe('PiAgentSessionFactory', () => {
+  it('resolves the current model for every newly created session', async () => {
+    const repository = new InMemorySessionRepo();
+    const controlled = testModels();
+    const nextModel = { ...model, id: 'pi-runtime-test-next', name: 'Pi Runtime Test Next' };
+    let currentModel = model;
+    const factory = new PiAgentSessionFactory({
+      repository, models: controlled.models, model, resolveModel: () => currentModel,
+    });
+
+    const first = await factory.create({
+      id: 'dynamic-model-first', initialMessage: { role: 'user', text: 'first' },
+      events: eventContext('dynamic-model-first'),
+    });
+    const firstEvents = collect(first.continue());
+    controlled.release();
+    await firstEvents;
+    await first.close();
+
+    currentModel = nextModel;
+    const second = await factory.create({
+      id: 'dynamic-model-second', initialMessage: { role: 'user', text: 'second' },
+      events: eventContext('dynamic-model-second'),
+    });
+    await collect(second.continue());
+    await second.close();
+
+    expect(controlled.requestedModels.map((requested) => requested.id)).toEqual([
+      'pi-runtime-test', 'pi-runtime-test-next',
+    ]);
+  });
+
   it('resolves governed tools from the durable run identity when creating a session', async () => {
     const repository = new InMemorySessionRepo();
     const controlled = testModels();

@@ -64,6 +64,11 @@ export interface DeferBoundInput {
   error: string;
 }
 
+export interface CleanupCompletedInput {
+  before: Date;
+  limit: number;
+}
+
 export interface SchedulerStore {
   claimDue(input: ClaimDueInput): Promise<ClaimedScheduledFire[]>;
   listBound(input: ListBoundInput): Promise<BoundScheduledFire[]>;
@@ -74,6 +79,8 @@ export interface SchedulerStore {
   completeFire(input: CompleteFireInput): Promise<void>;
   releaseFire(input: ReleaseFireInput): Promise<void>;
   recoverExpired(now: Date): Promise<number>;
+  /** 删除过期 completed Fire；不触碰关联 Durable Run。 */
+  cleanupCompleted(input: CleanupCompletedInput): Promise<number>;
 }
 
 export class MemorySchedulerStore implements SchedulerStore {
@@ -112,7 +119,7 @@ export class MemorySchedulerStore implements SchedulerStore {
 
   async completeFire(input: CompleteFireInput): Promise<void> {
     const fire = this.fires.get(input.fireId);
-    if (fire?.state === 'started') {
+    if (fire?.state === 'completed') {
       if (fire.runId === input.runId && input.result.runId === input.runId) return;
       throw new Error(`scheduled fire Run mismatch: ${input.fireId}`);
     }
@@ -123,9 +130,10 @@ export class MemorySchedulerStore implements SchedulerStore {
       throw new Error(`scheduled fire Run mismatch: ${input.fireId}`);
     }
     Object.assign(fire, {
-      state: 'started' as const,
+      state: 'completed' as const,
       runId: input.runId,
       result: structuredClone(input.result),
+      completedAt: new Date(input.completedAt),
       claimToken: undefined,
       claimedBy: undefined,
       leaseExpiresAt: undefined,
@@ -243,6 +251,15 @@ export class MemorySchedulerStore implements SchedulerStore {
     return recovered;
   }
 
+  async cleanupCompleted(input: CleanupCompletedInput): Promise<number> {
+    const expired = [...this.fires.values()]
+      .filter((fire) => fire.state === 'completed' && fireTimeForRetention(fire).getTime() < input.before.getTime())
+      .sort((left, right) => fireTimeForRetention(left).getTime() - fireTimeForRetention(right).getTime())
+      .slice(0, input.limit);
+    for (const fire of expired) this.fires.delete(fire.fireId);
+    return expired.length;
+  }
+
   async listFires(): Promise<ScheduledFire[]> {
     return [...this.fires.values()].map(cloneFire);
   }
@@ -265,7 +282,7 @@ export class MemorySchedulerStore implements SchedulerStore {
           attempts: 0,
         });
       }
-      task.nextFireAt = nextFireAt(task.cron, fireTime);
+      task.nextFireAt = nextFireAt(task.cron, now, task.timezone);
     }
   }
 
@@ -276,6 +293,10 @@ export class MemorySchedulerStore implements SchedulerStore {
     }
     return fire;
   }
+}
+
+function fireTimeForRetention(fire: ScheduledFire): Date {
+  return fire.completedAt ?? fire.fireTime;
 }
 
 export function scheduledFireId(taskId: string, fireTime: Date): string {
@@ -298,6 +319,7 @@ function cloneFire(fire: ScheduledFire): ScheduledFire {
       deadlineAt: fire.limits.deadlineAt ? new Date(fire.limits.deadlineAt) : undefined,
     } : undefined,
     fireTime: new Date(fire.fireTime),
+    completedAt: fire.completedAt ? new Date(fire.completedAt) : undefined,
     leaseExpiresAt: fire.leaseExpiresAt ? new Date(fire.leaseExpiresAt) : undefined,
     retryAt: fire.retryAt ? new Date(fire.retryAt) : undefined,
   };

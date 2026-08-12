@@ -14,7 +14,10 @@ USERNAME="admin"
 PASSWORD="admin-pass"
 PASS=0
 FAIL=0
-TMP_DIR="$(mktemp -d)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+mkdir -p "$REPO_ROOT/dist/test-tmp"
+umask 077
+TMP_DIR="$(mktemp -d "$REPO_ROOT/dist/test-tmp/chat-skills-auth.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 pass() {

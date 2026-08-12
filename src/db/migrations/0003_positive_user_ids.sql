@@ -1,0 +1,4 @@
+-- User identity migration is orchestrated by runPositiveUserIdMigration in src/db/index.ts.
+-- MySQL DDL auto-commits, so the runner uses guarded object-shape checks, durable DML stage
+-- markers, and one atomic RENAME TABLE cut-over instead of executing a monolithic SQL script.
+-- Fresh databases already have BIGINT UNSIGNED identities in 0001 and skip all legacy work.

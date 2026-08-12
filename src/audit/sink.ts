@@ -1,4 +1,5 @@
 import { logger } from '../logger.js';
+import type { AuthProviderKind, DeploymentMode } from '../auth/types.js';
 
 const log = logger.child({ mod: 'audit' });
 
@@ -11,6 +12,11 @@ export interface AuditEvent {
   action: string;
   /** 归属租户（多租户隔离）。 */
   tenantId?: string;
+  userId?: string;
+  provider?: AuthProviderKind;
+  deploymentMode?: DeploymentMode;
+  runId?: string;
+  correlationId?: string;
   sessionId?: string;
   cluster?: string;
   tool?: string;

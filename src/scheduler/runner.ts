@@ -4,17 +4,18 @@ import {
   createRunDispatcher,
   MysqlSchedulerStore,
   SchedulerRunner,
-  scheduledFireId,
+  TerminalScheduledFireError,
   type BoundRunRecovery,
   type SchedulerMysqlDatabase,
+  type SchedulerObserver,
   type SchedulerStore,
   type ScheduledRunInput,
 } from '@aiop/scheduler-runtime';
 import { logger } from '../logger.js';
+import { projectCommittedPiSession } from '../agent/projections.js';
 import type { Runtime } from '../runtime.js';
-import { DEFAULT_TASK_MAX_RUN_MS, type AgentRunRecord, type ScheduledTask } from '../db/store.js';
+import { DEFAULT_TASK_MAX_RUN_MS, type AgentRunRecord } from '../db/store.js';
 import { MysqlStore } from '../db/mysql.js';
-import type { TaskRunner } from './ticker.js';
 
 const log = logger.child({ mod: 'scheduler' });
 
@@ -25,32 +26,21 @@ export function shouldEmbedScheduler(env: Env = process.env): boolean {
   return value === 'true' || value === '1';
 }
 
-/** Creates a durable product Run. The scheduler never enters an agent/Pi execution loop. */
-export function createScheduledTaskRunner(rt: Runtime): TaskRunner {
-  return async (task: ScheduledTask) => {
-    const dispatcher = createRunDispatcher(rt.durableRunRuntime, scheduledRunLookup(rt));
-    const fireTime = new Date();
-    const result = await dispatcher.startScheduledRun({
-      taskId: String(task.id),
-      fireId: scheduledFireId(String(task.id), fireTime),
-      fireTime,
-      identity: { tenantId: task.tenantId, actorId: task.userId, roles: ['user'] },
-      sessionId: task.sessionId,
-      input: [{ role: 'user', text: task.task }],
-      execution: { unattended: true, preApproved: task.preApproved },
-      limits: {
-        deadlineAt: new Date(fireTime.getTime() + (
-          (await rt.store.getSchedulerSettings({ tenantId: task.tenantId }))?.maxRunMs ?? DEFAULT_TASK_MAX_RUN_MS
-        )),
-      },
-    });
-    return {
-      status: result.result.status === 'succeeded' ? 'success' : 'error',
-      detail: JSON.stringify({
-        runId: result.runId, status: result.result.status, text: result.result.text,
-        error: result.result.error, usage: result.result.usage,
-      }),
-    };
+const DAY_MS = 24 * 60 * 60 * 1000;
+export const DEFAULT_SCHEDULER_CLEANUP_BATCH = 100;
+
+export interface SchedulerRetentionOptions {
+  retentionMs: number;
+  batch: number;
+}
+
+export function schedulerRetentionOptions(env: Env = process.env): SchedulerRetentionOptions | undefined {
+  const days = Number(env.AIOP_SCHEDULER_FIRE_RETENTION_DAYS);
+  if (!Number.isFinite(days) || days <= 0) return undefined;
+  const configuredBatch = Number(env.AIOP_SCHEDULER_CLEANUP_BATCH);
+  return {
+    retentionMs: days * DAY_MS,
+    batch: Number.isInteger(configuredBatch) && configuredBatch > 0 ? configuredBatch : DEFAULT_SCHEDULER_CLEANUP_BATCH,
   };
 }
 
@@ -62,6 +52,9 @@ export interface RuntimeSchedulerOptions {
   batch?: number;
   leaseMs?: number;
   retryDelayMs?: number;
+  /** 默认关闭；启用后只删除指定窗口外的 completed Fire。 */
+  retention?: SchedulerRetentionOptions;
+  observer?: SchedulerObserver;
   now?: () => Date;
 }
 
@@ -83,15 +76,54 @@ export function createRuntimeScheduler(
     workerId: options.workerId ?? `scheduler-${randomUUID()}`,
     leaseMs: options.leaseMs,
     retryDelayMs: options.retryDelayMs,
-    prepareRun: async (fire, now) => ({
-      limits: {
-        deadlineAt: new Date(now.getTime() + (
-          (await rt.store.getSchedulerSettings({ tenantId: fire.identity.tenantId }))?.maxRunMs ?? DEFAULT_TASK_MAX_RUN_MS
-        )),
-      },
-    }),
+    observer: options.observer ?? schedulerObserver(),
+    prepareRun: async (fire, now) => {
+      if (rt.deploymentMode === 'aios-integrated') {
+        // TODO(aios-token-renewal): 接入 AIOS 内部受控续约接口后，在这里按 tenantId + actorId
+        // 加载/续约用户 Token、复核账号状态，并以 CAS/互斥避免并发续约覆盖；完成前禁止离线代跑。
+        throw new TerminalScheduledFireError('aios_offline_scheduling_unavailable');
+      }
+      if (rt.deploymentMode === 'standalone') {
+        const user = await rt.store.getUser(fire.identity.tenantId, fire.identity.actorId);
+        if (!user || user.status !== 'active' || (user.authProvider !== 'local' && user.authProvider !== 'oidc')) {
+          throw new Error('scheduled_actor_unavailable');
+        }
+      }
+      return {
+        limits: {
+          deadlineAt: new Date(now.getTime() + (
+            (await rt.store.getSchedulerSettings({ tenantId: fire.identity.tenantId }))?.maxRunMs ?? DEFAULT_TASK_MAX_RUN_MS
+          )),
+        },
+      };
+    },
+    completed: async (fire, result) => {
+      if (result.status !== 'succeeded' || !rt.piSessionStore) return;
+      try {
+        await projectCommittedPiSession({
+          store: rt.store,
+          sessions: rt.piSessionStore,
+          ctx: requestContext(fire.identity),
+          sessionId: fire.sessionId,
+        });
+      } catch (error) {
+        log.warn({ err: error, fireId: fire.fireId, runId: result.runId }, 'scheduler durable 会话投影失败');
+      }
+    },
   });
-  return new RuntimeSchedulerLoop(runner, options);
+  return new RuntimeSchedulerLoop(runner, store, {
+    ...options,
+    retention: options.retention ?? schedulerRetentionOptions(),
+  });
+}
+
+function schedulerObserver(): SchedulerObserver {
+  return {
+    record(observation) {
+      const { fireId, ...measurement } = observation;
+      log.info({ ...measurement, ...(fireId ? { fireId, correlationId: fireId } : {}) }, 'scheduler measurement');
+    },
+  };
 }
 
 export function startRuntimeScheduler(
@@ -115,7 +147,8 @@ class RuntimeSchedulerLoop implements RuntimeScheduler {
 
   constructor(
     private readonly runner: SchedulerRunner,
-    options: RuntimeSchedulerOptions,
+    private readonly store: SchedulerStore,
+    private readonly options: RuntimeSchedulerOptions,
   ) {
     this.intervalMs = options.intervalMs ?? 30_000;
     this.batch = options.batch ?? 10;
@@ -126,6 +159,13 @@ class RuntimeSchedulerLoop implements RuntimeScheduler {
     if (this.stopped) return Promise.resolve(0);
     if (this.inFlight) return this.inFlight;
     const execution = this.runner.tick(now, this.batch, this.lifecycle.signal)
+      .then(async (processed) => {
+        const retention = this.options.retention;
+        if (retention) await this.store.cleanupCompleted({
+          before: new Date(now.getTime() - retention.retentionMs), limit: retention.batch,
+        });
+        return processed;
+      })
       .finally(() => {
         if (this.inFlight === execution) this.inFlight = undefined;
       });
@@ -204,9 +244,9 @@ function durableBoundRunRecovery(rt: Runtime): BoundRunRecovery {
         tenantId: fire.identity.tenantId, userId: fire.identity.actorId, role: 'user',
       }, fire.runId);
       if (!record) throw new Error(`scheduled fire Durable Run not found: ${fire.fireId}`);
+      if (record.status === 'waiting') return { kind: 'waiting' };
       if (
-        record.status === 'waiting'
-        || record.status === 'succeeded'
+        record.status === 'succeeded'
         || record.status === 'failed'
         || record.status === 'cancelled'
         || record.status === 'recovery_required'
@@ -226,6 +266,15 @@ function durableBoundRunRecovery(rt: Runtime): BoundRunRecovery {
       });
       return handle.result();
     },
+  };
+}
+
+function requestContext(identity: ScheduledRunInput['identity']) {
+  return {
+    tenantId: identity.tenantId,
+    userId: identity.actorId,
+    role: identity.roles.includes('platform_admin') ? 'platform_admin' as const
+      : identity.roles.includes('tenant_admin') ? 'tenant_admin' as const : 'user' as const,
   };
 }
 

@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { chmod, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { SignJWT, jwtVerify } from 'jose';
@@ -12,7 +12,7 @@ import { InMemoryApprovalStore } from '../agent/approval.js';
 import { InMemoryQuestionStore } from '../agent/question.js';
 import type { QuestionAnswers } from '../agent/question.js';
 import { authenticate } from './context.js';
-import { AuthzError, canManageUsersOf, requirePermission } from '../auth/rbac.js';
+import { AuthzError, canManageUsersOf, permissionsFor, requirePermission } from '../auth/rbac.js';
 import { LocalAuthProvider } from '../auth/local.js';
 import { OidcAuthProvider } from '../auth/oidc.js';
 import { AiosAuthError } from '../auth/aios.js';
@@ -21,8 +21,7 @@ import { createTenant, createUser, listTenants } from '../auth/admin.js';
 import type { RequestContext, Role } from '../auth/types.js';
 import { DEFAULT_TASK_MAX_RUN_MS, type SandboxSettings, type ScheduledTaskPatch } from '../db/store.js';
 import { normalizeUserHomeDir } from '@aiop/sandbox-runtime';
-import { isValidCron } from '../scheduler/cron.js';
-import { createScheduledTaskRunner } from '../scheduler/runner.js';
+import { DEFAULT_SCHEDULER_TIMEZONE, isValidCron, isValidTimezone } from '../scheduler/cron.js';
 import { createModel } from '../llm/factory.js';
 import type { JsonValue, Msg, ToolCall } from '../llm/types.js';
 import { importSkillZip, MAX_SKILL_ZIP_BYTES } from '../skill/import.js';
@@ -59,8 +58,11 @@ type ActiveAgentRuns = Map<string, Set<ActiveAgentRun>>;
 type CompactionWatermarks = Map<string, number>;
 
 const OIDC_COOKIE = 'aiop_oidc';
+const OIDC_STATE_PATH = '/auth/callback';
+const OIDC_SESSION_COOKIE = 'aiop_oidc_session';
+const OIDC_SESSION_PATH = '/auth/oidc/session';
+const OIDC_EXCHANGE_TTL_SECONDS = 60;
 /** 手动“立即执行”的任务 id 去重（本进程内），防止连点重复触发。 */
-const runningManualTasks = new Set<number>();
 const RUN_TERMINATED_MESSAGE = '会话运行已终止';
 /** 10MB zip 的 base64 加 JSON 包装；该路由不继承通用大请求攻击面。 */
 const SKILL_IMPORT_MAX_BODY = Math.ceil(MAX_SKILL_ZIP_BYTES * 4 / 3) + 64_000;
@@ -208,6 +210,12 @@ async function readJson(req: Req, maxSize = 8_000_000): Promise<Record<string, u
   }
 }
 
+function requestCorrelationId(req: Req): string {
+  const value = req.headers['x-correlation-id'] ?? req.headers['x-request-id'];
+  const raw = Array.isArray(value) ? value[0] : value;
+  return typeof raw === 'string' && raw.trim() ? raw.trim().slice(0, 128) : randomUUID();
+}
+
 function sendJson(res: Res, status: number, body: unknown): void {
   const buf = Buffer.from(JSON.stringify(body));
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': buf.length });
@@ -281,6 +289,39 @@ function parseCookies(header: string | undefined): Record<string, string> {
     out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
   }
   return out;
+}
+
+function oidcCookie(name: string, value: string, maxAge: number, secure: boolean, path = '/'): string {
+  return `${name}=${encodeURIComponent(value)}; HttpOnly; Path=${path}; Max-Age=${maxAge}; SameSite=Lax${secure ? '; Secure' : ''}`;
+}
+
+function opaqueCodeHash(code: string): string {
+  return createHash('sha256').update(code).digest('hex');
+}
+
+function assertOidcExchangeRequest(req: Req, provider: OidcAuthProvider): void {
+  const expectedOrigin = oidcWebCallback(provider).origin;
+  const origin = req.headers.origin;
+  const fetchSite = req.headers['sec-fetch-site'];
+  const fetchMode = req.headers['sec-fetch-mode'];
+  if (origin !== undefined) {
+    if (origin !== expectedOrigin) throw new HttpError(403, 'OIDC 兑换来源无效');
+    if (fetchSite === 'none') throw new HttpError(403, 'OIDC 兑换缺少可信站点关系');
+  } else if (fetchSite !== 'same-origin') {
+    // 浏览器可能在 same-origin POST 省略 Origin；仅接受 Fetch Metadata 明确证明的同源请求。
+    throw new HttpError(403, 'OIDC 兑换缺少可信同源信息');
+  }
+  if (fetchMode !== undefined && fetchMode !== 'cors' && fetchMode !== 'same-origin') {
+    throw new HttpError(403, 'OIDC 兑换请求模式无效');
+  }
+}
+
+function oidcWebCallback(provider: OidcAuthProvider): URL {
+  const callback = provider.webCallbackUrl();
+  if (!['http:', 'https:'].includes(callback.protocol) || callback.username || callback.password) {
+    throw new HttpError(500, 'OIDC Web callback URL 配置无效');
+  }
+  return callback;
 }
 
 /** 业务错误：携带 HTTP 状态码。 */
@@ -790,32 +831,40 @@ const USER_STATUS_TTL_MS = 60_000;
 const statusCaches = new WeakMap<Runtime, Map<string, { active: boolean; at: number }>>();
 
 async function assertUserActive(rt: Runtime, ctx: RequestContext): Promise<void> {
+  // AIOS 状态由 exchange 的可信 userinfo/JWT claims 验证；会话中没有本地影子行可查。
+  if (ctx.provider === 'aios') return;
+  // provider 缺失只允许内部调用；Bearer 会话必须明确标记 local/oidc 并 fail closed。
+  if (ctx.provider !== 'local' && ctx.provider !== 'oidc') throw new HttpError(401, '认证来源无效');
   let cache = statusCaches.get(rt);
   if (!cache) {
     cache = new Map();
     statusCaches.set(rt, cache);
   }
-  const key = `${ctx.tenantId}/${ctx.userId}`;
+  const key = `${ctx.provider}/${ctx.tenantId}/${ctx.userId}`;
   const cached = cache.get(key);
   if (cached && Date.now() - cached.at < USER_STATUS_TTL_MS) {
     if (!cached.active) throw new HttpError(401, '账号已被禁用');
     return;
   }
-  // 无用户行（CLI 默认身份 / 遗留数据）不拦：状态门只对存在且被禁用的账号生效。
   const user = await rt.store.getUser(ctx.tenantId, ctx.userId).catch(() => undefined);
-  const active = !user || user.status !== 'disabled';
+  const active = user?.status === 'active' && user.authProvider === ctx.provider;
   cache.set(key, { active, at: Date.now() });
-  if (!active) throw new HttpError(401, '账号已被禁用');
+  if (!active) throw new HttpError(401, '账号不存在、已禁用或认证来源不匹配');
 }
 
 /** 用户状态变更后清缓存，让禁用/恢复立即生效。 */
 function invalidateUserStatus(rt: Runtime, tenantId: string, userId: string): void {
-  statusCaches.get(rt)?.delete(`${tenantId}/${userId}`);
+  const cache = statusCaches.get(rt);
+  cache?.delete(`local/${tenantId}/${userId}`);
+  cache?.delete(`oidc/${tenantId}/${userId}`);
 }
 
 /** 校验 Bearer token 并返回身份；失败抛 401。 */
 async function requireAuth(rt: Runtime, req: Req): Promise<RequestContext> {
-  const ctx = await authenticate(rt.authProvider, req.headers.authorization);
+  const ctx = await authenticate(rt.authProvider, req.headers.authorization)
+    ?? (rt.aiosAuth && rt.aiosAuth !== rt.authProvider
+      ? await authenticate(rt.aiosAuth, req.headers.authorization)
+      : undefined);
   if (!ctx) throw new HttpError(401, '未认证或 token 无效');
   await assertUserActive(rt, ctx);
   return ctx;
@@ -990,6 +1039,9 @@ async function handle(
 
   // —— 本地登录 ——
   if (route === 'POST /auth/login') {
+    if (rt.deploymentMode === 'aios-integrated' || !(rt.authProvider instanceof LocalAuthProvider)) {
+      throw new HttpError(404, '本地登录未启用');
+    }
     const body = await readJson(req);
     const tenantId = str(body, 'tenantId') ?? 'default';
     const username = str(body, 'username');
@@ -1006,23 +1058,29 @@ async function handle(
     const body = await readJson(req);
     const aiosToken = str(body, 'token');
     if (!aiosToken) throw new HttpError(400, 'token 必填');
+    const hasExpiredTime = Object.prototype.hasOwnProperty.call(body, 'expiredTime');
+    if (hasExpiredTime && (typeof body.expiredTime !== 'string' || !body.expiredTime.trim())) {
+      throw new HttpError(400, 'expiredTime 必须是非空时间字符串');
+    }
     try {
-      const { token, ctx, user } = await rt.aiosAuth.exchange({
+      const { token, ctx } = await rt.aiosAuth.exchange({
         token: aiosToken,
         refreshToken: str(body, 'refreshToken'),
-        expiredTime: str(body, 'expiredTime'),
+        expiredTime: hasExpiredTime ? body.expiredTime as string : undefined,
       });
-      invalidateUserStatus(rt, ctx.tenantId, ctx.userId);
       await rt.audit?.record({
         kind: 'auth', action: 'aios-exchange', tenantId: ctx.tenantId,
-        detail: { userId: ctx.userId, role: ctx.role },
+        userId: ctx.userId, provider: ctx.provider,
+        deploymentMode: rt.deploymentMode ?? 'standalone',
+        correlationId: requestCorrelationId(req),
+        detail: { role: ctx.role },
       });
       return sendJson(res, 200, {
         token,
         tenantId: ctx.tenantId,
         userId: ctx.userId,
         role: ctx.role,
-        displayName: user.displayName ?? user.username,
+        displayName: ctx.displayName ?? ctx.userId,
       });
     } catch (err) {
       if (err instanceof AiosAuthError) throw new HttpError(401, err.message);
@@ -1040,7 +1098,10 @@ async function handle(
       .setIssuedAt()
       .setExpirationTime('10m')
       .sign(secret);
-    res.setHeader('set-cookie', `${OIDC_COOKIE}=${stateToken}; HttpOnly; Path=/; Max-Age=600; SameSite=Lax`);
+    res.setHeader('set-cookie', oidcCookie(
+      OIDC_COOKIE, stateToken, 600, rt.authProvider.usesSecureCallback(), OIDC_STATE_PATH,
+    ));
+    res.setHeader('cache-control', 'no-store');
     return sendJson(res, 200, { url: start.url });
   }
 
@@ -1058,8 +1119,43 @@ async function handle(
       throw new HttpError(400, 'OIDC state cookie 无效或已过期');
     }
     const token = await rt.authProvider.handleCallback(url.href, { state, codeVerifier });
-    res.setHeader('set-cookie', `${OIDC_COOKIE}=; HttpOnly; Path=/; Max-Age=0`);
-    return sendJson(res, 200, { token });
+    const identity = await rt.authProvider.authenticate(token);
+    if (!identity) throw new HttpError(500, 'OIDC 登录会话签发失败');
+    const exchangeCode = randomBytes(32).toString('base64url');
+    await rt.store.putOidcExchangeCode({
+      codeHash: opaqueCodeHash(exchangeCode),
+      tenantId: identity.tenantId,
+      provider: 'oidc',
+      sessionToken: token,
+      expiresAt: new Date(Date.now() + OIDC_EXCHANGE_TTL_SECONDS * 1000),
+    });
+    const secure = rt.authProvider.usesSecureCallback();
+    res.setHeader('set-cookie', [
+      oidcCookie(OIDC_COOKIE, '', 0, secure, OIDC_STATE_PATH),
+      oidcCookie(OIDC_SESSION_COOKIE, exchangeCode, OIDC_EXCHANGE_TTL_SECONDS, secure, OIDC_SESSION_PATH),
+    ]);
+    const callback = oidcWebCallback(rt.authProvider);
+    res.writeHead(303, { location: callback.href, 'cache-control': 'no-store' });
+    res.end();
+    return;
+  }
+
+  // —— standalone Web 用 HttpOnly opaque code 原子换取 bearer token；响应同时清理 cookie。 ——
+  if (route === 'POST /auth/oidc/session') {
+    if (!(rt.authProvider instanceof OidcAuthProvider)) throw new HttpError(400, '未启用 OIDC');
+    assertOidcExchangeRequest(req, rt.authProvider);
+    const code = parseCookies(req.headers.cookie)[OIDC_SESSION_COOKIE];
+    const consumed = code ? await rt.store.consumeOidcExchangeCode({
+      codeHash: opaqueCodeHash(code), provider: 'oidc', now: new Date(),
+    }) : undefined;
+    res.setHeader('set-cookie', oidcCookie(
+      OIDC_SESSION_COOKIE, '', 0, rt.authProvider.usesSecureCallback(), OIDC_SESSION_PATH,
+    ));
+    res.setHeader('cache-control', 'no-store');
+    if (!consumed || !await rt.authProvider.authenticate(consumed.sessionToken)) {
+      throw new HttpError(401, 'OIDC 登录会话缺失或已失效');
+    }
+    return sendJson(res, 200, { token: consumed.sessionToken });
   }
 
   // —— 以下均需认证 ——
@@ -1130,15 +1226,18 @@ async function handle(
 
   if (route === 'GET /v1/me') {
     const ctx = await requireAuth(rt, req);
-    const user = await rt.store.getUser(ctx.tenantId, ctx.userId).catch(() => undefined);
     return sendJson(res, 200, {
       tenantId: ctx.tenantId,
       userId: ctx.userId,
       role: ctx.role,
-      username: user?.username,
-      displayName: user?.displayName ?? user?.username,
-      authProvider: user?.authProvider,
-      homeDir: user?.homeDir ?? '',
+      displayName: ctx.displayName ?? ctx.userId,
+      authProvider: ctx.provider,
+      deploymentMode: rt.deploymentMode ?? 'standalone',
+      permissions: permissionsFor(ctx.role),
+      features: {
+        localLogin: (rt.deploymentMode ?? 'standalone') === 'standalone' && rt.authProvider instanceof LocalAuthProvider,
+        localUserManagement: (rt.deploymentMode ?? 'standalone') === 'standalone',
+      },
     });
   }
 
@@ -1571,7 +1670,7 @@ async function handle(
     const current = await rt.store.getLlmSettings(ctx) ?? currentModelConfig(rt);
     const next = modelConfigFromBody(await readJson(req), current, rt.modelOptions);
     await rt.store.setLlmSettings(ctx, next);
-    if (rt.updateModel) rt.updateModel(next);
+    if (rt.updateModel) await rt.updateModel(next);
     else {
       rt.model = createModel(next.id, next);
       rt.modelConfig = { ...next };
@@ -1871,27 +1970,31 @@ async function handle(
     const body = await readJson(req);
     const sessionId = sessionIdFromBody(body);
     const cron = str(body, 'cron');
+    const timezone = str(body, 'timezone') ?? DEFAULT_SCHEDULER_TIMEZONE;
     const task = str(body, 'task');
     if (!cron || !task) throw new HttpError(400, 'cron/task 必填');
+    if (!isValidTimezone(timezone)) throw new HttpError(400, `非法 IANA 时区: ${timezone}`);
+    if (!isValidCron(cron, timezone)) throw new HttpError(400, `非法 cron 表达式: ${cron}`);
     const title = str(body, 'title')?.trim() ?? '';
     const preApproved = body.preApproved === true;
     if (preApproved) requirePermission(ctx, 'approve'); // 预批准属审批权
     const created = await rt.store.createScheduledTask(ctx, {
-      sessionId, cron, title, task, preApproved, enabled: body.enabled !== false,
+      sessionId, cron, timezone, title, task, preApproved, enabled: body.enabled !== false,
     });
     return sendJson(res, 201, { task: created });
   }
   const schedRunsMatch = /^\/v1\/schedule\/(\d+)\/runs$/.exec(path);
   if (method === 'GET' && schedRunsMatch) {
     const ctx = await requireAuth(rt, req);
-    const runs = await rt.store.listTaskRuns(ctx, Number(schedRunsMatch[1]));
+    const runs = await rt.store.listScheduledExecutions(ctx, Number(schedRunsMatch[1]));
     return sendJson(res, 200, { runs });
   }
   const schedMatch = /^\/v1\/schedule\/(\d+)\/(enable|disable)$/.exec(path);
   if (method === 'POST' && schedMatch) {
     const ctx = await requireAuth(rt, req);
     requirePermission(ctx, 'task:create');
-    await rt.store.setTaskEnabled(ctx, Number(schedMatch[1]), schedMatch[2] === 'enable');
+    const changed = await rt.store.setTaskEnabled(ctx, Number(schedMatch[1]), schedMatch[2] === 'enable');
+    if (!changed) throw new HttpError(404, '定时任务不存在');
     return sendJson(res, 200, { ok: true });
   }
   const schedUpdateMatch = /^\/v1\/schedule\/(\d+)$/.exec(path);
@@ -1901,8 +2004,15 @@ async function handle(
     const body = await readJson(req);
     const patch: ScheduledTaskPatch = {};
     const cron = str(body, 'cron');
+    const timezone = str(body, 'timezone');
+    if (timezone !== undefined) {
+      if (!isValidTimezone(timezone)) throw new HttpError(400, `非法 IANA 时区: ${timezone}`);
+      patch.timezone = timezone;
+    }
     if (cron !== undefined) {
-      if (!isValidCron(cron)) throw new HttpError(400, `非法 cron 表达式: ${cron}`);
+      if (!isValidCron(cron, timezone ?? DEFAULT_SCHEDULER_TIMEZONE)) {
+        throw new HttpError(400, `非法 cron 表达式: ${cron}`);
+      }
       patch.cron = cron;
     }
     const task = str(body, 'task');
@@ -1921,7 +2031,7 @@ async function handle(
       if (typeof body.enabled !== 'boolean') throw new HttpError(400, 'enabled 必须是布尔值');
       patch.enabled = body.enabled;
     }
-    if (!Object.keys(patch).length) throw new HttpError(400, '没有可更新的字段（cron/title/task/preApproved/enabled）');
+    if (!Object.keys(patch).length) throw new HttpError(400, '没有可更新的字段（cron/timezone/title/task/preApproved/enabled）');
     const updated = await rt.store.updateScheduledTask(ctx, Number(schedUpdateMatch[1]), patch);
     if (!updated) throw new HttpError(404, '定时任务不存在');
     return sendJson(res, 200, { task: updated });
@@ -1938,18 +2048,13 @@ async function handle(
     const ctx = await requireAuth(rt, req);
     requirePermission(ctx, 'task:create');
     const id = Number(schedRunNowMatch[1]);
-    const task = await rt.store.getScheduledTask(ctx, id);
-    if (!task) throw new HttpError(404, '定时任务不存在');
-    if (runningManualTasks.has(id)) throw new HttpError(409, '该任务正在手动执行中');
-    // 异步执行（任务可能跑很久），结果照常写入 task_runs；前端轮询执行记录即可。
-    runningManualTasks.add(id);
-    const runner = createScheduledTaskRunner(rt);
-    void runner(task)
-      .then((result) => rt.store.recordTaskRun({ taskId: id, ...result }))
-      .catch((err) => rt.store.recordTaskRun({ taskId: id, status: 'error', detail: String(err) }))
-      .catch((err) => log.error({ taskId: id, err: String(err) }, '手动执行记录失败'))
-      .finally(() => runningManualTasks.delete(id));
-    return sendJson(res, 202, { ok: true, taskId: id, started: true });
+    const idempotencyKey = req.headers['idempotency-key']?.toString().trim();
+    if (!idempotencyKey) throw new HttpError(400, 'Idempotency-Key 必填');
+    if (idempotencyKey.length > 128) throw new HttpError(400, 'Idempotency-Key 不能超过 128 个字符');
+    const fire = await rt.store.createManualFire(ctx, id, idempotencyKey);
+    if (!fire) throw new HttpError(404, '定时任务不存在');
+    if (!fire.replayed) rt.requestSchedulerTick?.();
+    return sendJson(res, 202, { ok: true, taskId: id, ...fire });
   }
 
   // —— 审计 ——
@@ -1967,10 +2072,12 @@ async function handle(
 
   // —— 管理：租户 / 用户 ——
   if (route === 'GET /v1/admin/tenants') {
+    if (rt.deploymentMode === 'aios-integrated') throw new HttpError(404, '本地租户管理未启用');
     const ctx = await requireAuth(rt, req);
     return sendJson(res, 200, { tenants: await listTenants(ctx, rt.store) });
   }
   if (route === 'POST /v1/admin/tenants') {
+    if (rt.deploymentMode === 'aios-integrated') throw new HttpError(404, '本地租户管理未启用');
     const ctx = await requireAuth(rt, req);
     const body = await readJson(req);
     const id = str(body, 'id');
@@ -1979,6 +2086,7 @@ async function handle(
     return sendJson(res, 201, { ok: true });
   }
   if (route === 'POST /v1/admin/users') {
+    if (rt.deploymentMode === 'aios-integrated') throw new HttpError(404, '本地用户管理未启用');
     const ctx = await requireAuth(rt, req);
     if (!(rt.authProvider instanceof LocalAuthProvider)) {
       throw new HttpError(400, 'OIDC 模式下用户由 IdP 管理，不支持本地建号');
@@ -2006,6 +2114,7 @@ async function handle(
 
   // —— 管理：用户列表 / 软删除 / 禁用恢复（DESIGN-aios-integration §8.5）——
   if (route === 'GET /v1/admin/users') {
+    if (rt.deploymentMode === 'aios-integrated') throw new HttpError(404, '本地用户管理未启用');
     const ctx = await requireAuth(rt, req);
     const tenantId = url.searchParams.get('tenantId') ?? ctx.tenantId;
     if (!canManageUsersOf(ctx, tenantId)) throw new AuthzError(`权限不足：无法管理租户 ${tenantId} 的用户`);
@@ -2014,6 +2123,7 @@ async function handle(
 
   const adminUserActionMatch = /^\/v1\/admin\/users\/([^/]+)\/(disable|enable)$/.exec(path);
   if (method === 'POST' && adminUserActionMatch) {
+    if (rt.deploymentMode === 'aios-integrated') throw new HttpError(404, '本地用户管理未启用');
     const ctx = await requireAuth(rt, req);
     const tenantId = url.searchParams.get('tenantId') ?? ctx.tenantId;
     const target = await rt.store.getUser(tenantId, decodeURIComponent(adminUserActionMatch[1]!));
@@ -2026,6 +2136,7 @@ async function handle(
 
   const adminUserDeleteMatch = /^\/v1\/admin\/users\/([^/]+)$/.exec(path);
   if (method === 'DELETE' && adminUserDeleteMatch) {
+    if (rt.deploymentMode === 'aios-integrated') throw new HttpError(404, '本地用户管理未启用');
     const ctx = await requireAuth(rt, req);
     const tenantId = url.searchParams.get('tenantId') ?? ctx.tenantId;
     const target = await rt.store.getUser(tenantId, decodeURIComponent(adminUserDeleteMatch[1]!));

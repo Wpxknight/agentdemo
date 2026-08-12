@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { Msg } from '../llm/types.js';
 import { estimateTokens } from '../llm/context.js';
 import type { AuditEvent } from '../audit/sink.js';
@@ -26,15 +27,19 @@ import type {
   ScheduledTask,
   ScheduledTaskInput,
   ScheduledTaskPatch,
+  ScheduledExecution,
+  ManualFire,
   Store,
-  TaskRun,
   ToolExecutionRecord,
+  OidcExchangeCode,
+  OidcExchangeCodeClaim,
+  ConsumedOidcExchangeCode,
   UserCredentialRecord,
   UserPatch,
   UserWithSecret,
 } from './store.js';
 import { DEFAULT_SESSION_TITLE } from './store.js';
-import { nextRunAt } from '../scheduler/cron.js';
+import { assertValidCron, DEFAULT_SCHEDULER_TIMEZONE, nextRunAt } from '../scheduler/cron.js';
 import { MemoryRunStore } from '@aiop/pi-runtime';
 import type { StoredRun } from '@aiop/pi-runtime';
 import type {
@@ -59,6 +64,10 @@ interface SessionRow {
   updatedAt: Date;
 }
 
+function manualFireId(taskId: number, idempotencyKey: string): string {
+  return `manual:${taskId}:${createHash('sha256').update(idempotencyKey).digest('hex')}`;
+}
+
 function summarize(text: string | undefined, max = 48): string {
   if (!text) return '';
   const compact = text.replace(/\s+/g, ' ').trim();
@@ -76,10 +85,12 @@ export class MemoryStore implements Store {
   private sessions = new Map<string, SessionRow>();
   private audit: AuditEvent[] = [];
   private tasks = new Map<number, ScheduledTask>();
-  private runs: TaskRun[] = [];
+  private deletedTasks = new Map<number, ScheduledTask>();
+  private manualFires = new Map<string, ManualFire & { taskId: number; createdAt: Date; updatedAt: Date }>();
   private tenants = new Map<string, Tenant>();
   private users = new Map<string, UserWithSecret>(); // key: tenantId/username
   private credentials = new Map<string, UserCredentialRecord>(); // key: tenantId/userId/provider
+  private oidcExchangeCodes = new Map<string, OidcExchangeCode & { consumedAt?: Date }>();
   private llmSettings = new Map<string, LlmSettings>();
   private schedulerSettings = new Map<string, SchedulerSettings>();
   private sandboxSettings = new Map<string, SandboxSettingsRecord>();
@@ -88,9 +99,8 @@ export class MemoryStore implements Store {
   private agentRunBindings = new Map<string, AgentRunRecord>();
   private agentRunEvents: AgentRunEvent[] = [];
   private taskSeq = 0;
-  private runSeq = 0;
   private agentRunEventSeq = 0;
-  private userSeq = 0;
+  private userSeq = 0n;
 
   // 会话/消息按 (tenant, user) 双重隔离：不同用户的同名 sessionId 互不可见、互不冲突。
   private sessionKey(ctx: Pick<RequestContext, 'tenantId' | 'userId'>, sessionId: string): string {
@@ -550,6 +560,8 @@ export class MemoryStore implements Store {
   }
 
   async createScheduledTask(ctx: RequestContext, input: ScheduledTaskInput): Promise<ScheduledTask> {
+    const timezone = input.timezone ?? DEFAULT_SCHEDULER_TIMEZONE;
+    assertValidCron(input.cron, timezone);
     const id = ++this.taskSeq;
     const task: ScheduledTask = {
       id,
@@ -557,11 +569,12 @@ export class MemoryStore implements Store {
       userId: ctx.userId,
       sessionId: input.sessionId,
       cron: input.cron,
+      timezone,
       title: input.title ?? '',
       task: input.task,
       preApproved: input.preApproved ?? false,
       enabled: input.enabled ?? true,
-      nextRunAt: nextRunAt(input.cron, new Date()),
+      nextRunAt: nextRunAt(input.cron, new Date(), timezone),
     };
     this.tasks.set(id, task);
     return { ...task };
@@ -587,13 +600,17 @@ export class MemoryStore implements Store {
   async updateScheduledTask(ctx: RequestContext, id: number, patch: ScheduledTaskPatch): Promise<ScheduledTask | undefined> {
     const t = this.tasks.get(id);
     if (!t || !this.canSeeTask(ctx, t)) return undefined;
+    const timezone = patch.timezone ?? t.timezone;
+    const cron = patch.cron ?? t.cron;
+    assertValidCron(cron, timezone);
     if (patch.title !== undefined) t.title = patch.title;
     if (patch.task !== undefined) t.task = patch.task;
     if (patch.preApproved !== undefined) t.preApproved = patch.preApproved;
     if (patch.enabled !== undefined) t.enabled = patch.enabled;
-    if (patch.cron !== undefined && patch.cron !== t.cron) {
-      t.cron = patch.cron;
-      t.nextRunAt = nextRunAt(patch.cron, new Date());
+    if (patch.cron !== undefined) t.cron = patch.cron;
+    if (patch.timezone !== undefined) t.timezone = patch.timezone;
+    if (patch.cron !== undefined || patch.timezone !== undefined) {
+      t.nextRunAt = nextRunAt(cron, new Date(), timezone);
     }
     return { ...t };
   }
@@ -602,44 +619,48 @@ export class MemoryStore implements Store {
     const t = this.tasks.get(id);
     if (!t || !this.canSeeTask(ctx, t)) return false;
     this.tasks.delete(id);
-    this.runs = this.runs.filter((r) => r.taskId !== id);
+    this.deletedTasks.set(id, { ...t });
     return true;
   }
 
-  async setTaskEnabled(ctx: RequestContext, id: number, enabled: boolean): Promise<void> {
+  async setTaskEnabled(ctx: RequestContext, id: number, enabled: boolean): Promise<boolean> {
     const t = this.tasks.get(id);
-    if (t && this.canSeeTask(ctx, t)) t.enabled = enabled;
+    if (!t || !this.canSeeTask(ctx, t)) return false;
+    t.enabled = enabled;
+    return true;
   }
 
-  // 单进程内 JS 单线程：select→推进之间无 await，天然原子，并发 tick 不会重复领取。
-  async claimDueTasks(now: Date, limit: number): Promise<ScheduledTask[]> {
-    const due = [...this.tasks.values()]
-      .filter((t) => t.enabled && t.nextRunAt.getTime() <= now.getTime())
-      .sort((a, b) => a.nextRunAt.getTime() - b.nextRunAt.getTime())
-      .slice(0, limit);
-    const claimed = due.map((t) => ({ ...t }));
-    for (const t of due) {
-      t.lastRunAt = now;
-      t.nextRunAt = nextRunAt(t.cron, now);
-    }
-    return claimed;
+  async createManualFire(
+    ctx: RequestContext,
+    taskId: number,
+    idempotencyKey: string,
+    now = new Date(),
+  ): Promise<ManualFire | undefined> {
+    const task = this.tasks.get(taskId);
+    if (!task || !this.canSeeTask(ctx, task)) return undefined;
+    const key = `${ctx.tenantId}/${taskId}/${idempotencyKey}`;
+    const existing = this.manualFires.get(key);
+    if (existing) return { ...existing, replayed: true };
+    const fireId = manualFireId(taskId, idempotencyKey);
+    const fire: ManualFire & { taskId: number; createdAt: Date; updatedAt: Date } = {
+      fireId, runId: fireId, state: 'pending', replayed: false, taskId,
+      createdAt: new Date(now), updatedAt: new Date(now),
+    };
+    this.manualFires.set(key, fire);
+    return { ...fire };
   }
 
-  async recordTaskRun(run: TaskRun): Promise<void> {
-    this.runs.push({
-      ...run,
-      id: run.id ?? ++this.runSeq,
-      createdAt: run.createdAt ?? new Date(),
-    });
-  }
-
-  async listTaskRuns(ctx: RequestContext, taskId: number): Promise<TaskRun[]> {
-    const t = this.tasks.get(taskId);
-    if (!t || !this.canSeeTask(ctx, t)) return [];
-    return this.runs
-      .filter((r) => r.taskId === taskId)
-      .sort((a, b) => (b.id ?? 0) - (a.id ?? 0))
-      .map((r) => ({ ...r }));
+  async listScheduledExecutions(ctx: RequestContext, taskId: number): Promise<ScheduledExecution[]> {
+    const task = this.tasks.get(taskId) ?? this.deletedTasks.get(taskId);
+    if (!task || !this.canSeeTask(ctx, task)) return [];
+    return [...this.manualFires.values()]
+      .filter((fire) => fire.taskId === taskId)
+      .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime())
+      .map((fire) => ({
+        fireId: fire.fireId, runId: fire.runId, triggerKind: 'manual', fireTime: new Date(fire.createdAt),
+        fireState: fire.state, attempts: 0, createdAt: new Date(fire.createdAt), updatedAt: new Date(fire.updatedAt),
+        run: null,
+      }));
   }
 
   async createTenant(tenant: Tenant): Promise<void> {
@@ -651,11 +672,8 @@ export class MemoryStore implements Store {
   }
 
   async createUser(user: NewUser): Promise<User> {
-    // 确定性 id（便于测试与排查）；墓碑改名后重建同名用户时追加序号保证唯一。
-    const base = `u_${user.tenantId}_${user.username}`;
-    const taken = new Set([...this.users.values()].map((u) => u.id));
-    let id = base;
-    while (taken.has(id)) id = `${base}_${++this.userSeq}`;
+    // 模拟 MySQL BIGINT UNSIGNED AUTO_INCREMENT；字符串返回避免 JS 精度损失。
+    const id = (++this.userSeq).toString();
     const rec: UserWithSecret = {
       id,
       tenantId: user.tenantId,
@@ -739,6 +757,35 @@ export class MemoryStore implements Store {
     }
   }
 
+  private cleanupOidcExchangeCodes(now: Date, limit = 100): void {
+    let deleted = 0;
+    for (const [codeHash, record] of this.oidcExchangeCodes) {
+      if (deleted >= limit) break;
+      if (record.consumedAt || record.expiresAt.getTime() <= now.getTime()) {
+        this.oidcExchangeCodes.delete(codeHash);
+        deleted += 1;
+      }
+    }
+  }
+
+  async putOidcExchangeCode(record: OidcExchangeCode): Promise<void> {
+    this.cleanupOidcExchangeCodes(new Date());
+    if (this.oidcExchangeCodes.has(record.codeHash)) throw new Error('OIDC exchange code hash collision');
+    this.oidcExchangeCodes.set(record.codeHash, structuredClone(record));
+  }
+
+  async consumeOidcExchangeCode(claim: OidcExchangeCodeClaim): Promise<ConsumedOidcExchangeCode | undefined> {
+    this.cleanupOidcExchangeCodes(claim.now);
+    // JavaScript 的同步检查+删除在同一事件循环临界区内完成，供开发和单元测试使用。
+    const record = this.oidcExchangeCodes.get(claim.codeHash);
+    if (!record || record.expiresAt.getTime() <= claim.now.getTime()
+      || record.provider !== claim.provider
+      || (claim.tenantId !== undefined && record.tenantId !== claim.tenantId)
+      || record.browserNonceHash !== claim.browserNonceHash) return undefined;
+    this.oidcExchangeCodes.delete(claim.codeHash);
+    return { tenantId: record.tenantId, provider: record.provider, sessionToken: record.sessionToken };
+  }
+
   async getLlmSettings(ctx: Pick<RequestContext, 'tenantId'>): Promise<LlmSettings | undefined> {
     const settings = this.llmSettings.get(ctx.tenantId);
     return settings ? { ...settings } : undefined;
@@ -790,11 +837,12 @@ export class MemoryStore implements Store {
     this.sessions.clear();
     this.audit = [];
     this.tasks.clear();
-    this.runs = [];
-    this.runSeq = 0;
+    this.deletedTasks.clear();
+    this.manualFires.clear();
     this.tenants.clear();
     this.users.clear();
     this.credentials.clear();
+    this.oidcExchangeCodes.clear();
     this.llmSettings.clear();
     this.schedulerSettings.clear();
     this.sandboxSettings.clear();

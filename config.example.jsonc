@@ -28,6 +28,8 @@
     }
   },
   "defaultModel": "my-claude",
+  // standalone: Local/OIDC 独立部署；aios-integrated: AIOS 主身份源（禁止隐式回退 Local）。
+  "deploymentMode": "standalone",
   // 工具权限规则（叠加在运维策略之上，覆盖所有工具）。语法：`工具名` 或 `工具名(子模式)`。
   // deny > ask > allow；deny 且不带子模式的工具在发给模型前即被剥离。
   // 子模式对 kubectl 是 `<verb>` / `<verb>:<资源名>`，对 sbx__run_command 是命令文本（shell 通配 * ?）。
@@ -57,16 +59,17 @@
     "dir": "./skills",
     // "sandboxEnv": { "AIOS_BASE_URL": "http://10.10.72.20:30001/paas-web", "AIOS_CLIENT_ID": "..." }
   },
-  // 认证：local（默认，用户名口令）或 oidc（SSO）。HTTP 服务接入后生效
+  // 认证：standalone 使用 local 或 oidc；aios-integrated 必须使用 aios。HTTP 服务接入后生效
   "auth": {
     "provider": "local"
-    // "provider": "oidc",
+    // To use OIDC, replace the provider value above and enable the oidc block below.
     // "jwtTtl": "12h",
     // "oidc": {
     //   "issuer": "https://keycloak.example.com/realms/aiop",
     //   "clientId": "aiop",
     //   "clientSecret": "${OIDC_CLIENT_SECRET}",
-    //   "redirectUri": "https://aiop.example.com/auth/callback",
+    //   "redirectUri": "https://aiop.example.com/auth/callback", // 同时定义 API/Web public origin
+    //   "webCallbackUrl": "https://aiop.example.com/chat",       // 可选；必须与 redirectUri 同源
     //   "scopes": ["openid", "profile", "email"],
     //   "mapping": {
     //     "tenantClaim": "tenant", "defaultTenant": "default",
@@ -76,15 +79,15 @@
     //     "defaultRole": "user"
     //   }
     // },
-    // AIOS 嵌入登录（token exchange，与 local/oidc 并存；配置即启用）：
-    // 宿主页 postMessage 传 AIOS token，aiop 服务端验证后 JIT 建号并签发自己的 JWT。
+    // AIOS direct identity 仅用于 deploymentMode=aios-integrated，并需把 provider 改成 aios。
+    // 宿主传 AIOS token，aiop 服务端验证后直接使用可信 accountId，不创建本地 users 影子行。
     // "aios": {
     //   "verify": "userinfo",                                  // userinfo=回调校验；jwks=本地验签
     //   "userinfoUrl": "http://aios.example.com/paas-web/upmstreeapi/userinfo",
     //   "systemId": "1",
-    //   "tenantId": "default",                                  // AIOS 用户落入的租户
+    //   "tenantId": "default",                                  // fields.tenantId 未配置时使用固定租户
     //   "allowedParentOrigins": ["https://aios.example.com"],   // CSP frame-ancestors + postMessage 白名单
-    //   "fields": { "userId": "userId", "displayName": "displayName", "roles": "roles" },
+    //   "fields": { "userId": "accountId", "tenantId": "tenantId", "status": "status", "displayName": "displayName", "roles": "roles" },
     //   "adminRoles": ["admin"],                                // 命中 → tenant_admin；其余 user
     //   "credentialTtlMs": 43200000                             // 凭据缓存兜底 TTL（12h）
     // }

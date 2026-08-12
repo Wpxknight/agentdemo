@@ -6,7 +6,9 @@ export function writeStorage(key: string, value: string): void {
   if (typeof localStorage !== 'undefined') localStorage.setItem(key, value);
 }
 
-export function createApi(token: string, onUnauthorized: () => void) {
+import { apiUrl, type WebHostAdapter } from './host-adapter';
+
+export function createApi(host: WebHostAdapter, token: string, onUnauthorized: () => void) {
   async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     if (!token) {
       onUnauthorized();
@@ -14,7 +16,7 @@ export function createApi(token: string, onUnauthorized: () => void) {
     }
     const headers = new Headers(init.headers);
     headers.set('authorization', `Bearer ${token}`);
-    const response = await fetch(path, { ...init, headers });
+    const response = await fetch(apiUrl(host, path), { ...init, headers });
     if (response.status === 401) {
       onUnauthorized();
       throw new Error('未认证或登录已过期');
@@ -28,9 +30,9 @@ export function createApi(token: string, onUnauthorized: () => void) {
 
   return {
     get: <T>(path: string) => request<T>(path),
-    post: <T>(path: string, body: unknown = {}) => request<T>(path, {
+    post: <T>(path: string, body: unknown = {}, headers: HeadersInit = {}) => request<T>(path, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...headers },
       body: JSON.stringify(body),
     }),
     patch: <T>(path: string, body: unknown = {}) => request<T>(path, {

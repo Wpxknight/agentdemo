@@ -8,6 +8,14 @@ import type {
   ScheduledRunLookup,
 } from './domain.js';
 import type { SchedulerStore } from './store.js';
+import type { SchedulerObserver } from './observation.js';
+
+export class TerminalScheduledFireError extends Error {
+  constructor(readonly code: string, message = code) {
+    super(message);
+    this.name = 'TerminalScheduledFireError';
+  }
+}
 
 export interface SchedulerRunnerOptions {
   store: SchedulerStore;
@@ -16,7 +24,9 @@ export interface SchedulerRunnerOptions {
   workerId: string;
   leaseMs?: number;
   retryDelayMs?: number;
+  observer?: SchedulerObserver;
   prepareRun?(fire: ClaimedScheduledFire, now: Date): Promise<Pick<ScheduledRunInput, 'limits' | 'signal'>>;
+  completed?(fire: ScheduledRunInput, result: AgentRunResult): Promise<void>;
 }
 
 export function createRunDispatcher(
@@ -37,7 +47,7 @@ export function createRunDispatcher(
           signal: input.signal,
         });
       } catch (error) {
-        // A worker may die after Run creation but before marking the fire started.
+        // A worker may die after Run creation but before marking the fire complete.
         // The stable fire ID is the Run ID. Compensate only after an explicit lookup proves
         // that the deterministic Run exists; exception text is not a domain contract.
         const existing = await lookup?.findScheduledRun(input);
@@ -64,9 +74,15 @@ export class SchedulerRunner {
 
   async tick(now: Date, limit: number, signal?: AbortSignal): Promise<number> {
     if (signal?.aborted) return 0;
+    const tickStartedAt = Date.now();
     await this.options.store.recoverExpired(now);
     if (signal?.aborted) return 0;
     const bound = await this.options.store.listBound({ now, limit });
+    const boundConsumed = bound.length;
+    this.observe({ name: 'state_count', value: bound.length, state: 'bound' });
+    for (const fire of bound) {
+      this.observe({ name: 'long_stuck', value: Math.max(0, now.getTime() - fire.fireTime.getTime()), fireId: fire.fireId, state: 'bound' });
+    }
     let recovered = 0;
     for (const fire of bound) {
       if (signal?.aborted) return recovered;
@@ -83,8 +99,17 @@ export class SchedulerRunner {
         recovered += 1;
         continue;
       }
-      if (inspection.kind === 'active') continue;
+      if (inspection.kind === 'active' || inspection.kind === 'waiting') {
+        await this.options.store.deferBound({
+          fireId: fire.fireId,
+          claimToken: fire.claimToken,
+          retryAt: new Date(now.getTime() + this.retryDelayMs),
+          error: `durable Run remains ${inspection.kind}`,
+        }).catch(() => undefined);
+        continue;
+      }
       if (inspection.kind === 'terminal') {
+        let completed = true;
         await this.options.store.completeFire({
           fireId: fire.fireId,
           claimToken: fire.claimToken,
@@ -92,6 +117,7 @@ export class SchedulerRunner {
           result: inspection.result,
           completedAt: now,
         }).catch(async (error) => {
+          completed = false;
           await this.options.store.deferBound({
             fireId: fire.fireId,
             claimToken: fire.claimToken,
@@ -99,6 +125,7 @@ export class SchedulerRunner {
             error: String(error),
           }).catch(() => undefined);
         });
+        if (completed) await this.options.completed?.(fire, inspection.result);
         recovered += 1;
         continue;
       }
@@ -125,6 +152,16 @@ export class SchedulerRunner {
         recovered += 1;
         continue;
       }
+      if (result.status === 'waiting') {
+        await this.options.store.releaseBound({
+          fireId: claimed.fireId,
+          claimToken: claimed.claimToken,
+          retryAt: new Date(now.getTime() + this.retryDelayMs),
+          error: 'durable Run remains waiting',
+        }).catch(() => undefined);
+        recovered += 1;
+        continue;
+      }
       try {
         await this.options.store.completeFire({
           fireId: claimed.fireId,
@@ -133,6 +170,7 @@ export class SchedulerRunner {
           result,
           completedAt: now,
         });
+        await this.options.completed?.(claimed, result);
       } catch (error) {
         await this.options.store.releaseBound({
           fireId: claimed.fireId,
@@ -144,14 +182,18 @@ export class SchedulerRunner {
       recovered += 1;
     }
     if (signal?.aborted) return recovered;
-    const remaining = Math.max(0, limit - recovered);
+    const remaining = Math.max(0, limit - boundConsumed);
     const fires = await this.options.store.claimDue({
       now,
       limit: remaining,
       workerId: this.options.workerId,
       leaseMs: this.leaseMs,
     });
+    this.observe({ name: 'backlog', value: fires.length });
     for (const fire of fires) {
+      const startedAt = Date.now();
+      this.observe({ name: 'due_lag_ms', value: Math.max(0, now.getTime() - fire.fireTime.getTime()), fireId: fire.fireId });
+      this.observe({ name: 'state_count', value: 1, fireId: fire.fireId, state: 'claimed' });
       let bound = false;
       try {
         if (signal?.aborted) throw signal.reason ?? new Error('scheduler stopped');
@@ -177,23 +219,57 @@ export class SchedulerRunner {
           bound = true;
         });
         if (signal?.aborted) throw signal.reason ?? new Error('scheduler stopped');
-        await this.options.store.completeFire({
-          fireId: fire.fireId, claimToken: fire.claimToken, runId, result, completedAt: now,
-        });
-      } catch (error) {
-        const retry = {
-          fireId: fire.fireId,
-          claimToken: fire.claimToken,
-          retryAt: new Date(now.getTime() + this.retryDelayMs),
-          error: String(error),
-        };
-        if (bound) {
-          await this.options.store.deferBound(retry).catch(() => undefined);
+        if (result.status === 'waiting') {
+          await this.options.store.deferBound({
+            fireId: fire.fireId,
+            claimToken: fire.claimToken,
+            retryAt: new Date(now.getTime() + this.retryDelayMs),
+            error: 'durable Run remains waiting',
+          });
         } else {
-          await this.options.store.releaseFire(retry).catch(() => undefined);
+          await this.options.store.completeFire({
+            fireId: fire.fireId, claimToken: fire.claimToken, runId, result, completedAt: now,
+          });
+          this.observe({ name: 'completion', value: 1, fireId: fire.fireId, state: 'completed' });
+          await this.options.completed?.(fire, result);
+        }
+      } catch (error) {
+        if (error instanceof TerminalScheduledFireError && !bound) {
+          const result: AgentRunResult = {
+            runId: fire.fireId,
+            status: 'failed',
+            usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+            error: { code: 'MODEL_PROVIDER_ERROR', message: error.code, retryable: false },
+          };
+          await this.options.store.bindRun({
+            fireId: fire.fireId, claimToken: fire.claimToken, runId: fire.fireId, boundAt: now,
+          });
+          await this.options.store.completeFire({
+            fireId: fire.fireId, claimToken: fire.claimToken, runId: fire.fireId, result, completedAt: now,
+          });
+          this.observe({ name: 'completion', value: 1, fireId: fire.fireId, state: 'completed' });
+        } else {
+          this.observe({ name: 'retry', value: 1, fireId: fire.fireId, state: 'failed' });
+          const retry = {
+            fireId: fire.fireId,
+            claimToken: fire.claimToken,
+            retryAt: new Date(now.getTime() + this.retryDelayMs),
+            error: String(error),
+          };
+          if (bound) {
+            await this.options.store.deferBound(retry).catch(() => undefined);
+          } else {
+            await this.options.store.releaseFire(retry).catch(() => undefined);
+          }
         }
       }
+      this.observe({ name: 'duration_ms', value: Math.max(0, Date.now() - startedAt), fireId: fire.fireId });
     }
+    this.observe({ name: 'duration_ms', value: Math.max(0, Date.now() - tickStartedAt) });
     return recovered + fires.length;
+  }
+
+  private observe(observation: Parameters<SchedulerObserver['record']>[0]): void {
+    this.options.observer?.record(observation);
   }
 }

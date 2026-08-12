@@ -1,0 +1,8 @@
+# 复用已验证的本地 nginx 运行时层；web/dist 必须由调用方预先构建并校验。
+FROM aiop-web:138931c
+
+# 走 templates 目录：入口脚本 envsubst 后落到 conf.d（AIOP_FRAME_ANCESTORS 注入 CSP 嵌入白名单）
+COPY web/nginx.conf /etc/nginx/templates/default.conf.template
+COPY web/dist /usr/share/nginx/html
+
+EXPOSE 8080

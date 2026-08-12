@@ -32,6 +32,6 @@ describe('Scheduler runtime package', () => {
     expect(startScheduledRun).toHaveBeenCalledWith(expect.objectContaining({
       sessionId: 'session-a', input: [{ role: 'user', text: 'diagnose' }],
     }), expect.any(Function));
-    expect((await store.listFires())[0]).toMatchObject({ state: 'started', runId: 'run-a' });
+    expect((await store.listFires())[0]).toMatchObject({ state: 'completed', runId: 'run-a' });
   });
 });

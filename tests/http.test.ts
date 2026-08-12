@@ -367,7 +367,7 @@ describe('HTTP server', () => {
     expect(body).toContain('event: done');
 
     // 消息已落库（user + assistant）
-    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: '1', role: 'platform_admin' as const };
     const msgs = await store.listMessages(ctx, 'sess-1');
     expect(msgs.map((m) => m.role)).toContain('assistant');
   });
@@ -464,7 +464,7 @@ describe('HTTP server', () => {
       expect(body).toContain('event: thinking_delta');
       expect(body).toContain('event: text_delta');
 
-      const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+      const ctx = { tenantId: 'default', userId: '1', role: 'platform_admin' as const };
       const msgs = await localStore.listMessages(ctx, 'think-sess');
       const assistant = msgs.find((m) => m.role === 'assistant');
       expect(assistant?.thinking).toBe('先分析上下文。');
@@ -480,7 +480,7 @@ describe('HTTP server', () => {
       headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
       body: JSON.stringify({ task: 'again', sessionId: 'sess-1' }),
     }).then((r) => r.text());
-    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: '1', role: 'platform_admin' as const };
     const msgs = await store.listMessages(ctx, 'sess-1');
     // 两轮：user/assistant ×2
     expect(msgs.filter((m) => m.role === 'user').length).toBe(2);
@@ -492,7 +492,7 @@ describe('HTTP server', () => {
     const auth = new LocalAuthProvider({ store: localStore, secret: 'context-secret' });
     await auth.createUser('default', 'admin', 'pw', 'platform_admin');
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
-    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: '1', role: 'platform_admin' as const };
     await localStore.appendMessage(ctx, 'ctx-sess', { role: 'user', text: '上一轮问题' });
     await localStore.appendMessage(ctx, 'ctx-sess', { role: 'assistant', text: '上一轮回答' });
 
@@ -547,7 +547,7 @@ describe('HTTP server', () => {
     const auth = new LocalAuthProvider({ store: localStore, secret: 'terminate-secret' });
     await auth.createUser('default', 'admin', 'pw', 'platform_admin');
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
-    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: '1', role: 'platform_admin' as const };
     await localStore.appendMessage(ctx, 'term-sess', { role: 'user', text: '保留的问题' });
     await localStore.appendMessage(ctx, 'term-sess', { role: 'assistant', text: '保留的回答' });
 
@@ -809,7 +809,7 @@ describe('HTTP server', () => {
       expect(run.status).toBe(200);
       expect(await run.text()).toContain('event: error');
 
-      const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+      const ctx = { tenantId: 'default', userId: '1', role: 'platform_admin' as const };
       const messages = await localStore.listMessages(ctx, 'failed-sess');
       expect(messages.at(-2)).toMatchObject({ role: 'user', text: '失败任务' });
       expect(messages.at(-1)).toMatchObject({
@@ -825,7 +825,7 @@ describe('HTTP server', () => {
   });
 
   it('paginates and deletes chat sessions', async () => {
-    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: '1', role: 'platform_admin' as const };
     for (let i = 0; i < 3; i++) {
       await store.appendMessage(ctx, `paged-${i}`, { role: 'user', text: `分页会话 ${i}` });
       await store.appendMessage(ctx, `paged-${i}`, { role: 'assistant', text: `回答 ${i}` });
@@ -888,7 +888,7 @@ describe('HTTP server', () => {
     expect(r.status).toBe(200);
     expect(await r.text()).toContain('event: done');
 
-    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: '1', role: 'platform_admin' as const };
     const msgs = await store.listMessages(ctx, 'sess-upload');
     expect(msgs.find((m) => m.role === 'user')?.text).toContain('[上传附件]');
     expect(msgs.find((m) => m.role === 'user')?.text).toContain('error.log');
@@ -914,7 +914,7 @@ describe('HTTP server', () => {
     expect(r.status).toBe(200);
     expect(await r.text()).toContain('event: done');
 
-    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: '1', role: 'platform_admin' as const };
     const msgs = await store.listMessages(ctx, 'sess-upload-img');
     const user = msgs.find((m) => m.role === 'user');
     // 图像本体进 contentBlocks（受 keep-last-K / 硬裁剪治理），text 只留元信息
@@ -941,7 +941,7 @@ describe('HTTP server', () => {
     const listedBody = await listed.json() as { sessions: Array<{ sessionId: string; title: string }> };
     expect(listedBody.sessions).toContainEqual(expect.objectContaining({ sessionId: 'empty-http', title: '新会话' }));
 
-    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: '1', role: 'platform_admin' as const };
     await store.appendMessage(ctx, 'context-http', { role: 'user', text: '1234567890' });
     await store.appendMessage(ctx, 'context-http', { role: 'assistant', text: 'abcd' });
     const context = await fetch(`${base}/v1/sessions/context-http/context`, {
@@ -977,7 +977,7 @@ describe('HTTP server', () => {
       body: JSON.stringify({ tenantId: 'default', username: 'admin', password: 'pw' }),
     });
     const authToken = ((await login.json()) as { token: string }).token;
-    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: '1', role: 'platform_admin' as const };
     await store.createSession(ctx, { sessionId: 'usage-http', title: '用量会话' });
     await store.record({ kind: 'usage', action: 'agent', tenantId: 'default', sessionId: 'usage-http', detail: { inputTokens: 100, outputTokens: 25, cacheReadTokens: 40 } });
     await store.record({ kind: 'usage', action: 'agent', tenantId: 'default', sessionId: 'usage-http', detail: { inputTokens: 50, outputTokens: 10 } });
@@ -1010,7 +1010,7 @@ describe('HTTP server', () => {
     expect(appended.status).toBe(200);
     expect(await appended.json()).toEqual({ ok: true, sessionId: 'append-idle', queued: false });
 
-    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: '1', role: 'platform_admin' as const };
     const msgs = await store.listMessages(ctx, 'append-idle');
     expect(msgs).toEqual([
       expect.objectContaining({ role: 'user', text: expect.stringContaining('补充一条信息') }),
@@ -1199,7 +1199,7 @@ describe('HTTP server', () => {
     const auth = new LocalAuthProvider({ store: localStore, secret: 'durable-result-secret' });
     await auth.createUser('default', 'admin', 'pw', 'platform_admin');
     const adminToken = (await auth.login('default', 'admin', 'pw'))!;
-    const ownerCtx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+    const ownerCtx = { tenantId: 'default', userId: '1', role: 'platform_admin' as const };
     for (const sessionId of ['result-failed', 'result-cancelled']) {
       await localStore.appendMessage(ownerCtx, sessionId, { role: 'user', text: 'prior question' });
       await localStore.appendMessage(ownerCtx, sessionId, { role: 'assistant', text: 'prior answer', durationMs: 77 });
@@ -2443,7 +2443,7 @@ describe('HTTP server 会话互斥与自动压缩', () => {
       },
     };
     const { srv, url, headers, localStore } = await makeServer(chatModel);
-    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: '1', role: 'platform_admin' as const };
     // 默认 200k 窗口 → 预算 152k → 触发线 ≈129k tokens；30 对消息 ≈180k tokens 超线
     for (let i = 0; i < 30; i++) {
       await localStore.appendMessage(ctx, 'compact-sess', { role: 'user', text: `问题${i} ${'x'.repeat(24_000)}` });
@@ -2761,6 +2761,46 @@ describe('HTTP server 定时任务管理', () => {
     return ((await r.json()) as { task: { id: number } }).task.id;
   }
 
+  it('rejects an invalid cron before creating a task', async () => {
+    const token = await adminToken();
+    const response = await fetch(`${base}/v1/schedule`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ cron: 'nope', task: '不会写入' }),
+    });
+
+    expect(response.status).toBe(400);
+    const tasks = await store.listScheduledTasks({ tenantId: 'default', userId: '1', role: 'platform_admin' });
+    expect(tasks.some((task) => task.task === '不会写入')).toBe(false);
+  });
+
+  it('persists a task IANA timezone and rejects invalid values', async () => {
+    const token = await adminToken();
+    const invalid = await fetch(`${base}/v1/schedule`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ cron: '0 3 * * *', timezone: 'Not/A_Zone', task: '巡检测试' }),
+    });
+    expect(invalid.status).toBe(400);
+
+    const created = await fetch(`${base}/v1/schedule`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ cron: '0 3 * * *', timezone: 'America/New_York', task: '巡检测试' }),
+    });
+    expect(created.status).toBe(201);
+    const task = (await created.json()) as { task: { id: number; timezone: string } };
+    expect(task.task.timezone).toBe('America/New_York');
+
+    const updated = await fetch(`${base}/v1/schedule/${task.task.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ timezone: 'Asia/Shanghai' }),
+    });
+    expect(updated.status).toBe(200);
+    expect(await updated.json()).toMatchObject({ task: { timezone: 'Asia/Shanghai' } });
+  });
+
   it('PATCH updates fields, validates cron, recomputes next run', async () => {
     const token = await adminToken();
     const id = await createTask(token);
@@ -2787,10 +2827,11 @@ describe('HTTP server 定时任务管理', () => {
     expect(missing.status).toBe(404);
   });
 
-  it('DELETE removes task and its runs; 404 afterwards', async () => {
+  it('DELETE hides a task while retaining its execution history', async () => {
     const token = await adminToken();
     const id = await createTask(token);
-    await store.recordTaskRun({ taskId: id, status: 'success', detail: 'ok' });
+    const ctx = { tenantId: 'default', userId: '1', role: 'platform_admin' as const };
+    await store.createManualFire(ctx, id, 'deleted-history');
 
     const del = await fetch(`${base}/v1/schedule/${id}`, {
       method: 'DELETE',
@@ -2801,7 +2842,13 @@ describe('HTTP server 定时任务管理', () => {
     const listed = await fetch(`${base}/v1/schedule`, { headers: { authorization: `Bearer ${token}` } });
     const tasks = ((await listed.json()) as { tasks: Array<{ id: number }> }).tasks;
     expect(tasks.some((t) => t.id === id)).toBe(false);
-    expect(await store.listTaskRuns({ tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' }, id)).toHaveLength(0);
+    expect(await store.listScheduledExecutions(ctx, id)).toHaveLength(1);
+
+    const run = await fetch(`${base}/v1/schedule/${id}/run`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'idempotency-key': 'deleted-task' },
+    });
+    expect(run.status).toBe(404);
 
     const again = await fetch(`${base}/v1/schedule/${id}`, {
       method: 'DELETE',
@@ -2810,51 +2857,50 @@ describe('HTTP server 定时任务管理', () => {
     expect(again.status).toBe(404);
   });
 
-  it('POST /run triggers an immediate run recorded in task_runs', async () => {
+  it('returns 404 when changing a missing task state', async () => {
     const token = await adminToken();
-    const id = await createTask(token);
-    const originalDurableRunRuntime = runtime.durableRunRuntime;
-    runtime.durableRunRuntime = {
-      run: async (input: { runId?: string }) => {
-        const runId = input.runId ?? 'scheduled-run';
-        return {
-          runId,
-          status: 'running',
-          events: { async *[Symbol.asyncIterator]() {} },
-          result: async () => ({
-            runId,
-            status: 'succeeded',
-            usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
-          }),
-        };
-      },
-    } as unknown as DurableRunRuntime;
-
-    try {
-      const run = await fetch(`${base}/v1/schedule/${id}/run`, {
+    for (const action of ['enable', 'disable']) {
+      const response = await fetch(`${base}/v1/schedule/99999/${action}`, {
         method: 'POST',
         headers: { authorization: `Bearer ${token}` },
       });
-      expect(run.status).toBe(202);
-      expect(await run.json()).toMatchObject({ ok: true, taskId: id, started: true });
-
-      // 异步执行：轮询 task_runs 直到出现结果
-      let runs: Array<{ status: string; detail?: string }> = [];
-      for (let i = 0; i < 50 && !runs.length; i++) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        const r = await fetch(`${base}/v1/schedule/${id}/runs`, { headers: { authorization: `Bearer ${token}` } });
-        runs = ((await r.json()) as { runs: typeof runs }).runs;
-      }
-      expect(runs.length).toBeGreaterThan(0);
-      expect(runs[0]!.status).toBe('success');
-      expect(runs[0]!.detail).toBeTruthy();
-    } finally {
-      runtime.durableRunRuntime = originalDurableRunRuntime;
+      expect(response.status).toBe(404);
     }
+  });
+
+  it('POST /run persists an idempotent manual Fire for scheduler execution', async () => {
+    const token = await adminToken();
+    const id = await createTask(token);
+    const wake = vi.fn();
+    runtime.requestSchedulerTick = wake;
+    const headers = { authorization: `Bearer ${token}`, 'idempotency-key': 'manual-run-1' };
+
+    const missingKey = await fetch(`${base}/v1/schedule/${id}/run`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}` },
+    });
+    expect(missingKey.status).toBe(400);
+
+    const first = await fetch(`${base}/v1/schedule/${id}/run`, { method: 'POST', headers });
+    expect(first.status).toBe(202);
+    const created = await first.json() as { ok: boolean; taskId: number; fireId: string; runId: string; state: string; replayed: boolean };
+    expect(created).toMatchObject({ ok: true, taskId: id, state: 'pending', replayed: false });
+    expect(created.runId).toBe(created.fireId);
+    expect(wake).toHaveBeenCalledOnce();
+
+    const replay = await fetch(`${base}/v1/schedule/${id}/run`, { method: 'POST', headers });
+    expect(replay.status).toBe(202);
+    expect(await replay.json()).toMatchObject({ fireId: created.fireId, runId: created.runId, replayed: true });
+    expect(wake).toHaveBeenCalledOnce();
+
+    const history = await fetch(`${base}/v1/schedule/${id}/runs`, { headers: { authorization: `Bearer ${token}` } });
+    expect(await history.json()).toMatchObject({
+      runs: [expect.objectContaining({
+        fireId: created.fireId, runId: created.runId, triggerKind: 'manual', fireState: 'pending', run: null,
+      })],
+    });
 
     const missing = await fetch(`${base}/v1/schedule/99999/run`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${token}` },
+      method: 'POST', headers,
     });
     expect(missing.status).toBe(404);
   });

@@ -20,8 +20,9 @@ describe('React frontend stack', () => {
   it('uses React, Vite, Tailwind, and shadcn project wiring under web/', async () => {
     const pkg = JSON.parse(await readFile('web/package.json', 'utf8')) as {
       scripts: Record<string, string>;
-      dependencies: Record<string, string>;
+      dependencies?: Record<string, string>;
       devDependencies: Record<string, string>;
+      peerDependencies: Record<string, string>;
     };
     const vite = await readFile('web/vite.config.ts', 'utf8');
     const components = await readFile('web/components.json', 'utf8');
@@ -29,10 +30,10 @@ describe('React frontend stack', () => {
     const css = await readFile('web/src/index.css', 'utf8');
 
     expect(pkg.scripts).toMatchObject({ dev: 'vite', build: 'tsc -b && vite build', preview: 'vite preview' });
-    expect(pkg.dependencies).toHaveProperty('react');
-    expect(pkg.dependencies).toHaveProperty('react-dom');
-    expect(pkg.dependencies).toHaveProperty('lucide-react');
-    expect(pkg.dependencies).toHaveProperty('class-variance-authority');
+    expect(pkg.peerDependencies).toHaveProperty('react');
+    expect(pkg.peerDependencies).toHaveProperty('react-dom');
+    expect(pkg.devDependencies).toHaveProperty('lucide-react');
+    expect(pkg.devDependencies).toHaveProperty('class-variance-authority');
     expect(pkg.devDependencies).toHaveProperty('@vitejs/plugin-react');
     expect(pkg.devDependencies).toHaveProperty('tailwindcss');
     expect(vite).toContain('@vitejs/plugin-react');
@@ -40,6 +41,24 @@ describe('React frontend stack', () => {
     expect(components).toContain('"ui": "@/components/ui"');
     expect(main).toContain('createRoot');
     expect(css).toContain('@tailwind base');
+  });
+
+  it('packages the private Web Core with built chunks, assets, metadata, and declarations', async () => {
+    const pkg = JSON.parse(await readFile('web/package.json', 'utf8')) as {
+      private: boolean; files: string[]; scripts: Record<string, string>; exports: Record<string, unknown>;
+    };
+    const makefile = await readFile('Makefile', 'utf8');
+    const core = await readFile('web/src/web-core.tsx', 'utf8');
+
+    expect(pkg.private).toBe(true);
+    expect(pkg.files).toEqual(['dist-lib']);
+    expect(pkg.scripts['package:lib']).toContain('npm pack --pack-destination ../dist');
+    expect(pkg.exports['./style.css']).toBe('./dist-lib/style.css');
+    expect(core).toContain("import './index.css'");
+    expect(makefile).toContain('verify-web-core-package: package-web-core');
+    expect(makefile).toContain("tar -tzf \"$$archive\"");
+    expect(makefile).toMatch(/image: verify-web-core-package/);
+    expect(makefile).toMatch(/image-check: verify-web-core-package/);
   });
 
   it('keeps the approved navigation model in React source', async () => {
@@ -71,6 +90,24 @@ describe('React frontend stack', () => {
     expect(app).toContain('pageFromUrl(window.location.pathname)');
     expect(app).toContain("window.addEventListener('popstate', handlePopState)");
     expect(app).toContain("window.history.pushState({}, '', pageUrl(next))");
+  });
+
+  it('uses the backend product contract for pending skill imports', async () => {
+    const types = await readFile('web/src/types.ts', 'utf8');
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(types).toMatch(/interface SkillsImportBody\s*{[\s\S]*product: ToolSummary;[\s\S]*pendingReview: boolean;/);
+    expect(types).not.toContain('skill: ToolSummary;');
+    expect(app).toContain('body.product.name');
+    expect(app).toContain('等待管理员审核');
+    expect(app).not.toContain('setSelectedName(body.product.name)');
+  });
+
+  it('shows the persisted timezone in the schedule detail summary', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(app).toContain("{selectedTask.timezone || 'UTC'}");
+    expect(app).not.toContain('{humanizeCron(selectedTask.cron)}，UTC）');
   });
 });
 
@@ -126,14 +163,14 @@ describe('frontend API wiring', () => {
     const css = await readFile('web/src/index.css', 'utf8');
     const types = await readFile('web/src/types.ts', 'utf8');
 
-    expect(types).toContain('export interface TaskRun');
+    expect(types).toContain('export interface ScheduledExecution');
     expect(types).toContain('export interface ScheduleRunsBody');
-    expect(app).toContain('useState<TaskRun[]>([])');
+    expect(app).toContain('useState<ScheduledExecution[]>([])');
     expect(app).toContain('<SchedulePage tasks={tasks} api={api} onChanged={() => void loadPageData(\'schedule\')} onRequestConfirm={requestConfirmDialog} />');
     expect(app).toContain('selectedTaskId');
     expect(app).toContain('selectedRunId');
     expect(app).toContain('setSelectedTaskId(task.id)');
-    expect(app).toContain('setSelectedRunId(run.id)');
+    expect(app).toContain('setSelectedRunId(run.fireId)');
     expect(app).toContain('className="schedule-task-cell"');
     expect(app).toContain('<TabsTrigger value="runs">执行记录</TabsTrigger>');
     expect(app).toContain('title="执行记录详情"');
@@ -203,6 +240,18 @@ describe('frontend API wiring', () => {
     expect(app).toContain("window.location.pathname !== '/login'");
     expect(app).toContain('id="login-form"');
     expect(app).not.toContain('data-action="login"');
+  });
+
+  it('distinguishes standalone OIDC redirect from integrated host credential waiting', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const standalone = await readFile('web/src/standalone-host.ts', 'utf8');
+    const contract = await readFile('web/src/host-adapter.ts', 'utf8');
+
+    expect(standalone).toContain("if (host.authProvider === 'oidc') await host.startOidcLogin?.()");
+    expect(app).toContain("host.authProvider === 'local'");
+    expect(app).toContain("mode={host.deploymentMode === 'standalone' ? 'redirect' : 'waiting'}");
+    expect(app).toContain("mode === 'redirect' ? '正在跳转到统一登录...' : '等待宿主平台提供授权凭据'");
+    expect(contract).toContain('onUnauthorized(): void | Promise<void>');
   });
 
   it('supports dragging the right preview panel wider', async () => {
@@ -794,8 +843,9 @@ describe('frontend API wiring', () => {
   it('uses the refreshed AIOP logo for assistant identity and concise running copy', async () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
 
-    expect(app).toContain("const logoUrl = '/assets/logo.jpg'");
-    expect(app).toContain('const aiAvatarUrl = logoUrl');
+    expect(app).toContain("new URL('./assets/logo.jpg', import.meta.url).href");
+    expect(app).toContain('aiAvatarUrl: logoUrl');
+    expect(app).not.toContain("'/assets/");
     expect(app).toContain('<em>执行中</em>');
     expect(app).toContain('aria-label="执行中"');
     expect(app).not.toContain("const aiAvatarUrl = '/assets/ai-avatar.jpg'");
@@ -803,13 +853,13 @@ describe('frontend API wiring', () => {
   });
 
   it('renders assistant replies with Markdown, GFM, and syntax highlighting only for assistant messages', async () => {
-    const pkg = JSON.parse(await readFile('web/package.json', 'utf8')) as { dependencies: Record<string, string> };
+    const pkg = JSON.parse(await readFile('web/package.json', 'utf8')) as { devDependencies: Record<string, string> };
     const app = await readFile('web/src/App.tsx', 'utf8');
 
-    expect(pkg.dependencies).toHaveProperty('react-markdown');
-    expect(pkg.dependencies).toHaveProperty('remark-gfm');
-    expect(pkg.dependencies).toHaveProperty('rehype-highlight');
-    expect(pkg.dependencies).toHaveProperty('highlight.js');
+    expect(pkg.devDependencies).toHaveProperty('react-markdown');
+    expect(pkg.devDependencies).toHaveProperty('remark-gfm');
+    expect(pkg.devDependencies).toHaveProperty('rehype-highlight');
+    expect(pkg.devDependencies).toHaveProperty('highlight.js');
     expect(app).toContain("import ReactMarkdown, { type Components } from 'react-markdown'");
     expect(app).toContain("import remarkGfm from 'remark-gfm'");
     expect(app).toContain("import rehypeHighlight from 'rehype-highlight'");
@@ -1066,21 +1116,18 @@ describe('frontend data APIs', () => {
     const auth = new LocalAuthProvider({ store, secret: 'ui-secret' });
     await auth.createUser('default', 'admin', 'pw', 'platform_admin');
     const token = (await auth.login('default', 'admin', 'pw'))!;
-    const ctx = { tenantId: 'default', userId: 'u_default_admin', role: 'platform_admin' as const };
+    const ctx = { tenantId: 'default', userId: '1', role: 'platform_admin' as const };
     await store.appendMessage(ctx, 'sess-a', { role: 'user', text: '检查 Pod 异常' });
     await store.appendMessage(ctx, 'sess-a', { role: 'assistant', text: '发现 OOMKilled' });
-    await store.createScheduledTask(ctx, {
+    const scheduledTask = await store.createScheduledTask(ctx, {
       sessionId: 'sess-a',
       cron: '0 2 * * *',
       task: '每日巡检 aiop 命名空间',
       enabled: true,
     });
-    await store.recordTaskRun({
-      taskId: 1,
-      status: 'success',
-      detail: '巡检完成：所有 Pod 正常',
-      steps: 3,
-    });
+    await store.createManualFire(
+      ctx, scheduledTask.id, 'frontend-data-api-pending', new Date('2026-08-08T02:00:00.000Z'),
+    );
 
     const tools = new ToolRegistry();
     tools.register({
@@ -1145,20 +1192,35 @@ describe('frontend data APIs', () => {
       const schedule = await getJson<{ tasks: Array<{ id: number }> }>(`${base}/v1/schedule`, authed);
       expect(schedule.tasks).toHaveLength(1);
 
-      const runs = await getJson<{ runs: Array<{ id: number; taskId: number; status: string; detail: string; steps: number; createdAt: string }> }>(
-        `${base}/v1/schedule/${schedule.tasks[0]!.id}/runs`,
-        authed,
-      );
-      expect(runs.runs).toEqual([
-        expect.objectContaining({
-          id: 1,
-          taskId: schedule.tasks[0]!.id,
-          status: 'success',
-          detail: '巡检完成：所有 Pod 正常',
-          steps: 3,
-        }),
-      ]);
-      expect(new Date(runs.runs[0]!.createdAt).getTime()).not.toBeNaN();
+      const runs = await getJson<{ runs: Array<{
+        fireId: string;
+        runId: string;
+        triggerKind: string;
+        fireTime: string;
+        fireState: string;
+        attempts: number;
+        createdAt: string;
+        updatedAt: string;
+        run: null | {
+          status: string;
+          startedAt?: string;
+          completedAt?: string;
+          errorMessage?: string;
+          stepCount: number;
+          usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; costUsd?: number };
+        };
+      }> }>(`${base}/v1/schedule/${schedule.tasks[0]!.id}/runs`, authed);
+      expect(runs.runs).toHaveLength(1);
+      expect(runs.runs[0]).toMatchObject({
+        fireId: expect.stringContaining(`manual:${schedule.tasks[0]!.id}:`),
+        runId: expect.stringContaining(`manual:${schedule.tasks[0]!.id}:`),
+        triggerKind: 'manual', fireState: 'pending', attempts: 0, run: null,
+      });
+      for (const execution of runs.runs) {
+        expect(new Date(execution.fireTime).getTime()).not.toBeNaN();
+        expect(new Date(execution.createdAt).getTime()).not.toBeNaN();
+        expect(new Date(execution.updatedAt).getTime()).not.toBeNaN();
+      }
 
       const sandboxes = await getJson<{ sandboxes: Array<{ id: string; status: string; actions: string[] }>; profiles: unknown[] }>(
         `${base}/v1/sandboxes`,

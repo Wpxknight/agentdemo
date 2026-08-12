@@ -20,6 +20,9 @@ export interface MeBody {
   username?: string;
   displayName?: string;
   authProvider?: 'local' | 'oidc' | 'aios';
+  deploymentMode?: 'standalone' | 'aios-integrated';
+  permissions?: string[];
+  features?: { localUserManagement: boolean; localLogin: boolean };
   /** 绑定的宿主机主目录（启动沙箱时默认挂载）；空串表示未绑定。 */
   homeDir?: string;
 }
@@ -107,6 +110,7 @@ export interface ScheduledTask {
   title?: string;
   task: string;
   cron: string;
+  timezone?: string;
   nextRunAt?: string;
   enabled?: boolean;
   lastRunAt?: string;
@@ -114,13 +118,24 @@ export interface ScheduledTask {
   sessionId?: string;
 }
 
-export interface TaskRun {
-  id?: number;
-  taskId: number;
-  status: 'success' | 'error';
-  detail?: string;
-  steps?: number;
-  createdAt?: string;
+export interface ScheduledExecution {
+  fireId: string;
+  runId: string;
+  triggerKind: 'cron' | 'manual';
+  fireTime: string;
+  fireState: 'pending' | 'claimed' | 'bound' | 'recovering' | 'completed';
+  attempts: number;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+  run?: {
+    status: AgentRunStatus;
+    startedAt?: string;
+    completedAt?: string;
+    errorMessage?: string;
+    stepCount: number;
+    usage: AgentRunUsage;
+  } | null;
 }
 
 export type AgentRunStatus = 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'recovery_required';
@@ -389,7 +404,8 @@ export interface ToolsBody {
 }
 
 export interface SkillsImportBody {
-  skill: ToolSummary;
+  product: ToolSummary;
+  pendingReview: boolean;
 }
 
 export interface SkillFileBody {
@@ -410,7 +426,7 @@ export interface ScheduleBody {
 }
 
 export interface ScheduleRunsBody {
-  runs: TaskRun[];
+  runs: ScheduledExecution[];
 }
 
 export interface SandboxesBody {

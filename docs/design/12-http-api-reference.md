@@ -99,10 +99,10 @@ curl -X POST /auth/login -H 'content-type: application/json' \
 `GET /auth/oidc/start`
 
 - 认证：匿名
-- 行为：同步；设置 10 分钟、HttpOnly、SameSite=Lax 的 state/PKCE 签名 cookie
-- 实现：`src/server/http.ts:1019`
+- 行为：同步；设置 10 分钟、HttpOnly、SameSite=Lax、`Path=/auth/callback` 的 state/PKCE 签名 cookie
+- 实现：`src/server/http.ts`
 - Request Body：不适用
-- Response：`200 {url}`，并返回 `Set-Cookie`
+- Response：`200 {url}`，并返回 `Set-Cookie`；`Cache-Control: no-store`
 - 错误：`400` 未启用 OIDC；provider 错误未定义为稳定契约
 
 ### OIDC 回调
@@ -819,7 +819,7 @@ ScheduledTask 字段：`id,tenantId,userId,sessionId,cron,title,task,preApproved
 - 认证：Bearer + `task:create`
 - 行为：同步
 - 实现匹配：`^/v1/schedule/(\d+)/(enable|disable)$`
-- Response：`200 {ok:true}`；handler 未定义稳定不存在错误。
+- Response：`200 {ok:true}`；不存在或无权访问的任务返回 `404`。
 
 ### 禁用任务
 
@@ -843,7 +843,7 @@ ScheduledTask 字段：`id,tenantId,userId,sessionId,cron,title,task,preApproved
 `DELETE /v1/schedule/{taskId}`
 
 - 认证：Bearer + `task:create`
-- 行为：同步
+- 行为：同步软删除；停止后续调度，但保留已存在的 Fire 与 Run 历史，且不取消已绑定 Run。
 - 实现匹配：`^/v1/schedule/(\d+)$`
 - Response：`200 {ok:true}`。
 - 错误：`404` 不存在；`403` 权限。
@@ -852,11 +852,11 @@ ScheduledTask 字段：`id,tenantId,userId,sessionId,cron,title,task,preApproved
 
 `POST /v1/schedule/{taskId}/run`
 
-- 认证：Bearer + `task:create`
-- 行为：异步；进程内 taskId 去重，后台 runner 完成后写 task_runs，客户端轮询 runs
+- 认证：Bearer + `task:create`；请求头必须带不超过 128 字符的 `Idempotency-Key`
+- 行为：异步；先持久化 `triggerKind=manual` 的 Fire，再由 Scheduler 领取、绑定并执行 Durable Run。新 Fire 会 best-effort 唤醒本机内嵌 Worker；客户端可轮询 runs。
 - 实现匹配：`^/v1/schedule/(\d+)/run$`
-- Response：`202 {ok:true,taskId,started:true}`，不代表执行成功。
-- 错误：`404` 不存在；`409` 同 id 正在本进程手动执行；后台失败记为 TaskRun error，不改变已返回响应。
+- Response：`202 {ok:true,taskId,fireId,runId,state,replayed}`，仅表示 Fire 已持久化，不代表执行成功。相同幂等键返回相同 Fire/Run 且 `replayed=true`。
+- 错误：`400` 缺少或过长的 `Idempotency-Key`；`404` 不存在；`403` 权限。
 
 ## Audit
 

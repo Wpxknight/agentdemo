@@ -13,6 +13,7 @@ export interface ScheduledTask {
   roles?: readonly string[];
   sessionId: string;
   cron: string;
+  timezone?: string;
   input: readonly AgentInputMessage[];
   nextFireAt: Date;
   preApproved?: boolean;
@@ -42,13 +43,14 @@ export interface ScheduledRunLookup {
   findScheduledRun(input: ScheduledRunInput): Promise<{ runId: string; result: AgentRunResult } | undefined>;
 }
 
-export type ScheduledFireState = 'pending' | 'claimed' | 'bound' | 'recovering' | 'started';
+export type ScheduledFireState = 'pending' | 'claimed' | 'bound' | 'recovering' | 'completed';
 
 export interface ScheduledFire extends ScheduledRunInput {
   state: ScheduledFireState;
   attempts: number;
   runId?: string;
   result?: AgentRunResult;
+  completedAt?: Date;
   claimToken?: string;
   claimedBy?: string;
   leaseExpiresAt?: Date;
@@ -80,6 +82,7 @@ export interface RecoveringScheduledFire extends ScheduledFire {
 
 export type BoundRunInspection =
   | { kind: 'active' }
+  | { kind: 'waiting' }
   | { kind: 'terminal'; result: AgentRunResult }
   | { kind: 'recoverable' };
 

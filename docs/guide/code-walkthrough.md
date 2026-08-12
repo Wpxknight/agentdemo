@@ -76,10 +76,9 @@ flowchart TB
 
 ## 5. 第一条主线：进程启动
 
-`src/index.ts` 识别四种入口：
+`src/index.ts` 识别三种入口：
 
 - `serve`：启动 HTTP Server，可通过 `AIOP_EMBED_SCHEDULER` 内嵌 Scheduler；
-- `scheduler`：独立运行 Scheduler；
 - `seed-admin`：Local Auth 初始化管理员；
 - 其他参数：CLI Agent。
 
@@ -199,15 +198,9 @@ Pi loader 只处理已批准的 Skill 来源和 prompt 格式，不决定租户�
 
 先读 `src/db/store.ts`，再读 `src/db/memory.ts` 与 `src/db/mysql.ts`。Durable Pi Store 的额外合同在 `packages/pi-runtime/src/store/types.ts`。
 
-重点迁移：
+当前项目以 `src/db/migrations/0001_baseline.sql` 作为新环境基线；其中包含 Pi-only Runtime、Scheduler Fire、Durable Run 控制面以及手动 Fire 幂等索引。基线已不包含旧的 Scheduler 兼容历史表。
 
-- `0022_pi_only_runtime.sql`
-- `0023_pi_session_and_run_inbox.sql`
-- `0024_pi_run_controls.sql`
-- `0025_scheduler_fires.sql`
-- `0026_scheduler_run_compat.sql`
-
-`0022` 不可逆；代码回滚不等于数据库回滚。
+基线重建会丢失数据；生产升级必须使用经批准的迁移计划，不能将重建基线当作回滚手段。
 
 ## 14. 常见需求修改入口
 
