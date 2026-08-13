@@ -190,6 +190,16 @@ describe('runtime sandbox controller', () => {
         template: 'browser-id',
         placement: { clusterId: 'local', namespace: 'aios-sandbox-local' },
       });
+      expect(rt.sandboxes?.list(platformAdmin)).toEqual([
+        expect.objectContaining({
+          key: expect.stringContaining(':placement:["clusterId","local","aios-sandbox-local"]'),
+          metadata: expect.objectContaining({
+            placementSelector: 'clusterId',
+            placementCluster: 'local',
+            placementNamespace: 'aios-sandbox-local',
+          }),
+        }),
+      ]);
 
       await rt.updateSandbox?.({
         settings: { ...AIOS_SETTINGS, enabled: false },

@@ -614,7 +614,7 @@ describe('sandbox tools', () => {
     expect(mgr.list()[0]).toMatchObject({ profile: 'netdiag', sessionId: 'sess-1' });
   });
 
-  it('isolates one session across dynamic placements and reuses identical placement', async () => {
+  it('validates but ignores placement routing for non-AIOS profile tools', async () => {
     const { provider } = mockProvider();
     const mgr = new SandboxManager({ provider });
     const tools = buildSandboxProfileTools(mgr, [{
@@ -625,11 +625,11 @@ describe('sandbox tools', () => {
     await run.execute({ profile: 'code', command: 'true', clusterName: 'pc1' }, ctx);
     await run.execute({ profile: 'code', command: 'true', clusterName: 'pc2' }, ctx);
     await run.execute({ profile: 'code', command: 'true', clusterName: 'pc1' }, ctx);
-    expect(provider.create).toHaveBeenCalledTimes(2);
-    expect(mgr.list().map((item) => item.key)).toEqual(expect.arrayContaining([
-      'sess-1:profile:code:placement:["clusterName","pc1","aios-system"]',
-      'sess-1:profile:code:placement:["clusterName","pc2","aios-system"]',
-    ]));
+    expect(provider.create).toHaveBeenCalledTimes(1);
+    expect(mgr.list().map((item) => item.key)).toEqual(['sess-1:profile:code']);
+    await expect(run.execute({
+      profile: 'code', command: 'true', clusterName: 'pc1', clusterId: '35',
+    }, ctx)).rejects.toThrow(/只能提供一个/);
   });
 });
 

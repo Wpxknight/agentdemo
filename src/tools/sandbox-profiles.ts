@@ -4,7 +4,7 @@ import type { SandboxManagerLike } from '@aiop/sandbox-runtime';
 import { executeAcquiredSandbox } from '@aiop/sandbox-runtime';
 import { isSandboxAcquirer } from '@aiop/sandbox-runtime';
 import type { SandboxProfile } from '@aiop/sandbox-runtime';
-import { findSandboxProfile, publicSandboxProfiles, sandboxSpecForProfile, withSandboxPlacement } from '@aiop/sandbox-runtime';
+import { findSandboxProfile, normalizeSandboxPlacement, publicSandboxProfiles, sandboxSpecForProfile } from '@aiop/sandbox-runtime';
 import type { SandboxPlacementInput } from '@aiop/sandbox-runtime';
 import type { ExecResult } from '@aiop/sandbox-runtime';
 
@@ -71,7 +71,8 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
   const acquire = async (ctx: ToolContext, profileName?: string, placement?: SandboxPlacementInput) => {
     if (isSandboxAcquirer(manager)) return manager.acquire(ctx, profileName, placement);
     const profile = findSandboxProfile(profiles(ctx), profileName, ctx.role);
-    const spec = withSandboxPlacement(sandboxSpecForProfile(profile, ctx), placement);
+    if (placement !== undefined) normalizeSandboxPlacement(placement);
+    const spec = sandboxSpecForProfile(profile, ctx);
     const handle = await manager.get(spec, { signal: ctx.signal });
     return { handle, spec, invalidate: () => manager.evict?.(spec.key, handle) };
   };

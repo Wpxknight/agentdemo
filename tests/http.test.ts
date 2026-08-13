@@ -1712,9 +1712,7 @@ describe('HTTP server', () => {
         body: JSON.stringify({ sessionId: 'session-c', code: 'print(1)', cluster_name: 'cluster-pc1' }),
       });
       expect(dynamic.status).toBe(200);
-      expect(provider.create).toHaveBeenCalledWith(expect.objectContaining({
-        placement: { clusterName: 'cluster-pc1', namespace: 'aios-system' },
-      }));
+      expect(provider.create).toHaveBeenCalledWith(expect.not.objectContaining({ placement: expect.anything() }));
 
       const conflict = await fetch(`${sandboxBase}/v1/sandbox/run-code`, {
         method: 'POST', headers,
@@ -1770,8 +1768,7 @@ describe('HTTP server', () => {
           sandboxId: 'sandbox-2',
           sessionId: 'session-c',
           status: 'ready',
-          type: 'cluster',
-          metadata: expect.objectContaining({ placementCluster: 'cluster-pc1', placementNamespace: 'aios-system' }),
+          type: 'session',
         }),
         expect.objectContaining({
           id: 'sandbox-3',
@@ -1789,7 +1786,7 @@ describe('HTTP server', () => {
     }
   });
 
-  it.each([401, 403])('preserves AIOS Lifecycle HTTP %s for direct sandbox APIs', async (status) => {
+  it.each([401, 403, 404])('preserves AIOS Lifecycle HTTP %s for direct sandbox APIs', async (status) => {
     const localStore = new MemoryStore();
     await localStore.createTenant({ id: 'default', name: 'Default' });
     const auth = new LocalAuthProvider({ store: localStore, secret: `sandbox-upstream-${status}` });
@@ -1820,6 +1817,78 @@ describe('HTTP server', () => {
         expect(response.status).toBe(status);
         expect(await response.json()).toEqual({ error: `AIOS Lifecycle request failed (HTTP ${status})` });
       }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('keeps ordinary direct-tool exceptions as compatible ToolResult failures without retrying', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'direct-tool-error' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const token = (await auth.login('default', 'admin', 'pw'))!;
+    const execute = vi.fn(async () => { throw new Error('ordinary failure'); });
+    const tools = new ToolRegistry().register({
+      name: 'ordinary_failure', description: 'failure', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute,
+    });
+    const rt = {
+      model, tools, store: localStore, policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth, jwtSecret: 'direct-tool-error', systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+    const server = createHttpServer(rt);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const response = await fetch(`${base}/v1/tools/call`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'ordinary_failure', args: {} }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        ok: false,
+        result: { isError: true, content: expect.stringContaining('ordinary failure') },
+      });
+      expect(execute).toHaveBeenCalledOnce();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it.each([
+    { cluster_name: '   ' },
+    { cluster_id: '' },
+    { cluster_name: 'pc1', namespace: '   ' },
+  ])('rejects blank sandbox placement fields at the HTTP boundary: %o', async (placement) => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'blank-placement' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const token = (await auth.login('default', 'admin', 'pw'))!;
+    const execute = vi.fn(async () => ({ id: '', content: 'unexpected' }));
+    const tools = new ToolRegistry().register({
+      name: 'sbx__run_code', description: 'code', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute,
+    });
+    const rt = {
+      model, tools, store: localStore, policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth, jwtSecret: 'blank-placement', systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+    const server = createHttpServer(rt);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const response = await fetch(`${base}/v1/sandbox/run-code`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ code: 'print(1)', ...placement }),
+      });
+      expect(response.status).toBe(400);
+      expect(execute).not.toHaveBeenCalled();
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }

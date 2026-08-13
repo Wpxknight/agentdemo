@@ -42,6 +42,10 @@ export interface ToolHandler {
   execute(args: JsonValue, ctx: ToolContext): Promise<ToolResult>;
 }
 
+export type DirectToolExecution =
+  | { result: ToolResult }
+  | { error: unknown; result: ToolResult };
+
 export function defineTool(input: ToolHandler): ToolHandler {
   return input;
 }
@@ -108,26 +112,28 @@ export class ToolRegistry {
   }
 
   async dispatch(call: ToolCall, ctx: ToolContext): Promise<ToolResult> {
-    try {
-      return await this.execute(call, ctx);
-    } catch (err) {
-      // Runtime interrupt/drain 等控制流异常必须穿透工具边界，不能被降级为普通 ToolResult。
-      if (err && typeof err === 'object' && (err as { is_bubble_up?: unknown }).is_bubble_up === true) throw err;
-      return {
-        id: call.id,
-        content: `tool ${call.name} failed: ${String(err)}`,
-        isError: true,
-      };
-    }
+    return (await this.executeDirect(call, ctx)).result;
   }
 
   /** 直接 API 使用：保留结构化异常，由 HTTP 边界映射状态码。 */
-  async execute(call: ToolCall, ctx: ToolContext): Promise<ToolResult> {
+  async executeDirect(call: ToolCall, ctx: ToolContext): Promise<DirectToolExecution> {
     const registered = this.handlers.get(call.name);
     if (!registered) {
-      return { id: call.id, content: `unknown tool: ${call.name}`, isError: true };
+      return { result: { id: call.id, content: `unknown tool: ${call.name}`, isError: true } };
     }
-    const result = await registered.tool.execute(call.args, ctx);
-    return { ...result, id: call.id };
+    try {
+      const result = await registered.tool.execute(call.args, ctx);
+      return { result: { ...result, id: call.id } };
+    } catch (error) {
+      if (error && typeof error === 'object' && (error as { is_bubble_up?: unknown }).is_bubble_up === true) throw error;
+      return {
+        error,
+        result: {
+          id: call.id,
+          content: `tool ${call.name} failed: ${String(error)}`,
+          isError: true,
+        },
+      };
+    }
   }
 }

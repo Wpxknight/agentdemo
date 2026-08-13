@@ -96,6 +96,7 @@ import {
   sandboxSpecForProfile,
   selectBrowserProfile,
   selectDefaultProfile,
+  normalizeSandboxPlacement,
   withSandboxPlacement,
 } from '@aiop/sandbox-runtime';
 import type { PublicSandboxProfile } from '@aiop/sandbox-runtime';
@@ -654,7 +655,9 @@ export async function buildRuntime(
       if (cfg.aios && !selectedProfile) throw new Error('当前身份没有可用的代码沙箱模板');
       const base = selectedProfile ? sandboxSpecForProfile(selectedProfile, ctx) : { key: ctx.sessionId };
       const unresolved = skillSandboxEnv ? { ...base, envs: { ...skillSandboxEnv, ...base.envs } } : base;
-      const spec = withSandboxPlacement(unresolved, placement);
+      const spec = cfg.aios
+        ? withSandboxPlacement(unresolved, placement ?? cfg.aios.placement)
+        : (placement === undefined ? unresolved : (normalizeSandboxPlacement(placement), unresolved));
       if (cfg.aios || !ctx.tenantId || !ctx.userId) return spec;
       const user = await store.getUser(ctx.tenantId, ctx.userId).catch(() => undefined);
       if (!user?.homeDir) return spec;
@@ -683,7 +686,7 @@ export async function buildRuntime(
       resolveDesktop = async (ctx) => {
         const profile = selectBrowserProfile(profiles, ctx.role ?? 'user');
         if (!profile) throw new Error('当前身份没有可用的浏览器沙箱模板');
-        const spec = sandboxSpecForProfile(profile, ctx);
+        const spec = withSandboxPlacement(sandboxSpecForProfile(profile, ctx), cfg.aios?.placement);
         return { key: spec.key, create: () => dp.create(spec) };
       };
     } else if (cfg.desktop) {

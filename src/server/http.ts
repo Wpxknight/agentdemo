@@ -628,7 +628,9 @@ function addSandboxPlacementArgs(body: Record<string, unknown>, args: Record<str
   for (const [input, output] of fields) {
     if (body[input] === undefined) continue;
     if (typeof body[input] !== 'string') throw new HttpError(400, `${input} 必须是字符串`);
-    args[output] = body[input] as string;
+    const value = body[input].trim();
+    if (!value) throw new HttpError(400, `${input} 必须是非空字符串`);
+    args[output] = value;
   }
   if (args.clusterName !== undefined && args.clusterId !== undefined) {
     throw new HttpError(400, 'cluster_name 与 cluster_id 只能提供一个');
@@ -816,10 +818,9 @@ async function dispatchDirectTool(
   const decision = await rt.policy.check(call, toolCtx);
   if (decision.blocked) throw new HttpError(403, decision.reason ?? '策略阻止了该操作');
   if (decision.needApproval) throw new HttpError(409, decision.reason ?? '该操作需要审批，无法直接执行');
-  let result;
-  try {
-    result = await rt.tools.execute(call, toolCtx);
-  } catch (err) {
+  const execution = await rt.tools.executeDirect(call, toolCtx);
+  if ('error' in execution) {
+    const err = execution.error;
     const lifecycle = err instanceof AiosLifecycleHttpError || (
       err instanceof Error
       && err.name === 'AiosLifecycleHttpError'
@@ -827,11 +828,11 @@ async function dispatchDirectTool(
     );
     if (lifecycle) {
       const status = (err as AiosLifecycleHttpError).status;
-      if (status === 401 || status === 403) throw new HttpError(status, (err as Error).message);
+      if (status >= 400 && status < 500) throw new HttpError(status, (err as Error).message);
     }
     if (err instanceof SandboxProfileAuthorizationError) throw new HttpError(403, err.message);
-    throw err;
   }
+  const result = execution.result;
   return { ok: !result.isError, sessionId, result };
 }
 

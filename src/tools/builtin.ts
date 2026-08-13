@@ -1,7 +1,7 @@
 import type { JsonValue, ToolResult } from '../llm/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import type { SandboxManagerLike } from '@aiop/sandbox-runtime';
-import { isSandboxAcquirer, type SandboxPlacementInput, type SpecResolver, withSandboxPlacement } from '@aiop/sandbox-runtime';
+import { isSandboxAcquirer, normalizeSandboxPlacement, type SandboxPlacementInput, type SpecResolver } from '@aiop/sandbox-runtime';
 import { sandboxIdentityKey, sandboxIdentityMetadata } from '@aiop/sandbox-runtime';
 import { createSandboxToolDefinitions, downloadAcquiredSandbox, executeAcquiredSandbox, uploadAcquiredSandbox } from '@aiop/sandbox-runtime';
 import type { SandboxSpec } from '@aiop/sandbox-runtime';
@@ -44,11 +44,12 @@ const placementProperties = {
 
 export async function resolveSandboxSpec(resolve: SpecResolver, ctx: ToolContext, placement?: SandboxPlacementInput): Promise<SandboxSpec> {
   const partial = await resolve(ctx, undefined, placement);
-  return withSandboxPlacement({
+  if (placement !== undefined) normalizeSandboxPlacement(placement);
+  return {
     key: sandboxIdentityKey(ctx),
     ...partial,
     metadata: { ...sandboxIdentityMetadata(ctx), ...partial.metadata },
-  }, partial.placement || placement === undefined ? undefined : placement);
+  };
 }
 
 /** 构造 E2B 沙箱内置工具：sbx__run_code / sbx__run_command。 */
