@@ -105,4 +105,17 @@ describe('AIoP rollback compatibility contract', () => {
     expect(standalone).toContain('aiop.bocloud.com/deployment-mode: standalone');
     expect(integrated).toContain('aiop.bocloud.com/deployment-mode: aios-integrated');
   });
+
+  it('keeps the AIOS integrated UI sidecar and external test entrypoint in the deployment contract', async () => {
+    const makefile = await readFile(makefileUrl, 'utf8');
+    const deployment = await readFile(new URL('../../deploy/aiop/deployment-aios-integrated.yaml', import.meta.url), 'utf8');
+    const service = await readFile(new URL('../../deploy/aiop/service-aios-integrated.yaml', import.meta.url), 'utf8');
+    expect(deployment).toMatch(/name:\s+aiop-web/);
+    expect(deployment).toContain('deploy.bocloud.k8s:40443/aios/aiop-web:dev');
+    expect(deployment).toContain('containerPort: 8080');
+    expect(service).toMatch(/type:\s+NodePort/);
+    expect(service).toMatch(/targetPort:\s+8080/);
+    expect(service).toMatch(/nodePort:\s+30084/);
+    expect(makefile).toContain('aiop=$(PUBLISH_IMAGE) aiop-web=$(PUBLISH_WEB_IMAGE)');
+  });
 });
