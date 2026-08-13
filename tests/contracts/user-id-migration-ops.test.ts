@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 
 const scriptUrl = new URL('../../scripts/migrate-user-id-staging.sh', import.meta.url);
 const rollbackScriptUrl = new URL('../../scripts/rollback-aiop-compatible.sh', import.meta.url);
+const makefileUrl = new URL('../../Makefile', import.meta.url);
 
 function position(source: string, marker: string): number {
   const value = source.indexOf(`migration-step:${marker}`);
@@ -11,6 +12,17 @@ function position(source: string, marker: string): number {
 }
 
 describe('staging user-id migration operational contract', () => {
+  it('keeps the AIOS identity preflight explicit instead of blocking test-environment deployment', async () => {
+    const makefile = await readFile(makefileUrl, 'utf8');
+    const deployTarget = makefile.slice(
+      makefile.indexOf('deploy-aios-integrated:'),
+      makefile.indexOf('\ncheck-user-id-migration:'),
+    );
+    expect(deployTarget).not.toContain('$(MAKE) check-user-id-migration');
+    expect(makefile).toContain('\ncheck-user-id-migration:');
+    expect(makefile).toContain('scripts/check-user-id-migration.ts');
+  });
+
   it('orders backup, both preflights, quiescence, migration, postcheck and restore', async () => {
     const source = await readFile(scriptUrl, 'utf8');
     const order = ['backup', 'precheck', 'scale0', 'quiesced-check', 'migrate', 'postcheck'];

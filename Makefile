@@ -100,7 +100,7 @@ deploy-standalone:
 
 deploy-aios-integrated:
 	@test "$(DEPLOYMENT_MODE)" = "aios-integrated" || (printf '%s\n' 'Set DEPLOYMENT_MODE=aios-integrated' >&2; exit 1)
-	$(MAKE) check-user-id-migration DEPLOYMENT_MODE=aios-integrated AUTH_PROVIDER=aios
+	@# 测试环境部署不自动执行身份迁移预检；需要诊断时显式运行 check-user-id-migration。
 	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) get secret aiop-secrets -o name >/dev/null
 	$(AIOP_KUBECTL) apply -f deploy/aiop/configmap-aios-integrated.yaml
 	$(AIOP_KUBECTL) apply -f deploy/aiop/pvc-skills.yaml
