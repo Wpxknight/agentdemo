@@ -563,6 +563,10 @@ import { type SandboxIdentity } from './keys.js';
 import type { SandboxSpec } from './types.js';
 export type SandboxProfileEnvType = 'code' | 'browser';
 export type SandboxProfileRuntimeRole = 'sandbox-reader' | 'sandbox-diag';
+export declare class SandboxProfileAuthorizationError extends Error {
+    readonly status = 403;
+    constructor();
+}
 export interface SandboxProfile {
     id: string;
     name: string;

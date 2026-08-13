@@ -22,6 +22,7 @@ import { SandboxManager } from '../packages/sandbox-runtime/src/lifecycle.js';
 import { buildSandboxTools } from '../src/tools/builtin.js';
 import { buildSandboxProfileTools } from '../src/tools/sandbox-profiles.js';
 import type { ExecResult, SandboxHandle, SandboxProvider, SandboxSpec } from '../packages/sandbox-runtime/src/types.js';
+import { AiosLifecycleHttpError } from '../packages/sandbox-runtime/src/aios-http.js';
 import type {
   AgentRunEvent,
   AgentRunResult,
@@ -1748,6 +1749,17 @@ describe('HTTP server', () => {
           expect.objectContaining({ id: 'code-id' }),
         ]);
       }
+      const deniedDiag = await fetch(`${sandboxBase}/v1/sandbox/run-command`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${userToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          sessionId: 'denied-diag', profile: 'diag-id', command: 'kubectl get pods', cluster_name: 'pc1',
+        }),
+      });
+      expect(deniedDiag.status).toBe(403);
+      expect(await deniedDiag.json()).toEqual({
+        error: '当前身份无权使用该沙箱模板；sandbox-diag 仅 platform_admin 可用',
+      });
       expect(body.sandboxes).toEqual([
         expect.objectContaining({
           id: 'sandbox-1', sandboxId: 'sandbox-1', sessionId: 'session-a', status: 'ready', type: 'session',
@@ -1774,6 +1786,42 @@ describe('HTTP server', () => {
       ]);
     } finally {
       await new Promise<void>((resolve) => sandboxServer.close(() => resolve()));
+    }
+  });
+
+  it.each([401, 403])('preserves AIOS Lifecycle HTTP %s for direct sandbox APIs', async (status) => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: `sandbox-upstream-${status}` });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const token = (await auth.login('default', 'admin', 'pw'))!;
+    const tools = new ToolRegistry();
+    for (const name of ['sbx__run_code', 'sbx__run_command'] as const) {
+      tools.register({
+        name, description: name, inputSchema: { type: 'object' }, capability: 'non_idempotent_write',
+        execute: async () => { throw new AiosLifecycleHttpError(status); },
+      });
+    }
+    const rt = {
+      model, tools, store: localStore, policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth, jwtSecret: `sandbox-upstream-${status}`, systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+    const server = createHttpServer(rt);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+    try {
+      for (const [path, body] of [
+        ['run-code', { code: 'print(1)', cluster_name: 'pc1' }],
+        ['run-command', { command: 'true', cluster_id: '35' }],
+      ] as const) {
+        const response = await fetch(`${base}/v1/sandbox/${path}`, { method: 'POST', headers, body: JSON.stringify(body) });
+        expect(response.status).toBe(status);
+        expect(await response.json()).toEqual({ error: `AIOS Lifecycle request failed (HTTP ${status})` });
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
 

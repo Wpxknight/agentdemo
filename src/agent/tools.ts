@@ -108,13 +108,8 @@ export class ToolRegistry {
   }
 
   async dispatch(call: ToolCall, ctx: ToolContext): Promise<ToolResult> {
-    const registered = this.handlers.get(call.name);
-    if (!registered) {
-      return { id: call.id, content: `unknown tool: ${call.name}`, isError: true };
-    }
     try {
-      const result = await registered.tool.execute(call.args, ctx);
-      return { ...result, id: call.id };
+      return await this.execute(call, ctx);
     } catch (err) {
       // Runtime interrupt/drain 等控制流异常必须穿透工具边界，不能被降级为普通 ToolResult。
       if (err && typeof err === 'object' && (err as { is_bubble_up?: unknown }).is_bubble_up === true) throw err;
@@ -124,5 +119,15 @@ export class ToolRegistry {
         isError: true,
       };
     }
+  }
+
+  /** 直接 API 使用：保留结构化异常，由 HTTP 边界映射状态码。 */
+  async execute(call: ToolCall, ctx: ToolContext): Promise<ToolResult> {
+    const registered = this.handlers.get(call.name);
+    if (!registered) {
+      return { id: call.id, content: `unknown tool: ${call.name}`, isError: true };
+    }
+    const result = await registered.tool.execute(call.args, ctx);
+    return { ...result, id: call.id };
   }
 }

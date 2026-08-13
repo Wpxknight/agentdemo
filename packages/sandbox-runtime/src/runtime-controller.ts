@@ -15,6 +15,7 @@ import {
   type PublicSandboxProfile,
   type SandboxProfile,
 } from './profiles.js';
+import { SandboxProfileAuthorizationError } from './profiles.js';
 import type { SandboxHandle, SandboxSpec } from './types.js';
 import type { SandboxAcquisition, SandboxAcquirer, SpecResolver } from './acquisition.js';
 
@@ -153,7 +154,7 @@ export class SandboxRuntimeController implements SandboxAcquirer {
         ? findSandboxProfile(generation.profiles, spec.profile, role)
         : undefined;
       if (resolvedProfile && !canUseSandboxProfile(resolvedProfile, role)) {
-        throw new Error('当前身份无权使用该沙箱模板；sandbox-diag 仅 platform_admin 可用');
+        throw new SandboxProfileAuthorizationError();
       }
       this.assertOperationValid(generation, sessionEpochs);
       const handle = await generation.manager.get(spec, { signal: ctx.signal });

@@ -37,6 +37,7 @@ cd "$PROJECT_ROOT" || exit 1
 run_case "TC001" "dynamic placement focused Vitest suites pass" \
   npm exec -- vitest run \
     tests/aios-e2b.test.ts \
+    tests/sandbox-placement.test.ts \
     tests/sandbox-settings.test.ts \
     tests/sandbox.test.ts \
     tests/http.test.ts \
@@ -51,4 +52,3 @@ echo "Evidence: $LOG_FILE"
 if [ "$FAIL_COUNT" -gt 0 ]; then
   exit 1
 fi
-

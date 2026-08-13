@@ -29,7 +29,9 @@ import { SKILL_IMPORT_GLOBAL_CONCURRENCY, SKILL_IMPORT_TENANT_CONCURRENCY } from
 import type { Skill, SkillProductRecord, SkillRegistry } from '../skill/registry.js';
 import { McpServerSchema } from '../config/schema.js';
 import {
+  AiosLifecycleHttpError,
   parseSandboxSettings,
+  SandboxProfileAuthorizationError,
   type SandboxApiKeyUpdate,
 } from '@aiop/sandbox-runtime';
 import { projectCommittedPiSession, projectPiSessionStats, projectPiUsage } from '../agent/projections.js';
@@ -814,7 +816,22 @@ async function dispatchDirectTool(
   const decision = await rt.policy.check(call, toolCtx);
   if (decision.blocked) throw new HttpError(403, decision.reason ?? '策略阻止了该操作');
   if (decision.needApproval) throw new HttpError(409, decision.reason ?? '该操作需要审批，无法直接执行');
-  const result = await rt.tools.dispatch(call, toolCtx);
+  let result;
+  try {
+    result = await rt.tools.execute(call, toolCtx);
+  } catch (err) {
+    const lifecycle = err instanceof AiosLifecycleHttpError || (
+      err instanceof Error
+      && err.name === 'AiosLifecycleHttpError'
+      && typeof (err as Error & { status?: unknown }).status === 'number'
+    );
+    if (lifecycle) {
+      const status = (err as AiosLifecycleHttpError).status;
+      if (status === 401 || status === 403) throw new HttpError(status, (err as Error).message);
+    }
+    if (err instanceof SandboxProfileAuthorizationError) throw new HttpError(403, err.message);
+    throw err;
+  }
   return { ok: !result.isError, sessionId, result };
 }
 
