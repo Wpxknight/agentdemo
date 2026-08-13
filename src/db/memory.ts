@@ -730,6 +730,14 @@ export class MemoryStore implements Store {
     return undefined;
   }
 
+  async updateLocalUserPassword(tenantId: string, username: string, passwordHash: string): Promise<User | undefined> {
+    const user = this.users.get(`${tenantId}/${username}`);
+    if (!user || user.authProvider !== 'local') return undefined;
+    user.passwordHash = passwordHash;
+    const { passwordHash: _omit, ...pub } = user;
+    return { ...pub };
+  }
+
   async disableTasksByUser(tenantId: string, userId: string): Promise<number> {
     let n = 0;
     for (const t of this.tasks.values()) {

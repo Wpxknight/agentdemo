@@ -196,6 +196,8 @@ export interface Runtime {
   authProvider: AuthProvider;
   /** AIOS 嵌入登录（token exchange）；配置 auth.aios 后启用，与 authProvider 并存。 */
   aiosAuth?: AiosAuthProvider;
+  /** AIOS 集成测试环境的本地调试登录；默认关闭。 */
+  debugLocalAuth?: LocalAuthProvider;
   /** 用户下游平台凭据缓存（加密存储；exchange 写入、技能同步时按用户注入）。 */
   credentials: UserCredentials;
   /** 允许嵌入 aiop 的宿主 origin（CSP frame-ancestors）；未配置时仅允许同源。 */
@@ -531,6 +533,10 @@ export async function buildRuntime(
 
   const deploymentMode = config.deploymentMode ?? 'standalone';
   const providerKind = config.auth?.provider ?? 'local';
+  const debugLocalLogin = process.env.AIOP_AIOS_DEBUG_LOCAL_LOGIN === 'true';
+  if (debugLocalLogin && (deploymentMode !== 'aios-integrated' || providerKind !== 'aios')) {
+    throw new Error('AIOP_AIOS_DEBUG_LOCAL_LOGIN=true requires aios-integrated deployment with auth.provider=aios');
+  }
   const mysqlConfig = readMysqlConfig();
   const store = options.store ?? await createStore(mysqlConfig, {
     deploymentMode,
@@ -887,6 +893,7 @@ export async function buildRuntime(
   const ttl = config.auth?.jwtTtl;
   let authProvider: AuthProvider;
   let aiosAuth: AiosAuthProvider | undefined;
+  let debugLocalAuth: LocalAuthProvider | undefined;
   if (providerKind === 'oidc') {
     if (!config.auth?.oidc) throw new Error('auth.provider=oidc requires auth.oidc');
     authProvider = new OidcAuthProvider({ store, secret: jwtSecret, ttl, config: config.auth.oidc });
@@ -896,6 +903,10 @@ export async function buildRuntime(
     aiosAuth = new AiosAuthProvider({ store, secret: jwtSecret, ttl, config: config.auth.aios, credentials });
     authProvider = aiosAuth;
     logger.info({ verify: config.auth.aios.verify }, 'AIOS 主认证已启用');
+    if (debugLocalLogin) {
+      debugLocalAuth = new LocalAuthProvider({ store, secret: jwtSecret, ttl });
+      logger.warn({ deploymentMode, authProvider: providerKind }, 'AIOS integrated debug local login is enabled; test environment only');
+    }
   } else {
     authProvider = new LocalAuthProvider({ store, secret: jwtSecret, ttl });
   }
@@ -1087,6 +1098,7 @@ export async function buildRuntime(
     planState,
     authProvider,
     aiosAuth,
+    debugLocalAuth,
     credentials,
     frameAncestors: config.auth?.aios?.allowedParentOrigins,
     jwtSecret,

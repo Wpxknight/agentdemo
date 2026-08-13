@@ -446,6 +446,8 @@ export interface Store extends AuditSink {
   listUsers(tenantId: string): Promise<User[]>;
   /** 局部更新用户（状态/墓碑改名/角色/展示名）；不存在返回 undefined。 */
   updateUser(tenantId: string, userId: string, patch: UserPatch): Promise<User | undefined>;
+  /** 仅更新已存在 local 用户的口令哈希；其他认证来源必须返回 undefined。 */
+  updateLocalUserPassword(tenantId: string, username: string, passwordHash: string): Promise<User | undefined>;
   /** 禁用某用户名下全部定时任务（软删除流程用）；返回受影响任务数。 */
   disableTasksByUser(tenantId: string, userId: string): Promise<number>;
 

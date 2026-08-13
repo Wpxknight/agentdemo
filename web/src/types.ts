@@ -27,6 +27,12 @@ export interface MeBody {
   homeDir?: string;
 }
 
+export interface AuthCapabilitiesBody {
+  deploymentMode: 'standalone' | 'aios-integrated';
+  authProvider: 'local' | 'oidc' | 'aios';
+  capabilities: { aiosExchange: boolean; localLogin: boolean };
+}
+
 /** 用户管理列表项（GET /v1/admin/users）。 */
 export interface AdminUser {
   id: string;

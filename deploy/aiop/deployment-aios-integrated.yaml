@@ -53,6 +53,8 @@ spec:
               value: "true"
             - name: AIOP_PI_MODE
               value: full
+            - name: AIOP_AIOS_DEBUG_LOCAL_LOGIN
+              value: "true"
           envFrom:
             - secretRef: { name: aiop-secrets }
           securityContext:

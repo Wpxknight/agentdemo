@@ -1,4 +1,4 @@
-import { apiUrl, type WebHostAdapter } from './host-adapter';
+import { apiUrl, type LoginCredentials, type WebHostAdapter } from './host-adapter';
 
 export interface AiosHostAdapterOptions {
   apiBase: string;
@@ -48,6 +48,16 @@ export class AiosHostAdapter implements WebHostAdapter {
       body: JSON.stringify(credential),
     });
     if (!response.ok) throw new Error('AIOS 登录凭据校验失败');
+    const body = await response.json() as { token: string };
+    this.setToken(body.token);
+    return body.token;
+  }
+
+  async login(credentials: LoginCredentials): Promise<string> {
+    const response = await fetch(apiUrl(this, '/auth/login'), {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(credentials),
+    });
+    if (!response.ok) throw new Error('登录失败，请检查用户名或密码。');
     const body = await response.json() as { token: string };
     this.setToken(body.token);
     return body.token;

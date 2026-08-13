@@ -254,6 +254,18 @@ describe('frontend API wiring', () => {
     expect(contract).toContain('onUnauthorized(): void | Promise<void>');
   });
 
+  it('discovers server auth capabilities and shows an explicit integrated debug login', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const adapter = await readFile('web/src/aios-host-adapter.ts', 'utf8');
+    const types = await readFile('web/src/types.ts', 'utf8');
+
+    expect(types).toContain('export interface AuthCapabilitiesBody');
+    expect(app).toContain("fetch(apiUrl(host, '/v1/auth/capabilities'))");
+    expect(app).toContain('authCapabilities?.capabilities.localLogin');
+    expect(app).toContain("'测试环境调试登录'");
+    expect(adapter).toContain('async login(credentials: LoginCredentials)');
+  });
+
   it('supports dragging the right preview panel wider', async () => {
     const app = await readFile('web/src/App.tsx', 'utf8');
     const css = await readFile('web/src/index.css', 'utf8');

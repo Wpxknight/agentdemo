@@ -101,6 +101,25 @@ describe('server/context', () => {
 });
 
 describe('local auth bootstrap', () => {
+  it('rejects debug local login outside AIOS integrated mode', async () => {
+    const previous = process.env.AIOP_AIOS_DEBUG_LOCAL_LOGIN;
+    process.env.AIOP_AIOS_DEBUG_LOCAL_LOGIN = 'true';
+    const config = {
+      models: { mock: { protocol: 'openai', baseURL: 'http://localhost/v1', apiKey: 'x', model: 'mock' } },
+      defaultModel: 'mock',
+      deploymentMode: 'standalone',
+      auth: { provider: 'local' },
+    } as Config;
+    try {
+      await expect(buildRuntime(config, { store: new MemoryStore() })).rejects.toThrow(
+        'requires aios-integrated deployment with auth.provider=aios',
+      );
+    } finally {
+      if (previous === undefined) delete process.env.AIOP_AIOS_DEBUG_LOCAL_LOGIN;
+      else process.env.AIOP_AIOS_DEBUG_LOCAL_LOGIN = previous;
+    }
+  });
+
   it('parses configured bootstrap admin credentials', () => {
     const cfg = parseConfig(`{
       "models": { "mock": { "protocol": "openai", "baseURL": "http://localhost/v1", "apiKey": "x", "model": "mock" } },

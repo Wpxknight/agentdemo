@@ -48,6 +48,7 @@ import { NAV_ITEMS, defaultLlmConfig, pageFromUrl, pageUrl } from './app-data';
 import { MermaidDiagram } from './components/mermaid-diagram';
 import { RunCenterPage } from './components/run-center-page';
 import { createApi, numericSessionId, randomId, readStorage, writeStorage } from './api';
+import { apiUrl } from './host-adapter';
 import { useWebHost } from './web-core';
 import { formatSandboxOutputChunk, parseSandboxOutput, sandboxOutputClassNames, sandboxOutputCommand, sandboxOutputLabels } from './sandbox-output';
 import { isPersistedSession } from './session-context';
@@ -62,6 +63,7 @@ import {
 import type {
   AdminUser,
   AdminUsersBody,
+  AuthCapabilitiesBody,
   Attachment,
   ChatMessage,
   MeBody,
@@ -941,6 +943,7 @@ export default function App() {
   const [llm, setLlm] = useState<RuntimeModelConfig>(defaultLlmConfig);
   const [settingsStatus, setSettingsStatus] = useState('');
   const [authStatus, setAuthStatus] = useState('');
+  const [authCapabilities, setAuthCapabilities] = useState<AuthCapabilitiesBody | null>(null);
   const [historyOpen, setHistoryOpen] = useState(true);
   const [previewOpen, setPreviewOpen] = useState(true);
   const [previewWidth, setPreviewWidth] = useState(() => clampPreviewWidth(readStorage('aiop_sandbox_width') || 440));
@@ -1055,6 +1058,18 @@ export default function App() {
   }, []);
 
   const api = useMemo(() => createApi(host, token, redirectToLogin), [host, token, redirectToLogin]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetch(apiUrl(host, '/v1/auth/capabilities')).then(async (response) => {
+      if (!response.ok) throw new Error('auth capabilities unavailable');
+      const body = await response.json() as AuthCapabilitiesBody;
+      if (!cancelled) setAuthCapabilities(body);
+    }).catch(() => {
+      if (!cancelled) setAuthCapabilities(null);
+    });
+    return () => { cancelled = true; };
+  }, [host]);
 
   useEffect(() => {
     if (!host.subscribeToken) return;
@@ -1864,8 +1879,8 @@ export default function App() {
   }
 
   if (page === 'login') {
-    if (host.deploymentMode === 'standalone' && host.authProvider === 'local') {
-      return <LoginPage authStatus={authStatus} onSubmit={submitLogin} />;
+    if ((host.deploymentMode === 'standalone' && host.authProvider === 'local') || authCapabilities?.capabilities.localLogin) {
+      return <LoginPage authStatus={authStatus} onSubmit={submitLogin} debug={host.deploymentMode === 'aios-integrated'} />;
     }
     return <HostAuthenticationPending mode={host.deploymentMode === 'standalone' ? 'redirect' : 'waiting'} />;
   }
@@ -4948,7 +4963,7 @@ function HostAuthenticationPending({ mode }: { mode: 'redirect' | 'waiting' }) {
   );
 }
 
-function LoginPage({ authStatus, onSubmit }: { authStatus: string; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
+function LoginPage({ authStatus, onSubmit, debug = false }: { authStatus: string; onSubmit: (event: FormEvent<HTMLFormElement>) => void; debug?: boolean }) {
   return (
     <main className="login-page">
       <section className="login-card">
@@ -4956,7 +4971,7 @@ function LoginPage({ authStatus, onSubmit }: { authStatus: string; onSubmit: (ev
           <BrandLogo className="brand-logo-login" />
           <div>
             <h1>AIOP</h1>
-            <p>登录后进入 AI 运维工作台</p>
+            <p>{debug ? '测试环境调试登录' : '登录后进入 AI 运维工作台'}</p>
           </div>
         </div>
         <form id="login-form" className="login-form" onSubmit={onSubmit}>

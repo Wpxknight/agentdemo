@@ -11,11 +11,12 @@ import type { ToolContentBlock } from '../llm/types.js';
 import { InMemoryApprovalStore } from '../agent/approval.js';
 import { InMemoryQuestionStore } from '../agent/question.js';
 import type { QuestionAnswers } from '../agent/question.js';
-import { authenticate } from './context.js';
+import { bearerToken } from './context.js';
 import { AuthzError, canManageUsersOf, permissionsFor, requirePermission } from '../auth/rbac.js';
 import { LocalAuthProvider } from '../auth/local.js';
 import { OidcAuthProvider } from '../auth/oidc.js';
 import { AiosAuthError } from '../auth/aios.js';
+import { verifySession } from '../auth/session.js';
 import { softDeleteUser, setUserEnabled } from '../auth/lifecycle.js';
 import { createTenant, createUser, listTenants } from '../auth/admin.js';
 import type { RequestContext, Role } from '../auth/types.js';
@@ -888,10 +889,19 @@ function invalidateUserStatus(rt: Runtime, tenantId: string, userId: string): vo
 
 /** 校验 Bearer token 并返回身份；失败抛 401。 */
 async function requireAuth(rt: Runtime, req: Req): Promise<RequestContext> {
-  const ctx = await authenticate(rt.authProvider, req.headers.authorization)
-    ?? (rt.aiosAuth && rt.aiosAuth !== rt.authProvider
-      ? await authenticate(rt.aiosAuth, req.headers.authorization)
-      : undefined);
+  const token = bearerToken(req.headers.authorization);
+  if (!token) throw new HttpError(401, '未认证或 token 无效');
+  const trusted = await verifySession(new TextEncoder().encode(rt.jwtSecret), token);
+  if (!trusted?.provider) throw new HttpError(401, '未认证或 token 无效');
+  let ctx: RequestContext | undefined;
+  if (trusted.provider === 'aios') {
+    ctx = rt.aiosAuth ? await rt.aiosAuth.authenticate(token) : undefined;
+  } else if (trusted.provider === 'local') {
+    const provider = rt.debugLocalAuth ?? (rt.authProvider instanceof LocalAuthProvider ? rt.authProvider : undefined);
+    ctx = provider ? await provider.authenticate(token) : undefined;
+  } else if (trusted.provider === 'oidc') {
+    ctx = rt.authProvider instanceof OidcAuthProvider ? await rt.authProvider.authenticate(token) : undefined;
+  }
   if (!ctx) throw new HttpError(401, '未认证或 token 无效');
   await assertUserActive(rt, ctx);
   return ctx;
@@ -1064,9 +1074,26 @@ async function handle(
 
   if (method === 'GET' && await sendWebAsset(res, path, rt.frameAncestors)) return;
 
+  if (route === 'GET /v1/auth/capabilities') {
+    return sendJson(res, 200, {
+      deploymentMode: rt.deploymentMode ?? 'standalone',
+      authProvider: rt.deploymentMode === 'aios-integrated' ? 'aios'
+        : rt.authProvider instanceof LocalAuthProvider ? 'local'
+          : rt.authProvider instanceof OidcAuthProvider ? 'oidc' : 'aios',
+      capabilities: {
+        aiosExchange: Boolean(rt.aiosAuth),
+        localLogin: Boolean(rt.debugLocalAuth)
+          || ((rt.deploymentMode ?? 'standalone') === 'standalone' && rt.authProvider instanceof LocalAuthProvider),
+      },
+    });
+  }
+
   // —— 本地登录 ——
   if (route === 'POST /auth/login') {
-    if (rt.deploymentMode === 'aios-integrated' || !(rt.authProvider instanceof LocalAuthProvider)) {
+    const localAuth = rt.debugLocalAuth
+      ?? ((rt.deploymentMode ?? 'standalone') === 'standalone' && rt.authProvider instanceof LocalAuthProvider
+        ? rt.authProvider : undefined);
+    if (!localAuth) {
       throw new HttpError(404, '本地登录未启用');
     }
     const body = await readJson(req);
@@ -1074,8 +1101,19 @@ async function handle(
     const username = str(body, 'username');
     const password = str(body, 'password');
     if (!username || !password) throw new HttpError(400, 'username/password 必填');
-    const token = await rt.authProvider.login(tenantId, username, password);
+    const token = await localAuth.login(tenantId, username, password);
     if (!token) throw new HttpError(401, '登录失败：用户名或口令错误');
+    if (rt.debugLocalAuth) {
+      const ctx = await localAuth.authenticate(token);
+      if (!ctx) throw new HttpError(401, '登录失败：用户名或口令错误');
+      const correlationId = requestCorrelationId(req);
+      log.warn({ tenantId: ctx.tenantId, userId: ctx.userId, role: ctx.role, correlationId }, 'AIOS debug local login used');
+      await rt.audit?.record({
+        kind: 'auth', action: 'aios-debug-local-login', tenantId: ctx.tenantId,
+        userId: ctx.userId, provider: 'local', deploymentMode: 'aios-integrated', correlationId,
+        detail: { role: ctx.role },
+      });
+    }
     return sendJson(res, 200, { token });
   }
 
@@ -1262,7 +1300,8 @@ async function handle(
       deploymentMode: rt.deploymentMode ?? 'standalone',
       permissions: permissionsFor(ctx.role),
       features: {
-        localLogin: (rt.deploymentMode ?? 'standalone') === 'standalone' && rt.authProvider instanceof LocalAuthProvider,
+        localLogin: Boolean(rt.debugLocalAuth)
+          || ((rt.deploymentMode ?? 'standalone') === 'standalone' && rt.authProvider instanceof LocalAuthProvider),
         localUserManagement: (rt.deploymentMode ?? 'standalone') === 'standalone',
       },
     });

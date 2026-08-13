@@ -49,6 +49,10 @@ export class LocalAuthProvider implements AuthProvider {
       log.warn({ tenantId, username }, 'login: 账号已禁用');
       return undefined;
     }
+    if (user.authProvider !== 'local') {
+      log.warn({ tenantId, username, authProvider: user.authProvider }, 'login: 账号认证来源不是 local');
+      return undefined;
+    }
     if (!(await verifyPassword(password, user.passwordHash))) {
       log.warn({ tenantId, username }, 'login: 口令错误');
       return undefined;
@@ -64,5 +68,10 @@ export class LocalAuthProvider implements AuthProvider {
     const user = await this.store.getUser(ctx.tenantId, ctx.userId);
     if (!user || user.status !== 'active' || user.authProvider !== 'local' || user.role !== ctx.role) return undefined;
     return ctx;
+  }
+
+  async resetPassword(tenantId: string, username: string, password: string): Promise<User | undefined> {
+    const passwordHash = await hashPassword(password);
+    return this.store.updateLocalUserPassword(tenantId, username, passwordHash);
   }
 }

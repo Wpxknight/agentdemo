@@ -1212,6 +1212,21 @@ export class MysqlStore implements Store {
     return this.getUser(tenantId, userId);
   }
 
+  async updateLocalUserPassword(tenantId: string, username: string, passwordHash: string): Promise<User | undefined> {
+    const result = await this.db
+      .updateTable('users')
+      .set({ password_hash: passwordHash })
+      .where('tenant_id', '=', tenantId)
+      .where('username', '=', username)
+      .where('auth_provider', '=', 'local')
+      .executeTakeFirst();
+    if (Number(result.numUpdatedRows ?? 0) !== 1) return undefined;
+    const user = await this.getUserByUsername(tenantId, username);
+    if (!user) return undefined;
+    const { passwordHash: _omit, ...publicUser } = user;
+    return publicUser;
+  }
+
   async disableTasksByUser(tenantId: string, userId: string): Promise<number> {
     const res = await this.db
       .updateTable('scheduled_tasks')
