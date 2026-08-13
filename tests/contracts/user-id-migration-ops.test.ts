@@ -117,5 +117,13 @@ describe('AIoP rollback compatibility contract', () => {
     expect(service).toMatch(/targetPort:\s+8080/);
     expect(service).toMatch(/nodePort:\s+30084/);
     expect(makefile).toContain('aiop=$(PUBLISH_IMAGE) aiop-web=$(PUBLISH_WEB_IMAGE)');
+    const deployTarget = makefile.slice(
+      makefile.indexOf('deploy-aios-integrated:'),
+      makefile.indexOf('\ncheck-user-id-migration:'),
+    );
+    const deleteService = deployTarget.indexOf('delete -f deploy/aiop/service-aios-integrated.yaml');
+    const applyService = deployTarget.indexOf('apply -f deploy/aiop/service-aios-integrated.yaml');
+    expect(deleteService).toBeGreaterThan(-1);
+    expect(deleteService).toBeLessThan(applyService);
   });
 });
