@@ -108,7 +108,7 @@ deploy-aios-integrated:
 	$(AIOP_KUBECTL) apply -f deploy/aiop/pvc-skills.yaml
 	$(AIOP_KUBECTL) apply -f deploy/aiop/service-aios-integrated.yaml
 	$(AIOP_KUBECTL) set image -f deploy/aiop/deployment-aios-integrated.yaml aiop=$(PUBLISH_IMAGE) --local -o yaml | $(AIOP_KUBECTL) apply -f -
-	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) set env deployment/aiop-server AIOP_ALLOW_MIXED_IDENTITY_SOURCE=$(AIOP_ALLOW_MIXED_IDENTITY_SOURCE)
+	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) set env deployment/aiop-server AIOP_DEPLOY_IMAGE=$(PUBLISH_IMAGE) AIOP_DEPLOY_WEB_IMAGE=$(PUBLISH_WEB_IMAGE) AIOP_ALLOW_MIXED_IDENTITY_SOURCE=$(AIOP_ALLOW_MIXED_IDENTITY_SOURCE)
 	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) rollout status deployment/aiop-server --timeout=300s
 
 check-user-id-migration:

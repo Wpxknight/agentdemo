@@ -20,6 +20,7 @@ describe('staging user-id migration operational contract', () => {
     );
     expect(deployTarget).not.toContain('$(MAKE) check-user-id-migration');
     expect(deployTarget).toContain('AIOP_ALLOW_MIXED_IDENTITY_SOURCE=$(AIOP_ALLOW_MIXED_IDENTITY_SOURCE)');
+    expect(deployTarget).toContain('AIOP_DEPLOY_IMAGE=$(PUBLISH_IMAGE) AIOP_DEPLOY_WEB_IMAGE=$(PUBLISH_WEB_IMAGE)');
     expect(makefile).toContain('AIOP_ALLOW_MIXED_IDENTITY_SOURCE ?= false');
     expect(makefile).toContain('\ncheck-user-id-migration:');
     expect(makefile).toContain('scripts/check-user-id-migration.ts');
