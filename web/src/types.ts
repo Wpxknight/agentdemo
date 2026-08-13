@@ -276,7 +276,6 @@ export interface RuntimeModelConfig {
   model: string;
   api_key: string;
   api_key_set: boolean;
-  api_key_preview: string;
   /** 允许该 LLM 访问使用自签名或不受信任证书的 HTTPS 服务。 */
   allow_insecure_tls?: boolean;
   context_window_tokens: number;

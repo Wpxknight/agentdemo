@@ -359,21 +359,14 @@ function currentModelConfig(rt: Runtime): RuntimeModelConfig {
   };
 }
 
-function maskApiKey(apiKey: string): string {
-  if (!apiKey) return '';
-  if (apiKey.length <= 6) return `${apiKey.slice(0, 1)}...${apiKey.slice(-1)}`;
-  return `${apiKey.slice(0, 3)}...${apiKey.slice(-3)}`;
-}
-
 function publicModelConfig(config: RuntimeModelConfig): Record<string, unknown> {
   return {
     id: config.id,
     protocol: config.protocol,
     base_url: config.baseURL,
     model: config.model,
-    api_key: config.apiKey,
+    api_key: '',
     api_key_set: Boolean(config.apiKey),
-    api_key_preview: maskApiKey(config.apiKey),
     allow_insecure_tls: Boolean(config.allowInsecureTls),
     context_window_tokens: contextWindowTokens(config),
     context_keep_images: keepImagesOf(config),

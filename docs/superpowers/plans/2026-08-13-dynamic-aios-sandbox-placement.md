@@ -99,3 +99,7 @@ make deploy-aios-integrated DEPLOYMENT_MODE=aios-integrated AUTH_PROVIDER=aios
 ## 复估节点
 
 阶段 2 完成并对远端 aios-sandbox 做一次 clusterName/clusterId/403 合约探测后复估剩余工作。若需要新增用户级集群授权查询或 allowlist，不纳入本计划，应先补充安全设计。
+
+## 166 兼容说明
+
+166 当前 Lifecycle pool credential 以 `clusterId` 绑定，直接发送 `clusterName` 会在凭据选择阶段失败。AIoP 支持通过默认空的 `AIOP_AIOS_SANDBOX_CLUSTER_DIRECTORY` 显式注入测试环境名称目录；名称匹配后仅 Lifecycle 请求改发 `clusterId`，Sandbox key 与 metadata 仍保留用户原始 `clusterName`。未知名称直接失败且不使用 fallback。该目录不替代用户级 AIOS 授权，生产默认不得启用；后续应以当前 AIOS 用户凭据查询平台公开集群目录。

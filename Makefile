@@ -14,6 +14,7 @@ AIOP_KUBECTL = $(KUBECTL) --kubeconfig $(AIOP_KUBECONFIG)
 AIOP_IMAGE_PULL_POLICY ?= Always
 AIOP_ALLOW_MIXED_IDENTITY_SOURCE ?= false
 AIOP_AIOS_DEBUG_LOCAL_LOGIN ?= false
+AIOP_AIOS_SANDBOX_CLUSTER_DIRECTORY ?=
 DEBUG_LOCAL_TENANT ?= default
 DEBUG_LOCAL_USERNAME ?= admin
 DEBUG_LOCAL_PASSWORD_SECRET ?= aiop-debug-local-login
@@ -115,7 +116,7 @@ deploy-aios-integrated:
 	$(AIOP_KUBECTL) delete -f deploy/aiop/service-aios-integrated.yaml --ignore-not-found --wait=true
 	$(AIOP_KUBECTL) apply -f deploy/aiop/service-aios-integrated.yaml
 	$(AIOP_KUBECTL) set image -f deploy/aiop/deployment-aios-integrated.yaml aiop=$(PUBLISH_IMAGE) aiop-web=$(PUBLISH_WEB_IMAGE) --local -o yaml | $(AIOP_KUBECTL) apply -f -
-	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) set env deployment/aiop-server AIOP_DEPLOY_IMAGE=$(PUBLISH_IMAGE) AIOP_DEPLOY_WEB_IMAGE=$(PUBLISH_WEB_IMAGE) AIOP_ALLOW_MIXED_IDENTITY_SOURCE=$(AIOP_ALLOW_MIXED_IDENTITY_SOURCE) AIOP_AIOS_DEBUG_LOCAL_LOGIN=$(AIOP_AIOS_DEBUG_LOCAL_LOGIN)
+	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) set env deployment/aiop-server AIOP_DEPLOY_IMAGE=$(PUBLISH_IMAGE) AIOP_DEPLOY_WEB_IMAGE=$(PUBLISH_WEB_IMAGE) AIOP_ALLOW_MIXED_IDENTITY_SOURCE=$(AIOP_ALLOW_MIXED_IDENTITY_SOURCE) AIOP_AIOS_DEBUG_LOCAL_LOGIN=$(AIOP_AIOS_DEBUG_LOCAL_LOGIN) AIOP_AIOS_SANDBOX_CLUSTER_DIRECTORY='$(AIOP_AIOS_SANDBOX_CLUSTER_DIRECTORY)'
 	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) rollout status deployment/aiop-server --timeout=300s
 
 reset-aios-debug-local-password:

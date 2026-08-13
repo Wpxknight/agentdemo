@@ -701,7 +701,7 @@ MCP 身份固定为 `{tenantId,actorId:userId,roles:[role]}`。
 - 认证：Bearer + `tenant:manage`
 - 行为：同步
 - 实现：`src/server/http.ts:1547`
-- Response：`200 {config,options?}`。config 为 `id,protocol,base_url,model,api_key,api_key_set,api_key_preview,allow_insecure_tls,context_window_tokens,context_keep_images,effort?`。注意：当前实现 **会返回完整 `api_key`**；调用方必须按敏感数据处理。
+- Response：`200 {config,options?}`。config 为 `id,protocol,base_url,model,api_key,api_key_set,allow_insecure_tls,context_window_tokens,context_keep_images,effort?`。`api_key` 固定为空字符串，`api_key_set` 仅表示服务端是否已配置凭据；接口不会返回完整 Key 或摘要。
 - 错误：`403` 权限。
 
 ### 更新 LLM 设置
@@ -711,7 +711,7 @@ MCP 身份固定为 `{tenantId,actorId:userId,roles:[role]}`。
 - 认证：Bearer + `tenant:manage`
 - 行为：同步持久化并热更新模型
 - 实现：`src/server/http.ts:1553`
-- Body：可用 `id/model_id` 选 option；或 `protocol` (`anthropic|openai`)、`base_url/baseURL`、`api_key/apiKey`、`model`、`allow_insecure_tls/allowInsecureTls` boolean、`context_window_tokens/contextWindowTokens` 正整数、`context_keep_images/contextKeepImages` >=0、`effort`。未知 effort 当前静默保留旧值。`allow_insecure_tls=true` 仅用于可信内网的自签名/不受信任证书 HTTPS LLM。
+- Body：可用 `id/model_id` 选 option；或 `protocol` (`anthropic|openai`)、`base_url/baseURL`、`api_key/apiKey`、`model`、`allow_insecure_tls/allowInsecureTls` boolean、`context_window_tokens/contextWindowTokens` 正整数、`context_keep_images/contextKeepImages` >=0、`effort`。`api_key` 缺省或为空时保留服务端已有凭据，非空时替换。未知 effort 当前静默保留旧值。`allow_insecure_tls=true` 仅用于可信内网的自签名/不受信任证书 HTTPS LLM。
 - Response：`200 {config,options?}`。
 - 错误：`400` 未知模型、protocol、必填连接字段、token 配置；`403` 权限。
 

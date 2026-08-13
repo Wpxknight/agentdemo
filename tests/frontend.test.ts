@@ -263,7 +263,19 @@ describe('frontend API wiring', () => {
     expect(app).toContain("fetch(apiUrl(host, '/v1/auth/capabilities'))");
     expect(app).toContain('authCapabilities?.capabilities.localLogin');
     expect(app).toContain("'测试环境调试登录'");
+    expect(app).toContain("debug={authCapabilities?.deploymentMode === 'aios-integrated'}");
     expect(adapter).toContain('async login(credentials: LoginCredentials)');
+  });
+
+  it('never pre-fills or renders the persisted model API key', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const types = await readFile('web/src/types.ts', 'utf8');
+
+    expect(app).toContain("api_key: ''");
+    expect(app).toContain("type=\"password\"");
+    expect(app).toContain("llm.api_key_set ? '已配置；留空保留' : '输入 API Key'");
+    expect(app).not.toContain("api_key: llm.api_key || ''");
+    expect(types).not.toContain('api_key_preview: string;');
   });
 
   it('supports dragging the right preview panel wider', async () => {
@@ -1250,7 +1262,7 @@ describe('frontend data APIs', () => {
         protocol: 'anthropic',
         base_url: 'http://localhost:8000/v1',
         model: 'ui-model',
-        api_key: 'ui-key',
+        api_key: '',
         api_key_set: true,
       });
     } finally {

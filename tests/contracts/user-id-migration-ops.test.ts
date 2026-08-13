@@ -23,6 +23,8 @@ describe('staging user-id migration operational contract', () => {
     expect(deployTarget).toContain('AIOP_DEPLOY_IMAGE=$(PUBLISH_IMAGE) AIOP_DEPLOY_WEB_IMAGE=$(PUBLISH_WEB_IMAGE)');
     expect(makefile).toContain('AIOP_ALLOW_MIXED_IDENTITY_SOURCE ?= false');
     expect(makefile).toContain('AIOP_AIOS_DEBUG_LOCAL_LOGIN ?= false');
+    expect(makefile).toContain('AIOP_AIOS_SANDBOX_CLUSTER_DIRECTORY ?=');
+    expect(deployTarget).toContain("AIOP_AIOS_SANDBOX_CLUSTER_DIRECTORY='$(AIOP_AIOS_SANDBOX_CLUSTER_DIRECTORY)'");
     expect(deployTarget).toContain('AIOP_AIOS_DEBUG_LOCAL_LOGIN=$(AIOP_AIOS_DEBUG_LOCAL_LOGIN)');
     expect(makefile).toContain('DEBUG_LOCAL_PASSWORD_SECRET ?= aiop-debug-local-login');
     expect(makefile).toContain("get secret \"$(DEBUG_LOCAL_PASSWORD_SECRET)\" -o jsonpath='{.data.password}'");

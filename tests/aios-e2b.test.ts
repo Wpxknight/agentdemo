@@ -134,7 +134,6 @@ describe('AiosE2bProvider', () => {
   });
 
   it.each([
-    [{ clusterName: ' cluster-pc1 ' }, { clusterName: 'cluster-pc1', namespace: 'aios-system' }],
     [{ clusterId: ' 35 ', namespace: ' test ' }, { clusterId: '35', namespace: 'test' }],
   ])('prefers dynamic placement and sends exactly one selector', async (placement, expected) => {
     const { fetch, requests } = queuedFetch([
@@ -147,6 +146,31 @@ describe('AiosE2bProvider', () => {
     });
     expect(requests[0].body).toMatchObject({ placement: expected });
     expect(JSON.stringify(requests[0].body)).not.toContain('clusterName' in expected ? 'clusterId' : 'clusterName');
+  });
+
+  it('resolves an explicitly authorized cluster name to clusterId while preserving caller metadata', async () => {
+    const { fetch, requests } = queuedFetch([
+      jsonResponse(201, { sandboxID: 'sb-name' }),
+      jsonResponse(200, { stdout: '', stderr: '', exitCode: 0 }),
+    ]);
+    await provider(fetch, { clusterDirectory: { 'cluster-pc1': '4' } }).create({
+      key: 'name', template: 'code-id', placement: { clusterName: 'cluster-pc1', namespace: 'aios-system' },
+      metadata: { placementSelector: 'clusterName', placementCluster: 'cluster-pc1' },
+    });
+    expect(requests[0].body).toMatchObject({
+      placement: { clusterId: '4', namespace: 'aios-system' },
+      metadata: { placementSelector: 'clusterName', placementCluster: 'cluster-pc1' },
+    });
+    expect((requests[0].body as { placement: object }).placement).not.toHaveProperty('clusterName');
+  });
+
+  it('rejects unknown cluster names before HTTP and never falls back to configured placement', async () => {
+    const fetch = vi.fn() as unknown as typeof globalThis.fetch;
+    const p = provider(fetch, { clusterDirectory: { allowed: '4' } });
+    await expect(p.create({
+      key: 'unknown', template: 'code-id', placement: { clusterName: 'unknown', namespace: 'aios-system' },
+    })).rejects.toThrow('未授权或未知集群名称');
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it('fails before HTTP when neither dynamic placement nor fallback exists', async () => {

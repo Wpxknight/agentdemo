@@ -36,7 +36,11 @@ export interface SandboxConfig {
   enabled: boolean;
   provider: 'local' | 'e2b' | 'opensandbox';
   apiKey?: string;
-  aios?: { lifecycleUrl: string; placement?: { clusterId?: string; clusterName?: string; namespace?: string } };
+  aios?: {
+    lifecycleUrl: string;
+    placement?: { clusterId?: string; clusterName?: string; namespace?: string };
+    clusterDirectory?: Readonly<Record<string, string>>;
+  };
   domain?: string;
   protocol?: 'http' | 'https';
   defaultImage?: string;

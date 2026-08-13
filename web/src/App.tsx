@@ -1880,7 +1880,7 @@ export default function App() {
 
   if (page === 'login') {
     if ((host.deploymentMode === 'standalone' && host.authProvider === 'local') || authCapabilities?.capabilities.localLogin) {
-      return <LoginPage authStatus={authStatus} onSubmit={submitLogin} debug={host.deploymentMode === 'aios-integrated'} />;
+      return <LoginPage authStatus={authStatus} onSubmit={submitLogin} debug={authCapabilities?.deploymentMode === 'aios-integrated'} />;
     }
     return <HostAuthenticationPending mode={host.deploymentMode === 'standalone' ? 'redirect' : 'waiting'} />;
   }
@@ -4447,11 +4447,11 @@ function SettingsPage({ llm, status, api, me, onLlmChange, onStatus, onRequestCo
   // 隐藏只是 UX，权限边界在后端 RBAC：普通用户只保留我的主目录；全局沙箱仅平台管理员可见。
   const isAdmin = me?.role === 'platform_admin' || me?.role === 'tenant_admin';
   const isPlatformAdmin = me?.role === 'platform_admin';
-  const [form, setForm] = useState(() => ({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', allow_insecure_tls: Boolean(llm.allow_insecure_tls), effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) }));
+  const [form, setForm] = useState(() => ({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: '', allow_insecure_tls: Boolean(llm.allow_insecure_tls), effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) }));
 
   useEffect(() => {
-    setForm({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', allow_insecure_tls: Boolean(llm.allow_insecure_tls), effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) });
-  }, [llm.api_key, llm.allow_insecure_tls, llm.base_url, llm.model, llm.protocol, llm.effort, llm.context_window_tokens]);
+    setForm({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: '', allow_insecure_tls: Boolean(llm.allow_insecure_tls), effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) });
+  }, [llm.api_key_set, llm.allow_insecure_tls, llm.base_url, llm.model, llm.protocol, llm.effort, llm.context_window_tokens]);
 
   // 上下文窗口仅在填了合法正整数时提交，避免编辑中间态触发后端 400。
   function formPayload() {
@@ -4507,7 +4507,8 @@ function SettingsPage({ llm, status, api, me, onLlmChange, onStatus, onRequestCo
                   <span>允许不安全 HTTPS（忽略证书校验）</span>
                 </Label>
                 {form.allow_insecure_tls ? <div className="settings-status">仅用于自签名或证书链不受信任的内网 LLM 服务；会降低中间人攻击防护。</div> : null}
-                <Label>API Key<Input placeholder="输入 API Key" value={form.api_key} onChange={(event) => setForm((current) => ({ ...current, api_key: event.target.value }))} /></Label>
+                <Label>API Key<Input type="password" placeholder={llm.api_key_set ? '已配置；留空保留' : '输入 API Key'} value={form.api_key} onChange={(event) => setForm((current) => ({ ...current, api_key: event.target.value }))} /></Label>
+                <div className="settings-hint">当前凭据：{llm.api_key_set ? '已配置' : '未配置'}。页面不会读取或回显已保存的 Key。</div>
                 <Label>Model<Input value={form.model} onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))} /></Label>
                 <Label>上下文窗口（tokens）<Input type="number" min={20000} step={1000} placeholder="200000" value={form.context_window_tokens} onChange={(event) => setForm((current) => ({ ...current, context_window_tokens: event.target.value }))} /></Label>
                 <Label>推理深度<Select value={form.effort} onValueChange={(effort) => setForm((current) => ({ ...current, effort: effort as ReasoningEffort }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="none">none（关闭思考）</SelectItem><SelectItem value="low">low</SelectItem><SelectItem value="medium">medium</SelectItem><SelectItem value="high">high</SelectItem><SelectItem value="xhigh">xhigh</SelectItem><SelectItem value="max">max</SelectItem></SelectGroup></SelectContent></Select></Label>
