@@ -12,6 +12,7 @@ AIOP_KUBECONFIG ?= /home/lb/.kube/config-10.241.0.166
 AIOP_NAMESPACE ?= aios-system
 AIOP_KUBECTL = $(KUBECTL) --kubeconfig $(AIOP_KUBECONFIG)
 AIOP_IMAGE_PULL_POLICY ?= Always
+AIOP_ALLOW_MIXED_IDENTITY_SOURCE ?= false
 SANDBOX_IMAGE ?= deploy.bocloud.k8s:40443/aios/aiop-sandbox:latest
 SANDBOX_PLATFORM ?= linux/amd64
 SANDBOX_KUBECTL_VERSION ?= v1.32.4
@@ -100,12 +101,14 @@ deploy-standalone:
 
 deploy-aios-integrated:
 	@test "$(DEPLOYMENT_MODE)" = "aios-integrated" || (printf '%s\n' 'Set DEPLOYMENT_MODE=aios-integrated' >&2; exit 1)
+	@test "$(AIOP_ALLOW_MIXED_IDENTITY_SOURCE)" = "false" -o "$(AIOP_ALLOW_MIXED_IDENTITY_SOURCE)" = "true" || (printf '%s\n' 'AIOP_ALLOW_MIXED_IDENTITY_SOURCE must be false or true' >&2; exit 1)
 	@# 测试环境部署不自动执行身份迁移预检；需要诊断时显式运行 check-user-id-migration。
 	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) get secret aiop-secrets -o name >/dev/null
 	$(AIOP_KUBECTL) apply -f deploy/aiop/configmap-aios-integrated.yaml
 	$(AIOP_KUBECTL) apply -f deploy/aiop/pvc-skills.yaml
 	$(AIOP_KUBECTL) apply -f deploy/aiop/service-aios-integrated.yaml
 	$(AIOP_KUBECTL) set image -f deploy/aiop/deployment-aios-integrated.yaml aiop=$(PUBLISH_IMAGE) --local -o yaml | $(AIOP_KUBECTL) apply -f -
+	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) set env deployment/aiop-server AIOP_ALLOW_MIXED_IDENTITY_SOURCE=$(AIOP_ALLOW_MIXED_IDENTITY_SOURCE)
 	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) rollout status deployment/aiop-server --timeout=300s
 
 check-user-id-migration:

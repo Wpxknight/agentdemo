@@ -35,6 +35,20 @@ describe('deployment identity database gate', () => {
     })).rejects.toThrow(/another identity namespace/);
   });
 
+  it('allows mixed identity sources only with the explicit AIOS-integrated unsafe override', async () => {
+    const { pool } = fakeIdentityModePool([1]);
+    await expect(assertIdentityModeCompatibility(pool as never, {
+      deploymentMode: 'aios-integrated', authProvider: 'aios', allowMixedIdentitySource: true,
+    })).resolves.toBeUndefined();
+  });
+
+  it('does not let the mixed identity override bypass standalone orphan validation', async () => {
+    const { pool } = fakeIdentityModePool([0, 0, 1]);
+    await expect(assertIdentityModeCompatibility(pool as never, {
+      deploymentMode: 'standalone', authProvider: 'local', allowMixedIdentitySource: true,
+    })).rejects.toThrow(/messages\.user_id.*direct or unmapped identities/);
+  });
+
   it('rejects direct or unmapped business identities in standalone mode', async () => {
     const { pool } = fakeIdentityModePool([0, 0, 1]);
     await expect(assertIdentityModeCompatibility(pool as never, {

@@ -535,6 +535,7 @@ export async function buildRuntime(
   const store = options.store ?? await createStore(mysqlConfig, {
     deploymentMode,
     authProvider: providerKind,
+    allowMixedIdentitySource: process.env.AIOP_ALLOW_MIXED_IDENTITY_SOURCE === 'true',
   });
   const skillMutationLock = mysqlConfig && store instanceof MysqlStore
     ? new MysqlSkillMutationLock(createMysqlPool(mysqlConfig))
