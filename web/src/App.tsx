@@ -4594,8 +4594,6 @@ type SandboxSettingsForm = {
   protocol: 'http' | 'https';
   defaultImage: string;
   lifecycleUrl: string;
-  clusterId: string;
-  namespace: string;
   apiKey: string;
 };
 
@@ -4607,8 +4605,6 @@ function sandboxSettingsForm(settings?: SandboxSettingsInfo): SandboxSettingsFor
     protocol: settings?.protocol ?? 'http',
     defaultImage: settings?.default_image ?? '',
     lifecycleUrl: settings?.lifecycle_url ?? '',
-    clusterId: settings?.placement?.cluster_id ?? '',
-    namespace: settings?.placement?.namespace ?? '',
     apiKey: '',
   };
 }
@@ -4631,7 +4627,6 @@ function sandboxSettingsPayload(form: SandboxSettingsForm): Record<string, unkno
     payload.domain = form.domain.trim();
   } else if (form.mode === 'aios_lifecycle') {
     payload.lifecycle_url = form.lifecycleUrl.trim();
-    payload.placement = { cluster_id: form.clusterId.trim(), namespace: form.namespace.trim() };
   } else if (form.mode === 'opensandbox') {
     payload.domain = form.domain.trim();
     payload.protocol = form.protocol;
@@ -4772,8 +4767,6 @@ function SandboxSettingsCard({ api, status, onStatus, onRequestConfirm }: {
         {form.mode === 'aios_lifecycle' ? (
           <>
             <Label>Lifecycle URL<Input disabled={busy} value={form.lifecycleUrl} spellCheck={false} placeholder="http(s)://lifecycle-service" onChange={(event) => setForm((current) => ({ ...current, lifecycleUrl: event.target.value }))} /></Label>
-            <Label>Cluster ID<Input disabled={busy} value={form.clusterId} spellCheck={false} onChange={(event) => setForm((current) => ({ ...current, clusterId: event.target.value }))} /></Label>
-            <Label>Namespace<Input disabled={busy} value={form.namespace} spellCheck={false} onChange={(event) => setForm((current) => ({ ...current, namespace: event.target.value }))} /></Label>
             <div className="settings-hint">模板由 AIOS 目录动态加载；browser 模板接入现有截图预览，sandbox-diag 仅平台管理员可见可用。</div>
             <div className={runtime?.status === 'catalog_unavailable' ? 'settings-status' : 'settings-hint'}>
               {runtime?.status === 'catalog_unavailable'

@@ -254,8 +254,7 @@ flowchart LR
 | `sandbox.provider` | `local/e2b/opensandbox` | 否 | `e2b` | provider | 普通 | `sandbox.aios` 仅允许 `e2b`。 |
 | `sandbox.apiKey` | 字符串 | provider 需要时 | provider env fallback | provider | **Secret** | JSONC key 优先于 E2B/AIOS provider 环境 fallback。 |
 | `sandbox.aios.lifecycleUrl` | HTTP(S) URL | AIOS Lifecycle | 无 | AIOS catalog/lifecycle | 普通 | 必须完整 URL。 |
-| `sandbox.aios.placement.clusterId` | 非空字符串 | AIOS Lifecycle | 无 | 调度 placement | 普通 | 每个 spec 不可覆盖。 |
-| `sandbox.aios.placement.namespace` | 非空字符串 | AIOS Lifecycle | 无 | 调度 placement | 普通 | 同上。 |
+| `sandbox.aios.placement` | 旧 `{clusterId|clusterName,namespace?}` | AIOS Lifecycle | 无 | 仅兼容旧配置 fallback | 普通 | 新调用通过工具参数动态指定；namespace 默认 `aios-system`。 |
 | `sandbox.domain` | host[:port] 字符串 | 自托管端点时 | provider 默认 | E2B/OpenSandbox | 普通 | 静态 schema 不统一校验 scheme；页面 settings 会严格规范化。 |
 | `sandbox.protocol` | `http/https` | OpenSandbox 可选 | provider 默认；页面投影为 `http` | OpenSandbox | 普通 | — |
 | `sandbox.defaultImage` | 字符串 | OpenSandbox 无 template 时 | provider 默认 | Sandbox image | 普通 | manifest netdiag/browser 示例依赖不同镜像能力。 |
@@ -288,7 +287,7 @@ flowchart LR
 | `protocol` | `http/https` | OpenSandbox 可选 | `http`（投影/credential target） | 平台 | 普通 | — |
 | `defaultImage` | 非空字符串 | OpenSandbox 可选 | provider default | 平台 | 普通 | — |
 | `lifecycleUrl` | 规范化 HTTP(S) URL | AIOS Lifecycle | 无 | 平台 | 普通 | 禁止 URL 凭据、query、fragment。 |
-| `placement.clusterId/namespace` | 非空字符串 | AIOS Lifecycle | 无 | 平台 | 普通 | — |
+| `placement` | 旧兼容字段 | AIOS Lifecycle | 无 | 平台 | 普通 | 设置页不再展示，新保存会移除。 |
 | `api_key` update | replace/retain/clear | 启用 standard E2B/AIOS 时必须存在 | retain | 加密 secret record | **Secret** | API 不回显完整 key，只返回 `api_key_set`；与 target 绑定。 |
 
 **优先级与 generation**：持久化 settings + 已解密 key > 静态 `sandbox`。更新顺序是：准备新 generation → Store 内原子保存普通 settings 与 encrypted secret → controller 原子切换 active generation；切换后旧 handle 由 controller 排空。MySQL Store 的 settings/secret 写入处于同一数据库事务，controller 内 generation 切换也各自原子，但 Store 事务与进程内切换不属于同一事务，跨 Store/Runtime **不是整体原子**。AIOS catalog 指纹未变化时不切 generation，后台每 60s 刷新。

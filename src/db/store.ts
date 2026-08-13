@@ -34,7 +34,8 @@ export interface SandboxSettings {
   defaultImage?: string;
   /** AIOS Lifecycle API 完整 HTTP(S) URL。 */
   lifecycleUrl?: string;
-  placement?: { clusterId: string; namespace: string };
+  /** @deprecated 旧记录的 AIOS placement fallback。 */
+  placement?: { clusterId?: string; clusterName?: string; namespace?: string };
 }
 
 /** Store 内部的 Sandbox 配置和不透明密文。 */

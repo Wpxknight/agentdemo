@@ -290,7 +290,10 @@ describe('SandboxSettingsPersistence', () => {
 
     await expect(persistence.save(enabled, { action: 'clear' })).rejects.toThrow(/API key/i);
     await persistence.save({ ...enabled, enabled: false }, { action: 'clear' });
-    expect(await persistence.load()).toEqual({ settings: { ...enabled, enabled: false }, apiKeySet: false });
+    expect(await persistence.load()).toEqual({
+      settings: { enabled: false, mode: 'aios_lifecycle', lifecycleUrl: 'http://aios-sandbox-server:8080' },
+      apiKeySet: false,
+    });
   });
 
   it('keeps MemoryStore records tenant scoped', async () => {

@@ -399,10 +399,6 @@ function publicSandboxSettings(settings: SandboxSettings, apiKeySet: boolean): R
       return {
         ...common,
         lifecycle_url: settings.lifecycleUrl,
-        placement: {
-          cluster_id: settings.placement?.clusterId,
-          namespace: settings.placement?.namespace,
-        },
         api_key_set: apiKeySet,
       };
     case 'opensandbox':
@@ -452,17 +448,11 @@ function sandboxSettingsFromBody(body: Record<string, unknown>): SandboxSettings
     if (!allowed.has(key)) throw new HttpError(400, `当前 Sandbox mode 不支持字段 ${key}`);
   }
 
-  const placement = body.placement && typeof body.placement === 'object' && !Array.isArray(body.placement)
-    ? body.placement as Record<string, unknown>
-    : body.placement;
   const input = mode === 'aios_lifecycle'
     ? {
         enabled,
         mode,
         lifecycleUrl: str(body, 'lifecycle_url'),
-        placement: placement && typeof placement === 'object'
-          ? { clusterId: str(placement as Record<string, unknown>, 'cluster_id'), namespace: str(placement as Record<string, unknown>, 'namespace') }
-          : placement,
       }
     : mode === 'opensandbox'
       ? {
@@ -509,7 +499,7 @@ function sandboxAuditDetail(settings: SandboxSettings, keyAction: SandboxApiKeyU
     enabled: settings.enabled,
     mode: settings.mode,
     ...(settings.mode === 'aios_lifecycle'
-      ? { endpoint: settings.lifecycleUrl, placement: settings.placement }
+      ? { endpoint: settings.lifecycleUrl }
       : settings.mode === 'standard_e2b'
         ? { endpoint: settings.domain ?? 'default' }
         : settings.mode === 'opensandbox'
@@ -625,6 +615,25 @@ function sessionIdFromBody(body: Record<string, unknown>): string {
 
 function profileFromBody(body: Record<string, unknown>): string | undefined {
   return str(body, 'profile') ?? str(body, 'sandboxProfile');
+}
+
+function addSandboxPlacementArgs(body: Record<string, unknown>, args: Record<string, JsonValue>): void {
+  const fields = [
+    ['cluster_name', 'clusterName'],
+    ['cluster_id', 'clusterId'],
+    ['namespace', 'namespace'],
+  ] as const;
+  for (const [input, output] of fields) {
+    if (body[input] === undefined) continue;
+    if (typeof body[input] !== 'string') throw new HttpError(400, `${input} 必须是字符串`);
+    args[output] = body[input] as string;
+  }
+  if (args.clusterName !== undefined && args.clusterId !== undefined) {
+    throw new HttpError(400, 'cluster_name 与 cluster_id 只能提供一个');
+  }
+  if (args.namespace !== undefined && args.clusterName === undefined && args.clusterId === undefined) {
+    throw new HttpError(400, 'namespace 不能单独提供，必须同时提供 cluster_name 或 cluster_id');
+  }
 }
 
 function intParam(value: string | null, fallback: number, min: number, max: number): number {
@@ -1579,6 +1588,7 @@ async function handle(
     if (language) args.language = language;
     const profile = profileFromBody(body);
     if (profile) args.profile = profile;
+    addSandboxPlacementArgs(body, args);
     return sendJson(res, 200, await dispatchDirectTool(
       rt,
       ctx,
@@ -1596,6 +1606,7 @@ async function handle(
     const args: Record<string, JsonValue> = { command };
     const profile = profileFromBody(body);
     if (profile) args.profile = profile;
+    addSandboxPlacementArgs(body, args);
     return sendJson(res, 200, await dispatchDirectTool(
       rt,
       ctx,

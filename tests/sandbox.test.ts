@@ -613,6 +613,24 @@ describe('sandbox tools', () => {
     }));
     expect(mgr.list()[0]).toMatchObject({ profile: 'netdiag', sessionId: 'sess-1' });
   });
+
+  it('isolates one session across dynamic placements and reuses identical placement', async () => {
+    const { provider } = mockProvider();
+    const mgr = new SandboxManager({ provider });
+    const tools = buildSandboxProfileTools(mgr, [{
+      id: 'code', name: 'code', description: 'code', envType: 'code', runtimeRole: 'sandbox-reader',
+      image: 'code-image', desktop: false, privileged: false, capabilities: ['shell'],
+    }]);
+    const run = tools.find((tool) => tool.name === 'sandbox_run_command')!;
+    await run.execute({ profile: 'code', command: 'true', clusterName: 'pc1' }, ctx);
+    await run.execute({ profile: 'code', command: 'true', clusterName: 'pc2' }, ctx);
+    await run.execute({ profile: 'code', command: 'true', clusterName: 'pc1' }, ctx);
+    expect(provider.create).toHaveBeenCalledTimes(2);
+    expect(mgr.list().map((item) => item.key)).toEqual(expect.arrayContaining([
+      'sess-1:profile:code:placement:["clusterName","pc1","aios-system"]',
+      'sess-1:profile:code:placement:["clusterName","pc2","aios-system"]',
+    ]));
+  });
 });
 
 describe('LocalSandboxProvider', () => {

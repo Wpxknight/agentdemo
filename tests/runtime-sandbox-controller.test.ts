@@ -295,14 +295,18 @@ describe('runtime sandbox controller', () => {
       const pendingCatalog = deferred<Response>();
       fetch.mockImplementationOnce(async () => pendingCatalog.promise);
       const refresh = rt.refreshSandboxTemplates!();
-      await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(fetch.mock.calls.length).toBeGreaterThanOrEqual(2));
 
       const switchMode = rt.updateSandbox!({
         settings: { enabled: true, mode: 'local' },
         keyAction: { action: 'clear' },
       });
       await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(rt.sandboxSettings).toEqual(AIOS_SETTINGS);
+      expect(rt.sandboxSettings).toEqual({
+        enabled: true,
+        mode: 'aios_lifecycle',
+        lifecycleUrl: AIOS_SETTINGS.lifecycleUrl,
+      });
 
       pendingCatalog.resolve(jsonResponse(200, aiosCatalog('two')));
       await refresh;

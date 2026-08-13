@@ -443,10 +443,6 @@ export interface SandboxSettingsInfo {
   protocol?: 'http' | 'https';
   default_image?: string;
   lifecycle_url?: string;
-  placement?: {
-    cluster_id: string;
-    namespace: string;
-  };
   api_key_set: boolean;
 }
 

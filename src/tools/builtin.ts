@@ -1,7 +1,7 @@
 import type { JsonValue, ToolResult } from '../llm/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import type { SandboxManagerLike } from '@aiop/sandbox-runtime';
-import { isSandboxAcquirer, type SpecResolver } from '@aiop/sandbox-runtime';
+import { isSandboxAcquirer, type SandboxPlacementInput, type SpecResolver, withSandboxPlacement } from '@aiop/sandbox-runtime';
 import { sandboxIdentityKey, sandboxIdentityMetadata } from '@aiop/sandbox-runtime';
 import { createSandboxToolDefinitions, downloadAcquiredSandbox, executeAcquiredSandbox, uploadAcquiredSandbox } from '@aiop/sandbox-runtime';
 import type { SandboxSpec } from '@aiop/sandbox-runtime';
@@ -24,13 +24,31 @@ function reqString(o: Record<string, JsonValue>, key: string): string {
   return v;
 }
 
-export async function resolveSandboxSpec(resolve: SpecResolver, ctx: ToolContext): Promise<SandboxSpec> {
-  const partial = await resolve(ctx);
-  return {
+function optString(o: Record<string, JsonValue>, key: string): string | undefined {
+  const value = o[key];
+  return typeof value === 'string' && value ? value : undefined;
+}
+
+function placementFromArgs(o: Record<string, JsonValue>): SandboxPlacementInput | undefined {
+  const keys = ['clusterName', 'clusterId', 'namespace'] as const;
+  if (!keys.some((key) => o[key] !== undefined)) return undefined;
+  for (const key of keys) if (o[key] !== undefined && typeof o[key] !== 'string') throw new Error(`参数 ${key} 必须是字符串`);
+  return { clusterName: optString(o, 'clusterName'), clusterId: optString(o, 'clusterId'), namespace: optString(o, 'namespace') };
+}
+
+const placementProperties = {
+  clusterName: { type: 'string', description: '目标 Kubernetes 集群名称；与 clusterId 二选一，不能猜测 ID' },
+  clusterId: { type: 'string', description: '目标 Kubernetes 集群 ID；与 clusterName 二选一' },
+  namespace: { type: 'string', description: '目标 namespace；省略时使用 aios-system', default: 'aios-system' },
+} as const;
+
+export async function resolveSandboxSpec(resolve: SpecResolver, ctx: ToolContext, placement?: SandboxPlacementInput): Promise<SandboxSpec> {
+  const partial = await resolve(ctx, undefined, placement);
+  return withSandboxPlacement({
     key: sandboxIdentityKey(ctx),
     ...partial,
     metadata: { ...sandboxIdentityMetadata(ctx), ...partial.metadata },
-  };
+  }, partial.placement || placement === undefined ? undefined : placement);
 }
 
 /** 构造 E2B 沙箱内置工具：sbx__run_code / sbx__run_command。 */
@@ -38,9 +56,9 @@ export function buildSandboxTools(
   manager: SandboxManagerLike,
   resolve: SpecResolver = defaultResolver,
 ): ToolHandler[] {
-  const acquire = async (ctx: ToolContext) => {
-    if (isSandboxAcquirer(manager)) return manager.acquire(ctx);
-    const spec = await resolveSandboxSpec(resolve, ctx);
+  const acquire = async (ctx: ToolContext, placement?: SandboxPlacementInput) => {
+    if (isSandboxAcquirer(manager)) return manager.acquire(ctx, undefined, placement);
+    const spec = await resolveSandboxSpec(resolve, ctx, placement);
     const handle = await manager.get(spec, { signal: ctx.signal });
     return { handle, spec, invalidate: () => manager.evict?.(spec.key, handle) };
   };
@@ -49,7 +67,7 @@ export function buildSandboxTools(
     args: JsonValue,
     ctx: ToolContext,
   ): Promise<ToolResult> => {
-    const acquired = await acquire(ctx);
+    const acquired = await acquire(ctx, placementFromArgs(asObject(args)));
     const definitions = createSandboxToolDefinitions({
       runCode: (code, options) => executeAcquiredSandbox(acquired, { code, language: options.language, signal: options.signal, onOutput: ctx.onOutput }),
       runCommand: (command, options) => executeAcquiredSandbox(acquired, { command, signal: options.signal, onOutput: ctx.onOutput }),
@@ -91,6 +109,7 @@ export function buildSandboxTools(
               type: 'string',
               description: '语言，如 python / javascript；缺省 python',
             },
+            ...placementProperties,
           },
           required: ['code'],
         },
@@ -98,7 +117,8 @@ export function buildSandboxTools(
         const o = asObject(args);
         const code = reqString(o, 'code');
         const language = typeof o.language === 'string' ? o.language : undefined;
-        return executeAdapter('sbx__run_code', { code, ...(language ? { language } : {}) }, ctx);
+        const placement = placementFromArgs(o);
+        return executeAdapter('sbx__run_code', { code, ...(language ? { language } : {}), ...placement }, ctx);
       },
     }),
     defineTool({
@@ -109,13 +129,14 @@ export function buildSandboxTools(
           type: 'object',
           properties: {
             command: { type: 'string', description: '要执行的 shell 命令' },
+            ...placementProperties,
           },
           required: ['command'],
         },
       async execute(args, ctx): Promise<ToolResult> {
         const o = asObject(args);
         const command = reqString(o, 'command');
-        return executeAdapter('sbx__run_command', { command }, ctx);
+        return executeAdapter('sbx__run_command', { command, ...placementFromArgs(o) }, ctx);
       },
     }),
   ];

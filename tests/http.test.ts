@@ -1705,6 +1705,21 @@ describe('HTTP server', () => {
         headers,
         body: JSON.stringify({ sessionId: 'session-a', command: 'echo a' }),
       });
+      const dynamic = await fetch(`${sandboxBase}/v1/sandbox/run-code`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ sessionId: 'session-c', code: 'print(1)', cluster_name: 'cluster-pc1' }),
+      });
+      expect(dynamic.status).toBe(200);
+      expect(provider.create).toHaveBeenCalledWith(expect.objectContaining({
+        placement: { clusterName: 'cluster-pc1', namespace: 'aios-system' },
+      }));
+
+      const conflict = await fetch(`${sandboxBase}/v1/sandbox/run-code`, {
+        method: 'POST', headers,
+        body: JSON.stringify({ code: 'print(1)', cluster_name: 'pc1', cluster_id: '35' }),
+      });
+      expect(conflict.status).toBe(400);
       await fetch(`${sandboxBase}/v1/sandbox/run-command`, {
         method: 'POST',
         headers,
@@ -1741,6 +1756,14 @@ describe('HTTP server', () => {
         expect.objectContaining({
           id: 'sandbox-2',
           sandboxId: 'sandbox-2',
+          sessionId: 'session-c',
+          status: 'ready',
+          type: 'cluster',
+          metadata: expect.objectContaining({ placementCluster: 'cluster-pc1', placementNamespace: 'aios-system' }),
+        }),
+        expect.objectContaining({
+          id: 'sandbox-3',
+          sandboxId: 'sandbox-3',
           sessionId: 'session-b',
           status: 'ready',
           type: 'diag-id',
@@ -3038,7 +3061,6 @@ describe('HTTP server 平台 Sandbox 设置', () => {
           enabled: true,
           mode: 'aios_lifecycle',
           lifecycle_url: 'https://sandbox.example.test/lifecycle',
-          placement: { cluster_id: 'local', namespace: 'sandbox-system' },
           api_key_set: true,
         },
         runtime: { enabled: true, mode: 'aios_lifecycle', status: 'active' },
@@ -3135,7 +3157,6 @@ describe('HTTP server 平台 Sandbox 设置', () => {
           enabled: true,
           mode: 'aios_lifecycle',
           lifecycle_url: 'https://sandbox.example.test/lifecycle',
-          placement: { cluster_id: 'cluster-a', namespace: 'sandbox-system' },
           api_key_set: true,
         },
         runtime: {
@@ -3227,14 +3248,12 @@ describe('HTTP server 平台 Sandbox 设置', () => {
             enabled: true,
             mode: 'aios_lifecycle',
             lifecycle_url: 'https://AIOS.EXAMPLE.TEST/lifecycle/',
-            placement: { cluster_id: 'cluster-a', namespace: 'sandbox-system' },
             api_key: 'aios-key',
           },
           settings: {
             enabled: true,
             mode: 'aios_lifecycle',
             lifecycleUrl: 'https://aios.example.test/lifecycle',
-            placement: { clusterId: 'cluster-a', namespace: 'sandbox-system' },
           },
         },
         {
@@ -3413,7 +3432,6 @@ describe('HTTP server 平台 Sandbox 设置', () => {
           enabled: true,
           mode: 'aios_lifecycle',
           lifecycle_url: 'https://sandbox.example.test/lifecycle',
-          placement: { cluster_id: 'cluster-a', namespace: 'sandbox-system' },
           api_key: 'replacement-key',
         }),
       });
@@ -3427,7 +3445,6 @@ describe('HTTP server 平台 Sandbox 设置', () => {
           enabled: true,
           mode: 'aios_lifecycle',
           endpoint: 'https://sandbox.example.test/lifecycle',
-          placement: { clusterId: 'cluster-a', namespace: 'sandbox-system' },
           keyAction: 'replace',
         },
       });

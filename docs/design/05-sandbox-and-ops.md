@@ -20,9 +20,9 @@ Pi 不直接依赖 provider SDK；它只调用经过 Governed Tool Execution 包
 | `local` | `local` | 无 | 本机开发/测试 provider |
 | `standard_e2b` | `e2b` | 标准 E2B domain | 直接使用 E2B provider |
 | `opensandbox` | `opensandbox` | OpenSandbox domain/protocol | 自建 OpenSandbox provider |
-| `aios_lifecycle` | `e2b` | AIOS Lifecycle URL + placement | 产品模式是 AIOS lifecycle，但内部仍由带 AIOS adapter 的 E2B provider 执行 |
+| `aios_lifecycle` | `e2b` | AIOS Lifecycle URL；placement 由每次沙箱调用提供 | 产品模式是 AIOS lifecycle，但内部仍由带 AIOS adapter 的 E2B provider 执行 |
 
-因此，`mode=aios_lifecycle` 不等于存在名为 `aios_lifecycle` 的 provider；其精确映射是 `provider=e2b` 加 `aios.lifecycleUrl/placement`。内部 provider 联合类型只有 `local | e2b | opensandbox`。
+因此，`mode=aios_lifecycle` 不等于存在名为 `aios_lifecycle` 的 provider；其精确映射是 `provider=e2b` 加 `aios.lifecycleUrl`。内部 provider 联合类型只有 `local | e2b | opensandbox`。旧配置中的 placement 仅作为兼容 fallback。
 
 API key 与规范化远端目标绑定。切换 credential target 时不能静默复用旧 key；`local` 不接受 API key。Sandbox 设置和加密 Secret 通过 Store 原子保存，但新 generation 在保存前先准备，以减少写入不可用配置的概率。
 

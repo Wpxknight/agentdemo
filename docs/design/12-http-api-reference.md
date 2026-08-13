@@ -608,11 +608,13 @@ MCP 身份固定为 `{tenantId,actorId:userId,roles:[role]}`。
 - 行为：同步等待工具
 - 实现：`src/server/http.ts:1458`
 - Body：`code:string` 必填；`language?:string`；`profile` 或 `sandboxProfile` 可选；`sessionId` 可选。
-- Response/错误：同直接工具调用。指定 profile 调 `sandbox_run_code`，否则 `sbx__run_code`；缺 code 为 `400`。
+- 可选调度字段：`cluster_name` 或 `cluster_id`（二选一），`namespace` 缺省为 `aios-system`。指定 profile 调 `sandbox_run_code`，否则 `sbx__run_code`；缺 code、选择器冲突或仅传 namespace 为 `400`。
 
 ### 运行命令
 
 `POST /v1/sandbox/run-command`
+
+- 同样支持 `cluster_name`、`cluster_id`、`namespace` 动态调度字段。
 
 - 认证：Bearer；直接工具策略生效
 - 行为：同步等待工具
@@ -731,7 +733,7 @@ MCP 身份固定为 `{tenantId,actorId:userId,roles:[role]}`。
 - 认证：Bearer + `tenant:manage`
 - 行为：同步；scope 固定 `platform`
 - 实现：`src/server/http.ts:1591`
-- Response：`200 {scope:"platform",settings,runtime?}`。settings 公共字段为 `enabled,mode,api_key_set`，按 mode 增加：standard_e2b `domain?`；aios_lifecycle `lifecycle_url,placement:{cluster_id,namespace}`；opensandbox `domain?,protocol,default_image?`；local 无 key。runtime 可含 `enabled,mode,status,template_count,last_successful_refresh_at`。
+- Response：`200 {scope:"platform",settings,runtime?}`。settings 公共字段为 `enabled,mode,api_key_set`，按 mode 增加：standard_e2b `domain?`；aios_lifecycle `lifecycle_url`；opensandbox `domain?,protocol,default_image?`；local 无 key。runtime 可含 `enabled,mode,status,template_count,last_successful_refresh_at`。
 
 ### 更新 Sandbox Runtime 设置
 
@@ -741,7 +743,7 @@ MCP 身份固定为 `{tenantId,actorId:userId,roles:[role]}`。
 - 行为：同步应用平台全局 runtime 并写 sandbox audit
 - 实现：`src/server/http.ts:1607`
 
-公共 body：`enabled:boolean`、`mode` 必填（`standard_e2b|aios_lifecycle|opensandbox|local`）、`api_key?:string`、`clear_api_key?:boolean`。mode 专属：standard_e2b `domain?`；aios_lifecycle `lifecycle_url`、`placement:{cluster_id,namespace}`；opensandbox `domain?`,`protocol?`,`default_image?`。传入当前 mode 不支持字段会 `400`；api_key 与 clear 互斥，local 禁止 key；启用 standard_e2b/aios_lifecycle 时清 key 被拒。
+公共 body：`enabled:boolean`、`mode` 必填（`standard_e2b|aios_lifecycle|opensandbox|local`）、`api_key?:string`、`clear_api_key?:boolean`。mode 专属：standard_e2b `domain?`；aios_lifecycle `lifecycle_url`；opensandbox `domain?`,`protocol?`,`default_image?`。兼容窗口内 AIOS 的旧 `placement` 字段会被接受但忽略且不持久化；其他不支持字段返回 `400`。
 
 - Response：同查询。
 - 错误：`400` Schema/凭据目标；`403`；`503` runtime 不支持动态设置；应用失败通常 `500`。

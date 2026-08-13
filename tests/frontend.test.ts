@@ -1021,8 +1021,9 @@ describe('frontend API wiring', () => {
     expect(app).toContain('<SelectItem value="opensandbox">OpenSandbox（k8s）</SelectItem>');
     expect(app).toContain('<SelectItem value="local">Local（本地开发）</SelectItem>');
     expect(app).toContain('Lifecycle URL');
-    expect(app).toContain('Cluster ID');
-    expect(app).toContain('Namespace');
+    expect(app).not.toContain('<Label>Cluster ID');
+    expect(app).not.toContain('<Label>Namespace');
+    expect(sandboxSettingsType).not.toContain('placement');
     expect(app).toContain('模板由 AIOS 目录动态加载；browser 模板接入现有截图预览，sandbox-diag 仅平台管理员可见可用。');
     expect(app).not.toContain('固定使用 code-interpreter');
     expect(app).toContain('template_count');

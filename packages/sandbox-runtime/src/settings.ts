@@ -37,9 +37,10 @@ const AiosLifecycleSettingsSchema = EnabledModeSchema.extend({
   mode: z.literal('aios_lifecycle'),
   lifecycleUrl: z.string().trim().min(1).transform(normalizeLifecycleUrl),
   placement: z.object({
-    clusterId: z.string().trim().min(1),
-    namespace: z.string().trim().min(1),
-  }).strict(),
+    clusterId: z.string().trim().min(1).optional(),
+    clusterName: z.string().trim().min(1).optional(),
+    namespace: z.string().trim().min(1).optional(),
+  }).strict().optional(),
 }).strict();
 
 export const SandboxSettingsSchema = z.discriminatedUnion('mode', [
@@ -140,7 +141,7 @@ export function sandboxConfigToSettings(config: SandboxConfig): SandboxSettings 
       enabled: config.enabled,
       mode: 'aios_lifecycle',
       lifecycleUrl: config.aios.lifecycleUrl,
-      placement: config.aios.placement,
+      ...(config.aios.placement ? { placement: config.aios.placement } : {}),
     });
   }
   if (config.provider === 'local') return { enabled: config.enabled, mode: 'local' };
@@ -201,12 +202,15 @@ export function sandboxSettingsToConfig(settings: SandboxSettings, apiKey?: stri
         userHomeMountPath: '/home/user/host',
       };
     case 'aios_lifecycle':
-      if (!settings.lifecycleUrl || !settings.placement) throw new Error('AIOS Lifecycle 设置缺少 URL 或 placement');
+      if (!settings.lifecycleUrl) throw new Error('AIOS Lifecycle 设置缺少 lifecycleUrl');
       return {
         enabled: settings.enabled,
         provider: 'e2b',
         ...(apiKey ? { apiKey } : {}),
-        aios: { lifecycleUrl: settings.lifecycleUrl, placement: { ...settings.placement } },
+        aios: {
+          lifecycleUrl: settings.lifecycleUrl,
+          ...(settings.placement ? { placement: { ...settings.placement } } : {}),
+        },
         desktop: false,
         userHomeMountPath: '/home/user/host',
       };
@@ -235,7 +239,10 @@ export class SandboxSettingsPersistence {
   }
 
   async save(input: SandboxSettings, update: SandboxApiKeyUpdate): Promise<LoadedSandboxSettings> {
-    const settings = parseSandboxSettings(input);
+    const parsed = parseSandboxSettings(input);
+    const settings = parsed.mode === 'aios_lifecycle'
+      ? { enabled: parsed.enabled, mode: parsed.mode, lifecycleUrl: parsed.lifecycleUrl } as SandboxSettings
+      : parsed;
     const current = await this.store.getSandboxSettingsRecord(this.ctx);
     let storedUpdate: SandboxSettingsSecretUpdate;
     let apiKey: string | undefined;

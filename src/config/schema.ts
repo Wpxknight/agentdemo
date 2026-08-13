@@ -67,11 +67,14 @@ const AiosSandboxConfigSchema = z.object({
   lifecycleUrl: z.string().url().refine((url) => /^https?:\/\//.test(url), {
     message: 'lifecycleUrl 必须是完整 HTTP(S) URL',
   }),
-  /** AIOS 调度目标；固定于启动配置，不接受每个 SandboxSpec 覆盖。 */
+  /** @deprecated AIOS 调度 fallback；新调用应通过 SandboxSpec 动态提供。 */
   placement: z.object({
-    clusterId: z.string().trim().min(1),
-    namespace: z.string().trim().min(1),
-  }),
+    clusterId: z.string().trim().min(1).optional(),
+    clusterName: z.string().trim().min(1).optional(),
+    namespace: z.string().trim().min(1).optional(),
+  }).refine((value) => Boolean(value.clusterId) !== Boolean(value.clusterName), {
+    message: 'clusterId 与 clusterName 必须且只能提供一个',
+  }).optional(),
 });
 
 export const SandboxConfigSchema = z

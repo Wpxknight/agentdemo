@@ -96,6 +96,7 @@ import {
   sandboxSpecForProfile,
   selectBrowserProfile,
   selectDefaultProfile,
+  withSandboxPlacement,
 } from '@aiop/sandbox-runtime';
 import type { PublicSandboxProfile } from '@aiop/sandbox-runtime';
 import { LocalAuthProvider } from './auth/local.js';
@@ -628,7 +629,7 @@ export async function buildRuntime(
           aios: {
             lifecycleUrl: cfg.aios.lifecycleUrl,
             apiKey: cfg.apiKey,
-            placement: { ...cfg.aios.placement },
+            ...(cfg.aios.placement ? { placement: { ...cfg.aios.placement } } : {}),
             allowedTemplateIds: new Set(catalogSnapshot!.templates.map((template) => template.templateId)),
           },
         })
@@ -645,14 +646,15 @@ export async function buildRuntime(
     const skillSandboxEnv = config.skills?.sandboxEnv;
     const userHomeMountPath = cfg.userHomeMountPath ?? '/home/user/host';
     const userHomeRoot = cfg.userHomeRoot;
-    const resolver: SpecResolver = async (ctx, profileName) => {
+    const resolver: SpecResolver = async (ctx, profileName, placement) => {
       const role = ctx.role ?? 'user';
       const selectedProfile = profileName
         ? findSandboxProfile(profiles, profileName, role)
         : selectDefaultProfile(profiles, role);
       if (cfg.aios && !selectedProfile) throw new Error('当前身份没有可用的代码沙箱模板');
       const base = selectedProfile ? sandboxSpecForProfile(selectedProfile, ctx) : { key: ctx.sessionId };
-      const spec = skillSandboxEnv ? { ...base, envs: { ...skillSandboxEnv, ...base.envs } } : base;
+      const unresolved = skillSandboxEnv ? { ...base, envs: { ...skillSandboxEnv, ...base.envs } } : base;
+      const spec = withSandboxPlacement(unresolved, placement);
       if (cfg.aios || !ctx.tenantId || !ctx.userId) return spec;
       const user = await store.getUser(ctx.tenantId, ctx.userId).catch(() => undefined);
       if (!user?.homeDir) return spec;

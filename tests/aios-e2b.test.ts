@@ -133,6 +133,29 @@ describe('AiosE2bProvider', () => {
     expect(sleep).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    [{ clusterName: ' cluster-pc1 ' }, { clusterName: 'cluster-pc1', namespace: 'aios-system' }],
+    [{ clusterId: ' 35 ', namespace: ' test ' }, { clusterId: '35', namespace: 'test' }],
+  ])('prefers dynamic placement and sends exactly one selector', async (placement, expected) => {
+    const { fetch, requests } = queuedFetch([
+      jsonResponse(201, { sandboxID: 'sb-dynamic' }),
+      jsonResponse(200, { stdout: '', stderr: '', exitCode: 0 }),
+    ]);
+    await provider(fetch).create({
+      key: 'dynamic', template: 'code-id',
+      placement: { ...placement, namespace: 'namespace' in placement ? placement.namespace : 'aios-system' },
+    });
+    expect(requests[0].body).toMatchObject({ placement: expected });
+    expect(JSON.stringify(requests[0].body)).not.toContain('clusterName' in expected ? 'clusterId' : 'clusterName');
+  });
+
+  it('fails before HTTP when neither dynamic placement nor fallback exists', async () => {
+    const fetch = vi.fn() as unknown as typeof globalThis.fetch;
+    const p = provider(fetch, { placement: undefined });
+    await expect(p.create({ key: 'missing', template: 'code-id' })).rejects.toThrow(/clusterName|clusterId/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it('aborts a 409 readiness retry sleep promptly and completes late sandbox cleanup', async () => {
     const cleanup = deferred<Response>();
     const cleanupFinished = vi.fn();
