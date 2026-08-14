@@ -602,7 +602,9 @@ describe('sandbox tools', () => {
     expect(listed.content).toContain('netdiag');
     expect(listed.content).toContain('tcpdump');
 
-    const res = await runCommand.execute({ profile: 'netdiag', command: 'kubectl get pods' }, ctx);
+    const res = await runCommand.execute({
+      profile: 'netdiag', command: 'kubectl get pods', timeoutMs: 600_000,
+    }, ctx);
 
     expect(res.content).toContain('out:kubectl get pods');
     expect(provider.create).toHaveBeenCalledWith(expect.objectContaining({
@@ -611,10 +613,15 @@ describe('sandbox tools', () => {
       template: 'aiop/opensandbox-netdiag:dev',
       metadata: expect.objectContaining({ sessionId: 'sess-1', profile: 'netdiag', privileged: 'true' }),
     }));
+    const created = await vi.mocked(provider.create).mock.results[0]!.value;
+    expect(created.runCommand).toHaveBeenCalledWith('kubectl get pods', expect.objectContaining({ timeoutMs: 600_000 }));
     expect(mgr.list()[0]).toMatchObject({ profile: 'netdiag', sessionId: 'sess-1' });
+    await expect(runCommand.execute({
+      profile: 'netdiag', command: 'true', timeoutMs: 900_001,
+    }, ctx)).rejects.toThrow(/timeoutMs/);
   });
 
-  it('validates but ignores placement routing for non-AIOS profile tools', async () => {
+  it('normalizes but ignores placement routing for non-AIOS profile tools', async () => {
     const { provider } = mockProvider();
     const mgr = new SandboxManager({ provider });
     const tools = buildSandboxProfileTools(mgr, [{
@@ -629,7 +636,8 @@ describe('sandbox tools', () => {
     expect(mgr.list().map((item) => item.key)).toEqual(['sess-1:profile:code']);
     await expect(run.execute({
       profile: 'code', command: 'true', clusterName: 'pc1', clusterId: '35',
-    }, ctx)).rejects.toThrow(/只能提供一个/);
+    }, ctx)).resolves.toMatchObject({ isError: false });
+    expect(provider.create).toHaveBeenCalledTimes(1);
   });
 });
 

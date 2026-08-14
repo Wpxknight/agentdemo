@@ -48,7 +48,7 @@ import { E2bDesktopProvider } from '@aiop/sandbox-runtime';
 import { LocalDesktopProvider } from '@aiop/sandbox-runtime';
 import { OpenSandboxDesktopProvider } from '@aiop/sandbox-runtime';
 import { CommandDesktopProvider } from '@aiop/sandbox-runtime';
-import type { DesktopProvider } from '@aiop/sandbox-runtime';
+import type { DesktopProvider, SandboxSpec } from '@aiop/sandbox-runtime';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildSandboxTools } from './tools/builtin.js';
@@ -257,6 +257,7 @@ export function bridgeDurableGovernedTools(input: {
         turnNo: input.context.turnNo,
         sessionId: input.context.sessionId,
         signal: context.signal,
+        onUpdate: context.onUpdate,
         interactionResolution: input.context.interactionResolution,
       });
       if (outcome.kind === 'result') return attachGovernedToolFacts(outcome.result, outcome);
@@ -654,6 +655,7 @@ export async function buildRuntime(
     const skillSandboxEnv = config.skills?.sandboxEnv;
     const userHomeMountPath = cfg.userHomeMountPath ?? '/home/user/host';
     const userHomeRoot = cfg.userHomeRoot;
+    const browserSpecs = new Map<string, SandboxSpec>();
     const resolver: SpecResolver = async (ctx, profileName, placement) => {
       const role = ctx.role ?? 'user';
       const selectedProfile = profileName
@@ -663,8 +665,9 @@ export async function buildRuntime(
       const base = selectedProfile ? sandboxSpecForProfile(selectedProfile, ctx) : { key: ctx.sessionId };
       const unresolved = skillSandboxEnv ? { ...base, envs: { ...skillSandboxEnv, ...base.envs } } : base;
       const spec = cfg.aios
-        ? withSandboxPlacement(unresolved, placement ?? cfg.aios.placement)
+        ? withSandboxPlacement(unresolved, placement, cfg.aios.placement)
         : (placement === undefined ? unresolved : (normalizeSandboxPlacement(placement), unresolved));
+      if (cfg.aios && selectedProfile?.envType === 'browser') browserSpecs.set(base.key, spec);
       if (cfg.aios || !ctx.tenantId || !ctx.userId) return spec;
       const user = await store.getUser(ctx.tenantId, ctx.userId).catch(() => undefined);
       if (!user?.homeDir) return spec;
@@ -693,7 +696,11 @@ export async function buildRuntime(
       resolveDesktop = async (ctx) => {
         const profile = selectBrowserProfile(profiles, ctx.role ?? 'user');
         if (!profile) throw new Error('当前身份没有可用的浏览器沙箱模板');
-        const spec = withSandboxPlacement(sandboxSpecForProfile(profile, ctx), cfg.aios?.placement);
+        const base = sandboxSpecForProfile(profile, ctx);
+        const existing = browserSpecs.get(base.key);
+        const spec = existing && manager.has(existing.key)
+          ? existing
+          : withSandboxPlacement(base, cfg.aios?.placement);
         return { key: spec.key, create: () => dp.create(spec) };
       };
     } else if (cfg.desktop) {

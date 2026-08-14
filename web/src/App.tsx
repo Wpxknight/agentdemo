@@ -145,6 +145,10 @@ interface ConfirmDialogRequest {
   onConfirm: () => void | Promise<void>;
 }
 
+interface QuestionsBody {
+  questions: PendingQuestion[];
+}
+
 function sessionCategoryFor(session: SessionSummary) {
   const text = `${session.title} ${session.desc}`.toLowerCase();
   if (text.includes('pod') || text.includes('异常') || text.includes('oom')) {
@@ -1191,6 +1195,15 @@ export default function App() {
     setSandboxProfiles(body.profiles || []);
   }, [api]);
 
+  const loadPendingQuestions = useCallback(async () => {
+    const body = await api.get<QuestionsBody>('/v1/questions');
+    setPendingQuestions(Object.fromEntries(
+      (body.questions || [])
+        .filter((item) => item?.id && item.sessionId && Array.isArray(item.questions))
+        .map((item) => [item.sessionId, item]),
+    ));
+  }, [api]);
+
   useEffect(() => {
     if (!token || !isPersistedSession(sessionId, sessions)) return;
     void loadContextUsage(sessionId);
@@ -1204,6 +1217,7 @@ export default function App() {
         // 模型配置读取需要管理权限：普通用户 403 不能阻断会话列表 / 工具加载。
         await loadLlmSettings().catch(() => {});
         await fetchSessionsPage(0);
+        await loadPendingQuestions().catch(() => {});
         const toolsBody = await api.get<ToolsBody>('/v1/tools');
         setTools(toolsBody.tools || []);
         await loadSandboxes().catch(() => {});
@@ -1223,7 +1237,7 @@ export default function App() {
     } catch (err) {
       console.error(err);
     }
-  }, [api, fetchSessionsPage, loadLlmSettings, loadSandboxes, page, token]);
+  }, [api, fetchSessionsPage, loadLlmSettings, loadPendingQuestions, loadSandboxes, page, token]);
 
   useEffect(() => {
     if (!token && page !== 'login') {
@@ -1276,6 +1290,7 @@ export default function App() {
         setAttachments([]);
         void loadContextUsage(session.sessionId);
         void loadSessionTokenUsage(session.sessionId);
+        void loadPendingQuestions().catch(() => {});
         return;
       }
       const body = await api.get<SessionMessagesBody>(`/v1/sessions/${encodeURIComponent(session.sessionId)}/messages`);
@@ -1283,6 +1298,7 @@ export default function App() {
       setAttachments([]);
       void loadContextUsage(session.sessionId);
       void loadSessionTokenUsage(session.sessionId);
+      void loadPendingQuestions().catch(() => {});
     } catch (err) {
       setMessages([{
         id: randomId(),
@@ -1694,6 +1710,7 @@ export default function App() {
       await refreshSessions();
       await loadContextUsage(activeSessionId);
       await loadSessionTokenUsage(activeSessionId);
+      await loadPendingQuestions().catch(() => {});
       await loadSandboxes().catch(() => {});
     }
   }
@@ -1724,6 +1741,7 @@ export default function App() {
     });
     try {
       await api.post<{ ok: boolean }>(`/v1/questions/${encodeURIComponent(pending.id)}/answer`, { answers });
+      await loadPendingQuestions().catch(() => {});
     } catch (err) {
       setPendingQuestions((current) => ({ ...current, [pending.sessionId]: pending }));
       setMessages((currentMessages) => [...currentMessages, {
@@ -1909,6 +1927,7 @@ export default function App() {
           totalTokens={sessionTokenUsage[sessionId] ?? 0}
           runStartedAt={runStartedAt[sessionId]}
           pendingQuestion={pendingQuestions[sessionId]}
+          waitingSessionIds={new Set(Object.keys(pendingQuestions))}
           onAnswerQuestion={submitQuestionAnswer}
           messages={messages}
           attachments={attachments}
@@ -2055,6 +2074,7 @@ function PrototypeChatShell(props: {
   totalTokens: number;
   runStartedAt?: number;
   pendingQuestion?: PendingQuestion;
+  waitingSessionIds: Set<string>;
   onAnswerQuestion: (pending: PendingQuestion, answers: Record<string, string[]>) => void;
   messages: ChatMessage[];
   attachments: Attachment[];
@@ -2105,6 +2125,7 @@ function PrototypeChatShell(props: {
             page={props.sessionPage}
             pageCount={props.sessionPageCount}
             selectedSessionId={props.selectedSessionId}
+            waitingSessionIds={props.waitingSessionIds}
             onToggle={props.onToggleHistory}
             onSelect={props.onSelectSession}
             onDeleteMany={props.onDeleteSessions}
@@ -2206,12 +2227,13 @@ function PrototypeSidebarNav({ page, token, me, onNavigate, onLogout }: {
   );
 }
 
-function PrototypeSessionPanel({ sessions, total, page, pageCount, selectedSessionId, onToggle, onSelect, onDeleteMany, onPrevPage, onNextPage }: {
+function PrototypeSessionPanel({ sessions, total, page, pageCount, selectedSessionId, waitingSessionIds, onToggle, onSelect, onDeleteMany, onPrevPage, onNextPage }: {
   sessions: SessionSummary[];
   total: number;
   page: number;
   pageCount: number;
   selectedSessionId: string;
+  waitingSessionIds: Set<string>;
   onToggle: () => void;
   onSelect: (session: SessionSummary) => void;
   onDeleteMany: (sessions: SessionSummary[]) => void;
@@ -2357,6 +2379,9 @@ function PrototypeSessionPanel({ sessions, total, page, pageCount, selectedSessi
                 </span>
                 <strong>{session.title}</strong>
                 <time>{session.time}</time>
+                {session.sessionId && waitingSessionIds.has(session.sessionId) ? (
+                  <Badge className="prototype-session-waiting" variant="secondary">等待交互</Badge>
+                ) : null}
                 {session.sessionId ? <code className="prototype-session-id">ID: {session.sessionId}</code> : null}
                 <p>{session.desc}</p>
               </div>
@@ -4610,6 +4635,8 @@ type SandboxSettingsForm = {
   protocol: 'http' | 'https';
   defaultImage: string;
   lifecycleUrl: string;
+  defaultClusterId: string;
+  defaultNamespace: string;
   apiKey: string;
 };
 
@@ -4621,6 +4648,8 @@ function sandboxSettingsForm(settings?: SandboxSettingsInfo): SandboxSettingsFor
     protocol: settings?.protocol ?? 'http',
     defaultImage: settings?.default_image ?? '',
     lifecycleUrl: settings?.lifecycle_url ?? '',
+    defaultClusterId: settings?.default_cluster_id ?? '1',
+    defaultNamespace: settings?.default_namespace ?? 'aios-system',
     apiKey: '',
   };
 }
@@ -4643,6 +4672,8 @@ function sandboxSettingsPayload(form: SandboxSettingsForm): Record<string, unkno
     payload.domain = form.domain.trim();
   } else if (form.mode === 'aios_lifecycle') {
     payload.lifecycle_url = form.lifecycleUrl.trim();
+    payload.default_cluster_id = form.defaultClusterId.trim();
+    payload.default_namespace = form.defaultNamespace.trim();
   } else if (form.mode === 'opensandbox') {
     payload.domain = form.domain.trim();
     payload.protocol = form.protocol;
@@ -4783,6 +4814,9 @@ function SandboxSettingsCard({ api, status, onStatus, onRequestConfirm }: {
         {form.mode === 'aios_lifecycle' ? (
           <>
             <Label>Lifecycle URL<Input disabled={busy} value={form.lifecycleUrl} spellCheck={false} placeholder="http(s)://lifecycle-service" onChange={(event) => setForm((current) => ({ ...current, lifecycleUrl: event.target.value }))} /></Label>
+            <Label>默认集群 ID<Input disabled={busy} value={form.defaultClusterId} spellCheck={false} placeholder="1" onChange={(event) => setForm((current) => ({ ...current, defaultClusterId: event.target.value }))} /></Label>
+            <Label>默认命名空间<Input disabled={busy} value={form.defaultNamespace} spellCheck={false} placeholder="aios-system" onChange={(event) => setForm((current) => ({ ...current, defaultNamespace: event.target.value }))} /></Label>
+            <div className="settings-hint">聊天中指定的 clusterId/clusterName 或 namespace 优先；未指定的字段由上述默认值补齐。clusterId 与 clusterName 同时出现时以 clusterId 为准。</div>
             <div className="settings-hint">模板由 AIOS 目录动态加载；browser 模板接入现有截图预览，sandbox-diag 仅平台管理员可见可用。</div>
             <div className={runtime?.status === 'catalog_unavailable' ? 'settings-status' : 'settings-hint'}>
               {runtime?.status === 'catalog_unavailable'

@@ -92,6 +92,14 @@ describe('React frontend stack', () => {
     expect(app).toContain("window.history.pushState({}, '', pageUrl(next))");
   });
 
+  it('restores and marks sessions that are waiting for user interaction', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(app).toContain("api.get<QuestionsBody>('/v1/questions')");
+    expect(app).toContain('waitingSessionIds={new Set(Object.keys(pendingQuestions))}');
+    expect(app).toContain('等待交互');
+  });
+
   it('uses the backend product contract for pending skill imports', async () => {
     const types = await readFile('web/src/types.ts', 'utf8');
     const app = await readFile('web/src/App.tsx', 'utf8');
@@ -1034,6 +1042,8 @@ describe('frontend API wiring', () => {
     const sandboxSettingsType = types.match(/export interface SandboxSettingsInfo \{[\s\S]*?\n\}/)?.[0] || '';
     const sandboxSettingsBodyType = types.match(/export interface SandboxSettingsBody \{[\s\S]*?\n\}/)?.[0] || '';
     expect(sandboxSettingsType).toContain('api_key_set: boolean;');
+    expect(sandboxSettingsType).toContain('default_cluster_id?: string;');
+    expect(sandboxSettingsType).toContain('default_namespace?: string;');
     expect(sandboxSettingsType).not.toContain('api_key_preview');
     expect(sandboxSettingsBodyType).toContain("status?: 'disabled' | 'active' | 'catalog_unavailable' | 'refreshing' | string;");
     expect(sandboxSettingsBodyType).toContain('template_count?: number;');
@@ -1045,8 +1055,12 @@ describe('frontend API wiring', () => {
     expect(app).toContain('<SelectItem value="opensandbox">OpenSandbox（k8s）</SelectItem>');
     expect(app).toContain('<SelectItem value="local">Local（本地开发）</SelectItem>');
     expect(app).toContain('Lifecycle URL');
-    expect(app).not.toContain('<Label>Cluster ID');
-    expect(app).not.toContain('<Label>Namespace');
+    expect(app).toContain('<Label>默认集群 ID');
+    expect(app).toContain('<Label>默认命名空间');
+    expect(app).toContain("defaultClusterId: settings?.default_cluster_id ?? '1'");
+    expect(app).toContain("defaultNamespace: settings?.default_namespace ?? 'aios-system'");
+    expect(app).toContain('payload.default_cluster_id = form.defaultClusterId.trim()');
+    expect(app).toContain('payload.default_namespace = form.defaultNamespace.trim()');
     expect(sandboxSettingsType).not.toContain('placement');
     expect(app).toContain('模板由 AIOS 目录动态加载；browser 模板接入现有截图预览，sandbox-diag 仅平台管理员可见可用。');
     expect(app).not.toContain('固定使用 code-interpreter');

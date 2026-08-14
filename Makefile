@@ -181,7 +181,7 @@ sandbox-image: sandbox-prepare-kubectl
 
 sandbox-image-check:
 	docker image inspect $(SANDBOX_IMAGE) >/dev/null
-	docker run --rm --platform $(SANDBOX_PLATFORM) $(SANDBOX_IMAGE) sh -ec 'python3 -c "import requests, yaml, cryptography, openpyxl"; node -e "if (typeof fetch !== \"function\" || typeof WebSocket !== \"function\") process.exit(1)"; chromium --version; kubectl version --client; for binary in tcpdump conntrack dig iptables nft nsenter ovs-ofctl ovs-vsctl; do command -v "$$binary" >/dev/null; done'
+	docker run --rm --platform $(SANDBOX_PLATFORM) $(SANDBOX_IMAGE) sh -ec 'python3 -c "import requests, yaml, cryptography, openpyxl"; node -e "if (typeof fetch !== \"function\" || typeof WebSocket !== \"function\") process.exit(1)"; chromium --version; Xvfb -help >/dev/null 2>&1; fc-list :lang=zh family | grep -q .; kubectl version --client; for binary in Xvfb fc-list tcpdump conntrack dig iptables nft nsenter ovs-ofctl ovs-vsctl; do command -v "$$binary" >/dev/null; done'
 
 sandbox-image-push: sandbox-image-check
 	docker push $(SANDBOX_IMAGE)

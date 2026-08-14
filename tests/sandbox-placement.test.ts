@@ -23,16 +23,23 @@ describe('sandbox placement', () => {
     expect(byName.metadata).toMatchObject({ sessionId: 'session', placementSelector: 'clusterName' });
   });
 
-  it('rejects conflicting, empty and namespace-only dynamic placement', () => {
-    expect(() => normalizeSandboxPlacement({ clusterName: 'pc1', clusterId: '1' })).toThrow(/只能提供一个/);
+  it('uses clusterId when both selectors are supplied and rejects a missing final cluster', () => {
+    expect(normalizeSandboxPlacement({ clusterName: 'pc1', clusterId: '35' })?.placement)
+      .toEqual({ clusterId: '35', namespace: 'aios-system' });
     expect(() => normalizeSandboxPlacement({})).toThrow(/必须提供/);
-    expect(() => normalizeSandboxPlacement({ namespace: 'aios-system' })).toThrow(/不能只提供 namespace/);
+    expect(() => normalizeSandboxPlacement({ namespace: 'aios-system' })).toThrow(/必须提供/);
   });
 
-  it('uses legacy fallback only when dynamic placement is absent', () => {
+  it('merges user placement fields over configured defaults', () => {
     expect(normalizeSandboxPlacement(undefined, { clusterId: '35', namespace: 'legacy-ns' })?.placement)
       .toEqual({ clusterId: '35', namespace: 'legacy-ns' });
     expect(normalizeSandboxPlacement({ clusterName: 'pc1' }, { clusterId: '35', namespace: 'legacy-ns' })?.placement)
-      .toEqual({ clusterName: 'pc1', namespace: 'aios-system' });
+      .toEqual({ clusterName: 'pc1', namespace: 'legacy-ns' });
+    expect(normalizeSandboxPlacement({ namespace: 'user-ns' }, { clusterId: '35', namespace: 'legacy-ns' })?.placement)
+      .toEqual({ clusterId: '35', namespace: 'user-ns' });
+    expect(normalizeSandboxPlacement(
+      { clusterId: '99', clusterName: 'ignored', namespace: 'user-ns' },
+      { clusterId: '35', namespace: 'legacy-ns' },
+    )?.placement).toEqual({ clusterId: '99', namespace: 'user-ns' });
   });
 });

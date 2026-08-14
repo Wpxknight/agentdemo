@@ -1,7 +1,7 @@
 import type { JsonValue, ToolResult } from '../llm/types.js';
 import { defineTool, type ToolContext, type ToolHandler } from '../agent/tools.js';
 import type { SandboxManagerLike } from '@aiop/sandbox-runtime';
-import { isSandboxAcquirer, normalizeSandboxPlacement, type SandboxPlacementInput, type SpecResolver } from '@aiop/sandbox-runtime';
+import { isSandboxAcquirer, type SandboxPlacementInput, type SpecResolver } from '@aiop/sandbox-runtime';
 import { sandboxIdentityKey, sandboxIdentityMetadata } from '@aiop/sandbox-runtime';
 import { createSandboxToolDefinitions, downloadAcquiredSandbox, executeAcquiredSandbox, uploadAcquiredSandbox } from '@aiop/sandbox-runtime';
 import type { SandboxSpec } from '@aiop/sandbox-runtime';
@@ -37,14 +37,13 @@ function placementFromArgs(o: Record<string, JsonValue>): SandboxPlacementInput 
 }
 
 const placementProperties = {
-  clusterName: { type: 'string', description: '目标 Kubernetes 集群名称；与 clusterId 二选一，不能猜测 ID' },
-  clusterId: { type: 'string', description: '目标 Kubernetes 集群 ID；与 clusterName 二选一' },
-  namespace: { type: 'string', description: '目标 namespace；省略时使用 aios-system', default: 'aios-system' },
+  clusterName: { type: 'string', description: '目标 Kubernetes 集群名称；与 clusterId 同时提供时 clusterId 优先' },
+  clusterId: { type: 'string', description: '目标 Kubernetes 集群 ID；优先级高于 clusterName' },
+  namespace: { type: 'string', description: '目标 namespace；省略时使用沙箱设置中的默认命名空间' },
 } as const;
 
 export async function resolveSandboxSpec(resolve: SpecResolver, ctx: ToolContext, placement?: SandboxPlacementInput): Promise<SandboxSpec> {
   const partial = await resolve(ctx, undefined, placement);
-  if (placement !== undefined) normalizeSandboxPlacement(placement);
   return {
     key: sandboxIdentityKey(ctx),
     ...partial,

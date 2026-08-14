@@ -1,6 +1,7 @@
 import type { SandboxSpec } from './types.js';
 
 export const DEFAULT_SANDBOX_PLACEMENT_NAMESPACE = 'aios-system';
+export const DEFAULT_SANDBOX_PLACEMENT_CLUSTER_ID = '1';
 
 export interface SandboxPlacementInput {
   clusterName?: string;
@@ -29,33 +30,33 @@ export function normalizeSandboxPlacement(
   input?: SandboxPlacementInput,
   fallback?: SandboxPlacementInput,
 ): NormalizedSandboxPlacement | undefined {
-  const supplied = input !== undefined;
-  const source = supplied ? input : fallback;
-  if (!source) return undefined;
-  const clusterName = trimmed(source.clusterName);
-  const clusterId = trimmed(source.clusterId);
-  const namespace = trimmed(source.namespace);
-  if (clusterName && clusterId) {
-    throw new Error('Sandbox placement 的 clusterName 与 clusterId 只能提供一个');
-  }
+  if (!input && !fallback) return undefined;
+  const inputClusterId = trimmed(input?.clusterId);
+  const inputClusterName = trimmed(input?.clusterName);
+  const fallbackClusterId = trimmed(fallback?.clusterId);
+  const fallbackClusterName = trimmed(fallback?.clusterName);
+  const clusterId = inputClusterId ?? (inputClusterName ? undefined : fallbackClusterId);
+  const clusterName = clusterId
+    ? undefined
+    : inputClusterName ?? fallbackClusterName;
+  const namespace = trimmed(input?.namespace)
+    ?? trimmed(fallback?.namespace)
+    ?? DEFAULT_SANDBOX_PLACEMENT_NAMESPACE;
   if (!clusterName && !clusterId) {
-    throw new Error(supplied && namespace
-      ? 'Sandbox placement 不能只提供 namespace，必须提供 clusterName 或 clusterId'
-      : 'Sandbox placement 必须提供 clusterName 或 clusterId');
+    throw new Error('Sandbox placement 必须提供 clusterName 或 clusterId');
   }
   const selector = clusterName ? 'clusterName' : 'clusterId';
   const cluster = clusterName ?? clusterId!;
-  const resolvedNamespace = namespace ?? DEFAULT_SANDBOX_PLACEMENT_NAMESPACE;
   return {
     placement: {
       ...(clusterName ? { clusterName } : { clusterId }),
-      namespace: resolvedNamespace,
+      namespace,
     },
-    cacheSuffix: `:placement:${JSON.stringify([selector, cluster, resolvedNamespace])}`,
+    cacheSuffix: `:placement:${JSON.stringify([selector, cluster, namespace])}`,
     metadata: {
       placementSelector: selector,
       placementCluster: cluster,
-      placementNamespace: resolvedNamespace,
+      placementNamespace: namespace,
     },
   };
 }
@@ -63,9 +64,10 @@ export function normalizeSandboxPlacement(
 export function withSandboxPlacement(
   spec: SandboxSpec,
   input?: SandboxPlacementInput,
+  fallback?: SandboxPlacementInput,
 ): SandboxSpec {
-  if (input === undefined) return spec;
-  const normalized = normalizeSandboxPlacement(input);
+  if (input === undefined && fallback === undefined) return spec;
+  const normalized = normalizeSandboxPlacement(input, fallback);
   if (!normalized) return spec;
   return {
     ...spec,

@@ -103,6 +103,7 @@ export class ToolRegistry {
             ...ctx,
             idempotencyKey: executionContext.idempotencyKey,
             signal: executionContext.signal,
+            ...(executionContext.onUpdate ? { onOutput: executionContext.onUpdate } : {}),
           });
           return { content: output.content, isError: output.isError };
         },

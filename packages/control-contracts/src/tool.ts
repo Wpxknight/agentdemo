@@ -25,6 +25,12 @@ export interface ToolResult {
   digest?: string;
 }
 
+/** Ephemeral output emitted while a tool call is still executing. */
+export interface ToolExecutionUpdate {
+  stream: 'stdout' | 'stderr';
+  text: string;
+}
+
 export interface ToolExecutionContext {
   identity: IdentityContext;
   runId: string;
@@ -33,6 +39,8 @@ export interface ToolExecutionContext {
   sessionId?: string;
   interactionResolution?: ResolvedInteraction;
   signal?: AbortSignal;
+  /** Per-call live output. It is intentionally not persisted in the tool ledger. */
+  onUpdate?: (update: ToolExecutionUpdate) => void;
 }
 
 export interface DurableToolLedgerUpdate {

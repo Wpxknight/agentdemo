@@ -23,6 +23,17 @@ function optString(o: Record<string, JsonValue>, key: string): string | undefine
   return typeof v === 'string' && v ? v : undefined;
 }
 
+const MAX_COMMAND_TIMEOUT_MS = 15 * 60_000;
+
+function optTimeoutMs(o: Record<string, JsonValue>): number | undefined {
+  const value = o.timeoutMs;
+  if (value === undefined) return undefined;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1_000 || value > MAX_COMMAND_TIMEOUT_MS) {
+    throw new Error(`参数 timeoutMs 必须是 1000 到 ${MAX_COMMAND_TIMEOUT_MS} 之间的整数`);
+  }
+  return value;
+}
+
 function placementFromArgs(o: Record<string, JsonValue>): SandboxPlacementInput | undefined {
   const keys = ['clusterName', 'clusterId', 'namespace'] as const;
   if (!keys.some((key) => o[key] !== undefined)) return undefined;
@@ -33,9 +44,9 @@ function placementFromArgs(o: Record<string, JsonValue>): SandboxPlacementInput 
 }
 
 const placementProperties = {
-  clusterName: { type: 'string', description: '目标 Kubernetes 集群名称；与 clusterId 二选一。用户提到名称时原样传入，不猜测 ID' },
-  clusterId: { type: 'string', description: '目标 Kubernetes 集群 ID；与 clusterName 二选一' },
-  namespace: { type: 'string', description: '目标 namespace；省略时使用 aios-system', default: 'aios-system' },
+  clusterName: { type: 'string', description: '目标 Kubernetes 集群名称；与 clusterId 同时提供时 clusterId 优先' },
+  clusterId: { type: 'string', description: '目标 Kubernetes 集群 ID；优先级高于 clusterName' },
+  namespace: { type: 'string', description: '目标 namespace；省略时使用沙箱设置中的默认命名空间' },
 } as const;
 
 function formatExec(r: ExecResult): ToolResult {
@@ -143,6 +154,12 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
           properties: {
             profile: { type: 'string', description: '稳定的沙箱 Profile ID；可先用 sandbox_list_profiles 查询' },
             command: { type: 'string', description: '要执行的 shell 命令' },
+            timeoutMs: {
+              type: 'integer',
+              minimum: 1_000,
+              maximum: MAX_COMMAND_TIMEOUT_MS,
+              description: '命令执行超时（毫秒）；长耗时巡检按需设置，最大 15 分钟',
+            },
             ...placementProperties,
           },
           required: ['command'],
@@ -151,7 +168,12 @@ export function buildSandboxProfileTools(manager: SandboxManagerLike, source: Sa
         const o = asObject(args);
         const command = reqString(o, 'command');
         const acquired = await acquire(ctx, optString(o, 'profile'), placementFromArgs(o));
-        return formatExec(await executeAcquiredSandbox(acquired, { command, signal: ctx.signal, onOutput: ctx.onOutput }));
+        return formatExec(await executeAcquiredSandbox(acquired, {
+          command,
+          timeoutMs: optTimeoutMs(o),
+          signal: ctx.signal,
+          onOutput: ctx.onOutput,
+        }));
       },
     }),
   ];

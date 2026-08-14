@@ -448,6 +448,8 @@ export interface SandboxSettingsInfo {
   protocol?: 'http' | 'https';
   default_image?: string;
   lifecycle_url?: string;
+  default_cluster_id?: string;
+  default_namespace?: string;
   api_key_set: boolean;
 }
 

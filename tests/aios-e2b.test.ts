@@ -117,13 +117,14 @@ describe('AiosE2bProvider', () => {
         'x-api-key': 'secret-aios-key',
       },
       body: {
-        template: 'browser-id',
+        templateID: 'browser-id',
         timeout: 2,
         env: { A: 'one' },
         metadata: { sessionId: 'session', profile: 'code' },
         placement: { clusterId: 'local', namespace: 'aios-sandbox-local' },
       },
     });
+    expect(requests[0].body).not.toHaveProperty('template');
     expect(requests[0].body).not.toHaveProperty('namespace');
     expect(requests[0].body).not.toHaveProperty('serviceAccount');
     expect(requests.slice(1).map((request) => request.body)).toEqual([

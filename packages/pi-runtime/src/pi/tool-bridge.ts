@@ -1,4 +1,11 @@
-import type { JsonValue, ToolCall, ToolDefinition, ToolExecutionOutcome, ToolResult } from '@aiop/control-contracts';
+import type {
+  JsonValue,
+  ToolCall,
+  ToolDefinition,
+  ToolExecutionOutcome,
+  ToolExecutionUpdate,
+  ToolResult,
+} from '@aiop/control-contracts';
 import type { TSchema } from '@earendil-works/pi-ai';
 import type { AgentHarnessTool } from '@earendil-works/pi-agent-core';
 import {
@@ -22,6 +29,7 @@ export interface GovernedToolExecutionContext {
   signal?: AbortSignal;
   logicalCallId: string;
   piContext?: unknown;
+  onUpdate?: (update: ToolExecutionUpdate) => void;
 }
 
 export interface GovernedToolBridgeOptions {
@@ -94,7 +102,7 @@ function createAgentTool(
     description: definition.description,
     parameters: definition.inputSchema as TSchema,
     executionMode: definition.capability === 'read' ? 'parallel' : 'sequential',
-    execute: async (toolCallId, params, signal, _onUpdate, piContext) => {
+    execute: async (toolCallId, params, signal, onUpdate, piContext) => {
       const argumentsValue = params as JsonValue;
       const logicalCallId = governed.logicalCallId?.(toolCallId, argumentsValue)
         ?? options.resolveLogicalCallId?.({ toolCallId, tool: definition, arguments: argumentsValue })
@@ -105,7 +113,17 @@ function createAgentTool(
         name: definition.name,
         arguments: argumentsValue,
       };
-      const context = { signal, logicalCallId, piContext };
+      const context = {
+        signal,
+        logicalCallId,
+        piContext,
+        ...(onUpdate ? {
+          onUpdate: (update: ToolExecutionUpdate) => onUpdate({
+            content: [{ type: 'text', text: update.text }],
+            details: { stream: update.stream },
+          }),
+        } : {}),
+      };
       let result: ToolResult;
       try {
         result = await execute(call, context);

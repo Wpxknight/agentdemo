@@ -7,6 +7,10 @@ import type {
   SandboxSettingsStore,
   SecretBoxLike,
 } from './contracts.js';
+import {
+  DEFAULT_SANDBOX_PLACEMENT_CLUSTER_ID,
+  DEFAULT_SANDBOX_PLACEMENT_NAMESPACE,
+} from './placement.js';
 
 const PLATFORM_SETTINGS_CONTEXT = { tenantId: 'default' } as const;
 const SECRET_SCHEMA_VERSION = 1;
@@ -203,13 +207,17 @@ export function sandboxSettingsToConfig(settings: SandboxSettings, apiKey?: stri
       };
     case 'aios_lifecycle':
       if (!settings.lifecycleUrl) throw new Error('AIOS Lifecycle 设置缺少 lifecycleUrl');
+      const placement = settings.placement ?? {
+        clusterId: DEFAULT_SANDBOX_PLACEMENT_CLUSTER_ID,
+        namespace: DEFAULT_SANDBOX_PLACEMENT_NAMESPACE,
+      };
       return {
         enabled: settings.enabled,
         provider: 'e2b',
         ...(apiKey ? { apiKey } : {}),
         aios: {
           lifecycleUrl: settings.lifecycleUrl,
-          ...(settings.placement ? { placement: { ...settings.placement } } : {}),
+          placement: { ...placement },
         },
         desktop: false,
         userHomeMountPath: '/home/user/host',
@@ -240,9 +248,7 @@ export class SandboxSettingsPersistence {
 
   async save(input: SandboxSettings, update: SandboxApiKeyUpdate): Promise<LoadedSandboxSettings> {
     const parsed = parseSandboxSettings(input);
-    const settings = parsed.mode === 'aios_lifecycle'
-      ? { enabled: parsed.enabled, mode: parsed.mode, lifecycleUrl: parsed.lifecycleUrl } as SandboxSettings
-      : parsed;
+    const settings = parsed;
     const current = await this.store.getSandboxSettingsRecord(this.ctx);
     let storedUpdate: SandboxSettingsSecretUpdate;
     let apiKey: string | undefined;

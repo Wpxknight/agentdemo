@@ -1713,9 +1713,9 @@ describe('HTTP server', () => {
 
       const conflict = await fetch(`${sandboxBase}/v1/sandbox/run-code`, {
         method: 'POST', headers,
-        body: JSON.stringify({ code: 'print(1)', cluster_name: 'pc1', cluster_id: '35' }),
+        body: JSON.stringify({ sessionId: 'session-c', code: 'print(1)', cluster_name: 'pc1', cluster_id: '35' }),
       });
-      expect(conflict.status).toBe(400);
+      expect(conflict.status).toBe(200);
       await fetch(`${sandboxBase}/v1/sandbox/run-command`, {
         method: 'POST',
         headers,
@@ -3175,6 +3175,8 @@ describe('HTTP server 平台 Sandbox 设置', () => {
           enabled: true,
           mode: 'aios_lifecycle',
           lifecycle_url: 'https://sandbox.example.test/lifecycle',
+          default_cluster_id: 'local',
+          default_namespace: 'sandbox-system',
           api_key_set: true,
         },
         runtime: { enabled: true, mode: 'aios_lifecycle', status: 'active' },
@@ -3271,6 +3273,8 @@ describe('HTTP server 平台 Sandbox 设置', () => {
           enabled: true,
           mode: 'aios_lifecycle',
           lifecycle_url: 'https://sandbox.example.test/lifecycle',
+          default_cluster_id: 'cluster-a',
+          default_namespace: 'sandbox-system',
           api_key_set: true,
         },
         runtime: {
@@ -3368,6 +3372,7 @@ describe('HTTP server 平台 Sandbox 设置', () => {
             enabled: true,
             mode: 'aios_lifecycle',
             lifecycleUrl: 'https://aios.example.test/lifecycle',
+            placement: { clusterId: '1', namespace: 'aios-system' },
           },
         },
         {
@@ -3546,10 +3551,15 @@ describe('HTTP server 平台 Sandbox 设置', () => {
           enabled: true,
           mode: 'aios_lifecycle',
           lifecycle_url: 'https://sandbox.example.test/lifecycle',
+          default_cluster_id: '1',
+          default_namespace: 'aios-system',
           api_key: 'replacement-key',
         }),
       });
       expect(replaced.status).toBe(200);
+      expect(fixture.updateSandbox.mock.calls.at(-1)?.[0].settings).toMatchObject({
+        placement: { clusterId: '1', namespace: 'aios-system' },
+      });
       expect(fixture.auditEvents).toHaveLength(1);
       expect(fixture.auditEvents[0]).toMatchObject({
         kind: 'sandbox',

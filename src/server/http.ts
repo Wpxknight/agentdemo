@@ -20,7 +20,7 @@ import { verifySession } from '../auth/session.js';
 import { softDeleteUser, setUserEnabled } from '../auth/lifecycle.js';
 import { createTenant, createUser, listTenants } from '../auth/admin.js';
 import type { RequestContext, Role } from '../auth/types.js';
-import { DEFAULT_TASK_MAX_RUN_MS, type SandboxSettings, type ScheduledTaskPatch } from '../db/store.js';
+import { DEFAULT_TASK_MAX_RUN_MS, type InteractionRecord, type SandboxSettings, type ScheduledTaskPatch } from '../db/store.js';
 import { normalizeUserHomeDir } from '@aiop/sandbox-runtime';
 import { DEFAULT_SCHEDULER_TIMEZONE, isValidCron, isValidTimezone } from '../scheduler/cron.js';
 import { createModel } from '../llm/factory.js';
@@ -31,6 +31,8 @@ import type { Skill, SkillProductRecord, SkillRegistry } from '../skill/registry
 import { McpServerSchema } from '../config/schema.js';
 import {
   AiosLifecycleHttpError,
+  DEFAULT_SANDBOX_PLACEMENT_CLUSTER_ID,
+  DEFAULT_SANDBOX_PLACEMENT_NAMESPACE,
   parseSandboxSettings,
   SandboxProfileAuthorizationError,
   type SandboxApiKeyUpdate,
@@ -395,6 +397,8 @@ function publicSandboxSettings(settings: SandboxSettings, apiKeySet: boolean): R
       return {
         ...common,
         lifecycle_url: settings.lifecycleUrl,
+        default_cluster_id: settings.placement?.clusterId ?? DEFAULT_SANDBOX_PLACEMENT_CLUSTER_ID,
+        default_namespace: settings.placement?.namespace ?? DEFAULT_SANDBOX_PLACEMENT_NAMESPACE,
         api_key_set: apiKeySet,
       };
     case 'opensandbox':
@@ -438,7 +442,12 @@ function sandboxSettingsFromBody(body: Record<string, unknown>): SandboxSettings
   if (typeof mode !== 'string') throw new HttpError(400, 'mode 必填');
   const allowed = new Set(['enabled', 'mode', 'api_key', 'clear_api_key']);
   if (mode === 'standard_e2b') allowed.add('domain');
-  else if (mode === 'aios_lifecycle') { allowed.add('lifecycle_url'); allowed.add('placement'); }
+  else if (mode === 'aios_lifecycle') {
+    allowed.add('lifecycle_url');
+    allowed.add('default_cluster_id');
+    allowed.add('default_namespace');
+    allowed.add('placement');
+  }
   else if (mode === 'opensandbox') { allowed.add('domain'); allowed.add('protocol'); allowed.add('default_image'); }
   for (const key of Object.keys(body)) {
     if (!allowed.has(key)) throw new HttpError(400, `当前 Sandbox mode 不支持字段 ${key}`);
@@ -449,6 +458,7 @@ function sandboxSettingsFromBody(body: Record<string, unknown>): SandboxSettings
         enabled,
         mode,
         lifecycleUrl: str(body, 'lifecycle_url'),
+        placement: sandboxSettingsPlacement(body),
       }
     : mode === 'opensandbox'
       ? {
@@ -466,6 +476,21 @@ function sandboxSettingsFromBody(body: Record<string, unknown>): SandboxSettings
   } catch (err) {
     throw new HttpError(400, err instanceof Error ? err.message : 'Sandbox 配置无效');
   }
+}
+
+function sandboxSettingsPlacement(body: Record<string, unknown>): { clusterId: string; namespace: string } {
+  const legacy = body.placement;
+  if (legacy !== undefined && (!legacy || typeof legacy !== 'object' || Array.isArray(legacy))) {
+    throw new HttpError(400, 'placement 必须是对象');
+  }
+  const placement = legacy as Record<string, unknown> | undefined;
+  const clusterId = str(body, 'default_cluster_id')
+    ?? (placement ? str(placement, 'cluster_id') ?? str(placement, 'clusterId') : undefined)
+    ?? DEFAULT_SANDBOX_PLACEMENT_CLUSTER_ID;
+  const namespace = str(body, 'default_namespace')
+    ?? (placement ? str(placement, 'namespace') : undefined)
+    ?? DEFAULT_SANDBOX_PLACEMENT_NAMESPACE;
+  return { clusterId, namespace };
 }
 
 function sandboxApiKeyUpdate(body: Record<string, unknown>, settings: SandboxSettings): SandboxApiKeyUpdate {
@@ -626,12 +651,7 @@ function addSandboxPlacementArgs(body: Record<string, unknown>, args: Record<str
     if (!value) throw new HttpError(400, `${input} 必须是非空字符串`);
     args[output] = value;
   }
-  if (args.clusterName !== undefined && args.clusterId !== undefined) {
-    throw new HttpError(400, 'cluster_name 与 cluster_id 只能提供一个');
-  }
-  if (args.namespace !== undefined && args.clusterName === undefined && args.clusterId === undefined) {
-    throw new HttpError(400, 'namespace 不能单独提供，必须同时提供 cluster_name 或 cluster_id');
-  }
+  if (args.clusterId !== undefined) delete args.clusterName;
 }
 
 function intParam(value: string | null, fallback: number, min: number, max: number): number {
@@ -2481,6 +2501,15 @@ async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req:
     } else if (result.status === 'failed' || result.status === 'recovery_required') {
       sse('error', { error: result.error?.message ?? '运行失败', runId: result.runId, status: result.status });
     } else {
+      if (result.status === 'waiting') {
+        const interactions = await rt.store.listAgentRunInteractions(ctx, result.runId);
+        const pending = interactions.find((interaction) => (
+          interaction.status === 'pending'
+          && (interaction.kind === 'question' || interaction.kind === 'plan')
+        ));
+        const projected = pending ? projectPendingInteractionHttpEvent(pending) : undefined;
+        if (projected) sse(projected.event, projected.data);
+      }
       if (result.status === 'succeeded' && result.text && !emittedText) sse('text_delta', { text: result.text });
       sse('done', projectDurableHttpDone({
         sessionId,
@@ -2495,6 +2524,23 @@ async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req:
     removeActiveRun(activeRuns, activeKey, activeRun);
     if (!res.destroyed && !res.writableEnded) res.end();
   }
+}
+
+export function projectPendingInteractionHttpEvent(
+  interaction: Pick<InteractionRecord, 'id' | 'sessionId' | 'kind' | 'status' | 'payload'>,
+): { event: 'question_required' | 'change_plan_required'; data: Record<string, unknown> } | undefined {
+  if (interaction.status !== 'pending' || (interaction.kind !== 'question' && interaction.kind !== 'plan')) return undefined;
+  const payload = objectValue(interaction.payload);
+  if (!payload || !Array.isArray(payload.questions)) return undefined;
+  return {
+    event: interaction.kind === 'plan' ? 'change_plan_required' : 'question_required',
+    data: {
+      id: interaction.id,
+      sessionId: interaction.sessionId,
+      questions: payload.questions,
+      ...(payload.plan && typeof payload.plan === 'object' ? { plan: payload.plan } : {}),
+    },
+  };
 }
 
 export function projectDurableHttpEvent(event: { type: string; detail?: unknown }): { event: string; data: unknown } | undefined {
@@ -2520,7 +2566,8 @@ export function projectDurableHttpEvent(event: { type: string; detail?: unknown 
     if (!toolId) return undefined;
     const text = stringValue(detail.outputText);
     if (!text) return undefined;
-    return { event: 'tool_output', data: { toolId, stream: 'stdout', text } };
+    const stream = detail.outputStream === 'stderr' ? 'stderr' : 'stdout';
+    return { event: 'tool_output', data: { toolId, stream, text } };
   }
   if (event.type === 'tool_execution_end' || event.type === 'tool_result') {
     const toolId = stringValue(detail.toolCallId);

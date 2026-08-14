@@ -72,6 +72,7 @@ function projectKnown(event: AgentHarnessEvent, summarizedMessages?: number): Re
     case 'tool_execution_update': return {
       version: 1, toolCallId: limited(event.toolCallId, MAX_NAME), toolName: limited(event.toolName, MAX_NAME),
       inputKeys: objectKeys(event.args), partial: valueShape(event.partialResult), outputText: displayText(event.partialResult),
+      ...(outputStream(event.partialResult) ? { outputStream: outputStream(event.partialResult) } : {}),
     };
     case 'tool_execution_end': return {
       version: 1, toolCallId: limited(event.toolCallId, MAX_NAME), toolName: limited(event.toolName, MAX_NAME),
@@ -237,6 +238,14 @@ function displayText(value: unknown): string | undefined {
     return item.type === 'text' && typeof item.text === 'string' ? [item.text] : [];
   }).join('');
   return text ? limited(text, MAX_STRING) : undefined;
+}
+
+function outputStream(value: unknown): 'stdout' | 'stderr' | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const details = (value as Record<string, unknown>).details;
+  if (!details || typeof details !== 'object') return undefined;
+  const stream = (details as Record<string, unknown>).stream;
+  return stream === 'stdout' || stream === 'stderr' ? stream : undefined;
 }
 
 function objectKeys(value: unknown): string[] | typeof UNSERIALIZABLE {

@@ -48,6 +48,19 @@ describe('sandbox settings validation and conversion', () => {
     });
   });
 
+  it('supplies the platform default placement for AIOS settings without one', () => {
+    const settings = parseSandboxSettings({
+      enabled: true,
+      mode: 'aios_lifecycle',
+      lifecycleUrl: 'https://sandbox.example.test/lifecycle',
+    });
+
+    expect(sandboxSettingsToConfig(settings, 'configured-key').aios?.placement).toEqual({
+      clusterId: '1',
+      namespace: 'aios-system',
+    });
+  });
+
   it('keeps AIOS safety rules while allowing runtime catalog browser profiles', () => {
     expect(SandboxConfigSchema.parse({
       enabled: true,
@@ -291,7 +304,12 @@ describe('SandboxSettingsPersistence', () => {
     await expect(persistence.save(enabled, { action: 'clear' })).rejects.toThrow(/API key/i);
     await persistence.save({ ...enabled, enabled: false }, { action: 'clear' });
     expect(await persistence.load()).toEqual({
-      settings: { enabled: false, mode: 'aios_lifecycle', lifecycleUrl: 'http://aios-sandbox-server:8080' },
+      settings: {
+        enabled: false,
+        mode: 'aios_lifecycle',
+        lifecycleUrl: 'http://aios-sandbox-server:8080',
+        placement: { clusterId: 'local', namespace: 'aios-sandbox-local' },
+      },
       apiKeySet: false,
     });
   });

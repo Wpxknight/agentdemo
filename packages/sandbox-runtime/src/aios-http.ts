@@ -3,10 +3,11 @@ const DEFAULT_MAX_RESPONSE_BYTES = 1_000_000;
 
 const REQUEST_FAILED_MESSAGE = 'AIOS Lifecycle request failed';
 const RESPONSE_TOO_LARGE_MESSAGE = 'AIOS Lifecycle response exceeded size limit';
+const MAX_ERROR_DETAIL_CHARS = 1_000;
 
 export class AiosLifecycleHttpError extends Error {
-  constructor(readonly status: number) {
-    super(`AIOS Lifecycle request failed (HTTP ${status})`);
+  constructor(readonly status: number, readonly detail?: string) {
+    super(`AIOS Lifecycle request failed (HTTP ${status})${detail ? `: ${detail}` : ''}`);
     this.name = 'AiosLifecycleHttpError';
   }
 }
@@ -35,6 +36,33 @@ function positiveNumber(value: number, name: string): number {
     throw new Error(`AIOS ${name} must be a positive number`);
   }
   return value;
+}
+
+function lifecycleErrorDetail(bytes: Uint8Array, apiKey: string): string | undefined {
+  const raw = new TextDecoder().decode(bytes).trim();
+  if (!raw) return undefined;
+  let candidate = raw;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (typeof parsed === 'string') candidate = parsed;
+    else if (parsed && typeof parsed === 'object') {
+      const record = parsed as Record<string, unknown>;
+      const nested = record.error && typeof record.error === 'object'
+        ? record.error as Record<string, unknown>
+        : undefined;
+      const value = [record.message, record.detail, record.error, nested?.message, nested?.detail]
+        .find((item) => typeof item === 'string');
+      if (typeof value === 'string') candidate = value;
+    }
+  } catch {
+    // A short plain-text upstream error is still useful after sanitization.
+  }
+  const withoutConfiguredKey = apiKey ? candidate.split(apiKey).join('[REDACTED]') : candidate;
+  const sanitized = withoutConfiguredKey
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\b(api[-_ ]?key|authorization|bearer|token|secret|password)\b\s*[:=]?\s*[^\s,;]+/gi, '$1=[REDACTED]')
+    .trim();
+  return sanitized ? sanitized.slice(0, MAX_ERROR_DETAIL_CHARS) : undefined;
 }
 
 async function readBoundedBody(response: Response, maxResponseBytes: number): Promise<Uint8Array> {
@@ -119,12 +147,12 @@ export class AiosLifecycleHttpClient {
 
     try {
       const response = await this.fetchResponse(path, init, signal);
-      if (!response.ok && !allowedStatuses.includes(response.status)) {
-        throw new AiosLifecycleHttpError(response.status);
-      }
       if (response.status === 204) return { body: undefined as T, status: response.status };
 
       const bytes = await readBoundedBody(response, maxResponseBytes);
+      if (!response.ok && !allowedStatuses.includes(response.status)) {
+        throw new AiosLifecycleHttpError(response.status, lifecycleErrorDetail(bytes, this.apiKey));
+      }
       try {
         const body = JSON.parse(new TextDecoder().decode(bytes)) as T;
         return { body, status: response.status };

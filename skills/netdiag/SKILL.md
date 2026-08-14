@@ -54,8 +54,10 @@ ls /etc/cni/net.d && ip r
 kubectl auth can-i create pods --subresource=exec -n kube-system   # 期望 yes
 ```
 
-不满足 → 说明还在普通沙箱：用 `sandbox_list_profiles` 确认有 `netdiag`，再 `sandbox_ensure`
-（`profile=netdiag`）拉起/复用运维沙箱后重查。不要在当前主沙箱里执行 `kubectl apply -f deploy/opensandbox/netdiag-sandbox.yaml`、
+不满足 → 说明还在普通沙箱：先用 `sandbox_list_profiles` 查询动态目录。优先选择名称为 `netdiag` 的
+profile；若不存在，则选择包含 `diagnostics` capability 或 `runtimeRole=sandbox-diag` 的 profile，并把其稳定
+ID 传给 `sandbox_ensure` / `sandbox_run_command`。当前 AIOS 目录中的这类 profile 可能名为 `aiop-sandbox`，
+不要因为没有 `netdiag` 这个名称就停止执行。拉起/复用运维沙箱后重查。不要在当前主沙箱里执行 `kubectl apply -f deploy/opensandbox/netdiag-sandbox.yaml`、
 patch OpenSandbox server 或删除旧沙箱；每个沙箱都是平级实例，主沙箱不能“升级”为运维沙箱。
 
 ## 0. 逐节点 fabric 健康预检
@@ -154,7 +156,8 @@ done
 1. **fabric 健康**：`fabric-admin health show [--show-errors-only]`，异常则 `health fix --all --force`。
 2. **集群网络巡检 `/opt/cni/bin/fabric-admin e2e network`——仅当用户明确提出「检查/巡检集群
    网络」等集群级需求时执行**：它新建探测 pod 做端到端探测、不动现有负载，相对安全；点状问题
-   不要主动跑。执行前告知会创建探测 pod 及耗时，执行后汇报结果并确认探测 pod 已清理。
+   不要主动跑。通过 `sandbox_run_command` 执行时必须传 `timeoutMs=600000`（10 分钟），不要使用默认
+   30 秒命令超时。执行前告知会创建探测 pod 及耗时，执行后汇报结果并确认探测 pod 已清理。
 3. **组件状态**：`kubectl get pod -A | grep -E 'fabric|ovs'`；
    `kubectl -n kube-system logs <fabric-node-pod> -c fabric --tail=100`。
 4. **防火墙/路由/基础网络**：iptables（legacy + nft）、`nft list ruleset | head -50`、

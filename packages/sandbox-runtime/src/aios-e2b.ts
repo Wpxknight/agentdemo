@@ -193,7 +193,7 @@ export class AiosE2bProvider implements SandboxProvider {
     const response = await this.request<SandboxResponse>('/sandboxes', {
       method: 'POST',
       body: {
-        template,
+        templateID: template,
         ...(timeout === undefined ? {} : { timeout }),
         ...(spec.envs === undefined ? {} : { env: spec.envs }),
         ...(spec.metadata === undefined ? {} : { metadata: spec.metadata }),
