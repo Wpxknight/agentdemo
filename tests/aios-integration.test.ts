@@ -1,4 +1,4 @@
-import { beforeAll, afterAll, describe, expect, it } from 'vitest';
+import { beforeAll, afterAll, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -139,6 +139,118 @@ describe('UserCredentials（加密缓存）', () => {
     await credentials.set('t1', 'u1', 'aios', { token: 'x' });
     await credentials.clear('t1', 'u1');
     expect(await credentials.get('t1', 'u1', 'aios')).toBeUndefined();
+  });
+});
+
+describe('AIOS integrated debug local login', () => {
+  async function startDebugServer(enabled: boolean) {
+    const store = new MemoryStore();
+    await store.createTenant({ id: 'default', name: 'Default' });
+    const local = new LocalAuthProvider({ store, secret: SECRET });
+    const localUser = await local.createUser('default', 'admin', 'pw', 'tenant_admin');
+    await store.createUser({
+      tenantId: 'default', username: 'aios-name', role: 'user', passwordHash: 'not-a-password', authProvider: 'aios',
+    });
+    const credentials = new UserCredentials(store, SECRET);
+    const aios = aiosProvider(store, credentials, async () =>
+      jsonResponse({ data: { accountId: '901', displayName: '平台用户', status: 'active', roles: [] } }));
+    const auditEvents: Array<Record<string, unknown>> = [];
+    const rt = {
+      tools: new ToolRegistry(), store,
+      audit: { record: async (event: Record<string, unknown>) => { auditEvents.push(event); } },
+      policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(),
+      deploymentMode: 'aios-integrated', authProvider: aios, aiosAuth: aios,
+      ...(enabled ? { debugLocalAuth: local } : {}), credentials, jwtSecret: SECRET, systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: '1', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+    const server = createHttpServer(rt);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    return { store, local, localUser, aios, auditEvents, server, base };
+  }
+
+  it('is closed by default and exposes anonymous capabilities', async () => {
+    const env = await startDebugServer(false);
+    try {
+      const capabilities = await fetch(`${env.base}/v1/auth/capabilities`);
+      expect(capabilities.status).toBe(200);
+      expect(await capabilities.json()).toMatchObject({
+        deploymentMode: 'aios-integrated', authProvider: 'aios',
+        capabilities: { aiosExchange: true, localLogin: false },
+      });
+      const login = await fetch(`${env.base}/auth/login`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ tenantId: 'default', username: 'admin', password: 'pw' }),
+      });
+      expect(login.status).toBe(404);
+      const localToken = await env.local.login('default', 'admin', 'pw');
+      const me = await fetch(`${env.base}/v1/me`, { headers: { authorization: `Bearer ${localToken}` } });
+      expect(me.status).toBe(401);
+    } finally {
+      await new Promise<void>((resolve) => env.server.close(() => resolve()));
+    }
+  });
+
+  it('allows only active local users, audits success, and keeps local user management disabled', async () => {
+    const env = await startDebugServer(true);
+    try {
+      const capabilities = await fetch(`${env.base}/v1/auth/capabilities`).then((r) => r.json());
+      expect(capabilities).toMatchObject({ capabilities: { aiosExchange: true, localLogin: true } });
+      const wrong = await fetch(`${env.base}/auth/login`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ tenantId: 'default', username: 'admin', password: 'wrong' }),
+      });
+      expect(wrong.status).toBe(401);
+      const nonLocal = await fetch(`${env.base}/auth/login`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ tenantId: 'default', username: 'aios-name', password: 'anything' }),
+      });
+      expect(nonLocal.status).toBe(401);
+      const login = await fetch(`${env.base}/auth/login`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ tenantId: 'default', username: 'admin', password: 'pw' }),
+      });
+      expect(login.status).toBe(200);
+      const token = (await login.json() as { token: string }).token;
+      const me = await fetch(`${env.base}/v1/me`, { headers: { authorization: `Bearer ${token}` } });
+      expect(await me.json()).toMatchObject({
+        userId: env.localUser.id, authProvider: 'local',
+        features: { localLogin: true, localUserManagement: false },
+      });
+      expect(env.auditEvents.find((event) => event.action === 'aios-debug-local-login')).toMatchObject({
+        provider: 'local', deploymentMode: 'aios-integrated', userId: env.localUser.id,
+      });
+    } finally {
+      await new Promise<void>((resolve) => env.server.close(() => resolve()));
+    }
+  });
+
+  it('routes signed JWT by provider claim without fallback', async () => {
+    const env = await startDebugServer(true);
+    try {
+      const localToken = await env.local.login('default', 'admin', 'pw');
+      const localSpy = vi.spyOn(env.local, 'authenticate');
+      const aiosSpy = vi.spyOn(env.aios, 'authenticate');
+      expect((await fetch(`${env.base}/v1/me`, { headers: { authorization: `Bearer ${localToken}` } })).status).toBe(200);
+      expect(localSpy).toHaveBeenCalledTimes(1);
+      expect(aiosSpy).not.toHaveBeenCalled();
+
+      const exchanged = await env.aios.exchange({ token: 'platform-token' });
+      localSpy.mockClear();
+      aiosSpy.mockClear();
+      expect((await fetch(`${env.base}/v1/me`, { headers: { authorization: `Bearer ${exchanged.token}` } })).status).toBe(200);
+      expect(aiosSpy).toHaveBeenCalledTimes(1);
+      expect(localSpy).not.toHaveBeenCalled();
+
+      await env.store.deleteUserCredentials('default', '901');
+      localSpy.mockClear();
+      aiosSpy.mockClear();
+      expect((await fetch(`${env.base}/v1/me`, { headers: { authorization: `Bearer ${exchanged.token}` } })).status).toBe(401);
+      expect(aiosSpy).toHaveBeenCalledTimes(1);
+      expect(localSpy).not.toHaveBeenCalled();
+    } finally {
+      await new Promise<void>((resolve) => env.server.close(() => resolve()));
+    }
   });
 });
 

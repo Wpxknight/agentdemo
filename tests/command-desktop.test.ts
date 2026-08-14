@@ -97,6 +97,48 @@ describe('CommandDesktopProvider', () => {
     expect(decodeURIComponent(desktop.streamUrl())).toContain(Buffer.from(SCREENSHOT).toString('base64'));
   });
 
+  it('restarts Chrome and retries once when the cached CDP process has died', async () => {
+    const commands: string[] = [];
+    let screenshotAttempts = 0;
+    const runCommand = vi.fn(async (command: string): Promise<ExecResult> => {
+      commands.push(command);
+      const { action } = decodeCommand(command);
+      if (action === 'screenshot') {
+        screenshotAttempts += 1;
+        if (screenshotAttempts === 1) {
+          return { stdout: '', stderr: 'TypeError: fetch failed', exitCode: 1 };
+        }
+        return {
+          stdout: `__AIOP_SCREENSHOT__${Buffer.from(SCREENSHOT).toString('base64')}\n`,
+          stderr: '',
+          exitCode: 0,
+        };
+      }
+      return { stdout: '', stderr: '', exitCode: 0 };
+    });
+    const sandbox: SandboxHandle = {
+      sandboxId: 'sandbox-restart',
+      runCode: vi.fn(async () => ({ stdout: '', stderr: '' })),
+      runCommand,
+      readFile: vi.fn(async () => new Uint8Array()),
+      setTimeout: vi.fn(async () => {}),
+      kill: vi.fn(async () => {}),
+    };
+    const manager = {
+      get: vi.fn(async () => sandbox),
+      touch: vi.fn(() => true),
+      use: vi.fn(async <T>(_key: string, action: () => Promise<T>) => action()),
+    } as unknown as SandboxManagerLike;
+    const desktop = await new CommandDesktopProvider(manager).create({ key: 'browser' });
+
+    await desktop.startStream();
+    const screenshot = await desktop.screenshot();
+
+    expect([...screenshot]).toEqual([...SCREENSHOT]);
+    expect(screenshotAttempts).toBe(2);
+    expect(commands.filter((command) => command.includes('--remote-debugging-port=9222'))).toHaveLength(2);
+  });
+
   it('keeps the OpenSandbox provider as a compatible subclass', async () => {
     const { get, manager } = setup();
     const provider = new OpenSandboxDesktopProvider(manager);

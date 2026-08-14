@@ -16,6 +16,8 @@ import type {
   SandboxProviderOperationOptions,
   SandboxSpec,
 } from './types.js';
+import { normalizeSandboxPlacement } from './placement.js';
+import type { SandboxPlacementInput } from './placement.js';
 
 const READY_PROBE = 'true';
 const DEFAULT_READY_ATTEMPTS = 20;
@@ -25,15 +27,12 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 const MAX_FILE_BYTES = 50 * 1024 * 1024;
 const FILE_RESPONSE_BYTES = Math.ceil(MAX_FILE_BYTES * 4 / 3) + 64 * 1024;
 
-/** AIOS Lifecycle REST API 所需的固定调度位置。 */
-export interface AiosSandboxPlacement {
-  clusterId: string;
-  namespace?: string;
-}
+/** @deprecated 使用 provider-neutral SandboxPlacementInput。 */
+export type AiosSandboxPlacement = SandboxPlacementInput;
 
 export interface AiosE2bProviderOptions extends AiosLifecycleHttpOptions {
-  /** Generic Key 创建所需的固定调度位置。 */
-  placement: AiosSandboxPlacement;
+  /** 旧配置的可选 fallback；动态 spec.placement 优先。 */
+  placement?: AiosSandboxPlacement;
   /** 当前 Runtime generation 从 AIOS 目录加载的模板 ID。 */
   allowedTemplateIds: ReadonlySet<string>;
   /** readiness probe 最大次数；仅供测试或特殊部署调整。 */
@@ -172,7 +171,7 @@ export class AiosE2bProvider implements SandboxProvider {
   private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(private readonly opts: AiosE2bProviderOptions) {
-    if (!opts.placement.clusterId) throw new Error('AIOS placement.clusterId is required');
+    if (opts.placement) normalizeSandboxPlacement(undefined, opts.placement);
     this.http = new AiosLifecycleHttpClient(opts);
     this.readinessAttempts = opts.readinessAttempts ?? DEFAULT_READY_ATTEMPTS;
     this.readinessDelayMs = opts.readinessDelayMs ?? DEFAULT_READY_DELAY_MS;
@@ -187,12 +186,14 @@ export class AiosE2bProvider implements SandboxProvider {
 
   async create(spec: SandboxSpec, options: SandboxProviderOperationOptions = {}): Promise<SandboxHandle> {
     const template = this.assertTemplateAllowed(spec);
+    const normalizedPlacement = normalizeSandboxPlacement(spec.placement, this.opts.placement);
+    if (!normalizedPlacement) throw new Error('AIOS Lifecycle 创建沙箱需要 clusterName 或 clusterId');
     if (spec.volumes?.length) throw new Error('AIOS Lifecycle mode does not support sandbox volumes');
     const timeout = timeoutSeconds(spec.timeoutMs);
     const response = await this.request<SandboxResponse>('/sandboxes', {
       method: 'POST',
       body: {
-        template,
+        templateID: template,
         ...(timeout === undefined ? {} : { timeout }),
         ...(spec.envs === undefined ? {} : { env: spec.envs }),
         ...(spec.metadata === undefined ? {} : { metadata: spec.metadata }),
@@ -203,7 +204,7 @@ export class AiosE2bProvider implements SandboxProvider {
           },
         }),
         ...(spec.network === undefined ? {} : { network: spec.network }),
-        placement: this.opts.placement,
+        placement: normalizedPlacement.placement,
       },
     }, { signal: options.signal });
     const sandboxId = response.sandboxID ?? response.id;

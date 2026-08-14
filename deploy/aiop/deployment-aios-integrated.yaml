@@ -19,6 +19,25 @@ spec:
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
       containers:
+        - name: aiop-web
+          image: deploy.bocloud.k8s:40443/aios/aiop-web:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: AIOP_FRAME_ANCESTORS
+              value: "http://10.241.0.166:30001"
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits: { cpu: "200m", memory: "128Mi" }
         - name: aiop
           image: deploy.bocloud.k8s:40443/aios/aiop:dev
           imagePullPolicy: IfNotPresent
@@ -34,6 +53,8 @@ spec:
               value: "true"
             - name: AIOP_PI_MODE
               value: full
+            - name: AIOP_AIOS_DEBUG_LOCAL_LOGIN
+              value: "true"
           envFrom:
             - secretRef: { name: aiop-secrets }
           securityContext:

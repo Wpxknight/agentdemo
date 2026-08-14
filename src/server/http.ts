@@ -11,15 +11,16 @@ import type { ToolContentBlock } from '../llm/types.js';
 import { InMemoryApprovalStore } from '../agent/approval.js';
 import { InMemoryQuestionStore } from '../agent/question.js';
 import type { QuestionAnswers } from '../agent/question.js';
-import { authenticate } from './context.js';
+import { bearerToken } from './context.js';
 import { AuthzError, canManageUsersOf, permissionsFor, requirePermission } from '../auth/rbac.js';
 import { LocalAuthProvider } from '../auth/local.js';
 import { OidcAuthProvider } from '../auth/oidc.js';
 import { AiosAuthError } from '../auth/aios.js';
+import { verifySession } from '../auth/session.js';
 import { softDeleteUser, setUserEnabled } from '../auth/lifecycle.js';
 import { createTenant, createUser, listTenants } from '../auth/admin.js';
 import type { RequestContext, Role } from '../auth/types.js';
-import { DEFAULT_TASK_MAX_RUN_MS, type SandboxSettings, type ScheduledTaskPatch } from '../db/store.js';
+import { DEFAULT_TASK_MAX_RUN_MS, type InteractionRecord, type SandboxSettings, type ScheduledTaskPatch } from '../db/store.js';
 import { normalizeUserHomeDir } from '@aiop/sandbox-runtime';
 import { DEFAULT_SCHEDULER_TIMEZONE, isValidCron, isValidTimezone } from '../scheduler/cron.js';
 import { createModel } from '../llm/factory.js';
@@ -29,7 +30,11 @@ import { SKILL_IMPORT_GLOBAL_CONCURRENCY, SKILL_IMPORT_TENANT_CONCURRENCY } from
 import type { Skill, SkillProductRecord, SkillRegistry } from '../skill/registry.js';
 import { McpServerSchema } from '../config/schema.js';
 import {
+  AiosLifecycleHttpError,
+  DEFAULT_SANDBOX_PLACEMENT_CLUSTER_ID,
+  DEFAULT_SANDBOX_PLACEMENT_NAMESPACE,
   parseSandboxSettings,
+  SandboxProfileAuthorizationError,
   type SandboxApiKeyUpdate,
 } from '@aiop/sandbox-runtime';
 import { projectCommittedPiSession, projectPiSessionStats, projectPiUsage } from '../agent/projections.js';
@@ -356,21 +361,14 @@ function currentModelConfig(rt: Runtime): RuntimeModelConfig {
   };
 }
 
-function maskApiKey(apiKey: string): string {
-  if (!apiKey) return '';
-  if (apiKey.length <= 6) return `${apiKey.slice(0, 1)}...${apiKey.slice(-1)}`;
-  return `${apiKey.slice(0, 3)}...${apiKey.slice(-3)}`;
-}
-
 function publicModelConfig(config: RuntimeModelConfig): Record<string, unknown> {
   return {
     id: config.id,
     protocol: config.protocol,
     base_url: config.baseURL,
     model: config.model,
-    api_key: config.apiKey,
+    api_key: '',
     api_key_set: Boolean(config.apiKey),
-    api_key_preview: maskApiKey(config.apiKey),
     allow_insecure_tls: Boolean(config.allowInsecureTls),
     context_window_tokens: contextWindowTokens(config),
     context_keep_images: keepImagesOf(config),
@@ -399,10 +397,8 @@ function publicSandboxSettings(settings: SandboxSettings, apiKeySet: boolean): R
       return {
         ...common,
         lifecycle_url: settings.lifecycleUrl,
-        placement: {
-          cluster_id: settings.placement?.clusterId,
-          namespace: settings.placement?.namespace,
-        },
+        default_cluster_id: settings.placement?.clusterId ?? DEFAULT_SANDBOX_PLACEMENT_CLUSTER_ID,
+        default_namespace: settings.placement?.namespace ?? DEFAULT_SANDBOX_PLACEMENT_NAMESPACE,
         api_key_set: apiKeySet,
       };
     case 'opensandbox':
@@ -446,23 +442,23 @@ function sandboxSettingsFromBody(body: Record<string, unknown>): SandboxSettings
   if (typeof mode !== 'string') throw new HttpError(400, 'mode 必填');
   const allowed = new Set(['enabled', 'mode', 'api_key', 'clear_api_key']);
   if (mode === 'standard_e2b') allowed.add('domain');
-  else if (mode === 'aios_lifecycle') { allowed.add('lifecycle_url'); allowed.add('placement'); }
+  else if (mode === 'aios_lifecycle') {
+    allowed.add('lifecycle_url');
+    allowed.add('default_cluster_id');
+    allowed.add('default_namespace');
+    allowed.add('placement');
+  }
   else if (mode === 'opensandbox') { allowed.add('domain'); allowed.add('protocol'); allowed.add('default_image'); }
   for (const key of Object.keys(body)) {
     if (!allowed.has(key)) throw new HttpError(400, `当前 Sandbox mode 不支持字段 ${key}`);
   }
 
-  const placement = body.placement && typeof body.placement === 'object' && !Array.isArray(body.placement)
-    ? body.placement as Record<string, unknown>
-    : body.placement;
   const input = mode === 'aios_lifecycle'
     ? {
         enabled,
         mode,
         lifecycleUrl: str(body, 'lifecycle_url'),
-        placement: placement && typeof placement === 'object'
-          ? { clusterId: str(placement as Record<string, unknown>, 'cluster_id'), namespace: str(placement as Record<string, unknown>, 'namespace') }
-          : placement,
+        placement: sandboxSettingsPlacement(body),
       }
     : mode === 'opensandbox'
       ? {
@@ -480,6 +476,21 @@ function sandboxSettingsFromBody(body: Record<string, unknown>): SandboxSettings
   } catch (err) {
     throw new HttpError(400, err instanceof Error ? err.message : 'Sandbox 配置无效');
   }
+}
+
+function sandboxSettingsPlacement(body: Record<string, unknown>): { clusterId: string; namespace: string } {
+  const legacy = body.placement;
+  if (legacy !== undefined && (!legacy || typeof legacy !== 'object' || Array.isArray(legacy))) {
+    throw new HttpError(400, 'placement 必须是对象');
+  }
+  const placement = legacy as Record<string, unknown> | undefined;
+  const clusterId = str(body, 'default_cluster_id')
+    ?? (placement ? str(placement, 'cluster_id') ?? str(placement, 'clusterId') : undefined)
+    ?? DEFAULT_SANDBOX_PLACEMENT_CLUSTER_ID;
+  const namespace = str(body, 'default_namespace')
+    ?? (placement ? str(placement, 'namespace') : undefined)
+    ?? DEFAULT_SANDBOX_PLACEMENT_NAMESPACE;
+  return { clusterId, namespace };
 }
 
 function sandboxApiKeyUpdate(body: Record<string, unknown>, settings: SandboxSettings): SandboxApiKeyUpdate {
@@ -509,7 +520,7 @@ function sandboxAuditDetail(settings: SandboxSettings, keyAction: SandboxApiKeyU
     enabled: settings.enabled,
     mode: settings.mode,
     ...(settings.mode === 'aios_lifecycle'
-      ? { endpoint: settings.lifecycleUrl, placement: settings.placement }
+      ? { endpoint: settings.lifecycleUrl }
       : settings.mode === 'standard_e2b'
         ? { endpoint: settings.domain ?? 'default' }
         : settings.mode === 'opensandbox'
@@ -625,6 +636,22 @@ function sessionIdFromBody(body: Record<string, unknown>): string {
 
 function profileFromBody(body: Record<string, unknown>): string | undefined {
   return str(body, 'profile') ?? str(body, 'sandboxProfile');
+}
+
+function addSandboxPlacementArgs(body: Record<string, unknown>, args: Record<string, JsonValue>): void {
+  const fields = [
+    ['cluster_name', 'clusterName'],
+    ['cluster_id', 'clusterId'],
+    ['namespace', 'namespace'],
+  ] as const;
+  for (const [input, output] of fields) {
+    if (body[input] === undefined) continue;
+    if (typeof body[input] !== 'string') throw new HttpError(400, `${input} 必须是字符串`);
+    const value = body[input].trim();
+    if (!value) throw new HttpError(400, `${input} 必须是非空字符串`);
+    args[output] = value;
+  }
+  if (args.clusterId !== undefined) delete args.clusterName;
 }
 
 function intParam(value: string | null, fallback: number, min: number, max: number): number {
@@ -805,7 +832,21 @@ async function dispatchDirectTool(
   const decision = await rt.policy.check(call, toolCtx);
   if (decision.blocked) throw new HttpError(403, decision.reason ?? '策略阻止了该操作');
   if (decision.needApproval) throw new HttpError(409, decision.reason ?? '该操作需要审批，无法直接执行');
-  const result = await rt.tools.dispatch(call, toolCtx);
+  const execution = await rt.tools.executeDirect(call, toolCtx);
+  if ('error' in execution) {
+    const err = execution.error;
+    const lifecycle = err instanceof AiosLifecycleHttpError || (
+      err instanceof Error
+      && err.name === 'AiosLifecycleHttpError'
+      && typeof (err as Error & { status?: unknown }).status === 'number'
+    );
+    if (lifecycle) {
+      const status = (err as AiosLifecycleHttpError).status;
+      if (status >= 400 && status < 500) throw new HttpError(status, (err as Error).message);
+    }
+    if (err instanceof SandboxProfileAuthorizationError) throw new HttpError(403, err.message);
+  }
+  const result = execution.result;
   return { ok: !result.isError, sessionId, result };
 }
 
@@ -861,10 +902,19 @@ function invalidateUserStatus(rt: Runtime, tenantId: string, userId: string): vo
 
 /** 校验 Bearer token 并返回身份；失败抛 401。 */
 async function requireAuth(rt: Runtime, req: Req): Promise<RequestContext> {
-  const ctx = await authenticate(rt.authProvider, req.headers.authorization)
-    ?? (rt.aiosAuth && rt.aiosAuth !== rt.authProvider
-      ? await authenticate(rt.aiosAuth, req.headers.authorization)
-      : undefined);
+  const token = bearerToken(req.headers.authorization);
+  if (!token) throw new HttpError(401, '未认证或 token 无效');
+  const trusted = await verifySession(new TextEncoder().encode(rt.jwtSecret), token);
+  if (!trusted?.provider) throw new HttpError(401, '未认证或 token 无效');
+  let ctx: RequestContext | undefined;
+  if (trusted.provider === 'aios') {
+    ctx = rt.aiosAuth ? await rt.aiosAuth.authenticate(token) : undefined;
+  } else if (trusted.provider === 'local') {
+    const provider = rt.debugLocalAuth ?? (rt.authProvider instanceof LocalAuthProvider ? rt.authProvider : undefined);
+    ctx = provider ? await provider.authenticate(token) : undefined;
+  } else if (trusted.provider === 'oidc') {
+    ctx = rt.authProvider instanceof OidcAuthProvider ? await rt.authProvider.authenticate(token) : undefined;
+  }
   if (!ctx) throw new HttpError(401, '未认证或 token 无效');
   await assertUserActive(rt, ctx);
   return ctx;
@@ -1037,9 +1087,26 @@ async function handle(
 
   if (method === 'GET' && await sendWebAsset(res, path, rt.frameAncestors)) return;
 
+  if (route === 'GET /v1/auth/capabilities') {
+    return sendJson(res, 200, {
+      deploymentMode: rt.deploymentMode ?? 'standalone',
+      authProvider: rt.deploymentMode === 'aios-integrated' ? 'aios'
+        : rt.authProvider instanceof LocalAuthProvider ? 'local'
+          : rt.authProvider instanceof OidcAuthProvider ? 'oidc' : 'aios',
+      capabilities: {
+        aiosExchange: Boolean(rt.aiosAuth),
+        localLogin: Boolean(rt.debugLocalAuth)
+          || ((rt.deploymentMode ?? 'standalone') === 'standalone' && rt.authProvider instanceof LocalAuthProvider),
+      },
+    });
+  }
+
   // —— 本地登录 ——
   if (route === 'POST /auth/login') {
-    if (rt.deploymentMode === 'aios-integrated' || !(rt.authProvider instanceof LocalAuthProvider)) {
+    const localAuth = rt.debugLocalAuth
+      ?? ((rt.deploymentMode ?? 'standalone') === 'standalone' && rt.authProvider instanceof LocalAuthProvider
+        ? rt.authProvider : undefined);
+    if (!localAuth) {
       throw new HttpError(404, '本地登录未启用');
     }
     const body = await readJson(req);
@@ -1047,8 +1114,19 @@ async function handle(
     const username = str(body, 'username');
     const password = str(body, 'password');
     if (!username || !password) throw new HttpError(400, 'username/password 必填');
-    const token = await rt.authProvider.login(tenantId, username, password);
+    const token = await localAuth.login(tenantId, username, password);
     if (!token) throw new HttpError(401, '登录失败：用户名或口令错误');
+    if (rt.debugLocalAuth) {
+      const ctx = await localAuth.authenticate(token);
+      if (!ctx) throw new HttpError(401, '登录失败：用户名或口令错误');
+      const correlationId = requestCorrelationId(req);
+      log.warn({ tenantId: ctx.tenantId, userId: ctx.userId, role: ctx.role, correlationId }, 'AIOS debug local login used');
+      await rt.audit?.record({
+        kind: 'auth', action: 'aios-debug-local-login', tenantId: ctx.tenantId,
+        userId: ctx.userId, provider: 'local', deploymentMode: 'aios-integrated', correlationId,
+        detail: { role: ctx.role },
+      });
+    }
     return sendJson(res, 200, { token });
   }
 
@@ -1235,7 +1313,8 @@ async function handle(
       deploymentMode: rt.deploymentMode ?? 'standalone',
       permissions: permissionsFor(ctx.role),
       features: {
-        localLogin: (rt.deploymentMode ?? 'standalone') === 'standalone' && rt.authProvider instanceof LocalAuthProvider,
+        localLogin: Boolean(rt.debugLocalAuth)
+          || ((rt.deploymentMode ?? 'standalone') === 'standalone' && rt.authProvider instanceof LocalAuthProvider),
         localUserManagement: (rt.deploymentMode ?? 'standalone') === 'standalone',
       },
     });
@@ -1579,6 +1658,7 @@ async function handle(
     if (language) args.language = language;
     const profile = profileFromBody(body);
     if (profile) args.profile = profile;
+    addSandboxPlacementArgs(body, args);
     return sendJson(res, 200, await dispatchDirectTool(
       rt,
       ctx,
@@ -1596,6 +1676,7 @@ async function handle(
     const args: Record<string, JsonValue> = { command };
     const profile = profileFromBody(body);
     if (profile) args.profile = profile;
+    addSandboxPlacementArgs(body, args);
     return sendJson(res, 200, await dispatchDirectTool(
       rt,
       ctx,
@@ -2420,6 +2501,15 @@ async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req:
     } else if (result.status === 'failed' || result.status === 'recovery_required') {
       sse('error', { error: result.error?.message ?? '运行失败', runId: result.runId, status: result.status });
     } else {
+      if (result.status === 'waiting') {
+        const interactions = await rt.store.listAgentRunInteractions(ctx, result.runId);
+        const pending = interactions.find((interaction) => (
+          interaction.status === 'pending'
+          && (interaction.kind === 'question' || interaction.kind === 'plan')
+        ));
+        const projected = pending ? projectPendingInteractionHttpEvent(pending) : undefined;
+        if (projected) sse(projected.event, projected.data);
+      }
       if (result.status === 'succeeded' && result.text && !emittedText) sse('text_delta', { text: result.text });
       sse('done', projectDurableHttpDone({
         sessionId,
@@ -2434,6 +2524,23 @@ async function runDurableAgentSse(rt: Runtime, activeRuns: ActiveAgentRuns, req:
     removeActiveRun(activeRuns, activeKey, activeRun);
     if (!res.destroyed && !res.writableEnded) res.end();
   }
+}
+
+export function projectPendingInteractionHttpEvent(
+  interaction: Pick<InteractionRecord, 'id' | 'sessionId' | 'kind' | 'status' | 'payload'>,
+): { event: 'question_required' | 'change_plan_required'; data: Record<string, unknown> } | undefined {
+  if (interaction.status !== 'pending' || (interaction.kind !== 'question' && interaction.kind !== 'plan')) return undefined;
+  const payload = objectValue(interaction.payload);
+  if (!payload || !Array.isArray(payload.questions)) return undefined;
+  return {
+    event: interaction.kind === 'plan' ? 'change_plan_required' : 'question_required',
+    data: {
+      id: interaction.id,
+      sessionId: interaction.sessionId,
+      questions: payload.questions,
+      ...(payload.plan && typeof payload.plan === 'object' ? { plan: payload.plan } : {}),
+    },
+  };
 }
 
 export function projectDurableHttpEvent(event: { type: string; detail?: unknown }): { event: string; data: unknown } | undefined {
@@ -2459,7 +2566,8 @@ export function projectDurableHttpEvent(event: { type: string; detail?: unknown 
     if (!toolId) return undefined;
     const text = stringValue(detail.outputText);
     if (!text) return undefined;
-    return { event: 'tool_output', data: { toolId, stream: 'stdout', text } };
+    const stream = detail.outputStream === 'stderr' ? 'stderr' : 'stdout';
+    return { event: 'tool_output', data: { toolId, stream, text } };
   }
   if (event.type === 'tool_execution_end' || event.type === 'tool_result') {
     const toolId = stringValue(detail.toolCallId);

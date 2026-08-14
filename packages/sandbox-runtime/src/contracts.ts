@@ -36,7 +36,10 @@ export interface SandboxConfig {
   enabled: boolean;
   provider: 'local' | 'e2b' | 'opensandbox';
   apiKey?: string;
-  aios?: { lifecycleUrl: string; placement: { clusterId: string; namespace: string } };
+  aios?: {
+    lifecycleUrl: string;
+    placement?: { clusterId?: string; clusterName?: string; namespace?: string };
+  };
   domain?: string;
   protocol?: 'http' | 'https';
   defaultImage?: string;
@@ -56,7 +59,8 @@ export interface SandboxSettings {
   protocol?: 'http' | 'https';
   defaultImage?: string;
   lifecycleUrl?: string;
-  placement?: { clusterId: string; namespace: string };
+  /** @deprecated 仅供旧数据库记录作为内部 fallback，公共设置不再返回或保存。 */
+  placement?: { clusterId?: string; clusterName?: string; namespace?: string };
 }
 
 export interface SandboxSettingsRecord {

@@ -4,6 +4,7 @@
 FROM node:24-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
 
 RUN sed -i 's#https\?://deb.debian.org/debian-security#http://mirrors.aliyun.com/debian-security#g; s#https\?://deb.debian.org/debian#http://mirrors.aliyun.com/debian#g' /etc/apt/sources.list.d/debian.sources \
   && apt-get update \
@@ -15,6 +16,9 @@ RUN sed -i 's#https\?://deb.debian.org/debian-security#http://mirrors.aliyun.com
        curl \
        dnsutils \
        ethtool \
+       fontconfig \
+       fonts-noto-cjk \
+       fonts-noto-color-emoji \
        iproute2 \
        ipset \
        iptables \
@@ -35,6 +39,7 @@ RUN sed -i 's#https\?://deb.debian.org/debian-security#http://mirrors.aliyun.com
        traceroute \
        util-linux \
        vim-tiny \
+       xvfb \
   && rm -rf /var/lib/apt/lists/* \
   && pip3 install --no-cache-dir --break-system-packages \
        requests \
@@ -49,8 +54,10 @@ RUN chmod +x /usr/local/bin/kubectl \
   && python3 -c "import requests, yaml, cryptography, openpyxl" \
   && node -e "if (typeof fetch !== 'function' || typeof WebSocket !== 'function') process.exit(1)" \
   && chromium --version \
+  && fc-cache -f \
+  && fc-list :lang=zh family | grep -q . \
   && kubectl version --client \
-  && for binary in python3 node chromium kubectl tcpdump conntrack dig nslookup ping \
+  && for binary in python3 node chromium Xvfb fc-list kubectl tcpdump conntrack dig nslookup ping \
        netstat ss ip iptables nft curl jq nsenter ovs-ofctl ovs-vsctl; do \
        command -v "$binary" >/dev/null || { echo "missing: $binary" >&2; exit 1; }; \
      done \

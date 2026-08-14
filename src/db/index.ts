@@ -231,6 +231,19 @@ export async function runMigrations(pool: Pool): Promise<void> {
 export interface IdentityModeCompatibility {
   deploymentMode: DeploymentMode;
   authProvider: AuthProviderKind;
+  allowMixedIdentitySource?: boolean;
+}
+
+function allowMixedIdentitySource(identity: IdentityModeCompatibility, incompatibleUsers: bigint): boolean {
+  if (!identity.allowMixedIdentitySource || identity.deploymentMode !== 'aios-integrated' || identity.authProvider !== 'aios') {
+    return false;
+  }
+  log.warn({
+    deploymentMode: identity.deploymentMode,
+    authProvider: identity.authProvider,
+    incompatibleUserCount: incompatibleUsers.toString(),
+  }, 'UNSAFE mixed identity source compatibility override is enabled');
+  return true;
 }
 
 async function assertExistingIdentitySourceCompatibility(
@@ -251,7 +264,7 @@ async function assertExistingIdentitySourceCompatibility(
       expectedProvider ? [expectedProvider] : [],
     );
     const incompatibleUsers = BigInt(String((userRows as Array<{ count: string | number }>)[0]?.count ?? 0));
-    if (incompatibleUsers !== 0n) {
+    if (incompatibleUsers !== 0n && !allowMixedIdentitySource(identity, incompatibleUsers)) {
       throw new Error(
         `Database identity mode is incompatible with ${identity.deploymentMode}/${identity.authProvider}: `
         + `${incompatibleUsers} user rows belong to another identity namespace`,
@@ -280,7 +293,7 @@ export async function assertIdentityModeCompatibility(
       expectedProvider ? [expectedProvider] : [],
     );
     const incompatibleUsers = BigInt(String((userRows as Array<{ count: string | number }>)[0]?.count ?? 0));
-    if (incompatibleUsers !== 0n) {
+    if (incompatibleUsers !== 0n && !allowMixedIdentitySource(identity, incompatibleUsers)) {
       throw new Error(
         `Database identity mode is incompatible with ${identity.deploymentMode}/${identity.authProvider}: `
         + `${incompatibleUsers} user rows belong to another identity namespace`,

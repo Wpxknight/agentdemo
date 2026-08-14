@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   projectDurableHttpDone,
   projectDurableHttpEvent,
+  projectPendingInteractionHttpEvent,
   readSessionContextProjection,
   readSessionUsageProjection,
 } from '../../src/server/http.js';
@@ -49,6 +50,12 @@ describe('HTTP Pi event projection compatibility', () => {
       { event: 'tool_output', data: { toolId: 'call-1', stream: 'stdout', text: 'live output' } },
     ],
     [
+      { type: 'tool_execution_update', detail: {
+        toolCallId: 'call-1', toolName: 'lookup', outputText: 'warning', outputStream: 'stderr',
+      } },
+      { event: 'tool_output', data: { toolId: 'call-1', stream: 'stderr', text: 'warning' } },
+    ],
+    [
       { type: 'tool_execution_end', detail: { toolCallId: 'call-1', toolName: 'lookup', isError: false } },
       { event: 'tool_result', data: { toolId: 'call-1', name: 'lookup', isError: false } },
     ],
@@ -69,6 +76,39 @@ describe('HTTP Pi event projection compatibility', () => {
     expect(projectDurableHttpEvent({ type: 'retry_scheduled', detail: { errorMessage: 'internal' } })).toBeUndefined();
     expect(projectDurableHttpEvent({ type: 'todo_updated', detail: { todos: [] } })).toBeUndefined();
     expect(projectDurableHttpEvent({ type: 'file_exported', detail: { name: 'report.txt' } })).toBeUndefined();
+  });
+
+  it.each([
+    ['question', 'question_required'],
+    ['plan', 'change_plan_required'],
+  ] as const)('projects a pending %s interaction to the existing browser event', (kind, event) => {
+    expect(projectPendingInteractionHttpEvent({
+      id: 'interaction-a',
+      sessionId: 'session-a',
+      kind,
+      status: 'pending',
+      payload: {
+        questions: [{ question: '选择集群', options: [{ label: 'portal' }] }],
+        ...(kind === 'plan' ? { plan: { summary: '变更方案' } } : {}),
+      },
+    })).toEqual({
+      event,
+      data: {
+        id: 'interaction-a',
+        sessionId: 'session-a',
+        questions: [{ question: '选择集群', options: [{ label: 'portal' }] }],
+        ...(kind === 'plan' ? { plan: { summary: '变更方案' } } : {}),
+      },
+    });
+  });
+
+  it('does not project resolved or malformed interactions', () => {
+    expect(projectPendingInteractionHttpEvent({
+      id: 'interaction-a', sessionId: 'session-a', kind: 'question', status: 'resolved', payload: { questions: [] },
+    })).toBeUndefined();
+    expect(projectPendingInteractionHttpEvent({
+      id: 'interaction-a', sessionId: 'session-a', kind: 'question', status: 'pending', payload: {},
+    })).toBeUndefined();
   });
 
   it('retains the legacy done DTO fields for durable results', () => {

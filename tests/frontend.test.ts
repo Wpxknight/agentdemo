@@ -92,6 +92,14 @@ describe('React frontend stack', () => {
     expect(app).toContain("window.history.pushState({}, '', pageUrl(next))");
   });
 
+  it('restores and marks sessions that are waiting for user interaction', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+
+    expect(app).toContain("api.get<QuestionsBody>('/v1/questions')");
+    expect(app).toContain('waitingSessionIds={new Set(Object.keys(pendingQuestions))}');
+    expect(app).toContain('等待交互');
+  });
+
   it('uses the backend product contract for pending skill imports', async () => {
     const types = await readFile('web/src/types.ts', 'utf8');
     const app = await readFile('web/src/App.tsx', 'utf8');
@@ -252,6 +260,30 @@ describe('frontend API wiring', () => {
     expect(app).toContain("mode={host.deploymentMode === 'standalone' ? 'redirect' : 'waiting'}");
     expect(app).toContain("mode === 'redirect' ? '正在跳转到统一登录...' : '等待宿主平台提供授权凭据'");
     expect(contract).toContain('onUnauthorized(): void | Promise<void>');
+  });
+
+  it('discovers server auth capabilities and shows an explicit integrated debug login', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const adapter = await readFile('web/src/aios-host-adapter.ts', 'utf8');
+    const types = await readFile('web/src/types.ts', 'utf8');
+
+    expect(types).toContain('export interface AuthCapabilitiesBody');
+    expect(app).toContain("fetch(apiUrl(host, '/v1/auth/capabilities'))");
+    expect(app).toContain('authCapabilities?.capabilities.localLogin');
+    expect(app).toContain("'测试环境调试登录'");
+    expect(app).toContain("debug={authCapabilities?.deploymentMode === 'aios-integrated'}");
+    expect(adapter).toContain('async login(credentials: LoginCredentials)');
+  });
+
+  it('never pre-fills or renders the persisted model API key', async () => {
+    const app = await readFile('web/src/App.tsx', 'utf8');
+    const types = await readFile('web/src/types.ts', 'utf8');
+
+    expect(app).toContain("api_key: ''");
+    expect(app).toContain("type=\"password\"");
+    expect(app).toContain("llm.api_key_set ? '已配置；留空保留' : '输入 API Key'");
+    expect(app).not.toContain("api_key: llm.api_key || ''");
+    expect(types).not.toContain('api_key_preview: string;');
   });
 
   it('supports dragging the right preview panel wider', async () => {
@@ -1010,6 +1042,8 @@ describe('frontend API wiring', () => {
     const sandboxSettingsType = types.match(/export interface SandboxSettingsInfo \{[\s\S]*?\n\}/)?.[0] || '';
     const sandboxSettingsBodyType = types.match(/export interface SandboxSettingsBody \{[\s\S]*?\n\}/)?.[0] || '';
     expect(sandboxSettingsType).toContain('api_key_set: boolean;');
+    expect(sandboxSettingsType).toContain('default_cluster_id?: string;');
+    expect(sandboxSettingsType).toContain('default_namespace?: string;');
     expect(sandboxSettingsType).not.toContain('api_key_preview');
     expect(sandboxSettingsBodyType).toContain("status?: 'disabled' | 'active' | 'catalog_unavailable' | 'refreshing' | string;");
     expect(sandboxSettingsBodyType).toContain('template_count?: number;');
@@ -1021,8 +1055,13 @@ describe('frontend API wiring', () => {
     expect(app).toContain('<SelectItem value="opensandbox">OpenSandbox（k8s）</SelectItem>');
     expect(app).toContain('<SelectItem value="local">Local（本地开发）</SelectItem>');
     expect(app).toContain('Lifecycle URL');
-    expect(app).toContain('Cluster ID');
-    expect(app).toContain('Namespace');
+    expect(app).toContain('<Label>默认集群 ID');
+    expect(app).toContain('<Label>默认命名空间');
+    expect(app).toContain("defaultClusterId: settings?.default_cluster_id ?? '1'");
+    expect(app).toContain("defaultNamespace: settings?.default_namespace ?? 'aios-system'");
+    expect(app).toContain('payload.default_cluster_id = form.defaultClusterId.trim()');
+    expect(app).toContain('payload.default_namespace = form.defaultNamespace.trim()');
+    expect(sandboxSettingsType).not.toContain('placement');
     expect(app).toContain('模板由 AIOS 目录动态加载；browser 模板接入现有截图预览，sandbox-diag 仅平台管理员可见可用。');
     expect(app).not.toContain('固定使用 code-interpreter');
     expect(app).toContain('template_count');
@@ -1237,7 +1276,7 @@ describe('frontend data APIs', () => {
         protocol: 'anthropic',
         base_url: 'http://localhost:8000/v1',
         model: 'ui-model',
-        api_key: 'ui-key',
+        api_key: '',
         api_key_set: true,
       });
     } finally {

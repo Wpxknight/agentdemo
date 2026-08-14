@@ -117,13 +117,14 @@ describe('AiosE2bProvider', () => {
         'x-api-key': 'secret-aios-key',
       },
       body: {
-        template: 'browser-id',
+        templateID: 'browser-id',
         timeout: 2,
         env: { A: 'one' },
         metadata: { sessionId: 'session', profile: 'code' },
         placement: { clusterId: 'local', namespace: 'aios-sandbox-local' },
       },
     });
+    expect(requests[0].body).not.toHaveProperty('template');
     expect(requests[0].body).not.toHaveProperty('namespace');
     expect(requests[0].body).not.toHaveProperty('serviceAccount');
     expect(requests.slice(1).map((request) => request.body)).toEqual([
@@ -131,6 +132,60 @@ describe('AiosE2bProvider', () => {
       { command: 'true' },
     ]);
     expect(sleep).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    [{ clusterId: ' 35 ', namespace: ' test ' }, { clusterId: '35', namespace: 'test' }],
+    [{ clusterName: ' Cluster PC-1 ', namespace: ' test ' }, { clusterName: 'Cluster PC-1', namespace: 'test' }],
+  ])('prefers dynamic placement and sends exactly one selector', async (placement, expected) => {
+    const { fetch, requests } = queuedFetch([
+      jsonResponse(201, { sandboxID: 'sb-dynamic' }),
+      jsonResponse(200, { stdout: '', stderr: '', exitCode: 0 }),
+    ]);
+    await provider(fetch).create({
+      key: 'dynamic', template: 'code-id',
+      placement: { ...placement, namespace: 'namespace' in placement ? placement.namespace : 'aios-system' },
+    });
+    expect(requests[0].body).toMatchObject({ placement: expected });
+    expect(JSON.stringify(requests[0].body)).not.toContain('clusterName' in expected ? 'clusterId' : 'clusterName');
+  });
+
+  it('passes arbitrary cluster names through without mapping while preserving caller metadata', async () => {
+    const { fetch, requests } = queuedFetch([
+      jsonResponse(201, { sandboxID: 'sb-name' }),
+      jsonResponse(200, { stdout: '', stderr: '', exitCode: 0 }),
+    ]);
+    await provider(fetch).create({
+      key: 'name', template: 'code-id', placement: { clusterName: 'unlisted-cluster', namespace: 'aios-system' },
+      metadata: { placementSelector: 'clusterName', placementCluster: 'unlisted-cluster' },
+    });
+    expect(requests[0].body).toMatchObject({
+      placement: { clusterName: 'unlisted-cluster', namespace: 'aios-system' },
+      metadata: { placementSelector: 'clusterName', placementCluster: 'unlisted-cluster' },
+    });
+    expect((requests[0].body as { placement: object }).placement).not.toHaveProperty('clusterId');
+  });
+
+  it('forwards server rejection for a dynamic cluster name once without selector conversion or fallback', async () => {
+    const { fetch, requests } = queuedFetch([
+      jsonResponse(403, { error: { message: 'target cluster forbidden' } }),
+    ]);
+    const p = provider(fetch);
+    await expect(p.create({
+      key: 'unknown', template: 'code-id', placement: { clusterName: 'unknown', namespace: 'aios-system' },
+    })).rejects.toMatchObject({ status: 403 });
+    expect(requests).toHaveLength(1);
+    expect(requests[0].body).toMatchObject({
+      placement: { clusterName: 'unknown', namespace: 'aios-system' },
+    });
+    expect((requests[0].body as { placement: object }).placement).not.toHaveProperty('clusterId');
+  });
+
+  it('fails before HTTP when neither dynamic placement nor fallback exists', async () => {
+    const fetch = vi.fn() as unknown as typeof globalThis.fetch;
+    const p = provider(fetch, { placement: undefined });
+    await expect(p.create({ key: 'missing', template: 'code-id' })).rejects.toThrow(/clusterName|clusterId/);
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it('aborts a 409 readiness retry sleep promptly and completes late sandbox cleanup', async () => {

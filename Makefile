@@ -12,6 +12,11 @@ AIOP_KUBECONFIG ?= /home/lb/.kube/config-10.241.0.166
 AIOP_NAMESPACE ?= aios-system
 AIOP_KUBECTL = $(KUBECTL) --kubeconfig $(AIOP_KUBECONFIG)
 AIOP_IMAGE_PULL_POLICY ?= Always
+AIOP_ALLOW_MIXED_IDENTITY_SOURCE ?= false
+AIOP_AIOS_DEBUG_LOCAL_LOGIN ?= false
+DEBUG_LOCAL_TENANT ?= default
+DEBUG_LOCAL_USERNAME ?= admin
+DEBUG_LOCAL_PASSWORD_SECRET ?= aiop-debug-local-login
 SANDBOX_IMAGE ?= deploy.bocloud.k8s:40443/aios/aiop-sandbox:latest
 SANDBOX_PLATFORM ?= linux/amd64
 SANDBOX_KUBECTL_VERSION ?= v1.32.4
@@ -20,7 +25,7 @@ SANDBOX_KUBECTL_DIST ?= dist/opensandbox/kubectl-$(SANDBOX_KUBECTL_VERSION)-linu
 ROLLBACK_REVISION ?=
 ROLLBACK_TO_REVISION = $(if $(strip $(ROLLBACK_REVISION)),--to-revision=$(ROLLBACK_REVISION),)
 
-.PHONY: verify-node test-agent-platform test-runtime-refactor verify-runtime-refactor test-dual-auth test-migrations-mariadb check-dual-deploy-config package-web-core verify-web-core-package test-web-core-consumer image-check check-user-id-migration migrate-user-id-staging image pipeline sandbox-prepare-kubectl sandbox-image sandbox-image-check sandbox-image-push sandbox-pipeline deploy-staging rollback-staging deploy-aiop deploy-standalone deploy-aios-integrated rollback-aiop backup-aiop-staging-k8s-settings backup-aiop-staging-db-settings rebuild-aiop-staging-db deploy-aiop-staging deploy-aiop-staging-workload deploy-aiop-staging-fresh
+.PHONY: verify-node test-agent-platform test-runtime-refactor verify-runtime-refactor test-dual-auth test-migrations-mariadb check-dual-deploy-config package-web-core verify-web-core-package test-web-core-consumer image-check check-user-id-migration migrate-user-id-staging image pipeline sandbox-prepare-kubectl sandbox-image sandbox-image-check sandbox-image-push sandbox-pipeline deploy-staging rollback-staging deploy-aiop deploy-standalone deploy-aios-integrated reset-aios-debug-local-password rollback-aiop backup-aiop-staging-k8s-settings backup-aiop-staging-db-settings rebuild-aiop-staging-db deploy-aiop-staging deploy-aiop-staging-workload deploy-aiop-staging-fresh
 
 verify-node:
 	npm run verify:node
@@ -100,13 +105,32 @@ deploy-standalone:
 
 deploy-aios-integrated:
 	@test "$(DEPLOYMENT_MODE)" = "aios-integrated" || (printf '%s\n' 'Set DEPLOYMENT_MODE=aios-integrated' >&2; exit 1)
-	$(MAKE) check-user-id-migration DEPLOYMENT_MODE=aios-integrated AUTH_PROVIDER=aios
+	@test "$(AIOP_ALLOW_MIXED_IDENTITY_SOURCE)" = "false" -o "$(AIOP_ALLOW_MIXED_IDENTITY_SOURCE)" = "true" || (printf '%s\n' 'AIOP_ALLOW_MIXED_IDENTITY_SOURCE must be false or true' >&2; exit 1)
+	@test "$(AIOP_AIOS_DEBUG_LOCAL_LOGIN)" = "false" -o "$(AIOP_AIOS_DEBUG_LOCAL_LOGIN)" = "true" || (printf '%s\n' 'AIOP_AIOS_DEBUG_LOCAL_LOGIN must be false or true' >&2; exit 1)
+	@# 测试环境部署不自动执行身份迁移预检；需要诊断时显式运行 check-user-id-migration。
 	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) get secret aiop-secrets -o name >/dev/null
 	$(AIOP_KUBECTL) apply -f deploy/aiop/configmap-aios-integrated.yaml
 	$(AIOP_KUBECTL) apply -f deploy/aiop/pvc-skills.yaml
+	@# Fabric 不会可靠清理 Service targetPort 原地变更的旧 NodePort 链，重建以避免流量命中陈旧后端。
+	$(AIOP_KUBECTL) delete -f deploy/aiop/service-aios-integrated.yaml --ignore-not-found --wait=true
 	$(AIOP_KUBECTL) apply -f deploy/aiop/service-aios-integrated.yaml
-	$(AIOP_KUBECTL) set image -f deploy/aiop/deployment-aios-integrated.yaml aiop=$(PUBLISH_IMAGE) --local -o yaml | $(AIOP_KUBECTL) apply -f -
+	$(AIOP_KUBECTL) set image -f deploy/aiop/deployment-aios-integrated.yaml aiop=$(PUBLISH_IMAGE) aiop-web=$(PUBLISH_WEB_IMAGE) --local -o yaml | $(AIOP_KUBECTL) apply -f -
+	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) set env deployment/aiop-server AIOP_DEPLOY_IMAGE=$(PUBLISH_IMAGE) AIOP_DEPLOY_WEB_IMAGE=$(PUBLISH_WEB_IMAGE) AIOP_ALLOW_MIXED_IDENTITY_SOURCE=$(AIOP_ALLOW_MIXED_IDENTITY_SOURCE) AIOP_AIOS_DEBUG_LOCAL_LOGIN=$(AIOP_AIOS_DEBUG_LOCAL_LOGIN)
 	$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) rollout status deployment/aiop-server --timeout=300s
+
+reset-aios-debug-local-password:
+	@set -eu; \
+		if $(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) get secret "$(DEBUG_LOCAL_PASSWORD_SECRET)" >/dev/null 2>&1; then \
+			$(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) get secret "$(DEBUG_LOCAL_PASSWORD_SECRET)" -o jsonpath='{.data.password}' \
+				| base64 -d \
+				| $(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) exec -i deploy/aiop-server -c aiop -- npm exec -- tsx src/index.ts reset-local-password "$(DEBUG_LOCAL_TENANT)" "$(DEBUG_LOCAL_USERNAME)"; \
+		elif test -t 0; then \
+			stty -echo; trap 'stty echo' EXIT INT TERM; printf 'New password: ' >&2; IFS= read -r password; printf '\n' >&2; stty echo; trap - EXIT INT TERM; \
+			test -n "$$password" || { printf '%s\n' 'Password must not be empty' >&2; exit 1; }; \
+			printf '%s' "$$password" | $(AIOP_KUBECTL) -n $(AIOP_NAMESPACE) exec -i deploy/aiop-server -c aiop -- npm exec -- tsx src/index.ts reset-local-password "$(DEBUG_LOCAL_TENANT)" "$(DEBUG_LOCAL_USERNAME)"; \
+		else \
+			printf '%s\n' 'Create Secret $(DEBUG_LOCAL_PASSWORD_SECRET) with key password, or run interactively' >&2; exit 1; \
+		fi
 
 check-user-id-migration:
 	@test -n "$(DEPLOYMENT_MODE)" -a -n "$(AUTH_PROVIDER)" || (printf '%s\n' 'Set explicit DEPLOYMENT_MODE and AUTH_PROVIDER' >&2; exit 1)
@@ -157,7 +181,7 @@ sandbox-image: sandbox-prepare-kubectl
 
 sandbox-image-check:
 	docker image inspect $(SANDBOX_IMAGE) >/dev/null
-	docker run --rm --platform $(SANDBOX_PLATFORM) $(SANDBOX_IMAGE) sh -ec 'python3 -c "import requests, yaml, cryptography, openpyxl"; node -e "if (typeof fetch !== \"function\" || typeof WebSocket !== \"function\") process.exit(1)"; chromium --version; kubectl version --client; for binary in tcpdump conntrack dig iptables nft nsenter ovs-ofctl ovs-vsctl; do command -v "$$binary" >/dev/null; done'
+	docker run --rm --platform $(SANDBOX_PLATFORM) $(SANDBOX_IMAGE) sh -ec 'python3 -c "import requests, yaml, cryptography, openpyxl"; node -e "if (typeof fetch !== \"function\" || typeof WebSocket !== \"function\") process.exit(1)"; chromium --version; Xvfb -help >/dev/null 2>&1; fc-list :lang=zh family | grep -q .; kubectl version --client; for binary in Xvfb fc-list tcpdump conntrack dig iptables nft nsenter ovs-ofctl ovs-vsctl; do command -v "$$binary" >/dev/null; done'
 
 sandbox-image-push: sandbox-image-check
 	docker push $(SANDBOX_IMAGE)

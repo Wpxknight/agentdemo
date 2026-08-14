@@ -15,6 +15,7 @@ import {
   type PublicSandboxProfile,
   type SandboxProfile,
 } from './profiles.js';
+import { SandboxProfileAuthorizationError } from './profiles.js';
 import type { SandboxHandle, SandboxSpec } from './types.js';
 import type { SandboxAcquisition, SandboxAcquirer, SpecResolver } from './acquisition.js';
 
@@ -141,19 +142,19 @@ export class SandboxRuntimeController implements SandboxAcquirer {
     }
   }
 
-  async acquire(ctx: ToolContext, profile?: string): Promise<SandboxAcquisition> {
+  async acquire(ctx: ToolContext, profile?: string, placement?: import('./placement.js').SandboxPlacementInput): Promise<SandboxAcquisition> {
     const generation = this.pinCurrent();
     const sessionKeys = this.sessionKeys(ctx, ctx.sessionId);
     const sessionEpochs = this.captureSessionEpochs(generation, sessionKeys);
     try {
       const role = ctx.role ?? 'user';
       if (profile) findSandboxProfile(generation.profiles, profile, role);
-      const spec = await raceAbort(this.resolveSpec(generation, ctx, profile), ctx.signal);
+      const spec = await raceAbort(this.resolveSpec(generation, ctx, profile, placement), ctx.signal);
       const resolvedProfile = spec.profile
         ? findSandboxProfile(generation.profiles, spec.profile, role)
         : undefined;
       if (resolvedProfile && !canUseSandboxProfile(resolvedProfile, role)) {
-        throw new Error('当前身份无权使用该沙箱模板；sandbox-diag 仅 platform_admin 可用');
+        throw new SandboxProfileAuthorizationError();
       }
       this.assertOperationValid(generation, sessionEpochs);
       const handle = await generation.manager.get(spec, { signal: ctx.signal });
@@ -378,8 +379,9 @@ export class SandboxRuntimeController implements SandboxAcquirer {
     generation: SandboxGeneration,
     ctx: ToolContext,
     profile?: string,
+    placement?: import('./placement.js').SandboxPlacementInput,
   ): Promise<SandboxSpec> {
-    const partial = await generation.resolveSpec(ctx, profile);
+    const partial = await generation.resolveSpec(ctx, profile, placement);
     return {
       key: sandboxIdentityKey(ctx),
       ...partial,

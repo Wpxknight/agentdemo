@@ -48,6 +48,7 @@ import { NAV_ITEMS, defaultLlmConfig, pageFromUrl, pageUrl } from './app-data';
 import { MermaidDiagram } from './components/mermaid-diagram';
 import { RunCenterPage } from './components/run-center-page';
 import { createApi, numericSessionId, randomId, readStorage, writeStorage } from './api';
+import { apiUrl } from './host-adapter';
 import { useWebHost } from './web-core';
 import { formatSandboxOutputChunk, parseSandboxOutput, sandboxOutputClassNames, sandboxOutputCommand, sandboxOutputLabels } from './sandbox-output';
 import { isPersistedSession } from './session-context';
@@ -62,6 +63,7 @@ import {
 import type {
   AdminUser,
   AdminUsersBody,
+  AuthCapabilitiesBody,
   Attachment,
   ChatMessage,
   MeBody,
@@ -141,6 +143,10 @@ interface ConfirmDialogRequest {
   cancelLabel?: string;
   tone?: ConfirmDialogTone;
   onConfirm: () => void | Promise<void>;
+}
+
+interface QuestionsBody {
+  questions: PendingQuestion[];
 }
 
 function sessionCategoryFor(session: SessionSummary) {
@@ -941,6 +947,7 @@ export default function App() {
   const [llm, setLlm] = useState<RuntimeModelConfig>(defaultLlmConfig);
   const [settingsStatus, setSettingsStatus] = useState('');
   const [authStatus, setAuthStatus] = useState('');
+  const [authCapabilities, setAuthCapabilities] = useState<AuthCapabilitiesBody | null>(null);
   const [historyOpen, setHistoryOpen] = useState(true);
   const [previewOpen, setPreviewOpen] = useState(true);
   const [previewWidth, setPreviewWidth] = useState(() => clampPreviewWidth(readStorage('aiop_sandbox_width') || 440));
@@ -1055,6 +1062,18 @@ export default function App() {
   }, []);
 
   const api = useMemo(() => createApi(host, token, redirectToLogin), [host, token, redirectToLogin]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetch(apiUrl(host, '/v1/auth/capabilities')).then(async (response) => {
+      if (!response.ok) throw new Error('auth capabilities unavailable');
+      const body = await response.json() as AuthCapabilitiesBody;
+      if (!cancelled) setAuthCapabilities(body);
+    }).catch(() => {
+      if (!cancelled) setAuthCapabilities(null);
+    });
+    return () => { cancelled = true; };
+  }, [host]);
 
   useEffect(() => {
     if (!host.subscribeToken) return;
@@ -1176,6 +1195,15 @@ export default function App() {
     setSandboxProfiles(body.profiles || []);
   }, [api]);
 
+  const loadPendingQuestions = useCallback(async () => {
+    const body = await api.get<QuestionsBody>('/v1/questions');
+    setPendingQuestions(Object.fromEntries(
+      (body.questions || [])
+        .filter((item) => item?.id && item.sessionId && Array.isArray(item.questions))
+        .map((item) => [item.sessionId, item]),
+    ));
+  }, [api]);
+
   useEffect(() => {
     if (!token || !isPersistedSession(sessionId, sessions)) return;
     void loadContextUsage(sessionId);
@@ -1189,6 +1217,7 @@ export default function App() {
         // 模型配置读取需要管理权限：普通用户 403 不能阻断会话列表 / 工具加载。
         await loadLlmSettings().catch(() => {});
         await fetchSessionsPage(0);
+        await loadPendingQuestions().catch(() => {});
         const toolsBody = await api.get<ToolsBody>('/v1/tools');
         setTools(toolsBody.tools || []);
         await loadSandboxes().catch(() => {});
@@ -1208,7 +1237,7 @@ export default function App() {
     } catch (err) {
       console.error(err);
     }
-  }, [api, fetchSessionsPage, loadLlmSettings, loadSandboxes, page, token]);
+  }, [api, fetchSessionsPage, loadLlmSettings, loadPendingQuestions, loadSandboxes, page, token]);
 
   useEffect(() => {
     if (!token && page !== 'login') {
@@ -1261,6 +1290,7 @@ export default function App() {
         setAttachments([]);
         void loadContextUsage(session.sessionId);
         void loadSessionTokenUsage(session.sessionId);
+        void loadPendingQuestions().catch(() => {});
         return;
       }
       const body = await api.get<SessionMessagesBody>(`/v1/sessions/${encodeURIComponent(session.sessionId)}/messages`);
@@ -1268,6 +1298,7 @@ export default function App() {
       setAttachments([]);
       void loadContextUsage(session.sessionId);
       void loadSessionTokenUsage(session.sessionId);
+      void loadPendingQuestions().catch(() => {});
     } catch (err) {
       setMessages([{
         id: randomId(),
@@ -1679,6 +1710,7 @@ export default function App() {
       await refreshSessions();
       await loadContextUsage(activeSessionId);
       await loadSessionTokenUsage(activeSessionId);
+      await loadPendingQuestions().catch(() => {});
       await loadSandboxes().catch(() => {});
     }
   }
@@ -1709,6 +1741,7 @@ export default function App() {
     });
     try {
       await api.post<{ ok: boolean }>(`/v1/questions/${encodeURIComponent(pending.id)}/answer`, { answers });
+      await loadPendingQuestions().catch(() => {});
     } catch (err) {
       setPendingQuestions((current) => ({ ...current, [pending.sessionId]: pending }));
       setMessages((currentMessages) => [...currentMessages, {
@@ -1864,8 +1897,8 @@ export default function App() {
   }
 
   if (page === 'login') {
-    if (host.deploymentMode === 'standalone' && host.authProvider === 'local') {
-      return <LoginPage authStatus={authStatus} onSubmit={submitLogin} />;
+    if ((host.deploymentMode === 'standalone' && host.authProvider === 'local') || authCapabilities?.capabilities.localLogin) {
+      return <LoginPage authStatus={authStatus} onSubmit={submitLogin} debug={authCapabilities?.deploymentMode === 'aios-integrated'} />;
     }
     return <HostAuthenticationPending mode={host.deploymentMode === 'standalone' ? 'redirect' : 'waiting'} />;
   }
@@ -1894,6 +1927,7 @@ export default function App() {
           totalTokens={sessionTokenUsage[sessionId] ?? 0}
           runStartedAt={runStartedAt[sessionId]}
           pendingQuestion={pendingQuestions[sessionId]}
+          waitingSessionIds={new Set(Object.keys(pendingQuestions))}
           onAnswerQuestion={submitQuestionAnswer}
           messages={messages}
           attachments={attachments}
@@ -2040,6 +2074,7 @@ function PrototypeChatShell(props: {
   totalTokens: number;
   runStartedAt?: number;
   pendingQuestion?: PendingQuestion;
+  waitingSessionIds: Set<string>;
   onAnswerQuestion: (pending: PendingQuestion, answers: Record<string, string[]>) => void;
   messages: ChatMessage[];
   attachments: Attachment[];
@@ -2090,6 +2125,7 @@ function PrototypeChatShell(props: {
             page={props.sessionPage}
             pageCount={props.sessionPageCount}
             selectedSessionId={props.selectedSessionId}
+            waitingSessionIds={props.waitingSessionIds}
             onToggle={props.onToggleHistory}
             onSelect={props.onSelectSession}
             onDeleteMany={props.onDeleteSessions}
@@ -2191,12 +2227,13 @@ function PrototypeSidebarNav({ page, token, me, onNavigate, onLogout }: {
   );
 }
 
-function PrototypeSessionPanel({ sessions, total, page, pageCount, selectedSessionId, onToggle, onSelect, onDeleteMany, onPrevPage, onNextPage }: {
+function PrototypeSessionPanel({ sessions, total, page, pageCount, selectedSessionId, waitingSessionIds, onToggle, onSelect, onDeleteMany, onPrevPage, onNextPage }: {
   sessions: SessionSummary[];
   total: number;
   page: number;
   pageCount: number;
   selectedSessionId: string;
+  waitingSessionIds: Set<string>;
   onToggle: () => void;
   onSelect: (session: SessionSummary) => void;
   onDeleteMany: (sessions: SessionSummary[]) => void;
@@ -2342,6 +2379,9 @@ function PrototypeSessionPanel({ sessions, total, page, pageCount, selectedSessi
                 </span>
                 <strong>{session.title}</strong>
                 <time>{session.time}</time>
+                {session.sessionId && waitingSessionIds.has(session.sessionId) ? (
+                  <Badge className="prototype-session-waiting" variant="secondary">等待交互</Badge>
+                ) : null}
                 {session.sessionId ? <code className="prototype-session-id">ID: {session.sessionId}</code> : null}
                 <p>{session.desc}</p>
               </div>
@@ -4432,11 +4472,11 @@ function SettingsPage({ llm, status, api, me, onLlmChange, onStatus, onRequestCo
   // 隐藏只是 UX，权限边界在后端 RBAC：普通用户只保留我的主目录；全局沙箱仅平台管理员可见。
   const isAdmin = me?.role === 'platform_admin' || me?.role === 'tenant_admin';
   const isPlatformAdmin = me?.role === 'platform_admin';
-  const [form, setForm] = useState(() => ({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', allow_insecure_tls: Boolean(llm.allow_insecure_tls), effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) }));
+  const [form, setForm] = useState(() => ({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: '', allow_insecure_tls: Boolean(llm.allow_insecure_tls), effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) }));
 
   useEffect(() => {
-    setForm({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: llm.api_key || '', allow_insecure_tls: Boolean(llm.allow_insecure_tls), effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) });
-  }, [llm.api_key, llm.allow_insecure_tls, llm.base_url, llm.model, llm.protocol, llm.effort, llm.context_window_tokens]);
+    setForm({ protocol: llm.protocol, base_url: llm.base_url, model: llm.model, api_key: '', allow_insecure_tls: Boolean(llm.allow_insecure_tls), effort: llm.effort || 'medium', context_window_tokens: String(llm.context_window_tokens || 200000) });
+  }, [llm.api_key_set, llm.allow_insecure_tls, llm.base_url, llm.model, llm.protocol, llm.effort, llm.context_window_tokens]);
 
   // 上下文窗口仅在填了合法正整数时提交，避免编辑中间态触发后端 400。
   function formPayload() {
@@ -4492,7 +4532,8 @@ function SettingsPage({ llm, status, api, me, onLlmChange, onStatus, onRequestCo
                   <span>允许不安全 HTTPS（忽略证书校验）</span>
                 </Label>
                 {form.allow_insecure_tls ? <div className="settings-status">仅用于自签名或证书链不受信任的内网 LLM 服务；会降低中间人攻击防护。</div> : null}
-                <Label>API Key<Input placeholder="输入 API Key" value={form.api_key} onChange={(event) => setForm((current) => ({ ...current, api_key: event.target.value }))} /></Label>
+                <Label>API Key<Input type="password" placeholder={llm.api_key_set ? '已配置；留空保留' : '输入 API Key'} value={form.api_key} onChange={(event) => setForm((current) => ({ ...current, api_key: event.target.value }))} /></Label>
+                <div className="settings-hint">当前凭据：{llm.api_key_set ? '已配置' : '未配置'}。页面不会读取或回显已保存的 Key。</div>
                 <Label>Model<Input value={form.model} onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))} /></Label>
                 <Label>上下文窗口（tokens）<Input type="number" min={20000} step={1000} placeholder="200000" value={form.context_window_tokens} onChange={(event) => setForm((current) => ({ ...current, context_window_tokens: event.target.value }))} /></Label>
                 <Label>推理深度<Select value={form.effort} onValueChange={(effort) => setForm((current) => ({ ...current, effort: effort as ReasoningEffort }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="none">none（关闭思考）</SelectItem><SelectItem value="low">low</SelectItem><SelectItem value="medium">medium</SelectItem><SelectItem value="high">high</SelectItem><SelectItem value="xhigh">xhigh</SelectItem><SelectItem value="max">max</SelectItem></SelectGroup></SelectContent></Select></Label>
@@ -4594,8 +4635,8 @@ type SandboxSettingsForm = {
   protocol: 'http' | 'https';
   defaultImage: string;
   lifecycleUrl: string;
-  clusterId: string;
-  namespace: string;
+  defaultClusterId: string;
+  defaultNamespace: string;
   apiKey: string;
 };
 
@@ -4607,8 +4648,8 @@ function sandboxSettingsForm(settings?: SandboxSettingsInfo): SandboxSettingsFor
     protocol: settings?.protocol ?? 'http',
     defaultImage: settings?.default_image ?? '',
     lifecycleUrl: settings?.lifecycle_url ?? '',
-    clusterId: settings?.placement?.cluster_id ?? '',
-    namespace: settings?.placement?.namespace ?? '',
+    defaultClusterId: settings?.default_cluster_id ?? '1',
+    defaultNamespace: settings?.default_namespace ?? 'aios-system',
     apiKey: '',
   };
 }
@@ -4631,7 +4672,8 @@ function sandboxSettingsPayload(form: SandboxSettingsForm): Record<string, unkno
     payload.domain = form.domain.trim();
   } else if (form.mode === 'aios_lifecycle') {
     payload.lifecycle_url = form.lifecycleUrl.trim();
-    payload.placement = { cluster_id: form.clusterId.trim(), namespace: form.namespace.trim() };
+    payload.default_cluster_id = form.defaultClusterId.trim();
+    payload.default_namespace = form.defaultNamespace.trim();
   } else if (form.mode === 'opensandbox') {
     payload.domain = form.domain.trim();
     payload.protocol = form.protocol;
@@ -4772,8 +4814,9 @@ function SandboxSettingsCard({ api, status, onStatus, onRequestConfirm }: {
         {form.mode === 'aios_lifecycle' ? (
           <>
             <Label>Lifecycle URL<Input disabled={busy} value={form.lifecycleUrl} spellCheck={false} placeholder="http(s)://lifecycle-service" onChange={(event) => setForm((current) => ({ ...current, lifecycleUrl: event.target.value }))} /></Label>
-            <Label>Cluster ID<Input disabled={busy} value={form.clusterId} spellCheck={false} onChange={(event) => setForm((current) => ({ ...current, clusterId: event.target.value }))} /></Label>
-            <Label>Namespace<Input disabled={busy} value={form.namespace} spellCheck={false} onChange={(event) => setForm((current) => ({ ...current, namespace: event.target.value }))} /></Label>
+            <Label>默认集群 ID<Input disabled={busy} value={form.defaultClusterId} spellCheck={false} placeholder="1" onChange={(event) => setForm((current) => ({ ...current, defaultClusterId: event.target.value }))} /></Label>
+            <Label>默认命名空间<Input disabled={busy} value={form.defaultNamespace} spellCheck={false} placeholder="aios-system" onChange={(event) => setForm((current) => ({ ...current, defaultNamespace: event.target.value }))} /></Label>
+            <div className="settings-hint">聊天中指定的 clusterId/clusterName 或 namespace 优先；未指定的字段由上述默认值补齐。clusterId 与 clusterName 同时出现时以 clusterId 为准。</div>
             <div className="settings-hint">模板由 AIOS 目录动态加载；browser 模板接入现有截图预览，sandbox-diag 仅平台管理员可见可用。</div>
             <div className={runtime?.status === 'catalog_unavailable' ? 'settings-status' : 'settings-hint'}>
               {runtime?.status === 'catalog_unavailable'
@@ -4955,7 +4998,7 @@ function HostAuthenticationPending({ mode }: { mode: 'redirect' | 'waiting' }) {
   );
 }
 
-function LoginPage({ authStatus, onSubmit }: { authStatus: string; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
+function LoginPage({ authStatus, onSubmit, debug = false }: { authStatus: string; onSubmit: (event: FormEvent<HTMLFormElement>) => void; debug?: boolean }) {
   return (
     <main className="login-page">
       <section className="login-card">
@@ -4963,7 +5006,7 @@ function LoginPage({ authStatus, onSubmit }: { authStatus: string; onSubmit: (ev
           <BrandLogo className="brand-logo-login" />
           <div>
             <h1>AIOP</h1>
-            <p>登录后进入 AI 运维工作台</p>
+            <p>{debug ? '测试环境调试登录' : '登录后进入 AI 运维工作台'}</p>
           </div>
         </div>
         <form id="login-form" className="login-form" onSubmit={onSubmit}>

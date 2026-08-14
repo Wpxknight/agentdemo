@@ -48,7 +48,7 @@ import { E2bDesktopProvider } from '@aiop/sandbox-runtime';
 import { LocalDesktopProvider } from '@aiop/sandbox-runtime';
 import { OpenSandboxDesktopProvider } from '@aiop/sandbox-runtime';
 import { CommandDesktopProvider } from '@aiop/sandbox-runtime';
-import type { DesktopProvider } from '@aiop/sandbox-runtime';
+import type { DesktopProvider, SandboxSpec } from '@aiop/sandbox-runtime';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildSandboxTools } from './tools/builtin.js';
@@ -96,6 +96,8 @@ import {
   sandboxSpecForProfile,
   selectBrowserProfile,
   selectDefaultProfile,
+  normalizeSandboxPlacement,
+  withSandboxPlacement,
 } from '@aiop/sandbox-runtime';
 import type { PublicSandboxProfile } from '@aiop/sandbox-runtime';
 import { LocalAuthProvider } from './auth/local.js';
@@ -194,6 +196,8 @@ export interface Runtime {
   authProvider: AuthProvider;
   /** AIOS 嵌入登录（token exchange）；配置 auth.aios 后启用，与 authProvider 并存。 */
   aiosAuth?: AiosAuthProvider;
+  /** AIOS 集成测试环境的本地调试登录；默认关闭。 */
+  debugLocalAuth?: LocalAuthProvider;
   /** 用户下游平台凭据缓存（加密存储；exchange 写入、技能同步时按用户注入）。 */
   credentials: UserCredentials;
   /** 允许嵌入 aiop 的宿主 origin（CSP frame-ancestors）；未配置时仅允许同源。 */
@@ -253,6 +257,7 @@ export function bridgeDurableGovernedTools(input: {
         turnNo: input.context.turnNo,
         sessionId: input.context.sessionId,
         signal: context.signal,
+        onUpdate: context.onUpdate,
         interactionResolution: input.context.interactionResolution,
       });
       if (outcome.kind === 'result') return attachGovernedToolFacts(outcome.result, outcome);
@@ -529,10 +534,15 @@ export async function buildRuntime(
 
   const deploymentMode = config.deploymentMode ?? 'standalone';
   const providerKind = config.auth?.provider ?? 'local';
+  const debugLocalLogin = process.env.AIOP_AIOS_DEBUG_LOCAL_LOGIN === 'true';
+  if (debugLocalLogin && (deploymentMode !== 'aios-integrated' || providerKind !== 'aios')) {
+    throw new Error('AIOP_AIOS_DEBUG_LOCAL_LOGIN=true requires aios-integrated deployment with auth.provider=aios');
+  }
   const mysqlConfig = readMysqlConfig();
   const store = options.store ?? await createStore(mysqlConfig, {
     deploymentMode,
     authProvider: providerKind,
+    allowMixedIdentitySource: process.env.AIOP_ALLOW_MIXED_IDENTITY_SOURCE === 'true',
   });
   const skillMutationLock = mysqlConfig && store instanceof MysqlStore
     ? new MysqlSkillMutationLock(createMysqlPool(mysqlConfig))
@@ -628,7 +638,7 @@ export async function buildRuntime(
           aios: {
             lifecycleUrl: cfg.aios.lifecycleUrl,
             apiKey: cfg.apiKey,
-            placement: { ...cfg.aios.placement },
+            ...(cfg.aios.placement ? { placement: { ...cfg.aios.placement } } : {}),
             allowedTemplateIds: new Set(catalogSnapshot!.templates.map((template) => template.templateId)),
           },
         })
@@ -645,14 +655,19 @@ export async function buildRuntime(
     const skillSandboxEnv = config.skills?.sandboxEnv;
     const userHomeMountPath = cfg.userHomeMountPath ?? '/home/user/host';
     const userHomeRoot = cfg.userHomeRoot;
-    const resolver: SpecResolver = async (ctx, profileName) => {
+    const browserSpecs = new Map<string, SandboxSpec>();
+    const resolver: SpecResolver = async (ctx, profileName, placement) => {
       const role = ctx.role ?? 'user';
       const selectedProfile = profileName
         ? findSandboxProfile(profiles, profileName, role)
         : selectDefaultProfile(profiles, role);
       if (cfg.aios && !selectedProfile) throw new Error('当前身份没有可用的代码沙箱模板');
       const base = selectedProfile ? sandboxSpecForProfile(selectedProfile, ctx) : { key: ctx.sessionId };
-      const spec = skillSandboxEnv ? { ...base, envs: { ...skillSandboxEnv, ...base.envs } } : base;
+      const unresolved = skillSandboxEnv ? { ...base, envs: { ...skillSandboxEnv, ...base.envs } } : base;
+      const spec = cfg.aios
+        ? withSandboxPlacement(unresolved, placement, cfg.aios.placement)
+        : (placement === undefined ? unresolved : (normalizeSandboxPlacement(placement), unresolved));
+      if (cfg.aios && selectedProfile?.envType === 'browser') browserSpecs.set(base.key, spec);
       if (cfg.aios || !ctx.tenantId || !ctx.userId) return spec;
       const user = await store.getUser(ctx.tenantId, ctx.userId).catch(() => undefined);
       if (!user?.homeDir) return spec;
@@ -681,7 +696,11 @@ export async function buildRuntime(
       resolveDesktop = async (ctx) => {
         const profile = selectBrowserProfile(profiles, ctx.role ?? 'user');
         if (!profile) throw new Error('当前身份没有可用的浏览器沙箱模板');
-        const spec = sandboxSpecForProfile(profile, ctx);
+        const base = sandboxSpecForProfile(profile, ctx);
+        const existing = browserSpecs.get(base.key);
+        const spec = existing && manager.has(existing.key)
+          ? existing
+          : withSandboxPlacement(base, cfg.aios?.placement);
         return { key: spec.key, create: () => dp.create(spec) };
       };
     } else if (cfg.desktop) {
@@ -881,6 +900,7 @@ export async function buildRuntime(
   const ttl = config.auth?.jwtTtl;
   let authProvider: AuthProvider;
   let aiosAuth: AiosAuthProvider | undefined;
+  let debugLocalAuth: LocalAuthProvider | undefined;
   if (providerKind === 'oidc') {
     if (!config.auth?.oidc) throw new Error('auth.provider=oidc requires auth.oidc');
     authProvider = new OidcAuthProvider({ store, secret: jwtSecret, ttl, config: config.auth.oidc });
@@ -890,6 +910,10 @@ export async function buildRuntime(
     aiosAuth = new AiosAuthProvider({ store, secret: jwtSecret, ttl, config: config.auth.aios, credentials });
     authProvider = aiosAuth;
     logger.info({ verify: config.auth.aios.verify }, 'AIOS 主认证已启用');
+    if (debugLocalLogin) {
+      debugLocalAuth = new LocalAuthProvider({ store, secret: jwtSecret, ttl });
+      logger.warn({ deploymentMode, authProvider: providerKind }, 'AIOS integrated debug local login is enabled; test environment only');
+    }
   } else {
     authProvider = new LocalAuthProvider({ store, secret: jwtSecret, ttl });
   }
@@ -1081,6 +1105,7 @@ export async function buildRuntime(
     planState,
     authProvider,
     aiosAuth,
+    debugLocalAuth,
     credentials,
     frameAncestors: config.auth?.aios?.allowedParentOrigins,
     jwtSecret,

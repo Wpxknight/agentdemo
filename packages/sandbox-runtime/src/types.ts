@@ -31,6 +31,8 @@ export interface SandboxSpec {
   key: string;
   /** 沙箱模板/profile 名称，用于 UI 展示和会话内多沙箱隔离。 */
   profile?: string;
+  /** AIOS Lifecycle 调度位置；clusterName 与 clusterId 二选一。 */
+  placement?: import('./placement.js').SandboxPlacement;
   /** 连接远端既有沙箱时提供其 id；不提供则新建。 */
   sandboxId?: string;
   /** 模板 / 镜像（动态拉起到集群内部时使用）。 */

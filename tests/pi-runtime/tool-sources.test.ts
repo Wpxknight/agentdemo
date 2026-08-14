@@ -45,6 +45,36 @@ const piRead = (): AgentTool => ({
 } as AgentTool);
 
 describe('real unified tool sources', () => {
+  it('routes sandbox OutputSink chunks into the current governed execution update callback', async () => {
+    const sandboxRun = vi.fn(async (_command: string, options?: {
+      onOutput?: (chunk: { stream: 'stdout' | 'stderr'; text: string }) => void;
+    }) => {
+      options?.onOutput?.({ stream: 'stdout', text: 'hello\n' });
+      options?.onOutput?.({ stream: 'stderr', text: 'warning\n' });
+      return { stdout: 'hello\n', stderr: 'warning\n', exitCode: 0 };
+    });
+    const sandboxTools = buildSandboxTools({
+      get: async () => ({ runCode: sandboxRun, runCommand: sandboxRun }),
+    } as never);
+    const runtime = createAIOPToolRuntime({
+      tools: new ToolRegistry().register(sandboxTools[1]!, 'sandbox'),
+      policy: { check: async () => ({ blocked: false, needApproval: false }) },
+      ctx: { sessionId: 'session-a', tenantId: 'tenant-a', userId: 'user-a', role: 'user' },
+    }, ledger(), new ResourceConcurrencyController(), undefined, true);
+    const updates: Array<{ stream: 'stdout' | 'stderr'; text: string }> = [];
+
+    await expect(runtime.execute({
+      id: 'call-output', logicalCallId: 'logical-output', name: 'sbx__run_command',
+      arguments: { command: 'echo hello' },
+    }, { ...context, onUpdate: (update) => updates.push(update) })).resolves.toMatchObject({
+      kind: 'result', result: { content: expect.stringContaining('hello') },
+    });
+    expect(updates).toEqual([
+      { stream: 'stdout', text: 'hello\n' },
+      { stream: 'stderr', text: 'warning\n' },
+    ]);
+  });
+
   it('consumes MCP governed definitions without registering a legacy def/run shim', async () => {
     const executeMcp = vi.fn(async () => ({ content: [{ type: 'text', text: 'tenant-a' }] }));
     const mcp = new McpManager({

@@ -2790,6 +2790,14 @@
     font-size: 11px;
   }
 
+  .prototype-session-waiting {
+    grid-column: 2 / -1;
+    width: max-content;
+    margin-top: 2px;
+    color: hsl(38 92% 35%);
+    background: hsl(43 92% 95%);
+  }
+
   .prototype-session-item p {
     grid-column: 2 / -1;
     color: hsl(215 16% 44%);

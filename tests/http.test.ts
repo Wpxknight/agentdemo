@@ -22,6 +22,7 @@ import { SandboxManager } from '../packages/sandbox-runtime/src/lifecycle.js';
 import { buildSandboxTools } from '../src/tools/builtin.js';
 import { buildSandboxProfileTools } from '../src/tools/sandbox-profiles.js';
 import type { ExecResult, SandboxHandle, SandboxProvider, SandboxSpec } from '../packages/sandbox-runtime/src/types.js';
+import { AiosLifecycleHttpError } from '../packages/sandbox-runtime/src/aios-http.js';
 import type {
   AgentRunEvent,
   AgentRunResult,
@@ -1372,9 +1373,8 @@ describe('HTTP server', () => {
         protocol: 'anthropic',
         base_url: 'http://localhost:8000/v1',
         model: 'mock-model',
-        api_key: 'initial-key',
+        api_key: '',
         api_key_set: true,
-        api_key_preview: 'ini...key',
         allow_insecure_tls: false,
         context_window_tokens: 200000,
         context_keep_images: 1,
@@ -1385,9 +1385,8 @@ describe('HTTP server', () => {
           protocol: 'anthropic',
           base_url: 'http://localhost:8000/v1',
           model: 'mock-model',
-          api_key: 'initial-key',
+          api_key: '',
           api_key_set: true,
-          api_key_preview: 'ini...key',
           allow_insecure_tls: false,
           context_window_tokens: 200000,
           context_keep_images: 1,
@@ -1397,9 +1396,8 @@ describe('HTTP server', () => {
           protocol: 'anthropic',
           base_url: 'http://192.168.10.108:18317',
           model: 'glm-5',
-          api_key: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
+          api_key: '',
           api_key_set: true,
-          api_key_preview: 'tes...aZ3',
           allow_insecure_tls: false,
           context_window_tokens: 200000,
           context_keep_images: 1,
@@ -1425,9 +1423,8 @@ describe('HTTP server', () => {
         protocol: 'anthropic',
         base_url: 'http://192.168.10.108:18317',
         model: 'glm-5',
-        api_key: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
+        api_key: '',
         api_key_set: true,
-        api_key_preview: 'tes...aZ3',
         allow_insecure_tls: true,
         context_window_tokens: 128000,
       },
@@ -1472,7 +1469,8 @@ describe('HTTP server', () => {
         protocol: 'openai',
         base_url: 'http://192.168.10.108:18317',
         model: 'glm-5',
-        api_key: 'test-api-key-lb19tkNtlcFtsKkUtaZ3',
+        api_key: '',
+        api_key_set: true,
       },
     });
 
@@ -1488,7 +1486,7 @@ describe('HTTP server', () => {
         protocol: 'anthropic',
         base_url: 'http://localhost:8000/v1',
         model: 'mock-model',
-        api_key: 'initial-key',
+        api_key: '',
       },
     });
 
@@ -1507,7 +1505,7 @@ describe('HTTP server', () => {
         protocol: 'openai',
         base_url: 'http://example.test/v1',
         model: 'new-model-without-key',
-        api_key: 'initial-key',
+        api_key: '',
       },
     });
   });
@@ -1705,6 +1703,19 @@ describe('HTTP server', () => {
         headers,
         body: JSON.stringify({ sessionId: 'session-a', command: 'echo a' }),
       });
+      const dynamic = await fetch(`${sandboxBase}/v1/sandbox/run-code`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ sessionId: 'session-c', code: 'print(1)', cluster_name: 'cluster-pc1' }),
+      });
+      expect(dynamic.status).toBe(200);
+      expect(provider.create).toHaveBeenCalledWith(expect.not.objectContaining({ placement: expect.anything() }));
+
+      const conflict = await fetch(`${sandboxBase}/v1/sandbox/run-code`, {
+        method: 'POST', headers,
+        body: JSON.stringify({ sessionId: 'session-c', code: 'print(1)', cluster_name: 'pc1', cluster_id: '35' }),
+      });
+      expect(conflict.status).toBe(200);
       await fetch(`${sandboxBase}/v1/sandbox/run-command`, {
         method: 'POST',
         headers,
@@ -1733,6 +1744,17 @@ describe('HTTP server', () => {
           expect.objectContaining({ id: 'code-id' }),
         ]);
       }
+      const deniedDiag = await fetch(`${sandboxBase}/v1/sandbox/run-command`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${userToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          sessionId: 'denied-diag', profile: 'diag-id', command: 'kubectl get pods', cluster_name: 'pc1',
+        }),
+      });
+      expect(deniedDiag.status).toBe(403);
+      expect(await deniedDiag.json()).toEqual({
+        error: '当前身份无权使用该沙箱模板；sandbox-diag 仅 platform_admin 可用',
+      });
       expect(body.sandboxes).toEqual([
         expect.objectContaining({
           id: 'sandbox-1', sandboxId: 'sandbox-1', sessionId: 'session-a', status: 'ready', type: 'session',
@@ -1741,6 +1763,13 @@ describe('HTTP server', () => {
         expect.objectContaining({
           id: 'sandbox-2',
           sandboxId: 'sandbox-2',
+          sessionId: 'session-c',
+          status: 'ready',
+          type: 'session',
+        }),
+        expect.objectContaining({
+          id: 'sandbox-3',
+          sandboxId: 'sandbox-3',
           sessionId: 'session-b',
           status: 'ready',
           type: 'diag-id',
@@ -1751,6 +1780,114 @@ describe('HTTP server', () => {
       ]);
     } finally {
       await new Promise<void>((resolve) => sandboxServer.close(() => resolve()));
+    }
+  });
+
+  it.each([401, 403, 404])('preserves AIOS Lifecycle HTTP %s for direct sandbox APIs', async (status) => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: `sandbox-upstream-${status}` });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const token = (await auth.login('default', 'admin', 'pw'))!;
+    const tools = new ToolRegistry();
+    for (const name of ['sbx__run_code', 'sbx__run_command'] as const) {
+      tools.register({
+        name, description: name, inputSchema: { type: 'object' }, capability: 'non_idempotent_write',
+        execute: async () => { throw new AiosLifecycleHttpError(status); },
+      });
+    }
+    const rt = {
+      model, tools, store: localStore, policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth, jwtSecret: `sandbox-upstream-${status}`, systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+    const server = createHttpServer(rt);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+    try {
+      for (const [path, body] of [
+        ['run-code', { code: 'print(1)', cluster_name: 'pc1' }],
+        ['run-command', { command: 'true', cluster_id: '35' }],
+      ] as const) {
+        const response = await fetch(`${base}/v1/sandbox/${path}`, { method: 'POST', headers, body: JSON.stringify(body) });
+        expect(response.status).toBe(status);
+        expect(await response.json()).toEqual({ error: `AIOS Lifecycle request failed (HTTP ${status})` });
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('keeps ordinary direct-tool exceptions as compatible ToolResult failures without retrying', async () => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'direct-tool-error' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const token = (await auth.login('default', 'admin', 'pw'))!;
+    const execute = vi.fn(async () => { throw new Error('ordinary failure'); });
+    const tools = new ToolRegistry().register({
+      name: 'ordinary_failure', description: 'failure', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute,
+    });
+    const rt = {
+      model, tools, store: localStore, policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth, jwtSecret: 'direct-tool-error', systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+    const server = createHttpServer(rt);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const response = await fetch(`${base}/v1/tools/call`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'ordinary_failure', args: {} }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        ok: false,
+        result: { isError: true, content: expect.stringContaining('ordinary failure') },
+      });
+      expect(execute).toHaveBeenCalledOnce();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it.each([
+    { cluster_name: '   ' },
+    { cluster_id: '' },
+    { cluster_name: 'pc1', namespace: '   ' },
+  ])('rejects blank sandbox placement fields at the HTTP boundary: %o', async (placement) => {
+    const localStore = new MemoryStore();
+    await localStore.createTenant({ id: 'default', name: 'Default' });
+    const auth = new LocalAuthProvider({ store: localStore, secret: 'blank-placement' });
+    await auth.createUser('default', 'admin', 'pw', 'platform_admin');
+    const token = (await auth.login('default', 'admin', 'pw'))!;
+    const execute = vi.fn(async () => ({ id: '', content: 'unexpected' }));
+    const tools = new ToolRegistry().register({
+      name: 'sbx__run_code', description: 'code', inputSchema: { type: 'object' },
+      capability: 'non_idempotent_write', execute,
+    });
+    const rt = {
+      model, tools, store: localStore, policy: new AllowAllPolicy(), policyPreApproved: new AllowAllPolicy(),
+      authProvider: auth, jwtSecret: 'blank-placement', systemExtra: '',
+      defaultContext: { tenantId: 'default', userId: 'cli', role: 'platform_admin' as const },
+    } as unknown as Runtime;
+    const server = createHttpServer(rt);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const response = await fetch(`${base}/v1/sandbox/run-code`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ code: 'print(1)', ...placement }),
+      });
+      expect(response.status).toBe(400);
+      expect(execute).not.toHaveBeenCalled();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
 
@@ -3038,7 +3175,8 @@ describe('HTTP server 平台 Sandbox 设置', () => {
           enabled: true,
           mode: 'aios_lifecycle',
           lifecycle_url: 'https://sandbox.example.test/lifecycle',
-          placement: { cluster_id: 'local', namespace: 'sandbox-system' },
+          default_cluster_id: 'local',
+          default_namespace: 'sandbox-system',
           api_key_set: true,
         },
         runtime: { enabled: true, mode: 'aios_lifecycle', status: 'active' },
@@ -3135,7 +3273,8 @@ describe('HTTP server 平台 Sandbox 设置', () => {
           enabled: true,
           mode: 'aios_lifecycle',
           lifecycle_url: 'https://sandbox.example.test/lifecycle',
-          placement: { cluster_id: 'cluster-a', namespace: 'sandbox-system' },
+          default_cluster_id: 'cluster-a',
+          default_namespace: 'sandbox-system',
           api_key_set: true,
         },
         runtime: {
@@ -3227,14 +3366,13 @@ describe('HTTP server 平台 Sandbox 设置', () => {
             enabled: true,
             mode: 'aios_lifecycle',
             lifecycle_url: 'https://AIOS.EXAMPLE.TEST/lifecycle/',
-            placement: { cluster_id: 'cluster-a', namespace: 'sandbox-system' },
             api_key: 'aios-key',
           },
           settings: {
             enabled: true,
             mode: 'aios_lifecycle',
             lifecycleUrl: 'https://aios.example.test/lifecycle',
-            placement: { clusterId: 'cluster-a', namespace: 'sandbox-system' },
+            placement: { clusterId: '1', namespace: 'aios-system' },
           },
         },
         {
@@ -3413,11 +3551,15 @@ describe('HTTP server 平台 Sandbox 设置', () => {
           enabled: true,
           mode: 'aios_lifecycle',
           lifecycle_url: 'https://sandbox.example.test/lifecycle',
-          placement: { cluster_id: 'cluster-a', namespace: 'sandbox-system' },
+          default_cluster_id: '1',
+          default_namespace: 'aios-system',
           api_key: 'replacement-key',
         }),
       });
       expect(replaced.status).toBe(200);
+      expect(fixture.updateSandbox.mock.calls.at(-1)?.[0].settings).toMatchObject({
+        placement: { clusterId: '1', namespace: 'aios-system' },
+      });
       expect(fixture.auditEvents).toHaveLength(1);
       expect(fixture.auditEvents[0]).toMatchObject({
         kind: 'sandbox',
@@ -3427,7 +3569,6 @@ describe('HTTP server 平台 Sandbox 设置', () => {
           enabled: true,
           mode: 'aios_lifecycle',
           endpoint: 'https://sandbox.example.test/lifecycle',
-          placement: { clusterId: 'cluster-a', namespace: 'sandbox-system' },
           keyAction: 'replace',
         },
       });

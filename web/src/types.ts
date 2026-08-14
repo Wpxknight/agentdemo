@@ -27,6 +27,12 @@ export interface MeBody {
   homeDir?: string;
 }
 
+export interface AuthCapabilitiesBody {
+  deploymentMode: 'standalone' | 'aios-integrated';
+  authProvider: 'local' | 'oidc' | 'aios';
+  capabilities: { aiosExchange: boolean; localLogin: boolean };
+}
+
 /** 用户管理列表项（GET /v1/admin/users）。 */
 export interface AdminUser {
   id: string;
@@ -270,7 +276,6 @@ export interface RuntimeModelConfig {
   model: string;
   api_key: string;
   api_key_set: boolean;
-  api_key_preview: string;
   /** 允许该 LLM 访问使用自签名或不受信任证书的 HTTPS 服务。 */
   allow_insecure_tls?: boolean;
   context_window_tokens: number;
@@ -443,10 +448,8 @@ export interface SandboxSettingsInfo {
   protocol?: 'http' | 'https';
   default_image?: string;
   lifecycle_url?: string;
-  placement?: {
-    cluster_id: string;
-    namespace: string;
-  };
+  default_cluster_id?: string;
+  default_namespace?: string;
   api_key_set: boolean;
 }
 

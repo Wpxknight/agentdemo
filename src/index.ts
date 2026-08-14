@@ -8,6 +8,7 @@ import type { Config } from './config/schema.js';
 import { shouldEmbedScheduler, startRuntimeScheduler } from './scheduler/runner.js';
 import { MysqlStore } from './db/mysql.js';
 import { resolveCliPrincipalId } from './runtime.js';
+import { stdin } from 'node:process';
 
 /**
  * 入口：
@@ -21,8 +22,36 @@ async function main() {
 
   if (argv[0] === 'serve') return runServer(config);
   if (argv[0] === 'seed-admin') return seedAdmin(config, argv.slice(1));
+  if (argv[0] === 'reset-local-password') return resetLocalPassword(config, argv.slice(1));
 
   await runOnce(config, argv.join(' ') || '你好，做个自我介绍。');
+}
+
+async function readPasswordFromStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stdin) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks).toString('utf8').replace(/[\r\n]+$/, '');
+}
+
+async function resetLocalPassword(config: Config, args: string[]) {
+  const [tenantId, username] = args;
+  if (!tenantId || !username) throw new Error('用法: reset-local-password <tenantId> <username>（密码从 stdin 读取）');
+  const password = await readPasswordFromStdin();
+  if (!password) throw new Error('stdin 中的密码不能为空');
+  const rt = await buildRuntime(config);
+  try {
+    const localAuth = rt.debugLocalAuth ?? (rt.authProvider instanceof LocalAuthProvider ? rt.authProvider : undefined);
+    if (!localAuth) throw new Error('当前运行模式未启用 local 登录');
+    const user = await localAuth.resetPassword(tenantId, username, password);
+    if (!user) throw new Error('目标用户不存在或 auth_provider 不是 local');
+    logger.warn({ tenantId, username, userId: user.id }, 'local debug user password reset');
+    await rt.audit.record({
+      kind: 'auth', action: 'local-password-reset', tenantId, userId: user.id,
+      provider: 'local', deploymentMode: rt.deploymentMode ?? 'standalone',
+    });
+  } finally {
+    await rt.dispose();
+  }
 }
 
 /** HTTP + SSE 服务模式。 */

@@ -55,6 +55,28 @@ function events() {
 }
 
 describe('Pi governed tool bridge', () => {
+  it('projects governed stdout and stderr updates through the real Harness', async () => {
+    const tools = bridgeGovernedTools([{
+      definition: { name: 'lookup', description: 'Lookup', capability: 'read', inputSchema: { type: 'object' } },
+      execute: async (call, context) => {
+        context.onUpdate?.({ stream: 'stdout', text: 'first\n' });
+        context.onUpdate?.({ stream: 'stderr', text: 'warning\n' });
+        return { callId: call.id, content: 'ok' };
+      },
+    }]);
+    const session = await new PiAgentSessionFactory({
+      repository: new InMemorySessionRepo(), models: toolModels({}), model, tools,
+    }).create({ id: 'governed-updates', initialMessage: { role: 'user', text: 'start' }, events: events() });
+
+    const projected = await collect(session.continue());
+    expect(projected.filter((event) => event.type === 'tool_execution_update').map((event) => event.detail))
+      .toEqual([
+        expect.objectContaining({ toolCallId: 'call-1', outputText: 'first\n', outputStream: 'stdout' }),
+        expect.objectContaining({ toolCallId: 'call-1', outputText: 'warning\n', outputStream: 'stderr' }),
+      ]);
+    await session.close();
+  });
+
   it.each([
     {
       schema: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] },

@@ -449,9 +449,22 @@ describe('AiosLifecycleHttpClient safety', () => {
     });
     const httpError = await unauthorized.requestJson('/templates').catch((error: unknown) => error);
     expect(httpError).toBeInstanceOf(AiosLifecycleHttpError);
-    expect(httpError).toMatchObject({ status: 401 });
-    expect(String(httpError)).toBe('AiosLifecycleHttpError: AIOS Lifecycle request failed (HTTP 401)');
+    expect(httpError).toMatchObject({ status: 401, detail: 'bad key [REDACTED]' });
+    expect(String(httpError)).toBe(
+      'AiosLifecycleHttpError: AIOS Lifecycle request failed (HTTP 401): bad key [REDACTED]',
+    );
     expect(String(httpError)).not.toContain(API_KEY);
+
+    const unavailable = new AiosLifecycleHttpClient({
+      lifecycleUrl: 'https://lifecycle.example.test',
+      apiKey: API_KEY,
+      fetch: vi.fn(async () => jsonResponse(503, {
+        error: 'execd readiness failed: dial tcp 10.250.1.84:44772: no route to host',
+      })) as unknown as typeof globalThis.fetch,
+    });
+    await expect(unavailable.requestJson('/sandboxes/id/commands')).rejects.toThrow(
+      'AIOS Lifecycle request failed (HTTP 503): execd readiness failed: dial tcp 10.250.1.84:44772: no route to host',
+    );
 
     const offline = new AiosLifecycleHttpClient({
       lifecycleUrl: 'https://lifecycle.example.test',

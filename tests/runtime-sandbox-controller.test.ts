@@ -187,9 +187,19 @@ describe('runtime sandbox controller', () => {
       }, { ...ordinaryUser, sessionId: 'browser-session' });
       expect(navigate.isError).not.toBe(true);
       expect(requests.find((request) => request.url.endsWith('/sandboxes'))?.body).toMatchObject({
-        template: 'browser-id',
+        templateID: 'browser-id',
         placement: { clusterId: 'local', namespace: 'aios-sandbox-local' },
       });
+      expect(rt.sandboxes?.list(platformAdmin)).toEqual([
+        expect.objectContaining({
+          key: expect.stringContaining(':placement:["clusterId","local","aios-sandbox-local"]'),
+          metadata: expect.objectContaining({
+            placementSelector: 'clusterId',
+            placementCluster: 'local',
+            placementNamespace: 'aios-sandbox-local',
+          }),
+        }),
+      ]);
 
       await rt.updateSandbox?.({
         settings: { ...AIOS_SETTINGS, enabled: false },
@@ -199,6 +209,80 @@ describe('runtime sandbox controller', () => {
       expect(rt.sandboxProfiles).toEqual([]);
       expect(rt.tools.has('sbx__run_code')).toBe(false);
       expect(rt.tools.has('sandbox_list_profiles')).toBe(false);
+    } finally {
+      await rt.dispose();
+    }
+  });
+
+  it('reuses an existing dynamically placed browser sandbox for preview without a default placement', async () => {
+    const requests: Array<{ url: string; method: string; body?: unknown }> = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      const body = typeof init?.body === 'string' ? JSON.parse(init.body) : undefined;
+      requests.push({ url, method, ...(body === undefined ? {} : { body }) });
+      if (url.endsWith('/templates')) return jsonResponse(200, aiosCatalog());
+      if (url.endsWith('/sandboxes') && method === 'POST') return jsonResponse(201, { sandboxID: 'sb-browser-dynamic' });
+      if (url.endsWith('/commands') && method === 'POST') {
+        return jsonResponse(200, { stdout: '', stderr: '', exitCode: 0 });
+      }
+      throw new Error(`unexpected request ${method} ${url}`);
+    });
+    const rt = await buildRuntime(config, { store: new MemoryStore() });
+    try {
+      await rt.updateSandbox?.({
+        settings: {
+          enabled: true,
+          mode: 'aios_lifecycle',
+          lifecycleUrl: AIOS_SETTINGS.lifecycleUrl,
+        },
+        keyAction: { action: 'replace', apiKey: 'test-key' },
+      });
+      const ctx = { ...ordinaryUser, sessionId: 'dynamic-browser-preview' };
+      await expect(rt.tools.dispatch({
+        id: 'ensure-browser',
+        name: 'sandbox_ensure',
+        args: { profile: 'browser-id', clusterName: 'bke-cluster' },
+      }, ctx)).resolves.not.toMatchObject({ isError: true });
+
+      await expect(rt.tools.dispatch({
+        id: 'preview-browser',
+        name: 'desktop_stream_url',
+        args: {},
+      }, ctx)).resolves.not.toMatchObject({ isError: true });
+
+      await expect(rt.tools.dispatch({
+        id: 'ensure-browser-namespace',
+        name: 'sandbox_ensure',
+        args: { profile: 'browser-id', namespace: 'custom-ns' },
+      }, { ...ordinaryUser, sessionId: 'dynamic-browser-namespace' })).resolves.not.toMatchObject({ isError: true });
+
+      await expect(rt.tools.dispatch({
+        id: 'ensure-browser-id-priority',
+        name: 'sandbox_ensure',
+        args: { profile: 'browser-id', clusterId: '99', clusterName: 'ignored-cluster' },
+      }, { ...ordinaryUser, sessionId: 'dynamic-browser-id-priority' })).resolves.not.toMatchObject({ isError: true });
+
+      const creates = requests.filter((request) => request.url.endsWith('/sandboxes') && request.method === 'POST');
+      expect(creates).toHaveLength(3);
+      expect(creates[0]?.body).toMatchObject({
+        templateID: 'browser-id',
+        placement: { clusterName: 'bke-cluster', namespace: 'aios-system' },
+      });
+      expect(creates[1]?.body).toMatchObject({
+        templateID: 'browser-id',
+        placement: { clusterId: '1', namespace: 'custom-ns' },
+      });
+      expect(creates[2]?.body).toMatchObject({
+        templateID: 'browser-id',
+        placement: { clusterId: '99', namespace: 'aios-system' },
+      });
+      expect(rt.sandboxes?.list(ordinaryUser)).toHaveLength(3);
+      expect(rt.sandboxes?.list(ordinaryUser)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ sandboxId: 'sb-browser-dynamic', sessionId: 'dynamic-browser-preview' }),
+        expect.objectContaining({ sandboxId: 'sb-browser-dynamic', sessionId: 'dynamic-browser-namespace' }),
+        expect.objectContaining({ sandboxId: 'sb-browser-dynamic', sessionId: 'dynamic-browser-id-priority' }),
+      ]));
     } finally {
       await rt.dispose();
     }
@@ -295,14 +379,19 @@ describe('runtime sandbox controller', () => {
       const pendingCatalog = deferred<Response>();
       fetch.mockImplementationOnce(async () => pendingCatalog.promise);
       const refresh = rt.refreshSandboxTemplates!();
-      await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(fetch.mock.calls.length).toBeGreaterThanOrEqual(2));
 
       const switchMode = rt.updateSandbox!({
         settings: { enabled: true, mode: 'local' },
         keyAction: { action: 'clear' },
       });
       await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(rt.sandboxSettings).toEqual(AIOS_SETTINGS);
+      expect(rt.sandboxSettings).toEqual({
+        enabled: true,
+        mode: 'aios_lifecycle',
+        lifecycleUrl: AIOS_SETTINGS.lifecycleUrl,
+        placement: AIOS_SETTINGS.placement,
+      });
 
       pendingCatalog.resolve(jsonResponse(200, aiosCatalog('two')));
       await refresh;

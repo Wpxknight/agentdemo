@@ -2,8 +2,9 @@
 import type { ToolContext } from './contracts.js';
 import type { SandboxManagerLike } from './lifecycle.js';
 import type { SandboxHandle, SandboxSpec } from './types.js';
+import type { SandboxPlacementInput } from './placement.js';
 /** 由调用上下文推导 Sandbox spec；profile 由 generation 在调用开始时固定。 */
-export type SpecResolver = (ctx: ToolContext, profile?: string) => Partial<SandboxSpec> | Promise<Partial<SandboxSpec>>;
+export type SpecResolver = (ctx: ToolContext, profile?: string, placement?: SandboxPlacementInput) => Partial<SandboxSpec> | Promise<Partial<SandboxSpec>>;
 export interface SandboxAcquisition {
     handle: SandboxHandle;
     spec: SandboxSpec;
@@ -13,7 +14,7 @@ export interface SandboxAcquisition {
     markCredentialInjected(): void;
 }
 export interface SandboxAcquirer extends SandboxManagerLike {
-    acquire(ctx: ToolContext, profile?: string): Promise<SandboxAcquisition>;
+    acquire(ctx: ToolContext, profile?: string, placement?: SandboxPlacementInput): Promise<SandboxAcquisition>;
     acquireSpec(ctx: ToolContext, spec: SandboxSpec | (() => SandboxSpec | Promise<SandboxSpec>)): Promise<SandboxAcquisition>;
 }
 export declare function isSandboxAcquirer(manager: SandboxManagerLike): manager is SandboxAcquirer;
@@ -21,14 +22,12 @@ export declare function isSandboxAcquirer(manager: SandboxManagerLike): manager 
 // file: aios-e2b.d.ts
 import type { AiosLifecycleHttpOptions } from './aios-http.js';
 import type { SandboxHandle, SandboxProvider, SandboxProviderOperationOptions, SandboxSpec } from './types.js';
-/** AIOS Lifecycle REST API 所需的固定调度位置。 */
-export interface AiosSandboxPlacement {
-    clusterId: string;
-    namespace?: string;
-}
+import type { SandboxPlacementInput } from './placement.js';
+/** @deprecated 使用 provider-neutral SandboxPlacementInput。 */
+export type AiosSandboxPlacement = SandboxPlacementInput;
 export interface AiosE2bProviderOptions extends AiosLifecycleHttpOptions {
-    /** Generic Key 创建所需的固定调度位置。 */
-    placement: AiosSandboxPlacement;
+    /** 旧配置的可选 fallback；动态 spec.placement 优先。 */
+    placement?: AiosSandboxPlacement;
     /** 当前 Runtime generation 从 AIOS 目录加载的模板 ID。 */
     allowedTemplateIds: ReadonlySet<string>;
     /** readiness probe 最大次数；仅供测试或特殊部署调整。 */
@@ -177,9 +176,10 @@ export interface SandboxConfig {
     apiKey?: string;
     aios?: {
         lifecycleUrl: string;
-        placement: {
-            clusterId: string;
-            namespace: string;
+        placement?: {
+            clusterId?: string;
+            clusterName?: string;
+            namespace?: string;
         };
     };
     domain?: string;
@@ -200,9 +200,11 @@ export interface SandboxSettings {
     protocol?: 'http' | 'https';
     defaultImage?: string;
     lifecycleUrl?: string;
+    /** @deprecated 仅供旧数据库记录作为内部 fallback，公共设置不再返回或保存。 */
     placement?: {
-        clusterId: string;
-        namespace: string;
+        clusterId?: string;
+        clusterName?: string;
+        namespace?: string;
     };
 }
 export interface SandboxSettingsRecord {
@@ -321,6 +323,7 @@ export * from './notes.js';
 export * from './opensandbox-desktop.js';
 export * from './opensandbox.js';
 export * from './output.js';
+export * from './placement.js';
 export * from './profiles.js';
 export * from './runtime-controller.js';
 export * from './runtime.js';
@@ -533,12 +536,37 @@ export declare class OpenSandboxProvider implements SandboxProvider {
 // file: output.d.ts
 export declare function joinLogText(parts: string[]): string;
 
+// file: placement.d.ts
+import type { SandboxSpec } from './types.js';
+export declare const DEFAULT_SANDBOX_PLACEMENT_NAMESPACE = "aios-system";
+export interface SandboxPlacementInput {
+    clusterName?: string;
+    clusterId?: string;
+    namespace?: string;
+}
+export interface SandboxPlacement {
+    clusterName?: string;
+    clusterId?: string;
+    namespace: string;
+}
+export interface NormalizedSandboxPlacement {
+    placement: SandboxPlacement;
+    cacheSuffix: string;
+    metadata: Record<string, string>;
+}
+export declare function normalizeSandboxPlacement(input?: SandboxPlacementInput, fallback?: SandboxPlacementInput): NormalizedSandboxPlacement | undefined;
+export declare function withSandboxPlacement(spec: SandboxSpec, input?: SandboxPlacementInput): SandboxSpec;
+
 // file: profiles.d.ts
 import type { Role, SandboxConfig } from './contracts.js';
 import { type SandboxIdentity } from './keys.js';
 import type { SandboxSpec } from './types.js';
 export type SandboxProfileEnvType = 'code' | 'browser';
 export type SandboxProfileRuntimeRole = 'sandbox-reader' | 'sandbox-diag';
+export declare class SandboxProfileAuthorizationError extends Error {
+    readonly status = 403;
+    constructor();
+}
 export interface SandboxProfile {
     id: string;
     name: string;
@@ -624,7 +652,7 @@ export declare class SandboxRuntimeController implements SandboxAcquirer {
     profileDefinitions(ctx?: Pick<RequestContext, 'role'>): SandboxProfile[];
     profiles(ctx?: Pick<RequestContext, 'role'>): PublicSandboxProfile[];
     desktop(ctx: ToolContext): Promise<DesktopHandle>;
-    acquire(ctx: ToolContext, profile?: string): Promise<SandboxAcquisition>;
+    acquire(ctx: ToolContext, profile?: string, placement?: import('./placement.js').SandboxPlacementInput): Promise<SandboxAcquisition>;
     acquireSpec(ctx: ToolContext, source: SandboxSpec | (() => SandboxSpec | Promise<SandboxSpec>)): Promise<SandboxAcquisition>;
     commit(input?: SandboxGenerationInput): Promise<void>;
     get(spec: SandboxSpec): Promise<SandboxHandle>;
@@ -749,10 +777,11 @@ export declare const SandboxSettingsSchema: z.ZodDiscriminatedUnion<[z.ZodObject
     enabled: z.ZodBoolean;
     mode: z.ZodLiteral<"aios_lifecycle">;
     lifecycleUrl: z.ZodPipe<z.ZodString, z.ZodTransform<string, string>>;
-    placement: z.ZodObject<{
-        clusterId: z.ZodString;
-        namespace: z.ZodString;
-    }, z.core.$strict>;
+    placement: z.ZodOptional<z.ZodObject<{
+        clusterId: z.ZodOptional<z.ZodString>;
+        clusterName: z.ZodOptional<z.ZodString>;
+        namespace: z.ZodOptional<z.ZodString>;
+    }, z.core.$strict>>;
 }, z.core.$strict>, z.ZodObject<{
     enabled: z.ZodBoolean;
     mode: z.ZodLiteral<"opensandbox">;
@@ -853,6 +882,8 @@ export interface SandboxSpec {
     key: string;
     /** 沙箱模板/profile 名称，用于 UI 展示和会话内多沙箱隔离。 */
     profile?: string;
+    /** AIOS Lifecycle 调度位置；clusterName 与 clusterId 二选一。 */
+    placement?: import('./placement.js').SandboxPlacement;
     /** 连接远端既有沙箱时提供其 id；不提供则新建。 */
     sandboxId?: string;
     /** 模板 / 镜像（动态拉起到集群内部时使用）。 */

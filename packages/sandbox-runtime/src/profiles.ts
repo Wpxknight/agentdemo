@@ -5,6 +5,15 @@ import type { SandboxSpec } from './types.js';
 export type SandboxProfileEnvType = 'code' | 'browser';
 export type SandboxProfileRuntimeRole = 'sandbox-reader' | 'sandbox-diag';
 
+export class SandboxProfileAuthorizationError extends Error {
+  readonly status = 403;
+
+  constructor() {
+    super('当前身份无权使用该沙箱模板；sandbox-diag 仅 platform_admin 可用');
+    this.name = 'SandboxProfileAuthorizationError';
+  }
+}
+
 export interface SandboxProfile {
   id: string;
   name: string;
@@ -190,7 +199,7 @@ export function findSandboxProfile(
   const selected = byId ?? (nameMatches.length === 1 ? nameMatches[0] : undefined);
   if (!selected) throw new Error(`未配置沙箱模板: ${selector}`);
   if (!canUseSandboxProfile(selected, role)) {
-    throw new Error('当前身份无权使用该沙箱模板；sandbox-diag 仅 platform_admin 可用');
+    throw new SandboxProfileAuthorizationError();
   }
   return selected;
 }

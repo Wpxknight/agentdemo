@@ -608,11 +608,13 @@ MCP 身份固定为 `{tenantId,actorId:userId,roles:[role]}`。
 - 行为：同步等待工具
 - 实现：`src/server/http.ts:1458`
 - Body：`code:string` 必填；`language?:string`；`profile` 或 `sandboxProfile` 可选；`sessionId` 可选。
-- Response/错误：同直接工具调用。指定 profile 调 `sandbox_run_code`，否则 `sbx__run_code`；缺 code 为 `400`。
+- 可选调度字段：`cluster_name` 或 `cluster_id`（二选一），`namespace` 缺省为 `aios-system`。指定 profile 调 `sandbox_run_code`，否则 `sbx__run_code`；缺 code、选择器冲突或仅传 namespace 为 `400`。
 
 ### 运行命令
 
 `POST /v1/sandbox/run-command`
+
+- 同样支持 `cluster_name`、`cluster_id`、`namespace` 动态调度字段。
 
 - 认证：Bearer；直接工具策略生效
 - 行为：同步等待工具
@@ -699,7 +701,7 @@ MCP 身份固定为 `{tenantId,actorId:userId,roles:[role]}`。
 - 认证：Bearer + `tenant:manage`
 - 行为：同步
 - 实现：`src/server/http.ts:1547`
-- Response：`200 {config,options?}`。config 为 `id,protocol,base_url,model,api_key,api_key_set,api_key_preview,allow_insecure_tls,context_window_tokens,context_keep_images,effort?`。注意：当前实现 **会返回完整 `api_key`**；调用方必须按敏感数据处理。
+- Response：`200 {config,options?}`。config 为 `id,protocol,base_url,model,api_key,api_key_set,allow_insecure_tls,context_window_tokens,context_keep_images,effort?`。`api_key` 固定为空字符串，`api_key_set` 仅表示服务端是否已配置凭据；接口不会返回完整 Key 或摘要。
 - 错误：`403` 权限。
 
 ### 更新 LLM 设置
@@ -709,7 +711,7 @@ MCP 身份固定为 `{tenantId,actorId:userId,roles:[role]}`。
 - 认证：Bearer + `tenant:manage`
 - 行为：同步持久化并热更新模型
 - 实现：`src/server/http.ts:1553`
-- Body：可用 `id/model_id` 选 option；或 `protocol` (`anthropic|openai`)、`base_url/baseURL`、`api_key/apiKey`、`model`、`allow_insecure_tls/allowInsecureTls` boolean、`context_window_tokens/contextWindowTokens` 正整数、`context_keep_images/contextKeepImages` >=0、`effort`。未知 effort 当前静默保留旧值。`allow_insecure_tls=true` 仅用于可信内网的自签名/不受信任证书 HTTPS LLM。
+- Body：可用 `id/model_id` 选 option；或 `protocol` (`anthropic|openai`)、`base_url/baseURL`、`api_key/apiKey`、`model`、`allow_insecure_tls/allowInsecureTls` boolean、`context_window_tokens/contextWindowTokens` 正整数、`context_keep_images/contextKeepImages` >=0、`effort`。`api_key` 缺省或为空时保留服务端已有凭据，非空时替换。未知 effort 当前静默保留旧值。`allow_insecure_tls=true` 仅用于可信内网的自签名/不受信任证书 HTTPS LLM。
 - Response：`200 {config,options?}`。
 - 错误：`400` 未知模型、protocol、必填连接字段、token 配置；`403` 权限。
 
@@ -731,7 +733,7 @@ MCP 身份固定为 `{tenantId,actorId:userId,roles:[role]}`。
 - 认证：Bearer + `tenant:manage`
 - 行为：同步；scope 固定 `platform`
 - 实现：`src/server/http.ts:1591`
-- Response：`200 {scope:"platform",settings,runtime?}`。settings 公共字段为 `enabled,mode,api_key_set`，按 mode 增加：standard_e2b `domain?`；aios_lifecycle `lifecycle_url,placement:{cluster_id,namespace}`；opensandbox `domain?,protocol,default_image?`；local 无 key。runtime 可含 `enabled,mode,status,template_count,last_successful_refresh_at`。
+- Response：`200 {scope:"platform",settings,runtime?}`。settings 公共字段为 `enabled,mode,api_key_set`，按 mode 增加：standard_e2b `domain?`；aios_lifecycle `lifecycle_url`；opensandbox `domain?,protocol,default_image?`；local 无 key。runtime 可含 `enabled,mode,status,template_count,last_successful_refresh_at`。
 
 ### 更新 Sandbox Runtime 设置
 
@@ -741,7 +743,7 @@ MCP 身份固定为 `{tenantId,actorId:userId,roles:[role]}`。
 - 行为：同步应用平台全局 runtime 并写 sandbox audit
 - 实现：`src/server/http.ts:1607`
 
-公共 body：`enabled:boolean`、`mode` 必填（`standard_e2b|aios_lifecycle|opensandbox|local`）、`api_key?:string`、`clear_api_key?:boolean`。mode 专属：standard_e2b `domain?`；aios_lifecycle `lifecycle_url`、`placement:{cluster_id,namespace}`；opensandbox `domain?`,`protocol?`,`default_image?`。传入当前 mode 不支持字段会 `400`；api_key 与 clear 互斥，local 禁止 key；启用 standard_e2b/aios_lifecycle 时清 key 被拒。
+公共 body：`enabled:boolean`、`mode` 必填（`standard_e2b|aios_lifecycle|opensandbox|local`）、`api_key?:string`、`clear_api_key?:boolean`。mode 专属：standard_e2b `domain?`；aios_lifecycle `lifecycle_url`；opensandbox `domain?`,`protocol?`,`default_image?`。兼容窗口内 AIOS 的旧 `placement` 字段会被接受但忽略且不持久化；其他不支持字段返回 `400`。
 
 - Response：同查询。
 - 错误：`400` Schema/凭据目标；`403`；`503` runtime 不支持动态设置；应用失败通常 `500`。

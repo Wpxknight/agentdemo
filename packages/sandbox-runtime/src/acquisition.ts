@@ -1,11 +1,13 @@
 import type { ToolContext } from './contracts.js';
 import type { SandboxManagerLike } from './lifecycle.js';
 import type { SandboxHandle, SandboxSpec } from './types.js';
+import type { SandboxPlacementInput } from './placement.js';
 
 /** 由调用上下文推导 Sandbox spec；profile 由 generation 在调用开始时固定。 */
 export type SpecResolver = (
   ctx: ToolContext,
   profile?: string,
+  placement?: SandboxPlacementInput,
 ) => Partial<SandboxSpec> | Promise<Partial<SandboxSpec>>;
 
 export interface SandboxAcquisition {
@@ -18,7 +20,7 @@ export interface SandboxAcquisition {
 }
 
 export interface SandboxAcquirer extends SandboxManagerLike {
-  acquire(ctx: ToolContext, profile?: string): Promise<SandboxAcquisition>;
+  acquire(ctx: ToolContext, profile?: string, placement?: SandboxPlacementInput): Promise<SandboxAcquisition>;
   acquireSpec(
     ctx: ToolContext,
     spec: SandboxSpec | (() => SandboxSpec | Promise<SandboxSpec>),

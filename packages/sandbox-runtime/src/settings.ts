@@ -7,6 +7,10 @@ import type {
   SandboxSettingsStore,
   SecretBoxLike,
 } from './contracts.js';
+import {
+  DEFAULT_SANDBOX_PLACEMENT_CLUSTER_ID,
+  DEFAULT_SANDBOX_PLACEMENT_NAMESPACE,
+} from './placement.js';
 
 const PLATFORM_SETTINGS_CONTEXT = { tenantId: 'default' } as const;
 const SECRET_SCHEMA_VERSION = 1;
@@ -37,9 +41,10 @@ const AiosLifecycleSettingsSchema = EnabledModeSchema.extend({
   mode: z.literal('aios_lifecycle'),
   lifecycleUrl: z.string().trim().min(1).transform(normalizeLifecycleUrl),
   placement: z.object({
-    clusterId: z.string().trim().min(1),
-    namespace: z.string().trim().min(1),
-  }).strict(),
+    clusterId: z.string().trim().min(1).optional(),
+    clusterName: z.string().trim().min(1).optional(),
+    namespace: z.string().trim().min(1).optional(),
+  }).strict().optional(),
 }).strict();
 
 export const SandboxSettingsSchema = z.discriminatedUnion('mode', [
@@ -140,7 +145,7 @@ export function sandboxConfigToSettings(config: SandboxConfig): SandboxSettings 
       enabled: config.enabled,
       mode: 'aios_lifecycle',
       lifecycleUrl: config.aios.lifecycleUrl,
-      placement: config.aios.placement,
+      ...(config.aios.placement ? { placement: config.aios.placement } : {}),
     });
   }
   if (config.provider === 'local') return { enabled: config.enabled, mode: 'local' };
@@ -201,12 +206,19 @@ export function sandboxSettingsToConfig(settings: SandboxSettings, apiKey?: stri
         userHomeMountPath: '/home/user/host',
       };
     case 'aios_lifecycle':
-      if (!settings.lifecycleUrl || !settings.placement) throw new Error('AIOS Lifecycle 设置缺少 URL 或 placement');
+      if (!settings.lifecycleUrl) throw new Error('AIOS Lifecycle 设置缺少 lifecycleUrl');
+      const placement = settings.placement ?? {
+        clusterId: DEFAULT_SANDBOX_PLACEMENT_CLUSTER_ID,
+        namespace: DEFAULT_SANDBOX_PLACEMENT_NAMESPACE,
+      };
       return {
         enabled: settings.enabled,
         provider: 'e2b',
         ...(apiKey ? { apiKey } : {}),
-        aios: { lifecycleUrl: settings.lifecycleUrl, placement: { ...settings.placement } },
+        aios: {
+          lifecycleUrl: settings.lifecycleUrl,
+          placement: { ...placement },
+        },
         desktop: false,
         userHomeMountPath: '/home/user/host',
       };
@@ -235,7 +247,8 @@ export class SandboxSettingsPersistence {
   }
 
   async save(input: SandboxSettings, update: SandboxApiKeyUpdate): Promise<LoadedSandboxSettings> {
-    const settings = parseSandboxSettings(input);
+    const parsed = parseSandboxSettings(input);
+    const settings = parsed;
     const current = await this.store.getSandboxSettingsRecord(this.ctx);
     let storedUpdate: SandboxSettingsSecretUpdate;
     let apiKey: string | undefined;

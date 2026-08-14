@@ -16,6 +16,7 @@ export * from './notes.js';
 export * from './opensandbox-desktop.js';
 export * from './opensandbox.js';
 export * from './output.js';
+export * from './placement.js';
 export * from './profiles.js';
 export * from './runtime-controller.js';
 export * from './runtime.js';

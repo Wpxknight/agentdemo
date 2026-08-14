@@ -38,6 +38,12 @@ function assertOk(res: ExecResult, action: string): void {
   throw new Error(`sandbox browser ${action} failed\n${execDetails(res)}`);
 }
 
+function chromeUnavailable(res: ExecResult): boolean {
+  if (!execFailed(res)) return false;
+  const details = `${res.error ?? ''}\n${res.stderr ?? ''}`;
+  return /fetch failed|Failed to connect Chrome DevTools|ECONNREFUSED|Chrome endpoint/i.test(details);
+}
+
 function previewHtml(jpeg?: Uint8Array): string {
   const body = jpeg && jpeg.byteLength
     ? `<img src="data:image/jpeg;base64,${Buffer.from(jpeg).toString('base64')}" />`
@@ -223,6 +229,15 @@ nohup "$CHROME_BIN" \
   --disable-gpu \
   --no-sandbox \
   --disable-dev-shm-usage \
+  --disable-background-networking \
+  --disable-component-update \
+  --disable-default-apps \
+  --disable-extensions \
+  --disable-features=MediaRouter,OptimizationHints,Translate \
+  --disable-sync \
+  --metrics-recording-only \
+  --no-first-run \
+  --renderer-process-limit=2 \
   --remote-debugging-address=127.0.0.1 \
   --remote-debugging-port=9222 \
   --user-data-dir=/tmp/aiop-browser/profile \
@@ -315,11 +330,17 @@ if [ -f ${WORK_DIR}/xvfb.pid ]; then kill "$(cat ${WORK_DIR}/xvfb.pid)" >/dev/nu
       CDP_SCRIPT,
       'AIOP_CDP',
     ].join('\n');
-    return this.useSandbox(async () => {
-      const res = await this.handle.runCommand(command, { timeoutMs: 15_000 });
-      assertOk(res, action);
-      return res;
-    });
+    const execute = () => this.useSandbox(
+      () => this.handle.runCommand(command, { timeoutMs: 15_000 }),
+    );
+    let res = await execute();
+    if (chromeUnavailable(res)) {
+      this.chromeReady = false;
+      await this.ensureChrome();
+      res = await execute();
+    }
+    assertOk(res, action);
+    return res;
   }
 }
 

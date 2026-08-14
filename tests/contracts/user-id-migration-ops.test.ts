@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 
 const scriptUrl = new URL('../../scripts/migrate-user-id-staging.sh', import.meta.url);
 const rollbackScriptUrl = new URL('../../scripts/rollback-aiop-compatible.sh', import.meta.url);
+const makefileUrl = new URL('../../Makefile', import.meta.url);
 
 function position(source: string, marker: string): number {
   const value = source.indexOf(`migration-step:${marker}`);
@@ -11,6 +12,25 @@ function position(source: string, marker: string): number {
 }
 
 describe('staging user-id migration operational contract', () => {
+  it('keeps the AIOS identity preflight explicit instead of blocking test-environment deployment', async () => {
+    const makefile = await readFile(makefileUrl, 'utf8');
+    const deployTarget = makefile.slice(
+      makefile.indexOf('deploy-aios-integrated:'),
+      makefile.indexOf('\ncheck-user-id-migration:'),
+    );
+    expect(deployTarget).not.toContain('$(MAKE) check-user-id-migration');
+    expect(deployTarget).toContain('AIOP_ALLOW_MIXED_IDENTITY_SOURCE=$(AIOP_ALLOW_MIXED_IDENTITY_SOURCE)');
+    expect(deployTarget).toContain('AIOP_DEPLOY_IMAGE=$(PUBLISH_IMAGE) AIOP_DEPLOY_WEB_IMAGE=$(PUBLISH_WEB_IMAGE)');
+    expect(makefile).toContain('AIOP_ALLOW_MIXED_IDENTITY_SOURCE ?= false');
+    expect(makefile).toContain('AIOP_AIOS_DEBUG_LOCAL_LOGIN ?= false');
+    expect(makefile).not.toContain('AIOP_AIOS_SANDBOX_CLUSTER_DIRECTORY');
+    expect(deployTarget).toContain('AIOP_AIOS_DEBUG_LOCAL_LOGIN=$(AIOP_AIOS_DEBUG_LOCAL_LOGIN)');
+    expect(makefile).toContain('DEBUG_LOCAL_PASSWORD_SECRET ?= aiop-debug-local-login');
+    expect(makefile).toContain("get secret \"$(DEBUG_LOCAL_PASSWORD_SECRET)\" -o jsonpath='{.data.password}'");
+    expect(makefile).toContain('\ncheck-user-id-migration:');
+    expect(makefile).toContain('scripts/check-user-id-migration.ts');
+  });
+
   it('orders backup, both preflights, quiescence, migration, postcheck and restore', async () => {
     const source = await readFile(scriptUrl, 'utf8');
     const order = ['backup', 'precheck', 'scale0', 'quiesced-check', 'migrate', 'postcheck'];
@@ -89,5 +109,26 @@ describe('AIoP rollback compatibility contract', () => {
     }
     expect(standalone).toContain('aiop.bocloud.com/deployment-mode: standalone');
     expect(integrated).toContain('aiop.bocloud.com/deployment-mode: aios-integrated');
+  });
+
+  it('keeps the AIOS integrated UI sidecar and external test entrypoint in the deployment contract', async () => {
+    const makefile = await readFile(makefileUrl, 'utf8');
+    const deployment = await readFile(new URL('../../deploy/aiop/deployment-aios-integrated.yaml', import.meta.url), 'utf8');
+    const service = await readFile(new URL('../../deploy/aiop/service-aios-integrated.yaml', import.meta.url), 'utf8');
+    expect(deployment).toMatch(/name:\s+aiop-web/);
+    expect(deployment).toContain('deploy.bocloud.k8s:40443/aios/aiop-web:dev');
+    expect(deployment).toContain('containerPort: 8080');
+    expect(service).toMatch(/type:\s+NodePort/);
+    expect(service).toMatch(/targetPort:\s+8080/);
+    expect(service).toMatch(/nodePort:\s+30084/);
+    expect(makefile).toContain('aiop=$(PUBLISH_IMAGE) aiop-web=$(PUBLISH_WEB_IMAGE)');
+    const deployTarget = makefile.slice(
+      makefile.indexOf('deploy-aios-integrated:'),
+      makefile.indexOf('\ncheck-user-id-migration:'),
+    );
+    const deleteService = deployTarget.indexOf('delete -f deploy/aiop/service-aios-integrated.yaml');
+    const applyService = deployTarget.indexOf('apply -f deploy/aiop/service-aios-integrated.yaml');
+    expect(deleteService).toBeGreaterThan(-1);
+    expect(deleteService).toBeLessThan(applyService);
   });
 });

@@ -70,6 +70,9 @@ describe('netdiag sandbox manifest', () => {
     expect(skill).toContain('优先使用 `/opt/cni/bin/fabric-admin` 命令行');
     expect(skill).toContain('/opt/cni/bin/fabric-admin health show');
     expect(skill).toContain('/opt/cni/bin/fabric-admin e2e network');
+    expect(skill).toContain('timeoutMs=600000');
+    expect(skill).toContain('`diagnostics` capability');
+    expect(skill).toContain('`runtimeRole=sandbox-diag`');
   });
 
   it('documents node-wide fabric health preflight and automatic repair before netdiag flows', () => {
@@ -87,7 +90,8 @@ describe('netdiag sandbox manifest', () => {
   it('keeps operations sandbox creation in the chat agent instead of main-sandbox kubectl apply', () => {
     expect(skill).toContain('sandbox_list_profiles');
     expect(skill).toContain('sandbox_ensure');
-    expect(skill).toContain('profile=netdiag');
+    expect(skill).toContain('优先选择名称为 `netdiag`');
+    expect(skill).toContain('稳定\nID 传给 `sandbox_ensure` / `sandbox_run_command`');
     expect(skill).toContain('不要在当前主沙箱里执行 `kubectl apply -f deploy/opensandbox/netdiag-sandbox.yaml`');
     expect(skill).toContain('每个沙箱都是平级实例');
     expect(readme).toContain('sandbox_list_profiles');
