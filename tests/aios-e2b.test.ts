@@ -135,6 +135,7 @@ describe('AiosE2bProvider', () => {
 
   it.each([
     [{ clusterId: ' 35 ', namespace: ' test ' }, { clusterId: '35', namespace: 'test' }],
+    [{ clusterName: ' Cluster PC-1 ', namespace: ' test ' }, { clusterName: 'Cluster PC-1', namespace: 'test' }],
   ])('prefers dynamic placement and sends exactly one selector', async (placement, expected) => {
     const { fetch, requests } = queuedFetch([
       jsonResponse(201, { sandboxID: 'sb-dynamic' }),
@@ -148,29 +149,35 @@ describe('AiosE2bProvider', () => {
     expect(JSON.stringify(requests[0].body)).not.toContain('clusterName' in expected ? 'clusterId' : 'clusterName');
   });
 
-  it('resolves an explicitly authorized cluster name to clusterId while preserving caller metadata', async () => {
+  it('passes arbitrary cluster names through without mapping while preserving caller metadata', async () => {
     const { fetch, requests } = queuedFetch([
       jsonResponse(201, { sandboxID: 'sb-name' }),
       jsonResponse(200, { stdout: '', stderr: '', exitCode: 0 }),
     ]);
-    await provider(fetch, { clusterDirectory: { 'cluster-pc1': '4' } }).create({
-      key: 'name', template: 'code-id', placement: { clusterName: 'cluster-pc1', namespace: 'aios-system' },
-      metadata: { placementSelector: 'clusterName', placementCluster: 'cluster-pc1' },
+    await provider(fetch).create({
+      key: 'name', template: 'code-id', placement: { clusterName: 'unlisted-cluster', namespace: 'aios-system' },
+      metadata: { placementSelector: 'clusterName', placementCluster: 'unlisted-cluster' },
     });
     expect(requests[0].body).toMatchObject({
-      placement: { clusterId: '4', namespace: 'aios-system' },
-      metadata: { placementSelector: 'clusterName', placementCluster: 'cluster-pc1' },
+      placement: { clusterName: 'unlisted-cluster', namespace: 'aios-system' },
+      metadata: { placementSelector: 'clusterName', placementCluster: 'unlisted-cluster' },
     });
-    expect((requests[0].body as { placement: object }).placement).not.toHaveProperty('clusterName');
+    expect((requests[0].body as { placement: object }).placement).not.toHaveProperty('clusterId');
   });
 
-  it('rejects unknown cluster names before HTTP and never falls back to configured placement', async () => {
-    const fetch = vi.fn() as unknown as typeof globalThis.fetch;
-    const p = provider(fetch, { clusterDirectory: { allowed: '4' } });
+  it('forwards server rejection for a dynamic cluster name once without selector conversion or fallback', async () => {
+    const { fetch, requests } = queuedFetch([
+      jsonResponse(403, { error: { message: 'target cluster forbidden' } }),
+    ]);
+    const p = provider(fetch);
     await expect(p.create({
       key: 'unknown', template: 'code-id', placement: { clusterName: 'unknown', namespace: 'aios-system' },
-    })).rejects.toThrow('未授权或未知集群名称');
-    expect(fetch).not.toHaveBeenCalled();
+    })).rejects.toMatchObject({ status: 403 });
+    expect(requests).toHaveLength(1);
+    expect(requests[0].body).toMatchObject({
+      placement: { clusterName: 'unknown', namespace: 'aios-system' },
+    });
+    expect((requests[0].body as { placement: object }).placement).not.toHaveProperty('clusterId');
   });
 
   it('fails before HTTP when neither dynamic placement nor fallback exists', async () => {

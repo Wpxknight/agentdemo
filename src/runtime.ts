@@ -496,29 +496,6 @@ export function resolveRuntimeSandboxConfig(
   return persisted ? sandboxSettingsToConfig(persisted) : startup;
 }
 
-export function parseAiosSandboxClusterDirectory(value: string | undefined): Readonly<Record<string, string>> {
-  if (!value?.trim()) return {};
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(value);
-  } catch {
-    throw new Error('AIOP_AIOS_SANDBOX_CLUSTER_DIRECTORY must be a JSON object');
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error('AIOP_AIOS_SANDBOX_CLUSTER_DIRECTORY must be a JSON object');
-  }
-  const directory: Record<string, string> = {};
-  for (const [name, id] of Object.entries(parsed)) {
-    const normalizedName = name.trim();
-    const normalizedId = typeof id === 'string' ? id.trim() : '';
-    if (!normalizedName || !normalizedId || normalizedName !== name || normalizedName in directory) {
-      throw new Error('AIOS sandbox cluster directory entries require unique non-empty canonical names and string IDs');
-    }
-    directory[normalizedName] = normalizedId;
-  }
-  return Object.freeze(directory);
-}
-
 export async function resolveCliPrincipalId(
   configured: string | undefined,
   durableMysql: boolean,
@@ -556,10 +533,6 @@ export async function buildRuntime(
 
   const deploymentMode = config.deploymentMode ?? 'standalone';
   const providerKind = config.auth?.provider ?? 'local';
-  const aiosSandboxClusterDirectory = parseAiosSandboxClusterDirectory(process.env.AIOP_AIOS_SANDBOX_CLUSTER_DIRECTORY);
-  if (Object.keys(aiosSandboxClusterDirectory).length) {
-    logger.warn({ entries: Object.keys(aiosSandboxClusterDirectory).length }, 'AIOS sandbox cluster name compatibility directory enabled');
-  }
   const debugLocalLogin = process.env.AIOP_AIOS_DEBUG_LOCAL_LOGIN === 'true';
   if (debugLocalLogin && (deploymentMode !== 'aios-integrated' || providerKind !== 'aios')) {
     throw new Error('AIOP_AIOS_DEBUG_LOCAL_LOGIN=true requires aios-integrated deployment with auth.provider=aios');
@@ -666,7 +639,6 @@ export async function buildRuntime(
             apiKey: cfg.apiKey,
             ...(cfg.aios.placement ? { placement: { ...cfg.aios.placement } } : {}),
             allowedTemplateIds: new Set(catalogSnapshot!.templates.map((template) => template.templateId)),
-            clusterDirectory: aiosSandboxClusterDirectory,
           },
         })
       : makeSandboxProvider(cfg);

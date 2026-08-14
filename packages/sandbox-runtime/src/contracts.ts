@@ -39,7 +39,6 @@ export interface SandboxConfig {
   aios?: {
     lifecycleUrl: string;
     placement?: { clusterId?: string; clusterName?: string; namespace?: string };
-    clusterDirectory?: Readonly<Record<string, string>>;
   };
   domain?: string;
   protocol?: 'http' | 'https';

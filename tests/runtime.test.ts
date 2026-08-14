@@ -13,7 +13,6 @@ import {
   resolveMcpBootstrapConfigs,
   resolveRuntimeModelConfig,
   resolveRuntimeSandboxConfig,
-  parseAiosSandboxClusterDirectory,
 } from '../src/runtime.js';
 import { ConfigSchema, SandboxConfigSchema, type Config } from '../src/config/schema.js';
 import { DurableRunManager } from '@aiop/pi-runtime';
@@ -33,18 +32,6 @@ const config: Config = {
   },
   defaultModel: 'fallback',
 };
-
-describe('parseAiosSandboxClusterDirectory', () => {
-  it('defaults empty and accepts canonical non-empty mappings', () => {
-    expect(parseAiosSandboxClusterDirectory(undefined)).toEqual({});
-    expect(parseAiosSandboxClusterDirectory('{"pc-a":"4","pc-b":"35"}')).toEqual({ 'pc-a': '4', 'pc-b': '35' });
-  });
-
-  it.each(['[]', 'null', '{"":"4"}', '{" pc":"4"}', '{"pc":""}', '{"pc":4}'])(
-    'rejects invalid cluster directory: %s',
-    (value) => expect(() => parseAiosSandboxClusterDirectory(value)).toThrow(),
-  );
-});
 
 describe('resolveRuntimeModelConfig', () => {
   it('accepts an explicit insecure TLS flag in startup model config', () => {

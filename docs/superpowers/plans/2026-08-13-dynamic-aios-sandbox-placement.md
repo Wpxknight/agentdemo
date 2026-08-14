@@ -102,4 +102,4 @@ make deploy-aios-integrated DEPLOYMENT_MODE=aios-integrated AUTH_PROVIDER=aios
 
 ## 166 兼容说明
 
-166 当前 Lifecycle pool credential 以 `clusterId` 绑定，直接发送 `clusterName` 会在凭据选择阶段失败。AIoP 支持通过默认空的 `AIOP_AIOS_SANDBOX_CLUSTER_DIRECTORY` 显式注入测试环境名称目录；名称匹配后仅 Lifecycle 请求改发 `clusterId`，Sandbox key 与 metadata 仍保留用户原始 `clusterName`。未知名称直接失败且不使用 fallback。该目录不替代用户级 AIOS 授权，生产默认不得启用；后续应以当前 AIOS 用户凭据查询平台公开集群目录。
+AIoP 不维护集群名称目录，也不执行 `clusterName` 与 `clusterId` 互转。格式规范化后的 selector、值和默认 namespace 原样发送给 Lifecycle；目标存在性、名称解析和授权由 `aios-sandbox-server` 唯一裁决。动态 placement 被拒绝时禁止使用旧配置 fallback 或重试其他 selector，Sandbox key 与 metadata 保留调用方原始 selector。

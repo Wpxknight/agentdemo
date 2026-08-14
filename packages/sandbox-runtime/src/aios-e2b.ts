@@ -33,8 +33,6 @@ export type AiosSandboxPlacement = SandboxPlacementInput;
 export interface AiosE2bProviderOptions extends AiosLifecycleHttpOptions {
   /** 旧配置的可选 fallback；动态 spec.placement 优先。 */
   placement?: AiosSandboxPlacement;
-  /** 显式授权的 clusterName → clusterId 目录；未知名称必须 fail closed。 */
-  clusterDirectory?: Readonly<Record<string, string>>;
   /** 当前 Runtime generation 从 AIOS 目录加载的模板 ID。 */
   allowedTemplateIds: ReadonlySet<string>;
   /** readiness probe 最大次数；仅供测试或特殊部署调整。 */
@@ -171,12 +169,10 @@ export class AiosE2bProvider implements SandboxProvider {
   private readonly readinessAttempts: number;
   private readonly readinessDelayMs: number;
   private readonly sleep: (ms: number) => Promise<void>;
-  private readonly clusterDirectory: ReadonlyMap<string, string>;
 
   constructor(private readonly opts: AiosE2bProviderOptions) {
     if (opts.placement) normalizeSandboxPlacement(undefined, opts.placement);
     this.http = new AiosLifecycleHttpClient(opts);
-    this.clusterDirectory = new Map(Object.entries(opts.clusterDirectory ?? {}));
     this.readinessAttempts = opts.readinessAttempts ?? DEFAULT_READY_ATTEMPTS;
     this.readinessDelayMs = opts.readinessDelayMs ?? DEFAULT_READY_DELAY_MS;
     if (!Number.isInteger(this.readinessAttempts) || this.readinessAttempts < 1) {
@@ -192,7 +188,6 @@ export class AiosE2bProvider implements SandboxProvider {
     const template = this.assertTemplateAllowed(spec);
     const normalizedPlacement = normalizeSandboxPlacement(spec.placement, this.opts.placement);
     if (!normalizedPlacement) throw new Error('AIOS Lifecycle 创建沙箱需要 clusterName 或 clusterId');
-    const lifecyclePlacement = this.lifecyclePlacement(normalizedPlacement.placement);
     if (spec.volumes?.length) throw new Error('AIOS Lifecycle mode does not support sandbox volumes');
     const timeout = timeoutSeconds(spec.timeoutMs);
     const response = await this.request<SandboxResponse>('/sandboxes', {
@@ -209,7 +204,7 @@ export class AiosE2bProvider implements SandboxProvider {
           },
         }),
         ...(spec.network === undefined ? {} : { network: spec.network }),
-        placement: lifecyclePlacement,
+        placement: normalizedPlacement.placement,
       },
     }, { signal: options.signal });
     const sandboxId = response.sandboxID ?? response.id;
@@ -224,13 +219,6 @@ export class AiosE2bProvider implements SandboxProvider {
       else await cleanup;
       throw err;
     }
-  }
-
-  private lifecyclePlacement(placement: SandboxPlacementInput): SandboxPlacementInput {
-    if (!placement.clusterName) return placement;
-    const clusterId = this.clusterDirectory.get(placement.clusterName);
-    if (!clusterId) throw new Error(`AIOS Lifecycle 未授权或未知集群名称: ${placement.clusterName}`);
-    return { clusterId, namespace: placement.namespace };
   }
 
   async connect(
